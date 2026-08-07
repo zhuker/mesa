@@ -435,6 +435,140 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
          set_ssa_def(ctx, &instr->def, result);
       break;
    }
+   case nir_intrinsic_bindless_image_load: {
+      /*
+       * src[0] = 64-bit descriptor address (points to lp_image_descriptor)
+       * src[1] = vec4 coordinate (x, y, z, w)
+       * src[2] = sample index
+       * src[3] = lod
+       *
+       * lp_jit_image layout at descriptor:
+       *   offset 0:  base pointer (8 bytes)
+       *   offset 8:  width (4 bytes)
+       *   offset 12: height (2 bytes) + depth (2 bytes)
+       *   offset 16: num_samples (1 byte) + pad (3 bytes)
+       *   offset 20: sample_stride (4 bytes)
+       *   offset 24: row_stride (4 bytes)
+       *   offset 28: img_stride (4 bytes)
+       *   offset 32: residency (8 bytes)
+       *   offset 40: base_offset (4 bytes)
+       */
+      LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
+      LLVMValueRef coord = get_src(ctx, &instr->src[1]);
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+
+      /* Load base pointer from offset 0 */
+      LLVMValueRef base_ptr_ptr = LLVMBuildIntToPtr(ctx->builder, desc_addr,
+         LLVMPointerType(ptr_type, 0), "");
+      LLVMValueRef base_ptr = LLVMBuildLoad2(ctx->builder, ptr_type, base_ptr_ptr, "img_base");
+
+      /* Load row_stride from offset 24 */
+      LLVMValueRef stride_addr = LLVMBuildAdd(ctx->builder, desc_addr,
+         LLVMConstInt(i64, 24, false), "");
+      LLVMValueRef stride_ptr = LLVMBuildIntToPtr(ctx->builder, stride_addr,
+         LLVMPointerType(i32, 0), "");
+      LLVMValueRef row_stride = LLVMBuildLoad2(ctx->builder, i32, stride_ptr, "row_stride");
+
+      /* Load base_offset from offset 40 */
+      LLVMValueRef boff_addr = LLVMBuildAdd(ctx->builder, desc_addr,
+         LLVMConstInt(i64, 40, false), "");
+      LLVMValueRef boff_ptr = LLVMBuildIntToPtr(ctx->builder, boff_addr,
+         LLVMPointerType(i32, 0), "");
+      LLVMValueRef base_offset = LLVMBuildLoad2(ctx->builder, i32, boff_ptr, "base_off");
+
+      /* Get x, y from coordinate vector */
+      LLVMValueRef x = LLVMBuildExtractElement(ctx->builder, coord,
+         LLVMConstInt(i32, 0, false), "x");
+      LLVMValueRef y = LLVMBuildExtractElement(ctx->builder, coord,
+         LLVMConstInt(i32, 1, false), "y");
+
+      /* byte_offset = base_offset + y * row_stride + x * pixel_size */
+      unsigned bit_size = instr->def.bit_size;
+      unsigned pixel_size = bit_size / 8;
+      LLVMValueRef offset_val = LLVMBuildAdd(ctx->builder, base_offset,
+         LLVMBuildAdd(ctx->builder,
+            LLVMBuildMul(ctx->builder, y, row_stride, ""),
+            LLVMBuildMul(ctx->builder, x, LLVMConstInt(i32, pixel_size, false), ""), ""), "");
+
+      /* Load pixel */
+      LLVMValueRef pixel_ptr = LLVMBuildGEP2(ctx->builder,
+         LLVMInt8TypeInContext(ctx->llvm_ctx), base_ptr, &offset_val, 1, "");
+      LLVMTypeRef pixel_type = get_llvm_type(ctx, bit_size, 1);
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, pixel_ptr,
+         LLVMPointerType(pixel_type, 0), "");
+      LLVMValueRef pixel_val = LLVMBuildLoad2(ctx->builder, pixel_type, typed_ptr, "img_load");
+
+      /* Return as vec4 (only .x is meaningful for r32 formats) */
+      unsigned num_comp = instr->def.num_components;
+      if (num_comp > 1) {
+         LLVMValueRef vec = LLVMGetUndef(get_llvm_type(ctx, bit_size, num_comp));
+         vec = LLVMBuildInsertElement(ctx->builder, vec, pixel_val,
+            LLVMConstInt(i32, 0, false), "");
+         for (unsigned c = 1; c < num_comp; c++)
+            vec = LLVMBuildInsertElement(ctx->builder, vec, LLVMConstNull(pixel_type),
+               LLVMConstInt(i32, c, false), "");
+         set_ssa_def(ctx, &instr->def, vec);
+      } else {
+         set_ssa_def(ctx, &instr->def, pixel_val);
+      }
+      break;
+   }
+   case nir_intrinsic_bindless_image_store: {
+      /*
+       * src[0] = descriptor address
+       * src[1] = vec4 coordinate
+       * src[2] = sample
+       * src[3] = data to store
+       */
+      LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
+      LLVMValueRef coord = get_src(ctx, &instr->src[1]);
+      LLVMValueRef data = get_src(ctx, &instr->src[3]);
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+
+      LLVMValueRef base_ptr_ptr = LLVMBuildIntToPtr(ctx->builder, desc_addr,
+         LLVMPointerType(ptr_type, 0), "");
+      LLVMValueRef base_ptr = LLVMBuildLoad2(ctx->builder, ptr_type, base_ptr_ptr, "img_base");
+
+      LLVMValueRef stride_addr = LLVMBuildAdd(ctx->builder, desc_addr,
+         LLVMConstInt(i64, 24, false), "");
+      LLVMValueRef stride_ptr = LLVMBuildIntToPtr(ctx->builder, stride_addr,
+         LLVMPointerType(i32, 0), "");
+      LLVMValueRef row_stride = LLVMBuildLoad2(ctx->builder, i32, stride_ptr, "row_stride");
+
+      LLVMValueRef boff_addr = LLVMBuildAdd(ctx->builder, desc_addr,
+         LLVMConstInt(i64, 40, false), "");
+      LLVMValueRef boff_ptr = LLVMBuildIntToPtr(ctx->builder, boff_addr,
+         LLVMPointerType(i32, 0), "");
+      LLVMValueRef base_offset = LLVMBuildLoad2(ctx->builder, i32, boff_ptr, "base_off");
+
+      LLVMValueRef x = LLVMBuildExtractElement(ctx->builder, coord,
+         LLVMConstInt(i32, 0, false), "x");
+      LLVMValueRef y = LLVMBuildExtractElement(ctx->builder, coord,
+         LLVMConstInt(i32, 1, false), "y");
+
+      /* Extract first component of data for single-component formats */
+      LLVMValueRef store_val = data;
+      if (LLVMGetTypeKind(LLVMTypeOf(data)) == LLVMVectorTypeKind)
+         store_val = LLVMBuildExtractElement(ctx->builder, data,
+            LLVMConstInt(i32, 0, false), "");
+
+      unsigned pixel_size = LLVMGetIntTypeWidth(LLVMTypeOf(store_val)) / 8;
+      if (pixel_size == 0) pixel_size = 4;
+
+      LLVMValueRef offset_val = LLVMBuildAdd(ctx->builder, base_offset,
+         LLVMBuildAdd(ctx->builder,
+            LLVMBuildMul(ctx->builder, y, row_stride, ""),
+            LLVMBuildMul(ctx->builder, x, LLVMConstInt(i32, pixel_size, false), ""), ""), "");
+
+      LLVMValueRef pixel_ptr = LLVMBuildGEP2(ctx->builder,
+         LLVMInt8TypeInContext(ctx->llvm_ctx), base_ptr, &offset_val, 1, "");
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, pixel_ptr,
+         LLVMPointerType(LLVMTypeOf(store_val), 0), "");
+      LLVMBuildStore(ctx->builder, store_val, typed_ptr);
+      break;
+   }
    case nir_intrinsic_ssbo_atomic: {
       /* src[0] = 64-bit descriptor address, src[1] = byte offset, src[2] = data */
       LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
@@ -503,14 +637,10 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    LLVMValueRef src[4] = {0};
    for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
       src[i] = get_src(ctx, &instr->src[i].src);
-      /* Extract component if needed */
-      if (instr->src[i].swizzle[0] != 0 || num_comp == 1) {
-         if (LLVMGetTypeKind(LLVMTypeOf(src[i])) == LLVMVectorTypeKind) {
-            if (num_comp == 1) {
-               src[i] = LLVMBuildExtractElement(ctx->builder, src[i],
-                  LLVMConstInt(i32, instr->src[i].swizzle[0], false), "");
-            }
-         }
+      /* Extract component from vector sources when output is scalar */
+      if (LLVMGetTypeKind(LLVMTypeOf(src[i])) == LLVMVectorTypeKind && num_comp == 1) {
+         src[i] = LLVMBuildExtractElement(ctx->builder, src[i],
+            LLVMConstInt(i32, instr->src[i].swizzle[0], false), "");
       }
    }
 
@@ -601,6 +731,25 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    case nir_op_mov:
       result = src[0];
       break;
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4: {
+      unsigned nc = nir_op_infos[instr->op].num_inputs;
+      /* For vec ops, sources are always scalars — extract if vector */
+      for (unsigned c = 0; c < nc; c++) {
+         if (LLVMGetTypeKind(LLVMTypeOf(src[c])) == LLVMVectorTypeKind) {
+            src[c] = LLVMBuildExtractElement(ctx->builder, src[c],
+               LLVMConstInt(i32, instr->src[c].swizzle[0], false), "");
+         }
+      }
+      LLVMTypeRef elem_type = LLVMTypeOf(src[0]);
+      LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(elem_type, nc));
+      for (unsigned c = 0; c < nc; c++)
+         vec = LLVMBuildInsertElement(ctx->builder, vec, src[c],
+            LLVMConstInt(i32, c, false), "");
+      result = vec;
+      break;
+   }
    case nir_op_ilt:
       result = LLVMBuildICmp(ctx->builder, LLVMIntSLT, src[0], src[1], "");
       result = LLVMBuildZExt(ctx->builder, result, get_llvm_type(ctx, bit_size, 1), "");
@@ -697,8 +846,13 @@ emit_block_instrs(struct ntl_context *ctx, nir_block *block)
          emit_load_const(ctx, nir_instr_as_load_const(instr));
          break;
       case nir_instr_type_phi:
-         /* Phi sources are filled in after all blocks are emitted */
          break;
+      case nir_instr_type_undef: {
+         nir_undef_instr *undef = nir_instr_as_undef(instr);
+         set_ssa_def(ctx, &undef->def,
+            LLVMGetUndef(get_llvm_type(ctx, undef->def.bit_size, undef->def.num_components)));
+         break;
+      }
       case nir_instr_type_jump: {
          nir_jump_instr *jump = nir_instr_as_jump(instr);
          if (jump->type == nir_jump_break) {

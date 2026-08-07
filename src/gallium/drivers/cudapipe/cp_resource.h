@@ -6,17 +6,21 @@
 #include <stdbool.h>
 
 /*
- * IMPORTANT: The 'data' field must be at the same offset as
- * llvmpipe_resource.data (offset 512 on 64-bit) because lavapipe's
- * descriptor set code calls llvmpipe_resource_data() which casts to
- * llvmpipe_resource and reads .data. We pad our struct to match.
+ * IMPORTANT: tex_data and data must match llvmpipe_resource offsets
+ * because lavapipe's descriptor code calls llvmpipe_resource functions
+ * that read from these fixed offsets.
+ *   tex_data: offset 440 (used for textures/images)
+ *   data:     offset 456 (used for buffers)
  */
+#define CP_RESOURCE_TEX_DATA_OFFSET 440
 #define CP_RESOURCE_DATA_OFFSET 456
 
 struct cp_resource {
    struct pipe_resource base;
-   char _pad[CP_RESOURCE_DATA_OFFSET - sizeof(struct pipe_resource)];
-   void *data;                      /* MUST be at offset CP_RESOURCE_DATA_OFFSET */
+   char _pad[CP_RESOURCE_TEX_DATA_OFFSET - sizeof(struct pipe_resource)];
+   void *tex_data;                  /* MUST be at offset 440 */
+   char _pad2[456 - 440 - sizeof(void *)];
+   void *data;                      /* MUST be at offset 456 */
    CUdeviceptr device_ptr;
    uint64_t size;
    unsigned row_stride;

@@ -17,9 +17,10 @@
 _Static_assert(offsetof(struct cp_resource, data) == CP_RESOURCE_DATA_OFFSET,
                "cp_resource.data must be at offset CP_RESOURCE_DATA_OFFSET");
 
-/* Verify our data offset matches llvmpipe's (456 bytes on this platform) */
 _Static_assert(offsetof(struct cp_resource, data) == CP_RESOURCE_DATA_OFFSET,
-               "cp_resource.data must be at offset CP_RESOURCE_DATA_OFFSET");
+               "cp_resource.data must be at offset 456");
+_Static_assert(offsetof(struct cp_resource, tex_data) == CP_RESOURCE_TEX_DATA_OFFSET,
+               "cp_resource.tex_data must be at offset 440");
 
 
 static struct pipe_resource *
@@ -53,6 +54,7 @@ cp_resource_create(struct pipe_screen *screen,
          return NULL;
       }
       res->data = (void *)(uintptr_t)res->device_ptr;
+      res->tex_data = res->data;
       res->cuda_managed = true;
       res->owns_data = true;
       cuMemsetD8(res->device_ptr, 0, res->size);
@@ -211,9 +213,7 @@ cp_resource_bind_backing(struct pipe_screen *screen, struct pipe_resource *pt,
 {
    struct cp_resource *res = cp_resource(pt);
    res->data = (char *)mem + offset;
-   if (getenv("CUDAPIPE_DEBUG_LAUNCH"))
-      fprintf(stderr, "  bind_backing: res=%p mem=%p offset=%lu data=%p\n",
-              (void*)res, (void*)mem, (unsigned long)offset, res->data);
+   res->tex_data = res->data;
    return true;
 }
 

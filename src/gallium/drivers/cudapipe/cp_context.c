@@ -449,29 +449,38 @@ cp_set_polygon_stipple(struct pipe_context *ctx,
 {
 }
 
+struct cp_texture_handle {
+   void *functions;
+   uint32_t sampler_index;
+};
+
 static uint64_t
 cp_create_texture_handle(struct pipe_context *ctx,
                          struct pipe_sampler_view *view,
                          const struct pipe_sampler_state *state)
 {
-   return 0;
+   struct cp_texture_handle *h = CALLOC_STRUCT(cp_texture_handle);
+   return (uint64_t)(uintptr_t)h;
 }
 
 static uint64_t
 cp_create_image_handle(struct pipe_context *ctx,
                        const struct pipe_image_view *image)
 {
-   return 0;
+   struct cp_texture_handle *h = CALLOC_STRUCT(cp_texture_handle);
+   return (uint64_t)(uintptr_t)h;
 }
 
 static void
 cp_delete_texture_handle(struct pipe_context *ctx, uint64_t handle)
 {
+   FREE((void *)(uintptr_t)handle);
 }
 
 static void
 cp_delete_image_handle(struct pipe_context *ctx, uint64_t handle)
 {
+   FREE((void *)(uintptr_t)handle);
 }
 
 static void
