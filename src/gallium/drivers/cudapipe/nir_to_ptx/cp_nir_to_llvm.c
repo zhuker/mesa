@@ -21,8 +21,14 @@ struct ntl_context {
    LLVMValueRef *ssa_defs;
    unsigned num_ssa_defs;
 
+   LLVMValueRef *regs;
+   unsigned num_regs;
+
    LLVMValueRef *kernel_args;
    unsigned num_kernel_args;
+
+   LLVMBasicBlockRef break_block;
+   LLVMBasicBlockRef continue_block;
 
    struct nir_shader *nir;
    int sm_major;
@@ -279,6 +285,38 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       set_ssa_def(ctx, &instr->def, val);
       break;
    }
+   case nir_intrinsic_decl_reg: {
+      unsigned num_comp = nir_intrinsic_num_components(instr);
+      unsigned bit_size = nir_intrinsic_bit_size(instr);
+      LLVMTypeRef reg_type = get_llvm_type(ctx, bit_size, num_comp);
+      /* Create alloca at current position - it'll be in the entry block
+       * since decl_reg always appears first */
+      LLVMValueRef alloca_val = LLVMBuildAlloca(ctx->builder, reg_type, "reg");
+      LLVMBuildStore(ctx->builder, LLVMConstNull(reg_type), alloca_val);
+      set_ssa_def(ctx, &instr->def, alloca_val);
+      break;
+   }
+   case nir_intrinsic_load_reg: {
+      LLVMValueRef reg_ptr = get_src(ctx, &instr->src[0]);
+      if (!reg_ptr) {
+         set_ssa_def(ctx, &instr->def, LLVMConstNull(
+            get_llvm_type(ctx, instr->def.bit_size, instr->def.num_components)));
+         break;
+      }
+      unsigned num_comp = instr->def.num_components;
+      unsigned bit_size = instr->def.bit_size;
+      LLVMTypeRef load_type = get_llvm_type(ctx, bit_size, num_comp);
+      LLVMValueRef val = LLVMBuildLoad2(ctx->builder, load_type, reg_ptr, "reg_load");
+      set_ssa_def(ctx, &instr->def, val);
+      break;
+   }
+   case nir_intrinsic_store_reg: {
+      LLVMValueRef val = get_src(ctx, &instr->src[0]);
+      LLVMValueRef reg_ptr = get_src(ctx, &instr->src[1]);
+      if (reg_ptr && val)
+         LLVMBuildStore(ctx->builder, val, reg_ptr);
+      break;
+   }
    case nir_intrinsic_barrier: {
       LLVMTypeRef void_type = LLVMVoidTypeInContext(ctx->llvm_ctx);
       LLVMTypeRef fn_type = LLVMFunctionType(void_type, NULL, 0, false);
@@ -466,7 +504,7 @@ emit_load_const(struct ntl_context *ctx, nir_load_const_instr *instr)
 }
 
 static void
-emit_block(struct ntl_context *ctx, nir_block *block)
+emit_block_instrs(struct ntl_context *ctx, nir_block *block)
 {
    nir_foreach_instr(instr, block) {
       switch (instr->type) {
@@ -478,6 +516,96 @@ emit_block(struct ntl_context *ctx, nir_block *block)
          break;
       case nir_instr_type_load_const:
          emit_load_const(ctx, nir_instr_as_load_const(instr));
+         break;
+      case nir_instr_type_phi:
+         /* Phi sources are filled in after all blocks are emitted */
+         break;
+      case nir_instr_type_jump: {
+         nir_jump_instr *jump = nir_instr_as_jump(instr);
+         if (jump->type == nir_jump_break) {
+            LLVMBuildBr(ctx->builder, ctx->break_block);
+         } else if (jump->type == nir_jump_continue) {
+            LLVMBuildBr(ctx->builder, ctx->continue_block);
+         }
+         break;
+      }
+      default:
+         break;
+      }
+   }
+}
+
+static void emit_cf_list(struct ntl_context *ctx, struct exec_list *list);
+
+static void
+emit_if(struct ntl_context *ctx, nir_if *if_stmt)
+{
+   LLVMValueRef cond = get_src(ctx, &if_stmt->condition);
+   /* Convert to i1 if needed */
+   if (LLVMTypeOf(cond) != LLVMInt1TypeInContext(ctx->llvm_ctx)) {
+      cond = LLVMBuildICmp(ctx->builder, LLVMIntNE, cond,
+         LLVMConstNull(LLVMTypeOf(cond)), "");
+   }
+
+   LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "then");
+   LLVMBasicBlockRef else_block = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "else");
+   LLVMBasicBlockRef merge_block = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "endif");
+
+   LLVMBuildCondBr(ctx->builder, cond, then_block, else_block);
+
+   LLVMPositionBuilderAtEnd(ctx->builder, then_block);
+   emit_cf_list(ctx, &if_stmt->then_list);
+   if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder)))
+      LLVMBuildBr(ctx->builder, merge_block);
+
+   LLVMPositionBuilderAtEnd(ctx->builder, else_block);
+   emit_cf_list(ctx, &if_stmt->else_list);
+   if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder)))
+      LLVMBuildBr(ctx->builder, merge_block);
+
+   LLVMPositionBuilderAtEnd(ctx->builder, merge_block);
+}
+
+static void
+emit_loop(struct ntl_context *ctx, nir_loop *loop)
+{
+   LLVMBasicBlockRef loop_header = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "loop");
+   LLVMBasicBlockRef loop_exit = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "endloop");
+
+   /* Save previous break/continue targets */
+   LLVMBasicBlockRef prev_break = ctx->break_block;
+   LLVMBasicBlockRef prev_continue = ctx->continue_block;
+   ctx->break_block = loop_exit;
+   ctx->continue_block = loop_header;
+
+   LLVMBuildBr(ctx->builder, loop_header);
+   LLVMPositionBuilderAtEnd(ctx->builder, loop_header);
+
+   emit_cf_list(ctx, &loop->body);
+
+   /* If no terminator at end of loop body, branch back to header */
+   if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder)))
+      LLVMBuildBr(ctx->builder, loop_header);
+
+   LLVMPositionBuilderAtEnd(ctx->builder, loop_exit);
+
+   ctx->break_block = prev_break;
+   ctx->continue_block = prev_continue;
+}
+
+static void
+emit_cf_list(struct ntl_context *ctx, struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         emit_block_instrs(ctx, nir_cf_node_as_block(node));
+         break;
+      case nir_cf_node_if:
+         emit_if(ctx, nir_cf_node_as_if(node));
+         break;
+      case nir_cf_node_loop:
+         emit_loop(ctx, nir_cf_node_as_loop(node));
          break;
       default:
          break;
@@ -492,17 +620,20 @@ emit_function(struct ntl_context *ctx)
 
    ctx->num_ssa_defs = impl->ssa_alloc;
    ctx->ssa_defs = calloc(ctx->num_ssa_defs, sizeof(LLVMValueRef));
+   ctx->num_regs = impl->ssa_alloc;
+   ctx->regs = calloc(ctx->num_regs, sizeof(LLVMValueRef));
 
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "entry");
    LLVMPositionBuilderAtEnd(ctx->builder, entry);
 
-   nir_foreach_block(block, impl) {
-      emit_block(ctx, block);
-   }
+   emit_cf_list(ctx, &impl->body);
 
-   LLVMBuildRetVoid(ctx->builder);
+   /* Add return if no terminator */
+   if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder)))
+      LLVMBuildRetVoid(ctx->builder);
 
    free(ctx->ssa_defs);
+   free(ctx->regs);
    return true;
 }
 
@@ -569,6 +700,10 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor)
    ctx.sm_major = sm_major;
    ctx.sm_minor = sm_minor;
 
+   /* Convert from SSA to reg form to eliminate phi nodes */
+   nir_convert_from_ssa(nir, true, false);
+   nir_opt_dce(nir);
+
    ctx.llvm_ctx = LLVMContextCreate();
    ctx.module = LLVMModuleCreateWithNameInContext("cudapipe_compute", ctx.llvm_ctx);
    ctx.builder = LLVMCreateBuilderInContext(ctx.llvm_ctx);
@@ -603,6 +738,9 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor)
       return NULL;
    }
 
+   if (getenv("CUDAPIPE_DUMP_IR"))
+      LLVMDumpModule(ctx.module);
+
    /* Verify */
    char *error = NULL;
    if (LLVMVerifyModule(ctx.module, LLVMPrintMessageAction, &error)) {
@@ -623,8 +761,10 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor)
    if (!ptx)
       return NULL;
 
-   fprintf(stderr, "cudapipe: generated PTX (%zu bytes):\n%s\n---NIR---\n", ptx_size, ptx);
-   nir_print_shader(nir, stderr);
+   if (getenv("CUDAPIPE_DUMP_PTX"))
+      fprintf(stderr, "cudapipe: generated PTX (%zu bytes):\n%s\n", ptx_size, ptx);
+   if (getenv("CUDAPIPE_DUMP_NIR"))
+      nir_print_shader(nir, stderr);
 
    struct cp_shader_binary *bin = CALLOC_STRUCT(cp_shader_binary);
    bin->ptx_text = ptx;
