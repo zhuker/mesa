@@ -28,6 +28,10 @@
 #include "llvmpipe/lp_public.h"
 #endif
 
+#ifdef HAVE_CUDAPIPE
+#include "cudapipe/cp_public.h"
+#endif
+
 #ifdef GALLIUM_VIRGL
 #include "virgl/virgl_public.h"
 #include "virgl/vtest/virgl_vtest_public.h"
@@ -37,6 +41,11 @@ static inline struct pipe_screen *
 sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config *config, const char *driver)
 {
    struct pipe_screen *screen = NULL;
+
+#if defined(HAVE_CUDAPIPE)
+   if (screen == NULL && (strcmp(driver, "cudapipe") == 0 || !driver[0]))
+      screen = cudapipe_create_screen(winsys);
+#endif
 
 #if defined(GALLIUM_LLVMPIPE)
    if (screen == NULL && (strcmp(driver, "llvmpipe") == 0 || !driver[0]))

@@ -256,6 +256,15 @@ if with_swrast_vk
   subdir('targets/lavapipe')
 endif
 
+if with_gallium_cudapipe
+  subdir('drivers/cudapipe')
+  if with_swrast_vk
+    subdir('targets/cudapipe')
+  endif
+else
+  driver_cudapipe = declare_dependency()
+endif
+
 if with_teflon
   subdir('frontends/teflon')
   subdir('targets/teflon')
