@@ -569,6 +569,54 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMBuildStore(ctx->builder, store_val, typed_ptr);
       break;
    }
+   case nir_intrinsic_bindless_image_atomic: {
+      /* src[0]=desc, src[1]=coord, src[2]=sample, src[3]=data */
+      LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
+      LLVMValueRef coord = get_src(ctx, &instr->src[1]);
+      LLVMValueRef data = get_src(ctx, &instr->src[3]);
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      LLVMValueRef base_ptr_ptr = LLVMBuildIntToPtr(ctx->builder, desc_addr,
+         LLVMPointerType(ptr_type, 0), "");
+      LLVMValueRef base_ptr = LLVMBuildLoad2(ctx->builder, ptr_type, base_ptr_ptr, "img_base");
+      LLVMValueRef stride_addr = LLVMBuildAdd(ctx->builder, desc_addr, LLVMConstInt(i64, 24, false), "");
+      LLVMValueRef stride_ptr = LLVMBuildIntToPtr(ctx->builder, stride_addr, LLVMPointerType(i32, 0), "");
+      LLVMValueRef row_stride = LLVMBuildLoad2(ctx->builder, i32, stride_ptr, "row_stride");
+      LLVMValueRef boff_addr = LLVMBuildAdd(ctx->builder, desc_addr, LLVMConstInt(i64, 40, false), "");
+      LLVMValueRef boff_ptr = LLVMBuildIntToPtr(ctx->builder, boff_addr, LLVMPointerType(i32, 0), "");
+      LLVMValueRef base_offset = LLVMBuildLoad2(ctx->builder, i32, boff_ptr, "base_off");
+      LLVMValueRef x = LLVMBuildExtractElement(ctx->builder, coord, LLVMConstInt(i32, 0, false), "x");
+      LLVMValueRef y = LLVMBuildExtractElement(ctx->builder, coord, LLVMConstInt(i32, 1, false), "y");
+      unsigned pixel_size = instr->def.bit_size / 8;
+      LLVMValueRef offset_val = LLVMBuildAdd(ctx->builder, base_offset,
+         LLVMBuildAdd(ctx->builder,
+            LLVMBuildMul(ctx->builder, y, row_stride, ""),
+            LLVMBuildMul(ctx->builder, x, LLVMConstInt(i32, pixel_size, false), ""), ""), "");
+      LLVMValueRef pixel_ptr = LLVMBuildGEP2(ctx->builder,
+         LLVMInt8TypeInContext(ctx->llvm_ctx), base_ptr, &offset_val, 1, "");
+      LLVMTypeRef val_type = LLVMTypeOf(data);
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, pixel_ptr,
+         LLVMPointerType(val_type, 0), "");
+      nir_atomic_op op = nir_intrinsic_atomic_op(instr);
+      LLVMAtomicRMWBinOp llvm_op;
+      switch (op) {
+      case nir_atomic_op_iadd: llvm_op = LLVMAtomicRMWBinOpAdd; break;
+      case nir_atomic_op_iand: llvm_op = LLVMAtomicRMWBinOpAnd; break;
+      case nir_atomic_op_ior:  llvm_op = LLVMAtomicRMWBinOpOr; break;
+      case nir_atomic_op_ixor: llvm_op = LLVMAtomicRMWBinOpXor; break;
+      case nir_atomic_op_imin: llvm_op = LLVMAtomicRMWBinOpMin; break;
+      case nir_atomic_op_umin: llvm_op = LLVMAtomicRMWBinOpUMin; break;
+      case nir_atomic_op_imax: llvm_op = LLVMAtomicRMWBinOpMax; break;
+      case nir_atomic_op_umax: llvm_op = LLVMAtomicRMWBinOpUMax; break;
+      case nir_atomic_op_xchg: llvm_op = LLVMAtomicRMWBinOpXchg; break;
+      default: llvm_op = LLVMAtomicRMWBinOpAdd; break;
+      }
+      LLVMValueRef result = LLVMBuildAtomicRMW(ctx->builder, llvm_op, typed_ptr,
+         data, LLVMAtomicOrderingMonotonic, false);
+      if (nir_intrinsic_infos[instr->intrinsic].has_dest)
+         set_ssa_def(ctx, &instr->def, result);
+      break;
+   }
    case nir_intrinsic_ssbo_atomic: {
       /* src[0] = 64-bit descriptor address, src[1] = byte offset, src[2] = data */
       LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
