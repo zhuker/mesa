@@ -477,18 +477,29 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
          LLVMPointerType(i32, 0), "");
       LLVMValueRef base_offset = LLVMBuildLoad2(ctx->builder, i32, boff_ptr, "base_off");
 
-      /* Get x, y from coordinate vector */
+      /* Load img_stride from offset 28 */
+      LLVMValueRef istride_addr = LLVMBuildAdd(ctx->builder, desc_addr,
+         LLVMConstInt(i64, 28, false), "");
+      LLVMValueRef istride_ptr = LLVMBuildIntToPtr(ctx->builder, istride_addr,
+         LLVMPointerType(i32, 0), "");
+      LLVMValueRef img_stride = LLVMBuildLoad2(ctx->builder, i32, istride_ptr, "img_stride");
+
+      /* Get x, y, z from coordinate vector */
       LLVMValueRef x = LLVMBuildExtractElement(ctx->builder, coord,
          LLVMConstInt(i32, 0, false), "x");
       LLVMValueRef y = LLVMBuildExtractElement(ctx->builder, coord,
          LLVMConstInt(i32, 1, false), "y");
+      LLVMValueRef z = LLVMBuildExtractElement(ctx->builder, coord,
+         LLVMConstInt(i32, 2, false), "z");
 
-      /* byte_offset = base_offset + y * row_stride + x * pixel_size */
+      /* byte_offset = base_offset + z * img_stride + y * row_stride + x * pixel_size */
       unsigned bit_size = instr->def.bit_size;
       unsigned pixel_size = bit_size / 8;
       LLVMValueRef offset_val = LLVMBuildAdd(ctx->builder, base_offset,
          LLVMBuildAdd(ctx->builder,
-            LLVMBuildMul(ctx->builder, y, row_stride, ""),
+            LLVMBuildAdd(ctx->builder,
+               LLVMBuildMul(ctx->builder, z, img_stride, ""),
+               LLVMBuildMul(ctx->builder, y, row_stride, ""), ""),
             LLVMBuildMul(ctx->builder, x, LLVMConstInt(i32, pixel_size, false), ""), ""), "");
 
       /* Load pixel */
@@ -543,10 +554,18 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
          LLVMPointerType(i32, 0), "");
       LLVMValueRef base_offset = LLVMBuildLoad2(ctx->builder, i32, boff_ptr, "base_off");
 
+      LLVMValueRef istride_addr2 = LLVMBuildAdd(ctx->builder, desc_addr,
+         LLVMConstInt(i64, 28, false), "");
+      LLVMValueRef istride_ptr2 = LLVMBuildIntToPtr(ctx->builder, istride_addr2,
+         LLVMPointerType(i32, 0), "");
+      LLVMValueRef img_stride2 = LLVMBuildLoad2(ctx->builder, i32, istride_ptr2, "img_stride");
+
       LLVMValueRef x = LLVMBuildExtractElement(ctx->builder, coord,
          LLVMConstInt(i32, 0, false), "x");
       LLVMValueRef y = LLVMBuildExtractElement(ctx->builder, coord,
          LLVMConstInt(i32, 1, false), "y");
+      LLVMValueRef z = LLVMBuildExtractElement(ctx->builder, coord,
+         LLVMConstInt(i32, 2, false), "z");
 
       /* Extract first component of data for single-component formats */
       LLVMValueRef store_val = data;
@@ -559,7 +578,9 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
 
       LLVMValueRef offset_val = LLVMBuildAdd(ctx->builder, base_offset,
          LLVMBuildAdd(ctx->builder,
-            LLVMBuildMul(ctx->builder, y, row_stride, ""),
+            LLVMBuildAdd(ctx->builder,
+               LLVMBuildMul(ctx->builder, z, img_stride2, ""),
+               LLVMBuildMul(ctx->builder, y, row_stride, ""), ""),
             LLVMBuildMul(ctx->builder, x, LLVMConstInt(i32, pixel_size, false), ""), ""), "");
 
       LLVMValueRef pixel_ptr = LLVMBuildGEP2(ctx->builder,
@@ -585,12 +606,18 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef boff_addr = LLVMBuildAdd(ctx->builder, desc_addr, LLVMConstInt(i64, 40, false), "");
       LLVMValueRef boff_ptr = LLVMBuildIntToPtr(ctx->builder, boff_addr, LLVMPointerType(i32, 0), "");
       LLVMValueRef base_offset = LLVMBuildLoad2(ctx->builder, i32, boff_ptr, "base_off");
+      LLVMValueRef istride_addr3 = LLVMBuildAdd(ctx->builder, desc_addr, LLVMConstInt(i64, 28, false), "");
+      LLVMValueRef istride_ptr3 = LLVMBuildIntToPtr(ctx->builder, istride_addr3, LLVMPointerType(i32, 0), "");
+      LLVMValueRef img_stride3 = LLVMBuildLoad2(ctx->builder, i32, istride_ptr3, "img_stride");
       LLVMValueRef x = LLVMBuildExtractElement(ctx->builder, coord, LLVMConstInt(i32, 0, false), "x");
       LLVMValueRef y = LLVMBuildExtractElement(ctx->builder, coord, LLVMConstInt(i32, 1, false), "y");
+      LLVMValueRef z = LLVMBuildExtractElement(ctx->builder, coord, LLVMConstInt(i32, 2, false), "z");
       unsigned pixel_size = instr->def.bit_size / 8;
       LLVMValueRef offset_val = LLVMBuildAdd(ctx->builder, base_offset,
          LLVMBuildAdd(ctx->builder,
-            LLVMBuildMul(ctx->builder, y, row_stride, ""),
+            LLVMBuildAdd(ctx->builder,
+               LLVMBuildMul(ctx->builder, z, img_stride3, ""),
+               LLVMBuildMul(ctx->builder, y, row_stride, ""), ""),
             LLVMBuildMul(ctx->builder, x, LLVMConstInt(i32, pixel_size, false), ""), ""), "");
       LLVMValueRef pixel_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), base_ptr, &offset_val, 1, "");
