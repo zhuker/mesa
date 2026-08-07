@@ -14,6 +14,7 @@ struct cp_shader_binary {
    CUfunction kernel;
    int sm_major;
    int sm_minor;
+   unsigned shared_size;
 };
 
 struct cp_shader_binary *

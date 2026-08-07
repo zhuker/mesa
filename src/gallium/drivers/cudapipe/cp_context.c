@@ -133,7 +133,7 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
       bin->kernel,
       info->grid[0], info->grid[1], info->grid[2],
       info->block[0], info->block[1], info->block[2],
-      0, NULL, kernel_params, NULL);
+      bin->shared_size, NULL, kernel_params, NULL);
 
    if (err != CUDA_SUCCESS)
       fprintf(stderr, "cudapipe: cuLaunchKernel failed (%d) grid=[%u,%u,%u] block=[%u,%u,%u]\n",

@@ -307,20 +307,17 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       break;
    }
    case nir_intrinsic_load_ubo: {
-      /* Same pattern as SSBO but from UBO buffer array (starting at a different offset) */
-      LLVMValueRef buf_idx = get_src(ctx, &instr->src[0]);
+      /*
+       * After lavapipe lowering, src[0] is a 64-bit descriptor address
+       * pointing to lp_jit_buffer {ptr base, u32 num_elements}.
+       * Same pattern as load_ssbo.
+       */
+      LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
       LLVMValueRef byte_offset = get_src(ctx, &instr->src[1]);
-      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
       LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
       LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMValueRef args = ctx->kernel_args[0];
-      LLVMValueRef args_as_ptrptr = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      /* UBO pointers start at index 18 (after grid + 16 SSBO slots) */
-      LLVMValueRef ubo_base_idx = LLVMBuildAdd(ctx->builder, buf_idx, LLVMConstInt(i32, 18, false), "");
-      ubo_base_idx = LLVMBuildZExt(ctx->builder, ubo_base_idx, i64, "");
-      LLVMValueRef buf_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_as_ptrptr,
-            &ubo_base_idx, 1, ""), "ubo_ptr");
+      LLVMValueRef desc_ptr = LLVMBuildIntToPtr(ctx->builder, desc_addr, ptr_ptr_type, "");
+      LLVMValueRef buf_ptr = LLVMBuildLoad2(ctx->builder, ptr_type, desc_ptr, "ubo_base");
       LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), buf_ptr, &byte_offset, 1, "");
       unsigned bit_size = instr->def.bit_size;
@@ -362,6 +359,80 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef reg_ptr = get_src(ctx, &instr->src[1]);
       if (reg_ptr && val)
          LLVMBuildStore(ctx->builder, val, reg_ptr);
+      break;
+   }
+   case nir_intrinsic_load_shared: {
+      LLVMValueRef byte_offset = get_src(ctx, &instr->src[0]);
+      unsigned base = nir_intrinsic_base(instr);
+      if (base != 0) {
+         byte_offset = LLVMBuildAdd(ctx->builder, byte_offset,
+            LLVMConstInt(i32, base, false), "");
+      }
+      /* Shared memory is address space 3 in NVPTX */
+      LLVMTypeRef shared_ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 3);
+      LLVMValueRef shared_base = LLVMConstNull(shared_ptr_type);
+      LLVMValueRef ptr = LLVMBuildGEP2(ctx->builder,
+         LLVMInt8TypeInContext(ctx->llvm_ctx), shared_base, &byte_offset, 1, "");
+      unsigned bit_size = instr->def.bit_size;
+      unsigned num_comp = instr->def.num_components;
+      LLVMTypeRef load_type = get_llvm_type(ctx, bit_size, num_comp);
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, ptr,
+         LLVMPointerType(load_type, 3), "");
+      LLVMValueRef val = LLVMBuildLoad2(ctx->builder, load_type, typed_ptr, "shared_load");
+      set_ssa_def(ctx, &instr->def, val);
+      break;
+   }
+   case nir_intrinsic_store_shared: {
+      LLVMValueRef data = get_src(ctx, &instr->src[0]);
+      LLVMValueRef byte_offset = get_src(ctx, &instr->src[1]);
+      unsigned base = nir_intrinsic_base(instr);
+      if (base != 0) {
+         byte_offset = LLVMBuildAdd(ctx->builder, byte_offset,
+            LLVMConstInt(i32, base, false), "");
+      }
+      LLVMTypeRef shared_ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 3);
+      LLVMValueRef shared_base = LLVMConstNull(shared_ptr_type);
+      LLVMValueRef ptr = LLVMBuildGEP2(ctx->builder,
+         LLVMInt8TypeInContext(ctx->llvm_ctx), shared_base, &byte_offset, 1, "");
+      LLVMTypeRef store_type = LLVMTypeOf(data);
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, ptr,
+         LLVMPointerType(store_type, 3), "");
+      LLVMBuildStore(ctx->builder, data, typed_ptr);
+      break;
+   }
+   case nir_intrinsic_shared_atomic: {
+      LLVMValueRef byte_offset = get_src(ctx, &instr->src[0]);
+      LLVMValueRef data = get_src(ctx, &instr->src[1]);
+      unsigned base = nir_intrinsic_base(instr);
+      if (base != 0) {
+         byte_offset = LLVMBuildAdd(ctx->builder, byte_offset,
+            LLVMConstInt(i32, base, false), "");
+      }
+      LLVMTypeRef shared_ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 3);
+      LLVMValueRef shared_base = LLVMConstNull(shared_ptr_type);
+      LLVMValueRef ptr = LLVMBuildGEP2(ctx->builder,
+         LLVMInt8TypeInContext(ctx->llvm_ctx), shared_base, &byte_offset, 1, "");
+      LLVMTypeRef val_type = LLVMTypeOf(data);
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, ptr,
+         LLVMPointerType(val_type, 3), "");
+      nir_atomic_op op = nir_intrinsic_atomic_op(instr);
+      LLVMAtomicRMWBinOp llvm_op;
+      switch (op) {
+      case nir_atomic_op_iadd: llvm_op = LLVMAtomicRMWBinOpAdd; break;
+      case nir_atomic_op_iand: llvm_op = LLVMAtomicRMWBinOpAnd; break;
+      case nir_atomic_op_ior:  llvm_op = LLVMAtomicRMWBinOpOr; break;
+      case nir_atomic_op_ixor: llvm_op = LLVMAtomicRMWBinOpXor; break;
+      case nir_atomic_op_imin: llvm_op = LLVMAtomicRMWBinOpMin; break;
+      case nir_atomic_op_umin: llvm_op = LLVMAtomicRMWBinOpUMin; break;
+      case nir_atomic_op_imax: llvm_op = LLVMAtomicRMWBinOpMax; break;
+      case nir_atomic_op_umax: llvm_op = LLVMAtomicRMWBinOpUMax; break;
+      case nir_atomic_op_xchg: llvm_op = LLVMAtomicRMWBinOpXchg; break;
+      default: llvm_op = LLVMAtomicRMWBinOpAdd; break;
+      }
+      LLVMValueRef result = LLVMBuildAtomicRMW(ctx->builder, llvm_op, typed_ptr,
+         data, LLVMAtomicOrderingMonotonic, false);
+      if (nir_intrinsic_infos[instr->intrinsic].has_dest)
+         set_ssa_def(ctx, &instr->def, result);
       break;
    }
    case nir_intrinsic_ssbo_atomic: {
@@ -879,6 +950,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor)
    bin->ptx_size = ptx_size;
    bin->sm_major = sm_major;
    bin->sm_minor = sm_minor;
+   bin->shared_size = nir->info.shared_size;
 
    /* Load PTX into CUDA module */
    CUresult err = cuModuleLoadData(&bin->module, ptx);
