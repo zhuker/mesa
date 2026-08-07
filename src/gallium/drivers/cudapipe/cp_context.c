@@ -73,6 +73,21 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
 
    cuCtxSetCurrent(cp->screen->cuda_ctx);
 
+   /* Debug: print bound UBO/SSBO pointers */
+   if (getenv("CUDAPIPE_DEBUG_LAUNCH")) {
+      for (unsigned i = 0; i < cp->num_compute_ubos; i++) {
+         fprintf(stderr, "  UBO[%u] = %p (size %u)", i, cp->compute_ubos[i].buffer, cp->compute_ubos[i].buffer_size);
+         if (cp->compute_ubos[i].buffer && cp->compute_ubos[i].buffer_size >= 16) {
+            uint64_t *addrs = (uint64_t *)cp->compute_ubos[i].buffer;
+            fprintf(stderr, " u64s: [%lx, %lx, %lx, %lx, %lx, %lx, %lx, %lx]",
+               addrs[0], addrs[1], addrs[2], addrs[3], addrs[4], addrs[5], addrs[6], addrs[7]);
+         }
+         fprintf(stderr, "\n");
+      }
+      for (unsigned i = 0; i < cp->num_compute_ssbos; i++)
+         fprintf(stderr, "  SSBO[%u] = %p (size %u)\n", i, cp->compute_ssbos[i].buffer, cp->compute_ssbos[i].buffer_size);
+   }
+
    /*
     * Build the argument buffer layout (array of pointers):
     *   [0]    = pointer to grid_size {gridX, gridY, gridZ}
@@ -104,6 +119,11 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    void *args_ptr_val = (void *)(uintptr_t)args_dev;
    void *kernel_params[] = { &args_ptr_val };
 
+   if (getenv("CUDAPIPE_DEBUG_LAUNCH")) {
+      fprintf(stderr, "  args_dev=%p arg_ptrs[19]=%p (UBO[1])\n",
+              (void*)(uintptr_t)args_dev, arg_ptrs[19]);
+   }
+
    CUresult err = cuLaunchKernel(
       bin->kernel,
       info->grid[0], info->grid[1], info->grid[2],
@@ -111,7 +131,9 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
       0, NULL, kernel_params, NULL);
 
    if (err != CUDA_SUCCESS)
-      fprintf(stderr, "cudapipe: cuLaunchKernel failed (%d)\n", err);
+      fprintf(stderr, "cudapipe: cuLaunchKernel failed (%d) grid=[%u,%u,%u] block=[%u,%u,%u]\n",
+              err, info->grid[0], info->grid[1], info->grid[2],
+              info->block[0], info->block[1], info->block[2]);
 
    cuCtxSynchronize();
    cuMemFree(args_dev);

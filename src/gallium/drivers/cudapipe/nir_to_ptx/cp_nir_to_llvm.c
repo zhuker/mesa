@@ -153,15 +153,24 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       break;
    }
    case nir_intrinsic_load_num_workgroups: {
-      /* Passed as kernel argument 0: pointer to {gridX, gridY, gridZ} */
-      LLVMValueRef ptr = ctx->kernel_args[0];
+      /* arg_ptrs[0] = pointer to {gridX, gridY, gridZ} */
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+      LLVMValueRef args = ctx->kernel_args[0];
+      LLVMValueRef args_as_ptrptr = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
+      /* Load arg_ptrs[0] which is the grid_size pointer */
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMValueRef zero64 = LLVMConstInt(i64, 0, false);
+      LLVMValueRef grid_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
+         LLVMBuildGEP2(ctx->builder, ptr_type, args_as_ptrptr, &zero64, 1, ""), "grid_ptr");
+      /* Cast to i32* and load x, y, z */
       LLVMTypeRef i32_ptr = LLVMPointerType(i32, 0);
-      ptr = LLVMBuildBitCast(ctx->builder, ptr, i32_ptr, "");
-      LLVMValueRef x = LLVMBuildLoad2(ctx->builder, i32, ptr, "grid_x");
+      LLVMValueRef grid_i32 = LLVMBuildBitCast(ctx->builder, grid_ptr, i32_ptr, "");
+      LLVMValueRef x = LLVMBuildLoad2(ctx->builder, i32, grid_i32, "grid_x");
       LLVMValueRef y = LLVMBuildLoad2(ctx->builder, i32,
-         LLVMBuildGEP2(ctx->builder, i32, ptr, (LLVMValueRef[]){LLVMConstInt(i32, 1, false)}, 1, ""), "grid_y");
+         LLVMBuildGEP2(ctx->builder, i32, grid_i32, (LLVMValueRef[]){LLVMConstInt(i32, 1, false)}, 1, ""), "grid_y");
       LLVMValueRef z = LLVMBuildLoad2(ctx->builder, i32,
-         LLVMBuildGEP2(ctx->builder, i32, ptr, (LLVMValueRef[]){LLVMConstInt(i32, 2, false)}, 1, ""), "grid_z");
+         LLVMBuildGEP2(ctx->builder, i32, grid_i32, (LLVMValueRef[]){LLVMConstInt(i32, 2, false)}, 1, ""), "grid_z");
       LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(i32, 3));
       vec = LLVMBuildInsertElement(ctx->builder, vec, x, LLVMConstInt(i32, 0, false), "");
       vec = LLVMBuildInsertElement(ctx->builder, vec, y, LLVMConstInt(i32, 1, false), "");
@@ -222,8 +231,27 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       break;
    }
    case nir_intrinsic_get_ssbo_size: {
-      /* Return a large size - we don't track exact sizes yet */
-      set_ssa_def(ctx, &instr->def, LLVMConstInt(i32, 1 << 30, false));
+      /* The size is stored in the descriptor buffer at (base_addr - 16).
+       * For lavapipe descriptor heaps, the layout is:
+       *   [0..7]  = output size
+       *   [8..15] = input size (or next descriptor)
+       *   [16..23] = buffer address (actual data pointer)
+       * So get_ssbo_size returns the u32 at (address - 16) for the buffer.
+       * For now, return a value that lets the shader compute element count correctly.
+       * TODO: properly read from the descriptor buffer.
+       */
+      LLVMValueRef addr = get_src(ctx, &instr->src[0]);
+      LLVMTypeRef ptr_type = LLVMPointerType(i32, 0);
+      /* Read size from 8 bytes before the buffer address in the descriptor */
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMValueRef offset = LLVMConstInt(i64, -8, true);
+      LLVMValueRef base_ptr = LLVMBuildIntToPtr(ctx->builder, addr,
+         LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0), "");
+      LLVMValueRef size_ptr = LLVMBuildGEP2(ctx->builder,
+         LLVMInt8TypeInContext(ctx->llvm_ctx), base_ptr, &offset, 1, "");
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, size_ptr, ptr_type, "");
+      LLVMValueRef size = LLVMBuildLoad2(ctx->builder, i32, typed_ptr, "ssbo_size");
+      set_ssa_def(ctx, &instr->def, size);
       break;
    }
    case nir_intrinsic_load_ssbo: {
@@ -376,6 +404,15 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    case nir_op_imul:
       result = LLVMBuildMul(ctx->builder, src[0], src[1], "");
       break;
+   case nir_op_udiv:
+      result = LLVMBuildUDiv(ctx->builder, src[0], src[1], "");
+      break;
+   case nir_op_idiv:
+      result = LLVMBuildSDiv(ctx->builder, src[0], src[1], "");
+      break;
+   case nir_op_umod:
+      result = LLVMBuildURem(ctx->builder, src[0], src[1], "");
+      break;
    case nir_op_fadd:
       result = LLVMBuildFAdd(ctx->builder, src[0], src[1], "");
       break;
@@ -427,6 +464,16 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    case nir_op_f2u32:
       result = LLVMBuildFPToUI(ctx->builder, src[0], get_llvm_type(ctx, 32, 1), "");
       break;
+   case nir_op_i2i64:
+      result = LLVMBuildSExt(ctx->builder, src[0], get_llvm_type(ctx, 64, 1), "");
+      break;
+   case nir_op_u2u64:
+      result = LLVMBuildZExt(ctx->builder, src[0], get_llvm_type(ctx, 64, 1), "");
+      break;
+   case nir_op_i2i32:
+   case nir_op_u2u32:
+      result = LLVMBuildTrunc(ctx->builder, src[0], get_llvm_type(ctx, 32, 1), "");
+      break;
    case nir_op_mov:
       result = src[0];
       break;
@@ -436,6 +483,14 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       break;
    case nir_op_ige:
       result = LLVMBuildICmp(ctx->builder, LLVMIntSGE, src[0], src[1], "");
+      result = LLVMBuildZExt(ctx->builder, result, get_llvm_type(ctx, bit_size, 1), "");
+      break;
+   case nir_op_uge:
+      result = LLVMBuildICmp(ctx->builder, LLVMIntUGE, src[0], src[1], "");
+      result = LLVMBuildZExt(ctx->builder, result, get_llvm_type(ctx, bit_size, 1), "");
+      break;
+   case nir_op_ult:
+      result = LLVMBuildICmp(ctx->builder, LLVMIntULT, src[0], src[1], "");
       result = LLVMBuildZExt(ctx->builder, result, get_llvm_type(ctx, bit_size, 1), "");
       break;
    case nir_op_ieq:
