@@ -12,21 +12,6 @@
 #include <cuda.h>
 #include <string.h>
 
-struct cp_resource {
-   struct pipe_resource base;
-   CUdeviceptr device_ptr;
-   void *data;
-   uint64_t size;
-   unsigned row_stride;
-   unsigned layer_stride;
-   bool cuda_managed;
-};
-
-static struct cp_resource *
-cp_resource(struct pipe_resource *pt)
-{
-   return (struct cp_resource *)pt;
-}
 
 static struct pipe_resource *
 cp_resource_create(struct pipe_screen *screen,
@@ -60,6 +45,7 @@ cp_resource_create(struct pipe_screen *screen,
       }
       res->data = (void *)(uintptr_t)res->device_ptr;
       res->cuda_managed = true;
+      res->owns_data = true;
       cuMemsetD8(res->device_ptr, 0, res->size);
    }
 
@@ -100,10 +86,12 @@ static void
 cp_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pt)
 {
    struct cp_resource *res = cp_resource(pt);
-   if (res->cuda_managed && res->device_ptr)
-      cuMemFree(res->device_ptr);
-   else if (res->data && !res->cuda_managed)
-      FREE(res->data);
+   if (res->owns_data) {
+      if (res->cuda_managed && res->device_ptr)
+         cuMemFree(res->device_ptr);
+      else if (res->data)
+         FREE(res->data);
+   }
    FREE(res);
 }
 

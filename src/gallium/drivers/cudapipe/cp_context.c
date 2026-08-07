@@ -71,16 +71,28 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    if (!bin || !bin->kernel)
       return;
 
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+
    /*
     * Build the argument buffer layout (array of pointers):
     *   [0]    = pointer to grid_size {gridX, gridY, gridZ}
     *   [1]    = reserved
     *   [2..17]  = SSBO pointers (16 slots)
     *   [18..33] = UBO pointers (16 slots)
+    *
+    * This is allocated as managed memory so the GPU can access it.
     */
    uint32_t grid_size[3] = { info->grid[0], info->grid[1], info->grid[2] };
-   void *arg_ptrs[34] = {0};
-   arg_ptrs[0] = grid_size;
+
+   CUdeviceptr args_dev;
+   cuMemAllocManaged(&args_dev, 34 * sizeof(void *), CU_MEM_ATTACH_GLOBAL);
+   void **arg_ptrs = (void **)(uintptr_t)args_dev;
+
+   CUdeviceptr grid_dev;
+   cuMemAllocManaged(&grid_dev, sizeof(grid_size), CU_MEM_ATTACH_GLOBAL);
+   memcpy((void *)(uintptr_t)grid_dev, grid_size, sizeof(grid_size));
+
+   arg_ptrs[0] = (void *)(uintptr_t)grid_dev;
    arg_ptrs[1] = NULL;
 
    for (unsigned i = 0; i < CP_MAX_SHADER_BUFFERS; i++)
@@ -89,9 +101,8 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++)
       arg_ptrs[18 + i] = cp->compute_ubos[i].buffer;
 
-   void *kernel_params[] = { &arg_ptrs };
-
-   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   void *args_ptr_val = (void *)(uintptr_t)args_dev;
+   void *kernel_params[] = { &args_ptr_val };
 
    CUresult err = cuLaunchKernel(
       bin->kernel,
@@ -103,6 +114,8 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
       fprintf(stderr, "cudapipe: cuLaunchKernel failed (%d)\n", err);
 
    cuCtxSynchronize();
+   cuMemFree(args_dev);
+   cuMemFree(grid_dev);
 }
 
 static void
@@ -325,15 +338,12 @@ cp_set_constant_buffer(struct pipe_context *ctx, mesa_shader_stage shader,
    if (shader != MESA_SHADER_COMPUTE || index >= CP_MAX_CONST_BUFFERS)
       return;
    if (buf && buf->buffer) {
-      struct pipe_transfer *xfer = NULL;
-      void *map = ctx->buffer_map(ctx, buf->buffer, 0, PIPE_MAP_READ,
-         &(struct pipe_box){.x = buf->buffer_offset,
-                            .width = buf->buffer_size,
-                            .height = 1, .depth = 1}, &xfer);
-      cp->compute_ubos[index].buffer = map;
+      struct cp_resource *res = (struct cp_resource *)buf->buffer;
+      cp->compute_ubos[index].buffer = (char *)res->data + buf->buffer_offset;
       cp->compute_ubos[index].buffer_size = buf->buffer_size;
-      if (xfer)
-         ctx->buffer_unmap(ctx, xfer);
+   } else if (buf && buf->user_buffer) {
+      cp->compute_ubos[index].buffer = (void *)buf->user_buffer;
+      cp->compute_ubos[index].buffer_size = buf->buffer_size;
    } else {
       cp->compute_ubos[index].buffer = NULL;
       cp->compute_ubos[index].buffer_size = 0;
@@ -362,17 +372,10 @@ cp_set_shader_buffers(struct pipe_context *ctx, mesa_shader_stage shader,
       if (idx >= CP_MAX_SHADER_BUFFERS)
          break;
       if (buffers && buffers[i].buffer) {
-         struct pipe_resource *res = buffers[i].buffer;
-         /* For managed memory, the pipe_resource data pointer IS the device ptr */
-         struct pipe_transfer *xfer = NULL;
-         void *map = ctx->buffer_map(ctx, res, 0, PIPE_MAP_READ_WRITE,
-            &(struct pipe_box){.x = buffers[i].buffer_offset,
-                               .width = buffers[i].buffer_size,
-                               .height = 1, .depth = 1}, &xfer);
-         cp->compute_ssbos[idx].buffer = map;
+         /* Get the host-accessible pointer from the resource's backing store */
+         struct cp_resource *res = (struct cp_resource *)buffers[i].buffer;
+         cp->compute_ssbos[idx].buffer = (char *)res->data + buffers[i].buffer_offset;
          cp->compute_ssbos[idx].buffer_size = buffers[i].buffer_size;
-         if (xfer)
-            ctx->buffer_unmap(ctx, xfer);
       } else {
          cp->compute_ssbos[idx].buffer = NULL;
          cp->compute_ssbos[idx].buffer_size = 0;
