@@ -193,27 +193,42 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       set_ssa_def(ctx, &instr->def, vec);
       break;
    }
-   case nir_intrinsic_load_ssbo: {
-      /* src[0] = buffer index, src[1] = byte offset */
-      LLVMValueRef buf_idx = get_src(ctx, &instr->src[0]);
-      LLVMValueRef byte_offset = get_src(ctx, &instr->src[1]);
-      /* kernel arg is a pointer to an array of buffer pointers */
+   case nir_intrinsic_load_const_buf_base_addr_lvp: {
+      /* Returns the 64-bit base address of constant buffer `src[0]`
+       * In our layout: kernel arg is a ptr to array of ptrs.
+       * UBO pointers start at index 18 in the arg array.
+       * The slot index from src[0] maps to arg_ptrs[18 + slot].
+       */
+      LLVMValueRef slot = get_src(ctx, &instr->src[0]);
       LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
       LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
       LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      /* args_ptr -> array of {buffer_ptr, buffer_size} structs, starting at offset 16 (after grid_size) */
       LLVMValueRef args = ctx->kernel_args[0];
       LLVMValueRef args_as_ptrptr = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      /* Skip grid info (3 ints = 12 bytes, but aligned to ptr), buffer pointers start at index 2 */
-      LLVMValueRef buf_base_idx = LLVMBuildAdd(ctx->builder, buf_idx, LLVMConstInt(i32, 2, false), "");
-      buf_base_idx = LLVMBuildZExt(ctx->builder, buf_base_idx, i64, "");
-      LLVMValueRef buf_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
+      LLVMValueRef ubo_idx = LLVMBuildAdd(ctx->builder, slot, LLVMConstInt(i32, 18, false), "");
+      ubo_idx = LLVMBuildZExt(ctx->builder, ubo_idx, i64, "");
+      LLVMValueRef ubo_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
          LLVMBuildGEP2(ctx->builder, ptr_type, args_as_ptrptr,
-            &buf_base_idx, 1, ""), "buf_ptr");
-      /* Add byte offset */
+            &ubo_idx, 1, ""), "ubo_base");
+      /* Convert pointer to i64 (device address) */
+      LLVMValueRef addr = LLVMBuildPtrToInt(ctx->builder, ubo_ptr, i64, "");
+      set_ssa_def(ctx, &instr->def, addr);
+      break;
+   }
+   case nir_intrinsic_get_ssbo_size: {
+      /* Return a large size - we don't track exact sizes yet */
+      set_ssa_def(ctx, &instr->def, LLVMConstInt(i32, 1 << 30, false));
+      break;
+   }
+   case nir_intrinsic_load_ssbo: {
+      /* Lavapipe lowering: src[0] = 64-bit buffer base address, src[1] = byte offset */
+      LLVMValueRef base_addr = get_src(ctx, &instr->src[0]);
+      LLVMValueRef byte_offset = get_src(ctx, &instr->src[1]);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      /* Convert 64-bit integer address to pointer */
+      LLVMValueRef buf_ptr = LLVMBuildIntToPtr(ctx->builder, base_addr, ptr_type, "");
       LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), buf_ptr, &byte_offset, 1, "");
-      /* Load value */
       unsigned bit_size = instr->def.bit_size;
       unsigned num_comp = instr->def.num_components;
       LLVMTypeRef load_type = get_llvm_type(ctx, bit_size, num_comp);
@@ -224,20 +239,12 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       break;
    }
    case nir_intrinsic_store_ssbo: {
-      /* src[0] = data, src[1] = buffer index, src[2] = byte offset */
+      /* Lavapipe lowering: src[0] = data, src[1] = 64-bit buffer base address, src[2] = byte offset */
       LLVMValueRef data = get_src(ctx, &instr->src[0]);
-      LLVMValueRef buf_idx = get_src(ctx, &instr->src[1]);
+      LLVMValueRef base_addr = get_src(ctx, &instr->src[1]);
       LLVMValueRef byte_offset = get_src(ctx, &instr->src[2]);
-      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
       LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMValueRef args = ctx->kernel_args[0];
-      LLVMValueRef args_as_ptrptr = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      LLVMValueRef buf_base_idx = LLVMBuildAdd(ctx->builder, buf_idx, LLVMConstInt(i32, 2, false), "");
-      buf_base_idx = LLVMBuildZExt(ctx->builder, buf_base_idx, i64, "");
-      LLVMValueRef buf_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_as_ptrptr,
-            &buf_base_idx, 1, ""), "buf_ptr");
+      LLVMValueRef buf_ptr = LLVMBuildIntToPtr(ctx->builder, base_addr, ptr_type, "");
       LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), buf_ptr, &byte_offset, 1, "");
       LLVMTypeRef store_type = LLVMTypeOf(data);
@@ -615,6 +622,9 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor)
 
    if (!ptx)
       return NULL;
+
+   fprintf(stderr, "cudapipe: generated PTX (%zu bytes):\n%s\n---NIR---\n", ptx_size, ptx);
+   nir_print_shader(nir, stderr);
 
    struct cp_shader_binary *bin = CALLOC_STRUCT(cp_shader_binary);
    bin->ptx_text = ptx;
