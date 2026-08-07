@@ -365,8 +365,8 @@ cp_set_constant_buffer(struct pipe_context *ctx, mesa_shader_stage shader,
    if (shader != MESA_SHADER_COMPUTE || index >= CP_MAX_CONST_BUFFERS)
       return;
    if (buf && buf->buffer) {
-      struct cp_resource *res = (struct cp_resource *)buf->buffer;
-      cp->compute_ubos[index].buffer = (char *)res->data + buf->buffer_offset;
+      struct cp_resource *res = cp_resource(buf->buffer);
+      cp->compute_ubos[index].buffer = (char *)cp_resource_data(res) + buf->buffer_offset;
       cp->compute_ubos[index].buffer_size = buf->buffer_size;
    } else if (buf && buf->user_buffer) {
       cp->compute_ubos[index].buffer = (void *)buf->user_buffer;
@@ -399,9 +399,8 @@ cp_set_shader_buffers(struct pipe_context *ctx, mesa_shader_stage shader,
       if (idx >= CP_MAX_SHADER_BUFFERS)
          break;
       if (buffers && buffers[i].buffer) {
-         /* Get the host-accessible pointer from the resource's backing store */
-         struct cp_resource *res = (struct cp_resource *)buffers[i].buffer;
-         cp->compute_ssbos[idx].buffer = (char *)res->data + buffers[i].buffer_offset;
+         struct cp_resource *res = cp_resource(buffers[i].buffer);
+         cp->compute_ssbos[idx].buffer = (char *)cp_resource_data(res) + buffers[i].buffer_offset;
          cp->compute_ssbos[idx].buffer_size = buffers[i].buffer_size;
       } else {
          cp->compute_ssbos[idx].buffer = NULL;

@@ -6,25 +6,17 @@
 #include <stdbool.h>
 
 /*
- * IMPORTANT: tex_data and data must match llvmpipe_resource offsets
- * because lavapipe's descriptor code calls llvmpipe_resource functions
- * that read from these fixed offsets.
- *   tex_data: offset 440 (used for textures/images)
- *   data:     offset 456 (used for buffers)
+ * We reuse llvmpipe_resource directly because lavapipe's descriptor code
+ * calls llvmpipe functions that cast pipe_resource to llvmpipe_resource
+ * and read fields at specific offsets (row_stride, tex_data, data, etc).
+ *
+ * We add our CUDA-specific fields after the llvmpipe_resource struct.
  */
-#define CP_RESOURCE_TEX_DATA_OFFSET 440
-#define CP_RESOURCE_DATA_OFFSET 456
+#include "../llvmpipe/lp_texture.h"
 
 struct cp_resource {
-   struct pipe_resource base;
-   char _pad[CP_RESOURCE_TEX_DATA_OFFSET - sizeof(struct pipe_resource)];
-   void *tex_data;                  /* MUST be at offset 440 */
-   char _pad2[456 - 440 - sizeof(void *)];
-   void *data;                      /* MUST be at offset 456 */
+   struct llvmpipe_resource lpr;    /* compatible with lavapipe's expectations */
    CUdeviceptr device_ptr;
-   uint64_t size;
-   unsigned row_stride;
-   unsigned layer_stride;
    bool cuda_managed;
    bool owns_data;
 };
@@ -33,6 +25,14 @@ static inline struct cp_resource *
 cp_resource(struct pipe_resource *pt)
 {
    return (struct cp_resource *)pt;
+}
+
+static inline void *
+cp_resource_data(struct cp_resource *res)
+{
+   if (llvmpipe_resource_is_texture(&res->lpr.base))
+      return res->lpr.tex_data;
+   return res->lpr.data;
 }
 
 void cudapipe_init_screen_resource_funcs(struct pipe_screen *screen);

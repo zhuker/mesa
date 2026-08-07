@@ -13,15 +13,6 @@
 #include <string.h>
 #include <stddef.h>
 
-/* Verify our data offset matches llvmpipe's */
-_Static_assert(offsetof(struct cp_resource, data) == CP_RESOURCE_DATA_OFFSET,
-               "cp_resource.data must be at offset CP_RESOURCE_DATA_OFFSET");
-
-_Static_assert(offsetof(struct cp_resource, data) == CP_RESOURCE_DATA_OFFSET,
-               "cp_resource.data must be at offset 456");
-_Static_assert(offsetof(struct cp_resource, tex_data) == CP_RESOURCE_TEX_DATA_OFFSET,
-               "cp_resource.tex_data must be at offset 440");
-
 
 static struct pipe_resource *
 cp_resource_create(struct pipe_screen *screen,
@@ -31,36 +22,38 @@ cp_resource_create(struct pipe_screen *screen,
    if (!res)
       return NULL;
 
-   res->base = *tmpl;
-   res->base.screen = screen;
-   pipe_reference_init(&res->base.reference, 1);
+   res->lpr.base = *tmpl;
+   res->lpr.base.screen = screen;
+   pipe_reference_init(&res->lpr.base.reference, 1);
 
+   uint64_t size;
    if (tmpl->target == PIPE_BUFFER) {
-      res->size = tmpl->width0;
+      size = tmpl->width0;
    } else {
       unsigned nblocksx = util_format_get_nblocksx(tmpl->format, tmpl->width0);
       unsigned nblocksy = util_format_get_nblocksy(tmpl->format, tmpl->height0);
       unsigned block_size = util_format_get_blocksize(tmpl->format);
-      res->row_stride = nblocksx * block_size;
-      res->layer_stride = res->row_stride * nblocksy;
-      res->size = (uint64_t)res->layer_stride * tmpl->depth0 * tmpl->array_size;
+      res->lpr.row_stride[0] = nblocksx * block_size;
+      res->lpr.img_stride[0] = (uint64_t)res->lpr.row_stride[0] * nblocksy;
+      size = res->lpr.img_stride[0] * MAX2(tmpl->depth0, 1) * MAX2(tmpl->array_size, 1);
    }
 
-   if (res->size > 0) {
-      CUresult err = cuMemAllocManaged(&res->device_ptr, res->size,
+   if (size > 0) {
+      CUresult err = cuMemAllocManaged(&res->device_ptr, size,
                                        CU_MEM_ATTACH_GLOBAL);
       if (err != CUDA_SUCCESS) {
          FREE(res);
          return NULL;
       }
-      res->data = (void *)(uintptr_t)res->device_ptr;
-      res->tex_data = res->data;
+      void *ptr = (void *)(uintptr_t)res->device_ptr;
+      res->lpr.data = ptr;
+      res->lpr.tex_data = ptr;
       res->cuda_managed = true;
       res->owns_data = true;
-      cuMemsetD8(res->device_ptr, 0, res->size);
+      cuMemsetD8(res->device_ptr, 0, size);
    }
 
-   return &res->base;
+   return &res->lpr.base;
 }
 
 static struct pipe_resource *
@@ -72,25 +65,26 @@ cp_resource_create_unbacked(struct pipe_screen *screen,
    if (!res)
       return NULL;
 
-   res->base = *tmpl;
-   res->base.screen = screen;
-   pipe_reference_init(&res->base.reference, 1);
+   res->lpr.base = *tmpl;
+   res->lpr.base.screen = screen;
+   pipe_reference_init(&res->lpr.base.reference, 1);
 
+   uint64_t size;
    if (tmpl->target == PIPE_BUFFER) {
-      res->size = tmpl->width0;
+      size = tmpl->width0;
    } else {
       unsigned nblocksx = util_format_get_nblocksx(tmpl->format, tmpl->width0);
       unsigned nblocksy = util_format_get_nblocksy(tmpl->format, tmpl->height0);
       unsigned block_size = util_format_get_blocksize(tmpl->format);
-      res->row_stride = nblocksx * block_size;
-      res->layer_stride = res->row_stride * nblocksy;
-      res->size = (uint64_t)res->layer_stride * tmpl->depth0 * tmpl->array_size;
+      res->lpr.row_stride[0] = nblocksx * block_size;
+      res->lpr.img_stride[0] = (uint64_t)res->lpr.row_stride[0] * nblocksy;
+      size = res->lpr.img_stride[0] * MAX2(tmpl->depth0, 1) * MAX2(tmpl->array_size, 1);
    }
 
    if (size_required)
-      *size_required = res->size;
+      *size_required = size;
 
-   return &res->base;
+   return &res->lpr.base;
 }
 
 static void
@@ -100,8 +94,8 @@ cp_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pt)
    if (res->owns_data) {
       if (res->cuda_managed && res->device_ptr)
          cuMemFree(res->device_ptr);
-      else if (res->data)
-         FREE(res->data);
+      else if (res->lpr.data)
+         FREE(res->lpr.data);
    }
    FREE(res);
 }
@@ -120,17 +114,22 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
    transfer->level = level;
    transfer->usage = usage;
    transfer->box = *box;
-   transfer->stride = res->row_stride;
-   transfer->layer_stride = res->layer_stride;
+   transfer->stride = res->lpr.row_stride[level];
+   transfer->layer_stride = res->lpr.img_stride[level];
 
    *out_transfer = transfer;
 
-   if (resource->target == PIPE_BUFFER)
-      return (char *)res->data + box->x;
+   void *data = cp_resource_data(res);
+   if (!data)
+      return NULL;
 
-   unsigned offset = box->z * res->layer_stride + box->y * res->row_stride +
+   if (resource->target == PIPE_BUFFER)
+      return (char *)data + box->x;
+
+   unsigned offset = box->z * res->lpr.img_stride[level] +
+                     box->y * res->lpr.row_stride[level] +
                      box->x * util_format_get_blocksize(resource->format);
-   return (char *)res->data + offset;
+   return (char *)data + offset;
 }
 
 static void
@@ -160,10 +159,11 @@ cp_clear_buffer(struct pipe_context *ctx, struct pipe_resource *res,
                 const void *clear_value, int clear_value_size)
 {
    struct cp_resource *cp_res = cp_resource(res);
-   if (!cp_res->data)
+   void *data = cp_resource_data(cp_res);
+   if (!data)
       return;
 
-   char *dst = (char *)cp_res->data + offset;
+   char *dst = (char *)data + offset;
    for (unsigned i = 0; i < size; i += clear_value_size)
       memcpy(dst + i, clear_value, clear_value_size);
 }
@@ -212,8 +212,9 @@ cp_resource_bind_backing(struct pipe_screen *screen, struct pipe_resource *pt,
                          uint64_t size, uint64_t alignment)
 {
    struct cp_resource *res = cp_resource(pt);
-   res->data = (char *)mem + offset;
-   res->tex_data = res->data;
+   void *ptr = (char *)mem + offset;
+   res->lpr.data = ptr;
+   res->lpr.tex_data = ptr;
    return true;
 }
 
