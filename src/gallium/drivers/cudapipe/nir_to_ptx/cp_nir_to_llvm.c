@@ -231,36 +231,36 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       break;
    }
    case nir_intrinsic_get_ssbo_size: {
-      /* The size is stored in the descriptor buffer at (base_addr - 16).
-       * For lavapipe descriptor heaps, the layout is:
-       *   [0..7]  = output size
-       *   [8..15] = input size (or next descriptor)
-       *   [16..23] = buffer address (actual data pointer)
-       * So get_ssbo_size returns the u32 at (address - 16) for the buffer.
-       * For now, return a value that lets the shader compute element count correctly.
-       * TODO: properly read from the descriptor buffer.
+      /*
+       * Descriptor struct: { ptr base (8 bytes); u32 num_elements (4 bytes); }
+       * num_elements is at offset 8 from the descriptor address.
+       * Returns size in BYTES (num_elements is already in the unit the shader expects).
        */
-      LLVMValueRef addr = get_src(ctx, &instr->src[0]);
-      LLVMTypeRef ptr_type = LLVMPointerType(i32, 0);
-      /* Read size from 8 bytes before the buffer address in the descriptor */
+      LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
       LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
-      LLVMValueRef offset = LLVMConstInt(i64, -8, true);
-      LLVMValueRef base_ptr = LLVMBuildIntToPtr(ctx->builder, addr,
-         LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0), "");
-      LLVMValueRef size_ptr = LLVMBuildGEP2(ctx->builder,
-         LLVMInt8TypeInContext(ctx->llvm_ctx), base_ptr, &offset, 1, "");
-      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, size_ptr, ptr_type, "");
-      LLVMValueRef size = LLVMBuildLoad2(ctx->builder, i32, typed_ptr, "ssbo_size");
+      LLVMValueRef offset8 = LLVMConstInt(i64, 8, false);
+      LLVMValueRef addr_plus_8 = LLVMBuildAdd(ctx->builder, desc_addr, offset8, "");
+      LLVMValueRef size_ptr = LLVMBuildIntToPtr(ctx->builder, addr_plus_8,
+         LLVMPointerType(i32, 0), "");
+      LLVMValueRef size = LLVMBuildLoad2(ctx->builder, i32, size_ptr, "ssbo_size");
       set_ssa_def(ctx, &instr->def, size);
       break;
    }
    case nir_intrinsic_load_ssbo: {
-      /* Lavapipe lowering: src[0] = 64-bit buffer base address, src[1] = byte offset */
-      LLVMValueRef base_addr = get_src(ctx, &instr->src[0]);
+      /*
+       * After lavapipe lowering, src[0] is a 64-bit address pointing to a
+       * descriptor struct: { ptr base; u32 num_elements; }
+       * We read the base pointer from the descriptor, then access base[offset].
+       */
+      LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
       LLVMValueRef byte_offset = get_src(ctx, &instr->src[1]);
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
       LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      /* Convert 64-bit integer address to pointer */
-      LLVMValueRef buf_ptr = LLVMBuildIntToPtr(ctx->builder, base_addr, ptr_type, "");
+      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+      /* Read the base pointer from the descriptor (first 8 bytes) */
+      LLVMValueRef desc_ptr = LLVMBuildIntToPtr(ctx->builder, desc_addr, ptr_ptr_type, "");
+      LLVMValueRef buf_ptr = LLVMBuildLoad2(ctx->builder, ptr_type, desc_ptr, "ssbo_base");
+      /* Access buf_ptr + byte_offset */
       LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), buf_ptr, &byte_offset, 1, "");
       unsigned bit_size = instr->def.bit_size;
@@ -273,12 +273,16 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       break;
    }
    case nir_intrinsic_store_ssbo: {
-      /* Lavapipe lowering: src[0] = data, src[1] = 64-bit buffer base address, src[2] = byte offset */
+      /* src[0] = data, src[1] = 64-bit descriptor address, src[2] = byte offset */
       LLVMValueRef data = get_src(ctx, &instr->src[0]);
-      LLVMValueRef base_addr = get_src(ctx, &instr->src[1]);
+      LLVMValueRef desc_addr = get_src(ctx, &instr->src[1]);
       LLVMValueRef byte_offset = get_src(ctx, &instr->src[2]);
       LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMValueRef buf_ptr = LLVMBuildIntToPtr(ctx->builder, base_addr, ptr_type, "");
+      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+      /* Read the base pointer from the descriptor */
+      LLVMValueRef desc_ptr = LLVMBuildIntToPtr(ctx->builder, desc_addr, ptr_ptr_type, "");
+      LLVMValueRef buf_ptr = LLVMBuildLoad2(ctx->builder, ptr_type, desc_ptr, "ssbo_base");
+      /* Access buf_ptr + byte_offset */
       LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), buf_ptr, &byte_offset, 1, "");
       LLVMTypeRef store_type = LLVMTypeOf(data);

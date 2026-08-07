@@ -5,10 +5,19 @@
 #include <cuda.h>
 #include <stdbool.h>
 
+/*
+ * IMPORTANT: The 'data' field must be at the same offset as
+ * llvmpipe_resource.data (offset 512 on 64-bit) because lavapipe's
+ * descriptor set code calls llvmpipe_resource_data() which casts to
+ * llvmpipe_resource and reads .data. We pad our struct to match.
+ */
+#define CP_RESOURCE_DATA_OFFSET 456
+
 struct cp_resource {
    struct pipe_resource base;
+   char _pad[CP_RESOURCE_DATA_OFFSET - sizeof(struct pipe_resource)];
+   void *data;                      /* MUST be at offset CP_RESOURCE_DATA_OFFSET */
    CUdeviceptr device_ptr;
-   void *data;
    uint64_t size;
    unsigned row_stride;
    unsigned layer_stride;
