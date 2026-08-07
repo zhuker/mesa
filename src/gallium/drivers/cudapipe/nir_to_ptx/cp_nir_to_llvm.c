@@ -187,6 +187,21 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       set_ssa_def(ctx, &instr->def, vec);
       break;
    }
+   case nir_intrinsic_load_local_invocation_index: {
+      /* linearIndex = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y */
+      LLVMValueRef tid_x = emit_local_invocation_id(ctx, 0);
+      LLVMValueRef tid_y = emit_local_invocation_id(ctx, 1);
+      LLVMValueRef tid_z = emit_local_invocation_id(ctx, 2);
+      uint16_t *ws = ctx->nir->info.workgroup_size;
+      LLVMValueRef bx = LLVMConstInt(i32, ws[0], false);
+      LLVMValueRef bxy = LLVMConstInt(i32, ws[0] * ws[1], false);
+      LLVMValueRef idx = LLVMBuildAdd(ctx->builder, tid_x,
+         LLVMBuildAdd(ctx->builder,
+            LLVMBuildMul(ctx->builder, tid_y, bx, ""),
+            LLVMBuildMul(ctx->builder, tid_z, bxy, ""), ""), "local_idx");
+      set_ssa_def(ctx, &instr->def, idx);
+      break;
+   }
    case nir_intrinsic_load_global_invocation_id: {
       LLVMValueRef wg_x = emit_workgroup_id(ctx, 0);
       LLVMValueRef wg_y = emit_workgroup_id(ctx, 1);
@@ -347,6 +362,40 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef reg_ptr = get_src(ctx, &instr->src[1]);
       if (reg_ptr && val)
          LLVMBuildStore(ctx->builder, val, reg_ptr);
+      break;
+   }
+   case nir_intrinsic_ssbo_atomic: {
+      /* src[0] = 64-bit descriptor address, src[1] = byte offset, src[2] = data */
+      LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
+      LLVMValueRef byte_offset = get_src(ctx, &instr->src[1]);
+      LLVMValueRef data = get_src(ctx, &instr->src[2]);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+      LLVMValueRef desc_ptr = LLVMBuildIntToPtr(ctx->builder, desc_addr, ptr_ptr_type, "");
+      LLVMValueRef buf_ptr = LLVMBuildLoad2(ctx->builder, ptr_type, desc_ptr, "ssbo_base");
+      LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
+         LLVMInt8TypeInContext(ctx->llvm_ctx), buf_ptr, &byte_offset, 1, "");
+      LLVMTypeRef val_type = LLVMTypeOf(data);
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, elem_ptr,
+         LLVMPointerType(val_type, 0), "");
+      nir_atomic_op op = nir_intrinsic_atomic_op(instr);
+      LLVMAtomicRMWBinOp llvm_op;
+      switch (op) {
+      case nir_atomic_op_iadd: llvm_op = LLVMAtomicRMWBinOpAdd; break;
+      case nir_atomic_op_iand: llvm_op = LLVMAtomicRMWBinOpAnd; break;
+      case nir_atomic_op_ior:  llvm_op = LLVMAtomicRMWBinOpOr; break;
+      case nir_atomic_op_ixor: llvm_op = LLVMAtomicRMWBinOpXor; break;
+      case nir_atomic_op_imin: llvm_op = LLVMAtomicRMWBinOpMin; break;
+      case nir_atomic_op_umin: llvm_op = LLVMAtomicRMWBinOpUMin; break;
+      case nir_atomic_op_imax: llvm_op = LLVMAtomicRMWBinOpMax; break;
+      case nir_atomic_op_umax: llvm_op = LLVMAtomicRMWBinOpUMax; break;
+      case nir_atomic_op_xchg: llvm_op = LLVMAtomicRMWBinOpXchg; break;
+      default: llvm_op = LLVMAtomicRMWBinOpAdd; break;
+      }
+      LLVMValueRef result = LLVMBuildAtomicRMW(ctx->builder, llvm_op, typed_ptr,
+         data, LLVMAtomicOrderingMonotonic, false);
+      if (nir_intrinsic_infos[instr->intrinsic].has_dest)
+         set_ssa_def(ctx, &instr->def, result);
       break;
    }
    case nir_intrinsic_barrier: {

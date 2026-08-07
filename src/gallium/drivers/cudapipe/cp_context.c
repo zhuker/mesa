@@ -71,6 +71,11 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    if (!bin || !bin->kernel)
       return;
 
+   if (info->grid[0] == 0 || info->grid[1] == 0 || info->grid[2] == 0)
+      return;
+   if (info->block[0] == 0 || info->block[1] == 0 || info->block[2] == 0)
+      return;
+
    cuCtxSetCurrent(cp->screen->cuda_ctx);
 
    /* Debug: print bound UBO/SSBO pointers */
