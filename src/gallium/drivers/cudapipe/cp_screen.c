@@ -224,7 +224,7 @@ static const struct nir_shader_compiler_options cp_nir_options = {
    .lower_to_scalar = true,
    .lower_uniforms_to_ubo = true,
    .lower_device_index_to_zero = true,
-   .support_16bit_alu = true,
+   .support_16bit_alu = false,
 };
 
 static void

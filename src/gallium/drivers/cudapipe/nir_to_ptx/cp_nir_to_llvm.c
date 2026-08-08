@@ -1081,8 +1081,10 @@ compile_module_to_ptx(LLVMModuleRef module, int sm_major, int sm_minor, size_t *
 
    LLVMMemoryBufferRef buf = NULL;
    if (LLVMTargetMachineEmitToMemoryBuffer(tm, module, LLVMAssemblyFile, &error, &buf) != 0) {
-      fprintf(stderr, "cudapipe: PTX emission failed: %s\n", error);
-      LLVMDisposeMessage(error);
+      if (error) {
+         fprintf(stderr, "cudapipe: PTX emission failed: %s\n", error);
+         LLVMDisposeMessage(error);
+      }
       LLVMDisposeTargetMachine(tm);
       return NULL;
    }
@@ -1149,14 +1151,18 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor)
    if (getenv("CUDAPIPE_DUMP_IR"))
       LLVMDumpModule(ctx.module);
 
-   /* Verify */
+   /* Verify — if invalid IR, bail out instead of crashing in PTX emission */
    char *error = NULL;
-   if (LLVMVerifyModule(ctx.module, LLVMPrintMessageAction, &error)) {
-      fprintf(stderr, "cudapipe: LLVM module verification failed:\n%s\n", error);
+   if (LLVMVerifyModule(ctx.module, LLVMReturnStatusAction, &error)) {
+      if (getenv("CUDAPIPE_DUMP_IR"))
+         fprintf(stderr, "cudapipe: LLVM module verification failed:\n%s\n", error);
       LLVMDisposeMessage(error);
-   } else {
-      LLVMDisposeMessage(error);
+      LLVMDisposeBuilder(ctx.builder);
+      LLVMDisposeModule(ctx.module);
+      LLVMContextDispose(ctx.llvm_ctx);
+      return NULL;
    }
+   LLVMDisposeMessage(error);
 
    /* Compile to PTX */
    size_t ptx_size = 0;

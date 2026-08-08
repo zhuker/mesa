@@ -71,7 +71,21 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    if (!bin || !bin->kernel)
       return;
 
-   if (info->grid[0] == 0 || info->grid[1] == 0 || info->grid[2] == 0)
+   unsigned grid[3] = { info->grid[0], info->grid[1], info->grid[2] };
+
+   /* Handle indirect dispatch — read grid from buffer */
+   if (info->indirect) {
+      struct cp_resource *ind_res = cp_resource(info->indirect);
+      void *ind_data = cp_resource_data(ind_res);
+      if (ind_data) {
+         uint32_t *dims = (uint32_t *)((char *)ind_data + info->indirect_offset);
+         grid[0] = dims[0];
+         grid[1] = dims[1];
+         grid[2] = dims[2];
+      }
+   }
+
+   if (grid[0] == 0 || grid[1] == 0 || grid[2] == 0)
       return;
    if (info->block[0] == 0 || info->block[1] == 0 || info->block[2] == 0)
       return;
@@ -102,7 +116,7 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
     *
     * This is allocated as managed memory so the GPU can access it.
     */
-   uint32_t grid_size[3] = { info->grid[0], info->grid[1], info->grid[2] };
+   uint32_t grid_size[3] = { grid[0], grid[1], grid[2] };
 
    CUdeviceptr args_dev;
    cuMemAllocManaged(&args_dev, 34 * sizeof(void *), CU_MEM_ATTACH_GLOBAL);
@@ -131,7 +145,7 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
 
    CUresult err = cuLaunchKernel(
       bin->kernel,
-      info->grid[0], info->grid[1], info->grid[2],
+      grid[0], grid[1], grid[2],
       info->block[0], info->block[1], info->block[2],
       bin->shared_size, NULL, kernel_params, NULL);
 
@@ -289,6 +303,10 @@ cp_create_compute_state(struct pipe_context *ctx,
    struct nir_shader *nir = (struct nir_shader *)state->prog;
    struct cp_shader_binary *bin = cp_compile_nir_to_ptx(nir,
       cp->screen->sm_major, cp->screen->sm_minor);
+   if (!bin) {
+      /* Return empty binary so lavapipe doesn't get NULL */
+      bin = CALLOC_STRUCT(cp_shader_binary);
+   }
    return bin;
 }
 
