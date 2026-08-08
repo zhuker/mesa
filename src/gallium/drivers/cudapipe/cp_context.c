@@ -105,7 +105,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    /* For now: read vertex positions directly from the first bound vertex buffer.
     * Assume positions are at offset 0 as float4 (x,y,z,w).
     * TODO: proper VS execution with compiled vertex shader */
-   /* Viewport: pipe_viewport_state has scale/translate, convert to x,y,w,h */
+   /* Viewport: pass raw scale/translate for proper Vulkan Y-flip handling.
+    * screen = ndc * scale + translate (where scale[1] is negative for Y-down) */
    float vp_w = fabsf(cp->viewport.scale[0]) * 2.0f;
    float vp_h = fabsf(cp->viewport.scale[1]) * 2.0f;
    float vp_x = cp->viewport.translate[0] - fabsf(cp->viewport.scale[0]);
@@ -125,15 +126,29 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .front_face = 0,
    };
 
-   /* Get vertex positions from bound vertex buffer.
-    * For now, assume the first VB has float4 positions at buffer_offset.
-    * TODO: run compiled vertex shader instead of passthrough. */
+   /* Extract positions from vertex buffer into a packed float4 array.
+    * The VB is interleaved (stride != sizeof(float4)), so we copy out positions.
+    * TODO: run compiled vertex shader instead of passthrough copy. */
+   CUdeviceptr packed_positions = 0;
    if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
       struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
       void *vb_data = cp_resource_data(vb_res);
       if (vb_data) {
-         rast_args.positions = (uint64_t)(uintptr_t)(
-            (char *)vb_data + cp->vertex_buffers[0].buffer_offset);
+         char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
+         unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
+
+         /* Allocate packed positions (float4 per vertex) */
+         cuMemAllocManaged(&packed_positions, vertex_count * 16, CU_MEM_ATTACH_GLOBAL);
+         float *dst = (float *)(uintptr_t)packed_positions;
+
+         for (unsigned v = 0; v < vertex_count; v++) {
+            float *src_pos = (float *)(vb_start + v * stride);
+            dst[v * 4 + 0] = src_pos[0];
+            dst[v * 4 + 1] = src_pos[1];
+            dst[v * 4 + 2] = src_pos[2];
+            dst[v * 4 + 3] = src_pos[3];
+         }
+         rast_args.positions = packed_positions;
       }
    }
 
@@ -142,26 +157,85 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       return;
    }
 
-   if (getenv("CUDAPIPE_DEBUG_DRAW"))
+   if (getenv("CUDAPIPE_DEBUG_DRAW")) {
       fprintf(stderr, "cudapipe: draw %u tris, positions=%p, fb=%ux%u, vp=[%.0f,%.0f,%.0f,%.0f]\n",
               num_triangles, (void*)(uintptr_t)rast_args.positions, w, h,
               rast_args.vp_x, rast_args.vp_y, rast_args.vp_w, rast_args.vp_h);
+      fprintf(stderr, "  VB[0]: offset=%u, vertex_stride=%u, num_elements=%u\n",
+              cp->vertex_buffers[0].buffer_offset, cp->vertex_stride, cp->num_vertex_elements);
+      float *vdata = (float *)(uintptr_t)rast_args.positions;
+      fprintf(stderr, "  v0: [%.3f, %.3f, %.3f, %.3f]\n", vdata[0],vdata[1],vdata[2],vdata[3]);
+      if (cp->vertex_stride > 16) {
+         float *v0_color = (float *)((char*)vdata + 16);
+         fprintf(stderr, "  v0 color: [%.3f, %.3f, %.3f, %.3f]\n", v0_color[0],v0_color[1],v0_color[2],v0_color[3]);
+      }
+   }
 
    /* Rasterize */
    void *rast_params[] = { &rast_args };
-   cuLaunchKernel(screen->kernels.rasterize_triangles,
+   CUresult rast_err = cuLaunchKernel(screen->kernels.rasterize_triangles,
       (num_triangles + 255) / 256, 1, 1, 256, 1, 1,
       0, NULL, rast_params, NULL);
+   if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
+      fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
 
-   /* Resolve */
-   uint64_t color_ptr = (uint64_t)(uintptr_t)color_data;
-   void *res_params[] = { &visbuf_ptr, &color_ptr, &vw, &vh };
-   cuLaunchKernel(screen->kernels.resolve_visbuf,
+   if (getenv("CUDAPIPE_DEBUG_DRAW")) {
+      cuCtxSynchronize();
+      uint64_t *vis = (uint64_t *)(uintptr_t)visbuf;
+      int hits = 0;
+      for (unsigned i = 0; i < w * h; i++)
+         if (vis[i] != 0xFFFFFFFFFFFFFFFFULL) hits++;
+      fprintf(stderr, "  visbuf hits: %d/%u\n", hits, w * h);
+   }
+
+   /* Resolve — interpolate vertex colors */
+   struct cp_resolve_args resolve_args = {
+      .visbuf = visbuf,
+      .positions = packed_positions,
+      .colors = 0,
+      .color_out = (uint64_t)(uintptr_t)color_data,
+      .width = w, .height = h,
+      .vp_x = vp_x, .vp_y = vp_y, .vp_w = vp_w, .vp_h = vp_h,
+      .color_stride = 16,
+   };
+
+   /* Extract per-vertex colors (float4 at offset 16 in each vertex) */
+   CUdeviceptr packed_colors = 0;
+   if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource &&
+       cp->num_vertex_elements >= 2) {
+      struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
+      void *vb_data = cp_resource_data(vb_res);
+      if (vb_data) {
+         char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
+         unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
+         unsigned color_offset = cp->vertex_elements[1].src_offset;
+
+         cuMemAllocManaged(&packed_colors, vertex_count * 16, CU_MEM_ATTACH_GLOBAL);
+         float *cdst = (float *)(uintptr_t)packed_colors;
+         for (unsigned v = 0; v < vertex_count; v++) {
+            float *src_color = (float *)(vb_start + v * stride + color_offset);
+            cdst[v * 4 + 0] = src_color[0];
+            cdst[v * 4 + 1] = src_color[1];
+            cdst[v * 4 + 2] = src_color[2];
+            cdst[v * 4 + 3] = src_color[3];
+         }
+         resolve_args.colors = packed_colors;
+      }
+   }
+
+   void *res_params[] = { &resolve_args };
+   CUresult res_err = cuLaunchKernel(screen->kernels.resolve_visbuf,
       (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
       0, NULL, res_params, NULL);
+   if (res_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
+      fprintf(stderr, "  resolve launch failed: %d\n", res_err);
 
    cuCtxSynchronize();
    cuMemFree(visbuf);
+   if (packed_positions)
+      cuMemFree(packed_positions);
+   if (packed_colors)
+      cuMemFree(packed_colors);
 }
 
 static void
@@ -335,22 +409,40 @@ cp_delete_depth_stencil_alpha_state(struct pipe_context *ctx, void *state)
    FREE(state);
 }
 
+struct cp_vertex_elements_state {
+   struct pipe_vertex_element elements[16];
+   unsigned num_elements;
+   unsigned stride;
+};
+
 static void *
 cp_create_vertex_elements_state(struct pipe_context *ctx, unsigned num_elements,
                                 const struct pipe_vertex_element *elements)
 {
-   return MALLOC(num_elements * sizeof(struct pipe_vertex_element));
+   struct cp_vertex_elements_state *state = CALLOC_STRUCT(cp_vertex_elements_state);
+   state->num_elements = num_elements;
+   memcpy(state->elements, elements, num_elements * sizeof(struct pipe_vertex_element));
+   if (num_elements > 0)
+      state->stride = elements[0].src_stride;
+   return state;
 }
 
 static void
 cp_bind_vertex_elements_state(struct pipe_context *ctx, void *state)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
+   if (state) {
+      struct cp_vertex_elements_state *ve = (struct cp_vertex_elements_state *)state;
+      memcpy(cp->vertex_elements, ve->elements, ve->num_elements * sizeof(struct pipe_vertex_element));
+      cp->num_vertex_elements = ve->num_elements;
+      cp->vertex_stride = ve->stride;
+   }
 }
 
 static void
 cp_delete_vertex_elements_state(struct pipe_context *ctx, void *state)
 {
-   FREE(state);
+   FREE(state);  /* frees cp_vertex_elements_state */
 }
 
 static void *

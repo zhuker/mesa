@@ -68,4 +68,14 @@ struct cp_rasterize_args {
    uint32_t front_face;     /* 0=CCW, 1=CW */
 };
 
+struct cp_resolve_args {
+   uint64_t visbuf;
+   uint64_t positions;
+   uint64_t colors;
+   uint64_t color_out;
+   uint32_t width, height;
+   float vp_x, vp_y, vp_w, vp_h;
+   uint32_t color_stride;
+};
+
 #endif /* CP_RAST_TYPES_H */

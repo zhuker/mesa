@@ -31,7 +31,7 @@ compile_cuda_source(const char *source, const char *name, int sm_major, int sm_m
    const char *opts[] = {
       arch_opt,
       "--std=c++14",
-      "-I/home/coder/git/mesa/src/gallium/drivers/cudapipe",
+      "-I/home/coder/git/mesa/src/gallium/drivers/cudapipe/kernels",
    };
 
    res = nvrtcCompileProgram(prog, 3, opts);

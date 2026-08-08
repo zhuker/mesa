@@ -128,24 +128,70 @@ cp_clear_visbuf(uint64_t *visbuf, uint32_t width, uint32_t height)
       visbuf[y * width + x] = VISBUF_EMPTY;
 }
 
-/*
- * Resolve: read visibility buffer, output flat white for any hit pixel.
- * TODO: call compiled fragment shader, interpolate varyings.
- */
+/* cp_resolve_args is defined in cp_rast_types.h */
+
 extern "C" __global__ void
-cp_resolve_visbuf(uint64_t *visbuf, uint32_t *color_out,
-                  uint32_t width, uint32_t height)
+cp_resolve_visbuf(struct cp_resolve_args args)
 {
    uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
    uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-   if (x >= width || y >= height)
+   if (x >= args.width || y >= args.height)
       return;
 
-   uint64_t entry = visbuf[y * width + x];
+   uint64_t *visbuf = (uint64_t *)(uintptr_t)args.visbuf;
+   uint32_t *color_out = (uint32_t *)(uintptr_t)args.color_out;
+   float4 *positions = (float4 *)(uintptr_t)args.positions;
+
+   uint64_t entry = visbuf[y * args.width + x];
    if (entry == VISBUF_EMPTY) {
-      color_out[y * width + x] = 0xFF000000; /* black, opaque */
-   } else {
-      /* For now, output white for any triangle hit */
-      color_out[y * width + x] = 0xFFFFFFFF; /* white, opaque */
+      /* Keep existing color (from clear) */
+      return;
    }
+
+   uint32_t tri_id = VISBUF_TRIID(entry);
+
+   /* Re-fetch triangle vertices */
+   float4 v0 = positions[tri_id * 3 + 0];
+   float4 v1 = positions[tri_id * 3 + 1];
+   float4 v2 = positions[tri_id * 3 + 2];
+
+   /* Recompute screen positions */
+   float sx0 = (v0.x / v0.w * 0.5f + 0.5f) * args.vp_w + args.vp_x;
+   float sy0 = (v0.y / v0.w * 0.5f + 0.5f) * args.vp_h + args.vp_y;
+   float sx1 = (v1.x / v1.w * 0.5f + 0.5f) * args.vp_w + args.vp_x;
+   float sy1 = (v1.y / v1.w * 0.5f + 0.5f) * args.vp_h + args.vp_y;
+   float sx2 = (v2.x / v2.w * 0.5f + 0.5f) * args.vp_w + args.vp_x;
+   float sy2 = (v2.y / v2.w * 0.5f + 0.5f) * args.vp_h + args.vp_y;
+
+   /* Recompute barycentrics */
+   float cx = (float)x + 0.5f;
+   float cy = (float)y + 0.5f;
+   float area = edge_function(sx0, sy0, sx1, sy1, sx2, sy2);
+   float inv_area = 1.0f / area;
+   float w0 = edge_function(sx1, sy1, sx2, sy2, cx, cy) * inv_area;
+   float w1 = edge_function(sx2, sy2, sx0, sy0, cx, cy) * inv_area;
+   float w2 = 1.0f - w0 - w1;
+
+   /* Interpolate vertex colors */
+   float r, g, b, a;
+   if (args.colors) {
+      uint8_t *color_base = (uint8_t *)(uintptr_t)args.colors;
+      uint32_t cs = args.color_stride;
+      float4 *c0 = (float4 *)(color_base + (tri_id * 3 + 0) * cs);
+      float4 *c1 = (float4 *)(color_base + (tri_id * 3 + 1) * cs);
+      float4 *c2 = (float4 *)(color_base + (tri_id * 3 + 2) * cs);
+      r = w0 * c0->x + w1 * c1->x + w2 * c2->x;
+      g = w0 * c0->y + w1 * c1->y + w2 * c2->y;
+      b = w0 * c0->z + w1 * c1->z + w2 * c2->z;
+      a = w0 * c0->w + w1 * c1->w + w2 * c2->w;
+   } else {
+      r = g = b = a = 1.0f;
+   }
+
+   /* Clamp and pack RGBA8 */
+   uint32_t ri = (uint32_t)(fminf(fmaxf(r, 0.0f), 1.0f) * 255.0f + 0.5f);
+   uint32_t gi = (uint32_t)(fminf(fmaxf(g, 0.0f), 1.0f) * 255.0f + 0.5f);
+   uint32_t bi = (uint32_t)(fminf(fmaxf(b, 0.0f), 1.0f) * 255.0f + 0.5f);
+   uint32_t ai = (uint32_t)(fminf(fmaxf(a, 0.0f), 1.0f) * 255.0f + 0.5f);
+   color_out[y * args.width + x] = ri | (gi << 8) | (bi << 16) | (ai << 24);
 }
