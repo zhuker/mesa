@@ -198,6 +198,67 @@ cp_clear_buffer(struct pipe_context *ctx, struct pipe_resource *res,
 }
 
 static void
+cp_clear_render_target(struct pipe_context *ctx, struct pipe_surface *dst,
+                       const union pipe_color_union *color,
+                       unsigned dstx, unsigned dsty,
+                       unsigned width, unsigned height,
+                       bool render_condition_enabled)
+{
+   if (!dst || !dst->texture)
+      return;
+   struct cp_resource *res = cp_resource(dst->texture);
+   void *data = cp_resource_data(res);
+   if (!data)
+      return;
+
+   unsigned pixel_size = util_format_get_blocksize(dst->format);
+   unsigned stride = res->lpr.row_stride[dst->level];
+
+   uint32_t clear_val[4] = {0};
+   util_format_pack_rgba(dst->format, clear_val, color, 1);
+
+   for (unsigned y = dsty; y < dsty + height; y++) {
+      char *row = (char *)data + y * stride + dstx * pixel_size;
+      for (unsigned x = 0; x < width; x++)
+         memcpy(row + x * pixel_size, clear_val, pixel_size);
+   }
+}
+
+static void
+cp_clear_depth_stencil(struct pipe_context *ctx, struct pipe_surface *dst,
+                       unsigned clear_flags, double depth, unsigned stencil,
+                       unsigned dstx, unsigned dsty,
+                       unsigned width, unsigned height,
+                       bool render_condition_enabled)
+{
+   if (!dst || !dst->texture)
+      return;
+   struct cp_resource *res = cp_resource(dst->texture);
+   void *data = cp_resource_data(res);
+   if (!data)
+      return;
+
+   unsigned pixel_size = util_format_get_blocksize(dst->format);
+   unsigned stride = res->lpr.row_stride[dst->level];
+
+   uint32_t clear_val = 0;
+   if (clear_flags & PIPE_CLEAR_DEPTH) {
+      if (pixel_size == 4) {
+         float f = (float)depth;
+         memcpy(&clear_val, &f, 4);
+      } else {
+         clear_val = (uint32_t)(depth * 65535.0);
+      }
+   }
+
+   for (unsigned y = dsty; y < dsty + height; y++) {
+      char *row = (char *)data + y * stride + dstx * pixel_size;
+      for (unsigned x = 0; x < width; x++)
+         memcpy(row + x * pixel_size, &clear_val, pixel_size);
+   }
+}
+
+static void
 cp_clear_texture(struct pipe_context *ctx, struct pipe_resource *res,
                  unsigned level, const struct pipe_box *box, const void *data)
 {
@@ -232,6 +293,11 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
    struct pipe_framebuffer_state *fb = &cp_ctx->framebuffer;
 
    cuCtxSetCurrent(screen->cuda_ctx);
+
+   if (getenv("CUDAPIPE_DEBUG_DRAW"))
+      fprintf(stderr, "cudapipe: clear buffers=0x%x color=[%.2f,%.2f,%.2f,%.2f]\n",
+              buffers, color ? color->f[0] : 0, color ? color->f[1] : 0,
+              color ? color->f[2] : 0, color ? color->f[3] : 0);
 
    /* Clear color attachments */
    if ((buffers & PIPE_CLEAR_COLOR) && color && screen->kernels.clear_kernel) {
@@ -400,4 +466,6 @@ cudapipe_init_context_resource_funcs(struct pipe_context *ctx)
    ctx->clear = cp_clear;
    ctx->clear_buffer = cp_clear_buffer;
    ctx->clear_texture = cp_clear_texture;
+   ctx->clear_render_target = cp_clear_render_target;
+   ctx->clear_depth_stencil = cp_clear_depth_stencil;
 }

@@ -158,8 +158,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    }
 
    if (getenv("CUDAPIPE_DEBUG_DRAW")) {
-      fprintf(stderr, "cudapipe: draw %u tris, fb=%ux%u, vp=[%.0f,%.0f,%.0f,%.0f]\n",
-              num_triangles, w, h, vp_x, vp_y, vp_w, vp_h);
+      fprintf(stderr, "cudapipe: draw %u tris, fb=%ux%u, vp=[%.0f,%.0f,%.0f,%.0f] stride=%u\n",
+              num_triangles, w, h, vp_x, vp_y, vp_w, vp_h, cp->vertex_stride);
+      for (unsigned e = 0; e < cp->num_vertex_elements && e < 4; e++)
+         fprintf(stderr, "  elem[%u]: offset=%u fmt=%u vb=%u\n", e,
+                 cp->vertex_elements[e].src_offset, cp->vertex_elements[e].src_format,
+                 cp->vertex_elements[e].vertex_buffer_index);
    }
 
    /* Rasterize */
@@ -204,6 +208,17 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             cdst[v * 4 + 3] = src_color[3];
          }
          resolve_args.colors = packed_colors;
+         if (getenv("CUDAPIPE_DEBUG_DRAW")) {
+            float *c = (float*)(uintptr_t)packed_colors;
+            fprintf(stderr, "  packed colors: v0=[%.2f,%.2f,%.2f,%.2f] v1=[%.2f,%.2f,%.2f,%.2f] v2=[%.2f,%.2f,%.2f,%.2f]\n",
+                    c[0],c[1],c[2],c[3], c[4],c[5],c[6],c[7], c[8],c[9],c[10],c[11]);
+            /* Raw VB color data */
+            float *raw0 = (float*)(vb_start + 0*stride + color_offset);
+            float *raw1 = (float*)(vb_start + 1*stride + color_offset);
+            float *raw2 = (float*)(vb_start + 2*stride + color_offset);
+            fprintf(stderr, "  raw colors: v0=[%.2f,%.2f,%.2f,%.2f] v1=[%.2f,%.2f,%.2f,%.2f] v2=[%.2f,%.2f,%.2f,%.2f]\n",
+                    raw0[0],raw0[1],raw0[2],raw0[3], raw1[0],raw1[1],raw1[2],raw1[3], raw2[0],raw2[1],raw2[2],raw2[3]);
+         }
       }
    }
 
