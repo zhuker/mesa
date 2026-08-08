@@ -466,6 +466,22 @@ cp_set_polygon_stipple(struct pipe_context *ctx,
 {
 }
 
+static void
+cp_set_sample_locations(struct pipe_context *ctx, size_t size, const uint8_t *locations)
+{
+}
+
+static void
+cp_set_min_samples(struct pipe_context *ctx, unsigned min_samples)
+{
+}
+
+static void
+cp_render_condition(struct pipe_context *ctx, struct pipe_query *query,
+                    bool condition, enum pipe_render_cond_flag mode)
+{
+}
+
 struct cp_texture_handle {
    void *functions;
    uint32_t sampler_index;
@@ -580,6 +596,9 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.set_clip_state = cp_set_clip_state;
    ctx->base.set_polygon_stipple = cp_set_polygon_stipple;
    ctx->base.buffer_subdata = cp_buffer_subdata;
+   ctx->base.set_sample_locations = cp_set_sample_locations;
+   ctx->base.set_min_samples = cp_set_min_samples;
+   ctx->base.render_condition = cp_render_condition;
    ctx->base.create_texture_handle = cp_create_texture_handle;
    ctx->base.create_image_handle = cp_create_image_handle;
    ctx->base.delete_texture_handle = cp_delete_texture_handle;

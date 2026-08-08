@@ -1,5 +1,7 @@
 #include "cp_screen.h"
+#include "cp_context.h"
 #include "cp_resource.h"
+#include "kernels/cp_rast_types.h"
 
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
@@ -7,7 +9,9 @@
 #include "util/u_memory.h"
 #include "util/u_inlines.h"
 #include "util/u_transfer_helper.h"
+#include "util/u_surface.h"
 #include "util/format/u_format.h"
+#include "util/format/u_format_pack.h"
 
 #include <cuda.h>
 #include <string.h>
@@ -169,13 +173,115 @@ cp_clear_buffer(struct pipe_context *ctx, struct pipe_resource *res,
 }
 
 static void
+cp_clear_texture(struct pipe_context *ctx, struct pipe_resource *res,
+                 unsigned level, const struct pipe_box *box, const void *data)
+{
+   struct cp_resource *cp_res = cp_resource(res);
+   void *tex_data = cp_resource_data(cp_res);
+   if (!tex_data)
+      return;
+
+   unsigned pixel_size = util_format_get_blocksize(res->format);
+   unsigned stride = cp_res->lpr.row_stride[level];
+   unsigned img_stride = cp_res->lpr.img_stride[level];
+
+   for (int z = box->z; z < box->z + box->depth; z++) {
+      for (int y = box->y; y < box->y + box->height; y++) {
+         char *row = (char *)tex_data + z * img_stride + y * stride + box->x * pixel_size;
+         for (int x = 0; x < box->width; x++) {
+            memcpy(row + x * pixel_size, data, pixel_size);
+         }
+      }
+   }
+}
+
+static void
 cp_clear(struct pipe_context *ctx, unsigned buffers,
          uint32_t color_clear_mask, uint8_t stencil_clear_mask,
          const struct pipe_scissor_state *scissor,
          const union pipe_color_union *color, double depth,
          unsigned stencil)
 {
-   /* TODO: Phase 3 - clear kernel */
+   struct cp_context *cp_ctx = (struct cp_context *)ctx;
+   struct cp_screen *screen = cp_ctx->screen;
+   struct pipe_framebuffer_state *fb = &cp_ctx->framebuffer;
+
+   cuCtxSetCurrent(screen->cuda_ctx);
+
+   /* Clear color attachments */
+   if ((buffers & PIPE_CLEAR_COLOR) && color && screen->kernels.clear_kernel) {
+      for (unsigned i = 0; i < fb->nr_cbufs; i++) {
+         if (!(color_clear_mask & (1 << i)))
+            continue;
+
+         struct pipe_surface *surf = &fb->cbufs[i];
+         if (!surf->texture)
+            continue;
+
+         struct cp_resource *res = cp_resource(surf->texture);
+         void *data = cp_resource_data(res);
+         if (!data)
+            continue;
+
+         unsigned w = fb->width;
+         unsigned h = fb->height;
+         unsigned pixel_size = util_format_get_blocksize(surf->format);
+         unsigned stride = res->lpr.row_stride[surf->level];
+
+         struct cp_clear_args args = {
+            .target = (uint64_t)(uintptr_t)data,
+            .width = w, .height = h,
+            .stride = stride,
+            .pixel_size = pixel_size,
+         };
+
+         /* Pack clear color */
+         union pipe_color_union clamped = *color;
+         util_format_pack_rgba(surf->format, args.clear_value, &clamped, 1);
+
+         void *params[] = { &args };
+         cuLaunchKernel(screen->kernels.clear_kernel,
+            (w + 15) / 16, (h + 15) / 16, 1,
+            16, 16, 1,
+            0, NULL, params, NULL);
+      }
+   }
+
+   /* Clear depth */
+   if ((buffers & PIPE_CLEAR_DEPTH) && fb->zsbuf.texture && screen->kernels.clear_depth_kernel) {
+      struct pipe_surface *surf = &fb->zsbuf;
+      struct cp_resource *res = cp_resource(surf->texture);
+      void *data = cp_resource_data(res);
+      if (data) {
+         unsigned w = fb->width;
+         unsigned h = fb->height;
+         unsigned pixel_size = util_format_get_blocksize(surf->format);
+         unsigned stride = res->lpr.row_stride[surf->level];
+
+         struct cp_clear_args args = {
+            .target = (uint64_t)(uintptr_t)data,
+            .width = w, .height = h,
+            .stride = stride,
+            .pixel_size = pixel_size,
+         };
+
+         /* Pack depth as appropriate format */
+         if (pixel_size == 4) {
+            float f = (float)depth;
+            memcpy(&args.clear_value[0], &f, 4);
+         } else if (pixel_size == 2) {
+            args.clear_value[0] = (uint32_t)(depth * 65535.0);
+         }
+
+         void *params[] = { &args };
+         cuLaunchKernel(screen->kernels.clear_depth_kernel,
+            (w + 15) / 16, (h + 15) / 16, 1,
+            16, 16, 1,
+            0, NULL, params, NULL);
+      }
+   }
+
+   cuCtxSynchronize();
 }
 
 static struct pipe_memory_allocation *
@@ -218,6 +324,31 @@ cp_resource_bind_backing(struct pipe_screen *screen, struct pipe_resource *pt,
    return true;
 }
 
+static bool
+cp_resource_get_param(struct pipe_screen *screen, struct pipe_context *context,
+                      struct pipe_resource *resource, unsigned plane,
+                      unsigned layer, unsigned level,
+                      enum pipe_resource_param param, unsigned handle_usage,
+                      uint64_t *value)
+{
+   struct cp_resource *res = cp_resource(resource);
+
+   switch (param) {
+   case PIPE_RESOURCE_PARAM_STRIDE:
+      *value = res->lpr.row_stride[level];
+      return true;
+   case PIPE_RESOURCE_PARAM_OFFSET:
+      *value = res->lpr.mip_offsets[level] + layer * res->lpr.img_stride[level];
+      return true;
+   case PIPE_RESOURCE_PARAM_LAYER_STRIDE:
+      *value = res->lpr.img_stride[level];
+      return true;
+   default:
+      *value = 0;
+      return false;
+   }
+}
+
 void
 cudapipe_init_screen_resource_funcs(struct pipe_screen *screen)
 {
@@ -227,6 +358,7 @@ cudapipe_init_screen_resource_funcs(struct pipe_screen *screen)
    screen->allocate_memory = cp_allocate_memory;
    screen->free_memory = cp_free_memory;
    screen->resource_bind_backing = cp_resource_bind_backing;
+   screen->resource_get_param = cp_resource_get_param;
    screen->map_memory = cp_map_memory;
    screen->unmap_memory = cp_unmap_memory;
 }
@@ -242,4 +374,5 @@ cudapipe_init_context_resource_funcs(struct pipe_context *ctx)
    ctx->blit = cp_blit;
    ctx->clear = cp_clear;
    ctx->clear_buffer = cp_clear_buffer;
+   ctx->clear_texture = cp_clear_texture;
 }
