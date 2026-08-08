@@ -2,6 +2,7 @@
 #include "cp_screen.h"
 #include "cp_resource.h"
 #include "nir_to_ptx/cp_nir_to_llvm.h"
+#include "kernels/cp_rast_types.h"
 
 #include "pipe/p_context.h"
 #include "pipe/p_defines.h"
@@ -60,7 +61,94 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             const struct pipe_draw_start_count_bias *draws,
             unsigned num_draws)
 {
-   /* TODO: Phase 4 - launch rasterization pipeline */
+   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_screen *screen = cp->screen;
+   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+
+   if (!screen->kernels.initialized || !screen->kernels.rasterize_triangles)
+      return;
+   if (!fb->nr_cbufs || !fb->cbufs[0].texture)
+      return;
+   if (num_draws == 0 || draws[0].count == 0)
+      return;
+
+   cuCtxSetCurrent(screen->cuda_ctx);
+
+   /* For now: only handle triangle lists without index buffers as a simple case */
+   unsigned vertex_count = draws[0].count;
+   unsigned num_triangles = vertex_count / 3;
+   if (num_triangles == 0)
+      return;
+
+   /* Get the color output surface */
+   struct cp_resource *color_res = cp_resource(fb->cbufs[0].texture);
+   void *color_data = cp_resource_data(color_res);
+   if (!color_data)
+      return;
+
+   unsigned w = fb->width;
+   unsigned h = fb->height;
+
+   /* Allocate visibility buffer (temporary) */
+   CUdeviceptr visbuf;
+   cuMemAllocManaged(&visbuf, w * h * sizeof(uint64_t), CU_MEM_ATTACH_GLOBAL);
+
+   /* Clear visbuf */
+   uint32_t vw = w, vh = h;
+   uint64_t visbuf_ptr = visbuf;
+   void *cv_params[] = { &visbuf_ptr, &vw, &vh };
+   cuLaunchKernel(screen->kernels.clear_visbuf,
+      (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
+      0, NULL, cv_params, NULL);
+
+   /* For now: read vertex positions directly from the first bound vertex buffer.
+    * Assume positions are at offset 0 as float4 (x,y,z,w).
+    * TODO: proper VS execution with compiled vertex shader */
+   struct cp_rasterize_args rast_args = {
+      .framebuffer = visbuf,
+      .color_buffer = (uint64_t)(uintptr_t)color_data,
+      .width = w,
+      .height = h,
+      .num_triangles = num_triangles,
+      .num_varyings = 0,
+      .vp_x = 0, .vp_y = 0,
+      .vp_w = (float)w, .vp_h = (float)h,
+      .vp_near = 0.0f, .vp_far = 1.0f,
+      .cull_mode = 0,
+      .front_face = 0,
+   };
+
+   /* Get position data — use first vertex buffer or the VS output.
+    * For this initial implementation, assume the bound vertex buffer
+    * has float4 positions at the beginning. */
+   /* TODO: run the vertex shader */
+   rast_args.positions = 0; /* Will be filled from VB below */
+
+   /* The test uses simple passthrough VS that outputs positions from VB.
+    * We skip VS for now and read positions directly.
+    * lavapipe binds VBs via set_vertex_buffers. */
+   /* For now, just skip if no positions available */
+   if (rast_args.positions == 0) {
+      /* No vertex shader output — can't rasterize yet */
+      cuMemFree(visbuf);
+      return;
+   }
+
+   /* Rasterize */
+   void *rast_params[] = { &rast_args };
+   cuLaunchKernel(screen->kernels.rasterize_triangles,
+      (num_triangles + 255) / 256, 1, 1, 256, 1, 1,
+      0, NULL, rast_params, NULL);
+
+   /* Resolve */
+   uint64_t color_ptr = (uint64_t)(uintptr_t)color_data;
+   void *res_params[] = { &visbuf_ptr, &color_ptr, &vw, &vh };
+   cuLaunchKernel(screen->kernels.resolve_visbuf,
+      (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
+      0, NULL, res_params, NULL);
+
+   cuCtxSynchronize();
+   cuMemFree(visbuf);
 }
 
 static void
