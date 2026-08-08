@@ -2,6 +2,7 @@
 #include "cp_screen.h"
 #include "cp_resource.h"
 #include "nir_to_ptx/cp_nir_to_llvm.h"
+#include "compiler/nir/nir.h"
 #include "kernels/cp_rast_types.h"
 
 #include "pipe/p_context.h"
@@ -597,7 +598,10 @@ static void *
 cp_create_fs_state(struct pipe_context *ctx,
                    const struct pipe_shader_state *state)
 {
-   /* TODO: Phase 4 - NIR -> PTX device function */
+   if (state->type == PIPE_SHADER_IR_NIR && getenv("CUDAPIPE_DUMP_NIR")) {
+      fprintf(stderr, "=== FS NIR ===\n");
+      nir_print_shader((struct nir_shader*)state->ir.nir, stderr);
+   }
    return MALLOC(1);
 }
 
@@ -616,7 +620,11 @@ static void *
 cp_create_vs_state(struct pipe_context *ctx,
                    const struct pipe_shader_state *state)
 {
-   /* TODO: Phase 4 - NIR -> PTX device function */
+   if (state->type == PIPE_SHADER_IR_NIR && getenv("CUDAPIPE_DUMP_NIR")) {
+      fprintf(stderr, "=== VS NIR ===\n");
+      nir_print_shader((struct nir_shader*)state->ir.nir, stderr);
+   }
+   /* TODO: compile VS to CUDA kernel for proper vertex transformation */
    return MALLOC(1);
 }
 
