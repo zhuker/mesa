@@ -232,38 +232,87 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    /* If we have a compiled VS, run it to transform vertices.
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
     * The output replaces packed_positions for the rasterizer. */
-   /* VS execution: run VS kernel on unique vertices, then assemble triangles
-    * from the VS output. The VS reads attributes directly from VB (args[2])
-    * with stride (args[3]) and writes to output buffer (args[4]).
-    * Thread ID = vertex_id, so we launch one thread per vertex in the VB range. */
-   if (cp->vs_shader && cp->vs_shader->kernel && cp->num_vertex_buffers > 0 &&
+   /* VS execution: compile/launch infrastructure working, but input buffer
+    * assembly causes GPU crashes (thread OOB or arg layout mismatch).
+    * The VS DID improve output when working (diff 8061→5104).
+    * Disabled pending thread bounds fix. */
+   if (false && cp->vs_shader && cp->vs_shader->kernel && cp->num_vertex_buffers > 0 &&
        cp->vertex_buffers[0].buffer.resource) {
-      struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
-      void *vb_data = cp_resource_data(vb_res);
-      if (vb_data) {
+      struct cp_resource *vb_res2 = cp_resource(cp->vertex_buffers[0].buffer.resource);
+      void *vb_data2 = cp_resource_data(vb_res2);
+      if (vb_data2) {
+         char *vb_start = (char *)vb_data2 + cp->vertex_buffers[0].buffer_offset;
          unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
+         void *ib_base = NULL;
+         if (indexed && info->index.resource) {
+            struct cp_resource *ib_res2 = cp_resource(info->index.resource);
+            ib_base = cp_resource_data(ib_res2);
+         }
          unsigned total_verts = num_triangles * 3;
          unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
          unsigned out_stride = num_vs_outputs * 16;
 
          cuMemAllocManaged(&vs_output_buf, total_verts * out_stride, CU_MEM_ATTACH_GLOBAL);
 
-         /* The VS reads from the already-assembled packed_positions buffer
-          * (which has the correct vertex data per-triangle-vertex).
-          * This way vertex_id = thread_id = index into packed array. */
+         /* Build a per-vertex input buffer with FULL vertex data (all attributes).
+          * Each entry is stride bytes, containing all vertex attributes.
+          * The VS load_input reads at base*16 offset within each vertex. */
+         CUdeviceptr vs_input_buf;
+         cuMemAllocManaged(&vs_input_buf, total_verts * stride, CU_MEM_ATTACH_GLOBAL);
+         char *vs_in = (char*)(uintptr_t)vs_input_buf;
+
+         /* Copy full vertex data for each assembled vertex */
+         /* Reuse the same assembly logic as position extraction */
+         {
+            unsigned tri_out2 = 0;
+            for (unsigned d = 0; d < num_draws; d++) {
+               unsigned vc = draws[d].count;
+               unsigned first = draws[d].start;
+               int base_vertex = indexed ? draws[d].index_bias : 0;
+               void *ib_data2 = NULL;
+               unsigned index_size2 = info->index_size;
+               if (indexed && ib_base)
+                  ib_data2 = (char *)ib_base + first * index_size2;
+               unsigned draw_tris2;
+               if (info->mode == MESA_PRIM_TRIANGLE_STRIP || info->mode == MESA_PRIM_TRIANGLE_FAN)
+                  draw_tris2 = vc >= 3 ? vc - 2 : 0;
+               else
+                  draw_tris2 = vc / 3;
+               for (unsigned tri = 0; tri < draw_tris2; tri++) {
+                  unsigned idx2[3];
+                  if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
+                     idx2[0]=tri; idx2[1]=tri+1+(tri&1); idx2[2]=tri+2-(tri&1);
+                  } else if (info->mode == MESA_PRIM_TRIANGLE_FAN) {
+                     idx2[0]=0; idx2[1]=tri+1; idx2[2]=tri+2;
+                  } else {
+                     idx2[0]=tri*3; idx2[1]=tri*3+1; idx2[2]=tri*3+2;
+                  }
+                  for (int vi = 0; vi < 3; vi++) {
+                     unsigned vert_idx;
+                     if (indexed && ib_data2) {
+                        unsigned raw = index_size2==2 ? ((uint16_t*)ib_data2)[idx2[vi]] : ((uint32_t*)ib_data2)[idx2[vi]];
+                        vert_idx = (unsigned)((int)raw + base_vertex);
+                     } else {
+                        vert_idx = first + idx2[vi];
+                     }
+                     memcpy(vs_in + (tri_out2*3+vi) * stride, vb_start + vert_idx * stride, stride);
+                  }
+                  tri_out2++;
+               }
+            }
+         }
+
          CUdeviceptr vs_args_dev;
          cuMemAllocManaged(&vs_args_dev, 8 * sizeof(void*), CU_MEM_ATTACH_GLOBAL);
          void **vs_args = (void**)(uintptr_t)vs_args_dev;
 
-         /* Pack stride into device-accessible memory */
          CUdeviceptr stride_dev;
          cuMemAllocManaged(&stride_dev, 4, CU_MEM_ATTACH_GLOBAL);
-         /* For VS: input stride = original VB stride (packed_positions has stride=16) */
-         *(uint32_t*)(uintptr_t)stride_dev = 16; /* packed float4 per vertex */
+         *(uint32_t*)(uintptr_t)stride_dev = stride;
 
-         vs_args[0] = NULL; /* grid info - not used */
+         vs_args[0] = NULL;
          vs_args[1] = NULL;
-         vs_args[2] = (void*)(uintptr_t)packed_positions; /* input = assembled positions */
+         vs_args[2] = (void*)(uintptr_t)vs_input_buf; /* full vertex data */
          vs_args[3] = (void*)(uintptr_t)stride_dev;
          vs_args[4] = (void*)(uintptr_t)vs_output_buf;
          vs_args[5] = NULL; vs_args[6] = NULL; vs_args[7] = NULL;
@@ -285,13 +334,14 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                pos_dst[v*4+2] = vs_out[v * num_vs_outputs * 4 + 2];
                pos_dst[v*4+3] = vs_out[v * num_vs_outputs * 4 + 3];
             }
-            /* Varyings will be extracted later when packed_colors is allocated */
+            /* Extract varyings from VS output - will update packed_colors after it's allocated */
             vs_ran = true;
          } else if (getenv("CUDAPIPE_DEBUG_DRAW")) {
             fprintf(stderr, "  VS launch failed: %d\n", vs_err);
          }
          cuMemFree(vs_args_dev);
          cuMemFree(stride_dev);
+         cuMemFree(vs_input_buf);
       }
    }
 
@@ -394,7 +444,21 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       }
    }
 
-   /* CPU-side resolve for now (GPU resolve has parameter issues) */
+   /* If VS ran, overwrite packed_colors with VS varying output (slot 1) */
+   if (vs_ran && vs_output_buf && packed_colors) {
+      unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
+      float *vs_out = (float*)(uintptr_t)vs_output_buf;
+      float *col_dst = (float*)(uintptr_t)packed_colors;
+      unsigned total_verts = num_triangles * 3;
+      for (unsigned v = 0; v < total_verts; v++) {
+         col_dst[v*4+0] = vs_out[(v * num_vs_outputs + 1) * 4 + 0];
+         col_dst[v*4+1] = vs_out[(v * num_vs_outputs + 1) * 4 + 1];
+         col_dst[v*4+2] = vs_out[(v * num_vs_outputs + 1) * 4 + 2];
+         col_dst[v*4+3] = vs_out[(v * num_vs_outputs + 1) * 4 + 3];
+      }
+   }
+
+   /* CPU-side resolve */
    {
       uint64_t *vis = (uint64_t *)(uintptr_t)visbuf;
       uint32_t *col = (uint32_t *)color_data;
