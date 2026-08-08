@@ -76,18 +76,22 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    cuCtxSetCurrent(screen->cuda_ctx);
 
-   unsigned vertex_count = draws[0].count;
-   unsigned first_vertex = draws[0].start;
-   unsigned num_triangles;
-
-   /* Handle indexed draws */
    bool indexed = info->index_size > 0;
-   if (info->mode == MESA_PRIM_TRIANGLE_STRIP)
-      num_triangles = vertex_count >= 3 ? vertex_count - 2 : 0;
-   else
-      num_triangles = vertex_count / 3;
-   if (num_triangles == 0)
+
+   /* Count total triangles across all draws */
+   unsigned total_triangles = 0;
+   for (unsigned d = 0; d < num_draws; d++) {
+      unsigned vc = draws[d].count;
+      if (info->mode == MESA_PRIM_TRIANGLE_STRIP)
+         total_triangles += vc >= 3 ? vc - 2 : 0;
+      else if (info->mode == MESA_PRIM_TRIANGLE_FAN)
+         total_triangles += vc >= 3 ? vc - 2 : 0;
+      else
+         total_triangles += vc / 3;
+   }
+   if (total_triangles == 0)
       return;
+   unsigned num_triangles = total_triangles;
 
    /* Get the color output surface */
    struct cp_resource *color_res = cp_resource(fb->cbufs[0].texture);
@@ -135,7 +139,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    };
 
    /* Extract positions from vertex buffer into packed float4 array (3 per triangle).
-    * Handles indexed draws and triangle strips.
+    * Handles indexed draws, triangle strips/fans, and multi-draw.
     * TODO: run compiled vertex shader instead of passthrough copy. */
    CUdeviceptr packed_positions = 0;
    if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
@@ -144,48 +148,68 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       if (vb_data) {
          char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
          unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
-
-         /* Get index buffer if indexed */
-         void *ib_data = NULL;
          unsigned index_size = info->index_size;
+
+         void *ib_base = NULL;
          if (indexed && info->index.resource) {
             struct cp_resource *ib_res = cp_resource(info->index.resource);
-            ib_data = cp_resource_data(ib_res);
-            if (ib_data)
-               ib_data = (char *)ib_data + draws[0].start * index_size;
+            ib_base = cp_resource_data(ib_res);
          }
 
-         /* Allocate packed positions (3 float4 per triangle) */
          cuMemAllocManaged(&packed_positions, num_triangles * 3 * 16, CU_MEM_ATTACH_GLOBAL);
          float *dst = (float *)(uintptr_t)packed_positions;
+         unsigned tri_out = 0;
 
-         for (unsigned tri = 0; tri < num_triangles; tri++) {
-            unsigned idx[3];
-            if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
-               idx[0] = tri;
-               idx[1] = tri + 1 + (tri & 1);
-               idx[2] = tri + 2 - (tri & 1);
-            } else {
-               idx[0] = tri * 3 + 0;
-               idx[1] = tri * 3 + 1;
-               idx[2] = tri * 3 + 2;
-            }
+         for (unsigned d = 0; d < num_draws; d++) {
+            unsigned vc = draws[d].count;
+            unsigned first = draws[d].start;
+            int base_vertex = indexed ? draws[d].index_bias : 0;
 
-            for (int vi = 0; vi < 3; vi++) {
-               unsigned vert_idx;
-               if (indexed && ib_data) {
-                  if (index_size == 2)
-                     vert_idx = ((uint16_t *)ib_data)[idx[vi]];
-                  else
-                     vert_idx = ((uint32_t *)ib_data)[idx[vi]];
+            void *ib_data = NULL;
+            if (indexed && ib_base)
+               ib_data = (char *)ib_base + first * index_size;
+
+            unsigned draw_tris;
+            if (info->mode == MESA_PRIM_TRIANGLE_STRIP || info->mode == MESA_PRIM_TRIANGLE_FAN)
+               draw_tris = vc >= 3 ? vc - 2 : 0;
+            else
+               draw_tris = vc / 3;
+
+            for (unsigned tri = 0; tri < draw_tris; tri++) {
+               unsigned idx[3];
+               if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
+                  idx[0] = tri;
+                  idx[1] = tri + 1 + (tri & 1);
+                  idx[2] = tri + 2 - (tri & 1);
+               } else if (info->mode == MESA_PRIM_TRIANGLE_FAN) {
+                  idx[0] = 0;
+                  idx[1] = tri + 1;
+                  idx[2] = tri + 2;
                } else {
-                  vert_idx = first_vertex + idx[vi];
+                  idx[0] = tri * 3 + 0;
+                  idx[1] = tri * 3 + 1;
+                  idx[2] = tri * 3 + 2;
                }
-               float *src_pos = (float *)(vb_start + vert_idx * stride);
-               dst[(tri * 3 + vi) * 4 + 0] = src_pos[0];
-               dst[(tri * 3 + vi) * 4 + 1] = src_pos[1];
-               dst[(tri * 3 + vi) * 4 + 2] = src_pos[2];
-               dst[(tri * 3 + vi) * 4 + 3] = src_pos[3];
+
+               for (int vi = 0; vi < 3; vi++) {
+                  unsigned vert_idx;
+                  if (indexed && ib_data) {
+                     unsigned raw_idx;
+                     if (index_size == 2)
+                        raw_idx = ((uint16_t *)ib_data)[idx[vi]];
+                     else
+                        raw_idx = ((uint32_t *)ib_data)[idx[vi]];
+                     vert_idx = (unsigned)((int)raw_idx + base_vertex);
+                  } else {
+                     vert_idx = first + idx[vi];
+                  }
+                  float *src_pos = (float *)(vb_start + vert_idx * stride);
+                  dst[(tri_out * 3 + vi) * 4 + 0] = src_pos[0];
+                  dst[(tri_out * 3 + vi) * 4 + 1] = src_pos[1];
+                  dst[(tri_out * 3 + vi) * 4 + 2] = src_pos[2];
+                  dst[(tri_out * 3 + vi) * 4 + 3] = src_pos[3];
+               }
+               tri_out++;
             }
          }
          rast_args.positions = packed_positions;
@@ -227,7 +251,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .color_stride = 16,
    };
 
-   /* Extract per-vertex colors (matching the triangle assembly above) */
+   /* Extract per-vertex colors (same multi-draw assembly as positions) */
    CUdeviceptr packed_colors = 0;
    if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource &&
        cp->num_vertex_elements >= 2) {
@@ -237,46 +261,59 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
          unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
          unsigned color_offset = cp->vertex_elements[1].src_offset;
-
-         void *ib_data = NULL;
          unsigned index_size = info->index_size;
+
+         void *ib_base = NULL;
          if (indexed && info->index.resource) {
             struct cp_resource *ib_res = cp_resource(info->index.resource);
-            ib_data = cp_resource_data(ib_res);
-            if (ib_data)
-               ib_data = (char *)ib_data + draws[0].start * index_size;
+            ib_base = cp_resource_data(ib_res);
          }
 
          cuMemAllocManaged(&packed_colors, num_triangles * 3 * 16, CU_MEM_ATTACH_GLOBAL);
          float *cdst = (float *)(uintptr_t)packed_colors;
+         unsigned tri_out = 0;
 
-         for (unsigned tri = 0; tri < num_triangles; tri++) {
-            unsigned idx[3];
-            if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
-               idx[0] = tri;
-               idx[1] = tri + 1 + (tri & 1);
-               idx[2] = tri + 2 - (tri & 1);
-            } else {
-               idx[0] = tri * 3 + 0;
-               idx[1] = tri * 3 + 1;
-               idx[2] = tri * 3 + 2;
-            }
+         for (unsigned d = 0; d < num_draws; d++) {
+            unsigned vc = draws[d].count;
+            unsigned first = draws[d].start;
+            int base_vertex = indexed ? draws[d].index_bias : 0;
 
-            for (int vi = 0; vi < 3; vi++) {
-               unsigned vert_idx;
-               if (indexed && ib_data) {
-                  if (index_size == 2)
-                     vert_idx = ((uint16_t *)ib_data)[idx[vi]];
-                  else
-                     vert_idx = ((uint32_t *)ib_data)[idx[vi]];
+            void *ib_data = NULL;
+            if (indexed && ib_base)
+               ib_data = (char *)ib_base + first * index_size;
+
+            unsigned draw_tris;
+            if (info->mode == MESA_PRIM_TRIANGLE_STRIP || info->mode == MESA_PRIM_TRIANGLE_FAN)
+               draw_tris = vc >= 3 ? vc - 2 : 0;
+            else
+               draw_tris = vc / 3;
+
+            for (unsigned tri = 0; tri < draw_tris; tri++) {
+               unsigned idx[3];
+               if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
+                  idx[0] = tri; idx[1] = tri+1+(tri&1); idx[2] = tri+2-(tri&1);
+               } else if (info->mode == MESA_PRIM_TRIANGLE_FAN) {
+                  idx[0] = 0; idx[1] = tri+1; idx[2] = tri+2;
                } else {
-                  vert_idx = first_vertex + idx[vi];
+                  idx[0] = tri*3; idx[1] = tri*3+1; idx[2] = tri*3+2;
                }
-               float *src_color = (float *)(vb_start + vert_idx * stride + color_offset);
-               cdst[(tri * 3 + vi) * 4 + 0] = src_color[0];
-               cdst[(tri * 3 + vi) * 4 + 1] = src_color[1];
-               cdst[(tri * 3 + vi) * 4 + 2] = src_color[2];
-               cdst[(tri * 3 + vi) * 4 + 3] = src_color[3];
+
+               for (int vi = 0; vi < 3; vi++) {
+                  unsigned vert_idx;
+                  if (indexed && ib_data) {
+                     unsigned raw_idx = index_size == 2 ?
+                        ((uint16_t *)ib_data)[idx[vi]] : ((uint32_t *)ib_data)[idx[vi]];
+                     vert_idx = (unsigned)((int)raw_idx + base_vertex);
+                  } else {
+                     vert_idx = first + idx[vi];
+                  }
+                  float *src = (float *)(vb_start + vert_idx * stride + color_offset);
+                  cdst[(tri_out*3+vi)*4+0] = src[0];
+                  cdst[(tri_out*3+vi)*4+1] = src[1];
+                  cdst[(tri_out*3+vi)*4+2] = src[2];
+                  cdst[(tri_out*3+vi)*4+3] = src[3];
+               }
+               tri_out++;
             }
          }
          resolve_args.colors = packed_colors;
