@@ -6,10 +6,17 @@
 #ifndef CP_RAST_TYPES_H
 #define CP_RAST_TYPES_H
 
-#ifdef __CUDACC__
+#ifndef __CUDACC__
 #include <stdint.h>
 #else
-#include <stdint.h>
+/* NVRTC doesn't have stdint.h — define what we need */
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef signed int int32_t;
+typedef signed long long int64_t;
+typedef unsigned long long uintptr_t;
 #endif
 
 struct cp_framebuffer_info {
