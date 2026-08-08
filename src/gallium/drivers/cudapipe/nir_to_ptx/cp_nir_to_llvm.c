@@ -202,6 +202,108 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       set_ssa_def(ctx, &instr->def, idx);
       break;
    }
+   case nir_intrinsic_load_vertex_id:
+   case nir_intrinsic_load_vertex_id_zero_base: {
+      /* For VS kernel: vertex_id = blockIdx.x * blockDim.x + threadIdx.x */
+      LLVMValueRef bid = emit_workgroup_id(ctx, 0);
+      LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
+      LLVMValueRef bs = LLVMConstInt(i32, 256, false); /* block size used for VS launch */
+      LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, bid, bs, ""), tid, "vertex_id");
+      set_ssa_def(ctx, &instr->def, vid);
+      break;
+   }
+   case nir_intrinsic_load_input: {
+      /* VS input: read from input buffer at (base + component) * 4 bytes per vertex.
+       * Kernel arg layout: [0]=input_buffers_ptr, args as before.
+       * For now, treat input as reading from the vertex's attribute slot. */
+      unsigned base = nir_intrinsic_base(instr);
+      unsigned comp = nir_intrinsic_component(instr);
+      LLVMValueRef offset_val = get_src(ctx, &instr->src[0]);
+
+      /* Input ptr is at args[2] (after grid_info at 0, reserved at 1) */
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+      LLVMValueRef args = ctx->kernel_args[0];
+      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
+      LLVMValueRef input_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
+         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
+            &(LLVMValueRef){LLVMConstInt(i64, 2, false)}, 1, ""), "vs_input");
+
+      /* Compute byte offset: vertex_id * vertex_stride + base * 16 + comp * 4 + offset * 16 */
+      LLVMValueRef bid2 = emit_workgroup_id(ctx, 0);
+      LLVMValueRef tid2 = emit_local_invocation_id(ctx, 0);
+      LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, bid2, LLVMConstInt(i32, 256, false), ""), tid2, "");
+
+      /* Read stride from args[3] */
+      LLVMTypeRef i32_ptr = LLVMPointerType(i32, 0);
+      LLVMValueRef stride_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
+         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
+            &(LLVMValueRef){LLVMConstInt(i64, 3, false)}, 1, ""), "stride_ptr");
+      LLVMValueRef stride = LLVMBuildLoad2(ctx->builder, i32,
+         LLVMBuildBitCast(ctx->builder, stride_ptr, i32_ptr, ""), "stride");
+
+      LLVMValueRef byte_off = LLVMBuildAdd(ctx->builder,
+         LLVMBuildAdd(ctx->builder,
+            LLVMBuildMul(ctx->builder, vid, stride, ""),
+            LLVMConstInt(i32, base * 16 + comp * 4, false), ""),
+         LLVMBuildMul(ctx->builder, offset_val, LLVMConstInt(i32, 16, false), ""), "");
+
+      LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
+         LLVMInt8TypeInContext(ctx->llvm_ctx), input_ptr, &byte_off, 1, "");
+
+      unsigned nc = instr->def.num_components;
+      unsigned bs2 = instr->def.bit_size;
+      LLVMTypeRef load_type = get_llvm_type(ctx, bs2, nc);
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, elem_ptr,
+         LLVMPointerType(load_type, 0), "");
+      LLVMValueRef val = LLVMBuildLoad2(ctx->builder, load_type, typed_ptr, "vs_in");
+      set_ssa_def(ctx, &instr->def, val);
+      break;
+   }
+   case nir_intrinsic_store_output: {
+      /* VS output: write to output buffer at (base + component) * 4 bytes per vertex */
+      LLVMValueRef data = get_src(ctx, &instr->src[0]);
+      unsigned base = nir_intrinsic_base(instr);
+      unsigned comp = nir_intrinsic_component(instr);
+      LLVMValueRef offset_val = get_src(ctx, &instr->src[1]);
+
+      /* Output ptr is at args[4] */
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+      LLVMValueRef args = ctx->kernel_args[0];
+      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
+      LLVMValueRef output_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
+         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
+            &(LLVMValueRef){LLVMConstInt(i64, 4, false)}, 1, ""), "vs_output");
+
+      /* vertex_id */
+      LLVMValueRef bid2 = emit_workgroup_id(ctx, 0);
+      LLVMValueRef tid2 = emit_local_invocation_id(ctx, 0);
+      LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, bid2, LLVMConstInt(i32, 256, false), ""), tid2, "");
+
+      /* Output stride = num_output_slots * 16 (packed vec4s) */
+      unsigned num_outputs = ctx->nir->num_outputs;
+      unsigned out_stride = num_outputs * 16;
+
+      LLVMValueRef byte_off = LLVMBuildAdd(ctx->builder,
+         LLVMBuildAdd(ctx->builder,
+            LLVMBuildMul(ctx->builder, vid, LLVMConstInt(i32, out_stride, false), ""),
+            LLVMConstInt(i32, base * 16 + comp * 4, false), ""),
+         LLVMBuildMul(ctx->builder, offset_val, LLVMConstInt(i32, 16, false), ""), "");
+
+      LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
+         LLVMInt8TypeInContext(ctx->llvm_ctx), output_ptr, &byte_off, 1, "");
+      LLVMTypeRef store_type = LLVMTypeOf(data);
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, elem_ptr,
+         LLVMPointerType(store_type, 0), "");
+      LLVMBuildStore(ctx->builder, data, typed_ptr);
+      break;
+   }
    case nir_intrinsic_load_global_invocation_id: {
       LLVMValueRef wg_x = emit_workgroup_id(ctx, 0);
       LLVMValueRef wg_y = emit_workgroup_id(ctx, 1);

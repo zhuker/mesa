@@ -3,6 +3,13 @@
 #include "cp_resource.h"
 #include "nir_to_ptx/cp_nir_to_llvm.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
+
+static int
+type_size_vec4(const struct glsl_type *type, bool bindless)
+{
+   return glsl_count_attribute_slots(type, false);
+}
 #include "kernels/cp_rast_types.h"
 
 #include "pipe/p_context.h"
@@ -139,10 +146,10 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .front_face = 0,
    };
 
-   /* Extract positions from vertex buffer into packed float4 array (3 per triangle).
-    * Handles indexed draws, triangle strips/fans, and multi-draw.
-    * TODO: run compiled vertex shader instead of passthrough copy. */
+   /* Run vertex shader OR extract positions passthrough */
    CUdeviceptr packed_positions = 0;
+   CUdeviceptr vs_output_buf = 0;
+   bool vs_ran = false;
    if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
       struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
       void *vb_data = cp_resource_data(vb_res);
@@ -220,6 +227,69 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    if (rast_args.positions == 0) {
       cuMemFree(visbuf);
       return;
+   }
+
+   /* If we have a compiled VS, run it to transform vertices.
+    * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
+    * The output replaces packed_positions for the rasterizer. */
+   /* VS execution: temporarily disabled while arg layout is being debugged.
+    * The VS kernel compiles but the input/output buffer layout needs to
+    * match what the compiled shader expects (per-vertex attribute layout).
+    * TODO: pass assembled vertex attributes as input, collect VS outputs. */
+   if (false && cp->vs_shader && cp->vs_shader->kernel && cp->num_vertex_buffers > 0 &&
+       cp->vertex_buffers[0].buffer.resource) {
+      struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
+      void *vb_data = cp_resource_data(vb_res);
+      if (vb_data) {
+         unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
+         unsigned num_outputs = 2; /* position + 1 varying (typical) */
+         unsigned out_stride = num_outputs * 16;
+         unsigned total_verts = num_triangles * 3;
+
+         /* Allocate VS output buffer */
+         cuMemAllocManaged(&vs_output_buf, total_verts * out_stride, CU_MEM_ATTACH_GLOBAL);
+
+         /* Build VS kernel args:
+          * [0] = grid_info, [1] = reserved,
+          * [2] = input VB ptr, [3] = &stride, [4] = output ptr */
+         CUdeviceptr vs_args_dev;
+         cuMemAllocManaged(&vs_args_dev, 5 * sizeof(void*), CU_MEM_ATTACH_GLOBAL);
+         void **vs_args = (void**)(uintptr_t)vs_args_dev;
+         uint32_t stride_val = stride;
+         CUdeviceptr stride_dev;
+         cuMemAllocManaged(&stride_dev, 4, CU_MEM_ATTACH_GLOBAL);
+         *(uint32_t*)(uintptr_t)stride_dev = stride_val;
+
+         char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
+         vs_args[0] = NULL;
+         vs_args[1] = NULL;
+         vs_args[2] = vb_start;
+         vs_args[3] = (void*)(uintptr_t)stride_dev;
+         vs_args[4] = (void*)(uintptr_t)vs_output_buf;
+
+         void *vs_params[] = { &vs_args };
+         CUresult vs_err = cuLaunchKernel(cp->vs_shader->kernel,
+            (total_verts + 255) / 256, 1, 1, 256, 1, 1,
+            0, NULL, vs_params, NULL);
+
+         if (vs_err == CUDA_SUCCESS) {
+            cuCtxSynchronize();
+            /* VS output: slot 0 = position (float4), slot 1 = varying (float4)
+             * per vertex. Copy positions from VS output to packed_positions
+             * and varyings to packed_colors. */
+            float *vs_out = (float*)(uintptr_t)vs_output_buf;
+            float *pos_dst = (float*)(uintptr_t)packed_positions;
+            for (unsigned v = 0; v < total_verts; v++) {
+               pos_dst[v*4+0] = vs_out[v * num_outputs * 4 + 0]; /* pos.x */
+               pos_dst[v*4+1] = vs_out[v * num_outputs * 4 + 1]; /* pos.y */
+               pos_dst[v*4+2] = vs_out[v * num_outputs * 4 + 2]; /* pos.z */
+               pos_dst[v*4+3] = vs_out[v * num_outputs * 4 + 3]; /* pos.w */
+            }
+            vs_ran = true;
+         }
+         cuMemFree(vs_args_dev);
+         cuMemFree(stride_dev);
+      }
    }
 
    if (getenv("CUDAPIPE_DEBUG_DRAW")) {
@@ -385,6 +455,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       cuMemFree(packed_positions);
    if (packed_colors)
       cuMemFree(packed_colors);
+   if (vs_output_buf)
+      cuMemFree(vs_output_buf);
 }
 
 static void
@@ -620,17 +692,35 @@ static void *
 cp_create_vs_state(struct pipe_context *ctx,
                    const struct pipe_shader_state *state)
 {
-   if (state->type == PIPE_SHADER_IR_NIR && getenv("CUDAPIPE_DUMP_NIR")) {
+   struct cp_context *cp = (struct cp_context *)ctx;
+   if (state->type != PIPE_SHADER_IR_NIR)
+      return MALLOC(1);
+
+   struct nir_shader *nir = (struct nir_shader *)state->ir.nir;
+
+   if (getenv("CUDAPIPE_DUMP_NIR")) {
       fprintf(stderr, "=== VS NIR ===\n");
-      nir_print_shader((struct nir_shader*)state->ir.nir, stderr);
+      nir_print_shader(nir, stderr);
    }
-   /* TODO: compile VS to CUDA kernel for proper vertex transformation */
-   return MALLOC(1);
+
+   /* Lower I/O derefs to explicit load_input/store_output */
+   nir_lower_io(nir, nir_var_shader_in | nir_var_shader_out,
+                type_size_vec4, nir_lower_io_lower_64bit_to_32);
+
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+
+   struct cp_shader_binary *bin = cp_compile_nir_to_ptx(nir,
+      cp->screen->sm_major, cp->screen->sm_minor);
+   if (!bin)
+      bin = CALLOC_STRUCT(cp_shader_binary);
+   return bin;
 }
 
 static void
 cp_bind_vs_state(struct pipe_context *ctx, void *state)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
+   cp->vs_shader = (struct cp_shader_binary *)state;
 }
 
 static void

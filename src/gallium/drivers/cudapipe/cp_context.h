@@ -19,6 +19,8 @@ struct cp_context {
    struct pipe_scissor_state scissor;
 
    struct cp_shader_binary *compute_shader;
+   struct cp_shader_binary *vs_shader;
+   struct cp_shader_binary *fs_shader;
 
    /* Vertex buffers and elements */
    struct pipe_vertex_buffer vertex_buffers[16];
