@@ -5,6 +5,7 @@
 #include "util/u_thread.h"
 
 #include <cuda.h>
+#include "cp_kernels.h"
 
 struct cp_screen {
    struct pipe_screen base;
@@ -15,6 +16,8 @@ struct cp_screen {
    CUcontext cuda_ctx;
    int sm_major;
    int sm_minor;
+
+   struct cp_kernels kernels;
 
    char renderer_string[128];
 };

@@ -2,6 +2,7 @@ files_cudapipe = files(
   'cp_screen.c',
   'cp_context.c',
   'cp_resource.c',
+  'cp_kernels.c',
   'nir_to_ptx/cp_nir_to_llvm.c',
 )
 

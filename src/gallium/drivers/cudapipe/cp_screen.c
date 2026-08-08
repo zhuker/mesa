@@ -237,6 +237,7 @@ static void
 cp_destroy_screen(struct pipe_screen *screen)
 {
    struct cp_screen *cp = cp_screen(screen);
+   cp_kernels_destroy(&cp->kernels);
    cuCtxDestroy(cp->cuda_ctx);
    FREE(cp);
 }
@@ -326,6 +327,11 @@ cudapipe_create_screen(struct sw_winsys *winsys)
 
    snprintf(screen->renderer_string, sizeof(screen->renderer_string),
             "cudapipe (sm_%d%d)", screen->sm_major, screen->sm_minor);
+
+   if (!cp_kernels_init(&screen->kernels, screen)) {
+      fprintf(stderr, "cudapipe: warning: rasterization kernels failed to compile\n");
+      /* Non-fatal — compute still works, just no draw support */
+   }
 
    screen->base.destroy = cp_destroy_screen;
    screen->base.get_name = cp_get_name;
