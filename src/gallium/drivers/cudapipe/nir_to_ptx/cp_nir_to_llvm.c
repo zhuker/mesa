@@ -720,8 +720,25 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    }
 
    LLVMValueRef result = NULL;
-   LLVMTypeRef f32 = LLVMFloatTypeInContext(ctx->llvm_ctx);
-   (void)f32;
+
+   /* For float ops, ensure sources are float-typed (bitcast from int if needed) */
+   bool is_float_op = (instr->op >= nir_op_fadd && instr->op <= nir_op_fneu) ||
+                      instr->op == nir_op_fneg || instr->op == nir_op_fabs ||
+                      instr->op == nir_op_flt || instr->op == nir_op_fge ||
+                      instr->op == nir_op_feq || instr->op == nir_op_fneu ||
+                      instr->op == nir_op_fadd || instr->op == nir_op_fsub ||
+                      instr->op == nir_op_fmul || instr->op == nir_op_fdiv;
+   if (is_float_op) {
+      for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
+         if (src[i] && LLVMGetTypeKind(LLVMTypeOf(src[i])) == LLVMIntegerTypeKind) {
+            unsigned w = LLVMGetIntTypeWidth(LLVMTypeOf(src[i]));
+            LLVMTypeRef ft = (w == 64) ? LLVMDoubleTypeInContext(ctx->llvm_ctx) :
+                             (w == 16) ? LLVMHalfTypeInContext(ctx->llvm_ctx) :
+                                         LLVMFloatTypeInContext(ctx->llvm_ctx);
+            src[i] = LLVMBuildBitCast(ctx->builder, src[i], ft, "");
+         }
+      }
+   }
 
    switch (instr->op) {
    case nir_op_iadd:
@@ -1154,8 +1171,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor)
    /* Verify — if invalid IR, bail out instead of crashing in PTX emission */
    char *error = NULL;
    if (LLVMVerifyModule(ctx.module, LLVMReturnStatusAction, &error)) {
-      if (getenv("CUDAPIPE_DUMP_IR"))
-         fprintf(stderr, "cudapipe: LLVM module verification failed:\n%s\n", error);
+      fprintf(stderr, "cudapipe: LLVM module verification failed:\n%s\n", error ? error : "(null)");
       LLVMDisposeMessage(error);
       LLVMDisposeBuilder(ctx.builder);
       LLVMDisposeModule(ctx.module);
