@@ -15,6 +15,7 @@ struct cp_shader_binary {
    int sm_major;
    int sm_minor;
    unsigned shared_size;
+   unsigned nir_num_outputs;
 };
 
 struct cp_shader_binary *

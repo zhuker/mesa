@@ -925,6 +925,39 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    case nir_op_mov:
       result = src[0];
       break;
+   case nir_op_bcsel:
+   case nir_op_b32csel: {
+      LLVMValueRef cond_val = src[0];
+      if (LLVMGetTypeKind(LLVMTypeOf(cond_val)) != LLVMIntegerTypeKind ||
+          LLVMGetIntTypeWidth(LLVMTypeOf(cond_val)) != 1) {
+         cond_val = LLVMBuildICmp(ctx->builder, LLVMIntNE, cond_val,
+            LLVMConstNull(LLVMTypeOf(cond_val)), "");
+      }
+      result = LLVMBuildSelect(ctx->builder, cond_val, src[1], src[2], "");
+      break;
+   }
+   case nir_op_b2f32: {
+      LLVMValueRef cond_val = src[0];
+      if (LLVMGetTypeKind(LLVMTypeOf(cond_val)) != LLVMIntegerTypeKind ||
+          LLVMGetIntTypeWidth(LLVMTypeOf(cond_val)) != 1) {
+         cond_val = LLVMBuildICmp(ctx->builder, LLVMIntNE, cond_val,
+            LLVMConstNull(LLVMTypeOf(cond_val)), "");
+      }
+      result = LLVMBuildSelect(ctx->builder, cond_val,
+         LLVMConstReal(LLVMFloatTypeInContext(ctx->llvm_ctx), 1.0),
+         LLVMConstReal(LLVMFloatTypeInContext(ctx->llvm_ctx), 0.0), "");
+      break;
+   }
+   case nir_op_b2i32: {
+      LLVMValueRef cond_val = src[0];
+      if (LLVMGetTypeKind(LLVMTypeOf(cond_val)) != LLVMIntegerTypeKind ||
+          LLVMGetIntTypeWidth(LLVMTypeOf(cond_val)) != 1) {
+         cond_val = LLVMBuildICmp(ctx->builder, LLVMIntNE, cond_val,
+            LLVMConstNull(LLVMTypeOf(cond_val)), "");
+      }
+      result = LLVMBuildZExt(ctx->builder, cond_val, i32, "");
+      break;
+   }
    case nir_op_vec2:
    case nir_op_vec3:
    case nir_op_vec4: {
@@ -1304,6 +1337,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor)
    bin->sm_major = sm_major;
    bin->sm_minor = sm_minor;
    bin->shared_size = nir->info.shared_size;
+   bin->nir_num_outputs = nir->num_outputs;
 
    /* Load PTX into CUDA module */
    CUresult err = cuModuleLoadData(&bin->module, ptx);
