@@ -30,7 +30,8 @@ static void
 cp_destroy_context(struct pipe_context *ctx)
 {
    struct cp_context *cp = (struct cp_context *)ctx;
-   /* TODO: cuStreamDestroy */
+   if (cp->visbuf)
+      cuMemFree(cp->visbuf);
    if (ctx->stream_uploader)
       u_upload_destroy(ctx->stream_uploader);
    FREE(cp);
@@ -42,6 +43,21 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
 {
    struct cp_context *cp = (struct cp_context *)ctx;
    util_copy_framebuffer_state(&cp->framebuffer, state);
+
+   /* Reallocate visbuf if framebuffer size changed */
+   unsigned w = state->width, h = state->height;
+   if (w != cp->visbuf_w || h != cp->visbuf_h) {
+      if (cp->visbuf)
+         cuMemFree(cp->visbuf);
+      cp->visbuf = 0;
+      cp->visbuf_w = w;
+      cp->visbuf_h = h;
+      if (w > 0 && h > 0) {
+         cuCtxSetCurrent(cp->screen->cuda_ctx);
+         cuMemAllocManaged(&cp->visbuf, w * h * sizeof(uint64_t), CU_MEM_ATTACH_GLOBAL);
+      }
+   }
+   cp->visbuf_cleared = false;
 }
 
 static void
@@ -110,17 +126,20 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    unsigned w = fb->width;
    unsigned h = fb->height;
 
-   /* Allocate visibility buffer (temporary) */
-   CUdeviceptr visbuf;
-   cuMemAllocManaged(&visbuf, w * h * sizeof(uint64_t), CU_MEM_ATTACH_GLOBAL);
+   /* Use persistent visbuf — clear only once per render pass */
+   CUdeviceptr visbuf = cp->visbuf;
+   if (!visbuf)
+      return;
 
-   /* Clear visbuf */
-   uint32_t vw = w, vh = h;
-   uint64_t visbuf_ptr = visbuf;
-   void *cv_params[] = { &visbuf_ptr, &vw, &vh };
-   cuLaunchKernel(screen->kernels.clear_visbuf,
-      (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
-      0, NULL, cv_params, NULL);
+   if (!cp->visbuf_cleared) {
+      uint32_t vw = w, vh = h;
+      uint64_t visbuf_ptr = visbuf;
+      void *cv_params[] = { &visbuf_ptr, &vw, &vh };
+      cuLaunchKernel(screen->kernels.clear_visbuf,
+         (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
+         0, NULL, cv_params, NULL);
+      cp->visbuf_cleared = true;
+   }
 
    /* For now: read vertex positions directly from the first bound vertex buffer.
     * Assume positions are at offset 0 as float4 (x,y,z,w).
@@ -566,7 +585,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    }
 
    cuCtxSynchronize();
-   cuMemFree(visbuf);
+   /* visbuf is persistent (freed in set_framebuffer_state or destroy_context) */
    if (packed_positions)
       cuMemFree(packed_positions);
    if (packed_colors)

@@ -3,6 +3,7 @@
 
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
+#include <cuda.h>
 
 struct cp_shader_binary;
 
@@ -17,6 +18,11 @@ struct cp_context {
    struct pipe_framebuffer_state framebuffer;
    struct pipe_viewport_state viewport;
    struct pipe_scissor_state scissor;
+
+   /* Persistent visibility buffer for the current render pass */
+   CUdeviceptr visbuf;
+   unsigned visbuf_w, visbuf_h;
+   bool visbuf_cleared;
 
    struct cp_shader_binary *compute_shader;
    struct cp_shader_binary *vs_shader;
