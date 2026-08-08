@@ -12,6 +12,7 @@
 #include "util/u_upload_mgr.h"
 #include "util/u_framebuffer.h"
 #include "compiler/shader_enums.h"
+#include "util/u_prim.h"
 
 #include <string.h>
 #include <math.h>
@@ -75,9 +76,16 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    cuCtxSetCurrent(screen->cuda_ctx);
 
-   /* For now: only handle triangle lists without index buffers as a simple case */
    unsigned vertex_count = draws[0].count;
-   unsigned num_triangles = vertex_count / 3;
+   unsigned first_vertex = draws[0].start;
+   unsigned num_triangles;
+
+   /* Handle indexed draws */
+   bool indexed = info->index_size > 0;
+   if (info->mode == MESA_PRIM_TRIANGLE_STRIP)
+      num_triangles = vertex_count >= 3 ? vertex_count - 2 : 0;
+   else
+      num_triangles = vertex_count / 3;
    if (num_triangles == 0)
       return;
 
@@ -126,8 +134,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .front_face = 0,
    };
 
-   /* Extract positions from vertex buffer into a packed float4 array.
-    * The VB is interleaved (stride != sizeof(float4)), so we copy out positions.
+   /* Extract positions from vertex buffer into packed float4 array (3 per triangle).
+    * Handles indexed draws and triangle strips.
     * TODO: run compiled vertex shader instead of passthrough copy. */
    CUdeviceptr packed_positions = 0;
    if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
@@ -137,16 +145,48 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
          unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
 
-         /* Allocate packed positions (float4 per vertex) */
-         cuMemAllocManaged(&packed_positions, vertex_count * 16, CU_MEM_ATTACH_GLOBAL);
+         /* Get index buffer if indexed */
+         void *ib_data = NULL;
+         unsigned index_size = info->index_size;
+         if (indexed && info->index.resource) {
+            struct cp_resource *ib_res = cp_resource(info->index.resource);
+            ib_data = cp_resource_data(ib_res);
+            if (ib_data)
+               ib_data = (char *)ib_data + draws[0].start * index_size;
+         }
+
+         /* Allocate packed positions (3 float4 per triangle) */
+         cuMemAllocManaged(&packed_positions, num_triangles * 3 * 16, CU_MEM_ATTACH_GLOBAL);
          float *dst = (float *)(uintptr_t)packed_positions;
 
-         for (unsigned v = 0; v < vertex_count; v++) {
-            float *src_pos = (float *)(vb_start + v * stride);
-            dst[v * 4 + 0] = src_pos[0];
-            dst[v * 4 + 1] = src_pos[1];
-            dst[v * 4 + 2] = src_pos[2];
-            dst[v * 4 + 3] = src_pos[3];
+         for (unsigned tri = 0; tri < num_triangles; tri++) {
+            unsigned idx[3];
+            if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
+               idx[0] = tri;
+               idx[1] = tri + 1 + (tri & 1);
+               idx[2] = tri + 2 - (tri & 1);
+            } else {
+               idx[0] = tri * 3 + 0;
+               idx[1] = tri * 3 + 1;
+               idx[2] = tri * 3 + 2;
+            }
+
+            for (int vi = 0; vi < 3; vi++) {
+               unsigned vert_idx;
+               if (indexed && ib_data) {
+                  if (index_size == 2)
+                     vert_idx = ((uint16_t *)ib_data)[idx[vi]];
+                  else
+                     vert_idx = ((uint32_t *)ib_data)[idx[vi]];
+               } else {
+                  vert_idx = first_vertex + idx[vi];
+               }
+               float *src_pos = (float *)(vb_start + vert_idx * stride);
+               dst[(tri * 3 + vi) * 4 + 0] = src_pos[0];
+               dst[(tri * 3 + vi) * 4 + 1] = src_pos[1];
+               dst[(tri * 3 + vi) * 4 + 2] = src_pos[2];
+               dst[(tri * 3 + vi) * 4 + 3] = src_pos[3];
+            }
          }
          rast_args.positions = packed_positions;
       }
@@ -187,7 +227,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .color_stride = 16,
    };
 
-   /* Extract per-vertex colors (float4 at offset 16 in each vertex) */
+   /* Extract per-vertex colors (matching the triangle assembly above) */
    CUdeviceptr packed_colors = 0;
    if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource &&
        cp->num_vertex_elements >= 2) {
@@ -198,27 +238,48 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
          unsigned color_offset = cp->vertex_elements[1].src_offset;
 
-         cuMemAllocManaged(&packed_colors, vertex_count * 16, CU_MEM_ATTACH_GLOBAL);
+         void *ib_data = NULL;
+         unsigned index_size = info->index_size;
+         if (indexed && info->index.resource) {
+            struct cp_resource *ib_res = cp_resource(info->index.resource);
+            ib_data = cp_resource_data(ib_res);
+            if (ib_data)
+               ib_data = (char *)ib_data + draws[0].start * index_size;
+         }
+
+         cuMemAllocManaged(&packed_colors, num_triangles * 3 * 16, CU_MEM_ATTACH_GLOBAL);
          float *cdst = (float *)(uintptr_t)packed_colors;
-         for (unsigned v = 0; v < vertex_count; v++) {
-            float *src_color = (float *)(vb_start + v * stride + color_offset);
-            cdst[v * 4 + 0] = src_color[0];
-            cdst[v * 4 + 1] = src_color[1];
-            cdst[v * 4 + 2] = src_color[2];
-            cdst[v * 4 + 3] = src_color[3];
+
+         for (unsigned tri = 0; tri < num_triangles; tri++) {
+            unsigned idx[3];
+            if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
+               idx[0] = tri;
+               idx[1] = tri + 1 + (tri & 1);
+               idx[2] = tri + 2 - (tri & 1);
+            } else {
+               idx[0] = tri * 3 + 0;
+               idx[1] = tri * 3 + 1;
+               idx[2] = tri * 3 + 2;
+            }
+
+            for (int vi = 0; vi < 3; vi++) {
+               unsigned vert_idx;
+               if (indexed && ib_data) {
+                  if (index_size == 2)
+                     vert_idx = ((uint16_t *)ib_data)[idx[vi]];
+                  else
+                     vert_idx = ((uint32_t *)ib_data)[idx[vi]];
+               } else {
+                  vert_idx = first_vertex + idx[vi];
+               }
+               float *src_color = (float *)(vb_start + vert_idx * stride + color_offset);
+               cdst[(tri * 3 + vi) * 4 + 0] = src_color[0];
+               cdst[(tri * 3 + vi) * 4 + 1] = src_color[1];
+               cdst[(tri * 3 + vi) * 4 + 2] = src_color[2];
+               cdst[(tri * 3 + vi) * 4 + 3] = src_color[3];
+            }
          }
          resolve_args.colors = packed_colors;
-         if (getenv("CUDAPIPE_DEBUG_DRAW")) {
-            float *c = (float*)(uintptr_t)packed_colors;
-            fprintf(stderr, "  packed colors: v0=[%.2f,%.2f,%.2f,%.2f] v1=[%.2f,%.2f,%.2f,%.2f] v2=[%.2f,%.2f,%.2f,%.2f]\n",
-                    c[0],c[1],c[2],c[3], c[4],c[5],c[6],c[7], c[8],c[9],c[10],c[11]);
-            /* Raw VB color data */
-            float *raw0 = (float*)(vb_start + 0*stride + color_offset);
-            float *raw1 = (float*)(vb_start + 1*stride + color_offset);
-            float *raw2 = (float*)(vb_start + 2*stride + color_offset);
-            fprintf(stderr, "  raw colors: v0=[%.2f,%.2f,%.2f,%.2f] v1=[%.2f,%.2f,%.2f,%.2f] v2=[%.2f,%.2f,%.2f,%.2f]\n",
-                    raw0[0],raw0[1],raw0[2],raw0[3], raw1[0],raw1[1],raw1[2],raw1[3], raw2[0],raw2[1],raw2[2],raw2[3]);
-         }
       }
    }
 
