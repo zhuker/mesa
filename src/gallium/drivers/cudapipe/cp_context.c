@@ -232,11 +232,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    /* If we have a compiled VS, run it to transform vertices.
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
     * The output replaces packed_positions for the rasterizer. */
-   /* VS execution: infrastructure complete. Thread bounds check added.
-    * Still crashes on GPU — needs PTX-level debugging of arg layout.
-    * Proven to improve output (diff 8061→5104) when it worked earlier.
-    * Disabled pending GPU-side debugging. */
-   if (false && cp->vs_shader && cp->vs_shader->kernel && cp->num_vertex_buffers > 0 &&
+   /* VS execution */
+   if (cp->vs_shader && cp->vs_shader->kernel && cp->num_vertex_buffers > 0 &&
        cp->vertex_buffers[0].buffer.resource) {
       struct cp_resource *vb_res2 = cp_resource(cp->vertex_buffers[0].buffer.resource);
       void *vb_data2 = cp_resource_data(vb_res2);
@@ -340,8 +337,18 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             }
             /* Extract varyings from VS output - will update packed_colors after it's allocated */
             vs_ran = true;
-         } else if (getenv("CUDAPIPE_DEBUG_DRAW")) {
+         } else {
             fprintf(stderr, "  VS launch failed: %d\n", vs_err);
+         }
+
+         /* Check for async GPU errors */
+         CUresult sync_err = cuCtxSynchronize();
+         if (sync_err != CUDA_SUCCESS) {
+            const char *err_str = NULL;
+            cuGetErrorString(sync_err, &err_str);
+            fprintf(stderr, "  VS sync error: %d (%s)\n", sync_err, err_str ? err_str : "?");
+            /* VS failed — fall back to passthrough (don't use vs output) */
+            vs_ran = false;
          }
          cuMemFree(vs_args_dev);
          cuMemFree(stride_dev);

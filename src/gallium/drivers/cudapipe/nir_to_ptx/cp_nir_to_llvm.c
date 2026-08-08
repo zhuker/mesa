@@ -260,6 +260,8 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, elem_ptr,
          LLVMPointerType(load_type, 0), "");
       LLVMValueRef val = LLVMBuildLoad2(ctx->builder, load_type, typed_ptr, "vs_in");
+      /* Mark as unaligned — vertex stride may not be aligned to vec4 */
+      LLVMSetAlignment(val, 4);
       set_ssa_def(ctx, &instr->def, val);
       break;
    }
