@@ -805,22 +805,41 @@ static void *
 cp_create_fs_state(struct pipe_context *ctx,
                    const struct pipe_shader_state *state)
 {
-   if (state->type == PIPE_SHADER_IR_NIR && getenv("CUDAPIPE_DUMP_NIR")) {
+   struct cp_context *cp = (struct cp_context *)ctx;
+   if (state->type != PIPE_SHADER_IR_NIR)
+      return MALLOC(1);
+
+   struct nir_shader *nir = (struct nir_shader *)state->ir.nir;
+
+   if (getenv("CUDAPIPE_DUMP_NIR")) {
       fprintf(stderr, "=== FS NIR ===\n");
-      nir_print_shader((struct nir_shader*)state->ir.nir, stderr);
+      nir_print_shader(nir, stderr);
    }
-   return MALLOC(1);
+
+   /* Lower FS I/O */
+   nir_lower_io(nir, nir_var_shader_in | nir_var_shader_out,
+                type_size_vec4, nir_lower_io_lower_64bit_to_32);
+
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+
+   struct cp_shader_binary *bin = cp_compile_nir_to_ptx(nir,
+      cp->screen->sm_major, cp->screen->sm_minor);
+   if (!bin)
+      bin = CALLOC_STRUCT(cp_shader_binary);
+   return bin;
 }
 
 static void
 cp_bind_fs_state(struct pipe_context *ctx, void *state)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
+   cp->fs_shader = (struct cp_shader_binary *)state;
 }
 
 static void
 cp_delete_fs_state(struct pipe_context *ctx, void *state)
 {
-   FREE(state);
+   cp_shader_binary_destroy((struct cp_shader_binary *)state);
 }
 
 static void *

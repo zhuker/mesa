@@ -1089,6 +1089,27 @@ emit_block_instrs(struct ntl_context *ctx, nir_block *block)
          break;
       case nir_instr_type_phi:
          break;
+      case nir_instr_type_tex: {
+         /* Texture sampling — for now return (1,1,1,1) as placeholder.
+          * TODO: implement actual texture sampling via CUDA texture objects. */
+         nir_tex_instr *tex = nir_instr_as_tex(instr);
+         unsigned nc = tex->def.num_components;
+         unsigned bs = tex->def.bit_size;
+         LLVMTypeRef res_type = get_llvm_type(ctx, bs, nc);
+         /* Return white for any texture sample — placeholder */
+         if (nc == 1) {
+            set_ssa_def(ctx, &tex->def, LLVMConstReal(get_float_type(ctx, bs), 1.0));
+         } else {
+            LLVMTypeRef ft = get_float_type(ctx, bs);
+            LLVMValueRef one = LLVMConstReal(ft, 1.0);
+            LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(ft, nc));
+            for (unsigned c = 0; c < nc; c++)
+               vec = LLVMBuildInsertElement(ctx->builder, vec, one,
+                  LLVMConstInt(LLVMInt32TypeInContext(ctx->llvm_ctx), c, false), "");
+            set_ssa_def(ctx, &tex->def, vec);
+         }
+         break;
+      }
       case nir_instr_type_undef: {
          nir_undef_instr *undef = nir_instr_as_undef(instr);
          set_ssa_def(ctx, &undef->def,
