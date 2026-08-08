@@ -204,12 +204,25 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
    }
    case nir_intrinsic_load_vertex_id:
    case nir_intrinsic_load_vertex_id_zero_base: {
-      /* For VS kernel: vertex_id = blockIdx.x * blockDim.x + threadIdx.x */
+      /* Read original vertex_id from args[5] array indexed by thread_id */
       LLVMValueRef bid = emit_workgroup_id(ctx, 0);
       LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
-      LLVMValueRef bs = LLVMConstInt(i32, 256, false); /* block size used for VS launch */
-      LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
-         LLVMBuildMul(ctx->builder, bid, bs, ""), tid, "vertex_id");
+      LLVMValueRef bs = LLVMConstInt(i32, 256, false);
+      LLVMValueRef thread_id = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, bid, bs, ""), tid, "");
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+      LLVMValueRef args = ctx->kernel_args[0];
+      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
+      LLVMValueRef vid_arr_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
+         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
+            &(LLVMValueRef){LLVMConstInt(i64, 5, false)}, 1, ""), "vid_arr");
+      LLVMValueRef vid_ptr = LLVMBuildGEP2(ctx->builder, i32,
+         LLVMBuildBitCast(ctx->builder, vid_arr_ptr, LLVMPointerType(i32, 0), ""),
+         &thread_id, 1, "");
+      LLVMValueRef vid = LLVMBuildLoad2(ctx->builder, i32, vid_ptr, "vertex_id");
+      LLVMSetAlignment(vid, 4);
       set_ssa_def(ctx, &instr->def, vid);
       break;
    }

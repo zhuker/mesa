@@ -307,16 +307,52 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          cuMemAllocManaged(&stride_dev, 4, CU_MEM_ATTACH_GLOBAL);
          *(uint32_t*)(uintptr_t)stride_dev = stride;
 
-         /* args[0] = pointer to vertex_count (used by VS for bounds check) */
+         /* args[0] = pointer to vertex_count
+          * args[5] = vertex_id array (original VB indices per assembled vertex) */
          CUdeviceptr vcount_dev;
          cuMemAllocManaged(&vcount_dev, 4, CU_MEM_ATTACH_GLOBAL);
          *(uint32_t*)(uintptr_t)vcount_dev = total_verts;
+
+         /* Build vertex_id array — the original vertex index for each assembled vertex */
+         CUdeviceptr vid_buf;
+         cuMemAllocManaged(&vid_buf, total_verts * 4, CU_MEM_ATTACH_GLOBAL);
+         uint32_t *vid_arr = (uint32_t*)(uintptr_t)vid_buf;
+         {
+            unsigned tri_idx = 0;
+            for (unsigned d2 = 0; d2 < num_draws; d2++) {
+               unsigned vc2 = draws[d2].count;
+               unsigned first2 = draws[d2].start;
+               int bv2 = indexed ? draws[d2].index_bias : 0;
+               void *ib2 = NULL;
+               unsigned isz2 = info->index_size;
+               if (indexed && ib_base) ib2 = (char*)ib_base + first2 * isz2;
+               unsigned dt2 = (info->mode == MESA_PRIM_TRIANGLE_STRIP || info->mode == MESA_PRIM_TRIANGLE_FAN) ?
+                  (vc2 >= 3 ? vc2-2 : 0) : vc2/3;
+               for (unsigned t = 0; t < dt2; t++) {
+                  unsigned ix[3];
+                  if (info->mode == MESA_PRIM_TRIANGLE_STRIP) { ix[0]=t; ix[1]=t+1+(t&1); ix[2]=t+2-(t&1); }
+                  else if (info->mode == MESA_PRIM_TRIANGLE_FAN) { ix[0]=0; ix[1]=t+1; ix[2]=t+2; }
+                  else { ix[0]=t*3; ix[1]=t*3+1; ix[2]=t*3+2; }
+                  for (int v=0; v<3; v++) {
+                     unsigned vi;
+                     if (indexed && ib2) {
+                        unsigned raw = isz2==2 ? ((uint16_t*)ib2)[ix[v]] : ((uint32_t*)ib2)[ix[v]];
+                        vi = (unsigned)((int)raw + bv2);
+                     } else { vi = first2 + ix[v]; }
+                     vid_arr[tri_idx*3+v] = vi;
+                  }
+                  tri_idx++;
+               }
+            }
+         }
+
          vs_args[0] = (void*)(uintptr_t)vcount_dev;
          vs_args[1] = NULL;
          vs_args[2] = (void*)(uintptr_t)vs_input_buf; /* full vertex data */
          vs_args[3] = (void*)(uintptr_t)stride_dev;
          vs_args[4] = (void*)(uintptr_t)vs_output_buf;
-         vs_args[5] = NULL; vs_args[6] = NULL; vs_args[7] = NULL;
+         vs_args[5] = (void*)(uintptr_t)vid_buf; /* vertex_id array */
+         vs_args[6] = NULL; vs_args[7] = NULL;
 
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
@@ -354,6 +390,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          cuMemFree(stride_dev);
          cuMemFree(vs_input_buf);
          cuMemFree(vcount_dev);
+         cuMemFree(vid_buf);
       }
    }
 
