@@ -1186,6 +1186,34 @@ emit_function(struct ntl_context *ctx)
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "entry");
    LLVMPositionBuilderAtEnd(ctx->builder, entry);
 
+   /* For vertex shaders: add bounds check (if vertex_id >= num_verts, return) */
+   if (ctx->nir->info.stage == MESA_SHADER_VERTEX) {
+      LLVMTypeRef i32_t = LLVMInt32TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+      LLVMTypeRef i64_t = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMValueRef args = LLVMGetParam(ctx->function, 0);
+      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
+      LLVMValueRef cnt_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
+         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
+            &(LLVMValueRef){LLVMConstInt(i64_t, 0, false)}, 1, ""), "cnt_ptr");
+      LLVMValueRef num_verts = LLVMBuildLoad2(ctx->builder, i32_t,
+         LLVMBuildBitCast(ctx->builder, cnt_ptr, LLVMPointerType(i32_t, 0), ""), "num_verts");
+
+      LLVMValueRef bid = emit_workgroup_id(ctx, 0);
+      LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
+      LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, bid, LLVMConstInt(i32_t, 256, false), ""), tid, "");
+      LLVMValueRef oob = LLVMBuildICmp(ctx->builder, LLVMIntUGE, vid, num_verts, "");
+
+      LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "vs_body");
+      LLVMBasicBlockRef early_ret = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "vs_ret");
+      LLVMBuildCondBr(ctx->builder, oob, early_ret, body);
+      LLVMPositionBuilderAtEnd(ctx->builder, early_ret);
+      LLVMBuildRetVoid(ctx->builder);
+      LLVMPositionBuilderAtEnd(ctx->builder, body);
+   }
+
    emit_cf_list(ctx, &impl->body);
 
    /* Add return if no terminator */

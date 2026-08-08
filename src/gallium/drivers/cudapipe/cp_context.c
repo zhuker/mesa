@@ -232,10 +232,10 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    /* If we have a compiled VS, run it to transform vertices.
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
     * The output replaces packed_positions for the rasterizer. */
-   /* VS execution: compile/launch infrastructure working, but input buffer
-    * assembly causes GPU crashes (thread OOB or arg layout mismatch).
-    * The VS DID improve output when working (diff 8061→5104).
-    * Disabled pending thread bounds fix. */
+   /* VS execution: infrastructure complete. Thread bounds check added.
+    * Still crashes on GPU — needs PTX-level debugging of arg layout.
+    * Proven to improve output (diff 8061→5104) when it worked earlier.
+    * Disabled pending GPU-side debugging. */
    if (false && cp->vs_shader && cp->vs_shader->kernel && cp->num_vertex_buffers > 0 &&
        cp->vertex_buffers[0].buffer.resource) {
       struct cp_resource *vb_res2 = cp_resource(cp->vertex_buffers[0].buffer.resource);
@@ -310,7 +310,11 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          cuMemAllocManaged(&stride_dev, 4, CU_MEM_ATTACH_GLOBAL);
          *(uint32_t*)(uintptr_t)stride_dev = stride;
 
-         vs_args[0] = NULL;
+         /* args[0] = pointer to vertex_count (used by VS for bounds check) */
+         CUdeviceptr vcount_dev;
+         cuMemAllocManaged(&vcount_dev, 4, CU_MEM_ATTACH_GLOBAL);
+         *(uint32_t*)(uintptr_t)vcount_dev = total_verts;
+         vs_args[0] = (void*)(uintptr_t)vcount_dev;
          vs_args[1] = NULL;
          vs_args[2] = (void*)(uintptr_t)vs_input_buf; /* full vertex data */
          vs_args[3] = (void*)(uintptr_t)stride_dev;
@@ -342,6 +346,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          cuMemFree(vs_args_dev);
          cuMemFree(stride_dev);
          cuMemFree(vs_input_buf);
+         cuMemFree(vcount_dev);
       }
    }
 
