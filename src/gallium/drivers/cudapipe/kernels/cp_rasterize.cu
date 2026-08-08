@@ -62,20 +62,32 @@ cp_rasterize_triangles(struct cp_rasterize_args args)
    float ndc_x1 = v1.x * inv_w1, ndc_y1 = v1.y * inv_w1, ndc_z1 = v1.z * inv_w1;
    float ndc_x2 = v2.x * inv_w2, ndc_y2 = v2.y * inv_w2, ndc_z2 = v2.z * inv_w2;
 
-   /* NDC → screen space */
+   /* NDC → screen space (Vulkan: Y is flipped, ndc_y=-1 = bottom of screen)
+    * screen_x = (ndc_x * 0.5 + 0.5) * width
+    * screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * height  [Y flip for Vulkan]
+    */
    float sx0 = (ndc_x0 * 0.5f + 0.5f) * args.vp_w + args.vp_x;
-   float sy0 = (ndc_y0 * 0.5f + 0.5f) * args.vp_h + args.vp_y;
+   float sy0 = (0.5f - ndc_y0 * 0.5f) * args.vp_h + args.vp_y;
    float sx1 = (ndc_x1 * 0.5f + 0.5f) * args.vp_w + args.vp_x;
-   float sy1 = (ndc_y1 * 0.5f + 0.5f) * args.vp_h + args.vp_y;
+   float sy1 = (0.5f - ndc_y1 * 0.5f) * args.vp_h + args.vp_y;
    float sx2 = (ndc_x2 * 0.5f + 0.5f) * args.vp_w + args.vp_x;
-   float sy2 = (ndc_y2 * 0.5f + 0.5f) * args.vp_h + args.vp_y;
+   float sy2 = (0.5f - ndc_y2 * 0.5f) * args.vp_h + args.vp_y;
 
    /* Backface culling */
    float area = edge_function(sx0, sy0, sx1, sy1, sx2, sy2);
-   if (args.cull_mode == 1 && area > 0) return; /* cull front (CW positive) */
-   if (args.cull_mode == 2 && area < 0) return; /* cull back (CCW negative) */
+   if (args.cull_mode == 1 && area > 0) return; /* cull front */
+   if (args.cull_mode == 2 && area < 0) return; /* cull back */
    if (area == 0.0f) return; /* degenerate */
 
+   /* If area is negative (CW winding), flip to make barycentrics positive */
+   if (area < 0.0f) {
+      /* Swap v1 and v2 to flip winding */
+      float tmp;
+      tmp = sx1; sx1 = sx2; sx2 = tmp;
+      tmp = sy1; sy1 = sy2; sy2 = tmp;
+      tmp = ndc_z1; ndc_z1 = ndc_z2; ndc_z2 = tmp;
+      area = -area;
+   }
    float inv_area = 1.0f / area;
 
    /* Bounding box (clipped to viewport) */
@@ -155,13 +167,13 @@ cp_resolve_visbuf(struct cp_resolve_args args)
    float4 v1 = positions[tri_id * 3 + 1];
    float4 v2 = positions[tri_id * 3 + 2];
 
-   /* Recompute screen positions */
+   /* Recompute screen positions (must match rasterizer's transform) */
    float sx0 = (v0.x / v0.w * 0.5f + 0.5f) * args.vp_w + args.vp_x;
-   float sy0 = (v0.y / v0.w * 0.5f + 0.5f) * args.vp_h + args.vp_y;
+   float sy0 = (0.5f - v0.y / v0.w * 0.5f) * args.vp_h + args.vp_y;
    float sx1 = (v1.x / v1.w * 0.5f + 0.5f) * args.vp_w + args.vp_x;
-   float sy1 = (v1.y / v1.w * 0.5f + 0.5f) * args.vp_h + args.vp_y;
+   float sy1 = (0.5f - v1.y / v1.w * 0.5f) * args.vp_h + args.vp_y;
    float sx2 = (v2.x / v2.w * 0.5f + 0.5f) * args.vp_w + args.vp_x;
-   float sy2 = (v2.y / v2.w * 0.5f + 0.5f) * args.vp_h + args.vp_y;
+   float sy2 = (0.5f - v2.y / v2.w * 0.5f) * args.vp_h + args.vp_y;
 
    /* Recompute barycentrics */
    float cx = (float)x + 0.5f;

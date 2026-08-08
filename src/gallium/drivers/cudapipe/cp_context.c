@@ -158,17 +158,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    }
 
    if (getenv("CUDAPIPE_DEBUG_DRAW")) {
-      fprintf(stderr, "cudapipe: draw %u tris, positions=%p, fb=%ux%u, vp=[%.0f,%.0f,%.0f,%.0f]\n",
-              num_triangles, (void*)(uintptr_t)rast_args.positions, w, h,
-              rast_args.vp_x, rast_args.vp_y, rast_args.vp_w, rast_args.vp_h);
-      fprintf(stderr, "  VB[0]: offset=%u, vertex_stride=%u, num_elements=%u\n",
-              cp->vertex_buffers[0].buffer_offset, cp->vertex_stride, cp->num_vertex_elements);
-      float *vdata = (float *)(uintptr_t)rast_args.positions;
-      fprintf(stderr, "  v0: [%.3f, %.3f, %.3f, %.3f]\n", vdata[0],vdata[1],vdata[2],vdata[3]);
-      if (cp->vertex_stride > 16) {
-         float *v0_color = (float *)((char*)vdata + 16);
-         fprintf(stderr, "  v0 color: [%.3f, %.3f, %.3f, %.3f]\n", v0_color[0],v0_color[1],v0_color[2],v0_color[3]);
-      }
+      fprintf(stderr, "cudapipe: draw %u tris, fb=%ux%u, vp=[%.0f,%.0f,%.0f,%.0f]\n",
+              num_triangles, w, h, vp_x, vp_y, vp_w, vp_h);
    }
 
    /* Rasterize */
@@ -179,14 +170,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
       fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
 
-   if (getenv("CUDAPIPE_DEBUG_DRAW")) {
-      cuCtxSynchronize();
-      uint64_t *vis = (uint64_t *)(uintptr_t)visbuf;
-      int hits = 0;
-      for (unsigned i = 0; i < w * h; i++)
-         if (vis[i] != 0xFFFFFFFFFFFFFFFFULL) hits++;
-      fprintf(stderr, "  visbuf hits: %d/%u\n", hits, w * h);
-   }
+   cuCtxSynchronize();
 
    /* Resolve — interpolate vertex colors */
    struct cp_resolve_args resolve_args = {
@@ -223,12 +207,63 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       }
    }
 
-   void *res_params[] = { &resolve_args };
-   CUresult res_err = cuLaunchKernel(screen->kernels.resolve_visbuf,
-      (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
-      0, NULL, res_params, NULL);
-   if (res_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
-      fprintf(stderr, "  resolve launch failed: %d\n", res_err);
+   /* CPU-side resolve for now (GPU resolve has parameter issues) */
+   {
+      uint64_t *vis = (uint64_t *)(uintptr_t)visbuf;
+      uint32_t *col = (uint32_t *)color_data;
+      float *pos = (float *)(uintptr_t)packed_positions;
+      float *colors_arr = packed_colors ? (float *)(uintptr_t)packed_colors : NULL;
+
+      for (unsigned py = 0; py < h; py++) {
+         for (unsigned px = 0; px < w; px++) {
+            uint64_t entry = vis[py * w + px];
+            if (entry == 0xFFFFFFFFFFFFFFFFULL)
+               continue;
+            uint32_t tri_id = (uint32_t)(entry & 0xFFFFFFFF);
+
+            /* Re-fetch positions */
+            float *v0p = pos + (tri_id*3+0)*4;
+            float *v1p = pos + (tri_id*3+1)*4;
+            float *v2p = pos + (tri_id*3+2)*4;
+
+            float sx0 = (v0p[0]/v0p[3]*0.5f+0.5f)*vp_w+vp_x;
+            float sy0 = (0.5f-v0p[1]/v0p[3]*0.5f)*vp_h+vp_y;
+            float sx1 = (v1p[0]/v1p[3]*0.5f+0.5f)*vp_w+vp_x;
+            float sy1 = (0.5f-v1p[1]/v1p[3]*0.5f)*vp_h+vp_y;
+            float sx2 = (v2p[0]/v2p[3]*0.5f+0.5f)*vp_w+vp_x;
+            float sy2 = (0.5f-v2p[1]/v2p[3]*0.5f)*vp_h+vp_y;
+
+            float cx = (float)px + 0.5f;
+            float cy = (float)py + 0.5f;
+            float area = (sx1-sx0)*(sy2-sy0)-(sy1-sy0)*(sx2-sx0);
+            if (area == 0) continue;
+            float inv_a = 1.0f / area;
+            float w0 = ((sx1-cx)*(sy2-cy)-(sy1-cy)*(sx2-cx)) * inv_a;
+            float w1 = ((sx2-cx)*(sy0-cy)-(sy2-cy)*(sx0-cx)) * inv_a;
+            float w2 = 1.0f - w0 - w1;
+
+            float r=1,g=1,b=1,a=1;
+            if (colors_arr) {
+               float *c0=colors_arr+(tri_id*3+0)*4;
+               float *c1=colors_arr+(tri_id*3+1)*4;
+               float *c2=colors_arr+(tri_id*3+2)*4;
+               r = w0*c0[0]+w1*c1[0]+w2*c2[0];
+               g = w0*c0[1]+w1*c1[1]+w2*c2[1];
+               b = w0*c0[2]+w1*c1[2]+w2*c2[2];
+               a = w0*c0[3]+w1*c1[3]+w2*c2[3];
+            }
+            if(r<0)r=0; if(r>1)r=1;
+            if(g<0)g=0; if(g>1)g=1;
+            if(b<0)b=0; if(b>1)b=1;
+            if(a<0)a=0; if(a>1)a=1;
+            uint32_t ri=(uint32_t)(r*255+0.5f);
+            uint32_t gi=(uint32_t)(g*255+0.5f);
+            uint32_t bi=(uint32_t)(b*255+0.5f);
+            uint32_t ai=(uint32_t)(a*255+0.5f);
+            col[py*w+px] = ri|(gi<<8)|(bi<<16)|(ai<<24);
+         }
+      }
+   }
 
    cuCtxSynchronize();
    cuMemFree(visbuf);

@@ -148,7 +148,32 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
                         unsigned dstz, struct pipe_resource *src,
                         unsigned src_level, const struct pipe_box *src_box)
 {
-   /* TODO: implement copy */
+   struct cp_resource *src_res = cp_resource(src);
+   struct cp_resource *dst_res = cp_resource(dst);
+   void *src_data = cp_resource_data(src_res);
+   void *dst_data = cp_resource_data(dst_res);
+   if (!src_data || !dst_data)
+      return;
+
+   unsigned src_stride = src_res->lpr.row_stride[src_level];
+   unsigned dst_stride = dst_res->lpr.row_stride[dst_level];
+   unsigned pixel_size = util_format_get_blocksize(src->format);
+
+   if (!src_stride) src_stride = src->width0 * pixel_size;
+   if (!dst_stride) dst_stride = dst->width0 * pixel_size;
+
+   unsigned src_img_stride = src_res->lpr.img_stride[src_level];
+   unsigned dst_img_stride = dst_res->lpr.img_stride[dst_level];
+
+   for (int z = 0; z < src_box->depth; z++) {
+      for (int y = 0; y < src_box->height; y++) {
+         char *s = (char *)src_data + (src_box->z + z) * src_img_stride +
+                   (src_box->y + y) * src_stride + src_box->x * pixel_size;
+         char *d = (char *)dst_data + (dstz + z) * dst_img_stride +
+                   (dsty + y) * dst_stride + dstx * pixel_size;
+         memcpy(d, s, src_box->width * pixel_size);
+      }
+   }
 }
 
 static void
