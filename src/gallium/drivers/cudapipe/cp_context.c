@@ -14,6 +14,7 @@
 #include "compiler/shader_enums.h"
 
 #include <string.h>
+#include <math.h>
 #include <cuda.h>
 
 static void
@@ -104,6 +105,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    /* For now: read vertex positions directly from the first bound vertex buffer.
     * Assume positions are at offset 0 as float4 (x,y,z,w).
     * TODO: proper VS execution with compiled vertex shader */
+   /* Viewport: pipe_viewport_state has scale/translate, convert to x,y,w,h */
+   float vp_w = fabsf(cp->viewport.scale[0]) * 2.0f;
+   float vp_h = fabsf(cp->viewport.scale[1]) * 2.0f;
+   float vp_x = cp->viewport.translate[0] - fabsf(cp->viewport.scale[0]);
+   float vp_y = cp->viewport.translate[1] - fabsf(cp->viewport.scale[1]);
+
    struct cp_rasterize_args rast_args = {
       .framebuffer = visbuf,
       .color_buffer = (uint64_t)(uintptr_t)color_data,
@@ -111,28 +118,34 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .height = h,
       .num_triangles = num_triangles,
       .num_varyings = 0,
-      .vp_x = 0, .vp_y = 0,
-      .vp_w = (float)w, .vp_h = (float)h,
+      .vp_x = vp_x, .vp_y = vp_y,
+      .vp_w = vp_w, .vp_h = vp_h,
       .vp_near = 0.0f, .vp_far = 1.0f,
       .cull_mode = 0,
       .front_face = 0,
    };
 
-   /* Get position data — use first vertex buffer or the VS output.
-    * For this initial implementation, assume the bound vertex buffer
-    * has float4 positions at the beginning. */
-   /* TODO: run the vertex shader */
-   rast_args.positions = 0; /* Will be filled from VB below */
+   /* Get vertex positions from bound vertex buffer.
+    * For now, assume the first VB has float4 positions at buffer_offset.
+    * TODO: run compiled vertex shader instead of passthrough. */
+   if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
+      struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
+      void *vb_data = cp_resource_data(vb_res);
+      if (vb_data) {
+         rast_args.positions = (uint64_t)(uintptr_t)(
+            (char *)vb_data + cp->vertex_buffers[0].buffer_offset);
+      }
+   }
 
-   /* The test uses simple passthrough VS that outputs positions from VB.
-    * We skip VS for now and read positions directly.
-    * lavapipe binds VBs via set_vertex_buffers. */
-   /* For now, just skip if no positions available */
    if (rast_args.positions == 0) {
-      /* No vertex shader output — can't rasterize yet */
       cuMemFree(visbuf);
       return;
    }
+
+   if (getenv("CUDAPIPE_DEBUG_DRAW"))
+      fprintf(stderr, "cudapipe: draw %u tris, positions=%p, fb=%ux%u, vp=[%.0f,%.0f,%.0f,%.0f]\n",
+              num_triangles, (void*)(uintptr_t)rast_args.positions, w, h,
+              rast_args.vp_x, rast_args.vp_y, rast_args.vp_w, rast_args.vp_h);
 
    /* Rasterize */
    void *rast_params[] = { &rast_args };
@@ -489,6 +502,15 @@ static void
 cp_set_vertex_buffers(struct pipe_context *ctx, unsigned count,
                       const struct pipe_vertex_buffer *buffers)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
+   for (unsigned i = 0; i < count; i++) {
+      if (buffers) {
+         cp->vertex_buffers[i] = buffers[i];
+      } else {
+         memset(&cp->vertex_buffers[i], 0, sizeof(cp->vertex_buffers[i]));
+      }
+   }
+   cp->num_vertex_buffers = count;
 }
 
 static void

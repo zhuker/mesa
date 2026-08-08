@@ -20,6 +20,10 @@ struct cp_context {
 
    struct cp_shader_binary *compute_shader;
 
+   /* Vertex buffers */
+   struct pipe_vertex_buffer vertex_buffers[16];
+   unsigned num_vertex_buffers;
+
    struct {
       void *buffer;
       unsigned buffer_size;
