@@ -20,10 +20,18 @@ struct cp_context {
    struct pipe_viewport_state viewport;
    struct pipe_scissor_state scissor;
 
-   /* Persistent visibility buffer for the current render pass */
+   /* Visibility buffer, rebuilt per draw: it resolves which triangle of the
+    * current draw wins each pixel. */
    CUdeviceptr visbuf;
    unsigned visbuf_w, visbuf_h;
-   bool visbuf_cleared;
+
+   /* Depth buffer for the render pass, one sortable uint32 per pixel. This is
+    * what carries occlusion across draws. */
+   CUdeviceptr depthbuf;
+   unsigned depthbuf_w, depthbuf_h;
+   bool depthbuf_cleared;
+
+   struct pipe_depth_stencil_alpha_state depth_stencil;
 
    struct cp_shader_binary *compute_shader;
    struct cp_shader_binary *vs_shader;
@@ -78,5 +86,8 @@ struct cp_context {
 
 struct pipe_context *
 cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags);
+
+uint32_t cp_depth_to_sortable(float depth);
+void cp_clear_depthbuf(struct cp_context *cp, float depth);
 
 #endif

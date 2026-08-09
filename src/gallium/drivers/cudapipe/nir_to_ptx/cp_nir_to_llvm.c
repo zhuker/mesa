@@ -74,6 +74,39 @@ get_float_type(struct ntl_context *ctx, unsigned bit_size)
    }
 }
 
+/*
+ * Reinterpret a scalar as `type`.
+ *
+ * Values here carry no int/float tag — a float can arrive as the integer its
+ * bits spell — so same-width conversions are bitcasts, not numeric casts.
+ * Booleans are the one real width change, and widen by zero-extension.
+ */
+static LLVMValueRef
+coerce_to_type(struct ntl_context *ctx, LLVMValueRef value, LLVMTypeRef type)
+{
+   LLVMTypeRef from = LLVMTypeOf(value);
+   if (from == type)
+      return value;
+
+   unsigned from_bits = LLVMGetTypeKind(from) == LLVMIntegerTypeKind
+      ? LLVMGetIntTypeWidth(from) : (unsigned)LLVMSizeOfTypeInBits(
+           LLVMGetModuleDataLayout(ctx->module), from);
+   unsigned to_bits = LLVMGetTypeKind(type) == LLVMIntegerTypeKind
+      ? LLVMGetIntTypeWidth(type) : (unsigned)LLVMSizeOfTypeInBits(
+           LLVMGetModuleDataLayout(ctx->module), type);
+
+   if (from_bits != to_bits) {
+      LLVMTypeRef int_type = LLVMIntTypeInContext(ctx->llvm_ctx, to_bits);
+      value = from_bits < to_bits
+         ? LLVMBuildZExt(ctx->builder, value, int_type, "")
+         : LLVMBuildTrunc(ctx->builder, value, int_type, "");
+      if (LLVMTypeOf(value) == type)
+         return value;
+   }
+
+   return LLVMBuildBitCast(ctx->builder, value, type, "");
+}
+
 static LLVMValueRef
 get_ssa_def(struct ntl_context *ctx, nir_def *def)
 {
@@ -235,6 +268,53 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef vid = LLVMBuildLoad2(ctx->builder, i32, vid_ptr, "vertex_id");
       LLVMSetAlignment(vid, 4);
       set_ssa_def(ctx, &instr->def, vid);
+      break;
+   }
+   case nir_intrinsic_load_base_instance:
+   case nir_intrinsic_load_first_vertex:
+   case nir_intrinsic_load_base_vertex:
+   case nir_intrinsic_load_draw_id: {
+      /* Draw parameters, from the uint32 triple at args[7]. */
+      unsigned field =
+         instr->intrinsic == nir_intrinsic_load_base_instance ? 1 :
+         instr->intrinsic == nir_intrinsic_load_draw_id ? 2 : 0;
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+      LLVMValueRef args = ctx->kernel_args[0];
+      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
+      LLVMValueRef params = LLVMBuildLoad2(ctx->builder, ptr_type,
+         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
+            &(LLVMValueRef){LLVMConstInt(i64, 7, false)}, 1, ""), "draw_params");
+      LLVMValueRef slot = LLVMBuildGEP2(ctx->builder, i32,
+         LLVMBuildBitCast(ctx->builder, params, LLVMPointerType(i32, 0), ""),
+         &(LLVMValueRef){LLVMConstInt(i32, field, false)}, 1, "");
+      LLVMValueRef value = LLVMBuildLoad2(ctx->builder, i32, slot, "draw_param");
+      LLVMSetAlignment(value, 4);
+      set_ssa_def(ctx, &instr->def, value);
+      break;
+   }
+   case nir_intrinsic_load_instance_id: {
+      /* Per-vertex instance index, from args[6]; laid out like the vertex-id
+       * array above so the same indexing applies. */
+      LLVMValueRef bid = emit_workgroup_id(ctx, 0);
+      LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
+      LLVMValueRef thread_id = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, bid, LLVMConstInt(i32, 256, false), ""), tid, "");
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+      LLVMValueRef args = ctx->kernel_args[0];
+      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
+      LLVMValueRef arr_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
+         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
+            &(LLVMValueRef){LLVMConstInt(i64, 6, false)}, 1, ""), "iid_arr");
+      LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder, i32,
+         LLVMBuildBitCast(ctx->builder, arr_ptr, LLVMPointerType(i32, 0), ""),
+         &thread_id, 1, "");
+      LLVMValueRef iid = LLVMBuildLoad2(ctx->builder, i32, elem_ptr, "instance_id");
+      LLVMSetAlignment(iid, 4);
+      set_ssa_def(ctx, &instr->def, iid);
       break;
    }
    case nir_intrinsic_load_input: {
@@ -818,7 +898,12 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       break;
    }
    default:
-      /* Unhandled intrinsic — emit undef for the result */
+      /* Unhandled intrinsic. The undef below propagates through everything it
+       * feeds, so a missing intrinsic usually shows up as a shader that
+       * silently computes nothing — say so when debugging. */
+      if (getenv("CUDAPIPE_DEBUG_SHADER"))
+         fprintf(stderr, "cudapipe: unhandled intrinsic '%s' -> undef\n",
+                 nir_intrinsic_infos[instr->intrinsic].name);
       if (nir_intrinsic_infos[instr->intrinsic].has_dest) {
          unsigned num_comp = instr->def.num_components;
          unsigned bit_size = instr->def.bit_size;
@@ -995,11 +1080,27 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
                LLVMConstInt(i32, instr->src[c].swizzle[0], false), "");
          }
       }
+      /* Components reach here in whichever representation produced them —
+       * load_const yields integers even for float data. Settle on one element
+       * type and bitcast the rest, or insertelement rejects the mix. */
       LLVMTypeRef elem_type = LLVMTypeOf(src[0]);
+      for (unsigned c = 1; c < nc; c++) {
+         if (LLVMGetTypeKind(LLVMTypeOf(src[c])) == LLVMFloatTypeKind ||
+             LLVMGetTypeKind(LLVMTypeOf(src[c])) == LLVMDoubleTypeKind ||
+             LLVMGetTypeKind(LLVMTypeOf(src[c])) == LLVMHalfTypeKind) {
+            elem_type = LLVMTypeOf(src[c]);
+            break;
+         }
+      }
+
       LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(elem_type, nc));
-      for (unsigned c = 0; c < nc; c++)
-         vec = LLVMBuildInsertElement(ctx->builder, vec, src[c],
+      for (unsigned c = 0; c < nc; c++) {
+         LLVMValueRef comp = src[c];
+         if (LLVMTypeOf(comp) != elem_type)
+            comp = coerce_to_type(ctx, comp, elem_type);
+         vec = LLVMBuildInsertElement(ctx->builder, vec, comp,
             LLVMConstInt(i32, c, false), "");
+      }
       result = vec;
       break;
    }
@@ -1438,6 +1539,56 @@ compile_module_to_ptx(LLVMModuleRef module, int sm_major, int sm_minor, size_t *
    return ptx;
 }
 
+/*
+ * Reduce the shader to the subset this backend emits.
+ *
+ * The PTX emitter has no scratch memory and no support for derefs, so local
+ * variables have to become SSA values or if-else trees, and variable-mode
+ * copies have to be expanded. Running the optimiser afterwards is not just for
+ * speed: constant folding is what turns most dynamic array indices into
+ * constant ones, which keeps the if-else trees small.
+ */
+static void
+cp_lower_nir(struct nir_shader *nir)
+{
+   bool progress;
+
+   NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(progress, nir, nir_split_var_copies);
+   NIR_PASS(progress, nir, nir_lower_var_copies);
+   NIR_PASS(progress, nir, nir_lower_global_vars_to_local);
+
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_algebraic);
+      NIR_PASS(progress, nir, nir_opt_cse);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_opt_dead_cf);
+      NIR_PASS(progress, nir, nir_opt_remove_phis);
+      NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
+   } while (progress);
+
+   /* Anything still indexed dynamically becomes a select tree, since there is
+    * nowhere else to put it. */
+   NIR_PASS(progress, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            nir_var_function_temp | nir_var_shader_in | nir_var_shader_out,
+            UINT32_MAX);
+
+   NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(progress, nir, nir_remove_dead_variables,
+            nir_var_function_temp, NULL);
+
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_algebraic);
+      NIR_PASS(progress, nir, nir_opt_dce);
+   } while (progress);
+}
+
 /* Record which varying location each I/O slot carries, so the fragment
  * shader's inputs can be matched to the vertex shader's outputs by location. */
 static void
@@ -1502,6 +1653,8 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    ctx.nir = nir;
    ctx.sm_major = sm_major;
    ctx.sm_minor = sm_minor;
+
+   cp_lower_nir(nir);
 
    /* Convert from SSA to reg form to eliminate phi nodes */
    nir_convert_from_ssa(nir, true, false);

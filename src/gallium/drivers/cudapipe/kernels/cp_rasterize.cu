@@ -14,9 +14,16 @@
 
 /* Packed visibility buffer entry: upper 32 bits = depth (as uint for comparison),
  * lower 32 bits = triangle ID. atomicMin gives closest triangle. */
-#define PACK_VISBUF(depth_uint, tri_id) (((uint64_t)(depth_uint) << 32) | (uint64_t)(tri_id))
+/*
+ * The triangle index is stored complemented so that atomicMin resolves ties
+ * in favour of the *last* primitive. Coplanar triangles must follow primitive
+ * order, and without the complement the lowest index would win — drawing the
+ * first triangle on top instead of the last.
+ */
+#define PACK_VISBUF(depth_uint, tri_id) \
+   (((uint64_t)(depth_uint) << 32) | (uint64_t)(~(uint32_t)(tri_id)))
 #define VISBUF_DEPTH(packed) ((uint32_t)((packed) >> 32))
-#define VISBUF_TRIID(packed) ((uint32_t)((packed) & 0xFFFFFFFF))
+#define VISBUF_TRIID(packed) (~(uint32_t)((packed) & 0xFFFFFFFF))
 #define VISBUF_EMPTY 0xFFFFFFFFFFFFFFFFULL
 
 static __device__ __forceinline__ float
@@ -121,7 +128,32 @@ cp_rasterize_triangles(struct cp_rasterize_args args)
 
          /* Pack and atomicMin into visibility buffer */
          uint32_t depth_uint = float_to_sortable_uint(depth);
-         uint64_t packed = PACK_VISBUF(depth_uint, tri_id);
+
+         /* Test against what earlier draws in this pass left behind. The
+          * atomicMin below only orders triangles within this draw. */
+         if (args.depth_test && args.depthbuf) {
+            uint32_t prev =
+               ((const uint32_t *)(uintptr_t)args.depthbuf)[py * args.width + px];
+            bool pass;
+            switch (args.depth_func) {
+            case CP_FUNC_NEVER:     pass = false; break;
+            case CP_FUNC_LESS:      pass = depth_uint <  prev; break;
+            case CP_FUNC_EQUAL:     pass = depth_uint == prev; break;
+            case CP_FUNC_LEQUAL:    pass = depth_uint <= prev; break;
+            case CP_FUNC_GREATER:   pass = depth_uint >  prev; break;
+            case CP_FUNC_NOTEQUAL:  pass = depth_uint != prev; break;
+            case CP_FUNC_GEQUAL:    pass = depth_uint >= prev; break;
+            default:                pass = true; break;
+            }
+            if (!pass)
+               continue;
+         }
+
+         /* The visibility buffer resolves by atomicMin, which picks the
+          * nearest fragment. When the depth function prefers the farthest,
+          * invert the key so the same atomicMin still picks the winner. */
+         uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
+         uint64_t packed = PACK_VISBUF(key, tri_id);
          atomicMin(&visbuf[py * args.width + px], packed);
       }
    }

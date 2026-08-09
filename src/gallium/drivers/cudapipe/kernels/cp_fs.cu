@@ -32,7 +32,9 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
    if (entry == VISBUF_EMPTY)
       return;
 
-   uint32_t tri_id = (uint32_t)(entry & 0xFFFFFFFFu);
+   /* Triangle index is stored complemented so atomicMin favours the last
+    * primitive on ties; see PACK_VISBUF in cp_rasterize.cu. */
+   uint32_t tri_id = ~(uint32_t)(entry & 0xFFFFFFFFu);
 
    const float4 *positions = (const float4 *)(uintptr_t)args.positions;
    float4 v0 = positions[tri_id * 3 + 0];
@@ -327,6 +329,15 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
       return;
 
    uint32_t pixel = ((const uint32_t *)(uintptr_t)args.pixel_list)[i];
+
+   /* This fragment survived the depth test during rasterization, so commit its
+    * depth before the next draw tests against it. */
+   if (args.depth_write && args.depthbuf && args.visbuf) {
+      uint64_t entry = ((const uint64_t *)(uintptr_t)args.visbuf)[pixel];
+      uint32_t key = (uint32_t)(entry >> 32);
+      ((uint32_t *)(uintptr_t)args.depthbuf)[pixel] =
+         args.depth_key_invert ? ~key : key;
+   }
 
    const float4 *fs_out =
       (const float4 *)((const char *)(uintptr_t)args.fs_out +

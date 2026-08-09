@@ -67,6 +67,25 @@ struct cp_rasterize_args {
    /* Rasterizer state */
    uint32_t cull_mode;      /* 0=none, 1=front, 2=back */
    uint32_t front_face;     /* 0=CCW, 1=CW */
+   /* Depth buffer for the render pass, one sortable uint32 per pixel. The
+    * visibility buffer only resolves depth within a single draw, so the test
+    * against earlier draws happens here. */
+   uint64_t depthbuf;
+   uint32_t depth_test;     /* Enable the comparison below */
+   uint32_t depth_func;     /* enum pipe_compare_func */
+   uint32_t depth_key_invert; /* Depth function prefers the farthest fragment */
+};
+
+/* enum pipe_compare_func */
+enum cp_compare_func {
+   CP_FUNC_NEVER = 0,
+   CP_FUNC_LESS,
+   CP_FUNC_EQUAL,
+   CP_FUNC_LEQUAL,
+   CP_FUNC_GREATER,
+   CP_FUNC_NOTEQUAL,
+   CP_FUNC_GEQUAL,
+   CP_FUNC_ALWAYS,
 };
 
 struct cp_resolve_args {
@@ -126,6 +145,11 @@ struct cp_fs_writeback_args {
    uint64_t pixel_list;
    uint64_t fs_out;         /* Fragment shader colour output, per covered pixel */
    uint64_t color_out;
+   uint64_t visbuf;         /* Source of the depth to commit */
+   uint64_t depthbuf;
+   uint32_t depth_write;
+   uint32_t depth_key_invert;
+   uint32_t width;
    uint32_t fs_out_stride;
    uint32_t num_pixels;
    uint32_t color_encoding; /* enum cp_color_encoding */

@@ -354,6 +354,11 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
       }
    }
 
+   /* The rasterizer tests against its own depth buffer, so clear that too —
+    * not just the application's depth attachment. */
+   if (buffers & PIPE_CLEAR_DEPTH)
+      cp_clear_depthbuf(cp_ctx, (float)depth);
+
    /* Clear depth */
    if ((buffers & PIPE_CLEAR_DEPTH) && fb->zsbuf.texture && screen->kernels.clear_depth_kernel) {
       struct pipe_surface *surf = &fb->zsbuf;

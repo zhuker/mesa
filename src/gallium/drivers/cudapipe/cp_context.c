@@ -51,6 +51,10 @@ cp_destroy_context(struct pipe_context *ctx)
    struct cp_context *cp = (struct cp_context *)ctx;
    if (cp->visbuf)
       cuMemFree(cp->visbuf);
+   if (cp->depthbuf)
+      cuMemFree(cp->depthbuf);
+   if (cp->sampler_table)
+      cuMemFree(cp->sampler_table);
    if (ctx->stream_uploader)
       u_upload_destroy(ctx->stream_uploader);
    FREE(cp);
@@ -63,20 +67,53 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
    struct cp_context *cp = (struct cp_context *)ctx;
    util_copy_framebuffer_state(&cp->framebuffer, state);
 
-   /* Reallocate visbuf if framebuffer size changed */
+   /* Reallocate the visibility and depth buffers if the size changed */
    unsigned w = state->width, h = state->height;
    if (w != cp->visbuf_w || h != cp->visbuf_h) {
       if (cp->visbuf)
          cuMemFree(cp->visbuf);
+      if (cp->depthbuf)
+         cuMemFree(cp->depthbuf);
       cp->visbuf = 0;
-      cp->visbuf_w = w;
-      cp->visbuf_h = h;
+      cp->depthbuf = 0;
+      cp->visbuf_w = cp->depthbuf_w = w;
+      cp->visbuf_h = cp->depthbuf_h = h;
       if (w > 0 && h > 0) {
          cuCtxSetCurrent(cp->screen->cuda_ctx);
-         cuMemAllocManaged(&cp->visbuf, w * h * sizeof(uint64_t), CU_MEM_ATTACH_GLOBAL);
+         cuMemAllocManaged(&cp->visbuf, (size_t)w * h * sizeof(uint64_t),
+                           CU_MEM_ATTACH_GLOBAL);
+         cuMemAllocManaged(&cp->depthbuf, (size_t)w * h * sizeof(uint32_t),
+                           CU_MEM_ATTACH_GLOBAL);
       }
+      cp->depthbuf_cleared = false;
    }
-   cp->visbuf_cleared = false;
+}
+
+/* Sortable-uint form of a depth value: monotonic in the float, so the
+ * rasterizer's integer compares order the same way floats would. */
+uint32_t
+cp_depth_to_sortable(float depth)
+{
+   union { float f; uint32_t u; } v = { .f = depth };
+   uint32_t mask = -((int32_t)v.u >> 31) | 0x80000000u;
+   return v.u ^ mask;
+}
+
+void
+cp_clear_depthbuf(struct cp_context *cp, float depth)
+{
+   if (!cp->depthbuf)
+      return;
+
+   uint32_t value = cp_depth_to_sortable(depth);
+   uint32_t *dst = (uint32_t *)(uintptr_t)cp->depthbuf;
+   size_t count = (size_t)cp->depthbuf_w * cp->depthbuf_h;
+
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   cuCtxSynchronize();
+   for (size_t i = 0; i < count; i++)
+      dst[i] = value;
+   cp->depthbuf_cleared = true;
 }
 
 static void
@@ -97,6 +134,97 @@ cp_set_scissor_states(struct pipe_context *ctx, unsigned start_slot,
    struct cp_context *cp = (struct cp_context *)ctx;
    if (num_scissors > 0)
       cp->scissor = scissors[0];
+}
+
+/* One assembled vertex: which vertex of the bound buffers it reads, and which
+ * instance it belongs to. */
+struct cp_vertex_ref {
+   uint32_t vertex;
+   uint32_t instance;
+};
+
+/* Number of triangles one draw of `count` vertices produces. */
+static unsigned
+cp_triangles_for_draw(enum mesa_prim mode, unsigned count)
+{
+   if (mode == MESA_PRIM_TRIANGLE_STRIP || mode == MESA_PRIM_TRIANGLE_FAN)
+      return count >= 3 ? count - 2 : 0;
+   return count / 3;
+}
+
+/*
+ * Resolve every assembled vertex once: expand the primitive topology, apply
+ * the index buffer, and repeat the whole thing per instance.
+ *
+ * Everything downstream (positions, shader inputs, vertex ids) indexes this
+ * array, so the topology and indexing rules live in exactly one place.
+ */
+static struct cp_vertex_ref *
+cp_build_vertex_refs(const struct pipe_draw_info *info,
+                     const struct pipe_draw_start_count_bias *draws,
+                     unsigned num_draws, unsigned instance_count,
+                     const void *ib_base, unsigned num_triangles)
+{
+   struct cp_vertex_ref *refs =
+      MALLOC(sizeof(*refs) * num_triangles * 3);
+   if (!refs)
+      return NULL;
+
+   bool indexed = info->index_size > 0;
+   unsigned index_size = info->index_size;
+   unsigned out_tri = 0;
+
+   for (unsigned inst = 0; inst < instance_count; inst++) {
+      for (unsigned d = 0; d < num_draws; d++) {
+         unsigned count = draws[d].count;
+         unsigned first = draws[d].start;
+         int base_vertex = indexed ? draws[d].index_bias : 0;
+
+         const void *ib_data = NULL;
+         if (indexed && ib_base)
+            ib_data = (const char *)ib_base + (size_t)first * index_size;
+
+         unsigned draw_tris = cp_triangles_for_draw(info->mode, count);
+
+         for (unsigned tri = 0; tri < draw_tris; tri++) {
+            unsigned idx[3];
+            if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
+               /* Odd triangles swap two vertices to keep the winding. */
+               idx[0] = tri;
+               idx[1] = tri + 1 + (tri & 1);
+               idx[2] = tri + 2 - (tri & 1);
+            } else if (info->mode == MESA_PRIM_TRIANGLE_FAN) {
+               idx[0] = 0;
+               idx[1] = tri + 1;
+               idx[2] = tri + 2;
+            } else {
+               idx[0] = tri * 3 + 0;
+               idx[1] = tri * 3 + 1;
+               idx[2] = tri * 3 + 2;
+            }
+
+            for (unsigned vi = 0; vi < 3; vi++) {
+               unsigned vertex;
+               if (indexed && ib_data) {
+                  unsigned raw = index_size == 2
+                     ? ((const uint16_t *)ib_data)[idx[vi]]
+                     : ((const uint32_t *)ib_data)[idx[vi]];
+                  vertex = (unsigned)((int)raw + base_vertex);
+               } else {
+                  vertex = first + idx[vi];
+               }
+               refs[out_tri * 3 + vi].vertex = vertex;
+               /* Zero-based, matching load_instance_id. The first instance
+                * offset belongs to attribute fetch, not to the shader's
+                * instance id. */
+               refs[out_tri * 3 + vi].instance = inst;
+            }
+            out_tri++;
+         }
+      }
+   }
+
+   return refs;
 }
 
 static uint32_t
@@ -293,6 +421,13 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .pixel_list = pixel_list,
       .fs_out = fs_out,
       .color_out = (uint64_t)(uintptr_t)color_data,
+      .visbuf = visbuf,
+      .depthbuf = cp->depthbuf,
+      .depth_write = cp->depth_stencil.depth_writemask,
+      .depth_key_invert = cp->depth_stencil.depth_enabled &&
+         (cp->depth_stencil.depth_func == PIPE_FUNC_GREATER ||
+          cp->depth_stencil.depth_func == PIPE_FUNC_GEQUAL),
+      .width = w,
       .fs_out_stride = fs_out_stride,
       .num_pixels = num_pixels,
       .color_encoding =
@@ -385,17 +520,14 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    bool indexed = info->index_size > 0;
 
-   /* Count total triangles across all draws */
+   /* Every instance replays the same primitives, so it multiplies the count. */
+   unsigned instance_count = MAX2(info->instance_count, 1u);
+
    unsigned total_triangles = 0;
-   for (unsigned d = 0; d < num_draws; d++) {
-      unsigned vc = draws[d].count;
-      if (info->mode == MESA_PRIM_TRIANGLE_STRIP)
-         total_triangles += vc >= 3 ? vc - 2 : 0;
-      else if (info->mode == MESA_PRIM_TRIANGLE_FAN)
-         total_triangles += vc >= 3 ? vc - 2 : 0;
-      else
-         total_triangles += vc / 3;
-   }
+   for (unsigned d = 0; d < num_draws; d++)
+      total_triangles += cp_triangles_for_draw(info->mode, draws[d].count);
+   total_triangles *= instance_count;
+
    if (total_triangles == 0)
       return;
    unsigned num_triangles = total_triangles;
@@ -409,20 +541,25 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    unsigned w = fb->width;
    unsigned h = fb->height;
 
-   /* Use persistent visbuf — clear only once per render pass */
+   /* The visibility buffer only ever holds this draw's triangles: its entries
+    * are triangle indices into this draw's vertex arrays, so carrying it
+    * across draws would shade one draw's pixels with another's geometry.
+    * Occlusion between draws is carried by the depth buffer instead. */
    CUdeviceptr visbuf = cp->visbuf;
    if (!visbuf)
       return;
 
-   if (!cp->visbuf_cleared) {
+   {
       uint32_t vw = w, vh = h;
       uint64_t visbuf_ptr = visbuf;
       void *cv_params[] = { &visbuf_ptr, &vw, &vh };
       cuLaunchKernel(screen->kernels.clear_visbuf,
          (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
          0, NULL, cv_params, NULL);
-      cp->visbuf_cleared = true;
    }
+
+   if (!cp->depthbuf_cleared)
+      cp_clear_depthbuf(cp, 1.0f);
 
    /* For now: read vertex positions directly from the first bound vertex buffer.
     * Assume positions are at offset 0 as float4 (x,y,z,w).
@@ -453,9 +590,29 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
       .cull_mode = 0,
       .front_face = 0,
+      .depthbuf = cp->depthbuf,
+      .depth_test = cp->depth_stencil.depth_enabled,
+      .depth_func = cp->depth_stencil.depth_func,
+      .depth_key_invert = cp->depth_stencil.depth_enabled &&
+         (cp->depth_stencil.depth_func == PIPE_FUNC_GREATER ||
+          cp->depth_stencil.depth_func == PIPE_FUNC_GEQUAL),
    };
 
-   /* Run vertex shader OR extract positions passthrough */
+   const void *ib_base = NULL;
+   if (indexed && info->index.resource) {
+      struct cp_resource *ib_res = cp_resource(info->index.resource);
+      ib_base = cp_resource_data(ib_res);
+   }
+
+   unsigned total_verts = num_triangles * 3;
+   struct cp_vertex_ref *refs = cp_build_vertex_refs(info, draws, num_draws,
+                                                     instance_count, ib_base,
+                                                     num_triangles);
+   if (!refs)
+      return;
+
+   /* Positions straight from the vertex buffer. If a vertex shader runs it
+    * overwrites these; otherwise they are passed through as clip space. */
    CUdeviceptr packed_positions = 0;
    CUdeviceptr vs_output_buf = 0;
    bool vs_ran = false;
@@ -465,76 +622,22 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       if (vb_data) {
          char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
          unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
-         unsigned index_size = info->index_size;
 
-         void *ib_base = NULL;
-         if (indexed && info->index.resource) {
-            struct cp_resource *ib_res = cp_resource(info->index.resource);
-            ib_base = cp_resource_data(ib_res);
-         }
-
-         cuMemAllocManaged(&packed_positions, num_triangles * 3 * 16, CU_MEM_ATTACH_GLOBAL);
+         cuMemAllocManaged(&packed_positions, (size_t)total_verts * 16,
+                           CU_MEM_ATTACH_GLOBAL);
          float *dst = (float *)(uintptr_t)packed_positions;
-         unsigned tri_out = 0;
 
-         for (unsigned d = 0; d < num_draws; d++) {
-            unsigned vc = draws[d].count;
-            unsigned first = draws[d].start;
-            int base_vertex = indexed ? draws[d].index_bias : 0;
-
-            void *ib_data = NULL;
-            if (indexed && ib_base)
-               ib_data = (char *)ib_base + first * index_size;
-
-            unsigned draw_tris;
-            if (info->mode == MESA_PRIM_TRIANGLE_STRIP || info->mode == MESA_PRIM_TRIANGLE_FAN)
-               draw_tris = vc >= 3 ? vc - 2 : 0;
-            else
-               draw_tris = vc / 3;
-
-            for (unsigned tri = 0; tri < draw_tris; tri++) {
-               unsigned idx[3];
-               if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
-                  idx[0] = tri;
-                  idx[1] = tri + 1 + (tri & 1);
-                  idx[2] = tri + 2 - (tri & 1);
-               } else if (info->mode == MESA_PRIM_TRIANGLE_FAN) {
-                  idx[0] = 0;
-                  idx[1] = tri + 1;
-                  idx[2] = tri + 2;
-               } else {
-                  idx[0] = tri * 3 + 0;
-                  idx[1] = tri * 3 + 1;
-                  idx[2] = tri * 3 + 2;
-               }
-
-               for (int vi = 0; vi < 3; vi++) {
-                  unsigned vert_idx;
-                  if (indexed && ib_data) {
-                     unsigned raw_idx;
-                     if (index_size == 2)
-                        raw_idx = ((uint16_t *)ib_data)[idx[vi]];
-                     else
-                        raw_idx = ((uint32_t *)ib_data)[idx[vi]];
-                     vert_idx = (unsigned)((int)raw_idx + base_vertex);
-                  } else {
-                     vert_idx = first + idx[vi];
-                  }
-                  float *src_pos = (float *)(vb_start + vert_idx * stride);
-                  dst[(tri_out * 3 + vi) * 4 + 0] = src_pos[0];
-                  dst[(tri_out * 3 + vi) * 4 + 1] = src_pos[1];
-                  dst[(tri_out * 3 + vi) * 4 + 2] = src_pos[2];
-                  dst[(tri_out * 3 + vi) * 4 + 3] = src_pos[3];
-               }
-               tri_out++;
-            }
+         for (unsigned v = 0; v < total_verts; v++) {
+            const float *src = (const float *)(vb_start +
+                                               (size_t)refs[v].vertex * stride);
+            memcpy(dst + v * 4, src, 16);
          }
          rast_args.positions = packed_positions;
       }
    }
 
    if (rast_args.positions == 0) {
-      cuMemFree(visbuf);
+      FREE(refs);
       return;
    }
 
@@ -547,14 +650,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       struct cp_resource *vb_res2 = cp_resource(cp->vertex_buffers[0].buffer.resource);
       void *vb_data2 = cp_resource_data(vb_res2);
       if (vb_data2) {
-         char *vb_start = (char *)vb_data2 + cp->vertex_buffers[0].buffer_offset;
-         unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
-         void *ib_base = NULL;
-         if (indexed && info->index.resource) {
-            struct cp_resource *ib_res2 = cp_resource(info->index.resource);
-            ib_base = cp_resource_data(ib_res2);
-         }
-         unsigned total_verts = num_triangles * 3;
+         unsigned stride;
          unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
          unsigned out_stride = num_vs_outputs * 16;
 
@@ -569,62 +665,40 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          char *vs_in = (char*)(uintptr_t)vs_input_buf;
          memset(vs_in, 0, total_verts * vs_in_stride);
 
-         /* For each assembled vertex, copy each attribute from its VB */
-         {
-            unsigned tri_out2 = 0;
-            for (unsigned d = 0; d < num_draws; d++) {
-               unsigned vc = draws[d].count;
-               unsigned first = draws[d].start;
-               int base_vertex = indexed ? draws[d].index_bias : 0;
-               void *ib_data2 = NULL;
-               unsigned index_size2 = info->index_size;
-               if (indexed && ib_base)
-                  ib_data2 = (char *)ib_base + first * index_size2;
-               unsigned draw_tris2;
-               if (info->mode == MESA_PRIM_TRIANGLE_STRIP || info->mode == MESA_PRIM_TRIANGLE_FAN)
-                  draw_tris2 = vc >= 3 ? vc - 2 : 0;
-               else
-                  draw_tris2 = vc / 3;
-               for (unsigned tri = 0; tri < draw_tris2; tri++) {
-                  unsigned idx2[3];
-                  if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
-                     idx2[0]=tri; idx2[1]=tri+1+(tri&1); idx2[2]=tri+2-(tri&1);
-                  } else if (info->mode == MESA_PRIM_TRIANGLE_FAN) {
-                     idx2[0]=0; idx2[1]=tri+1; idx2[2]=tri+2;
-                  } else {
-                     idx2[0]=tri*3; idx2[1]=tri*3+1; idx2[2]=tri*3+2;
-                  }
-                  for (int vi = 0; vi < 3; vi++) {
-                     unsigned vert_idx;
-                     if (indexed && ib_data2) {
-                        unsigned raw = index_size2==2 ? ((uint16_t*)ib_data2)[idx2[vi]] : ((uint32_t*)ib_data2)[idx2[vi]];
-                        vert_idx = (unsigned)((int)raw + base_vertex);
-                     } else {
-                        vert_idx = first + idx2[vi];
-                     }
-                     /* Copy each element from its VB to the packed layout */
-                     unsigned out_off = (tri_out2*3+vi) * vs_in_stride;
-                     for (unsigned e = 0; e < cp->num_vertex_elements; e++) {
-                        unsigned vb_idx = cp->vertex_elements[e].vertex_buffer_index;
-                        unsigned src_off = cp->vertex_elements[e].src_offset;
-                        unsigned elem_stride = cp->vertex_elements[e].src_stride;
-                        if (vb_idx >= cp->num_vertex_buffers || !cp->vertex_buffers[vb_idx].buffer.resource)
-                           continue;
-                        struct cp_resource *evb = cp_resource(cp->vertex_buffers[vb_idx].buffer.resource);
-                        void *evb_data = cp_resource_data(evb);
-                        if (!evb_data) continue;
-                        char *evb_start = (char*)evb_data + cp->vertex_buffers[vb_idx].buffer_offset;
-                        /* Copy up to 16 bytes of this attribute */
-                        unsigned copy_size = 16; /* max per slot */
-                        char *src = evb_start + vert_idx * elem_stride + src_off;
-                        memcpy(vs_in + out_off + e * 16, src, copy_size);
-                     }
-                  }
-                  tri_out2++;
-               }
+         /* Gather each attribute for every assembled vertex. Attributes with a
+          * non-zero instance divisor advance per instance rather than per
+          * vertex, which is how instanced draws vary their per-instance data. */
+         for (unsigned v = 0; v < total_verts; v++) {
+            char *out = vs_in + (size_t)v * vs_in_stride;
+
+            for (unsigned e = 0; e < cp->num_vertex_elements; e++) {
+               const struct pipe_vertex_element *elem = &cp->vertex_elements[e];
+               unsigned vb_idx = elem->vertex_buffer_index;
+               if (vb_idx >= cp->num_vertex_buffers ||
+                   !cp->vertex_buffers[vb_idx].buffer.resource)
+                  continue;
+
+               struct cp_resource *evb =
+                  cp_resource(cp->vertex_buffers[vb_idx].buffer.resource);
+               void *evb_data = cp_resource_data(evb);
+               if (!evb_data)
+                  continue;
+
+               unsigned index = elem->instance_divisor
+                  ? info->start_instance +
+                    refs[v].instance / elem->instance_divisor
+                  : refs[v].vertex;
+
+               const char *src = (const char *)evb_data +
+                  cp->vertex_buffers[vb_idx].buffer_offset +
+                  (size_t)index * elem->src_stride + elem->src_offset;
+
+               /* Each attribute occupies a 16-byte slot regardless of its
+                * real width; the shader only reads the components it declared. */
+               memcpy(out + e * 16, src, 16);
             }
          }
-         /* Update stride passed to kernel */
+
          stride = vs_in_stride;
 
          CUdeviceptr vs_args_dev;
@@ -641,37 +715,15 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          cuMemAllocManaged(&vcount_dev, 4, CU_MEM_ATTACH_GLOBAL);
          *(uint32_t*)(uintptr_t)vcount_dev = total_verts;
 
-         /* Build vertex_id array — the original vertex index for each assembled vertex */
-         CUdeviceptr vid_buf;
-         cuMemAllocManaged(&vid_buf, total_verts * 4, CU_MEM_ATTACH_GLOBAL);
-         uint32_t *vid_arr = (uint32_t*)(uintptr_t)vid_buf;
-         {
-            unsigned tri_idx = 0;
-            for (unsigned d2 = 0; d2 < num_draws; d2++) {
-               unsigned vc2 = draws[d2].count;
-               unsigned first2 = draws[d2].start;
-               int bv2 = indexed ? draws[d2].index_bias : 0;
-               void *ib2 = NULL;
-               unsigned isz2 = info->index_size;
-               if (indexed && ib_base) ib2 = (char*)ib_base + first2 * isz2;
-               unsigned dt2 = (info->mode == MESA_PRIM_TRIANGLE_STRIP || info->mode == MESA_PRIM_TRIANGLE_FAN) ?
-                  (vc2 >= 3 ? vc2-2 : 0) : vc2/3;
-               for (unsigned t = 0; t < dt2; t++) {
-                  unsigned ix[3];
-                  if (info->mode == MESA_PRIM_TRIANGLE_STRIP) { ix[0]=t; ix[1]=t+1+(t&1); ix[2]=t+2-(t&1); }
-                  else if (info->mode == MESA_PRIM_TRIANGLE_FAN) { ix[0]=0; ix[1]=t+1; ix[2]=t+2; }
-                  else { ix[0]=t*3; ix[1]=t*3+1; ix[2]=t*3+2; }
-                  for (int v=0; v<3; v++) {
-                     unsigned vi;
-                     if (indexed && ib2) {
-                        unsigned raw = isz2==2 ? ((uint16_t*)ib2)[ix[v]] : ((uint32_t*)ib2)[ix[v]];
-                        vi = (unsigned)((int)raw + bv2);
-                     } else { vi = first2 + ix[v]; }
-                     vid_arr[tri_idx*3+v] = vi;
-                  }
-                  tri_idx++;
-               }
-            }
+         /* gl_VertexIndex and gl_InstanceIndex, per assembled vertex. */
+         CUdeviceptr vid_buf, iid_buf;
+         cuMemAllocManaged(&vid_buf, (size_t)total_verts * 4, CU_MEM_ATTACH_GLOBAL);
+         cuMemAllocManaged(&iid_buf, (size_t)total_verts * 4, CU_MEM_ATTACH_GLOBAL);
+         uint32_t *vid_arr = (uint32_t *)(uintptr_t)vid_buf;
+         uint32_t *iid_arr = (uint32_t *)(uintptr_t)iid_buf;
+         for (unsigned v = 0; v < total_verts; v++) {
+            vid_arr[v] = refs[v].vertex;
+            iid_arr[v] = refs[v].instance;
          }
 
          vs_args[0] = (void*)(uintptr_t)vcount_dev;
@@ -680,7 +732,16 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          vs_args[3] = (void*)(uintptr_t)stride_dev;
          vs_args[4] = (void*)(uintptr_t)vs_output_buf;
          vs_args[5] = (void*)(uintptr_t)vid_buf; /* vertex_id array */
-         vs_args[6] = NULL; vs_args[7] = NULL;
+         vs_args[6] = (void*)(uintptr_t)iid_buf; /* instance_id array */
+
+         /* Draw parameters: base vertex, base instance, draw id. */
+         CUdeviceptr draw_params;
+         cuMemAllocManaged(&draw_params, 3 * 4, CU_MEM_ATTACH_GLOBAL);
+         uint32_t *params = (uint32_t *)(uintptr_t)draw_params;
+         params[0] = indexed ? (uint32_t)draws[0].index_bias : draws[0].start;
+         params[1] = info->start_instance;
+         params[2] = drawid_offset;
+         vs_args[7] = (void*)(uintptr_t)draw_params;
 
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
@@ -718,12 +779,16 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          cuMemFree(vs_input_buf);
          cuMemFree(vcount_dev);
          cuMemFree(vid_buf);
+         cuMemFree(iid_buf);
+         cuMemFree(draw_params);
       }
    }
 
    if (getenv("CUDAPIPE_DEBUG_DRAW")) {
-      fprintf(stderr, "cudapipe: draw %u tris, fb=%ux%u, vp=[%.0f,%.0f,%.0f,%.0f] stride=%u scale=[%.1f,%.1f]\n",
-              num_triangles, w, h, vp_x, vp_y, vp_w, vp_h, cp->vertex_stride,
+      fprintf(stderr, "cudapipe: draw %u tris (%u instances), fb=%ux%u, "
+              "vp=[%.0f,%.0f,%.0f,%.0f] stride=%u scale=[%.1f,%.1f]\n",
+              num_triangles, instance_count, w, h, vp_x, vp_y, vp_w, vp_h,
+              cp->vertex_stride,
               cp->viewport.scale[0], cp->viewport.scale[1]);
       for (unsigned e = 0; e < cp->num_vertex_elements && e < 4; e++)
          fprintf(stderr, "  elem[%u]: offset=%u fmt=%u vb=%u\n", e,
@@ -750,11 +815,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
 
    cuCtxSynchronize();
-   /* visbuf is persistent (freed in set_framebuffer_state or destroy_context) */
+   /* visbuf and depthbuf outlive the draw; see cp_set_framebuffer_state() */
    if (packed_positions)
       cuMemFree(packed_positions);
    if (vs_output_buf)
       cuMemFree(vs_output_buf);
+   FREE(refs);
 }
 
 static void
@@ -928,6 +994,11 @@ cp_create_depth_stencil_alpha_state(struct pipe_context *ctx,
 static void
 cp_bind_depth_stencil_alpha_state(struct pipe_context *ctx, void *state)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
+   if (state)
+      cp->depth_stencil = *(struct pipe_depth_stencil_alpha_state *)state;
+   else
+      memset(&cp->depth_stencil, 0, sizeof(cp->depth_stencil));
 }
 
 static void
