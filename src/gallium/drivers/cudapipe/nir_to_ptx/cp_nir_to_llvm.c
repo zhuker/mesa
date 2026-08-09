@@ -2,6 +2,7 @@
 
 #include "compiler/nir/nir.h"
 #include "util/u_memory.h"
+#include "kernels/cp_rast_types.h"
 
 #include <llvm-c/Core.h>
 #include <llvm-c/Target.h>
@@ -1202,6 +1203,7 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
    unsigned bs = tex->def.bit_size;
 
    LLVMValueRef tex_handle = NULL, samp_handle = NULL, coord = NULL;
+   LLVMValueRef explicit_lod = NULL;
    for (unsigned i = 0; i < tex->num_srcs; i++) {
       switch (tex->src[i].src_type) {
       case nir_tex_src_texture_handle:
@@ -1213,14 +1215,48 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
       case nir_tex_src_coord:
          coord = get_src(ctx, &tex->src[i].src);
          break;
+      case nir_tex_src_lod:
+         explicit_lod = get_src(ctx, &tex->src[i].src);
+         break;
       default:
          break;
       }
    }
 
-   /* Anything we can't route to the sampler yet (texel fetches, shadow
-    * compares, cube maps, ...) still has to produce a value. */
-   if (tex->op != nir_texop_tex || !tex_handle || !coord) {
+   /* Map the sampler dimensionality onto what the sampler understands. */
+   int32_t flags;
+   switch (tex->sampler_dim) {
+   case GLSL_SAMPLER_DIM_1D:
+      flags = tex->is_array ? CP_TEX_1D_ARRAY : CP_TEX_1D;
+      break;
+   case GLSL_SAMPLER_DIM_3D:
+      flags = CP_TEX_3D;
+      break;
+   case GLSL_SAMPLER_DIM_CUBE:
+      flags = tex->is_array ? CP_TEX_CUBE_ARRAY : CP_TEX_CUBE;
+      break;
+   case GLSL_SAMPLER_DIM_2D:
+   case GLSL_SAMPLER_DIM_RECT:
+   case GLSL_SAMPLER_DIM_EXTERNAL:
+   case GLSL_SAMPLER_DIM_MS:
+      flags = tex->is_array ? CP_TEX_2D_ARRAY : CP_TEX_2D;
+      break;
+   default:
+      flags = -1;
+      break;
+   }
+
+   if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
+      flags |= CP_TEX_FETCH;
+
+   bool supported = flags >= 0 && tex_handle && coord &&
+      (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
+       tex->op == nir_texop_txb || tex->op == nir_texop_txf ||
+       tex->op == nir_texop_txf_ms);
+
+   /* Shadow compares, gathers and derivative-explicit samples still have to
+    * produce a value even though the sampler cannot serve them yet. */
+   if (!supported) {
       LLVMTypeRef ft = get_float_type(ctx, bs);
       LLVMValueRef zero = LLVMConstReal(ft, 0.0);
       if (nc == 1) {
@@ -1241,18 +1277,39 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
    if (!samp_handle)
       samp_handle = LLVMConstInt(i64, 0, false);
 
-   /* SSA values are kept in integer registers, so coerce the coordinates to
-    * float the same way the ALU path does. */
-   LLVMValueRef u = LLVMBuildExtractElement(ctx->builder, coord,
-                                            LLVMConstInt(i32, 0, false), "u");
-   LLVMValueRef v = tex->coord_components > 1
-      ? LLVMBuildExtractElement(ctx->builder, coord, LLVMConstInt(i32, 1, false), "v")
-      : LLVMConstReal(f32, 0.0);
+   /* Pull out up to three coordinate components as floats. Texel fetches carry
+    * integer coordinates, which convert numerically; sampled coordinates are
+    * already floats and only need a bitcast out of the integer register. */
+   bool integer_coords = (flags & CP_TEX_FETCH) != 0;
+   LLVMValueRef c[3];
+   for (unsigned i = 0; i < 3; i++) {
+      if (i < (unsigned)tex->coord_components) {
+         c[i] = LLVMGetTypeKind(LLVMTypeOf(coord)) == LLVMVectorTypeKind
+            ? LLVMBuildExtractElement(ctx->builder, coord,
+                                      LLVMConstInt(i32, i, false), "")
+            : coord;
+         if (LLVMGetTypeKind(LLVMTypeOf(c[i])) == LLVMIntegerTypeKind) {
+            c[i] = integer_coords
+               ? LLVMBuildSIToFP(ctx->builder, c[i], f32, "")
+               : LLVMBuildBitCast(ctx->builder, c[i], f32, "");
+         }
+      } else {
+         c[i] = LLVMConstReal(f32, 0.0);
+      }
+   }
 
-   if (LLVMGetTypeKind(LLVMTypeOf(u)) == LLVMIntegerTypeKind)
-      u = LLVMBuildBitCast(ctx->builder, u, f32, "u_f");
-   if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind)
-      v = LLVMBuildBitCast(ctx->builder, v, f32, "v_f");
+   LLVMValueRef lod_arg = LLVMConstReal(f32, 0.0);
+   if (explicit_lod) {
+      lod_arg = explicit_lod;
+      if (LLVMGetTypeKind(LLVMTypeOf(lod_arg)) == LLVMVectorTypeKind)
+         lod_arg = LLVMBuildExtractElement(ctx->builder, lod_arg,
+                                           LLVMConstInt(i32, 0, false), "");
+      if (LLVMGetTypeKind(LLVMTypeOf(lod_arg)) == LLVMIntegerTypeKind) {
+         lod_arg = integer_coords
+            ? LLVMBuildSIToFP(ctx->builder, lod_arg, f32, "")
+            : LLVMBuildBitCast(ctx->builder, lod_arg, f32, "");
+      }
+   }
 
    /* If the coordinate is a varying straight from the rasterizer, tell the
     * sampler which one: it can then look up that varying's screen-space
@@ -1273,16 +1330,17 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
    /* float4 comes back as a struct of four floats under the NVPTX ABI. */
    LLVMTypeRef ret_type = LLVMStructTypeInContext(ctx->llvm_ctx,
       (LLVMTypeRef[]){ f32, f32, f32, f32 }, 4, false);
-   LLVMTypeRef param_types[] = { i64, i64, f32, f32, i32 };
-   LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, 5, false);
+   LLVMTypeRef param_types[] = { i64, i64, f32, f32, f32, f32, i32, i32 };
+   LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, 8, false);
 
-   LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, "cp_tex_sample_2d");
+   LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, "cp_tex_sample");
    if (!fn)
-      fn = LLVMAddFunction(ctx->module, "cp_tex_sample_2d", fn_type);
+      fn = LLVMAddFunction(ctx->module, "cp_tex_sample", fn_type);
 
-   LLVMValueRef args[] = { tex_handle, samp_handle, u, v,
-                           LLVMConstInt(i32, (unsigned)coord_slot, true) };
-   LLVMValueRef call = LLVMBuildCall2(ctx->builder, fn_type, fn, args, 5, "tex");
+   LLVMValueRef args[] = { tex_handle, samp_handle, c[0], c[1], c[2], lod_arg,
+                           LLVMConstInt(i32, (unsigned)coord_slot, true),
+                           LLVMConstInt(i32, (unsigned)flags, true) };
+   LLVMValueRef call = LLVMBuildCall2(ctx->builder, fn_type, fn, args, 8, "tex");
 
    LLVMTypeRef ft = get_float_type(ctx, bs);
    if (nc == 1) {

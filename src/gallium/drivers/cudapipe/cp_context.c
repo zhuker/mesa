@@ -1587,11 +1587,30 @@ cp_create_texture_handle(struct pipe_context *ctx,
          info->base = (uint64_t)(uintptr_t)cp_resource_data(cres);
          info->width = res->width0;
          info->height = res->height0;
-         info->depth = res->depth0;
+
+         /* Layer count lives in depth0 for 3D textures and in array_size for
+          * everything layered — including cube maps, whose six faces are just
+          * array layers to the sampler. */
+         switch (res->target) {
+         case PIPE_TEXTURE_3D:
+            info->depth = MAX2(res->depth0, 1);
+            break;
+         case PIPE_TEXTURE_CUBE:
+         case PIPE_TEXTURE_CUBE_ARRAY:
+         case PIPE_TEXTURE_1D_ARRAY:
+         case PIPE_TEXTURE_2D_ARRAY:
+            info->depth = MAX2(res->array_size, 1);
+            break;
+         default:
+            info->depth = 1;
+            break;
+         }
+
          info->format = format;
          info->target = res->target;
          info->first_level = view->u.tex.first_level;
          info->last_level = view->u.tex.last_level;
+         info->first_layer = view->u.tex.first_layer;
          info->encoding = cp_texel_encoding_from_format(format);
          info->blocksize = util_format_get_blocksize(format);
          info->is_srgb = util_format_is_srgb(format);

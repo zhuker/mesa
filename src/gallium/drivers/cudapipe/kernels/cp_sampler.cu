@@ -106,6 +106,9 @@ cp_fetch_texel(const struct cp_texture_info *tex, unsigned level,
    const unsigned char *base =
       (const unsigned char *)tex->base + tex->mip_offset[level];
 
+   /* A view can start partway into an array, so layers are relative to it. */
+   z += (int)tex->first_layer;
+
    if (tex->encoding >= CP_TEXEL_DXT1_RGB) {
       /* Block-compressed: 4x4 blocks, 8 or 16 bytes each. */
       unsigned block_size = (tex->encoding == CP_TEXEL_DXT1_RGB ||
@@ -391,11 +394,51 @@ cp_wrap_texel(int *coord, int size, unsigned mode)
    return true;
 }
 
-/* Sample one mip level with the given in-level filter. */
+/*
+ * Map a cube direction to a face and the 2D coordinates within it.
+ *
+ * The major axis picks the face; the other two components, divided by its
+ * magnitude, give coordinates in [-1, 1] which then map to [0, 1]. Face order
+ * and the sign conventions follow the usual +X -X +Y -Y +Z -Z layout.
+ */
+static __device__ unsigned
+cp_cube_face(float x, float y, float z, float *out_u, float *out_v)
+{
+   float ax = fabsf(x), ay = fabsf(y), az = fabsf(z);
+   float ma, uc, vc;
+   unsigned face;
+
+   if (ax >= ay && ax >= az) {
+      ma = ax;
+      face = x > 0.0f ? 0 : 1;
+      uc = x > 0.0f ? -z : z;
+      vc = -y;
+   } else if (ay >= az) {
+      ma = ay;
+      face = y > 0.0f ? 2 : 3;
+      uc = x;
+      vc = y > 0.0f ? z : -z;
+   } else {
+      ma = az;
+      face = z > 0.0f ? 4 : 5;
+      uc = z > 0.0f ? x : -x;
+      vc = -y;
+   }
+
+   if (ma == 0.0f)
+      ma = 1.0f;
+   *out_u = 0.5f * (uc / ma + 1.0f);
+   *out_v = 0.5f * (vc / ma + 1.0f);
+   return face;
+}
+
+/* Sample one mip level with the given in-level filter. `layer` selects the
+ * array slice or cube face, or the 3D slice. */
 static __device__ struct cp_rgba
-cp_sample_level(const struct cp_texture_info *tex,
-                const struct cp_sampler_info *samp, unsigned level,
-                float u, float v, unsigned filter)
+cp_sample_level_layer(const struct cp_texture_info *tex,
+                      const struct cp_sampler_info *samp, unsigned level,
+                      float u, float v, int layer, unsigned filter,
+                      bool layer_is_normalized, float layer_coord)
 {
    struct cp_rgba c;
 
@@ -403,6 +446,26 @@ cp_sample_level(const struct cp_texture_info *tex,
    int h = (int)(tex->height >> level);
    w = w < 1 ? 1 : w;
    h = h < 1 ? 1 : h;
+
+   /* A 3D texture's slices shrink with the mip level, so the slice has to be
+    * derived from the normalized coordinate at the level being sampled —
+    * unlike array layers, which are the same at every level. */
+   int depth = (int)tex->depth;
+   if (layer_is_normalized) {
+      depth = depth >> level;
+      if (depth < 1)
+         depth = 1;
+      layer = (int)floorf(layer_coord * (float)depth);
+      if (!cp_wrap_texel(&layer, depth, samp->wrap_r)) {
+         c.r = samp->border_color[0]; c.g = samp->border_color[1];
+         c.b = samp->border_color[2]; c.a = samp->border_color[3];
+         return c;
+      }
+   } else {
+      if (depth < 1)
+         depth = 1;
+      layer = layer < 0 ? 0 : (layer >= depth ? depth - 1 : layer);
+   }
 
    /* Texel-space coordinates; normalized coords scale by the level size. */
    float su = samp->unnormalized_coords ? u : u * (float)w;
@@ -427,7 +490,7 @@ cp_sample_level(const struct cp_texture_info *tex,
             struct cp_rgba t;
             if (cp_wrap_texel(&x, w, samp->wrap_s) &&
                 cp_wrap_texel(&y, h, samp->wrap_t)) {
-               t = cp_fetch_texel(tex, level, x, y, 0);
+               t = cp_fetch_texel(tex, level, x, y, layer);
             } else {
                t.r = samp->border_color[0]; t.g = samp->border_color[1];
                t.b = samp->border_color[2]; t.a = samp->border_color[3];
@@ -442,7 +505,7 @@ cp_sample_level(const struct cp_texture_info *tex,
       int y = (int)floorf(sv);
       if (cp_wrap_texel(&x, w, samp->wrap_s) &&
           cp_wrap_texel(&y, h, samp->wrap_t)) {
-         c = cp_fetch_texel(tex, level, x, y, 0);
+         c = cp_fetch_texel(tex, level, x, y, layer);
       } else {
          c.r = samp->border_color[0]; c.g = samp->border_color[1];
          c.b = samp->border_color[2]; c.a = samp->border_color[3];
@@ -452,8 +515,13 @@ cp_sample_level(const struct cp_texture_info *tex,
 }
 
 /*
- * Sample a 2D texture. `tex_handle` and `samp_handle` are the descriptor
+ * Sample a texture. `tex_handle` and `samp_handle` are the descriptor
  * addresses the shader loaded; see the file comment.
+ *
+ * `c0..c2` are the coordinate, interpreted per `flags` (see enum
+ * cp_tex_target): the third component is the array layer, the 3D slice, or
+ * part of the cube direction. `explicit_lod` is used for texel fetches and
+ * explicit-LOD samples.
  *
  * `coord_slot` is the fragment shader input slot the coordinate came from, or
  * -1 if the compiler couldn't trace it to one. With a slot we can look up the
@@ -461,8 +529,9 @@ cp_sample_level(const struct cp_texture_info *tex,
  * sample the base level.
  */
 extern "C" __device__ float4
-cp_tex_sample_2d(unsigned long long tex_handle, unsigned long long samp_handle,
-                 float u, float v, int coord_slot)
+cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
+              float c0, float c1, float c2, float explicit_lod,
+              int coord_slot, int flags)
 {
    float4 result = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
 
@@ -474,6 +543,8 @@ cp_tex_sample_2d(unsigned long long tex_handle, unsigned long long samp_handle,
                                                CP_DESC_IMAGE_FUNCTIONS_OFFSET);
    if (!tex || !tex->base || !tex->width || !tex->height)
       return result;
+
+   unsigned target = (unsigned)flags & CP_TEX_TARGET_MASK;
 
    struct cp_sampler_info samp;
    if (samp_handle && cp_sampler_table) {
@@ -487,6 +558,65 @@ cp_tex_sample_2d(unsigned long long tex_handle, unsigned long long samp_handle,
       samp.min_lod = 0.0f; samp.max_lod = 0.0f; samp.lod_bias = 0.0f;
       samp.border_color[0] = samp.border_color[1] = 0.0f;
       samp.border_color[2] = 0.0f; samp.border_color[3] = 0.0f;
+   }
+
+   unsigned base_level = tex->first_level;
+   unsigned max_level = tex->last_level > base_level ? tex->last_level : base_level;
+
+   /* Resolve the coordinate into 2D-plus-layer form. */
+   float u = c0, v = c1;
+   int layer = 0;
+
+   switch (target) {
+   case CP_TEX_CUBE:
+   case CP_TEX_CUBE_ARRAY: {
+      /* The cube direction picks a face, which is just another layer. */
+      float fu, fv;
+      unsigned face = cp_cube_face(c0, c1, c2, &fu, &fv);
+      u = fu;
+      v = fv;
+      layer = (int)face;
+      break;
+   }
+   case CP_TEX_1D_ARRAY:
+      layer = (int)(c1 + 0.5f);
+      v = 0.0f;
+      break;
+   case CP_TEX_2D_ARRAY:
+      layer = (int)(c2 + 0.5f);
+      break;
+   case CP_TEX_3D:
+      /* Slice resolved per mip level inside cp_sample_level_layer(); filtering
+       * between slices is not implemented. */
+      break;
+   default:
+      break;
+   }
+
+   /* A texel fetch bypasses the sampler entirely: integer coordinates, an
+    * explicit level, and no filtering or wrapping. */
+   if (flags & CP_TEX_FETCH) {
+      unsigned level = (unsigned)explicit_lod + base_level;
+      if (level > max_level)
+         level = max_level;
+
+      int w = (int)(tex->width >> level);
+      int h = (int)(tex->height >> level);
+      w = w < 1 ? 1 : w;
+      h = h < 1 ? 1 : h;
+
+      int x = (int)c0;
+      int y = (int)c1;
+      if (target == CP_TEX_1D_ARRAY)
+         layer = (int)c1, y = 0;
+      else if (target == CP_TEX_2D_ARRAY || target == CP_TEX_3D)
+         layer = (int)c2;
+
+      if (x < 0 || y < 0 || x >= w || y >= h)
+         return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+      struct cp_rgba c = cp_fetch_texel(tex, level, x, y, layer);
+      return make_float4(c.r, c.g, c.b, c.a);
    }
 
    /* Level of detail from how fast the coordinate moves across the screen. */
@@ -515,11 +645,10 @@ cp_tex_sample_2d(unsigned long long tex_handle, unsigned long long samp_handle,
    bool minifying = have_lod && lod > 0.0f;
    unsigned filter = minifying ? samp.min_img_filter : samp.mag_img_filter;
 
-   unsigned base_level = tex->first_level;
-   unsigned max_level = tex->last_level > base_level ? tex->last_level : base_level;
-
    if (!minifying || samp.min_mip_filter == CP_MIPFILTER_NONE) {
-      struct cp_rgba c = cp_sample_level(tex, &samp, base_level, u, v, filter);
+      struct cp_rgba c =
+         cp_sample_level_layer(tex, &samp, base_level, u, v, layer, filter,
+                               target == CP_TEX_3D, c2);
       return make_float4(c.r, c.g, c.b, c.a);
    }
 
@@ -532,7 +661,9 @@ cp_tex_sample_2d(unsigned long long tex_handle, unsigned long long samp_handle,
       unsigned level = base_level + (unsigned)ceilf(lod - 0.5f);
       if (level > max_level)
          level = max_level;
-      struct cp_rgba c = cp_sample_level(tex, &samp, level, u, v, filter);
+      struct cp_rgba c =
+         cp_sample_level_layer(tex, &samp, level, u, v, layer, filter,
+                               target == CP_TEX_3D, c2);
       return make_float4(c.r, c.g, c.b, c.a);
    }
 
@@ -543,8 +674,10 @@ cp_tex_sample_2d(unsigned long long tex_handle, unsigned long long samp_handle,
    if (lo > max_level) lo = max_level;
    if (hi > max_level) hi = max_level;
 
-   struct cp_rgba a = cp_sample_level(tex, &samp, lo, u, v, filter);
-   struct cp_rgba b = cp_sample_level(tex, &samp, hi, u, v, filter);
+   struct cp_rgba a = cp_sample_level_layer(tex, &samp, lo, u, v, layer, filter,
+                                              target == CP_TEX_3D, c2);
+   struct cp_rgba b = cp_sample_level_layer(tex, &samp, hi, u, v, layer, filter,
+                                              target == CP_TEX_3D, c2);
    return make_float4(a.r + (b.r - a.r) * frac,
                       a.g + (b.g - a.g) * frac,
                       a.b + (b.b - a.b) * frac,

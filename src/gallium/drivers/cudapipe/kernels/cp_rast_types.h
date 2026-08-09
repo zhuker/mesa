@@ -174,6 +174,7 @@ struct cp_texture_info {
    uint32_t format;         /* enum pipe_format */
    uint32_t target;         /* enum pipe_texture_target */
    uint32_t first_level, last_level;
+   uint32_t first_layer;    /* Views can start partway into an array */
    uint32_t row_stride[CP_MAX_TEXTURE_LEVELS];
    uint32_t img_stride[CP_MAX_TEXTURE_LEVELS];
    uint32_t mip_offset[CP_MAX_TEXTURE_LEVELS];
@@ -218,6 +219,22 @@ enum cp_texel_encoding {
    CP_TEXEL_DXT3_RGBA,
    CP_TEXEL_DXT5_RGBA,
 };
+
+/* What kind of texture a sample targets, and how to sample it. Passed to the
+ * sampler as the `flags` argument. */
+enum cp_tex_target {
+   CP_TEX_1D = 0,
+   CP_TEX_2D,
+   CP_TEX_3D,
+   CP_TEX_CUBE,
+   CP_TEX_1D_ARRAY,
+   CP_TEX_2D_ARRAY,
+   CP_TEX_CUBE_ARRAY,
+};
+
+#define CP_TEX_TARGET_MASK 0xF
+/* Coordinates are integer texels and the level is explicit (texelFetch). */
+#define CP_TEX_FETCH       0x10
 
 /* Mirrors the subset of pipe_sampler_state the sampler actually uses. */
 struct cp_sampler_info {
