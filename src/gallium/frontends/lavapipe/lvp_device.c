@@ -1525,6 +1525,18 @@ lvp_physical_device_init(struct lvp_physical_device *device,
       device->vk.supported_extensions.KHR_robustness2 = false;
       device->vk.supported_extensions.EXT_robustness2 = false;
    }
+   /* Acceleration structures are built and traversed by shaders this frontend
+    * generates, and those do 64-bit device-address arithmetic throughout. A
+    * driver without 64-bit integers cannot run them. */
+   if (!device->pscreen->caps.int64) {
+      device->vk.supported_extensions.KHR_acceleration_structure = false;
+      device->vk.supported_extensions.KHR_ray_query = false;
+      device->vk.supported_extensions.KHR_ray_tracing_pipeline = false;
+      device->vk.supported_extensions.KHR_ray_tracing_maintenance1 = false;
+      device->vk.supported_extensions.KHR_ray_tracing_position_fetch = false;
+      device->vk.supported_extensions.EXT_opacity_micromap = false;
+      device->vk.supported_extensions.EXT_pipeline_library_group_handles = false;
+   }
 #if defined(HAVE_LIBDRM) && defined(HAVE_LINUX_UDMABUF_H)
    int dmabuf_bits = DRM_PRIME_CAP_EXPORT | DRM_PRIME_CAP_IMPORT;
    int supported_dmabuf_bits = device->pscreen->caps.dmabuf;

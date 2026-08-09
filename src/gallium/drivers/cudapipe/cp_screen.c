@@ -128,7 +128,9 @@ cp_init_shader_caps(struct pipe_screen *screen)
       caps->indirect_temp_addr = true;
       caps->indirect_const_addr = true;
       caps->integers = true;
-      caps->int64_atomics = true;
+      /* 64-bit integers aren't supported (caps.int64 is left false), and
+       * 64-bit atomics without them is a contradiction the API rejects. */
+      caps->int64_atomics = false;
       caps->max_texture_samplers = 32;
       caps->max_sampler_views = 32;
       caps->supported_irs = (1 << PIPE_SHADER_IR_NIR);
