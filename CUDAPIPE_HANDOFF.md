@@ -28,13 +28,44 @@ VK_DRIVER_FILES=$PWD/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv
   <vulkan app>
 ```
 
-## Scope: offscreen only
+## Scope
 
-The driver targets headless, compute-only rendering: applications draw into
-`VkImage`s and read the result back. It exposes no `VK_KHR_swapchain` and the
-build deliberately leaves `-Dplatforms=` empty. dEQP runs against the
-`vulkan_headless` target for the same reason. Presentation is out of scope, so
-nothing here depends on a display server.
+**Offscreen only.** Applications draw into `VkImage`s and read the result back.
+The driver exposes no `VK_KHR_swapchain` and the build deliberately leaves
+`-Dplatforms=` empty; dEQP runs against the `vulkan_headless` target for the
+same reason. Nothing here depends on a display server.
+
+**Feature target: a mid-range mobile GPU.** Rather than chase desktop Vulkan,
+aim at roughly what an Adreno 6xx or Mali-G7x exposes. That is a bounded,
+well-understood target, it is what the intended workload (Roblox's Android
+client) actually requires, and it lines up with what a compute-only rasterizer
+can realistically do:
+
+* no geometry or tessellation stages
+* no ray tracing, mesh shaders or transform feedback
+* no sparse resources, no multisampling
+* a small number of colour attachments
+* core Vulkan 1.1-era functionality rather than the latest extensions
+
+One consequence is easy to miss and matters: mobile GPUs use **ETC2 and ASTC**,
+not BC/DXT. The sampler currently decodes DXT1/3/5 — a desktop format family —
+and no ETC2 or ASTC at all. Committing to the mobile target makes ETC2 and
+ASTC LDR decode required work, and BC optional.
+
+A useful smell test for over-claiming: compare the advertised extension list
+against a real GPU on the same machine. cudapipe should never advertise more
+than hardware does.
+
+```bash
+for icd in /usr/share/vulkan/icd.d/nvidia_icd.json <cudapipe icd>.json; do
+   VK_DRIVER_FILES=$icd vulkaninfo 2>/dev/null |
+      awk '/^Device Extensions/,/^$/' | grep -oE "VK_[A-Za-z0-9_]+" | sort -u
+done
+```
+
+It is a heuristic, not a law — lavapipe implements some extensions in the
+frontend that NVIDIA has never shipped — but anything cudapipe claims and
+hardware doesn't deserves justification.
 
 ## Architecture
 

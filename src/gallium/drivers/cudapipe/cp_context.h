@@ -96,4 +96,14 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags);
 uint32_t cp_depth_to_sortable(float depth);
 void cp_clear_depthbuf(struct cp_context *cp, float depth);
 
+/*
+ * How the sampler and the fragment writeback decode and encode a format, or
+ * CP_TEXEL_UNSUPPORTED / a negative result when they can't handle it at all.
+ *
+ * The screen reports format support from these, so that what the driver claims
+ * to support and what its kernels can actually decode cannot drift apart.
+ */
+uint32_t cp_texel_encoding_from_format(enum pipe_format format);
+int cp_color_encoding_from_format(enum pipe_format format);
+
 #endif

@@ -227,10 +227,15 @@ cp_build_vertex_refs(const struct pipe_draw_info *info,
    return refs;
 }
 
-static uint32_t
+/* Which colour encoding the fragment writeback can produce, or -1 if it can't
+ * write this format at all. */
+int
 cp_color_encoding_from_format(enum pipe_format format)
 {
    switch (format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+      return CP_COLOR_R8G8B8A8_UNORM;
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
       return CP_COLOR_B8G8R8A8_UNORM;
@@ -245,7 +250,7 @@ cp_color_encoding_from_format(enum pipe_format format)
    case PIPE_FORMAT_R16G16B16A16_FLOAT:
       return CP_COLOR_R16G16B16A16_FLOAT;
    default:
-      return CP_COLOR_R8G8B8A8_UNORM;
+      return -1;
    }
 }
 
@@ -430,8 +435,8 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .width = w,
       .fs_out_stride = fs_out_stride,
       .num_pixels = num_pixels,
-      .color_encoding =
-         cp_color_encoding_from_format(cp->framebuffer.cbufs[0].format),
+      .color_encoding = (uint32_t)MAX2(
+         cp_color_encoding_from_format(cp->framebuffer.cbufs[0].format), 0),
       .blend_enable = rt->blend_enable,
       .rgb_src_factor = rt->rgb_src_factor,
       .rgb_dst_factor = rt->rgb_dst_factor,
@@ -1446,9 +1451,9 @@ struct cp_texture_handle {
 };
 
 /* Translate a pipe_format into the sampler's decode path. Formats we don't
- * decode yet map to CP_TEXEL_UNSUPPORTED, which samples as opaque black rather
- * than reading garbage. */
-static uint32_t
+ * decode yet map to CP_TEXEL_UNSUPPORTED; the screen refuses to advertise
+ * those, so reaching one here means something bypassed format checking. */
+uint32_t
 cp_texel_encoding_from_format(enum pipe_format format)
 {
    switch (format) {

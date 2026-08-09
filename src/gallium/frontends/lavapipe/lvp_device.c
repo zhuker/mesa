@@ -1505,6 +1505,26 @@ lvp_physical_device_init(struct lvp_physical_device *device,
 
    device->max_images = device->pscreen->shader_caps[MESA_SHADER_FRAGMENT].max_shader_images;
    device->vk.supported_extensions = lvp_device_extensions_supported;
+
+   /* The table above describes what this frontend can implement, not what the
+    * driver underneath can execute. Withdraw the extensions whose shader
+    * stages the screen doesn't support, so a driver that lacks them reports
+    * them as unsupported instead of accepting the work and failing later. */
+   if (!device->pscreen->shader_caps[MESA_SHADER_MESH].max_instructions) {
+      device->vk.supported_extensions.EXT_mesh_shader = false;
+      device->vk.supported_extensions.NV_mesh_shader = false;
+   }
+   if (!device->pscreen->caps.max_stream_output_buffers)
+      device->vk.supported_extensions.EXT_transform_feedback = false;
+   if (!device->pscreen->caps.shader_stencil_export)
+      device->vk.supported_extensions.EXT_shader_stencil_export = false;
+   if (!device->pscreen->caps.primitive_restart &&
+       !device->pscreen->caps.primitive_restart_fixed_index)
+      device->vk.supported_extensions.EXT_primitive_restart_index = false;
+   if (!device->pscreen->caps.robust_buffer_access_behavior) {
+      device->vk.supported_extensions.KHR_robustness2 = false;
+      device->vk.supported_extensions.EXT_robustness2 = false;
+   }
 #if defined(HAVE_LIBDRM) && defined(HAVE_LINUX_UDMABUF_H)
    int dmabuf_bits = DRM_PRIME_CAP_EXPORT | DRM_PRIME_CAP_IMPORT;
    int supported_dmabuf_bits = device->pscreen->caps.dmabuf;

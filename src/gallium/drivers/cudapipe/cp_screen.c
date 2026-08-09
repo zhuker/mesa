@@ -2,6 +2,7 @@
 #include "cp_context.h"
 #include "cp_resource.h"
 #include "cp_public.h"
+#include "kernels/cp_rast_types.h"
 
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
@@ -43,26 +44,44 @@ cp_init_screen_caps(struct pipe_screen *screen)
 
    u_init_pipe_screen_caps(screen, 0);
 
+   /*
+    * Only claim what the kernels implement. Anything advertised here that the
+    * driver can't actually do turns into a crash later rather than a clean
+    * refusal, so this list stays deliberately short.
+    */
    caps->npot_textures = true;
    caps->mixed_framebuffer_sizes = true;
    caps->mixed_color_depth_bits = true;
-   caps->anisotropic_filter = true;
-   caps->occlusion_query = true;
    caps->texture_mirror_clamp_to_edge = true;
    caps->texture_swizzle = true;
    caps->blend_equation_separate = true;
-   caps->indep_blend_enable = true;
-   caps->indep_blend_func = true;
    caps->depth_clip_disable = true;
    caps->fragment_shader_texture_lod = true;
-   caps->fragment_shader_derivatives = true;
-   caps->primitive_restart = true;
-   caps->conditional_render = true;
-   caps->texture_barrier = true;
    caps->seamless_cube_map = true;
-   caps->seamless_cube_map_per_texture = true;
-   caps->max_dual_source_render_targets = 1;
-   caps->max_render_targets = 4;
+
+   /* Not implemented:
+    *  - anisotropic_filter: the sampler ignores max_anisotropy
+    *  - occlusion_query / conditional_render: no query support
+    *  - texture_barrier: no explicit texture barriers
+    *  - primitive_restart: the index walk has no restart handling
+    *  - fragment_shader_derivatives: ddx/ddy return zero, since the fragment
+    *    stage runs one thread per pixel with no quad neighbours
+    *  - seamless_cube_map_per_texture: cube faces don't filter across seams
+    */
+   caps->anisotropic_filter = false;
+   caps->occlusion_query = false;
+   caps->conditional_render = false;
+   caps->texture_barrier = false;
+   caps->primitive_restart = false;
+   caps->fragment_shader_derivatives = false;
+   caps->seamless_cube_map_per_texture = false;
+
+   /* The fragment writeback resolves a single colour attachment, and blending
+    * uses the state of render target zero. */
+   caps->max_render_targets = 1;
+   caps->max_dual_source_render_targets = 0;
+   caps->indep_blend_enable = false;
+   caps->indep_blend_func = false;
    caps->max_texture_2d_size = 16384;
    caps->max_texture_3d_levels = 12;
    caps->max_texture_cube_levels = 14;
@@ -142,47 +161,100 @@ cp_init_compute_caps(struct pipe_screen *screen)
    caps->max_subgroups = 32;
 }
 
+/*
+ * Report format support.
+ *
+ * This answers for the kernels rather than for the API: a format is supported
+ * for sampling only if the sampler can decode it, and for rendering only if
+ * the fragment writeback can encode it. Claiming more than that doesn't make
+ * anything work — it invites applications down paths the driver then crashes
+ * on, instead of letting them pick something else.
+ */
 static bool
 cp_is_format_supported(struct pipe_screen *screen, enum pipe_format format,
                        enum pipe_texture_target target, unsigned sample_count,
                        unsigned storage_sample_count, unsigned bind)
 {
+   /* No multisampling. */
    if (sample_count > 1)
       return false;
-
    if (MAX2(1, sample_count) != MAX2(1, storage_sample_count))
       return false;
 
+   /* Cube arrays and multisample targets are not sampled. */
+   switch (target) {
+   case PIPE_BUFFER:
+   case PIPE_TEXTURE_1D:
+   case PIPE_TEXTURE_1D_ARRAY:
+   case PIPE_TEXTURE_2D:
+   case PIPE_TEXTURE_2D_ARRAY:
+   case PIPE_TEXTURE_3D:
+   case PIPE_TEXTURE_CUBE:
+   case PIPE_TEXTURE_RECT:
+      break;
+   default:
+      return false;
+   }
+
+   /*
+    * A compressed format is unusable unless the sampler can decode its blocks:
+    * there is no path that treats it as opaque bytes end to end, since even
+    * clearing and blitting have to understand the block layout. Rejecting them
+    * here rather than per-bind matters, because image creation, copies and
+    * blits arrive with bind flags naming none of the paths below — which is
+    * how ASTC and ETC2 were getting through and crashing.
+    *
+    * Uncompressed formats deliberately fall through: copying one is a byte
+    * move that works whether or not the sampler understands the format, so the
+    * decode and encode requirements below are applied per bind instead.
+    */
+   if (util_format_is_compressed(format) &&
+       cp_texel_encoding_from_format(format) == CP_TEXEL_UNSUPPORTED)
+      return false;
+
    if (bind & PIPE_BIND_RENDER_TARGET) {
+      if (cp_color_encoding_from_format(format) < 0)
+         return false;
+   }
+
+   if (bind & PIPE_BIND_DEPTH_STENCIL) {
+      /* Depth only: there is no stencil buffer and no stencil test, so a
+       * combined format would silently drop the stencil aspect. */
       switch (format) {
-      case PIPE_FORMAT_R8G8B8A8_UNORM:
-      case PIPE_FORMAT_B8G8R8A8_UNORM:
-      case PIPE_FORMAT_R8G8B8X8_UNORM:
-      case PIPE_FORMAT_B8G8R8X8_UNORM:
-      case PIPE_FORMAT_R16G16B16A16_FLOAT:
-      case PIPE_FORMAT_R16G16_FLOAT:
-      case PIPE_FORMAT_R32G32B32A32_FLOAT:
-      case PIPE_FORMAT_R8_UNORM:
-      case PIPE_FORMAT_R8G8_UNORM:
-      case PIPE_FORMAT_R11G11B10_FLOAT:
-      case PIPE_FORMAT_R10G10B10A2_UNORM:
+      case PIPE_FORMAT_Z16_UNORM:
+      case PIPE_FORMAT_Z32_FLOAT:
+      case PIPE_FORMAT_Z24X8_UNORM:
          break;
       default:
          return false;
       }
    }
 
-   if (bind & PIPE_BIND_DEPTH_STENCIL) {
-      switch (format) {
-      case PIPE_FORMAT_Z16_UNORM:
-      case PIPE_FORMAT_Z32_FLOAT:
-      case PIPE_FORMAT_Z24X8_UNORM:
-      case PIPE_FORMAT_Z24_UNORM_S8_UINT:
-      case PIPE_FORMAT_Z32_FLOAT_S8X24_UINT:
-         break;
-      default:
+   if (bind & PIPE_BIND_SAMPLER_VIEW) {
+      if (util_format_is_depth_or_stencil(format)) {
+         /* Sampling depth returns floats through the normal path; stencil
+          * would need integer returns, which the sampler doesn't do. */
+         if (util_format_has_stencil(util_format_description(format)))
+            return false;
+      } else if (cp_texel_encoding_from_format(format) == CP_TEXEL_UNSUPPORTED) {
          return false;
       }
+   }
+
+   /* Images are loaded and stored by the shader backend, which handles the
+    * same uncompressed formats the sampler does and no compressed ones. */
+   if (bind & PIPE_BIND_SHADER_IMAGE) {
+      if (util_format_is_compressed(format) ||
+          util_format_is_depth_or_stencil(format) ||
+          cp_texel_encoding_from_format(format) == CP_TEXEL_UNSUPPORTED)
+         return false;
+   }
+
+   /* Vertex attributes are fetched as raw bytes and reinterpreted by the
+    * shader, so anything uncompressed works. */
+   if (bind & PIPE_BIND_VERTEX_BUFFER) {
+      if (util_format_is_compressed(format))
+         return false;
    }
 
    return true;
