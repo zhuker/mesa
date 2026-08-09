@@ -95,34 +95,46 @@ the shader gets no derivatives and samples the base level.
 
 ## Status
 
-Verified with dEQP (`vulkan_headless` target):
+Verified with dEQP (`vulkan_headless` target). Counts are of *supported* cases;
+each group also reports many `NotSupported` that the driver never sees.
 
 | Area | Result |
 |---|---|
-| `texture.filtering.2d.formats.*` | 72/75 supported pass |
-| `compute.pipeline.basic.*` | 70/71 supported pass |
-| `draw...simple_draw.*` | 2/4 (both non-instanced pass) |
+| `texture.filtering.2d.formats.*` | 72/75 |
+| `texture.filtering.2d_array.formats.*` | 72/75 |
+| `texture.filtering.cube.formats.*` | 36/150 |
+| `texture.filtering.3d.formats.*` | 12/75 |
+| `compute.pipeline.basic.*` | 70/71 |
+| `draw...simple_draw.*` | 4/4 |
+| `draw...basic_draw.draw.*` | 8/12 |
 
 Known gaps, roughly in the order they matter for a real workload:
 
-1. **Instanced draws are not implemented.** `cp_draw_vbo` ignores
-   `info->instance_count` entirely — it never loops over instances. This is why
-   the two `simple_draw_instanced_*` tests fail.
-2. **No depth buffer.** Depth testing is implicit in the visibility buffer
-   (closest triangle wins), which is enough for a single pass but not for
-   multi-pass rendering, shadow maps, or explicit depth reads.
-3. **Vertex assembly is done on the host**, per draw, with a `memcpy` per
-   attribute per vertex. This dominates the cost of large draws — the full
-   `draw.dynamic_rendering` group does not finish in 25 minutes.
-4. **Compressed formats are written but unverified.** DXT1/3/5 decode exists in
-   `cp_fetch_texel` but no test in the suites run so far exercises it. BC4-7 are
+1. **No swapchain.** The build uses `-Dplatforms=` (empty), so WSI is compiled
+   out and nothing can present to a window. Any real application needs this
+   first; it requires the xcb development packages and a rebuild with
+   `-Dplatforms=x11`.
+2. **Vertex assembly is done on the host**, per draw, with a `memcpy` per
+   attribute per vertex, and the rasterizer is one thread per triangle walking
+   a bounding box. Together these dominate everything: the full
+   `draw.dynamic_rendering` group does not finish in 25 minutes. This is the
+   blocker for anything interactive.
+3. **Lines and points are not rasterized at all** — only triangles. The four
+   remaining `basic_draw.draw` failures are `line_list`, `line_strip` and
+   `point_list`.
+4. **Filtering between cube faces and between 3D slices** is not implemented,
+   which is most of the remaining cube and 3D failures.
+5. **Compressed formats are written but unverified.** DXT1/3/5 decode exists in
+   `cp_fetch_texel` but nothing in the suites run so far exercises it. BC4-7 are
    missing. These matter for real game content.
-5. **Depth/stencil aspect sampling** returns floats only, so the three
-   `*_stencil`/`s8_uint` filtering tests fail (they need integer texture returns).
-6. `copy_ssbo_bounds` fails — SSBO robustness/bounds behaviour.
-7. Only 2D textures are sampled. Cube maps, arrays, 3D textures, texel fetches
-   (`nir_texop_txf`) and shadow compares fall through to a zero result in
-   `emit_tex()`.
+6. **Depth/stencil aspect sampling** returns floats only, so the `*_stencil`
+   and `s8_uint` filtering cases fail; they need integer texture returns.
+7. **Shadow compares and texture gathers** fall through to a zero result in
+   `emit_tex()`. Shadow compares in particular are needed for shadow mapping.
+8. The rasterizer's depth buffer is internal and is never written back to the
+   application's depth attachment, so a shader cannot sample depth from a
+   previous pass.
+9. `copy_ssbo_bounds` fails — SSBO robustness/bounds behaviour.
 
 ## Debug environment variables
 
@@ -133,6 +145,7 @@ Known gaps, roughly in the order they matter for a real workload:
 | `CUDAPIPE_DEBUG_FS` | per-pixel fragment inputs/outputs and varying mapping |
 | `CUDAPIPE_DEBUG_FS_ROW` | restrict `CUDAPIPE_DEBUG_FS` to one framebuffer row |
 | `CUDAPIPE_DEBUG_LAUNCH` | compute UBO/SSBO bindings |
+| `CUDAPIPE_DEBUG_SHADER` | warn on NIR intrinsics the backend doesn't implement |
 | `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
 
 ## Notes for whoever picks this up
@@ -151,3 +164,11 @@ Known gaps, roughly in the order they matter for a real workload:
 * Every mip level needs its own `row_stride`/`img_stride`/`mip_offsets` entry.
   Leaving them zero doesn't just break the small levels — uploads of level 1 land
   at offset 0 and silently overwrite the first row of level 0.
+* Unhandled NIR intrinsics return `undef`, and LLVM propagates that through
+  everything downstream, so one missing intrinsic can collapse a whole shader
+  into a constant with no error anywhere. `CUDAPIPE_DEBUG_SHADER=1` lists them.
+  This is how `gl_InstanceIndex` silently did nothing for a while: it lowers to
+  `load_instance_id + load_base_instance`, and only the first was implemented.
+* The visibility buffer stores the triangle index *complemented*, so `atomicMin`
+  resolves equal depths in favour of the last primitive. Vulkan requires
+  primitive order for coplanar geometry; the obvious encoding gets it backwards.
