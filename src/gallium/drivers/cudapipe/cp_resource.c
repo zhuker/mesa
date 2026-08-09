@@ -18,6 +18,41 @@
 #include <stddef.h>
 
 
+/*
+ * Lay out every mip level and return the total size.
+ *
+ * Each level needs its own stride and offset: uploads locate their
+ * destination through row_stride[level] and mip_offsets[level], so a level
+ * left at zero would be written over the top of level 0.
+ */
+static uint64_t
+cp_resource_layout(struct cp_resource *res, const struct pipe_resource *tmpl)
+{
+   if (tmpl->target == PIPE_BUFFER)
+      return tmpl->width0;
+
+   unsigned block_size = util_format_get_blocksize(tmpl->format);
+   unsigned num_layers = tmpl->target == PIPE_TEXTURE_3D
+      ? 1 : MAX2(tmpl->array_size, 1);
+   uint64_t offset = 0;
+
+   for (unsigned level = 0; level <= tmpl->last_level; level++) {
+      unsigned width = u_minify(tmpl->width0, level);
+      unsigned height = u_minify(tmpl->height0, level);
+      unsigned depth = u_minify(MAX2(tmpl->depth0, 1), level);
+      unsigned nblocksx = util_format_get_nblocksx(tmpl->format, width);
+      unsigned nblocksy = util_format_get_nblocksy(tmpl->format, height);
+
+      res->lpr.row_stride[level] = nblocksx * block_size;
+      res->lpr.img_stride[level] = (uint64_t)res->lpr.row_stride[level] * nblocksy;
+      res->lpr.mip_offsets[level] = offset;
+
+      offset += res->lpr.img_stride[level] * depth * num_layers;
+   }
+
+   return offset;
+}
+
 static struct pipe_resource *
 cp_resource_create(struct pipe_screen *screen,
                    const struct pipe_resource *tmpl)
@@ -30,17 +65,7 @@ cp_resource_create(struct pipe_screen *screen,
    res->lpr.base.screen = screen;
    pipe_reference_init(&res->lpr.base.reference, 1);
 
-   uint64_t size;
-   if (tmpl->target == PIPE_BUFFER) {
-      size = tmpl->width0;
-   } else {
-      unsigned nblocksx = util_format_get_nblocksx(tmpl->format, tmpl->width0);
-      unsigned nblocksy = util_format_get_nblocksy(tmpl->format, tmpl->height0);
-      unsigned block_size = util_format_get_blocksize(tmpl->format);
-      res->lpr.row_stride[0] = nblocksx * block_size;
-      res->lpr.img_stride[0] = (uint64_t)res->lpr.row_stride[0] * nblocksy;
-      size = res->lpr.img_stride[0] * MAX2(tmpl->depth0, 1) * MAX2(tmpl->array_size, 1);
-   }
+   uint64_t size = cp_resource_layout(res, tmpl);
 
    if (size > 0) {
       CUresult err = cuMemAllocManaged(&res->device_ptr, size,
@@ -73,17 +98,7 @@ cp_resource_create_unbacked(struct pipe_screen *screen,
    res->lpr.base.screen = screen;
    pipe_reference_init(&res->lpr.base.reference, 1);
 
-   uint64_t size;
-   if (tmpl->target == PIPE_BUFFER) {
-      size = tmpl->width0;
-   } else {
-      unsigned nblocksx = util_format_get_nblocksx(tmpl->format, tmpl->width0);
-      unsigned nblocksy = util_format_get_nblocksy(tmpl->format, tmpl->height0);
-      unsigned block_size = util_format_get_blocksize(tmpl->format);
-      res->lpr.row_stride[0] = nblocksx * block_size;
-      res->lpr.img_stride[0] = (uint64_t)res->lpr.row_stride[0] * nblocksy;
-      size = res->lpr.img_stride[0] * MAX2(tmpl->depth0, 1) * MAX2(tmpl->array_size, 1);
-   }
+   uint64_t size = cp_resource_layout(res, tmpl);
 
    if (size_required)
       *size_required = size;
@@ -130,9 +145,10 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
    if (resource->target == PIPE_BUFFER)
       return (char *)data + box->x;
 
-   unsigned offset = box->z * res->lpr.img_stride[level] +
-                     box->y * res->lpr.row_stride[level] +
-                     box->x * util_format_get_blocksize(resource->format);
+   uint64_t offset = res->lpr.mip_offsets[level] +
+                     (uint64_t)box->z * res->lpr.img_stride[level] +
+                     (uint64_t)box->y * res->lpr.row_stride[level] +
+                     (uint64_t)box->x * util_format_get_blocksize(resource->format);
    return (char *)data + offset;
 }
 

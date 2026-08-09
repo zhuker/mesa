@@ -28,7 +28,7 @@
 #include "llvmpipe/lp_public.h"
 #endif
 
-#ifdef HAVE_CUDAPIPE
+#ifdef GALLIUM_CUDAPIPE
 #include "cudapipe/cp_public.h"
 #endif
 
@@ -42,7 +42,7 @@ sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config
 {
    struct pipe_screen *screen = NULL;
 
-#if defined(HAVE_CUDAPIPE)
+#if defined(GALLIUM_CUDAPIPE)
    if (screen == NULL && (strcmp(driver, "cudapipe") == 0 || !driver[0]))
       screen = cudapipe_create_screen(winsys);
 #endif

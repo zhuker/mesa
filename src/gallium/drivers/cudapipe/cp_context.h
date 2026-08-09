@@ -9,6 +9,7 @@ struct cp_shader_binary;
 
 #define CP_MAX_SHADER_BUFFERS 16
 #define CP_MAX_CONST_BUFFERS  16
+#define CP_MAX_SAMPLERS       256
 
 struct cp_context {
    struct pipe_context base;
@@ -68,6 +69,11 @@ struct cp_context {
       unsigned buffer_size;
    } fs_ubos[CP_MAX_CONST_BUFFERS];
    unsigned num_fs_ubos;
+
+   /* Device-visible table of deduplicated sampler states. Descriptors refer to
+    * entries by index; see cp_register_sampler(). */
+   CUdeviceptr sampler_table;
+   unsigned num_samplers;
 };
 
 struct pipe_context *

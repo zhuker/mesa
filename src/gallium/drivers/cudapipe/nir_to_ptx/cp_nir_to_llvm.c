@@ -12,6 +12,14 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Highest SM architecture we ask LLVM's NVPTX backend to target, as major*10 +
+ * minor. Kept at the conservative end of what every LLVM we build against
+ * understands: the generated PTX is JIT-compiled by the driver, so a newer GPU
+ * runs it fine, while naming an architecture LLVM does not know makes it fall
+ * back to a default that emits unloadable PTX. Raise this only alongside the
+ * PTX ISA version in the target machine's feature string below. */
+#define CP_MAX_PTX_SM 86
+
 struct ntl_context {
    LLVMContextRef llvm_ctx;
    LLVMModuleRef module;
@@ -26,6 +34,9 @@ struct ntl_context {
 
    LLVMValueRef *kernel_args;
    unsigned num_kernel_args;
+
+   /* Set when the shader samples a texture, so the sampler PTX gets linked in. */
+   bool uses_tex;
 
    LLVMBasicBlockRef break_block;
    LLVMBasicBlockRef continue_block;
@@ -1073,6 +1084,121 @@ emit_load_const(struct ntl_context *ctx, nir_load_const_instr *instr)
    }
 }
 
+/*
+ * Texture sampling.
+ *
+ * Rather than emitting a software sampler as LLVM IR, call into the sampler
+ * written in CUDA C (cp_sampler.cu). Its relocatable PTX is linked with this
+ * shader's PTX at module-load time, so this is just an external call.
+ */
+static void
+emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
+{
+   LLVMTypeRef f32 = LLVMFloatTypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
+   unsigned nc = tex->def.num_components;
+   unsigned bs = tex->def.bit_size;
+
+   LLVMValueRef tex_handle = NULL, samp_handle = NULL, coord = NULL;
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      switch (tex->src[i].src_type) {
+      case nir_tex_src_texture_handle:
+         tex_handle = get_src(ctx, &tex->src[i].src);
+         break;
+      case nir_tex_src_sampler_handle:
+         samp_handle = get_src(ctx, &tex->src[i].src);
+         break;
+      case nir_tex_src_coord:
+         coord = get_src(ctx, &tex->src[i].src);
+         break;
+      default:
+         break;
+      }
+   }
+
+   /* Anything we can't route to the sampler yet (texel fetches, shadow
+    * compares, cube maps, ...) still has to produce a value. */
+   if (tex->op != nir_texop_tex || !tex_handle || !coord) {
+      LLVMTypeRef ft = get_float_type(ctx, bs);
+      LLVMValueRef zero = LLVMConstReal(ft, 0.0);
+      if (nc == 1) {
+         set_ssa_def(ctx, &tex->def, zero);
+      } else {
+         LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(ft, nc));
+         for (unsigned c = 0; c < nc; c++)
+            vec = LLVMBuildInsertElement(ctx->builder, vec,
+               c == 3 ? LLVMConstReal(ft, 1.0) : zero,
+               LLVMConstInt(i32, c, false), "");
+         set_ssa_def(ctx, &tex->def, vec);
+      }
+      return;
+   }
+
+   ctx->uses_tex = true;
+
+   if (!samp_handle)
+      samp_handle = LLVMConstInt(i64, 0, false);
+
+   /* SSA values are kept in integer registers, so coerce the coordinates to
+    * float the same way the ALU path does. */
+   LLVMValueRef u = LLVMBuildExtractElement(ctx->builder, coord,
+                                            LLVMConstInt(i32, 0, false), "u");
+   LLVMValueRef v = tex->coord_components > 1
+      ? LLVMBuildExtractElement(ctx->builder, coord, LLVMConstInt(i32, 1, false), "v")
+      : LLVMConstReal(f32, 0.0);
+
+   if (LLVMGetTypeKind(LLVMTypeOf(u)) == LLVMIntegerTypeKind)
+      u = LLVMBuildBitCast(ctx->builder, u, f32, "u_f");
+   if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind)
+      v = LLVMBuildBitCast(ctx->builder, v, f32, "v_f");
+
+   /* If the coordinate is a varying straight from the rasterizer, tell the
+    * sampler which one: it can then look up that varying's screen-space
+    * derivatives and select a mip level. Anything computed in the shader
+    * leaves the sampler on the base level. */
+   int32_t coord_slot = -1;
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type != nir_tex_src_coord)
+         continue;
+      nir_instr *parent = nir_def_instr(tex->src[i].src.ssa);
+      if (parent->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(parent);
+         if (intr->intrinsic == nir_intrinsic_load_input)
+            coord_slot = nir_intrinsic_base(intr);
+      }
+   }
+
+   /* float4 comes back as a struct of four floats under the NVPTX ABI. */
+   LLVMTypeRef ret_type = LLVMStructTypeInContext(ctx->llvm_ctx,
+      (LLVMTypeRef[]){ f32, f32, f32, f32 }, 4, false);
+   LLVMTypeRef param_types[] = { i64, i64, f32, f32, i32 };
+   LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, 5, false);
+
+   LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, "cp_tex_sample_2d");
+   if (!fn)
+      fn = LLVMAddFunction(ctx->module, "cp_tex_sample_2d", fn_type);
+
+   LLVMValueRef args[] = { tex_handle, samp_handle, u, v,
+                           LLVMConstInt(i32, (unsigned)coord_slot, true) };
+   LLVMValueRef call = LLVMBuildCall2(ctx->builder, fn_type, fn, args, 5, "tex");
+
+   LLVMTypeRef ft = get_float_type(ctx, bs);
+   if (nc == 1) {
+      set_ssa_def(ctx, &tex->def,
+                  LLVMBuildExtractValue(ctx->builder, call, 0, ""));
+   } else {
+      LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(ft, nc));
+      for (unsigned c = 0; c < nc; c++) {
+         LLVMValueRef comp = LLVMBuildExtractValue(ctx->builder, call,
+                                                   c < 4 ? c : 3, "");
+         vec = LLVMBuildInsertElement(ctx->builder, vec, comp,
+                                      LLVMConstInt(i32, c, false), "");
+      }
+      set_ssa_def(ctx, &tex->def, vec);
+   }
+}
+
 static void
 emit_block_instrs(struct ntl_context *ctx, nir_block *block)
 {
@@ -1089,27 +1215,9 @@ emit_block_instrs(struct ntl_context *ctx, nir_block *block)
          break;
       case nir_instr_type_phi:
          break;
-      case nir_instr_type_tex: {
-         /* Texture sampling — for now return (1,1,1,1) as placeholder.
-          * TODO: implement actual texture sampling via CUDA texture objects. */
-         nir_tex_instr *tex = nir_instr_as_tex(instr);
-         unsigned nc = tex->def.num_components;
-         unsigned bs = tex->def.bit_size;
-         LLVMTypeRef res_type = get_llvm_type(ctx, bs, nc);
-         /* Return white for any texture sample — placeholder */
-         if (nc == 1) {
-            set_ssa_def(ctx, &tex->def, LLVMConstReal(get_float_type(ctx, bs), 1.0));
-         } else {
-            LLVMTypeRef ft = get_float_type(ctx, bs);
-            LLVMValueRef one = LLVMConstReal(ft, 1.0);
-            LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(ft, nc));
-            for (unsigned c = 0; c < nc; c++)
-               vec = LLVMBuildInsertElement(ctx->builder, vec, one,
-                  LLVMConstInt(LLVMInt32TypeInContext(ctx->llvm_ctx), c, false), "");
-            set_ssa_def(ctx, &tex->def, vec);
-         }
+      case nir_instr_type_tex:
+         emit_tex(ctx, nir_instr_as_tex(instr));
          break;
-      }
       case nir_instr_type_undef: {
          nir_undef_instr *undef = nir_instr_as_undef(instr);
          set_ssa_def(ctx, &undef->def,
@@ -1266,7 +1374,19 @@ compile_module_to_ptx(LLVMModuleRef module, int sm_major, int sm_minor, size_t *
 {
    char triple[] = "nvptx64-nvidia-cuda";
    char cpu[16];
-   snprintf(cpu, sizeof(cpu), "sm_%d%d", sm_major, sm_minor);
+
+   /* LLVM's NVPTX backend only knows the architectures that existed when it
+    * was released; on anything newer it warns and silently falls back to a
+    * default that produces PTX the driver rejects. PTX is forward compatible,
+    * so target the newest architecture this LLVM understands and let the
+    * driver JIT it for the actual GPU. */
+   int llvm_major = sm_major;
+   int llvm_minor = sm_minor;
+   if (llvm_major * 10 + llvm_minor > CP_MAX_PTX_SM) {
+      llvm_major = CP_MAX_PTX_SM / 10;
+      llvm_minor = CP_MAX_PTX_SM % 10;
+   }
+   snprintf(cpu, sizeof(cpu), "sm_%d%d", llvm_major, llvm_minor);
 
    LLVMInitializeNVPTXTargetInfo();
    LLVMInitializeNVPTXTarget();
@@ -1318,8 +1438,65 @@ compile_module_to_ptx(LLVMModuleRef module, int sm_major, int sm_minor, size_t *
    return ptx;
 }
 
+/* Record which varying location each I/O slot carries, so the fragment
+ * shader's inputs can be matched to the vertex shader's outputs by location. */
+static void
+capture_io_locations(struct nir_shader *nir, struct cp_shader_binary *bin)
+{
+   for (unsigned i = 0; i < CP_MAX_IO_SLOTS; i++) {
+      bin->in_location[i] = VARYING_SLOT_MAX;
+      bin->out_location[i] = VARYING_SLOT_MAX;
+   }
+
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+      unsigned slots = glsl_count_attribute_slots(var->type, false);
+      for (unsigned s = 0; s < slots; s++) {
+         unsigned slot = var->data.driver_location + s;
+         if (slot < CP_MAX_IO_SLOTS)
+            bin->in_location[slot] = var->data.location + s;
+      }
+   }
+
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+      unsigned slots = glsl_count_attribute_slots(var->type, false);
+      for (unsigned s = 0; s < slots; s++) {
+         unsigned slot = var->data.driver_location + s;
+         if (slot < CP_MAX_IO_SLOTS)
+            bin->out_location[slot] = var->data.location + s;
+      }
+   }
+}
+
+/* Link the sampler's relocatable PTX with the shader's, producing a cubin. */
+static CUresult
+link_shader_module(CUmodule *module, const char *shader_ptx,
+                   const char *sampler_ptx)
+{
+   CUlinkState link;
+   CUresult err = cuLinkCreate(0, NULL, NULL, &link);
+   if (err != CUDA_SUCCESS)
+      return err;
+
+   err = cuLinkAddData(link, CU_JIT_INPUT_PTX, (void *)sampler_ptx,
+                       strlen(sampler_ptx) + 1, "cp_sampler.ptx", 0, NULL, NULL);
+   if (err == CUDA_SUCCESS)
+      err = cuLinkAddData(link, CU_JIT_INPUT_PTX, (void *)shader_ptx,
+                          strlen(shader_ptx) + 1, "shader.ptx", 0, NULL, NULL);
+
+   void *cubin = NULL;
+   size_t cubin_size = 0;
+   if (err == CUDA_SUCCESS)
+      err = cuLinkComplete(link, &cubin, &cubin_size);
+   if (err == CUDA_SUCCESS)
+      err = cuModuleLoadData(module, cubin);
+
+   cuLinkDestroy(link);
+   return err;
+}
+
 struct cp_shader_binary *
-cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor)
+cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
+                      const char *sampler_ptx)
 {
    struct ntl_context ctx = {0};
    ctx.nir = nir;
@@ -1402,11 +1579,22 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor)
    bin->sm_minor = sm_minor;
    bin->shared_size = nir->info.shared_size;
    bin->nir_num_outputs = nir->num_outputs;
+   bin->nir_num_inputs = nir->num_inputs;
+   capture_io_locations(nir, bin);
 
-   /* Load PTX into CUDA module */
-   CUresult err = cuModuleLoadData(&bin->module, ptx);
+   /* Shaders that sample textures need the sampler linked in; the rest load
+    * their PTX directly. */
+   CUresult err;
+   if (ctx.uses_tex && sampler_ptx)
+      err = link_shader_module(&bin->module, ptx, sampler_ptx);
+   else
+      err = cuModuleLoadData(&bin->module, ptx);
+
    if (err != CUDA_SUCCESS) {
-      fprintf(stderr, "cudapipe: cuModuleLoadData failed (%d)\n", err);
+      const char *err_str = NULL;
+      cuGetErrorString(err, &err_str);
+      fprintf(stderr, "cudapipe: loading shader module failed (%d: %s)\n",
+              err, err_str ? err_str : "?");
       /* Keep the PTX for debugging even if load fails */
    } else {
       cuModuleGetFunction(&bin->kernel, bin->module, "main");

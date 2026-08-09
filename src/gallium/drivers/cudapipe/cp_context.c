@@ -22,9 +22,28 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
 #include "compiler/shader_enums.h"
 #include "util/u_prim.h"
 
+#include "gallivm/lp_bld_jit_types.h"
+#include "util/format/u_format.h"
+
 #include <string.h>
 #include <math.h>
+#include <stddef.h>
 #include <cuda.h>
+
+/*
+ * The sampler reads two fields out of the descriptors lavapipe builds. Pin
+ * those offsets here so an upstream layout change is a build failure instead
+ * of silently corrupt texturing.
+ */
+static_assert(offsetof(struct lp_image_descriptor, texture.base) ==
+              CP_DESC_IMAGE_BASE_OFFSET,
+              "lp_image_descriptor texture base offset changed");
+static_assert(offsetof(struct lp_image_descriptor, functions) ==
+              CP_DESC_IMAGE_FUNCTIONS_OFFSET,
+              "lp_image_descriptor functions offset changed");
+static_assert(offsetof(struct lp_sampler_descriptor, sampler_index) ==
+              CP_DESC_SAMPLER_INDEX_OFFSET,
+              "lp_sampler_descriptor sampler_index offset changed");
 
 static void
 cp_destroy_context(struct pipe_context *ctx)
@@ -78,6 +97,270 @@ cp_set_scissor_states(struct pipe_context *ctx, unsigned start_slot,
    struct cp_context *cp = (struct cp_context *)ctx;
    if (num_scissors > 0)
       cp->scissor = scissors[0];
+}
+
+static uint32_t
+cp_color_encoding_from_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      return CP_COLOR_B8G8R8A8_UNORM;
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+   case PIPE_FORMAT_R8G8B8X8_SRGB:
+      return CP_COLOR_R8G8B8A8_SRGB;
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
+   case PIPE_FORMAT_B8G8R8X8_SRGB:
+      return CP_COLOR_B8G8R8A8_SRGB;
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+      return CP_COLOR_R32G32B32A32_FLOAT;
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+      return CP_COLOR_R16G16B16A16_FLOAT;
+   default:
+      return CP_COLOR_R8G8B8A8_UNORM;
+   }
+}
+
+/*
+ * Run the fragment shader over every pixel the rasterizer covered.
+ *
+ * Three launches: gather the shader's inputs (which also compacts the covered
+ * pixels into a list), run the shader itself one thread per covered pixel, and
+ * blend its output into the colour attachment.
+ */
+static void
+cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
+                   CUdeviceptr visbuf, CUdeviceptr positions,
+                   CUdeviceptr vs_output_buf, unsigned num_triangles,
+                   unsigned w, unsigned h, void *color_data,
+                   float vp_scale_x, float vp_scale_y,
+                   float vp_trans_x, float vp_trans_y)
+{
+   struct cp_screen *screen = cp->screen;
+   struct cp_shader_binary *fs = cp->fs_shader;
+
+   if (!fs || !fs->kernel || !vs_output_buf || !cp->vs_shader)
+      return;
+   if (!screen->kernels.fs_interpolate || !screen->kernels.fs_writeback)
+      return;
+
+   unsigned num_fs_inputs = MIN2(fs->nir_num_inputs, CP_MAX_FS_INPUTS);
+   unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs
+      ? cp->vs_shader->nir_num_outputs : 2;
+
+   /* Fragment shader I/O buffers are indexed by thread, and the shader is
+    * launched in whole blocks, so round up to keep the tail threads in
+    * bounds. */
+   unsigned max_pixels = ALIGN_POT(w * h, 256);
+   unsigned fs_in_stride = MAX2(num_fs_inputs, 1u) * 16;
+   unsigned fs_out_stride = MAX2(fs->nir_num_outputs, 1u) * 16;
+
+   unsigned fs_deriv_stride = MAX2(num_fs_inputs, 1u) * 16;
+
+   CUdeviceptr pixel_list = 0, counter = 0, fs_in = 0, fs_out = 0, frag_coord = 0;
+   CUdeviceptr fs_deriv = 0;
+   CUdeviceptr fs_args_dev = 0, count_dev = 0, stride_dev = 0;
+
+   if (cuMemAllocManaged(&pixel_list, max_pixels * 4, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
+       cuMemAllocManaged(&counter, 4, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
+       cuMemAllocManaged(&fs_in, (size_t)max_pixels * fs_in_stride, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
+       cuMemAllocManaged(&fs_out, (size_t)max_pixels * fs_out_stride, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
+       cuMemAllocManaged(&fs_deriv, (size_t)max_pixels * fs_deriv_stride, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
+       cuMemAllocManaged(&frag_coord, (size_t)max_pixels * 16, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+      goto out;
+
+   *(uint32_t *)(uintptr_t)counter = 0;
+
+   struct cp_fs_interp_args interp = {
+      .visbuf = visbuf,
+      .positions = positions,
+      .vs_out = vs_output_buf,
+      .pixel_list = pixel_list,
+      .counter = counter,
+      .fs_in = fs_in,
+      .frag_coord = frag_coord,
+      .fs_deriv = fs_deriv,
+      .width = w, .height = h,
+      .vs_out_stride = num_vs_outputs * 16,
+      .fs_in_stride = fs_in_stride,
+      .num_fs_inputs = num_fs_inputs,
+      .max_pixels = max_pixels,
+      .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
+      .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
+   };
+
+   /* Match each fragment shader input to the vertex shader output carrying the
+    * same varying location. */
+   for (unsigned i = 0; i < num_fs_inputs; i++) {
+      interp.input_vs_slot[i] = -1;
+      unsigned location = fs->in_location[i];
+      if (location == VARYING_SLOT_MAX)
+         continue;
+      for (unsigned o = 0; o < num_vs_outputs && o < CP_MAX_IO_SLOTS; o++) {
+         if (cp->vs_shader->out_location[o] == location) {
+            interp.input_vs_slot[i] = (int32_t)o;
+            break;
+         }
+      }
+   }
+
+   void *interp_params[] = { &interp };
+   if (cuLaunchKernel(screen->kernels.fs_interpolate,
+                      (w * h + 255) / 256, 1, 1, 256, 1, 1,
+                      0, NULL, interp_params, NULL) != CUDA_SUCCESS)
+      goto out;
+   if (cuCtxSynchronize() != CUDA_SUCCESS)
+      goto out;
+
+   unsigned num_pixels = *(uint32_t *)(uintptr_t)counter;
+   if (num_pixels > max_pixels)
+      num_pixels = max_pixels;
+   if (num_pixels == 0)
+      goto out;
+
+   /* The shader reads its arguments through the same pointer-array ABI the
+    * compute path uses; see cp_launch_grid(). */
+   if (cuMemAllocManaged(&fs_args_dev, 64 * sizeof(void *), CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
+       cuMemAllocManaged(&count_dev, 4, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
+       cuMemAllocManaged(&stride_dev, 4, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+      goto out;
+
+   void **fs_args = (void **)(uintptr_t)fs_args_dev;
+   memset(fs_args, 0, 64 * sizeof(void *));
+   *(uint32_t *)(uintptr_t)count_dev = num_pixels;
+   *(uint32_t *)(uintptr_t)stride_dev = fs_in_stride;
+
+   fs_args[0] = (void *)(uintptr_t)count_dev;
+   fs_args[2] = (void *)(uintptr_t)fs_in;
+   fs_args[3] = (void *)(uintptr_t)stride_dev;
+   fs_args[4] = (void *)(uintptr_t)fs_out;
+   fs_args[6] = (void *)(uintptr_t)frag_coord;
+   for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
+      fs_args[18 + i] = cp->fs_ubos[i].buffer;
+
+   if (getenv("CUDAPIPE_DEBUG_TEX")) {
+      fprintf(stderr, "cudapipe: sampler table %p (%u entries) for FS module\n",
+              (void *)(uintptr_t)cp->sampler_table, cp->num_samplers);
+
+      /* Walk each bound descriptor the way the sampler does, so a mismatch
+       * between what the host bound and what the shader samples is visible. */
+      for (unsigned b = 0; b < cp->num_fs_ubos; b++) {
+         if (!cp->fs_ubos[b].buffer)
+            continue;
+         const char *desc = (const char *)cp->fs_ubos[b].buffer;
+         const struct cp_texture_info *ti =
+            *(const struct cp_texture_info *const *)(desc + CP_DESC_IMAGE_FUNCTIONS_OFFSET);
+         if (!ti)
+            continue;
+         fprintf(stderr, "  fs_ubo[%u]: %ux%u enc=%u stride=%u levels=%u..%u "
+                 "base=%p\n", b, ti->width, ti->height, ti->encoding,
+                 ti->row_stride[0], ti->first_level, ti->last_level,
+                 (void *)(uintptr_t)ti->base);
+      }
+   }
+
+   /* Hand the linked sampler the state it reads through module globals: the
+    * sampler table and the varying derivatives it needs for mip selection. */
+   {
+      CUdeviceptr sym;
+      size_t sym_size;
+      if (cp->sampler_table &&
+          cuModuleGetGlobal(&sym, &sym_size, fs->module,
+                            "cp_sampler_table") == CUDA_SUCCESS) {
+         uint64_t addr = (uint64_t)cp->sampler_table;
+         cuMemcpyHtoD(sym, &addr, sizeof(addr));
+      }
+      if (cuModuleGetGlobal(&sym, &sym_size, fs->module,
+                            "cp_fs_deriv") == CUDA_SUCCESS) {
+         uint64_t addr = (uint64_t)fs_deriv;
+         cuMemcpyHtoD(sym, &addr, sizeof(addr));
+      }
+      if (cuModuleGetGlobal(&sym, &sym_size, fs->module,
+                            "cp_fs_deriv_stride") == CUDA_SUCCESS)
+         cuMemcpyHtoD(sym, &fs_deriv_stride, sizeof(fs_deriv_stride));
+   }
+
+   void *fs_arg_ptr = (void *)(uintptr_t)fs_args_dev;
+   void *fs_params[] = { &fs_arg_ptr };
+   if (cuLaunchKernel(fs->kernel, (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
+                      0, NULL, fs_params, NULL) != CUDA_SUCCESS)
+      goto out;
+   if (cuCtxSynchronize() != CUDA_SUCCESS)
+      goto out;
+
+   const struct pipe_rt_blend_state *rt = &cp->blend_state.rt[0];
+   struct cp_fs_writeback_args wb = {
+      .pixel_list = pixel_list,
+      .fs_out = fs_out,
+      .color_out = (uint64_t)(uintptr_t)color_data,
+      .fs_out_stride = fs_out_stride,
+      .num_pixels = num_pixels,
+      .color_encoding =
+         cp_color_encoding_from_format(cp->framebuffer.cbufs[0].format),
+      .blend_enable = rt->blend_enable,
+      .rgb_src_factor = rt->rgb_src_factor,
+      .rgb_dst_factor = rt->rgb_dst_factor,
+      .rgb_func = rt->rgb_func,
+      .alpha_src_factor = rt->alpha_src_factor,
+      .alpha_dst_factor = rt->alpha_dst_factor,
+      .alpha_func = rt->alpha_func,
+      .colormask = rt->colormask ? rt->colormask : 0xF,
+   };
+
+   void *wb_params[] = { &wb };
+   cuLaunchKernel(screen->kernels.fs_writeback,
+                  (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
+                  0, NULL, wb_params, NULL);
+   cuCtxSynchronize();
+
+   if (getenv("CUDAPIPE_DEBUG_DRAW"))
+      fprintf(stderr, "  shaded %u pixels (%u fs inputs, %u tris)\n",
+              num_pixels, num_fs_inputs, num_triangles);
+
+   if (getenv("CUDAPIPE_DEBUG_FS")) {
+      const float *vs_out = (const float *)(uintptr_t)vs_output_buf;
+      for (unsigned v = 0; v < num_triangles * 3 && v < 6; v++) {
+         fprintf(stderr, "  vtx%u:", v);
+         for (unsigned s = 0; s < num_vs_outputs; s++)
+            fprintf(stderr, " slot%u=[%.3f %.3f %.3f %.3f]", s,
+                    vs_out[(v * num_vs_outputs + s) * 4 + 0],
+                    vs_out[(v * num_vs_outputs + s) * 4 + 1],
+                    vs_out[(v * num_vs_outputs + s) * 4 + 2],
+                    vs_out[(v * num_vs_outputs + s) * 4 + 3]);
+         fprintf(stderr, "\n");
+      }
+      for (unsigned i = 0; i < num_fs_inputs; i++)
+         fprintf(stderr, "  fs_in[%u] <- vs slot %d (loc %u)\n", i,
+                 interp.input_vs_slot[i], fs->in_location[i]);
+      const uint32_t *plist = (const uint32_t *)(uintptr_t)pixel_list;
+      const float *fin = (const float *)(uintptr_t)fs_in;
+      const float *fout = (const float *)(uintptr_t)fs_out;
+      const char *row_env = getenv("CUDAPIPE_DEBUG_FS_ROW");
+      int want_row = row_env ? atoi(row_env) : -1;
+      unsigned shown = 0;
+      for (unsigned i = 0; i < num_pixels && shown < (want_row >= 0 ? 64u : 8u); i++) {
+         unsigned px = plist[i];
+         if (want_row >= 0 && (int)(px / w) != want_row)
+            continue;
+         shown++;
+         fprintf(stderr, "  px(%u,%u) in=[%.9f %.9f] out=[%.3f %.3f %.3f %.3f]\n",
+                 px % w, px / w,
+                 fin[i * (fs_in_stride / 4) + 0], fin[i * (fs_in_stride / 4) + 1],
+                 fout[i * (fs_out_stride / 4) + 0], fout[i * (fs_out_stride / 4) + 1],
+                 fout[i * (fs_out_stride / 4) + 2], fout[i * (fs_out_stride / 4) + 3]);
+      }
+   }
+
+out:
+   if (pixel_list) cuMemFree(pixel_list);
+   if (counter) cuMemFree(counter);
+   if (fs_in) cuMemFree(fs_in);
+   if (fs_out) cuMemFree(fs_out);
+   if (fs_deriv) cuMemFree(fs_deriv);
+   if (frag_coord) cuMemFree(frag_coord);
+   if (fs_args_dev) cuMemFree(fs_args_dev);
+   if (count_dev) cuMemFree(count_dev);
+   if (stride_dev) cuMemFree(stride_dev);
 }
 
 static void
@@ -416,7 +699,6 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                pos_dst[v*4+2] = vs_out[v * num_vs_outputs * 4 + 2];
                pos_dst[v*4+3] = vs_out[v * num_vs_outputs * 4 + 3];
             }
-            /* Extract varyings from VS output - will update packed_colors after it's allocated */
             vs_ran = true;
          } else {
             fprintf(stderr, "  VS launch failed: %d\n", vs_err);
@@ -459,252 +741,18 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    cuCtxSynchronize();
 
-   /* Resolve — interpolate vertex colors */
-   struct cp_resolve_args resolve_args = {
-      .visbuf = visbuf,
-      .positions = packed_positions,
-      .colors = 0,
-      .color_out = (uint64_t)(uintptr_t)color_data,
-      .width = w, .height = h,
-      .vp_x = vp_x, .vp_y = vp_y, .vp_w = vp_w, .vp_h = vp_h,
-      .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
-      .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
-      .color_stride = 16,
-   };
+   /* Shade every covered pixel by running the fragment shader on the GPU:
+    * interpolate its inputs, launch it, then blend its output into the
+    * attachment. */
+   cp_shade_fragments(cp, info, visbuf, packed_positions, vs_output_buf,
+                      num_triangles, w, h, color_data,
+                      vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y);
 
-   /* Extract per-vertex colors (same multi-draw assembly as positions) */
-   CUdeviceptr packed_colors = 0;
-   if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource &&
-       cp->num_vertex_elements >= 2) {
-      struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
-      void *vb_data = cp_resource_data(vb_res);
-      if (vb_data) {
-         char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
-         unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
-         unsigned color_offset = cp->vertex_elements[1].src_offset;
-         unsigned index_size = info->index_size;
-
-         void *ib_base = NULL;
-         if (indexed && info->index.resource) {
-            struct cp_resource *ib_res = cp_resource(info->index.resource);
-            ib_base = cp_resource_data(ib_res);
-         }
-
-         cuMemAllocManaged(&packed_colors, num_triangles * 3 * 16, CU_MEM_ATTACH_GLOBAL);
-         float *cdst = (float *)(uintptr_t)packed_colors;
-         unsigned tri_out = 0;
-
-         for (unsigned d = 0; d < num_draws; d++) {
-            unsigned vc = draws[d].count;
-            unsigned first = draws[d].start;
-            int base_vertex = indexed ? draws[d].index_bias : 0;
-
-            void *ib_data = NULL;
-            if (indexed && ib_base)
-               ib_data = (char *)ib_base + first * index_size;
-
-            unsigned draw_tris;
-            if (info->mode == MESA_PRIM_TRIANGLE_STRIP || info->mode == MESA_PRIM_TRIANGLE_FAN)
-               draw_tris = vc >= 3 ? vc - 2 : 0;
-            else
-               draw_tris = vc / 3;
-
-            for (unsigned tri = 0; tri < draw_tris; tri++) {
-               unsigned idx[3];
-               if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
-                  idx[0] = tri; idx[1] = tri+1+(tri&1); idx[2] = tri+2-(tri&1);
-               } else if (info->mode == MESA_PRIM_TRIANGLE_FAN) {
-                  idx[0] = 0; idx[1] = tri+1; idx[2] = tri+2;
-               } else {
-                  idx[0] = tri*3; idx[1] = tri*3+1; idx[2] = tri*3+2;
-               }
-
-               for (int vi = 0; vi < 3; vi++) {
-                  unsigned vert_idx;
-                  if (indexed && ib_data) {
-                     unsigned raw_idx = index_size == 2 ?
-                        ((uint16_t *)ib_data)[idx[vi]] : ((uint32_t *)ib_data)[idx[vi]];
-                     vert_idx = (unsigned)((int)raw_idx + base_vertex);
-                  } else {
-                     vert_idx = first + idx[vi];
-                  }
-                  float *src = (float *)(vb_start + vert_idx * stride + color_offset);
-                  cdst[(tri_out*3+vi)*4+0] = src[0];
-                  cdst[(tri_out*3+vi)*4+1] = src[1];
-                  cdst[(tri_out*3+vi)*4+2] = src[2];
-                  cdst[(tri_out*3+vi)*4+3] = src[3];
-               }
-               tri_out++;
-            }
-         }
-         resolve_args.colors = packed_colors;
-      }
-   }
-
-   /* If VS ran, extract varying output (color/UV) from VS output.
-    * The color varying is at the LAST output slot (after pos and any other outputs).
-    * If packed_colors wasn't allocated (no color in VB), allocate it now. */
-   if (vs_ran && vs_output_buf) {
-      unsigned total_verts_col = num_triangles * 3;
-      if (!packed_colors) {
-         cuMemAllocManaged(&packed_colors, total_verts_col * 16, CU_MEM_ATTACH_GLOBAL);
-         resolve_args.colors = packed_colors;
-      }
-      unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
-      unsigned color_slot = num_vs_outputs - 1; /* last output = color varying */
-      float *vs_out = (float*)(uintptr_t)vs_output_buf;
-      float *col_dst = (float*)(uintptr_t)packed_colors;
-      unsigned total_verts = num_triangles * 3;
-      for (unsigned v = 0; v < total_verts; v++) {
-         col_dst[v*4+0] = vs_out[(v * num_vs_outputs + color_slot) * 4 + 0];
-         col_dst[v*4+1] = vs_out[(v * num_vs_outputs + color_slot) * 4 + 1];
-         col_dst[v*4+2] = vs_out[(v * num_vs_outputs + color_slot) * 4 + 2];
-         col_dst[v*4+3] = vs_out[(v * num_vs_outputs + color_slot) * 4 + 3];
-      }
-   }
-
-   /* CPU-side resolve */
-   {
-      uint64_t *vis = (uint64_t *)(uintptr_t)visbuf;
-      uint32_t *col = (uint32_t *)color_data;
-      float *pos = (float *)(uintptr_t)packed_positions;
-      float *colors_arr = packed_colors ? (float *)(uintptr_t)packed_colors : NULL;
-
-      for (unsigned py = 0; py < h; py++) {
-         for (unsigned px = 0; px < w; px++) {
-            uint64_t entry = vis[py * w + px];
-            if (entry == 0xFFFFFFFFFFFFFFFFULL)
-               continue;
-            uint32_t tri_id = (uint32_t)(entry & 0xFFFFFFFF);
-
-            /* Re-fetch positions */
-            float *v0p = pos + (tri_id*3+0)*4;
-            float *v1p = pos + (tri_id*3+1)*4;
-            float *v2p = pos + (tri_id*3+2)*4;
-
-            float sx0 = (v0p[0]/v0p[3]) * vp_scale_x + vp_trans_x;
-            float sy0 = (v0p[1]/v0p[3]) * vp_scale_y + vp_trans_y;
-            float sx1 = (v1p[0]/v1p[3]) * vp_scale_x + vp_trans_x;
-            float sy1 = (v1p[1]/v1p[3]) * vp_scale_y + vp_trans_y;
-            float sx2 = (v2p[0]/v2p[3]) * vp_scale_x + vp_trans_x;
-            float sy2 = (v2p[1]/v2p[3]) * vp_scale_y + vp_trans_y;
-
-            float cx = (float)px + 0.5f;
-            float cy = (float)py + 0.5f;
-            float area = (sx1-sx0)*(sy2-sy0)-(sy1-sy0)*(sx2-sx0);
-            if (area == 0) continue;
-            float inv_a = 1.0f / area;
-            float w0 = ((sx1-cx)*(sy2-cy)-(sy1-cy)*(sx2-cx)) * inv_a;
-            float w1 = ((sx2-cx)*(sy0-cy)-(sy2-cy)*(sx0-cx)) * inv_a;
-            float w2 = 1.0f - w0 - w1;
-
-            float r=1,g=1,b=1,a=1;
-            if (colors_arr) {
-               float *c0=colors_arr+(tri_id*3+0)*4;
-               float *c1=colors_arr+(tri_id*3+1)*4;
-               float *c2=colors_arr+(tri_id*3+2)*4;
-               r = w0*c0[0]+w1*c1[0]+w2*c2[0];
-               g = w0*c0[1]+w1*c1[1]+w2*c2[1];
-               b = w0*c0[2]+w1*c1[2]+w2*c2[2];
-               a = w0*c0[3]+w1*c1[3]+w2*c2[3];
-            }
-            /* If FS has texture descriptors bound (UBO[1+] contains lp_image_descriptor),
-             * sample the texture using the interpolated varying as UV coordinates. */
-            if (cp->num_fs_ubos > 1 && cp->fs_ubos[1].buffer) {
-               /* The descriptor buffer (FS UBO[1]) contains texture descriptors.
-                * Each descriptor starts with a pointer to the texture data,
-                * followed by width, height, etc (lp_jit_image layout). */
-               void *desc_buf = cp->fs_ubos[1].buffer;
-               /* First texture descriptor: read base ptr from offset 0 */
-               void *tex_base = *(void **)desc_buf;
-               if (tex_base) {
-                  /* Read width from offset 8, height from offset 12 */
-                  uint32_t tw = *(uint32_t *)((char*)desc_buf + 8);
-                  uint16_t th = *(uint16_t *)((char*)desc_buf + 12);
-                  uint32_t trs = *(uint32_t *)((char*)desc_buf + 24); /* row_stride */
-                  if (tw > 0 && th > 0 && trs > 0) {
-                     float u = r, v = g;
-                     u = u - floorf(u); v = v - floorf(v);
-                     unsigned tx = (unsigned)(u * (tw - 1) + 0.5f);
-                     unsigned ty = (unsigned)(v * (th - 1) + 0.5f);
-                     if (tx >= tw) tx = tw - 1;
-                     if (ty >= th) ty = th - 1;
-                     uint8_t *texel = (uint8_t *)tex_base + ty * trs + tx * 4;
-                     r = texel[0] / 255.0f;
-                     g = texel[1] / 255.0f;
-                     b = texel[2] / 255.0f;
-                     a = texel[3] / 255.0f;
-                  }
-               }
-            } else if (cp->tex_resources[0].data && cp->num_tex_objects > 0) {
-               float u = r, v = g;
-               /* Wrap UV to [0,1] */
-               u = u - floorf(u);
-               v = v - floorf(v);
-               /* Nearest-neighbor sample from texture */
-               unsigned tw = cp->tex_resources[0].width;
-               unsigned th = cp->tex_resources[0].height;
-               unsigned tx = (unsigned)(u * (tw - 1) + 0.5f);
-               unsigned ty = (unsigned)(v * (th - 1) + 0.5f);
-               if (tx >= tw) tx = tw - 1;
-               if (ty >= th) ty = th - 1;
-               unsigned tps = cp->tex_resources[0].pixel_size;
-               unsigned trs = cp->tex_resources[0].row_stride;
-               uint8_t *texel = (uint8_t *)cp->tex_resources[0].data + ty * trs + tx * tps;
-               /* Decode texel based on pixel size (assume RGBA8 or similar) */
-               if (tps >= 4) {
-                  r = texel[0] / 255.0f;
-                  g = texel[1] / 255.0f;
-                  b = texel[2] / 255.0f;
-                  a = tps >= 4 ? texel[3] / 255.0f : 1.0f;
-               } else if (tps == 3) {
-                  r = texel[0] / 255.0f;
-                  g = texel[1] / 255.0f;
-                  b = texel[2] / 255.0f;
-                  a = 1.0f;
-               } else if (tps == 1) {
-                  r = g = b = texel[0] / 255.0f;
-                  a = 1.0f;
-               }
-            }
-
-            if(r<0)r=0; if(r>1)r=1;
-            if(g<0)g=0; if(g>1)g=1;
-            if(b<0)b=0; if(b>1)b=1;
-            if(a<0)a=0; if(a>1)a=1;
-
-            /* Apply blending if enabled */
-            if (cp->blend_enabled) {
-               uint32_t dst_pix = col[py*w+px];
-               float dr = (float)(dst_pix & 0xFF) / 255.0f;
-               float dg = (float)((dst_pix >> 8) & 0xFF) / 255.0f;
-               float db = (float)((dst_pix >> 16) & 0xFF) / 255.0f;
-               float da = (float)((dst_pix >> 24) & 0xFF) / 255.0f;
-               /* Standard SRC_ALPHA, ONE_MINUS_SRC_ALPHA blend */
-               float sa = a;
-               float isa = 1.0f - a;
-               r = r * sa + dr * isa;
-               g = g * sa + dg * isa;
-               b = b * sa + db * isa;
-               a = a * sa + da * isa;
-               if(r>1)r=1; if(g>1)g=1; if(b>1)b=1; if(a>1)a=1;
-            }
-
-            uint32_t ri=(uint32_t)(r*255+0.5f);
-            uint32_t gi=(uint32_t)(g*255+0.5f);
-            uint32_t bi=(uint32_t)(b*255+0.5f);
-            uint32_t ai=(uint32_t)(a*255+0.5f);
-            col[py*w+px] = ri|(gi<<8)|(bi<<16)|(ai<<24);
-         }
-      }
-   }
 
    cuCtxSynchronize();
    /* visbuf is persistent (freed in set_framebuffer_state or destroy_context) */
    if (packed_positions)
       cuMemFree(packed_positions);
-   if (packed_colors)
-      cuMemFree(packed_colors);
    if (vs_output_buf)
       cuMemFree(vs_output_buf);
 }
@@ -946,7 +994,8 @@ cp_create_fs_state(struct pipe_context *ctx,
    cuCtxSetCurrent(cp->screen->cuda_ctx);
 
    struct cp_shader_binary *bin = cp_compile_nir_to_ptx(nir,
-      cp->screen->sm_major, cp->screen->sm_minor);
+      cp->screen->sm_major, cp->screen->sm_minor,
+      cp->screen->kernels.sampler_ptx);
    if (!bin)
       bin = CALLOC_STRUCT(cp_shader_binary);
    return bin;
@@ -987,7 +1036,8 @@ cp_create_vs_state(struct pipe_context *ctx,
    cuCtxSetCurrent(cp->screen->cuda_ctx);
 
    struct cp_shader_binary *bin = cp_compile_nir_to_ptx(nir,
-      cp->screen->sm_major, cp->screen->sm_minor);
+      cp->screen->sm_major, cp->screen->sm_minor,
+      cp->screen->kernels.sampler_ptx);
    if (!bin)
       bin = CALLOC_STRUCT(cp_shader_binary);
    return bin;
@@ -1018,7 +1068,8 @@ cp_create_compute_state(struct pipe_context *ctx,
 
    struct nir_shader *nir = (struct nir_shader *)state->prog;
    struct cp_shader_binary *bin = cp_compile_nir_to_ptx(nir,
-      cp->screen->sm_major, cp->screen->sm_minor);
+      cp->screen->sm_major, cp->screen->sm_minor,
+      cp->screen->kernels.sampler_ptx);
    if (!bin) {
       /* Return empty binary so lavapipe doesn't get NULL */
       bin = CALLOC_STRUCT(cp_shader_binary);
@@ -1053,6 +1104,17 @@ static void
 cp_bind_sampler_states(struct pipe_context *ctx, mesa_shader_stage shader,
                        unsigned start, unsigned count, void **states)
 {
+   if (getenv("CUDAPIPE_DEBUG_TEX")) {
+      fprintf(stderr, "cudapipe: bind_sampler_states stage=%d start=%u count=%u\n",
+              shader, start, count);
+      for (unsigned i = 0; i < count; i++) {
+         struct pipe_sampler_state *s = states ? states[i] : NULL;
+         if (s)
+            fprintf(stderr, "   samp[%u]: min=%u mag=%u mip=%u wrap=%u,%u,%u\n",
+                    start + i, s->min_img_filter, s->mag_img_filter,
+                    s->min_mip_filter, s->wrap_s, s->wrap_t, s->wrap_r);
+      }
+   }
 }
 
 static void
@@ -1089,6 +1151,9 @@ cp_set_sampler_views(struct pipe_context *ctx, mesa_shader_stage shader,
                      struct pipe_sampler_view **views)
 {
    struct cp_context *cp = (struct cp_context *)ctx;
+   if (getenv("CUDAPIPE_DEBUG_TEX"))
+      fprintf(stderr, "cudapipe: set_sampler_views stage=%d start=%u count=%u views=%p\n",
+              shader, start, count, (void *)views);
    if (shader != MESA_SHADER_FRAGMENT)
       return;
 
@@ -1280,17 +1345,205 @@ cp_render_condition(struct pipe_context *ctx, struct pipe_query *query,
 {
 }
 
+/*
+ * Layout-compatible with lp_texture_handle: lavapipe reads ->functions and
+ * ->sampler_index straight out of whatever create_texture_handle() returns and
+ * copies them into the descriptor it builds.
+ */
 struct cp_texture_handle {
    void *functions;
    uint32_t sampler_index;
 };
+
+/* Translate a pipe_format into the sampler's decode path. Formats we don't
+ * decode yet map to CP_TEXEL_UNSUPPORTED, which samples as opaque black rather
+ * than reading garbage. */
+static uint32_t
+cp_texel_encoding_from_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+      return CP_TEXEL_R8G8B8A8_UNORM;
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
+      return CP_TEXEL_B8G8R8A8_UNORM;
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_SRGB:
+      return CP_TEXEL_R8G8B8X8_UNORM;
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_SRGB:
+      return CP_TEXEL_B8G8R8X8_UNORM;
+   case PIPE_FORMAT_A8R8G8B8_UNORM:
+   case PIPE_FORMAT_A8R8G8B8_SRGB:
+      return CP_TEXEL_A8R8G8B8_UNORM;
+   case PIPE_FORMAT_X8R8G8B8_UNORM:
+   case PIPE_FORMAT_X8R8G8B8_SRGB:
+      return CP_TEXEL_X8R8G8B8_UNORM;
+   case PIPE_FORMAT_R8G8B8_UNORM:
+   case PIPE_FORMAT_R8G8B8_SRGB:
+      return CP_TEXEL_R8G8B8_UNORM;
+   case PIPE_FORMAT_R8G8_UNORM:
+      return CP_TEXEL_R8G8_UNORM;
+   case PIPE_FORMAT_R8_UNORM:
+      return CP_TEXEL_R8_UNORM;
+   case PIPE_FORMAT_R8G8B8A8_SNORM:
+      return CP_TEXEL_R8G8B8A8_SNORM;
+   case PIPE_FORMAT_R16G16B16A16_UNORM:
+      return CP_TEXEL_R16G16B16A16_UNORM;
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+      return CP_TEXEL_R16G16B16A16_FLOAT;
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+      return CP_TEXEL_R32G32B32A32_FLOAT;
+   case PIPE_FORMAT_R32G32B32_FLOAT:
+      return CP_TEXEL_R32G32B32_FLOAT;
+   case PIPE_FORMAT_R32G32_FLOAT:
+      return CP_TEXEL_R32G32_FLOAT;
+   case PIPE_FORMAT_R32_FLOAT:
+      return CP_TEXEL_R32_FLOAT;
+   case PIPE_FORMAT_B5G6R5_UNORM:
+      return CP_TEXEL_R5G6B5_UNORM;
+   case PIPE_FORMAT_B5G5R5A1_UNORM:
+   case PIPE_FORMAT_B5G5R5X1_UNORM:
+      return CP_TEXEL_B5G5R5A1_UNORM;
+   case PIPE_FORMAT_A1R5G5B5_UNORM:
+      return CP_TEXEL_A1R5G5B5_UNORM;
+   case PIPE_FORMAT_A1B5G5R5_UNORM:
+   case PIPE_FORMAT_X1B5G5R5_UNORM:
+      return CP_TEXEL_A1B5G5R5_UNORM;
+   case PIPE_FORMAT_B4G4R4A4_UNORM:
+   case PIPE_FORMAT_B4G4R4X4_UNORM:
+      return CP_TEXEL_B4G4R4A4_UNORM;
+   case PIPE_FORMAT_A4R4G4B4_UNORM:
+      return CP_TEXEL_A4R4G4B4_UNORM;
+   case PIPE_FORMAT_A4B4G4R4_UNORM:
+      return CP_TEXEL_A4B4G4R4_UNORM;
+   case PIPE_FORMAT_R4G4B4A4_UNORM:
+      return CP_TEXEL_R4G4B4A4_UNORM;
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+      return CP_TEXEL_R11G11B10_FLOAT;
+   case PIPE_FORMAT_R9G9B9E5_FLOAT:
+      return CP_TEXEL_R9G9B9E5_FLOAT;
+   case PIPE_FORMAT_DXT1_RGB:
+   case PIPE_FORMAT_DXT1_SRGB:
+      return CP_TEXEL_DXT1_RGB;
+   case PIPE_FORMAT_DXT1_RGBA:
+   case PIPE_FORMAT_DXT1_SRGBA:
+      return CP_TEXEL_DXT1_RGBA;
+   case PIPE_FORMAT_DXT3_RGBA:
+   case PIPE_FORMAT_DXT3_SRGBA:
+      return CP_TEXEL_DXT3_RGBA;
+   case PIPE_FORMAT_DXT5_RGBA:
+   case PIPE_FORMAT_DXT5_SRGBA:
+      return CP_TEXEL_DXT5_RGBA;
+   default:
+      return CP_TEXEL_UNSUPPORTED;
+   }
+}
+
+/* Samplers are deduplicated into a device-visible table; the descriptor only
+ * carries the resulting index. */
+static uint32_t
+cp_register_sampler(struct cp_context *cp, const struct pipe_sampler_state *state)
+{
+   if (!cp->sampler_table) {
+      if (cuMemAllocManaged(&cp->sampler_table,
+                            CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info),
+                            CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+         return 0;
+      memset((void *)(uintptr_t)cp->sampler_table, 0,
+             CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info));
+      cp->num_samplers = 0;
+   }
+
+   struct cp_sampler_info info = {
+      .wrap_s = state->wrap_s,
+      .wrap_t = state->wrap_t,
+      .wrap_r = state->wrap_r,
+      .min_img_filter = state->min_img_filter,
+      .mag_img_filter = state->mag_img_filter,
+      .min_mip_filter = state->min_mip_filter,
+      .unnormalized_coords = state->unnormalized_coords,
+      .min_lod = state->min_lod,
+      .max_lod = state->max_lod,
+      .lod_bias = state->lod_bias,
+   };
+   memcpy(info.border_color, state->border_color.f, sizeof(info.border_color));
+
+   struct cp_sampler_info *table = (struct cp_sampler_info *)(uintptr_t)cp->sampler_table;
+   for (unsigned i = 0; i < cp->num_samplers; i++) {
+      if (memcmp(&table[i], &info, sizeof(info)) == 0)
+         return i;
+   }
+
+   if (cp->num_samplers >= CP_MAX_SAMPLERS)
+      return 0;
+
+   table[cp->num_samplers] = info;
+   if (getenv("CUDAPIPE_DEBUG_TEX"))
+      fprintf(stderr, "cudapipe: sampler[%u] wrap=%u,%u min=%u mag=%u mip=%u\n",
+              cp->num_samplers, info.wrap_s, info.wrap_t,
+              info.min_img_filter, info.mag_img_filter, info.min_mip_filter);
+   return cp->num_samplers++;
+}
 
 static uint64_t
 cp_create_texture_handle(struct pipe_context *ctx,
                          struct pipe_sampler_view *view,
                          const struct pipe_sampler_state *state)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_texture_handle *h = CALLOC_STRUCT(cp_texture_handle);
+   if (!h)
+      return 0;
+
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+
+   /* lavapipe calls this once per image view (view set, sampler NULL) and once
+    * per VkSampler (view NULL, sampler set), then copies whichever field it
+    * needs into the descriptor. */
+   if (view && view->texture) {
+      CUdeviceptr info_dev;
+      if (cuMemAllocManaged(&info_dev, sizeof(struct cp_texture_info),
+                            CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
+         struct cp_texture_info *info = (struct cp_texture_info *)(uintptr_t)info_dev;
+         memset(info, 0, sizeof(*info));
+
+         struct pipe_resource *res = view->texture;
+         struct cp_resource *cres = cp_resource(res);
+         enum pipe_format format = view->format ? view->format : res->format;
+
+         info->base = (uint64_t)(uintptr_t)cp_resource_data(cres);
+         info->width = res->width0;
+         info->height = res->height0;
+         info->depth = res->depth0;
+         info->format = format;
+         info->target = res->target;
+         info->first_level = view->u.tex.first_level;
+         info->last_level = view->u.tex.last_level;
+         info->encoding = cp_texel_encoding_from_format(format);
+         info->blocksize = util_format_get_blocksize(format);
+         info->is_srgb = util_format_is_srgb(format);
+
+         for (unsigned l = 0; l <= res->last_level && l < CP_MAX_TEXTURE_LEVELS; l++) {
+            info->row_stride[l] = cres->lpr.row_stride[l];
+            info->img_stride[l] = cres->lpr.img_stride[l];
+            info->mip_offset[l] = cres->lpr.mip_offsets[l];
+         }
+
+         h->functions = info;
+
+         if (getenv("CUDAPIPE_DEBUG_TEX"))
+            fprintf(stderr, "cudapipe: texture handle %ux%u fmt=%u enc=%u "
+                    "stride=%u base=%p\n", info->width, info->height,
+                    info->format, info->encoding, info->row_stride[0],
+                    (void *)(uintptr_t)info->base);
+      }
+   }
+
+   if (state)
+      h->sampler_index = cp_register_sampler(cp, state);
+
    return (uint64_t)(uintptr_t)h;
 }
 
@@ -1305,7 +1558,12 @@ cp_create_image_handle(struct pipe_context *ctx,
 static void
 cp_delete_texture_handle(struct pipe_context *ctx, uint64_t handle)
 {
-   FREE((void *)(uintptr_t)handle);
+   struct cp_texture_handle *h = (struct cp_texture_handle *)(uintptr_t)handle;
+   if (!h)
+      return;
+   if (h->functions)
+      cuMemFree((CUdeviceptr)(uintptr_t)h->functions);
+   FREE(h);
 }
 
 static void

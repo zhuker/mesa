@@ -8,6 +8,8 @@ struct cp_screen;
 
 struct cp_kernels {
    CUmodule module;
+   CUmodule clear_module;
+   CUmodule fs_module;
 
    /* Clear kernels */
    CUfunction clear_kernel;
@@ -17,6 +19,14 @@ struct cp_kernels {
    CUfunction rasterize_triangles;
    CUfunction clear_visbuf;
    CUfunction resolve_visbuf;
+
+   /* Fragment stage kernels bracketing the compiled fragment shader */
+   CUfunction fs_interpolate;
+   CUfunction fs_writeback;
+
+   /* Relocatable PTX for the texture sampler, linked into each shader that
+    * samples textures. Owned here; see cp_compile_nir_to_ptx(). */
+   char *sampler_ptx;
 
    bool initialized;
 };

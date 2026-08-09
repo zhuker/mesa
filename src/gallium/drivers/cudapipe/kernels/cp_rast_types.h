@@ -80,4 +80,138 @@ struct cp_resolve_args {
    uint32_t color_stride;
 };
 
+#define CP_MAX_TEXTURE_LEVELS 16
+#define CP_MAX_FS_INPUTS 16
+
+/* How a colour attachment's bytes are laid out, for the writeback kernel. */
+enum cp_color_encoding {
+   CP_COLOR_R8G8B8A8_UNORM = 0,
+   CP_COLOR_B8G8R8A8_UNORM,
+   CP_COLOR_R8G8B8A8_SRGB,
+   CP_COLOR_B8G8R8A8_SRGB,
+   CP_COLOR_R32G32B32A32_FLOAT,
+   CP_COLOR_R16G16B16A16_FLOAT,
+};
+
+/*
+ * Gathers the fragment shader's inputs for every covered pixel.
+ *
+ * Covered pixels are compacted into pixel_list so the fragment shader can be
+ * launched over just those, one thread per pixel.
+ */
+struct cp_fs_interp_args {
+   uint64_t visbuf;
+   uint64_t positions;      /* Clip-space float4, 3 per triangle */
+   uint64_t vs_out;         /* Vertex shader output buffer */
+   uint64_t pixel_list;     /* Out: y * width + x for each covered pixel */
+   uint64_t counter;        /* Out: number of covered pixels */
+   uint64_t fs_in;          /* Out: interpolated varyings, per covered pixel */
+   uint64_t frag_coord;     /* Out: float4 (x, y, z, 1/w) per covered pixel */
+   /* Out: screen-space derivatives of each input, float4 per input slot per
+    * pixel as (du/dx, dv/dx, du/dy, dv/dy). The sampler needs these to pick a
+    * mip level, and this stage can compute them from the triangle directly. */
+   uint64_t fs_deriv;
+   uint32_t width, height;
+   uint32_t vs_out_stride;  /* Bytes per vertex in vs_out */
+   uint32_t fs_in_stride;   /* Bytes per pixel in fs_in */
+   uint32_t num_fs_inputs;
+   uint32_t max_pixels;
+   /* Which vertex shader output slot feeds each fragment shader input slot,
+    * matched by varying location on the host. -1 means nothing drives it. */
+   int32_t input_vs_slot[CP_MAX_FS_INPUTS];
+   float vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y;
+};
+
+struct cp_fs_writeback_args {
+   uint64_t pixel_list;
+   uint64_t fs_out;         /* Fragment shader colour output, per covered pixel */
+   uint64_t color_out;
+   uint32_t fs_out_stride;
+   uint32_t num_pixels;
+   uint32_t color_encoding; /* enum cp_color_encoding */
+   uint32_t blend_enable;
+   /* pipe_blend_state factors/functions for the colour and alpha channels. */
+   uint32_t rgb_src_factor, rgb_dst_factor, rgb_func;
+   uint32_t alpha_src_factor, alpha_dst_factor, alpha_func;
+   uint32_t colormask;
+};
+
+/*
+ * Everything the sampler needs to know about one texture.
+ *
+ * lavapipe hands the driver an lp_image_descriptor whose `functions` field is
+ * whatever this driver's create_texture_handle() returned, so we point it at
+ * one of these instead of at llvmpipe's JIT-compiled sample functions. That
+ * keeps us out of llvmpipe's internal descriptor layout entirely.
+ */
+struct cp_texture_info {
+   uint64_t base;           /* Texture data (level 0) */
+   uint32_t width, height, depth;
+   uint32_t format;         /* enum pipe_format */
+   uint32_t target;         /* enum pipe_texture_target */
+   uint32_t first_level, last_level;
+   uint32_t row_stride[CP_MAX_TEXTURE_LEVELS];
+   uint32_t img_stride[CP_MAX_TEXTURE_LEVELS];
+   uint32_t mip_offset[CP_MAX_TEXTURE_LEVELS];
+   /* Decoded from `format` on the host so the kernel doesn't need a format
+    * table: see enum cp_texel_encoding. */
+   uint32_t encoding;
+   uint32_t blocksize;      /* Bytes per texel (uncompressed) or per block */
+   uint32_t is_srgb;
+};
+
+/* How the sampler should turn raw bytes into an RGBA float. */
+enum cp_texel_encoding {
+   CP_TEXEL_UNSUPPORTED = 0,
+   CP_TEXEL_R8G8B8A8_UNORM,
+   CP_TEXEL_B8G8R8A8_UNORM,
+   CP_TEXEL_R8G8B8X8_UNORM,
+   CP_TEXEL_B8G8R8X8_UNORM,
+   CP_TEXEL_R8G8_UNORM,
+   CP_TEXEL_R8_UNORM,
+   CP_TEXEL_R8G8B8A8_SNORM,
+   CP_TEXEL_R16G16B16A16_UNORM,
+   CP_TEXEL_R16G16B16A16_FLOAT,
+   CP_TEXEL_R32G32B32A32_FLOAT,
+   CP_TEXEL_R32G32B32_FLOAT,
+   CP_TEXEL_R32G32_FLOAT,
+   CP_TEXEL_R32_FLOAT,
+   CP_TEXEL_R5G6B5_UNORM,
+   CP_TEXEL_B5G5R5A1_UNORM,
+   CP_TEXEL_A1R5G5B5_UNORM,
+   CP_TEXEL_A1B5G5R5_UNORM,
+   CP_TEXEL_B4G4R4A4_UNORM,
+   CP_TEXEL_A4R4G4B4_UNORM,
+   CP_TEXEL_A4B4G4R4_UNORM,
+   CP_TEXEL_R4G4B4A4_UNORM,
+   CP_TEXEL_R11G11B10_FLOAT,
+   CP_TEXEL_R9G9B9E5_FLOAT,
+   CP_TEXEL_A8R8G8B8_UNORM,
+   CP_TEXEL_X8R8G8B8_UNORM,
+   CP_TEXEL_R8G8B8_UNORM,
+   CP_TEXEL_DXT1_RGB,
+   CP_TEXEL_DXT1_RGBA,
+   CP_TEXEL_DXT3_RGBA,
+   CP_TEXEL_DXT5_RGBA,
+};
+
+/* Mirrors the subset of pipe_sampler_state the sampler actually uses. */
+struct cp_sampler_info {
+   uint32_t wrap_s, wrap_t, wrap_r;
+   uint32_t min_img_filter, mag_img_filter, min_mip_filter;
+   uint32_t unnormalized_coords;
+   float min_lod, max_lod, lod_bias;
+   float border_color[4];
+};
+
+/*
+ * Offsets into lavapipe's descriptors. These are the only two things we read
+ * out of structures we don't own, and cp_context.c static-asserts both against
+ * offsetof() so a layout change upstream breaks the build rather than the
+ * rendering.
+ */
+#define CP_DESC_IMAGE_BASE_OFFSET      0   /* lp_image_descriptor.texture.base */
+#define CP_DESC_IMAGE_FUNCTIONS_OFFSET 48  /* lp_image_descriptor.functions */
+#define CP_DESC_SAMPLER_INDEX_OFFSET   28  /* lp_sampler_descriptor.sampler_index */
+
 #endif /* CP_RAST_TYPES_H */

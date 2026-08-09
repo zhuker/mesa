@@ -309,8 +309,7 @@ cudapipe_create_screen(struct sw_winsys *winsys)
    }
 
    {
-      CUctxCreateParams params = {0};
-      CUresult err = cuCtxCreate(&screen->cuda_ctx, &params, 0, screen->cuda_device);
+      CUresult err = cuCtxCreate(&screen->cuda_ctx, 0, screen->cuda_device);
       if (err != CUDA_SUCCESS) {
          fprintf(stderr, "cudapipe: cuCtxCreate failed (%d)\n", err);
          FREE(screen);

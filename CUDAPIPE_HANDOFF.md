@@ -2,176 +2,152 @@
 
 ## What This Is
 
-A new Mesa Vulkan ICD (`libvulkan_cudapipe.so`) that rasterizes triangles on NVIDIA GPUs using CUDA compute kernels instead of fixed-function hardware. Targets GPUs without rasterization HW (like compute-only accelerators). Built on a Tesla T4 (SM 7.5).
+A Mesa Vulkan ICD (`libvulkan_cudapipe.so`) that rasterizes triangles on NVIDIA
+GPUs using CUDA compute kernels instead of fixed-function hardware. It reuses
+lavapipe as the Vulkan frontend and replaces the Gallium driver underneath.
 
-## Branch & Build
+## Build
+
+Needs meson >= 1.4, LLVM 18 with the NVPTX backend, and a CUDA toolkit whose
+NVRTC knows the target GPU (`/usr/local/cuda`, *not* the older nvrtc that may
+sit in `/usr/lib/x86_64-linux-gnu`).
 
 ```bash
-cd /home/coder/git/mesa
-git checkout cudapipe   # 39 commits ahead of main
-
-# Build
-meson setup build-cudapipe -Dvulkan-drivers=swrast -Dgallium-drivers=llvmpipe,cudapipe \
-  -Dllvm=enabled -Dglx=disabled -Degl=disabled -Dplatforms= -Dgbm=disabled \
-  -Dgles1=disabled -Dgles2=disabled -Dopengl=false -Dglvnd=disabled
+meson setup build-cudapipe -Dvulkan-drivers=swrast \
+  -Dgallium-drivers=llvmpipe,cudapipe -Dllvm=enabled -Dglx=disabled \
+  -Degl=disabled -Dplatforms= -Dgbm=disabled -Dgles1=disabled -Dgles2=disabled \
+  -Dopengl=false -Dglvnd=disabled
 ninja -C build-cudapipe
-
-# Test
-VK_ICD_FILENAMES=/home/coder/git/mesa/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_icd.x86_64.json \
-  /home/coder/git/VK-GL-CTS/build/external/vulkancts/modules/vulkan/deqp-vk \
-  --deqp-archive-dir=/home/coder/git/VK-GL-CTS/external/vulkancts/data \
-  --deqp-case=dEQP-VK.draw.dynamic_rendering.primary_cmd_buff.simple_draw.simple_draw_triangle_list
 ```
 
-## What Works
+The build emits `cudapipe_devenv_icd.<arch>.json` pointing at the build tree, so
+the driver runs without installing:
 
-| Feature | Status | dEQP Verification |
-|---|---|---|
-| Compute shaders | ✅ 50/50 basic tests pass | All Roblox compute ops (SSBO, UBO, shared mem, atomics, images) |
-| VS execution on CUDA | ✅ Pixel-perfect | simple_draw, draw_indexed tests pass |
-| Triangle rasterization | ✅ Visibility buffer + atomicMin | Correct shape, coverage, depth |
-| Color interpolation | ✅ Barycentric from VS varyings | Gradient matches reference exactly |
-| Indexed draws | ✅ uint16/uint32 | draw_indexed tests pass |
-| Multi-draw | ⚠️ Partial | Single draws perfect, 45-draw has issues |
-| Blending | ✅ SRC_ALPHA/ONE_MINUS_SRC_ALPHA | Implemented in CPU resolve |
-| Depth test | ✅ Implicit via visbuf | Closest triangle wins |
-| Texture sampling | ❌ Returns white | Architecture complete, parameter bug |
-
-## Immediate Task: Fix Texture Sampling
-
-The texture test (`dEQP-VK.texture.filtering.2d.formats.r8g8b8a8_unorm.nearest`) renders white instead of the expected colorful pattern. The reference image is a 64x64 grid of colored cells.
-
-### Root Cause Chain
-
-The texture data IS in managed memory (CPU-accessible). The path to sample it:
-
-1. **VS reads UVs from VB 1** → `load_input(base=1)` in the VS kernel
-2. **VS outputs UVs as varying** → `store_output(base=1)` 
-3. **CPU resolve interpolates UVs** → barycentric interpolation of varying slot
-4. **CPU resolve samples texture** → reads from FS UBO[1] descriptor → tex base ptr → texel
-
-### Where It's Broken
-
-The output is pure white, meaning either:
-- The VS doesn't produce visbuf hits (quad not rasterized) — unlikely since draw is reported
-- The VS outputs wrong varying data (UVs are all zero or the extraction fails)
-- The texture descriptor isn't found (FS UBO[1] not bound or wrong format)
-
-### Debugging Steps
-
-1. **Check if VS produces visbuf hits for texture test:**
-   - Add `cuCtxSynchronize()` after rasterize, count non-empty visbuf entries
-   - If 0 hits: VS positions are wrong (quad renders off-screen)
-
-2. **Check VS varying output (UV values):**
-   - After VS runs, print `packed_colors[0..3]` — should be UV values (0-1 range)
-   - If all zeros: multi-VB assembly failed (elem[1] from VB 1 not copied correctly)
-
-3. **Check FS UBO[1] binding:**
-   - Print `cp->fs_ubos[1].buffer` — should be non-NULL
-   - Print first 8 bytes as pointer — should be valid tex data address
-
-4. **Check texture data at descriptor address:**
-   - Dereference the base ptr from FS UBO descriptor
-   - First pixels should be non-zero (colorful test texture)
-
-### The Multi-VB Assembly Bug
-
-The texture test has:
-```
-elem[0]: offset=0, fmt=24 (RGBA32F), vb=0, stride=16  (position)
-elem[1]: offset=64, fmt=22 (RG32F), vb=1, stride=???  (UV)
+```bash
+VK_DRIVER_FILES=$PWD/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv_icd.x86_64.json \
+  <vulkan app>
 ```
 
-Our assembly code (`cp_context.c` ~line 290) copies each element from its VB:
-```c
-char *src = evb_start + vert_idx * elem_stride + src_off;
-memcpy(vs_in + out_off + e * 16, src, copy_size);
-```
-
-`elem_stride` = `cp->vertex_elements[e].src_stride` — this might be wrong for elem[1] if it's 0 or if `src_off=64` causes reading past buffer.
-
-### Key Files
-
-| File | Role |
-|---|---|
-| `src/gallium/drivers/cudapipe/cp_context.c` | Draw pipeline, VS launch, CPU resolve |
-| `src/gallium/drivers/cudapipe/nir_to_ptx/cp_nir_to_llvm.c` | NIR → LLVM IR → PTX shader compiler |
-| `src/gallium/drivers/cudapipe/cp_resource.c` | Resource management, clear, copy |
-| `src/gallium/drivers/cudapipe/cp_screen.c` | CUDA init, capabilities |
-| `src/gallium/drivers/cudapipe/cp_kernels.c` | NVRTC kernel compilation |
-| `src/gallium/drivers/cudapipe/kernels/cp_rasterize.cu` | Triangle rasterizer + resolve kernel |
-| `src/gallium/drivers/cudapipe/kernels/cp_rast_types.h` | Shared host/device structs |
-
-### Architecture
+## Architecture
 
 ```
-Vulkan App (SPIR-V)
+Vulkan app (SPIR-V)
     ↓
-Lavapipe Frontend (reused as-is, liblavapipe_st.a)
+lavapipe frontend (reused as-is)
     ↓ pipe_context calls
-cudapipe Gallium Driver
-    ├── create_compute_state → cp_compile_nir_to_ptx() → CUmodule
-    ├── create_vs_state → nir_lower_io + cp_compile_nir_to_ptx() → CUmodule  
-    ├── create_fs_state → nir_lower_io + cp_compile_nir_to_ptx() → CUmodule
+cudapipe Gallium driver
+    ├── create_{vs,fs,compute}_state → cp_compile_nir_to_ptx() → PTX → CUmodule
     ├── launch_grid → cuLaunchKernel (compute)
     └── draw_vbo:
-        1. Assemble vertices from VBs (multi-VB, indexed, strip/fan)
-        2. Launch VS kernel (transforms positions, outputs varyings)
-        3. Launch rasterize_triangles kernel (atomicMin visbuf)
-        4. CPU resolve (barycentric interpolation, texture sampling, blending)
-        5. Write to color buffer
+        1. Assemble vertices from vertex buffers (host side, multi-VB/indexed)
+        2. Vertex shader kernel      → clip positions + varyings
+        3. cp_rasterize_triangles    → visibility buffer (atomicMin depth|triID)
+        4. cp_fs_interpolate         → compact covered pixels, interpolate
+                                       varyings and their derivatives
+        5. <compiled fragment shader> → one thread per covered pixel
+        6. cp_fs_writeback           → blend into the colour attachment
 ```
 
-### Descriptor System (Critical for Textures)
+Shaders run as ordinary CUDA kernels named `main`, taking one argument: a
+pointer to an array of pointers. The slots are shared across stages:
 
-Lavapipe uses a "descriptor heap" where SSBO/UBO/texture descriptors are packed into constant buffers. The shader accesses them via:
-- `load_const_buf_base_addr_lvp(slot)` → returns base address of UBO[slot]
-- The UBO contains `lp_jit_buffer` structs (for SSBOs: {ptr base, u32 num_elements})
-- Or `lp_image_descriptor` structs (for textures: {ptr base, u32 width, u16 height, ...})
+| Slot | Meaning |
+|---|---|
+| 0 | thread/vertex/pixel count |
+| 2 | input buffer (vertex attributes, or interpolated varyings) |
+| 3 | input stride |
+| 4 | output buffer (varyings, or fragment colour) |
+| 5 | vertex-id array (vertex stage only) |
+| 6 | fragment coordinates |
+| 18.. | uniform/descriptor buffers |
 
-For compute shaders, this works perfectly (50/50 tests pass). The same mechanism is used for FS texture access — the texture data pointer is in the descriptor buffer.
+Because `load_input`/`store_output` index by `blockIdx.x * 256 + threadIdx.x`,
+the same emitter code serves the vertex stage (indexed by vertex) and the
+fragment stage (indexed by covered pixel).
 
-### Key Struct: llvmpipe_resource
+## Texture sampling
 
-We embed `struct llvmpipe_resource` as the first field of `struct cp_resource` because lavapipe's descriptor code calls `llvmpipe_resource_data()` which reads from fixed offsets (tex_data at 440, data at 456). This is critical — DON'T change the struct layout without verifying these offsets.
+The sampler lives in `kernels/cp_sampler.cu` as a `__device__` function. NVRTC
+compiles it to relocatable PTX once at screen init; `cuLink*` links it into each
+shader's PTX that contains a `nir_tex`. `emit_tex()` therefore only has to emit
+a call to `cp_tex_sample_2d()`.
 
-### Debug Environment Variables
+**Where texture state comes from.** lavapipe drives everything through its
+descriptor buffers — it never calls `set_sampler_views`/`bind_sampler_states`
+with real state (verified: it only ever unbinds). But it *does* call this
+driver's `create_texture_handle()` once per image view and once per sampler, and
+copies two fields out of whatever we return:
 
-- `CUDAPIPE_DEBUG_DRAW=1` — prints draw call info (tri count, viewport, stride)
-- `CUDAPIPE_DUMP_NIR=1` — dumps VS/FS NIR before compilation
-- `CUDAPIPE_DUMP_PTX=1` — dumps generated PTX
-- `CUDAPIPE_DUMP_IR=1` — dumps LLVM IR before PTX emission
+* `->functions`, which we point at our own `struct cp_texture_info`
+  (dimensions, format, strides, mip offsets)
+* `->sampler_index`, which we make an index into our own `cp_sampler_info` table
 
-### After Texture Fix: Remaining Work for Full Roblox
+So the sampler never parses llvmpipe's internal descriptor layout. It reads only
+two offsets from lavapipe's descriptors, and `cp_context.c` `static_assert`s both
+against `offsetof()` so an upstream change breaks the build rather than the
+rendering.
 
-1. **Multi-draw precision** — the .45 tests (45 sequential draws) fail because vertex_id assembly doesn't account for per-draw offsets correctly
-2. **Depth buffer write** — visbuf gives implicit depth test but Roblox needs explicit depth buffer for shadow maps / multi-pass
-3. **More blend modes** — currently only SRC_ALPHA/ONE_MINUS_SRC_ALPHA; Roblox may use additive blending
-4. **GPU-side FS execution** — current CPU resolve is slow; for production, run FS as CUDA kernel per-pixel
-5. **Performance** — switch from cuMemAllocManaged to explicit cuMemAlloc + copies for hot resources
+Mip level selection uses derivatives computed analytically in
+`cp_fs_interpolate` (the barycentrics are re-evaluated one pixel right and one
+pixel down). `emit_tex()` traces the coordinate back to its `load_input` slot at
+compile time and passes that slot to the sampler; a coordinate computed inside
+the shader gets no derivatives and samples the base level.
 
-### Test Commands
+## Status
 
-```bash
-# All draw tests
-VK_ICD_FILENAMES=...cudapipe_icd.x86_64.json deqp-vk --deqp-archive-dir=...data \
-  --deqp-case=dEQP-VK.draw.dynamic_rendering.primary_cmd_buff.simple_draw.*
+Verified with dEQP (`vulkan_headless` target):
 
-# Compute tests  
-deqp-vk --deqp-case=dEQP-VK.compute.pipeline.basic.*
+| Area | Result |
+|---|---|
+| `texture.filtering.2d.formats.*` | 72/75 supported pass |
+| `compute.pipeline.basic.*` | 70/71 supported pass |
+| `draw...simple_draw.*` | 2/4 (both non-instanced pass) |
 
-# Texture test (currently fails)
-deqp-vk --deqp-case=dEQP-VK.texture.filtering.2d.formats.r8g8b8a8_unorm.nearest
+Known gaps, roughly in the order they matter for a real workload:
 
-# Quick sanity check
-deqp-vk --deqp-case=dEQP-VK.draw.dynamic_rendering.primary_cmd_buff.simple_draw.simple_draw_triangle_list
-```
+1. **Instanced draws are not implemented.** `cp_draw_vbo` ignores
+   `info->instance_count` entirely — it never loops over instances. This is why
+   the two `simple_draw_instanced_*` tests fail.
+2. **No depth buffer.** Depth testing is implicit in the visibility buffer
+   (closest triangle wins), which is enough for a single pass but not for
+   multi-pass rendering, shadow maps, or explicit depth reads.
+3. **Vertex assembly is done on the host**, per draw, with a `memcpy` per
+   attribute per vertex. This dominates the cost of large draws — the full
+   `draw.dynamic_rendering` group does not finish in 25 minutes.
+4. **Compressed formats are written but unverified.** DXT1/3/5 decode exists in
+   `cp_fetch_texel` but no test in the suites run so far exercises it. BC4-7 are
+   missing. These matter for real game content.
+5. **Depth/stencil aspect sampling** returns floats only, so the three
+   `*_stencil`/`s8_uint` filtering tests fail (they need integer texture returns).
+6. `copy_ssbo_bounds` fails — SSBO robustness/bounds behaviour.
+7. Only 2D textures are sampled. Cube maps, arrays, 3D textures, texel fetches
+   (`nir_texop_txf`) and shadow compares fall through to a zero result in
+   `emit_tex()`.
 
-### Dependencies on This Machine
+## Debug environment variables
 
-- CUDA 12+ (nvcc at /usr/bin/nvcc, libcuda.so, libnvrtc.so, libnvJitLink.so)
-- LLVM 18 with NVPTX backend (`llc-18 --version` shows nvptx64)
-- Tesla T4 GPU (SM 7.5)
-- dEQP at /home/coder/git/VK-GL-CTS/build/external/vulkancts/modules/vulkan/deqp-vk
-- CuRast reference at /home/coder/git/CuRast/ (for rasterization algorithm inspiration)
+| Variable | Effect |
+|---|---|
+| `CUDAPIPE_DEBUG_DRAW` | draw call summary, vertex elements, shaded pixel count |
+| `CUDAPIPE_DEBUG_TEX` | sampler/texture descriptor resolution |
+| `CUDAPIPE_DEBUG_FS` | per-pixel fragment inputs/outputs and varying mapping |
+| `CUDAPIPE_DEBUG_FS_ROW` | restrict `CUDAPIPE_DEBUG_FS` to one framebuffer row |
+| `CUDAPIPE_DEBUG_LAUNCH` | compute UBO/SSBO bindings |
+| `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
+
+## Notes for whoever picks this up
+
+* `.cu` kernels are stringified into the binary at build time by
+  `kernels/cu_to_inc.py`; edit the `.cu` and rebuild, there is nothing to
+  regenerate by hand.
+* LLVM's NVPTX backend only knows architectures that existed when it was
+  released. On anything newer it warns and silently emits PTX the driver
+  rejects, so `CP_MAX_PTX_SM` in `cp_nir_to_llvm.c` caps the architecture we ask
+  for and lets the driver JIT forward. Raise it together with the PTX ISA
+  version in the same function.
+* `struct cp_resource` embeds `struct llvmpipe_resource` as its first member
+  because lavapipe's descriptor code reads llvmpipe fields at fixed offsets.
+  Don't reorder it.
+* Every mip level needs its own `row_stride`/`img_stride`/`mip_offsets` entry.
+  Leaving them zero doesn't just break the small levels — uploads of level 1 land
+  at offset 0 and silently overwrite the first row of level 0.
