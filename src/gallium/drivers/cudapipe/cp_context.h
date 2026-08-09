@@ -35,6 +35,13 @@ struct cp_context {
    /* Texture state for FS */
    CUtexObject tex_objects[32];
    unsigned num_tex_objects;
+   struct {
+      void *data;
+      unsigned width, height;
+      unsigned row_stride;
+      unsigned pixel_size;
+      enum pipe_format format;
+   } tex_resources[32];
 
    /* Vertex buffers and elements */
    struct pipe_vertex_buffer vertex_buffers[16];

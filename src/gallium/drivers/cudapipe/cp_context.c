@@ -277,15 +277,16 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
          cuMemAllocManaged(&vs_output_buf, total_verts * out_stride, CU_MEM_ATTACH_GLOBAL);
 
-         /* Build a per-vertex input buffer with FULL vertex data (all attributes).
-          * Each entry is stride bytes, containing all vertex attributes.
-          * The VS load_input reads at base*16 offset within each vertex. */
+         /* Build VS input buffer: lay out all attributes at base*16 offsets.
+          * VS load_input(base=N) reads from offset vertex_id * vs_stride + N*16.
+          * vs_stride = num_elements * 16 (each attribute gets 16 bytes even if smaller). */
+         unsigned vs_in_stride = cp->num_vertex_elements * 16;
          CUdeviceptr vs_input_buf;
-         cuMemAllocManaged(&vs_input_buf, total_verts * stride, CU_MEM_ATTACH_GLOBAL);
+         cuMemAllocManaged(&vs_input_buf, total_verts * vs_in_stride, CU_MEM_ATTACH_GLOBAL);
          char *vs_in = (char*)(uintptr_t)vs_input_buf;
+         memset(vs_in, 0, total_verts * vs_in_stride);
 
-         /* Copy full vertex data for each assembled vertex */
-         /* Reuse the same assembly logic as position extraction */
+         /* For each assembled vertex, copy each attribute from its VB */
          {
             unsigned tri_out2 = 0;
             for (unsigned d = 0; d < num_draws; d++) {
@@ -318,12 +319,30 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                      } else {
                         vert_idx = first + idx2[vi];
                      }
-                     memcpy(vs_in + (tri_out2*3+vi) * stride, vb_start + vert_idx * stride, stride);
+                     /* Copy each element from its VB to the packed layout */
+                     unsigned out_off = (tri_out2*3+vi) * vs_in_stride;
+                     for (unsigned e = 0; e < cp->num_vertex_elements; e++) {
+                        unsigned vb_idx = cp->vertex_elements[e].vertex_buffer_index;
+                        unsigned src_off = cp->vertex_elements[e].src_offset;
+                        unsigned elem_stride = cp->vertex_elements[e].src_stride;
+                        if (vb_idx >= cp->num_vertex_buffers || !cp->vertex_buffers[vb_idx].buffer.resource)
+                           continue;
+                        struct cp_resource *evb = cp_resource(cp->vertex_buffers[vb_idx].buffer.resource);
+                        void *evb_data = cp_resource_data(evb);
+                        if (!evb_data) continue;
+                        char *evb_start = (char*)evb_data + cp->vertex_buffers[vb_idx].buffer_offset;
+                        /* Copy up to 16 bytes of this attribute */
+                        unsigned copy_size = 16; /* max per slot */
+                        char *src = evb_start + vert_idx * elem_stride + src_off;
+                        memcpy(vs_in + out_off + e * 16, src, copy_size);
+                     }
                   }
                   tri_out2++;
                }
             }
          }
+         /* Update stride passed to kernel */
+         stride = vs_in_stride;
 
          CUdeviceptr vs_args_dev;
          cuMemAllocManaged(&vs_args_dev, 8 * sizeof(void*), CU_MEM_ATTACH_GLOBAL);
@@ -522,10 +541,15 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       }
    }
 
-   /* If VS ran, overwrite packed_colors with VS varying output.
+   /* If VS ran, extract varying output (color/UV) from VS output.
     * The color varying is at the LAST output slot (after pos and any other outputs).
-    * Position is always slot 0, color is typically the last slot. */
-   if (vs_ran && vs_output_buf && packed_colors) {
+    * If packed_colors wasn't allocated (no color in VB), allocate it now. */
+   if (vs_ran && vs_output_buf) {
+      unsigned total_verts_col = num_triangles * 3;
+      if (!packed_colors) {
+         cuMemAllocManaged(&packed_colors, total_verts_col * 16, CU_MEM_ATTACH_GLOBAL);
+         resolve_args.colors = packed_colors;
+      }
       unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
       unsigned color_slot = num_vs_outputs - 1; /* last output = color varying */
       float *vs_out = (float*)(uintptr_t)vs_output_buf;
@@ -584,6 +608,40 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                b = w0*c0[2]+w1*c1[2]+w2*c2[2];
                a = w0*c0[3]+w1*c1[3]+w2*c2[3];
             }
+            /* If textures are bound, sample texture using interpolated UV.
+             * Varying (r,g) = (u,v) texture coordinates. */
+            if (cp->tex_resources[0].data && cp->num_tex_objects > 0) {
+               float u = r, v = g;
+               /* Wrap UV to [0,1] */
+               u = u - floorf(u);
+               v = v - floorf(v);
+               /* Nearest-neighbor sample from texture */
+               unsigned tw = cp->tex_resources[0].width;
+               unsigned th = cp->tex_resources[0].height;
+               unsigned tx = (unsigned)(u * (tw - 1) + 0.5f);
+               unsigned ty = (unsigned)(v * (th - 1) + 0.5f);
+               if (tx >= tw) tx = tw - 1;
+               if (ty >= th) ty = th - 1;
+               unsigned tps = cp->tex_resources[0].pixel_size;
+               unsigned trs = cp->tex_resources[0].row_stride;
+               uint8_t *texel = (uint8_t *)cp->tex_resources[0].data + ty * trs + tx * tps;
+               /* Decode texel based on pixel size (assume RGBA8 or similar) */
+               if (tps >= 4) {
+                  r = texel[0] / 255.0f;
+                  g = texel[1] / 255.0f;
+                  b = texel[2] / 255.0f;
+                  a = tps >= 4 ? texel[3] / 255.0f : 1.0f;
+               } else if (tps == 3) {
+                  r = texel[0] / 255.0f;
+                  g = texel[1] / 255.0f;
+                  b = texel[2] / 255.0f;
+                  a = 1.0f;
+               } else if (tps == 1) {
+                  r = g = b = texel[0] / 255.0f;
+                  a = 1.0f;
+               }
+            }
+
             if(r<0)r=0; if(r>1)r=1;
             if(g<0)g=0; if(g>1)g=1;
             if(b<0)b=0; if(b>1)b=1;
@@ -1053,6 +1111,14 @@ cp_set_sampler_views(struct pipe_context *ctx, mesa_shader_stage shader,
       CUresult err = cuTexObjectCreate(&cp->tex_objects[idx], &resDesc, &texDesc, NULL);
       if (err != CUDA_SUCCESS)
          cp->tex_objects[idx] = 0;
+
+      /* Store resource info for CPU-side sampling */
+      cp->tex_resources[idx].data = data;
+      cp->tex_resources[idx].width = w;
+      cp->tex_resources[idx].height = h;
+      cp->tex_resources[idx].row_stride = row_stride;
+      cp->tex_resources[idx].pixel_size = pixel_size;
+      cp->tex_resources[idx].format = res->format;
    }
 
    if (start + count > cp->num_tex_objects)
