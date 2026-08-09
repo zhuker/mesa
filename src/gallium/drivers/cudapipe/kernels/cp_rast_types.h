@@ -60,9 +60,10 @@ struct cp_rasterize_args {
    uint32_t height;
    uint32_t num_triangles;
    uint32_t num_varyings;
-   /* Viewport */
+   /* Viewport (raw scale/translate for proper Vulkan Y handling) */
    float vp_x, vp_y, vp_w, vp_h;
    float vp_near, vp_far;
+   float vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y;
    /* Rasterizer state */
    uint32_t cull_mode;      /* 0=none, 1=front, 2=back */
    uint32_t front_face;     /* 0=CCW, 1=CW */
@@ -75,6 +76,7 @@ struct cp_resolve_args {
    uint64_t color_out;
    uint32_t width, height;
    float vp_x, vp_y, vp_w, vp_h;
+   float vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y;
    uint32_t color_stride;
 };
 

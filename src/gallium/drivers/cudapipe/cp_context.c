@@ -144,12 +144,17 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    /* For now: read vertex positions directly from the first bound vertex buffer.
     * Assume positions are at offset 0 as float4 (x,y,z,w).
     * TODO: proper VS execution with compiled vertex shader */
-   /* Viewport: pass raw scale/translate for proper Vulkan Y-flip handling.
-    * screen = ndc * scale + translate (where scale[1] is negative for Y-down) */
-   float vp_w = fabsf(cp->viewport.scale[0]) * 2.0f;
-   float vp_h = fabsf(cp->viewport.scale[1]) * 2.0f;
-   float vp_x = cp->viewport.translate[0] - fabsf(cp->viewport.scale[0]);
-   float vp_y = cp->viewport.translate[1] - fabsf(cp->viewport.scale[1]);
+   /* Viewport: pass raw scale/translate. The rasterizer uses:
+    * screen = ndc * scale + translate (handles both Y-flip and non-flip) */
+   float vp_scale_x = cp->viewport.scale[0];
+   float vp_scale_y = cp->viewport.scale[1];
+   float vp_trans_x = cp->viewport.translate[0];
+   float vp_trans_y = cp->viewport.translate[1];
+   /* For the rasterize kernel: vp_x/y/w/h format */
+   float vp_w = fabsf(vp_scale_x) * 2.0f;
+   float vp_h = fabsf(vp_scale_y) * 2.0f;
+   float vp_x = vp_trans_x - fabsf(vp_scale_x);
+   float vp_y = vp_trans_y - fabsf(vp_scale_y);
 
    struct cp_rasterize_args rast_args = {
       .framebuffer = visbuf,
@@ -161,6 +166,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .vp_x = vp_x, .vp_y = vp_y,
       .vp_w = vp_w, .vp_h = vp_h,
       .vp_near = 0.0f, .vp_far = 1.0f,
+      .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
+      .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
       .cull_mode = 0,
       .front_face = 0,
    };
@@ -414,8 +421,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    }
 
    if (getenv("CUDAPIPE_DEBUG_DRAW")) {
-      fprintf(stderr, "cudapipe: draw %u tris, fb=%ux%u, vp=[%.0f,%.0f,%.0f,%.0f] stride=%u\n",
-              num_triangles, w, h, vp_x, vp_y, vp_w, vp_h, cp->vertex_stride);
+      fprintf(stderr, "cudapipe: draw %u tris, fb=%ux%u, vp=[%.0f,%.0f,%.0f,%.0f] stride=%u scale=[%.1f,%.1f]\n",
+              num_triangles, w, h, vp_x, vp_y, vp_w, vp_h, cp->vertex_stride,
+              cp->viewport.scale[0], cp->viewport.scale[1]);
       for (unsigned e = 0; e < cp->num_vertex_elements && e < 4; e++)
          fprintf(stderr, "  elem[%u]: offset=%u fmt=%u vb=%u\n", e,
                  cp->vertex_elements[e].src_offset, cp->vertex_elements[e].src_format,
@@ -440,6 +448,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .color_out = (uint64_t)(uintptr_t)color_data,
       .width = w, .height = h,
       .vp_x = vp_x, .vp_y = vp_y, .vp_w = vp_w, .vp_h = vp_h,
+      .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
+      .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
       .color_stride = 16,
    };
 
@@ -545,12 +555,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             float *v1p = pos + (tri_id*3+1)*4;
             float *v2p = pos + (tri_id*3+2)*4;
 
-            float sx0 = (v0p[0]/v0p[3]*0.5f+0.5f)*vp_w+vp_x;
-            float sy0 = (0.5f-v0p[1]/v0p[3]*0.5f)*vp_h+vp_y;
-            float sx1 = (v1p[0]/v1p[3]*0.5f+0.5f)*vp_w+vp_x;
-            float sy1 = (0.5f-v1p[1]/v1p[3]*0.5f)*vp_h+vp_y;
-            float sx2 = (v2p[0]/v2p[3]*0.5f+0.5f)*vp_w+vp_x;
-            float sy2 = (0.5f-v2p[1]/v2p[3]*0.5f)*vp_h+vp_y;
+            float sx0 = (v0p[0]/v0p[3]) * vp_scale_x + vp_trans_x;
+            float sy0 = (v0p[1]/v0p[3]) * vp_scale_y + vp_trans_y;
+            float sx1 = (v1p[0]/v1p[3]) * vp_scale_x + vp_trans_x;
+            float sy1 = (v1p[1]/v1p[3]) * vp_scale_y + vp_trans_y;
+            float sx2 = (v2p[0]/v2p[3]) * vp_scale_x + vp_trans_x;
+            float sy2 = (v2p[1]/v2p[3]) * vp_scale_y + vp_trans_y;
 
             float cx = (float)px + 0.5f;
             float cy = (float)py + 0.5f;
