@@ -88,6 +88,25 @@ struct cp_context {
     * entries by index; see cp_register_sampler(). */
    CUdeviceptr sampler_table;
    unsigned num_samplers;
+
+   /*
+    * Scratch arena for the buffers a draw needs.
+    *
+    * A draw wants a dozen or so short-lived device allocations, and managed
+    * allocation is expensive enough that doing it per draw dominated frame
+    * time. Bump-allocate from one buffer instead and reset it per draw; it is
+    * grown between draws, when nothing points into it.
+    */
+   struct {
+      CUdeviceptr base;
+      size_t size;
+      size_t used;
+      size_t peak;
+      /* Allocations that didn't fit this draw. Freed at the end of it, and the
+       * arena grows to cover them next time. */
+      CUdeviceptr overflow[32];
+      unsigned num_overflow;
+   } scratch;
 };
 
 struct pipe_context *

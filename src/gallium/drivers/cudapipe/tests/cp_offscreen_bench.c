@@ -33,8 +33,14 @@
 #define WIDTH  512
 #define HEIGHT 512
 #define TEX_SIZE 64
-#define GRID 8                        /* GRID * GRID instanced cubes */
-#define NUM_INSTANCES (GRID * GRID)
+/*
+ * grid * grid instanced cubes. Overridable through CP_BENCH_GRID so the scene
+ * can be scaled: if time barely moves as the work grows, the cost is per-draw
+ * overhead rather than throughput, and those want completely different fixes.
+ */
+static unsigned grid = 8;
+#define MAX_GRID 48
+#define NUM_INSTANCES (grid * grid)
 
 #define VK_CHECK(x) do {                                                  \
    VkResult _r = (x);                                                     \
@@ -300,7 +306,7 @@ build_mvp(float *m, float angle)
    };
 
    float c = cosf(angle), s = sinf(angle);
-   float dist = 34.0f;
+   float dist = 4.5f * (float)grid + 2.0f;
    float view[16] = {
       c, 0, -s, 0,
       0, 1,  0, 0,
@@ -421,16 +427,23 @@ main(int argc, char **argv)
    };
    VK_CHECK(vkCreateSampler(dev, &sci, NULL, &sampler));
 
-   struct instance instances[NUM_INSTANCES];
+   const char *grid_env = getenv("CP_BENCH_GRID");
+   if (grid_env) {
+      int g = atoi(grid_env);
+      if (g > 0 && g <= MAX_GRID)
+         grid = (unsigned)g;
+   }
+
+   struct instance *instances = malloc(sizeof(*instances) * NUM_INSTANCES);
    for (unsigned i = 0; i < NUM_INSTANCES; i++) {
-      unsigned gx = i % GRID, gy = i / GRID;
-      instances[i].offset[0] = ((float)gx - (GRID - 1) * 0.5f) * 3.0f;
-      instances[i].offset[1] = ((float)gy - (GRID - 1) * 0.5f) * 3.0f;
+      unsigned gx = i % grid, gy = i / grid;
+      instances[i].offset[0] = ((float)gx - (grid - 1) * 0.5f) * 3.0f;
+      instances[i].offset[1] = ((float)gy - (grid - 1) * 0.5f) * 3.0f;
       instances[i].offset[2] = 0.0f;
       instances[i].offset[3] = 0.0f;
-      instances[i].tint[0] = 0.4f + 0.6f * (float)gx / GRID;
-      instances[i].tint[1] = 0.4f + 0.6f * (float)gy / GRID;
-      instances[i].tint[2] = 1.0f - 0.5f * (float)(gx + gy) / (2 * GRID);
+      instances[i].tint[0] = 0.4f + 0.6f * (float)gx / grid;
+      instances[i].tint[1] = 0.4f + 0.6f * (float)gy / grid;
+      instances[i].tint[2] = 1.0f - 0.5f * (float)(gx + gy) / (2 * grid);
       instances[i].tint[3] = 1.0f;
    }
 
@@ -438,7 +451,7 @@ main(int argc, char **argv)
    build_cube(cube_verts);
    struct buffer vbo = make_buffer(dev, pdev, sizeof(cube_verts),
                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, cube_verts);
-   struct buffer inst = make_buffer(dev, pdev, sizeof(instances),
+   struct buffer inst = make_buffer(dev, pdev, sizeof(*instances) * NUM_INSTANCES,
                                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, instances);
    struct buffer ubo = make_buffer(dev, pdev, 16 * sizeof(float),
                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, NULL);

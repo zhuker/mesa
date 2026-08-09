@@ -28,6 +28,7 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
 #include <string.h>
 #include <math.h>
 #include <stddef.h>
+#include <time.h>
 #include <cuda.h>
 
 /*
@@ -45,6 +46,8 @@ static_assert(offsetof(struct lp_sampler_descriptor, sampler_index) ==
               CP_DESC_SAMPLER_INDEX_OFFSET,
               "lp_sampler_descriptor sampler_index offset changed");
 
+static void cp_scratch_destroy(struct cp_context *cp);
+
 static void
 cp_destroy_context(struct pipe_context *ctx)
 {
@@ -55,6 +58,7 @@ cp_destroy_context(struct pipe_context *ctx)
       cuMemFree(cp->depthbuf);
    if (cp->sampler_table)
       cuMemFree(cp->sampler_table);
+   cp_scratch_destroy(cp);
    if (ctx->stream_uploader)
       u_upload_destroy(ctx->stream_uploader);
    FREE(cp);
@@ -134,6 +138,128 @@ cp_set_scissor_states(struct pipe_context *ctx, unsigned start_slot,
    struct cp_context *cp = (struct cp_context *)ctx;
    if (num_scissors > 0)
       cp->scissor = scissors[0];
+}
+
+/*
+ * Hand out a slice of the draw's scratch arena.
+ *
+ * Returns managed memory, so the pointer is valid on both host and device. The
+ * arena is only resized between draws, so a request that doesn't fit is served
+ * by a one-off allocation and the arena grows to cover it next time rather
+ * than moving memory that this draw is already pointing at.
+ */
+static void *
+cp_scratch_alloc(struct cp_context *cp, size_t bytes)
+{
+   if (!bytes)
+      return NULL;
+
+   /* Keep every slice 256-byte aligned: enough for any vector type, and it
+    * keeps separate buffers off each other's cache lines. */
+   size_t offset = ALIGN_POT(cp->scratch.used, 256);
+   size_t end = offset + bytes;
+
+   if (end <= cp->scratch.size) {
+      cp->scratch.used = end;
+      cp->scratch.peak = MAX2(cp->scratch.peak, end);
+      return (void *)(uintptr_t)(cp->scratch.base + offset);
+   }
+
+   /*
+    * Doesn't fit. Advance `used` anyway, so that `peak` accumulates the total
+    * this draw wanted rather than just the largest single request — otherwise
+    * the arena is grown to fit one allocation, every draw keeps overflowing,
+    * and eventually a request fails outright.
+    */
+   cp->scratch.used = end;
+   cp->scratch.peak = MAX2(cp->scratch.peak, end);
+
+   if (cp->scratch.num_overflow >= ARRAY_SIZE(cp->scratch.overflow))
+      return NULL;
+
+   CUdeviceptr ptr;
+   if (cuMemAllocManaged(&ptr, bytes, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+      return NULL;
+   cp->scratch.overflow[cp->scratch.num_overflow++] = ptr;
+   return (void *)(uintptr_t)ptr;
+}
+
+/* Start a draw: release last draw's overflow and size the arena to fit. */
+static void
+cp_scratch_begin(struct cp_context *cp)
+{
+   for (unsigned i = 0; i < cp->scratch.num_overflow; i++)
+      cuMemFree(cp->scratch.overflow[i]);
+   cp->scratch.num_overflow = 0;
+   cp->scratch.used = 0;
+
+   if (cp->scratch.peak > cp->scratch.size) {
+      /* Overshoot so a slowly growing scene doesn't reallocate every draw. */
+      size_t want = cp->scratch.peak + cp->scratch.peak / 2;
+      CUdeviceptr base;
+      if (cuMemAllocManaged(&base, want, CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
+         if (cp->scratch.base)
+            cuMemFree(cp->scratch.base);
+         cp->scratch.base = base;
+         cp->scratch.size = want;
+      }
+   }
+}
+
+static void
+cp_scratch_destroy(struct cp_context *cp)
+{
+   for (unsigned i = 0; i < cp->scratch.num_overflow; i++)
+      cuMemFree(cp->scratch.overflow[i]);
+   if (cp->scratch.base)
+      cuMemFree(cp->scratch.base);
+   memset(&cp->scratch, 0, sizeof(cp->scratch));
+}
+
+/*
+ * Per-stage timing for a draw, printed under CUDAPIPE_DEBUG_TIME.
+ *
+ * Every stage already synchronises, so wall clock around each one is an honest
+ * measure of where a draw's time goes — which is worth knowing before
+ * optimising anything.
+ */
+struct cp_draw_timing {
+   double assemble_ms;
+   double vertex_ms;
+   double rasterize_ms;
+   double interpolate_ms;
+   double fragment_ms;
+   double writeback_ms;
+};
+
+static bool
+cp_timing_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = getenv("CUDAPIPE_DEBUG_TIME") ? 1 : 0;
+   return enabled;
+}
+
+static double
+cp_now_ms(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
+}
+
+/* Returns the elapsed time since *since and resets it, so stages can be timed
+ * one after another without repeating the bookkeeping. */
+static double
+cp_lap(double *since)
+{
+   if (!cp_timing_enabled())
+      return 0.0;
+   double now = cp_now_ms();
+   double elapsed = now - *since;
+   *since = now;
+   return elapsed;
 }
 
 /* One assembled vertex: which vertex of the bound buffers it reads, and which
@@ -267,7 +393,8 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
                    CUdeviceptr vs_output_buf, unsigned num_triangles,
                    unsigned w, unsigned h, void *color_data,
                    float vp_scale_x, float vp_scale_y,
-                   float vp_trans_x, float vp_trans_y)
+                   float vp_trans_x, float vp_trans_y,
+                   struct cp_draw_timing *timing)
 {
    struct cp_screen *screen = cp->screen;
    struct cp_shader_binary *fs = cp->fs_shader;
@@ -290,17 +417,16 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 
    unsigned fs_deriv_stride = MAX2(num_fs_inputs, 1u) * 16;
 
-   CUdeviceptr pixel_list = 0, counter = 0, fs_in = 0, fs_out = 0, frag_coord = 0;
-   CUdeviceptr fs_deriv = 0;
+   CUdeviceptr pixel_list = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, max_pixels * 4);
+   CUdeviceptr counter = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
+   CUdeviceptr fs_in = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * fs_in_stride);
+   CUdeviceptr fs_out = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * fs_out_stride);
+   CUdeviceptr fs_deriv = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * fs_deriv_stride);
+   CUdeviceptr frag_coord = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * 16);
    CUdeviceptr fs_args_dev = 0, count_dev = 0, stride_dev = 0;
 
-   if (cuMemAllocManaged(&pixel_list, max_pixels * 4, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
-       cuMemAllocManaged(&counter, 4, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
-       cuMemAllocManaged(&fs_in, (size_t)max_pixels * fs_in_stride, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
-       cuMemAllocManaged(&fs_out, (size_t)max_pixels * fs_out_stride, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
-       cuMemAllocManaged(&fs_deriv, (size_t)max_pixels * fs_deriv_stride, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
-       cuMemAllocManaged(&frag_coord, (size_t)max_pixels * 16, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
-      goto out;
+   if (!pixel_list || !counter || !fs_in || !fs_out || !fs_deriv || !frag_coord)
+      return;
 
    *(uint32_t *)(uintptr_t)counter = 0;
 
@@ -337,26 +463,30 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       }
    }
 
+   double mark = cp_timing_enabled() ? cp_now_ms() : 0.0;
+
    void *interp_params[] = { &interp };
    if (cuLaunchKernel(screen->kernels.fs_interpolate,
                       (w * h + 255) / 256, 1, 1, 256, 1, 1,
                       0, NULL, interp_params, NULL) != CUDA_SUCCESS)
-      goto out;
+      return;
    if (cuCtxSynchronize() != CUDA_SUCCESS)
-      goto out;
+      return;
+   timing->interpolate_ms = cp_lap(&mark);
 
    unsigned num_pixels = *(uint32_t *)(uintptr_t)counter;
    if (num_pixels > max_pixels)
       num_pixels = max_pixels;
    if (num_pixels == 0)
-      goto out;
+      return;
 
    /* The shader reads its arguments through the same pointer-array ABI the
     * compute path uses; see cp_launch_grid(). */
-   if (cuMemAllocManaged(&fs_args_dev, 64 * sizeof(void *), CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
-       cuMemAllocManaged(&count_dev, 4, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
-       cuMemAllocManaged(&stride_dev, 4, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
-      goto out;
+   fs_args_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 64 * sizeof(void *));
+   count_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
+   stride_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
+   if (!fs_args_dev || !count_dev || !stride_dev)
+      return;
 
    void **fs_args = (void **)(uintptr_t)fs_args_dev;
    memset(fs_args, 0, 64 * sizeof(void *));
@@ -417,9 +547,10 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    void *fs_params[] = { &fs_arg_ptr };
    if (cuLaunchKernel(fs->kernel, (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
                       0, NULL, fs_params, NULL) != CUDA_SUCCESS)
-      goto out;
+      return;
    if (cuCtxSynchronize() != CUDA_SUCCESS)
-      goto out;
+      return;
+   timing->fragment_ms = cp_lap(&mark);
 
    const struct pipe_rt_blend_state *rt = &cp->blend_state.rt[0];
    struct cp_fs_writeback_args wb = {
@@ -452,6 +583,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
                   (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
                   0, NULL, wb_params, NULL);
    cuCtxSynchronize();
+   timing->writeback_ms = cp_lap(&mark);
 
    if (getenv("CUDAPIPE_DEBUG_DRAW"))
       fprintf(stderr, "  shaded %u pixels (%u fs inputs, %u tris)\n",
@@ -498,16 +630,6 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       }
    }
 
-out:
-   if (pixel_list) cuMemFree(pixel_list);
-   if (counter) cuMemFree(counter);
-   if (fs_in) cuMemFree(fs_in);
-   if (fs_out) cuMemFree(fs_out);
-   if (fs_deriv) cuMemFree(fs_deriv);
-   if (frag_coord) cuMemFree(frag_coord);
-   if (fs_args_dev) cuMemFree(fs_args_dev);
-   if (count_dev) cuMemFree(count_dev);
-   if (stride_dev) cuMemFree(stride_dev);
 }
 
 static void
@@ -610,6 +732,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
           cp->depth_stencil.depth_func == PIPE_FUNC_GEQUAL),
    };
 
+   struct cp_draw_timing timing = {0};
+   double mark = cp_timing_enabled() ? cp_now_ms() : 0.0;
+
+   /* Reclaim last draw's scratch and size the arena for this one. */
+   cp_scratch_begin(cp);
+
    const void *ib_base = NULL;
    if (indexed && info->index.resource) {
       struct cp_resource *ib_res = cp_resource(info->index.resource);
@@ -635,8 +763,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
          unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
 
-         cuMemAllocManaged(&packed_positions, (size_t)total_verts * 16,
-                           CU_MEM_ATTACH_GLOBAL);
+         packed_positions =
+            (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)total_verts * 16);
+         if (!packed_positions) {
+            FREE(refs);
+            return;
+         }
          float *dst = (float *)(uintptr_t)packed_positions;
 
          for (unsigned v = 0; v < total_verts; v++) {
@@ -652,6 +784,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       FREE(refs);
       return;
    }
+   timing.assemble_ms = cp_lap(&mark);
 
    /* If we have a compiled VS, run it to transform vertices.
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
@@ -666,14 +799,19 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
          unsigned out_stride = num_vs_outputs * 16;
 
-         cuMemAllocManaged(&vs_output_buf, total_verts * out_stride, CU_MEM_ATTACH_GLOBAL);
+         vs_output_buf = (CUdeviceptr)(uintptr_t)
+            cp_scratch_alloc(cp, (size_t)total_verts * out_stride);
 
          /* Build VS input buffer: lay out all attributes at base*16 offsets.
           * VS load_input(base=N) reads from offset vertex_id * vs_stride + N*16.
           * vs_stride = num_elements * 16 (each attribute gets 16 bytes even if smaller). */
          unsigned vs_in_stride = cp->num_vertex_elements * 16;
-         CUdeviceptr vs_input_buf;
-         cuMemAllocManaged(&vs_input_buf, total_verts * vs_in_stride, CU_MEM_ATTACH_GLOBAL);
+         CUdeviceptr vs_input_buf = (CUdeviceptr)(uintptr_t)
+            cp_scratch_alloc(cp, (size_t)total_verts * vs_in_stride);
+         if (!vs_output_buf || !vs_input_buf) {
+            FREE(refs);
+            return;
+         }
          char *vs_in = (char*)(uintptr_t)vs_input_buf;
          memset(vs_in, 0, total_verts * vs_in_stride);
 
@@ -715,25 +853,24 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
          /* Slots 0..7 are the stage's own buffers; uniform buffers start at
           * 18, matching the layout the compute path uses. */
-         CUdeviceptr vs_args_dev;
-         cuMemAllocManaged(&vs_args_dev, 64 * sizeof(void*), CU_MEM_ATTACH_GLOBAL);
+         CUdeviceptr vs_args_dev = (CUdeviceptr)(uintptr_t)
+            cp_scratch_alloc(cp, 64 * sizeof(void *));
          void **vs_args = (void**)(uintptr_t)vs_args_dev;
          memset(vs_args, 0, 64 * sizeof(void*));
 
-         CUdeviceptr stride_dev;
-         cuMemAllocManaged(&stride_dev, 4, CU_MEM_ATTACH_GLOBAL);
+         CUdeviceptr stride_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
          *(uint32_t*)(uintptr_t)stride_dev = stride;
 
          /* args[0] = pointer to vertex_count
           * args[5] = vertex_id array (original VB indices per assembled vertex) */
-         CUdeviceptr vcount_dev;
-         cuMemAllocManaged(&vcount_dev, 4, CU_MEM_ATTACH_GLOBAL);
+         CUdeviceptr vcount_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
          *(uint32_t*)(uintptr_t)vcount_dev = total_verts;
 
          /* gl_VertexIndex and gl_InstanceIndex, per assembled vertex. */
-         CUdeviceptr vid_buf, iid_buf;
-         cuMemAllocManaged(&vid_buf, (size_t)total_verts * 4, CU_MEM_ATTACH_GLOBAL);
-         cuMemAllocManaged(&iid_buf, (size_t)total_verts * 4, CU_MEM_ATTACH_GLOBAL);
+         CUdeviceptr vid_buf = (CUdeviceptr)(uintptr_t)
+            cp_scratch_alloc(cp, (size_t)total_verts * 4);
+         CUdeviceptr iid_buf = (CUdeviceptr)(uintptr_t)
+            cp_scratch_alloc(cp, (size_t)total_verts * 4);
          uint32_t *vid_arr = (uint32_t *)(uintptr_t)vid_buf;
          uint32_t *iid_arr = (uint32_t *)(uintptr_t)iid_buf;
          for (unsigned v = 0; v < total_verts; v++) {
@@ -750,8 +887,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          vs_args[6] = (void*)(uintptr_t)iid_buf; /* instance_id array */
 
          /* Draw parameters: base vertex, base instance, draw id. */
-         CUdeviceptr draw_params;
-         cuMemAllocManaged(&draw_params, 3 * 4, CU_MEM_ATTACH_GLOBAL);
+         CUdeviceptr draw_params = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 3 * 4);
+         if (!vs_args_dev || !stride_dev || !vcount_dev || !vid_buf ||
+             !iid_buf || !draw_params) {
+            FREE(refs);
+            return;
+         }
          uint32_t *params = (uint32_t *)(uintptr_t)draw_params;
          params[0] = indexed ? (uint32_t)draws[0].index_bias : draws[0].start;
          params[1] = info->start_instance;
@@ -792,15 +933,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             /* VS failed — fall back to passthrough (don't use vs output) */
             vs_ran = false;
          }
-         cuMemFree(vs_args_dev);
-         cuMemFree(stride_dev);
-         cuMemFree(vs_input_buf);
-         cuMemFree(vcount_dev);
-         cuMemFree(vid_buf);
-         cuMemFree(iid_buf);
-         cuMemFree(draw_params);
       }
    }
+   timing.vertex_ms = cp_lap(&mark);
 
    if (getenv("CUDAPIPE_DEBUG_DRAW")) {
       fprintf(stderr, "cudapipe: draw %u tris (%u instances), fb=%ux%u, "
@@ -823,21 +958,30 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
 
    cuCtxSynchronize();
+   timing.rasterize_ms = cp_lap(&mark);
 
    /* Shade every covered pixel by running the fragment shader on the GPU:
     * interpolate its inputs, launch it, then blend its output into the
     * attachment. */
    cp_shade_fragments(cp, info, visbuf, packed_positions, vs_output_buf,
                       num_triangles, w, h, color_data,
-                      vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y);
+                      vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y, &timing);
+
+   if (cp_timing_enabled()) {
+      double total = timing.assemble_ms + timing.vertex_ms +
+                     timing.rasterize_ms + timing.interpolate_ms +
+                     timing.fragment_ms + timing.writeback_ms;
+      fprintf(stderr,
+              "cudapipe: %5u tris  assemble %6.2f  vertex %6.2f  raster %6.2f  "
+              "interp %6.2f  fragment %6.2f  writeback %6.2f  total %6.2f ms\n",
+              num_triangles, timing.assemble_ms, timing.vertex_ms,
+              timing.rasterize_ms, timing.interpolate_ms, timing.fragment_ms,
+              timing.writeback_ms, total);
+   }
 
 
    cuCtxSynchronize();
    /* visbuf and depthbuf outlive the draw; see cp_set_framebuffer_state() */
-   if (packed_positions)
-      cuMemFree(packed_positions);
-   if (vs_output_buf)
-      cuMemFree(vs_output_buf);
    FREE(refs);
 }
 
