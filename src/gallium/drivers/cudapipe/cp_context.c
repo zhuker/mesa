@@ -608,9 +608,35 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                b = w0*c0[2]+w1*c1[2]+w2*c2[2];
                a = w0*c0[3]+w1*c1[3]+w2*c2[3];
             }
-            /* If textures are bound, sample texture using interpolated UV.
-             * Varying (r,g) = (u,v) texture coordinates. */
-            if (cp->tex_resources[0].data && cp->num_tex_objects > 0) {
+            /* If FS has texture descriptors bound (UBO[1+] contains lp_image_descriptor),
+             * sample the texture using the interpolated varying as UV coordinates. */
+            if (cp->num_fs_ubos > 1 && cp->fs_ubos[1].buffer) {
+               /* The descriptor buffer (FS UBO[1]) contains texture descriptors.
+                * Each descriptor starts with a pointer to the texture data,
+                * followed by width, height, etc (lp_jit_image layout). */
+               void *desc_buf = cp->fs_ubos[1].buffer;
+               /* First texture descriptor: read base ptr from offset 0 */
+               void *tex_base = *(void **)desc_buf;
+               if (tex_base) {
+                  /* Read width from offset 8, height from offset 12 */
+                  uint32_t tw = *(uint32_t *)((char*)desc_buf + 8);
+                  uint16_t th = *(uint16_t *)((char*)desc_buf + 12);
+                  uint32_t trs = *(uint32_t *)((char*)desc_buf + 24); /* row_stride */
+                  if (tw > 0 && th > 0 && trs > 0) {
+                     float u = r, v = g;
+                     u = u - floorf(u); v = v - floorf(v);
+                     unsigned tx = (unsigned)(u * (tw - 1) + 0.5f);
+                     unsigned ty = (unsigned)(v * (th - 1) + 0.5f);
+                     if (tx >= tw) tx = tw - 1;
+                     if (ty >= th) ty = th - 1;
+                     uint8_t *texel = (uint8_t *)tex_base + ty * trs + tx * 4;
+                     r = texel[0] / 255.0f;
+                     g = texel[1] / 255.0f;
+                     b = texel[2] / 255.0f;
+                     a = texel[3] / 255.0f;
+                  }
+               }
+            } else if (cp->tex_resources[0].data && cp->num_tex_objects > 0) {
                float u = r, v = g;
                /* Wrap UV to [0,1] */
                u = u - floorf(u);
@@ -1131,21 +1157,33 @@ cp_set_constant_buffer(struct pipe_context *ctx, mesa_shader_stage shader,
                        const struct pipe_constant_buffer *buf)
 {
    struct cp_context *cp = (struct cp_context *)ctx;
-   if (shader != MESA_SHADER_COMPUTE || index >= CP_MAX_CONST_BUFFERS)
+   if (index >= CP_MAX_CONST_BUFFERS)
       return;
+   if (shader != MESA_SHADER_COMPUTE && shader != MESA_SHADER_FRAGMENT)
+      return;
+
+   void *buf_ptr = NULL;
+   unsigned buf_size = 0;
    if (buf && buf->buffer) {
       struct cp_resource *res = cp_resource(buf->buffer);
-      cp->compute_ubos[index].buffer = (char *)cp_resource_data(res) + buf->buffer_offset;
-      cp->compute_ubos[index].buffer_size = buf->buffer_size;
+      buf_ptr = (char *)cp_resource_data(res) + buf->buffer_offset;
+      buf_size = buf->buffer_size;
    } else if (buf && buf->user_buffer) {
-      cp->compute_ubos[index].buffer = (void *)buf->user_buffer;
-      cp->compute_ubos[index].buffer_size = buf->buffer_size;
-   } else {
-      cp->compute_ubos[index].buffer = NULL;
-      cp->compute_ubos[index].buffer_size = 0;
+      buf_ptr = (void *)buf->user_buffer;
+      buf_size = buf->buffer_size;
    }
-   if (index + 1 > cp->num_compute_ubos)
-      cp->num_compute_ubos = index + 1;
+
+   if (shader == MESA_SHADER_COMPUTE) {
+      cp->compute_ubos[index].buffer = buf_ptr;
+      cp->compute_ubos[index].buffer_size = buf_size;
+      if (index + 1 > cp->num_compute_ubos)
+         cp->num_compute_ubos = index + 1;
+   } else if (shader == MESA_SHADER_FRAGMENT) {
+      cp->fs_ubos[index].buffer = buf_ptr;
+      cp->fs_ubos[index].buffer_size = buf_size;
+      if (index + 1 > cp->num_fs_ubos)
+         cp->num_fs_ubos = index + 1;
+   }
 }
 
 static void

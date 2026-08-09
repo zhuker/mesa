@@ -62,6 +62,12 @@ struct cp_context {
       unsigned buffer_size;
    } compute_ubos[CP_MAX_CONST_BUFFERS];
    unsigned num_compute_ubos;
+
+   struct {
+      void *buffer;
+      unsigned buffer_size;
+   } fs_ubos[CP_MAX_CONST_BUFFERS];
+   unsigned num_fs_ubos;
 };
 
 struct pipe_context *
