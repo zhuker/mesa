@@ -588,6 +588,24 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             if(g<0)g=0; if(g>1)g=1;
             if(b<0)b=0; if(b>1)b=1;
             if(a<0)a=0; if(a>1)a=1;
+
+            /* Apply blending if enabled */
+            if (cp->blend_enabled) {
+               uint32_t dst_pix = col[py*w+px];
+               float dr = (float)(dst_pix & 0xFF) / 255.0f;
+               float dg = (float)((dst_pix >> 8) & 0xFF) / 255.0f;
+               float db = (float)((dst_pix >> 16) & 0xFF) / 255.0f;
+               float da = (float)((dst_pix >> 24) & 0xFF) / 255.0f;
+               /* Standard SRC_ALPHA, ONE_MINUS_SRC_ALPHA blend */
+               float sa = a;
+               float isa = 1.0f - a;
+               r = r * sa + dr * isa;
+               g = g * sa + dg * isa;
+               b = b * sa + db * isa;
+               a = a * sa + da * isa;
+               if(r>1)r=1; if(g>1)g=1; if(b>1)b=1; if(a>1)a=1;
+            }
+
             uint32_t ri=(uint32_t)(r*255+0.5f);
             uint32_t gi=(uint32_t)(g*255+0.5f);
             uint32_t bi=(uint32_t)(b*255+0.5f);
@@ -727,6 +745,14 @@ cp_create_blend_state(struct pipe_context *ctx,
 static void
 cp_bind_blend_state(struct pipe_context *ctx, void *state)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
+   if (state) {
+      cp->blend_state = *(struct pipe_blend_state *)state;
+      cp->blend_enabled = cp->blend_state.rt[0].blend_enable;
+   } else {
+      memset(&cp->blend_state, 0, sizeof(cp->blend_state));
+      cp->blend_enabled = false;
+   }
 }
 
 static void
@@ -978,6 +1004,59 @@ cp_set_sampler_views(struct pipe_context *ctx, mesa_shader_stage shader,
                      unsigned start, unsigned count, unsigned unbind_num_trailing_slots,
                      struct pipe_sampler_view **views)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
+   if (shader != MESA_SHADER_FRAGMENT)
+      return;
+
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+
+   for (unsigned i = 0; i < count; i++) {
+      unsigned idx = start + i;
+      if (idx >= 32) break;
+
+      /* Destroy old texture object */
+      if (cp->tex_objects[idx]) {
+         cuTexObjectDestroy(cp->tex_objects[idx]);
+         cp->tex_objects[idx] = 0;
+      }
+
+      if (!views || !views[i] || !views[i]->texture)
+         continue;
+
+      struct pipe_resource *res = views[i]->texture;
+      struct cp_resource *cp_res = cp_resource(res);
+      void *data = cp_resource_data(cp_res);
+      if (!data)
+         continue;
+
+      /* Create CUDA texture object for 2D textures */
+      unsigned w = res->width0;
+      unsigned h = res->height0;
+      unsigned pixel_size = util_format_get_blocksize(res->format);
+      unsigned row_stride = cp_res->lpr.row_stride[0];
+
+      CUDA_RESOURCE_DESC resDesc = {0};
+      resDesc.resType = CU_RESOURCE_TYPE_PITCH2D;
+      resDesc.res.pitch2D.devPtr = (CUdeviceptr)(uintptr_t)data;
+      resDesc.res.pitch2D.format = CU_AD_FORMAT_UNSIGNED_INT8;
+      resDesc.res.pitch2D.numChannels = pixel_size;
+      resDesc.res.pitch2D.width = w;
+      resDesc.res.pitch2D.height = h;
+      resDesc.res.pitch2D.pitchInBytes = row_stride;
+
+      CUDA_TEXTURE_DESC texDesc = {0};
+      texDesc.addressMode[0] = CU_TR_ADDRESS_MODE_WRAP;
+      texDesc.addressMode[1] = CU_TR_ADDRESS_MODE_WRAP;
+      texDesc.filterMode = CU_TR_FILTER_MODE_LINEAR;
+      texDesc.flags = CU_TRSF_NORMALIZED_COORDINATES;
+
+      CUresult err = cuTexObjectCreate(&cp->tex_objects[idx], &resDesc, &texDesc, NULL);
+      if (err != CUDA_SUCCESS)
+         cp->tex_objects[idx] = 0;
+   }
+
+   if (start + count > cp->num_tex_objects)
+      cp->num_tex_objects = start + count;
 }
 
 static void

@@ -28,6 +28,14 @@ struct cp_context {
    struct cp_shader_binary *vs_shader;
    struct cp_shader_binary *fs_shader;
 
+   /* Blend state */
+   struct pipe_blend_state blend_state;
+   bool blend_enabled;
+
+   /* Texture state for FS */
+   CUtexObject tex_objects[32];
+   unsigned num_tex_objects;
+
    /* Vertex buffers and elements */
    struct pipe_vertex_buffer vertex_buffers[16];
    unsigned num_vertex_buffers;
