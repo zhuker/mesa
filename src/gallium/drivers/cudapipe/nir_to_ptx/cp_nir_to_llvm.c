@@ -928,6 +928,28 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
    }
 }
 
+/*
+ * Call a target-specific NVVM intrinsic, e.g. "llvm.nvvm.ex2.approx.f".
+ *
+ * The transcendentals have no generic LLVM lowering on NVPTX: llvm.exp2 and
+ * friends turn into libcalls to exp2f, which doesn't exist on the device and
+ * takes instruction selection down with it. The NVVM intrinsics map straight
+ * onto the ex2/lg2/sin/cos approximation instructions the hardware has. They
+ * are float-only and not overloaded, hence no type argument.
+ */
+static LLVMValueRef
+build_nvvm_intrinsic(struct ntl_context *ctx, const char *name,
+                     LLVMValueRef *args, unsigned num_args)
+{
+   unsigned id = LLVMLookupIntrinsicID(name, strlen(name));
+   if (!id)
+      return NULL;
+
+   LLVMValueRef fn = LLVMGetIntrinsicDeclaration(ctx->module, id, NULL, 0);
+   LLVMTypeRef fn_type = LLVMIntrinsicGetType(ctx->llvm_ctx, id, NULL, 0);
+   return LLVMBuildCall2(ctx->builder, fn_type, fn, args, num_args, "");
+}
+
 /* Call an LLVM intrinsic by name, e.g. "llvm.sqrt" — overloaded intrinsics are
  * specialised on the type of their first argument. */
 static LLVMValueRef
@@ -1051,12 +1073,15 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    case nir_op_fsqrt:
       result = build_intrinsic(ctx, "llvm.sqrt", src, 1);
       break;
-   case nir_op_frsq: {
-      LLVMValueRef root = build_intrinsic(ctx, "llvm.sqrt", src, 1);
-      result = LLVMBuildFDiv(ctx->builder,
-                             LLVMConstReal(LLVMTypeOf(root), 1.0), root, "");
+   case nir_op_frsq:
+      if (bit_size == 32) {
+         result = build_nvvm_intrinsic(ctx, "llvm.nvvm.rsqrt.approx.f", src, 1);
+      } else {
+         LLVMValueRef root = build_intrinsic(ctx, "llvm.sqrt", src, 1);
+         result = LLVMBuildFDiv(ctx->builder,
+                                LLVMConstReal(LLVMTypeOf(root), 1.0), root, "");
+      }
       break;
-   }
    case nir_op_frcp:
       result = LLVMBuildFDiv(ctx->builder,
                              LLVMConstReal(LLVMTypeOf(src[0]), 1.0), src[0], "");
@@ -1079,19 +1104,27 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       break;
    }
    case nir_op_fexp2:
-      result = build_intrinsic(ctx, "llvm.exp2", src, 1);
+      result = bit_size == 32
+         ? build_nvvm_intrinsic(ctx, "llvm.nvvm.ex2.approx.f", src, 1)
+         : build_intrinsic(ctx, "llvm.exp2", src, 1);
       break;
    case nir_op_flog2:
-      result = build_intrinsic(ctx, "llvm.log2", src, 1);
+      result = bit_size == 32
+         ? build_nvvm_intrinsic(ctx, "llvm.nvvm.lg2.approx.f", src, 1)
+         : build_intrinsic(ctx, "llvm.log2", src, 1);
       break;
    case nir_op_fpow:
       result = build_intrinsic(ctx, "llvm.pow", src, 2);
       break;
    case nir_op_fsin:
-      result = build_intrinsic(ctx, "llvm.sin", src, 1);
+      result = bit_size == 32
+         ? build_nvvm_intrinsic(ctx, "llvm.nvvm.sin.approx.f", src, 1)
+         : build_intrinsic(ctx, "llvm.sin", src, 1);
       break;
    case nir_op_fcos:
-      result = build_intrinsic(ctx, "llvm.cos", src, 1);
+      result = bit_size == 32
+         ? build_nvvm_intrinsic(ctx, "llvm.nvvm.cos.approx.f", src, 1)
+         : build_intrinsic(ctx, "llvm.cos", src, 1);
       break;
    case nir_op_ffma:
       result = build_intrinsic(ctx, "llvm.fma", src, 3);

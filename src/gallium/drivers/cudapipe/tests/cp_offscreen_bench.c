@@ -47,24 +47,55 @@
 struct vertex {
    float pos[3];
    float uv[2];
+   float normal[3];
 };
 
-/* A unit cube: 6 faces, 2 triangles each, with per-face UVs. */
-static const struct vertex cube_verts[] = {
-   {{-1,-1,-1},{0,0}}, {{ 1,-1,-1},{1,0}}, {{ 1, 1,-1},{1,1}},
-   {{-1,-1,-1},{0,0}}, {{ 1, 1,-1},{1,1}}, {{-1, 1,-1},{0,1}},
-   {{-1,-1, 1},{0,0}}, {{ 1, 1, 1},{1,1}}, {{ 1,-1, 1},{1,0}},
-   {{-1,-1, 1},{0,0}}, {{-1, 1, 1},{0,1}}, {{ 1, 1, 1},{1,1}},
-   {{-1,-1,-1},{0,0}}, {{-1, 1, 1},{1,1}}, {{-1,-1, 1},{1,0}},
-   {{-1,-1,-1},{0,0}}, {{-1, 1,-1},{0,1}}, {{-1, 1, 1},{1,1}},
-   {{ 1,-1,-1},{0,0}}, {{ 1,-1, 1},{1,0}}, {{ 1, 1, 1},{1,1}},
-   {{ 1,-1,-1},{0,0}}, {{ 1, 1, 1},{1,1}}, {{ 1, 1,-1},{0,1}},
-   {{-1,-1,-1},{0,0}}, {{-1,-1, 1},{0,1}}, {{ 1,-1, 1},{1,1}},
-   {{-1,-1,-1},{0,0}}, {{ 1,-1, 1},{1,1}}, {{ 1,-1,-1},{1,0}},
-   {{-1, 1,-1},{0,0}}, {{ 1, 1, 1},{1,1}}, {{-1, 1, 1},{0,1}},
-   {{-1, 1,-1},{0,0}}, {{ 1, 1,-1},{1,0}}, {{ 1, 1, 1},{1,1}},
-};
-#define NUM_VERTS ((unsigned)(sizeof(cube_verts) / sizeof(cube_verts[0])))
+#define NUM_VERTS 36u   /* 6 faces * 2 triangles * 3 vertices */
+
+/*
+ * Build a unit cube: 6 faces, each two triangles, with a face normal and UVs
+ * spanning the face. Generated rather than written out so the normals can't
+ * silently disagree with the winding.
+ */
+static void
+build_cube(struct vertex *out)
+{
+   /* Per face: the outward normal, and two edge vectors spanning it. */
+   static const float faces[6][9] = {
+      /* normal        edge u          edge v */
+      { 0, 0,-1,      -1, 0, 0,       0, 1, 0 },
+      { 0, 0, 1,       1, 0, 0,       0, 1, 0 },
+      {-1, 0, 0,       0, 0, 1,       0, 1, 0 },
+      { 1, 0, 0,       0, 0,-1,       0, 1, 0 },
+      { 0,-1, 0,       1, 0, 0,       0, 0, 1 },
+      { 0, 1, 0,       1, 0, 0,       0, 0,-1 },
+   };
+   /* Two triangles as (u, v) corners of the face. */
+   static const int corners[6][2] = {
+      { 0, 0 }, { 1, 0 }, { 1, 1 },
+      { 0, 0 }, { 1, 1 }, { 0, 1 },
+   };
+
+   unsigned v = 0;
+   for (unsigned f = 0; f < 6; f++) {
+      const float *n = &faces[f][0];
+      const float *eu = &faces[f][3];
+      const float *ev = &faces[f][6];
+
+      for (unsigned c = 0; c < 6; c++) {
+         float su = corners[c][0] ? 1.0f : -1.0f;
+         float sv = corners[c][1] ? 1.0f : -1.0f;
+
+         for (unsigned i = 0; i < 3; i++) {
+            out[v].pos[i] = n[i] + eu[i] * su + ev[i] * sv;
+            out[v].normal[i] = n[i];
+         }
+         out[v].uv[0] = corners[c][0] ? 1.0f : 0.0f;
+         out[v].uv[1] = corners[c][1] ? 1.0f : 0.0f;
+         v++;
+      }
+   }
+}
 
 struct instance {
    float offset[4];
@@ -403,6 +434,8 @@ main(int argc, char **argv)
       instances[i].tint[3] = 1.0f;
    }
 
+   struct vertex cube_verts[NUM_VERTS];
+   build_cube(cube_verts);
    struct buffer vbo = make_buffer(dev, pdev, sizeof(cube_verts),
                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, cube_verts);
    struct buffer inst = make_buffer(dev, pdev, sizeof(instances),
@@ -540,16 +573,17 @@ main(int argc, char **argv)
       { 0, sizeof(struct vertex), VK_VERTEX_INPUT_RATE_VERTEX },
       { 1, sizeof(struct instance), VK_VERTEX_INPUT_RATE_INSTANCE },
    };
-   VkVertexInputAttributeDescription vattr[4] = {
+   VkVertexInputAttributeDescription vattr[5] = {
       { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(struct vertex, pos) },
       { 1, 0, VK_FORMAT_R32G32_SFLOAT,    offsetof(struct vertex, uv) },
-      { 2, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(struct instance, offset) },
-      { 3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(struct instance, tint) },
+      { 2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(struct vertex, normal) },
+      { 3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(struct instance, offset) },
+      { 4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(struct instance, tint) },
    };
    VkPipelineVertexInputStateCreateInfo vi = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
       .vertexBindingDescriptionCount = 2, .pVertexBindingDescriptions = vbind,
-      .vertexAttributeDescriptionCount = 4, .pVertexAttributeDescriptions = vattr,
+      .vertexAttributeDescriptionCount = 5, .pVertexAttributeDescriptions = vattr,
    };
    VkPipelineInputAssemblyStateCreateInfo ia = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,

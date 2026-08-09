@@ -272,6 +272,12 @@ static const struct nir_shader_compiler_options cp_nir_options = {
    .lower_bitfield_extract = true,
    .lower_fdph = true,
    .lower_fmod = true,
+   /* NVPTX has no libcall for pow or the trig functions, so llvm.pow and
+    * llvm.sin fail instruction selection and take the backend down with them.
+    * Let NIR express them in terms of exp2/log2 and the fractional-turn
+    * reductions, which do select. */
+   .lower_fpow = true,
+   .lower_sincos = true,
    .lower_hadd = true,
    .lower_uadd_sat = true,
    .lower_usub_sat = true,

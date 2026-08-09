@@ -36,9 +36,14 @@ The driver exposes no `VK_KHR_swapchain` and the build deliberately leaves
 same reason. Nothing here depends on a display server.
 
 **Feature target: what a simple Roblox-style game needs, and nothing else.**
-Roughly a mid-range mobile GPU (Adreno 6xx, Mali-G7x). Everything outside that
-set is declared unsupported rather than half-implemented — a clean refusal lets
-an application choose another path, while a false claim crashes it.
+Everything outside that is declared unsupported rather than half-implemented —
+a clean refusal lets an application choose another path, while a false claim
+crashes it.
+
+The bar is deliberately low: think of the feature set a mid-range mobile GPU
+exposes as a rough gauge of *how little* is required, not as a specification to
+implement against. Features get added because something real fails without
+them, not because some class of hardware happens to have them.
 
 Wanted, and in place unless noted:
 
@@ -51,7 +56,7 @@ Wanted, and in place unless noted:
 | Bilinear and trilinear filtering, wrap modes | yes |
 | Alpha blending | yes |
 | Uniform buffers, storage buffers, compute | yes |
-| Compressed textures | **missing** — see below |
+| Compressed textures | DXT1/3/5 only, untested |
 | Line and point primitives | **missing** |
 
 Deliberately unsupported, and advertised as such:
@@ -64,10 +69,12 @@ Deliberately unsupported, and advertised as such:
 * 64-bit integers in shaders
 * anisotropic filtering, occlusion queries, conditional render, primitive restart
 
-One consequence is easy to miss: mobile GPUs use **ETC2 and ASTC**, not BC/DXT.
-The sampler decodes DXT1/3/5 — a desktop family — and no ETC2 or ASTC at all,
-so mobile content cannot currently be sampled. Which family is needed depends
-on where the assets come from; both are bounded, well-specified work.
+Compressed texture support is the open question. The sampler decodes DXT1/3/5
+and nothing else — no ETC2, no ASTC, no BC4-7 — and none of that decode has
+ever been exercised by a test. Which family actually matters depends on what
+the content ships, which is worth measuring rather than guessing: run something
+representative and see which formats it asks for. Each family is bounded,
+well-specified work once it's known to be needed.
 
 One consequence is easy to miss and matters: mobile GPUs use **ETC2 and ASTC**,
 not BC/DXT. The sampler currently decodes DXT1/3/5 — a desktop format family —
