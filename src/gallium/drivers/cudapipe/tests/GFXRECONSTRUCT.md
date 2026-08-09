@@ -73,21 +73,10 @@ Useful environment variables:
 Captures of a real game are large. `GFXRECON_CAPTURE_FRAMES` is worth using —
 a handful of frames is plenty to learn the requirements and to replay.
 
-**If the application runs inside Flatpak** (Roblox via Sober, for example) the
-environment has to be set inside the sandbox, and the layer must be on a path
-the sandbox can see:
-
-```bash
-flatpak run \
-  --filesystem=$GFX/layer --filesystem=/tmp \
-  --env=VK_LAYER_PATH=$GFX/layer \
-  --env=VK_INSTANCE_LAYERS=VK_LAYER_LUNARG_gfxreconstruct \
-  --env=GFXRECON_CAPTURE_FILE=/tmp/app.gfxr \
-  <flatpak app id>
-```
-
-That form is untested here — no Flatpak application was available — so treat it
-as a starting point rather than a known-good recipe.
+A natively built application needs nothing beyond the environment above. If one
+ever has to be captured inside a container or a Wine prefix, the same variables
+must be set *inside* that environment and the layer directory made visible to
+it — but a native build avoids the problem entirely and is worth preferring.
 
 ## 2. Read what the application required
 
