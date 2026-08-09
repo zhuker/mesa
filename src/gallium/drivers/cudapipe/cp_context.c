@@ -522,17 +522,20 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       }
    }
 
-   /* If VS ran, overwrite packed_colors with VS varying output (slot 1) */
+   /* If VS ran, overwrite packed_colors with VS varying output.
+    * The color varying is at the LAST output slot (after pos and any other outputs).
+    * Position is always slot 0, color is typically the last slot. */
    if (vs_ran && vs_output_buf && packed_colors) {
       unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
+      unsigned color_slot = num_vs_outputs - 1; /* last output = color varying */
       float *vs_out = (float*)(uintptr_t)vs_output_buf;
       float *col_dst = (float*)(uintptr_t)packed_colors;
       unsigned total_verts = num_triangles * 3;
       for (unsigned v = 0; v < total_verts; v++) {
-         col_dst[v*4+0] = vs_out[(v * num_vs_outputs + 1) * 4 + 0];
-         col_dst[v*4+1] = vs_out[(v * num_vs_outputs + 1) * 4 + 1];
-         col_dst[v*4+2] = vs_out[(v * num_vs_outputs + 1) * 4 + 2];
-         col_dst[v*4+3] = vs_out[(v * num_vs_outputs + 1) * 4 + 3];
+         col_dst[v*4+0] = vs_out[(v * num_vs_outputs + color_slot) * 4 + 0];
+         col_dst[v*4+1] = vs_out[(v * num_vs_outputs + color_slot) * 4 + 1];
+         col_dst[v*4+2] = vs_out[(v * num_vs_outputs + color_slot) * 4 + 2];
+         col_dst[v*4+3] = vs_out[(v * num_vs_outputs + color_slot) * 4 + 3];
       }
    }
 
