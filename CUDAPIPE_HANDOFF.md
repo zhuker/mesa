@@ -185,6 +185,32 @@ VK_DRIVER_FILES=<cudapipe icd>.json                     ./cp_offscreen_bench 3 o
 python3 cp_compare.py ref.png out.png
 ```
 
+**GFXReconstruct** for real applications. Capture a frame on a driver that
+works, then read what it required and replay it against cudapipe. Built at
+`~/gfxreconstruct` with `-DGFXRECON_ENABLE_OPENXR=OFF` (the bundled OpenXR
+loader wants `xcb/glx.h`, and nothing here needs it).
+
+```bash
+GFX=~/gfxreconstruct/build
+
+# capture on hardware
+VK_LAYER_PATH=$GFX/layer VK_INSTANCE_LAYERS=VK_LAYER_LUNARG_gfxreconstruct \
+GFXRECON_CAPTURE_FILE=/tmp/app.gfxr \
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json <application>
+
+# what did it require?
+$GFX/tools/convert/gfxrecon-convert --output /tmp/app.json /tmp/app_*.gfxr
+python3 tests/cp_capture_requirements.py /tmp/app.json
+
+# replay it on cudapipe
+VK_DRIVER_FILES=<cudapipe icd>.json \
+   $GFX/tools/replay/gfxrecon-replay -m remap /tmp/app_*.gfxr
+```
+
+`-m remap` is required: memory type indices are baked into the capture and
+differ between drivers. Do **not** pass `--wsi`; it adds surface extensions
+this driver deliberately doesn't have, and instance creation then fails.
+
 Current result: 15 pixels of 262144 differ by more than 8/255 from the RTX
 5090's output, all on triangle edges. Timing on that scene (768 triangles,
 512x512) is 2.3 ms against 0.02 ms for the hardware — roughly 100x slower.
