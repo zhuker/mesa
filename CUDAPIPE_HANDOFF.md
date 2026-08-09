@@ -35,17 +35,39 @@ The driver exposes no `VK_KHR_swapchain` and the build deliberately leaves
 `-Dplatforms=` empty; dEQP runs against the `vulkan_headless` target for the
 same reason. Nothing here depends on a display server.
 
-**Feature target: a mid-range mobile GPU.** Rather than chase desktop Vulkan,
-aim at roughly what an Adreno 6xx or Mali-G7x exposes. That is a bounded,
-well-understood target, it is what the intended workload (Roblox's Android
-client) actually requires, and it lines up with what a compute-only rasterizer
-can realistically do:
+**Feature target: what a simple Roblox-style game needs, and nothing else.**
+Roughly a mid-range mobile GPU (Adreno 6xx, Mali-G7x). Everything outside that
+set is declared unsupported rather than half-implemented — a clean refusal lets
+an application choose another path, while a false claim crashes it.
 
-* no geometry or tessellation stages
-* no ray tracing, mesh shaders or transform feedback
-* no sparse resources, no multisampling
-* a small number of colour attachments
-* core Vulkan 1.1-era functionality rather than the latest extensions
+Wanted, and in place unless noted:
+
+| | |
+|---|---|
+| Vertex and fragment shaders | yes |
+| Indexed and instanced draws | yes |
+| Depth test and depth write | yes |
+| 2D, 2D array and cube textures, mipmapped | yes |
+| Bilinear and trilinear filtering, wrap modes | yes |
+| Alpha blending | yes |
+| Uniform buffers, storage buffers, compute | yes |
+| Compressed textures | **missing** — see below |
+| Line and point primitives | **missing** |
+
+Deliberately unsupported, and advertised as such:
+
+* geometry and tessellation stages
+* ray tracing, mesh shaders, transform feedback
+* sparse resources, multisampling, protected memory
+* stencil test and stencil attachments
+* multiple colour attachments (the writeback resolves one)
+* 64-bit integers in shaders
+* anisotropic filtering, occlusion queries, conditional render, primitive restart
+
+One consequence is easy to miss: mobile GPUs use **ETC2 and ASTC**, not BC/DXT.
+The sampler decodes DXT1/3/5 — a desktop family — and no ETC2 or ASTC at all,
+so mobile content cannot currently be sampled. Which family is needed depends
+on where the assets come from; both are bounded, well-specified work.
 
 One consequence is easy to miss and matters: mobile GPUs use **ETC2 and ASTC**,
 not BC/DXT. The sampler currently decodes DXT1/3/5 — a desktop format family —
@@ -178,6 +200,16 @@ each group also reports many `NotSupported` that the driver never sees.
 | `compute.pipeline.basic.*` | 70/71 |
 | `draw...simple_draw.*` | 4/4 |
 | `draw...basic_draw.draw.*` | 8/12 |
+
+A capability sample of 406 cases spread across the whole suite, run one process
+per case so crashes don't abort the sweep, went from 111 crashes to 42 once the
+driver stopped advertising what it can't do. The same sample on this machine's
+NVIDIA driver passes 243 and crashes none, which is the yardstick.
+
+```bash
+# every 8000th case, then one process per case
+awk 'NR % 8000 == 0' all_cases.txt > sample.txt
+```
 
 Known gaps, roughly in the order they matter for a real workload:
 
