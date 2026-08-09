@@ -28,6 +28,14 @@ VK_DRIVER_FILES=$PWD/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv
   <vulkan app>
 ```
 
+## Scope: offscreen only
+
+The driver targets headless, compute-only rendering: applications draw into
+`VkImage`s and read the result back. It exposes no `VK_KHR_swapchain` and the
+build deliberately leaves `-Dplatforms=` empty. dEQP runs against the
+`vulkan_headless` target for the same reason. Presentation is out of scope, so
+nothing here depends on a display server.
+
 ## Architecture
 
 ```
@@ -93,6 +101,38 @@ pixel down). `emit_tex()` traces the coordinate back to its `load_input` slot at
 compile time and passes that slot to the sampler; a coordinate computed inside
 the shader gets no derivatives and samples the base level.
 
+## Testing
+
+Two complementary harnesses, and both are needed:
+
+**dEQP** (`vulkan_headless` target) for breadth of individual features.
+
+**`tests/cp_offscreen_bench.c`** for whole-frame correctness and timing. It
+renders a textured, depth-tested, instanced scene offscreen and writes a PNG,
+and it is ICD-agnostic — so the same binary can be run against the machine's
+real NVIDIA driver to produce ground truth, and `tests/cp_compare.py` diffs the
+two. Differential testing against real hardware is a far stronger oracle than
+dEQP's per-feature pass/fail.
+
+```bash
+cd src/gallium/drivers/cudapipe/tests
+glslangValidator -V cp_bench.vert -o cp_bench.vert.spv
+glslangValidator -V cp_bench.frag -o cp_bench.frag.spv
+cc -O2 cp_offscreen_bench.c -o cp_offscreen_bench -lvulkan -lz -lm
+
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json ./cp_offscreen_bench 3 ref.png
+VK_DRIVER_FILES=<cudapipe icd>.json                     ./cp_offscreen_bench 3 out.png
+python3 cp_compare.py ref.png out.png
+```
+
+Current result: 15 pixels of 262144 differ by more than 8/255 from the RTX
+5090's output, all on triangle edges. Timing on that scene (768 triangles,
+512x512) is 2.3 ms against 0.02 ms for the hardware — roughly 100x slower.
+
+Note the benchmark texture is a smooth gradient on purpose. A checkerboard
+minifies into heavy aliasing, where two *correct* implementations sampling
+slightly different points disagree enormously; that noise masks real bugs.
+
 ## Status
 
 Verified with dEQP (`vulkan_headless` target). Counts are of *supported* cases;
@@ -110,15 +150,12 @@ each group also reports many `NotSupported` that the driver never sees.
 
 Known gaps, roughly in the order they matter for a real workload:
 
-1. **No swapchain.** The build uses `-Dplatforms=` (empty), so WSI is compiled
-   out and nothing can present to a window. Any real application needs this
-   first; it requires the xcb development packages and a rebuild with
-   `-Dplatforms=x11`.
-2. **Vertex assembly is done on the host**, per draw, with a `memcpy` per
-   attribute per vertex, and the rasterizer is one thread per triangle walking
-   a bounding box. Together these dominate everything: the full
-   `draw.dynamic_rendering` group does not finish in 25 minutes. This is the
-   blocker for anything interactive.
+1. **Performance.** Vertex assembly is done on the host, per draw, with a
+   `memcpy` per attribute per vertex, and the rasterizer is one thread per
+   triangle walking its bounding box — so a single large triangle serializes
+   onto one CUDA thread. Together these dominate everything: the full
+   `draw.dynamic_rendering` group does not finish in 25 minutes. Fixing it
+   means GPU-side vertex fetch and a binned/tiled rasterizer.
 3. **Lines and points are not rasterized at all** — only triangles. The four
    remaining `basic_draw.draw` failures are `line_list`, `line_strip` and
    `point_list`.

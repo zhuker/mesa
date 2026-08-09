@@ -1,0 +1,4 @@
+# Build artefacts and rendered output
+cp_offscreen_bench
+*.spv
+*.png

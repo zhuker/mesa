@@ -78,6 +78,12 @@ struct cp_context {
    } fs_ubos[CP_MAX_CONST_BUFFERS];
    unsigned num_fs_ubos;
 
+   struct {
+      void *buffer;
+      unsigned buffer_size;
+   } vs_ubos[CP_MAX_CONST_BUFFERS];
+   unsigned num_vs_ubos;
+
    /* Device-visible table of deduplicated sampler states. Descriptors refer to
     * entries by index; see cp_register_sampler(). */
    CUdeviceptr sampler_table;

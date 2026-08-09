@@ -271,6 +271,19 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       set_ssa_def(ctx, &instr->def, vid);
       break;
    }
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddx_fine:
+   case nir_intrinsic_ddy_fine:
+   case nir_intrinsic_ddx_coarse:
+   case nir_intrinsic_ddy_coarse:
+      /* The fragment stage runs one thread per pixel with no quad neighbours,
+       * so a general derivative isn't available. Mip selection doesn't rely on
+       * this — it uses the varying derivatives computed during interpolation. */
+      set_ssa_def(ctx, &instr->def,
+                  LLVMConstNull(get_llvm_type(ctx, instr->def.bit_size,
+                                              instr->def.num_components)));
+      break;
    case nir_intrinsic_load_base_instance:
    case nir_intrinsic_load_first_vertex:
    case nir_intrinsic_load_base_vertex:
@@ -915,6 +928,22 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
    }
 }
 
+/* Call an LLVM intrinsic by name, e.g. "llvm.sqrt" — overloaded intrinsics are
+ * specialised on the type of their first argument. */
+static LLVMValueRef
+build_intrinsic(struct ntl_context *ctx, const char *name,
+                LLVMValueRef *args, unsigned num_args)
+{
+   unsigned id = LLVMLookupIntrinsicID(name, strlen(name));
+   if (!id)
+      return NULL;
+
+   LLVMTypeRef overload = LLVMTypeOf(args[0]);
+   LLVMValueRef fn = LLVMGetIntrinsicDeclaration(ctx->module, id, &overload, 1);
+   LLVMTypeRef fn_type = LLVMIntrinsicGetType(ctx->llvm_ctx, id, &overload, 1);
+   return LLVMBuildCall2(ctx->builder, fn_type, fn, args, num_args, "");
+}
+
 static void
 emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
 {
@@ -936,14 +965,15 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    LLVMValueRef result = NULL;
 
    /* For float ops, ensure sources are float-typed (bitcast from int if needed) */
-   bool is_float_op = (instr->op >= nir_op_fadd && instr->op <= nir_op_fneu) ||
-                      instr->op == nir_op_fneg || instr->op == nir_op_fabs ||
-                      instr->op == nir_op_flt || instr->op == nir_op_fge ||
-                      instr->op == nir_op_feq || instr->op == nir_op_fneu ||
-                      instr->op == nir_op_fadd || instr->op == nir_op_fsub ||
-                      instr->op == nir_op_fmul || instr->op == nir_op_fdiv;
-   if (is_float_op) {
-      for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
+   /* Values live in integer registers regardless of what they represent, so
+    * float operations have to reinterpret their sources first. NIR already
+    * records the type each operand is consumed as — use that rather than
+    * guessing from the opcode, so every float op is covered. */
+   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
+      if (nir_alu_type_get_base_type(nir_op_infos[instr->op].input_types[i]) !=
+          nir_type_float)
+         continue;
+      {
          if (src[i] && LLVMGetTypeKind(LLVMTypeOf(src[i])) == LLVMIntegerTypeKind) {
             unsigned w = LLVMGetIntTypeWidth(LLVMTypeOf(src[i]));
             LLVMTypeRef ft = (w == 64) ? LLVMDoubleTypeInContext(ctx->llvm_ctx) :
@@ -973,6 +1003,118 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    case nir_op_umod:
       result = LLVMBuildURem(ctx->builder, src[0], src[1], "");
       break;
+   case nir_op_irem:
+      result = LLVMBuildSRem(ctx->builder, src[0], src[1], "");
+      break;
+   case nir_op_imod: {
+      /* Unlike irem, imod's result takes the sign of the divisor, so a
+       * remainder with the wrong sign has to be nudged by one divisor. */
+      LLVMValueRef rem = LLVMBuildSRem(ctx->builder, src[0], src[1], "");
+      LLVMValueRef zero = LLVMConstNull(LLVMTypeOf(rem));
+      LLVMValueRef rem_nonzero = LLVMBuildICmp(ctx->builder, LLVMIntNE, rem, zero, "");
+      LLVMValueRef rem_neg = LLVMBuildICmp(ctx->builder, LLVMIntSLT, rem, zero, "");
+      LLVMValueRef div_neg = LLVMBuildICmp(ctx->builder, LLVMIntSLT, src[1], zero, "");
+      LLVMValueRef differ = LLVMBuildXor(ctx->builder, rem_neg, div_neg, "");
+      LLVMValueRef adjust = LLVMBuildAnd(ctx->builder, rem_nonzero, differ, "");
+      result = LLVMBuildSelect(ctx->builder, adjust,
+                               LLVMBuildAdd(ctx->builder, rem, src[1], ""), rem, "");
+      break;
+   }
+   case nir_op_imin:
+      result = build_intrinsic(ctx, "llvm.smin", src, 2);
+      break;
+   case nir_op_imax:
+      result = build_intrinsic(ctx, "llvm.smax", src, 2);
+      break;
+   case nir_op_umin:
+      result = build_intrinsic(ctx, "llvm.umin", src, 2);
+      break;
+   case nir_op_umax:
+      result = build_intrinsic(ctx, "llvm.umax", src, 2);
+      break;
+   case nir_op_iabs: {
+      LLVMValueRef args[2] = {
+         src[0], LLVMConstInt(LLVMInt1TypeInContext(ctx->llvm_ctx), 0, false)
+      };
+      result = build_intrinsic(ctx, "llvm.abs", args, 2);
+      break;
+   }
+   case nir_op_fabs:
+      result = build_intrinsic(ctx, "llvm.fabs", src, 1);
+      break;
+   case nir_op_fmin:
+      result = build_intrinsic(ctx, "llvm.minnum", src, 2);
+      break;
+   case nir_op_fmax:
+      result = build_intrinsic(ctx, "llvm.maxnum", src, 2);
+      break;
+   case nir_op_fsqrt:
+      result = build_intrinsic(ctx, "llvm.sqrt", src, 1);
+      break;
+   case nir_op_frsq: {
+      LLVMValueRef root = build_intrinsic(ctx, "llvm.sqrt", src, 1);
+      result = LLVMBuildFDiv(ctx->builder,
+                             LLVMConstReal(LLVMTypeOf(root), 1.0), root, "");
+      break;
+   }
+   case nir_op_frcp:
+      result = LLVMBuildFDiv(ctx->builder,
+                             LLVMConstReal(LLVMTypeOf(src[0]), 1.0), src[0], "");
+      break;
+   case nir_op_ffloor:
+      result = build_intrinsic(ctx, "llvm.floor", src, 1);
+      break;
+   case nir_op_fceil:
+      result = build_intrinsic(ctx, "llvm.ceil", src, 1);
+      break;
+   case nir_op_ftrunc:
+      result = build_intrinsic(ctx, "llvm.trunc", src, 1);
+      break;
+   case nir_op_fround_even:
+      result = build_intrinsic(ctx, "llvm.rint", src, 1);
+      break;
+   case nir_op_ffract: {
+      LLVMValueRef floor = build_intrinsic(ctx, "llvm.floor", src, 1);
+      result = LLVMBuildFSub(ctx->builder, src[0], floor, "");
+      break;
+   }
+   case nir_op_fexp2:
+      result = build_intrinsic(ctx, "llvm.exp2", src, 1);
+      break;
+   case nir_op_flog2:
+      result = build_intrinsic(ctx, "llvm.log2", src, 1);
+      break;
+   case nir_op_fpow:
+      result = build_intrinsic(ctx, "llvm.pow", src, 2);
+      break;
+   case nir_op_fsin:
+      result = build_intrinsic(ctx, "llvm.sin", src, 1);
+      break;
+   case nir_op_fcos:
+      result = build_intrinsic(ctx, "llvm.cos", src, 1);
+      break;
+   case nir_op_ffma:
+      result = build_intrinsic(ctx, "llvm.fma", src, 3);
+      break;
+   case nir_op_fsign: {
+      /* -1, 0 or +1, with 0 preserved (including -0). */
+      LLVMTypeRef ft = LLVMTypeOf(src[0]);
+      LLVMValueRef zero = LLVMConstNull(ft);
+      LLVMValueRef gt = LLVMBuildFCmp(ctx->builder, LLVMRealOGT, src[0], zero, "");
+      LLVMValueRef lt = LLVMBuildFCmp(ctx->builder, LLVMRealOLT, src[0], zero, "");
+      result = LLVMBuildSelect(ctx->builder, gt, LLVMConstReal(ft, 1.0),
+                 LLVMBuildSelect(ctx->builder, lt, LLVMConstReal(ft, -1.0), zero, ""), "");
+      break;
+   }
+   case nir_op_isign: {
+      LLVMTypeRef it = LLVMTypeOf(src[0]);
+      LLVMValueRef zero = LLVMConstNull(it);
+      LLVMValueRef gt = LLVMBuildICmp(ctx->builder, LLVMIntSGT, src[0], zero, "");
+      LLVMValueRef lt = LLVMBuildICmp(ctx->builder, LLVMIntSLT, src[0], zero, "");
+      result = LLVMBuildSelect(ctx->builder, gt, LLVMConstInt(it, 1, true),
+                 LLVMBuildSelect(ctx->builder, lt, LLVMConstAllOnes(it), zero, ""), "");
+      break;
+   }
    case nir_op_fadd:
       result = LLVMBuildFAdd(ctx->builder, src[0], src[1], "");
       break;
@@ -1146,12 +1288,24 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       result = LLVMBuildZExt(ctx->builder, result, get_llvm_type(ctx, 32, 1), "");
       break;
    default:
+      /* Same trap as the intrinsics: undef propagates silently and can fold a
+       * whole shader to a constant, so make the gap visible when debugging. */
+      if (getenv("CUDAPIPE_DEBUG_SHADER"))
+         fprintf(stderr, "cudapipe: unhandled ALU op '%s' -> undef\n",
+                 nir_op_infos[instr->op].name);
       result = LLVMGetUndef(dst_type);
       break;
    }
 
-   if (result)
-      set_ssa_def(ctx, &instr->def, result);
+   /* build_intrinsic() returns NULL if LLVM doesn't know the name. */
+   if (!result) {
+      if (getenv("CUDAPIPE_DEBUG_SHADER"))
+         fprintf(stderr, "cudapipe: no LLVM intrinsic for '%s' -> undef\n",
+                 nir_op_infos[instr->op].name);
+      result = LLVMGetUndef(dst_type);
+   }
+
+   set_ssa_def(ctx, &instr->def, result);
 }
 
 static void

@@ -454,7 +454,11 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 
    if (getenv("CUDAPIPE_DEBUG_FS")) {
       const float *vs_out = (const float *)(uintptr_t)vs_output_buf;
-      for (unsigned v = 0; v < num_triangles * 3 && v < 6; v++) {
+      const char *step_env = getenv("CUDAPIPE_DEBUG_FS_VSTEP");
+      unsigned vstep = step_env ? (unsigned)atoi(step_env) : 1;
+      if (vstep < 1)
+         vstep = 1;
+      for (unsigned v = 0; v < num_triangles * 3 && v < 6 * vstep; v += vstep) {
          fprintf(stderr, "  vtx%u:", v);
          for (unsigned s = 0; s < num_vs_outputs; s++)
             fprintf(stderr, " slot%u=[%.3f %.3f %.3f %.3f]", s,
@@ -478,11 +482,14 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
          if (want_row >= 0 && (int)(px / w) != want_row)
             continue;
          shown++;
-         fprintf(stderr, "  px(%u,%u) in=[%.9f %.9f] out=[%.3f %.3f %.3f %.3f]\n",
+         const uint32_t *cb = (const uint32_t *)color_data;
+         fprintf(stderr, "  px(%u,%u) in=[%.9f %.9f] out=[%.3f %.3f %.3f %.3f] "
+                 "fb=0x%08x\n",
                  px % w, px / w,
                  fin[i * (fs_in_stride / 4) + 0], fin[i * (fs_in_stride / 4) + 1],
                  fout[i * (fs_out_stride / 4) + 0], fout[i * (fs_out_stride / 4) + 1],
-                 fout[i * (fs_out_stride / 4) + 2], fout[i * (fs_out_stride / 4) + 3]);
+                 fout[i * (fs_out_stride / 4) + 2], fout[i * (fs_out_stride / 4) + 3],
+                 cb[px]);
       }
    }
 
@@ -701,9 +708,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
          stride = vs_in_stride;
 
+         /* Slots 0..7 are the stage's own buffers; uniform buffers start at
+          * 18, matching the layout the compute path uses. */
          CUdeviceptr vs_args_dev;
-         cuMemAllocManaged(&vs_args_dev, 8 * sizeof(void*), CU_MEM_ATTACH_GLOBAL);
+         cuMemAllocManaged(&vs_args_dev, 64 * sizeof(void*), CU_MEM_ATTACH_GLOBAL);
          void **vs_args = (void**)(uintptr_t)vs_args_dev;
+         memset(vs_args, 0, 64 * sizeof(void*));
 
          CUdeviceptr stride_dev;
          cuMemAllocManaged(&stride_dev, 4, CU_MEM_ATTACH_GLOBAL);
@@ -742,6 +752,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          params[1] = info->start_instance;
          params[2] = drawid_offset;
          vs_args[7] = (void*)(uintptr_t)draw_params;
+
+         for (unsigned i = 0; i < cp->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
+            vs_args[18 + i] = cp->vs_ubos[i].buffer;
 
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
@@ -786,10 +799,10 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    if (getenv("CUDAPIPE_DEBUG_DRAW")) {
       fprintf(stderr, "cudapipe: draw %u tris (%u instances), fb=%ux%u, "
-              "vp=[%.0f,%.0f,%.0f,%.0f] stride=%u scale=[%.1f,%.1f]\n",
+              "vp=[%.0f,%.0f,%.0f,%.0f] stride=%u scale=[%.1f,%.1f] color=%p\n",
               num_triangles, instance_count, w, h, vp_x, vp_y, vp_w, vp_h,
               cp->vertex_stride,
-              cp->viewport.scale[0], cp->viewport.scale[1]);
+              cp->viewport.scale[0], cp->viewport.scale[1], color_data);
       for (unsigned e = 0; e < cp->num_vertex_elements && e < 4; e++)
          fprintf(stderr, "  elem[%u]: offset=%u fmt=%u vb=%u\n", e,
                  cp->vertex_elements[e].src_offset, cp->vertex_elements[e].src_format,
@@ -1295,7 +1308,8 @@ cp_set_constant_buffer(struct pipe_context *ctx, mesa_shader_stage shader,
    struct cp_context *cp = (struct cp_context *)ctx;
    if (index >= CP_MAX_CONST_BUFFERS)
       return;
-   if (shader != MESA_SHADER_COMPUTE && shader != MESA_SHADER_FRAGMENT)
+   if (shader != MESA_SHADER_COMPUTE && shader != MESA_SHADER_FRAGMENT &&
+       shader != MESA_SHADER_VERTEX)
       return;
 
    void *buf_ptr = NULL;
@@ -1319,6 +1333,11 @@ cp_set_constant_buffer(struct pipe_context *ctx, mesa_shader_stage shader,
       cp->fs_ubos[index].buffer_size = buf_size;
       if (index + 1 > cp->num_fs_ubos)
          cp->num_fs_ubos = index + 1;
+   } else {
+      cp->vs_ubos[index].buffer = buf_ptr;
+      cp->vs_ubos[index].buffer_size = buf_size;
+      if (index + 1 > cp->num_vs_ubos)
+         cp->num_vs_ubos = index + 1;
    }
 }
 

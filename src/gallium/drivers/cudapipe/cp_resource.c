@@ -145,6 +145,11 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
    if (resource->target == PIPE_BUFFER)
       return (char *)data + box->x;
 
+   if (getenv("CUDAPIPE_DEBUG_COPY"))
+      fprintf(stderr, "cudapipe: map res=%p target=%u level=%u box=%d,%d %dx%d "
+              "usage=0x%x data=%p\n", (void *)resource, resource->target, level,
+              box->x, box->y, box->width, box->height, usage, data);
+
    uint64_t offset = res->lpr.mip_offsets[level] +
                      (uint64_t)box->z * res->lpr.img_stride[level] +
                      (uint64_t)box->y * res->lpr.row_stride[level] +
@@ -168,6 +173,13 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
    struct cp_resource *dst_res = cp_resource(dst);
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
+
+   if (getenv("CUDAPIPE_DEBUG_COPY"))
+      fprintf(stderr, "cudapipe: copy_region src=%p(t=%u lvl=%u) -> dst=%p(t=%u lvl=%u) "
+              "box=%d,%d %dx%d dst=%u,%u src_data=%p dst_data=%p\n",
+              (void *)src, src->target, src_level, (void *)dst, dst->target,
+              dst_level, src_box->x, src_box->y, src_box->width, src_box->height,
+              dstx, dsty, src_data, dst_data);
    if (!src_data || !dst_data)
       return;
 
