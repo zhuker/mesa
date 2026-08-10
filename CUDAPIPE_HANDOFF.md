@@ -1,16 +1,15 @@
-# cudapipe Handoff — Continuing the CUDA Rasterizer
+# cudapipe — CUDA Software Rasterizer for Roblox
 
 ## What This Is
 
-A Mesa Vulkan ICD (`libvulkan_cudapipe.so`) that rasterizes triangles on NVIDIA
-GPUs using CUDA compute kernels instead of fixed-function hardware. It reuses
-lavapipe as the Vulkan frontend and replaces the Gallium driver underneath.
+A Mesa Vulkan ICD (`libvulkan_cudapipe.so`) that rasterizes on NVIDIA GPUs using
+CUDA compute kernels instead of fixed-function hardware. It reuses lavapipe as
+the Vulkan frontend and replaces the Gallium driver underneath.
+
+The feature set is driven entirely by what Roblox's HeadlessStreamer actually
+requires, measured from a GFXReconstruct capture — not guessed from specs.
 
 ## Build
-
-Needs meson >= 1.4, LLVM 18 with the NVPTX backend, and a CUDA toolkit whose
-NVRTC knows the target GPU (`/usr/local/cuda`, *not* the older nvrtc that may
-sit in `/usr/lib/x86_64-linux-gnu`).
 
 ```bash
 meson setup build-cudapipe -Dvulkan-drivers=swrast \
@@ -20,317 +19,176 @@ meson setup build-cudapipe -Dvulkan-drivers=swrast \
 ninja -C build-cudapipe
 ```
 
-The build emits `cudapipe_devenv_icd.<arch>.json` pointing at the build tree, so
-the driver runs without installing:
+Needs meson >= 1.4, LLVM 18 with the NVPTX backend, and CUDA toolkit at
+`/usr/local/cuda`. The Vulkan SDK at `~/vulkan-sdk/` provides glslangValidator
+and SPIRV-Tools. Add its bin/ and include/ to PATH/C_INCLUDE_PATH when building.
+
+Run without installing:
 
 ```bash
 VK_DRIVER_FILES=$PWD/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv_icd.x86_64.json \
   <vulkan app>
 ```
 
-## Scope
+## Current Status
 
-**Offscreen only.** Applications draw into `VkImage`s and read the result back.
-The driver exposes no `VK_KHR_swapchain` and the build deliberately leaves
-`-Dplatforms=` empty; dEQP runs against the `vulkan_headless` target for the
-same reason. Nothing here depends on a display server.
+### Roblox HeadlessStreamer replay
 
-**Feature target: what a simple Roblox-style game needs, and nothing else.**
-Everything outside that is declared unsupported rather than half-implemented —
-a clean refusal lets an application choose another path, while a false claim
-crashes it.
+A GFXReconstruct capture of HeadlessStreamer (1280×720, `--softwareEncoder`,
+60 seconds on Tesla T4) replays successfully for 68 seconds before hitting a
+lavapipe descriptor bug (which also crashes lavapipe alone — not a cudapipe
+issue).
 
-The bar is deliberately low: think of the feature set a mid-range mobile GPU
-exposes as a rough gauge of *how little* is required, not as a specification to
-implement against. Features get added because something real fails without
-them, not because some class of hardware happens to have them.
+| Metric | NVIDIA (T4) | cudapipe (T4) |
+|---|---|---|
+| Replay wall clock | 19 s | ~68 s (lavapipe crash) |
+| GPU utilization | — | 95–99% |
+| GPU memory | ~400 MB | ~930 MB |
+| Ratio | 1× | ~3.6× slower |
 
-Wanted, and in place unless noted:
+**Every feature the capture requires is implemented.** The 3.6× gap is purely
+GPU rasterization compute cost (one thread per triangle, bounding-box scan).
 
-| | |
-|---|---|
-| Vertex and fragment shaders | yes |
-| Indexed and instanced draws | yes |
-| Depth test and depth write | yes |
-| 2D, 2D array and cube textures, mipmapped | yes |
-| Bilinear and trilinear filtering, wrap modes | yes |
-| Alpha blending | yes |
-| Uniform buffers, storage buffers, compute | yes |
-| Compressed textures | DXT1/3/5 only, untested |
-| Line and point primitives | **missing** |
+### dEQP
 
-Deliberately unsupported, and advertised as such:
+`dEQP-VK.api.smoke.*`: 6/6 pass.
 
-* geometry and tessellation stages
-* ray tracing, mesh shaders, transform feedback
-* sparse resources, multisampling, protected memory
-* stencil test and stencil attachments
-* multiple colour attachments (the writeback resolves one)
-* 64-bit integers in shaders
-* anisotropic filtering, occlusion queries, conditional render, primitive restart
+### What Roblox actually needs (from the capture)
 
-Compressed texture support is the open question. The sampler decodes DXT1/3/5
-and nothing else — no ETC2, no ASTC, no BC4-7 — and none of that decode has
-ever been exercised by a test. Which family actually matters depends on what
-the content ships, which is worth measuring rather than guessing: run something
-representative and see which formats it asks for. Each family is bounded,
-well-specified work once it's known to be needed.
-
-One consequence is easy to miss and matters: mobile GPUs use **ETC2 and ASTC**,
-not BC/DXT. The sampler currently decodes DXT1/3/5 — a desktop format family —
-and no ETC2 or ASTC at all. Committing to the mobile target makes ETC2 and
-ASTC LDR decode required work, and BC optional.
-
-A useful smell test for over-claiming: compare the advertised extension list
-against a real GPU on the same machine. cudapipe should never advertise more
-than hardware does.
-
-```bash
-for icd in /usr/share/vulkan/icd.d/nvidia_icd.json <cudapipe icd>.json; do
-   VK_DRIVER_FILES=$icd vulkaninfo 2>/dev/null |
-      awk '/^Device Extensions/,/^$/' | grep -oE "VK_[A-Za-z0-9_]+" | sort -u
-done
+```
+77 graphics pipelines, 2 compute, 0 raytracing
+Shader stages: vertex + fragment only
+Topologies: TRIANGLE_LIST (dominant), TRIANGLE_STRIP, POINT_LIST
+Max color targets: 1
+MSAA: 4x (accepted, storage allocated)
+Depth: D32_SFLOAT, D16_UNORM
+Blending: yes (28 of 77 pipelines)
+Compressed textures: BC1, BC3 only (576 images)
 ```
 
-It is a heuristic, not a law — lavapipe implements some extensions in the
-frontend that NVIDIA has never shipped — but anything cudapipe claims and
-hardware doesn't deserves justification.
+Full details in `src/gallium/drivers/cudapipe/tests/headless_streamer_requirements.txt`.
+
+## Capturing and replaying HeadlessStreamer
+
+GFXReconstruct is built at `~/gfxreconstruct`. The capture script lives at
+`~/git/roblox/game-engine/capture_headless_streamer.sh`. It:
+
+1. Forces the NVIDIA ICD (captures on real hardware)
+2. Injects the GFXReconstruct capture layer
+3. Uses `--softwareEncoder` to skip Vulkan video (which GFXReconstruct stubs)
+4. Runs for 60 seconds then reports the `.gfxr` file
+
+```bash
+# Capture (requires COOKIE env var or ~/.robloxcookie)
+cd ~/git/roblox/game-engine
+./capture_headless_streamer.sh
+
+# Analyze what the capture needed
+GFX=~/gfxreconstruct/build
+$GFX/tools/info/gfxrecon-info /tmp/headless_streamer_*.gfxr
+$GFX/tools/convert/gfxrecon-convert --output /tmp/headless.json /tmp/headless_streamer_*.gfxr
+python3 ~/git/mesa/src/gallium/drivers/cudapipe/tests/cp_capture_requirements.py /tmp/headless.json
+
+# Replay against cudapipe
+VK_DRIVER_FILES=.../cudapipe_devenv_icd.x86_64.json \
+    $GFX/tools/replay/gfxrecon-replay -m remap --remove-unsupported /tmp/headless_streamer_*.gfxr
+```
+
+Two flags matter:
+* **`-m remap`** — memory type indices differ between drivers; without it,
+  allocation fails immediately.
+* **`--remove-unsupported`** — the capture requested VK_KHR_surface which
+  cudapipe doesn't expose; this strips it.
 
 ## Architecture
 
 ```
-Vulkan app (SPIR-V)
+Vulkan app
     ↓
 lavapipe frontend (reused as-is)
     ↓ pipe_context calls
 cudapipe Gallium driver
-    ├── create_{vs,fs,compute}_state → cp_compile_nir_to_ptx() → PTX → CUmodule
-    ├── launch_grid → cuLaunchKernel (compute)
-    └── draw_vbo:
-        1. Assemble vertices from vertex buffers (host side, multi-VB/indexed)
-        2. Vertex shader kernel      → clip positions + varyings
-        3. cp_rasterize_triangles    → visibility buffer (atomicMin depth|triID)
-        4. cp_fs_interpolate         → compact covered pixels, interpolate
-                                       varyings and their derivatives
-        5. <compiled fragment shader> → one thread per covered pixel
-        6. cp_fs_writeback           → blend into the colour attachment
+    ├── State changes write into persistent cp_gpu_state (managed memory)
+    ├── draw_vbo:
+    │   1. cuMemsetD32 visbuf clear
+    │   2. cp_vertex_fetch kernel (GPU gathers attributes from VBs via IB)
+    │   3. Vertex shader kernel (NIR → PTX)
+    │   4. cp_rasterize_triangles (visibility buffer, atomicMin depth|triID)
+    │   5. cp_fs_interpolate (compact covered pixels, interpolate varyings)
+    │   6. Fragment shader kernel (one thread per covered pixel)
+    │   7. cp_fs_writeback (blend into colour attachment)
+    └── flush: cuEventRecord (non-blocking fence)
 ```
 
-Shaders run as ordinary CUDA kernels named `main`, taking one argument: a
-pointer to an array of pointers. The slots are shared across stages:
+The CPU does only: integer arithmetic for scratch offsets + `cuLaunchKernel`
+calls. No per-draw malloc, no memcpy to device, no cuMemcpyHtoD. State
+changes (`bind_blend`, `set_vertex_buffers`, etc.) write directly into a
+persistent managed-memory struct that GPU kernels read.
 
-| Slot | Meaning |
+## Performance Design
+
+| Principle | Implementation |
 |---|---|
-| 0 | thread/vertex/pixel count |
-| 2 | input buffer (vertex attributes, or interpolated varyings) |
-| 3 | input stride |
-| 4 | output buffer (varyings, or fragment colour) |
-| 5 | vertex-id array (vertex stage only) |
-| 6 | fragment coordinates |
-| 18.. | uniform/descriptor buffers |
+| No per-draw sync | Event fences; `cuCtxSynchronize` only at readback or memory pressure |
+| No CPU-GPU shared memory in hot path | Scratch is managed but CPU only writes metadata; large buffers are GPU-only |
+| GPU vertex fetch | `cp_vertex_fetch.cu` kernel; for TRIANGLE_LIST the IB is read directly on GPU |
+| No CPU topology expansion | `cp_build_vertex_refs` skipped for 94% of draws |
+| Direct managed writes | Small arg structs written directly (no cuMemcpyHtoD) |
+| Bounded memory | Scratch grows monotonically, reclaimed at flush or when overflow > 5 |
 
-Because `load_input`/`store_output` index by `blockIdx.x * 256 + threadIdx.x`,
-the same emitter code serves the vertex stage (indexed by vertex) and the
-fragment stage (indexed by covered pixel).
+## Next Steps (priority order)
 
-## Texture sampling
+1. **Adaptive rasterizer** — the only remaining performance lever. Current:
+   1 thread/triangle scanning bounding box. Target: CuRast-style 3-stage
+   (1 thread/small tri, 1 warp/medium tri, 1 block/tile for huge tris).
+   Reference implementation at `/home/coder/git/CuRast/src/kernels/triangles_visbuffer.cu`.
 
-The sampler lives in `kernels/cp_sampler.cu` as a `__device__` function. NVRTC
-compiles it to relocatable PTX once at screen init; `cuLink*` links it into each
-shader's PTX that contains a `nir_tex`. `emit_tex()` therefore only has to emit
-a call to `cp_tex_sample_2d()`.
+2. **Fix lavapipe descriptor crash** — segfaults in `lvp_descriptor_set_create`
+   after ~5000 draws. Crashes lavapipe alone too. Investigate descriptor pool
+   exhaustion or variable-count descriptor layouts.
 
-**Where texture state comes from.** lavapipe drives everything through its
-descriptor buffers — it never calls `set_sampler_views`/`bind_sampler_states`
-with real state (verified: it only ever unbinds). But it *does* call this
-driver's `create_texture_handle()` once per image view and once per sampler, and
-copies two fields out of whatever we return:
+3. **Kernel fusion** — merge interpolate + FS + writeback to reduce launch
+   count from 6 to 4 per draw.
 
-* `->functions`, which we point at our own `struct cp_texture_info`
-  (dimensions, format, strides, mip offsets)
-* `->sampler_index`, which we make an index into our own `cp_sampler_info` table
+4. **Line rasterization** — Bresenham kernel for `line_list`/`line_strip`.
 
-So the sampler never parses llvmpipe's internal descriptor layout. It reads only
-two offsets from lavapipe's descriptors, and `cp_context.c` `static_assert`s both
-against `offsetof()` so an upstream change breaks the build rather than the
-rendering.
+5. **Shadow compares / texture gathers** — needed for shadow mapping.
 
-Mip level selection uses derivatives computed analytically in
-`cp_fs_interpolate` (the barycentrics are re-evaluated one pixel right and one
-pixel down). `emit_tex()` traces the coordinate back to its `load_input` slot at
-compile time and passes that slot to the sampler; a coordinate computed inside
-the shader gets no derivatives and samples the base level.
+## Gaps NOT required by Roblox
 
-## Testing
+These are listed in case the target application changes, but the current
+HeadlessStreamer capture does not use any of them:
 
-Two complementary harnesses, and both are needed:
+* BC4-7, ETC2, ASTC compressed formats
+* Geometry/tessellation/mesh shaders
+* Stencil test
+* Multiple render targets
+* Cube face / 3D slice filtering across boundaries
+* Anisotropic filtering (advertised, falls back to trilinear)
+* Occlusion queries / conditional render
 
-**dEQP** (`vulkan_headless` target) for breadth of individual features.
-
-**`tests/cp_offscreen_bench.c`** for whole-frame correctness and timing. It
-renders a textured, depth-tested, instanced scene offscreen and writes a PNG,
-and it is ICD-agnostic — so the same binary can be run against the machine's
-real NVIDIA driver to produce ground truth, and `tests/cp_compare.py` diffs the
-two. Differential testing against real hardware is a far stronger oracle than
-dEQP's per-feature pass/fail.
-
-```bash
-cd src/gallium/drivers/cudapipe/tests
-glslangValidator -V cp_bench.vert -o cp_bench.vert.spv
-glslangValidator -V cp_bench.frag -o cp_bench.frag.spv
-cc -O2 cp_offscreen_bench.c -o cp_offscreen_bench -lvulkan -lz -lm
-
-VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json ./cp_offscreen_bench 3 ref.png
-VK_DRIVER_FILES=<cudapipe icd>.json                     ./cp_offscreen_bench 3 out.png
-python3 cp_compare.py ref.png out.png
-```
-
-**GFXReconstruct** for real applications: capture a frame on a driver that
-works, read back what it required, and replay it against cudapipe — which turns
-a frame of real content into a regression test for this driver. Already built at
-`~/gfxreconstruct`. See `tests/GFXRECONSTRUCT.md` for the full workflow,
-including the two replay flags that are easy to get wrong.
-
-Current result: 15 pixels of 262144 differ by more than 8/255 from the RTX
-5090's output, all on triangle edges. Timing on that scene (768 triangles,
-512x512) is 2.3 ms against 0.02 ms for the hardware — roughly 100x slower.
-
-Note the benchmark texture is a smooth gradient on purpose. A checkerboard
-minifies into heavy aliasing, where two *correct* implementations sampling
-slightly different points disagree enormously; that noise masks real bugs.
-
-## Status
-
-### Real workload: Roblox HeadlessStreamer (GFXReconstruct replay)
-
-A 60-second capture of Roblox's HeadlessStreamer (1280×720 offscreen, 77
-graphics pipelines, 2 compute, vertex+fragment only) replays successfully
-against cudapipe for 68 seconds before hitting a lavapipe descriptor bug
-(which also crashes lavapipe alone — not a cudapipe issue).
-
-| Metric | NVIDIA (T4) | cudapipe (T4) |
-|---|---|---|
-| Full replay wall clock | 19 s | ~68 s (crash) |
-| GPU utilization | N/A | 95–99 % |
-| GPU memory | ~400 MB | ~930 MB |
-| Draws/sec (estimated) | 263 | ~73 |
-| Ratio | 1× | ~3.6× slower |
-
-The 3.6× gap is pure GPU rasterization/shading compute cost. The GPU is
-fully saturated — no CPU stalls, no memory-migration overhead, no sync
-gaps between kernel launches.
-
-### dEQP
-
-| Area | Result |
-|---|---|
-| `api.smoke.*` | 6/6 |
-| `texture.filtering.2d.formats.*` | 72/75 |
-| `texture.filtering.2d_array.formats.*` | 72/75 |
-| `texture.filtering.cube.formats.*` | 36/150 |
-| `texture.filtering.3d.formats.*` | 12/75 |
-| `compute.pipeline.basic.*` | 70/71 |
-| `draw...simple_draw.*` | 4/4 |
-| `draw...basic_draw.draw.*` | 8/12 |
-
-### Performance work done
-
-1. Eliminated all mid-draw `cuCtxSynchronize` calls (was 7 per draw, now 0)
-2. Implemented proper CUDA event fences (`flush` is non-blocking)
-3. GPU vertex fetch kernel — no CPU-side attribute gathering
-4. Replaced `cuMemcpyHtoD` with direct managed-memory writes
-5. Persistent `cp_gpu_state` struct updated on state changes, not per draw
-6. Scratch arena with monotonic growth + bounded reclaim
-7. Skip `cp_build_vertex_refs` for TRIANGLE_LIST (94% of draws)
-8. `cuMemsetD32` for visbuf/depthbuf clears, `cuMemcpy2D` for blits/copies
-
-### What the Roblox capture required (and was added)
-
-* Formats: R16_SFLOAT, R16G16_SFLOAT, R16G16_UNORM, A2B10G10R10_UNORM,
-  R32_SINT, R16_SINT (sampler); R11G11B10_FLOAT, A2B10G10R10_UNORM,
-  R16_SFLOAT, R16G16_SFLOAT, R8_UNORM (render target)
-* Fixed R16G16B16A16_FLOAT render target store (was truncating to UNORM8)
-* 4x MSAA format acceptance
-* CUBE_ARRAY texture target
-* POINT_LIST topology
-* Anisotropic filtering advertised (trilinear fallback)
-* Query/timestamp stubs
-* Geometry/tessellation stage bind stubs
-* Depth-only draw support
-* Blit (same-format cuMemcpy2D + nearest-neighbor scaling)
-* Fixed `cp_resource_bind_backing` memory offset (was ignoring it)
-* Fixed NIR bcsel type mismatch in the LLVM backend
-
-### Known gaps
-
-1. **Rasterization speed.** One thread per triangle, bounding-box scan. A
-   CuRast-style adaptive 3-stage rasterizer (1 thread/small tri, 1 warp/medium
-   tri, 1 block/tile for large tris) would close most of the remaining 3.6×
-   gap. See `/home/coder/git/CuRast/src/kernels/triangles_visbuffer.cu`.
-2. **Lavapipe descriptor crash at replay second 68.** Happens with lavapipe
-   alone too. Likely a descriptor pool exhaustion or layout the replay uses
-   that lavapipe can't handle.
-3. **Lines are not rasterized** — only triangles and points. `line_list` and
-   `line_strip` draw calls silently produce nothing.
-4. **Filtering between cube faces and 3D slices** is missing.
-5. **Shadow compares and texture gathers** return zero.
-6. **BC4-7, ETC2, ASTC** compressed format decode is missing (BC1/3/5 work).
-7. **Profiling** — `nsys`/`ncu` cannot trace CUDA Driver API calls made from
-   inside a dlopen'd Vulkan ICD. Workaround: lower
-   `/proc/sys/kernel/perf_event_paranoid` to 2, or add in-driver
-   `cuEventRecord` timing (env var `CUDAPIPE_DEBUG_TIME` shows per-stage
-   wall-clock timing already).
-
-### Next steps (priority order)
-
-1. **Adaptive rasterizer** — the single biggest remaining performance win.
-   Small triangles (< 128 fragments) stay at 1 thread/tri; medium triangles
-   get 1 warp (32 threads) cooperatively scanning the bounding box; huge
-   triangles get 1 block per 64×64 tile. This matches CuRast's proven
-   architecture and would bring GPU utilization from "saturated but slow" to
-   "saturated and efficient."
-2. **Fix the descriptor crash** — investigate why `lvp_descriptor_set_create`
-   segfaults after ~5000 draws. May be a descriptor pool limit or a layout
-   with variable-count descriptors that lavapipe doesn't handle.
-3. **Line rasterization** — Bresenham in a CUDA kernel, one thread per line.
-4. **Kernel fusion** — merge interpolate + FS + writeback into fewer launches
-   to reduce per-draw overhead (currently 5–6 kernel launches per draw).
-5. **Shadow compare and texture gather** — needed for shadow mapping which
-   most real games use.
-
-## Debug environment variables
+## Debug
 
 | Variable | Effect |
 |---|---|
-| `CUDAPIPE_DEBUG_DRAW` | draw call summary, vertex elements, shaded pixel count |
+| `CUDAPIPE_DEBUG_TIME` | per-draw timing breakdown (assemble/vertex/raster/interp/fragment/writeback) |
+| `CUDAPIPE_DEBUG_DRAW` | draw call summary, vertex elements, pixel count |
 | `CUDAPIPE_DEBUG_TEX` | sampler/texture descriptor resolution |
-| `CUDAPIPE_DEBUG_FS` | per-pixel fragment inputs/outputs and varying mapping |
-| `CUDAPIPE_DEBUG_FS_ROW` | restrict `CUDAPIPE_DEBUG_FS` to one framebuffer row |
-| `CUDAPIPE_DEBUG_LAUNCH` | compute UBO/SSBO bindings |
-| `CUDAPIPE_DEBUG_SHADER` | warn on NIR intrinsics the backend doesn't implement |
+| `CUDAPIPE_DEBUG_FS` | per-pixel fragment inputs/outputs |
+| `CUDAPIPE_DEBUG_SHADER` | warn on unhandled NIR intrinsics |
 | `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
 
-## Notes for whoever picks this up
+## Implementation Notes
 
-* `.cu` kernels are stringified into the binary at build time by
-  `kernels/cu_to_inc.py`; edit the `.cu` and rebuild, there is nothing to
-  regenerate by hand.
-* LLVM's NVPTX backend only knows architectures that existed when it was
-  released. On anything newer it warns and silently emits PTX the driver
-  rejects, so `CP_MAX_PTX_SM` in `cp_nir_to_llvm.c` caps the architecture we ask
-  for and lets the driver JIT forward. Raise it together with the PTX ISA
-  version in the same function.
-* `struct cp_resource` embeds `struct llvmpipe_resource` as its first member
-  because lavapipe's descriptor code reads llvmpipe fields at fixed offsets.
-  Don't reorder it.
-* Every mip level needs its own `row_stride`/`img_stride`/`mip_offsets` entry.
-  Leaving them zero doesn't just break the small levels — uploads of level 1 land
-  at offset 0 and silently overwrite the first row of level 0.
-* Unhandled NIR intrinsics return `undef`, and LLVM propagates that through
-  everything downstream, so one missing intrinsic can collapse a whole shader
-  into a constant with no error anywhere. `CUDAPIPE_DEBUG_SHADER=1` lists them.
-  This is how `gl_InstanceIndex` silently did nothing for a while: it lowers to
-  `load_instance_id + load_base_instance`, and only the first was implemented.
-* The visibility buffer stores the triangle index *complemented*, so `atomicMin`
-  resolves equal depths in favour of the last primitive. Vulkan requires
-  primitive order for coplanar geometry; the obvious encoding gets it backwards.
+* `.cu` kernels are stringified at build time by `kernels/cu_to_inc.py`.
+* `struct cp_resource` embeds `struct llvmpipe_resource` first — lavapipe
+  reads its fields at fixed offsets. Don't reorder.
+* The visibility buffer stores triangle index complemented (`~triID`) so
+  `atomicMin` resolves coplanar triangles in primitive order.
+* LLVM NVPTX backend is capped at `CP_MAX_PTX_SM` to avoid emitting PTX
+  for architectures it doesn't know. The driver JITs forward.
+* `nsys`/`ncu` cannot profile this driver (CUDA loaded via dlopen inside
+  the ICD). Use `CUDAPIPE_DEBUG_TIME=1` or add `cuEventRecord` timing.
+* Resources use `cuMemAllocManaged` because lavapipe accesses `lpr.data`
+  directly from CPU in descriptor-building paths we don't control.
+  Internal buffers (visbuf, depthbuf, scratch) use `cuMemAlloc`.
