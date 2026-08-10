@@ -111,7 +111,7 @@ struct cp_context {
       size_t used;
       size_t peak;
       unsigned current;  /* 0 or 1: which arena is active */
-      CUdeviceptr overflow[32];
+      CUdeviceptr overflow[64];
       unsigned num_overflow;
    } scratch;
 };

@@ -159,53 +159,62 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
       return (void *)(uintptr_t)(cp->scratch.base[cur] + offset);
    }
 
-   cp->scratch.used = end;
    cp->scratch.peak = MAX2(cp->scratch.peak, end);
 
-   if (cp->scratch.num_overflow >= ARRAY_SIZE(cp->scratch.overflow))
+   /* Arena full — grow it in place by allocating a new larger chunk.
+    * This replaces the current arena (the old one stays alive until flush
+    * since the GPU may still be reading it). */
+   size_t want = MAX2(end, cp->scratch.size[cur] * 2);
+   want = MAX2(want, 1 << 20); /* at least 1MB */
+   CUdeviceptr new_base;
+   if (cuMemAlloc(&new_base, want) != CUDA_SUCCESS)
       return NULL;
 
-   CUdeviceptr ptr;
-   if (cuMemAlloc(&ptr, bytes) != CUDA_SUCCESS)
-      return NULL;
-   cp->scratch.overflow[cp->scratch.num_overflow++] = ptr;
-   return (void *)(uintptr_t)ptr;
+   /* Stash the old arena pointer for freeing at flush */
+   if (cp->scratch.base[cur] &&
+       cp->scratch.num_overflow < ARRAY_SIZE(cp->scratch.overflow))
+      cp->scratch.overflow[cp->scratch.num_overflow++] = cp->scratch.base[cur];
+
+   cp->scratch.base[cur] = new_base;
+   cp->scratch.size[cur] = want;
+   cp->scratch.used = end;
+   return (void *)(uintptr_t)(new_base + offset);
 }
 
-/* Start a draw: flip to the other scratch arena. The GPU may still be reading
- * the previous arena from the prior draw — that's fine since we're writing to
- * the OTHER one. Only sync when the arena we're about to use needs resizing
- * (which frees the old allocation). */
+/* Advance the scratch arena for a new draw. No sync, no reclaim — draws
+ * stack up in the arena sequentially. Overflow handles anything that doesn't
+ * fit. Reset happens only at flush() when all GPU work is guaranteed done. */
 static void
 cp_scratch_begin(struct cp_context *cp)
 {
-   /* Flip to the other arena so the previous draw's GPU work can still read
-    * its scratch while we fill the new one. */
-   unsigned next = cp->scratch.current ^ 1;
+   /* Nothing to do — just keep bumping the arena forward. Overflow in
+    * cp_scratch_alloc handles the case where the arena is full. */
+}
 
-   /* Overflow from TWO draws ago (the last time this arena was active) is now
-    * safe to free — that draw's GPU work is long finished since we've done at
-    * least one full draw cycle since. On the first few draws this is a no-op. */
+/* Reset scratch after all GPU work is done (called from flush). Reclaims
+ * all memory and optionally grows the arena for next frame. */
+static void
+cp_scratch_reset(struct cp_context *cp)
+{
    for (unsigned i = 0; i < cp->scratch.num_overflow; i++)
       cuMemFree(cp->scratch.overflow[i]);
    cp->scratch.num_overflow = 0;
 
-   /* If the target arena needs to grow, sync first (we're freeing its old
-    * allocation which the GPU used two draws ago — should be done). */
-   if (cp->scratch.peak > cp->scratch.size[next]) {
-      cuCtxSynchronize();
+   /* Grow arena if peak usage exceeded capacity */
+   unsigned cur = cp->scratch.current;
+   if (cp->scratch.peak > cp->scratch.size[cur]) {
       size_t want = cp->scratch.peak + cp->scratch.peak / 2;
       CUdeviceptr base;
       if (cuMemAlloc(&base, want) == CUDA_SUCCESS) {
-         if (cp->scratch.base[next])
-            cuMemFree(cp->scratch.base[next]);
-         cp->scratch.base[next] = base;
-         cp->scratch.size[next] = want;
+         if (cp->scratch.base[cur])
+            cuMemFree(cp->scratch.base[cur]);
+         cp->scratch.base[cur] = base;
+         cp->scratch.size[cur] = want;
       }
    }
 
-   cp->scratch.current = next;
    cp->scratch.used = 0;
+   cp->scratch.peak = 0;
 }
 
 static void
@@ -1128,6 +1137,7 @@ cp_flush(struct pipe_context *ctx, struct pipe_fence_handle **fence,
    struct cp_context *cp = (struct cp_context *)ctx;
    cuCtxSetCurrent(cp->screen->cuda_ctx);
    cuCtxSynchronize();
+   cp_scratch_reset(cp);
    if (fence)
       *fence = NULL;
 }
