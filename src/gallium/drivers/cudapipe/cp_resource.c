@@ -149,11 +149,6 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
    if (resource->target == PIPE_BUFFER)
       return (char *)data + box->x;
 
-   if (getenv("CUDAPIPE_DEBUG_COPY"))
-      fprintf(stderr, "cudapipe: map res=%p target=%u level=%u box=%d,%d %dx%d "
-              "usage=0x%x data=%p\n", (void *)resource, resource->target, level,
-              box->x, box->y, box->width, box->height, usage, data);
-
    uint64_t offset = res->lpr.mip_offsets[level] +
                      (uint64_t)box->z * res->lpr.img_stride[level] +
                      (uint64_t)box->y * res->lpr.row_stride[level] +
@@ -514,6 +509,8 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
 static struct pipe_memory_allocation *
 cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
 {
+   /* VkDeviceMemory allocations may be host-mapped later (vkMapMemory), so
+    * these stay as managed memory. Internal driver buffers use cuMemAlloc. */
    CUdeviceptr ptr;
    if (cuMemAllocManaged(&ptr, size, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
       return NULL;

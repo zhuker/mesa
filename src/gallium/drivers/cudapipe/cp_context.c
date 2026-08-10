@@ -84,10 +84,8 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
       cp->visbuf_h = cp->depthbuf_h = h;
       if (w > 0 && h > 0) {
          cuCtxSetCurrent(cp->screen->cuda_ctx);
-         cuMemAllocManaged(&cp->visbuf, (size_t)w * h * sizeof(uint64_t),
-                           CU_MEM_ATTACH_GLOBAL);
-         cuMemAllocManaged(&cp->depthbuf, (size_t)w * h * sizeof(uint32_t),
-                           CU_MEM_ATTACH_GLOBAL);
+         cuMemAlloc(&cp->visbuf, (size_t)w * h * sizeof(uint64_t));
+         cuMemAlloc(&cp->depthbuf, (size_t)w * h * sizeof(uint32_t));
       }
       cp->depthbuf_cleared = false;
    }
@@ -110,13 +108,10 @@ cp_clear_depthbuf(struct cp_context *cp, float depth)
       return;
 
    uint32_t value = cp_depth_to_sortable(depth);
-   uint32_t *dst = (uint32_t *)(uintptr_t)cp->depthbuf;
    size_t count = (size_t)cp->depthbuf_w * cp->depthbuf_h;
 
    cuCtxSetCurrent(cp->screen->cuda_ctx);
-   cuCtxSynchronize();
-   for (size_t i = 0; i < count; i++)
-      dst[i] = value;
+   cuMemsetD32(cp->depthbuf, value, count);
    cp->depthbuf_cleared = true;
 }
 
@@ -171,7 +166,7 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
       return NULL;
 
    CUdeviceptr ptr;
-   if (cuMemAllocManaged(&ptr, bytes, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+   if (cuMemAlloc(&ptr, bytes) != CUDA_SUCCESS)
       return NULL;
    cp->scratch.overflow[cp->scratch.num_overflow++] = ptr;
    return (void *)(uintptr_t)ptr;
@@ -201,7 +196,7 @@ cp_scratch_begin(struct cp_context *cp)
       cuCtxSynchronize();
       size_t want = cp->scratch.peak + cp->scratch.peak / 2;
       CUdeviceptr base;
-      if (cuMemAllocManaged(&base, want, CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
+      if (cuMemAlloc(&base, want) == CUDA_SUCCESS) {
          if (cp->scratch.base[next])
             cuMemFree(cp->scratch.base[next]);
          cp->scratch.base[next] = base;
@@ -456,7 +451,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    if (!pixel_list || !counter || !fs_in || !fs_out || !fs_deriv || !frag_coord)
       return;
 
-   *(uint32_t *)(uintptr_t)counter = 0;
+   cuMemsetD32(counter, 0, 1);
 
    struct cp_fs_interp_args interp = {
       .visbuf = visbuf,
@@ -508,24 +503,23 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    /* The shader reads its arguments through the same pointer-array ABI the
     * compute path uses; see cp_launch_grid(). */
    fs_args_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 64 * sizeof(void *));
-   count_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
    stride_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
-   if (!fs_args_dev || !count_dev || !stride_dev)
+   if (!fs_args_dev || !stride_dev)
       return;
 
-   void **fs_args = (void **)(uintptr_t)fs_args_dev;
-   memset(fs_args, 0, 64 * sizeof(void *));
-   *(uint32_t *)(uintptr_t)stride_dev = fs_in_stride;
+   uint32_t fs_stride_host = fs_in_stride;
+   cuMemcpyHtoD(stride_dev, &fs_stride_host, 4);
 
-   /* Point the FS bounds check at the interpolation counter so it self-limits
-    * without a host-side sync to read the count. */
-   fs_args[0] = (void *)(uintptr_t)counter;
-   fs_args[2] = (void *)(uintptr_t)fs_in;
-   fs_args[3] = (void *)(uintptr_t)stride_dev;
-   fs_args[4] = (void *)(uintptr_t)fs_out;
-   fs_args[6] = (void *)(uintptr_t)frag_coord;
+   void *fs_args_host[64] = {0};
+   fs_args_host[0] = (void *)(uintptr_t)counter;
+   fs_args_host[2] = (void *)(uintptr_t)fs_in;
+   fs_args_host[3] = (void *)(uintptr_t)stride_dev;
+   fs_args_host[4] = (void *)(uintptr_t)fs_out;
+   fs_args_host[6] = (void *)(uintptr_t)frag_coord;
    for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
-      fs_args[18 + i] = cp->fs_ubos[i].buffer;
+      fs_args_host[18 + i] = cp->fs_ubos[i].buffer;
+
+   cuMemcpyHtoD(fs_args_dev, fs_args_host, 64 * sizeof(void *));
 
    if (getenv("CUDAPIPE_DEBUG_TEX")) {
       fprintf(stderr, "cudapipe: sampler table %p (%u entries) for FS module\n",
@@ -849,12 +843,17 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             vfetch_vid = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, total_verts * 4);
             vfetch_iid = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, total_verts * 4);
             if (!vfetch_vid || !vfetch_iid) { FREE(refs); return; }
-            uint32_t *vid_arr = (uint32_t *)(uintptr_t)vfetch_vid;
-            uint32_t *iid_arr = (uint32_t *)(uintptr_t)vfetch_iid;
+            uint32_t *vid_host = malloc((size_t)total_verts * 4);
+            uint32_t *iid_host = malloc((size_t)total_verts * 4);
+            if (!vid_host || !iid_host) { free(vid_host); free(iid_host); FREE(refs); return; }
             for (unsigned v = 0; v < total_verts; v++) {
-               vid_arr[v] = refs[v].vertex;
-               iid_arr[v] = refs[v].instance;
+               vid_host[v] = refs[v].vertex;
+               iid_host[v] = refs[v].instance;
             }
+            cuMemcpyHtoD(vfetch_vid, vid_host, (size_t)total_verts * 4);
+            cuMemcpyHtoD(vfetch_iid, iid_host, (size_t)total_verts * 4);
+            free(vid_host);
+            free(iid_host);
          }
 
          struct cp_vertex_fetch_args vf_args = {
@@ -899,56 +898,64 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
          stride = vs_in_stride;
 
-         /* Slots 0..7 are the stage's own buffers; uniform buffers start at
-          * 18, matching the layout the compute path uses. */
+         /* Allocate device-side buffers for VS kernel args and metadata */
          CUdeviceptr vs_args_dev = (CUdeviceptr)(uintptr_t)
             cp_scratch_alloc(cp, 64 * sizeof(void *));
-         void **vs_args = (void**)(uintptr_t)vs_args_dev;
-         memset(vs_args, 0, 64 * sizeof(void*));
-
          CUdeviceptr stride_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
-         *(uint32_t*)(uintptr_t)stride_dev = stride;
-
-         /* args[0] = pointer to vertex_count
-          * args[5] = vertex_id array (original VB indices per assembled vertex) */
          CUdeviceptr vcount_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
-         *(uint32_t*)(uintptr_t)vcount_dev = total_verts;
-
-         /* gl_VertexIndex and gl_InstanceIndex, per assembled vertex. */
          CUdeviceptr vid_buf = (CUdeviceptr)(uintptr_t)
             cp_scratch_alloc(cp, (size_t)total_verts * 4);
          CUdeviceptr iid_buf = (CUdeviceptr)(uintptr_t)
             cp_scratch_alloc(cp, (size_t)total_verts * 4);
-         uint32_t *vid_arr = (uint32_t *)(uintptr_t)vid_buf;
-         uint32_t *iid_arr = (uint32_t *)(uintptr_t)iid_buf;
-         for (unsigned v = 0; v < total_verts; v++) {
-            vid_arr[v] = refs[v].vertex;
-            iid_arr[v] = refs[v].instance;
-         }
-
-         vs_args[0] = (void*)(uintptr_t)vcount_dev;
-         vs_args[1] = NULL;
-         vs_args[2] = (void*)(uintptr_t)vs_input_buf; /* full vertex data */
-         vs_args[3] = (void*)(uintptr_t)stride_dev;
-         vs_args[4] = (void*)(uintptr_t)vs_output_buf;
-         vs_args[5] = (void*)(uintptr_t)vid_buf; /* vertex_id array */
-         vs_args[6] = (void*)(uintptr_t)iid_buf; /* instance_id array */
-
-         /* Draw parameters: base vertex, base instance, draw id. */
          CUdeviceptr draw_params = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 3 * 4);
          if (!vs_args_dev || !stride_dev || !vcount_dev || !vid_buf ||
              !iid_buf || !draw_params) {
             FREE(refs);
             return;
          }
-         uint32_t *params = (uint32_t *)(uintptr_t)draw_params;
-         params[0] = indexed ? (uint32_t)draws[0].index_bias : draws[0].start;
-         params[1] = info->start_instance;
-         params[2] = drawid_offset;
-         vs_args[7] = (void*)(uintptr_t)draw_params;
+
+         /* Build vertex_id and instance_id arrays on the host, then upload */
+         uint32_t *vid_host = malloc((size_t)total_verts * 4);
+         uint32_t *iid_host = malloc((size_t)total_verts * 4);
+         if (!vid_host || !iid_host) {
+            free(vid_host); free(iid_host); FREE(refs); return;
+         }
+         for (unsigned v = 0; v < total_verts; v++) {
+            vid_host[v] = refs[v].vertex;
+            iid_host[v] = refs[v].instance;
+         }
+         cuMemcpyHtoD(vid_buf, vid_host, (size_t)total_verts * 4);
+         cuMemcpyHtoD(iid_buf, iid_host, (size_t)total_verts * 4);
+         free(vid_host);
+         free(iid_host);
+
+         /* Build the VS args table on the stack, upload in one shot */
+         void *vs_args_host[64] = {0};
+         uint32_t stride_host = stride;
+         uint32_t vcount_host = total_verts;
+         uint32_t draw_params_host[3] = {
+            indexed ? (uint32_t)draws[0].index_bias : draws[0].start,
+            info->start_instance,
+            drawid_offset,
+         };
+
+         cuMemcpyHtoD(stride_dev, &stride_host, 4);
+         cuMemcpyHtoD(vcount_dev, &vcount_host, 4);
+         cuMemcpyHtoD(draw_params, draw_params_host, 12);
+
+         vs_args_host[0] = (void*)(uintptr_t)vcount_dev;
+         vs_args_host[1] = NULL;
+         vs_args_host[2] = (void*)(uintptr_t)vs_input_buf;
+         vs_args_host[3] = (void*)(uintptr_t)stride_dev;
+         vs_args_host[4] = (void*)(uintptr_t)vs_output_buf;
+         vs_args_host[5] = (void*)(uintptr_t)vid_buf;
+         vs_args_host[6] = (void*)(uintptr_t)iid_buf;
+         vs_args_host[7] = (void*)(uintptr_t)draw_params;
 
          for (unsigned i = 0; i < cp->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
-            vs_args[18 + i] = cp->vs_ubos[i].buffer;
+            vs_args_host[18 + i] = cp->vs_ubos[i].buffer;
+
+         cuMemcpyHtoD(vs_args_dev, vs_args_host, 64 * sizeof(void *));
 
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
@@ -1072,28 +1079,30 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    uint32_t grid_size[3] = { grid[0], grid[1], grid[2] };
 
    CUdeviceptr args_dev;
-   cuMemAllocManaged(&args_dev, 34 * sizeof(void *), CU_MEM_ATTACH_GLOBAL);
-   void **arg_ptrs = (void **)(uintptr_t)args_dev;
+   cuMemAlloc(&args_dev, 34 * sizeof(void *));
 
    CUdeviceptr grid_dev;
-   cuMemAllocManaged(&grid_dev, sizeof(grid_size), CU_MEM_ATTACH_GLOBAL);
-   memcpy((void *)(uintptr_t)grid_dev, grid_size, sizeof(grid_size));
+   cuMemAlloc(&grid_dev, sizeof(grid_size));
+   cuMemcpyHtoD(grid_dev, grid_size, sizeof(grid_size));
 
-   arg_ptrs[0] = (void *)(uintptr_t)grid_dev;
-   arg_ptrs[1] = NULL;
+   void *arg_ptrs_host[34] = {0};
+   arg_ptrs_host[0] = (void *)(uintptr_t)grid_dev;
+   arg_ptrs_host[1] = NULL;
 
    for (unsigned i = 0; i < CP_MAX_SHADER_BUFFERS; i++)
-      arg_ptrs[2 + i] = cp->compute_ssbos[i].buffer;
+      arg_ptrs_host[2 + i] = cp->compute_ssbos[i].buffer;
 
    for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++)
-      arg_ptrs[18 + i] = cp->compute_ubos[i].buffer;
+      arg_ptrs_host[18 + i] = cp->compute_ubos[i].buffer;
+
+   cuMemcpyHtoD(args_dev, arg_ptrs_host, 34 * sizeof(void *));
 
    void *args_ptr_val = (void *)(uintptr_t)args_dev;
    void *kernel_params[] = { &args_ptr_val };
 
    if (getenv("CUDAPIPE_DEBUG_LAUNCH")) {
-      fprintf(stderr, "  args_dev=%p arg_ptrs[19]=%p (UBO[1])\n",
-              (void*)(uintptr_t)args_dev, arg_ptrs[19]);
+      fprintf(stderr, "  args_dev=%p arg_ptrs_host[19]=%p (UBO[1])\n",
+              (void*)(uintptr_t)args_dev, arg_ptrs_host[19]);
    }
 
    CUresult err = cuLaunchKernel(
@@ -1524,13 +1533,12 @@ cp_set_constant_buffer(struct pipe_context *ctx, mesa_shader_stage shader,
          if (cp->stage##_ubos[index].managed_size < buf_size) {         \
             if (cp->stage##_ubos[index].managed_copy)                   \
                cuMemFree(cp->stage##_ubos[index].managed_copy);         \
-            cuMemAllocManaged(&cp->stage##_ubos[index].managed_copy,    \
-                              buf_size, CU_MEM_ATTACH_GLOBAL);          \
+            cuMemAlloc(&cp->stage##_ubos[index].managed_copy, buf_size);\
             cp->stage##_ubos[index].managed_size = buf_size;            \
          }                                                              \
          if (cp->stage##_ubos[index].managed_copy) {                    \
-            memcpy((void*)(uintptr_t)cp->stage##_ubos[index].managed_copy, \
-                   buf_ptr, buf_size);                                   \
+            cuMemcpyHtoD(cp->stage##_ubos[index].managed_copy,          \
+                         buf_ptr, buf_size);                             \
             buf_ptr = (void*)(uintptr_t)cp->stage##_ubos[index].managed_copy; \
          }                                                              \
       }                                                                 \
@@ -1819,13 +1827,13 @@ static uint32_t
 cp_register_sampler(struct cp_context *cp, const struct pipe_sampler_state *state)
 {
    if (!cp->sampler_table) {
-      if (cuMemAllocManaged(&cp->sampler_table,
-                            CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info),
-                            CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+      if (cuMemAlloc(&cp->sampler_table,
+                     CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info)) != CUDA_SUCCESS)
          return 0;
-      memset((void *)(uintptr_t)cp->sampler_table, 0,
-             CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info));
+      cuMemsetD8(cp->sampler_table, 0,
+                 CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info));
       cp->num_samplers = 0;
+      memset(cp->sampler_table_host, 0, sizeof(cp->sampler_table_host));
    }
 
    struct cp_sampler_info info = {
@@ -1842,16 +1850,17 @@ cp_register_sampler(struct cp_context *cp, const struct pipe_sampler_state *stat
    };
    memcpy(info.border_color, state->border_color.f, sizeof(info.border_color));
 
-   struct cp_sampler_info *table = (struct cp_sampler_info *)(uintptr_t)cp->sampler_table;
    for (unsigned i = 0; i < cp->num_samplers; i++) {
-      if (memcmp(&table[i], &info, sizeof(info)) == 0)
+      if (memcmp(&cp->sampler_table_host[i], &info, sizeof(info)) == 0)
          return i;
    }
 
    if (cp->num_samplers >= CP_MAX_SAMPLERS)
       return 0;
 
-   table[cp->num_samplers] = info;
+   cp->sampler_table_host[cp->num_samplers] = info;
+   cuMemcpyHtoD(cp->sampler_table + cp->num_samplers * sizeof(info),
+                &info, sizeof(info));
    if (getenv("CUDAPIPE_DEBUG_TEX"))
       fprintf(stderr, "cudapipe: sampler[%u] wrap=%u,%u min=%u mag=%u mip=%u\n",
               cp->num_samplers, info.wrap_s, info.wrap_t,
@@ -1876,10 +1885,10 @@ cp_create_texture_handle(struct pipe_context *ctx,
     * needs into the descriptor. */
    if (view && view->texture) {
       CUdeviceptr info_dev;
-      if (cuMemAllocManaged(&info_dev, sizeof(struct cp_texture_info),
-                            CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
-         struct cp_texture_info *info = (struct cp_texture_info *)(uintptr_t)info_dev;
-         memset(info, 0, sizeof(*info));
+      if (cuMemAlloc(&info_dev, sizeof(struct cp_texture_info)) == CUDA_SUCCESS) {
+         struct cp_texture_info info_host;
+         memset(&info_host, 0, sizeof(info_host));
+         struct cp_texture_info *info = &info_host;
 
          struct pipe_resource *res = view->texture;
          struct cp_resource *cres = cp_resource(res);
@@ -1922,7 +1931,8 @@ cp_create_texture_handle(struct pipe_context *ctx,
             info->mip_offset[l] = cres->lpr.mip_offsets[l];
          }
 
-         h->functions = info;
+         cuMemcpyHtoD(info_dev, &info_host, sizeof(info_host));
+         h->functions = (void *)(uintptr_t)info_dev;
 
          if (getenv("CUDAPIPE_DEBUG_TEX"))
             fprintf(stderr, "cudapipe: texture handle %ux%u fmt=%u enc=%u "

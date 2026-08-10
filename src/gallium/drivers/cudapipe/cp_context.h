@@ -4,6 +4,7 @@
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
 #include <cuda.h>
+#include "kernels/cp_rast_types.h"
 
 struct cp_shader_binary;
 
@@ -93,6 +94,7 @@ struct cp_context {
    /* Device-visible table of deduplicated sampler states. Descriptors refer to
     * entries by index; see cp_register_sampler(). */
    CUdeviceptr sampler_table;
+   struct cp_sampler_info sampler_table_host[CP_MAX_SAMPLERS];
    unsigned num_samplers;
 
    /*
