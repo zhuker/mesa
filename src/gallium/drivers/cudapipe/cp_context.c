@@ -711,14 +711,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    if (!visbuf)
       return;
 
-   {
-      uint32_t vw = w, vh = h;
-      uint64_t visbuf_ptr = visbuf;
-      void *cv_params[] = { &visbuf_ptr, &vw, &vh };
-      cuLaunchKernel(screen->kernels.clear_visbuf,
-         (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
-         0, NULL, cv_params, NULL);
-   }
+   /* Clear visbuf to VISBUF_EMPTY (all-ones). cuMemsetD32 fills 32-bit words
+    * which is faster than a kernel launch for a bulk fill. */
+   cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2);
 
    if (!cp->depthbuf_cleared)
       cp_clear_depthbuf(cp, 1.0f);
