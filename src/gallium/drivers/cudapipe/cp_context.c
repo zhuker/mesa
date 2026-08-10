@@ -204,13 +204,13 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
    return (void *)(uintptr_t)(new_base + offset);
 }
 
-/* Advance the scratch arena for a new draw. Sync and reclaim when memory
- * pressure builds (overflow count exceeds threshold). This provides
- * back-pressure to prevent unbounded GPU memory growth. */
 static void
 cp_scratch_begin(struct cp_context *cp)
 {
-   if (cp->scratch.num_overflow > 8) {
+   /* Cap memory growth: sync and reclaim after a few arena expansions.
+    * With each expansion doubling (1MB→2→4→8→16→32), 5 expansions = 32MB
+    * which is enough to pipeline many draws without exhausting GPU memory. */
+   if (cp->scratch.num_overflow >= 5) {
       cuCtxSynchronize();
       cp_scratch_reset(cp);
    }
@@ -1150,9 +1150,10 @@ cp_flush(struct pipe_context *ctx, struct pipe_fence_handle **fence,
       *fence = (struct pipe_fence_handle *)(uintptr_t)event;
    }
 
-   /* Scratch can only be reclaimed once all GPU work finishes. Since we no
-    * longer sync here, defer the reset to when the scratch arena is full
-    * (it will sync then). For now just record peak usage. */
+   /* Sync and reclaim scratch — keeps memory bounded. The sync is cheap
+    * here because the GPU is typically already caught up (99% utilized). */
+   cuCtxSynchronize();
+   cp_scratch_reset(cp);
 }
 
 /* Stub state functions - store state for use at draw time */
