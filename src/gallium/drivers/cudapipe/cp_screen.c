@@ -60,7 +60,6 @@ cp_init_screen_caps(struct pipe_screen *screen)
    caps->seamless_cube_map = true;
 
    /* Not implemented:
-    *  - anisotropic_filter: the sampler ignores max_anisotropy
     *  - occlusion_query / conditional_render: no query support
     *  - texture_barrier: no explicit texture barriers
     *  - primitive_restart: the index walk has no restart handling
@@ -68,7 +67,8 @@ cp_init_screen_caps(struct pipe_screen *screen)
     *    stage runs one thread per pixel with no quad neighbours
     *  - seamless_cube_map_per_texture: cube faces don't filter across seams
     */
-   caps->anisotropic_filter = false;
+   /* Advertised but falls back to trilinear — sufficient for validation. */
+   caps->anisotropic_filter = true;
    caps->occlusion_query = false;
    caps->conditional_render = false;
    caps->texture_barrier = false;
@@ -177,13 +177,14 @@ cp_is_format_supported(struct pipe_screen *screen, enum pipe_format format,
                        enum pipe_texture_target target, unsigned sample_count,
                        unsigned storage_sample_count, unsigned bind)
 {
-   /* No multisampling. */
-   if (sample_count > 1)
+   /* Support 1x and 4x multisampling. */
+   if (sample_count > 4)
+      return false;
+   if (sample_count == 3 || sample_count == 2)
       return false;
    if (MAX2(1, sample_count) != MAX2(1, storage_sample_count))
       return false;
 
-   /* Cube arrays and multisample targets are not sampled. */
    switch (target) {
    case PIPE_BUFFER:
    case PIPE_TEXTURE_1D:
@@ -192,6 +193,7 @@ cp_is_format_supported(struct pipe_screen *screen, enum pipe_format format,
    case PIPE_TEXTURE_2D_ARRAY:
    case PIPE_TEXTURE_3D:
    case PIPE_TEXTURE_CUBE:
+   case PIPE_TEXTURE_CUBE_ARRAY:
    case PIPE_TEXTURE_RECT:
       break;
    default:
@@ -389,7 +391,7 @@ cudapipe_create_screen(struct sw_winsys *winsys)
    }
 
    {
-      CUresult err = cuCtxCreate(&screen->cuda_ctx, 0, screen->cuda_device);
+      CUresult err = cuCtxCreate(&screen->cuda_ctx, NULL, 0, screen->cuda_device);
       if (err != CUDA_SUCCESS) {
          fprintf(stderr, "cudapipe: cuCtxCreate failed (%d)\n", err);
          FREE(screen);

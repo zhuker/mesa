@@ -1220,6 +1220,18 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
          cond_val = LLVMBuildICmp(ctx->builder, LLVMIntNE, cond_val,
             LLVMConstNull(LLVMTypeOf(cond_val)), "");
       }
+      /* Ensure both branches have matching types — NIR constant folding can
+       * produce a bcsel with an i32 zero on one side and a float on the other. */
+      LLVMTypeRef t1 = LLVMTypeOf(src[1]);
+      LLVMTypeRef t2 = LLVMTypeOf(src[2]);
+      if (t1 != t2) {
+         if (LLVMGetTypeKind(t1) == LLVMFloatTypeKind &&
+             LLVMGetTypeKind(t2) == LLVMIntegerTypeKind)
+            src[2] = LLVMBuildBitCast(ctx->builder, src[2], t1, "");
+         else if (LLVMGetTypeKind(t2) == LLVMFloatTypeKind &&
+                  LLVMGetTypeKind(t1) == LLVMIntegerTypeKind)
+            src[1] = LLVMBuildBitCast(ctx->builder, src[1], t2, "");
+      }
       result = LLVMBuildSelect(ctx->builder, cond_val, src[1], src[2], "");
       break;
    }

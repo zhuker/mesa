@@ -275,6 +275,8 @@ cp_triangles_for_draw(enum mesa_prim mode, unsigned count)
 {
    if (mode == MESA_PRIM_TRIANGLE_STRIP || mode == MESA_PRIM_TRIANGLE_FAN)
       return count >= 3 ? count - 2 : 0;
+   if (mode == MESA_PRIM_POINTS)
+      return count;
    return count / 3;
 }
 
@@ -314,7 +316,13 @@ cp_build_vertex_refs(const struct pipe_draw_info *info,
 
          for (unsigned tri = 0; tri < draw_tris; tri++) {
             unsigned idx[3];
-            if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
+            if (info->mode == MESA_PRIM_POINTS) {
+               /* Each point becomes a degenerate triangle: the rasterizer will
+                * expand it into a screen-aligned quad later using point size. */
+               idx[0] = tri;
+               idx[1] = tri;
+               idx[2] = tri;
+            } else if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
                /* Odd triangles swap two vertices to keep the winding. */
                idx[0] = tri;
                idx[1] = tri + 1 + (tri & 1);
@@ -375,6 +383,16 @@ cp_color_encoding_from_format(enum pipe_format format)
       return CP_COLOR_R32G32B32A32_FLOAT;
    case PIPE_FORMAT_R16G16B16A16_FLOAT:
       return CP_COLOR_R16G16B16A16_FLOAT;
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+      return CP_COLOR_R11G11B10_FLOAT;
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+      return CP_COLOR_A2B10G10R10_UNORM;
+   case PIPE_FORMAT_R16_FLOAT:
+      return CP_COLOR_R16_SFLOAT;
+   case PIPE_FORMAT_R16G16_FLOAT:
+      return CP_COLOR_R16G16_SFLOAT;
+   case PIPE_FORMAT_R8_UNORM:
+      return CP_COLOR_R8_UNORM;
    default:
       return -1;
    }
@@ -645,7 +663,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    if (!screen->kernels.initialized || !screen->kernels.rasterize_triangles)
       return;
-   if (!fb->nr_cbufs || !fb->cbufs[0].texture)
+   if (!fb->nr_cbufs && !fb->zsbuf.texture)
       return;
    if (num_draws == 0 || draws[0].count == 0)
       return;
@@ -666,11 +684,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       return;
    unsigned num_triangles = total_triangles;
 
-   /* Get the color output surface */
-   struct cp_resource *color_res = cp_resource(fb->cbufs[0].texture);
-   void *color_data = cp_resource_data(color_res);
-   if (!color_data)
-      return;
+   /* Get the color output surface (may be NULL for depth-only passes) */
+   void *color_data = NULL;
+   if (fb->nr_cbufs && fb->cbufs[0].texture) {
+      struct cp_resource *color_res = cp_resource(fb->cbufs[0].texture);
+      color_data = cp_resource_data(color_res);
+   }
 
    unsigned w = fb->width;
    unsigned h = fb->height;
@@ -843,9 +862,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                   cp->vertex_buffers[vb_idx].buffer_offset +
                   (size_t)index * elem->src_stride + elem->src_offset;
 
-               /* Each attribute occupies a 16-byte slot regardless of its
-                * real width; the shader only reads the components it declared. */
-               memcpy(out + e * 16, src, 16);
+               unsigned attr_size = util_format_get_blocksize(elem->src_format);
+               memcpy(out + e * 16, src, MIN2(attr_size, 16));
             }
          }
 
@@ -1284,6 +1302,13 @@ cp_bind_vs_state(struct pipe_context *ctx, void *state)
 }
 
 static void
+cp_bind_gs_state(struct pipe_context *ctx, void *state) {}
+static void
+cp_bind_tcs_state(struct pipe_context *ctx, void *state) {}
+static void
+cp_bind_tes_state(struct pipe_context *ctx, void *state) {}
+
+static void
 cp_delete_vs_state(struct pipe_context *ctx, void *state)
 {
    FREE(state);
@@ -1463,31 +1488,51 @@ cp_set_constant_buffer(struct pipe_context *ctx, mesa_shader_stage shader,
 
    void *buf_ptr = NULL;
    unsigned buf_size = 0;
+   bool needs_managed_copy = false;
+
    if (buf && buf->buffer) {
       struct cp_resource *res = cp_resource(buf->buffer);
-      buf_ptr = (char *)cp_resource_data(res) + buf->buffer_offset;
-      buf_size = buf->buffer_size;
+      void *data = cp_resource_data(res);
+      if (data) {
+         buf_ptr = (char *)data + buf->buffer_offset;
+         buf_size = buf->buffer_size;
+      }
    } else if (buf && buf->user_buffer) {
       buf_ptr = (void *)buf->user_buffer;
       buf_size = buf->buffer_size;
+      needs_managed_copy = true;
    }
 
+   /* Macro to handle all three shader stages identically */
+#define SET_UBO(stage) do {                                              \
+      if (needs_managed_copy && buf_ptr && buf_size > 0) {              \
+         if (cp->stage##_ubos[index].managed_size < buf_size) {         \
+            if (cp->stage##_ubos[index].managed_copy)                   \
+               cuMemFree(cp->stage##_ubos[index].managed_copy);         \
+            cuMemAllocManaged(&cp->stage##_ubos[index].managed_copy,    \
+                              buf_size, CU_MEM_ATTACH_GLOBAL);          \
+            cp->stage##_ubos[index].managed_size = buf_size;            \
+         }                                                              \
+         if (cp->stage##_ubos[index].managed_copy) {                    \
+            memcpy((void*)(uintptr_t)cp->stage##_ubos[index].managed_copy, \
+                   buf_ptr, buf_size);                                   \
+            buf_ptr = (void*)(uintptr_t)cp->stage##_ubos[index].managed_copy; \
+         }                                                              \
+      }                                                                 \
+      cp->stage##_ubos[index].buffer = buf_ptr;                         \
+      cp->stage##_ubos[index].buffer_size = buf_size;                   \
+      if (index + 1 > cp->num_##stage##_ubos)                           \
+         cp->num_##stage##_ubos = index + 1;                            \
+   } while (0)
+
    if (shader == MESA_SHADER_COMPUTE) {
-      cp->compute_ubos[index].buffer = buf_ptr;
-      cp->compute_ubos[index].buffer_size = buf_size;
-      if (index + 1 > cp->num_compute_ubos)
-         cp->num_compute_ubos = index + 1;
+      SET_UBO(compute);
    } else if (shader == MESA_SHADER_FRAGMENT) {
-      cp->fs_ubos[index].buffer = buf_ptr;
-      cp->fs_ubos[index].buffer_size = buf_size;
-      if (index + 1 > cp->num_fs_ubos)
-         cp->num_fs_ubos = index + 1;
+      SET_UBO(fs);
    } else {
-      cp->vs_ubos[index].buffer = buf_ptr;
-      cp->vs_ubos[index].buffer_size = buf_size;
-      if (index + 1 > cp->num_vs_ubos)
-         cp->num_vs_ubos = index + 1;
+      SET_UBO(vs);
    }
+#undef SET_UBO
 }
 
 static void
@@ -1584,6 +1629,67 @@ cp_render_condition(struct pipe_context *ctx, struct pipe_query *query,
 {
 }
 
+struct cp_query {
+   unsigned type;
+};
+
+static struct pipe_query *
+cp_create_query(struct pipe_context *ctx, unsigned query_type, unsigned index)
+{
+   struct cp_query *q = CALLOC_STRUCT(cp_query);
+   if (q)
+      q->type = query_type;
+   return (struct pipe_query *)q;
+}
+
+static void
+cp_destroy_query(struct pipe_context *ctx, struct pipe_query *query)
+{
+   FREE(query);
+}
+
+static bool
+cp_begin_query(struct pipe_context *ctx, struct pipe_query *query)
+{
+   return true;
+}
+
+static bool
+cp_end_query(struct pipe_context *ctx, struct pipe_query *query)
+{
+   return true;
+}
+
+static bool
+cp_get_query_result(struct pipe_context *ctx, struct pipe_query *query,
+                    bool wait, union pipe_query_result *result)
+{
+   memset(result, 0, sizeof(*result));
+   if (((struct cp_query *)query)->type == PIPE_QUERY_TIMESTAMP)
+      result->u64 = 0;
+   return true;
+}
+
+static void
+cp_get_query_result_resource(struct pipe_context *ctx, struct pipe_query *query,
+                             enum pipe_query_flags flags, enum pipe_query_value_type type,
+                             int index, struct pipe_resource *resource,
+                             unsigned offset)
+{
+   struct cp_resource *res = cp_resource(resource);
+   void *data = cp_resource_data(res);
+   if (!data)
+      return;
+   char *dst = (char *)data + offset;
+   if (type == PIPE_QUERY_TYPE_U64) {
+      uint64_t val = 0;
+      memcpy(dst, &val, 8);
+   } else {
+      uint32_t val = 0;
+      memcpy(dst, &val, 4);
+   }
+}
+
 /*
  * Layout-compatible with lp_texture_handle: lavapipe reads ->functions and
  * ->sampler_index straight out of whatever create_texture_handle() returns and
@@ -1663,6 +1769,18 @@ cp_texel_encoding_from_format(enum pipe_format format)
       return CP_TEXEL_R11G11B10_FLOAT;
    case PIPE_FORMAT_R9G9B9E5_FLOAT:
       return CP_TEXEL_R9G9B9E5_FLOAT;
+   case PIPE_FORMAT_R16_FLOAT:
+      return CP_TEXEL_R16_SFLOAT;
+   case PIPE_FORMAT_R16G16_FLOAT:
+      return CP_TEXEL_R16G16_SFLOAT;
+   case PIPE_FORMAT_R16G16_UNORM:
+      return CP_TEXEL_R16G16_UNORM;
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+      return CP_TEXEL_A2B10G10R10_UNORM;
+   case PIPE_FORMAT_R32_SINT:
+      return CP_TEXEL_R32_SINT;
+   case PIPE_FORMAT_R16_SINT:
+      return CP_TEXEL_R16_SINT;
    case PIPE_FORMAT_DXT1_RGB:
    case PIPE_FORMAT_DXT1_SRGB:
       return CP_TEXEL_DXT1_RGB;
@@ -1884,6 +2002,9 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.create_vs_state = cp_create_vs_state;
    ctx->base.bind_vs_state = cp_bind_vs_state;
    ctx->base.delete_vs_state = cp_delete_vs_state;
+   ctx->base.bind_gs_state = cp_bind_gs_state;
+   ctx->base.bind_tcs_state = cp_bind_tcs_state;
+   ctx->base.bind_tes_state = cp_bind_tes_state;
 
    ctx->base.create_compute_state = cp_create_compute_state;
    ctx->base.bind_compute_state = cp_bind_compute_state;
@@ -1913,6 +2034,12 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.set_sample_locations = cp_set_sample_locations;
    ctx->base.set_min_samples = cp_set_min_samples;
    ctx->base.render_condition = cp_render_condition;
+   ctx->base.create_query = cp_create_query;
+   ctx->base.destroy_query = cp_destroy_query;
+   ctx->base.begin_query = cp_begin_query;
+   ctx->base.end_query = cp_end_query;
+   ctx->base.get_query_result = cp_get_query_result;
+   ctx->base.get_query_result_resource = cp_get_query_result_resource;
    ctx->base.create_texture_handle = cp_create_texture_handle;
    ctx->base.create_image_handle = cp_create_image_handle;
    ctx->base.delete_texture_handle = cp_delete_texture_handle;

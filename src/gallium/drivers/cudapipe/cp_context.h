@@ -69,18 +69,24 @@ struct cp_context {
    struct {
       void *buffer;
       unsigned buffer_size;
+      CUdeviceptr managed_copy; /* Device buffer for user_buffer data */
+      unsigned managed_size;
    } compute_ubos[CP_MAX_CONST_BUFFERS];
    unsigned num_compute_ubos;
 
    struct {
       void *buffer;
       unsigned buffer_size;
+      CUdeviceptr managed_copy;
+      unsigned managed_size;
    } fs_ubos[CP_MAX_CONST_BUFFERS];
    unsigned num_fs_ubos;
 
    struct {
       void *buffer;
       unsigned buffer_size;
+      CUdeviceptr managed_copy;
+      unsigned managed_size;
    } vs_ubos[CP_MAX_CONST_BUFFERS];
    unsigned num_vs_ubos;
 

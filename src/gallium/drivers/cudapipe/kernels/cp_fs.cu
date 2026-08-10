@@ -245,6 +245,22 @@ cp_float_to_unorm8(float v)
    return (uint32_t)(v * 255.0f + 0.5f);
 }
 
+static __device__ __forceinline__ float
+cp_half_to_float_wb(unsigned short h)
+{
+   unsigned sign = (unsigned)(h >> 15) << 31;
+   unsigned exp = (h >> 10) & 0x1F;
+   unsigned mant = h & 0x3FF;
+   unsigned bits;
+   if (exp == 0)
+      bits = sign;
+   else if (exp == 0x1F)
+      bits = sign | 0x7F800000u | (mant << 13);
+   else
+      bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+   return __int_as_float((int)bits);
+}
+
 static __device__ void
 cp_load_dst(const void *ptr, uint32_t encoding, float *out)
 {
@@ -255,21 +271,41 @@ cp_load_dst(const void *ptr, uint32_t encoding, float *out)
       break;
    }
    case CP_COLOR_R16G16B16A16_FLOAT: {
-      /* Only needed to blend against; decoded via the same path as textures. */
       const unsigned short *h = (const unsigned short *)ptr;
-      for (int i = 0; i < 4; i++) {
-         unsigned sign = (unsigned)(h[i] >> 15) << 31;
-         unsigned exp = (h[i] >> 10) & 0x1F;
-         unsigned mant = h[i] & 0x3FF;
-         unsigned bits;
-         if (exp == 0)
-            bits = sign;
-         else if (exp == 0x1F)
-            bits = sign | 0x7F800000u | (mant << 13);
-         else
-            bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
-         out[i] = __int_as_float((int)bits);
-      }
+      out[0] = cp_half_to_float_wb(h[0]); out[1] = cp_half_to_float_wb(h[1]);
+      out[2] = cp_half_to_float_wb(h[2]); out[3] = cp_half_to_float_wb(h[3]);
+      break;
+   }
+   case CP_COLOR_R11G11B10_FLOAT: {
+      unsigned p = *(const uint32_t *)ptr;
+      out[0] = cp_half_to_float_wb((unsigned short)((p & 0x7FF) << 4));
+      out[1] = cp_half_to_float_wb((unsigned short)(((p >> 11) & 0x7FF) << 4));
+      out[2] = cp_half_to_float_wb((unsigned short)(((p >> 22) & 0x3FF) << 5));
+      out[3] = 1.0f;
+      break;
+   }
+   case CP_COLOR_A2B10G10R10_UNORM: {
+      uint32_t p = *(const uint32_t *)ptr;
+      out[0] = (float)(p & 0x3FF) * (1.0f / 1023.0f);
+      out[1] = (float)((p >> 10) & 0x3FF) * (1.0f / 1023.0f);
+      out[2] = (float)((p >> 20) & 0x3FF) * (1.0f / 1023.0f);
+      out[3] = (float)((p >> 30) & 0x3) * (1.0f / 3.0f);
+      break;
+   }
+   case CP_COLOR_R16_SFLOAT: {
+      out[0] = cp_half_to_float_wb(*(const unsigned short *)ptr);
+      out[1] = 0.0f; out[2] = 0.0f; out[3] = 1.0f;
+      break;
+   }
+   case CP_COLOR_R16G16_SFLOAT: {
+      const unsigned short *h = (const unsigned short *)ptr;
+      out[0] = cp_half_to_float_wb(h[0]); out[1] = cp_half_to_float_wb(h[1]);
+      out[2] = 0.0f; out[3] = 1.0f;
+      break;
+   }
+   case CP_COLOR_R8_UNORM: {
+      out[0] = cp_unorm8_to_float(*(const uint8_t *)ptr);
+      out[1] = 0.0f; out[2] = 0.0f; out[3] = 1.0f;
       break;
    }
    default: {
@@ -293,6 +329,22 @@ cp_load_dst(const void *ptr, uint32_t encoding, float *out)
    }
 }
 
+static __device__ __forceinline__ unsigned short
+cp_float_to_half(float f)
+{
+   unsigned bits = __float_as_int(f);
+   unsigned sign = (bits >> 16) & 0x8000;
+   int exp = ((bits >> 23) & 0xFF) - 127 + 15;
+   unsigned mant = bits & 0x7FFFFF;
+
+   if (exp <= 0) {
+      return (unsigned short)sign;
+   } else if (exp >= 0x1F) {
+      return (unsigned short)(sign | 0x7C00);
+   }
+   return (unsigned short)(sign | (exp << 10) | (mant >> 13));
+}
+
 static __device__ void
 cp_store_dst(void *ptr, uint32_t encoding, const float *c)
 {
@@ -300,6 +352,48 @@ cp_store_dst(void *ptr, uint32_t encoding, const float *c)
    case CP_COLOR_R32G32B32A32_FLOAT:
       *(float4 *)ptr = make_float4(c[0], c[1], c[2], c[3]);
       break;
+   case CP_COLOR_R16G16B16A16_FLOAT: {
+      unsigned short *h = (unsigned short *)ptr;
+      h[0] = cp_float_to_half(c[0]); h[1] = cp_float_to_half(c[1]);
+      h[2] = cp_float_to_half(c[2]); h[3] = cp_float_to_half(c[3]);
+      break;
+   }
+   case CP_COLOR_R11G11B10_FLOAT: {
+      /* 11-bit float: 5-bit exp, 6-bit mantissa; 10-bit: 5-bit exp, 5-bit mantissa */
+      unsigned short hr = cp_float_to_half(c[0]);
+      unsigned short hg = cp_float_to_half(c[1]);
+      unsigned short hb = cp_float_to_half(c[2]);
+      unsigned r11 = (hr >> 4) & 0x7FF;
+      unsigned g11 = (hg >> 4) & 0x7FF;
+      unsigned b10 = (hb >> 5) & 0x3FF;
+      *(uint32_t *)ptr = r11 | (g11 << 11) | (b10 << 22);
+      break;
+   }
+   case CP_COLOR_A2B10G10R10_UNORM: {
+      float r = fminf(fmaxf(c[0], 0.0f), 1.0f);
+      float g = fminf(fmaxf(c[1], 0.0f), 1.0f);
+      float b = fminf(fmaxf(c[2], 0.0f), 1.0f);
+      float a = fminf(fmaxf(c[3], 0.0f), 1.0f);
+      uint32_t p = ((uint32_t)(r * 1023.0f + 0.5f)) |
+                   ((uint32_t)(g * 1023.0f + 0.5f) << 10) |
+                   ((uint32_t)(b * 1023.0f + 0.5f) << 20) |
+                   ((uint32_t)(a * 3.0f + 0.5f) << 30);
+      *(uint32_t *)ptr = p;
+      break;
+   }
+   case CP_COLOR_R16_SFLOAT: {
+      *(unsigned short *)ptr = cp_float_to_half(c[0]);
+      break;
+   }
+   case CP_COLOR_R16G16_SFLOAT: {
+      unsigned short *h = (unsigned short *)ptr;
+      h[0] = cp_float_to_half(c[0]); h[1] = cp_float_to_half(c[1]);
+      break;
+   }
+   case CP_COLOR_R8_UNORM: {
+      *(uint8_t *)ptr = (uint8_t)cp_float_to_unorm8(c[0]);
+      break;
+   }
    default: {
       float r = c[0], g = c[1], b = c[2];
       if (encoding == CP_COLOR_R8G8B8A8_SRGB || encoding == CP_COLOR_B8G8R8A8_SRGB) {
@@ -344,8 +438,15 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
                        (size_t)i * args.fs_out_stride);
    float src[4] = { fs_out->x, fs_out->y, fs_out->z, fs_out->w };
 
-   uint32_t bpp = (args.color_encoding == CP_COLOR_R32G32B32A32_FLOAT) ? 16 :
-                  (args.color_encoding == CP_COLOR_R16G16B16A16_FLOAT) ? 8 : 4;
+   uint32_t bpp;
+   switch (args.color_encoding) {
+   case CP_COLOR_R32G32B32A32_FLOAT: bpp = 16; break;
+   case CP_COLOR_R16G16B16A16_FLOAT: bpp = 8; break;
+   case CP_COLOR_R16G16_SFLOAT: bpp = 4; break;
+   case CP_COLOR_R16_SFLOAT: bpp = 2; break;
+   case CP_COLOR_R8_UNORM: bpp = 1; break;
+   default: bpp = 4; break;
+   }
    void *dst_ptr = (char *)(uintptr_t)args.color_out + (size_t)pixel * bpp;
 
    float out[4];

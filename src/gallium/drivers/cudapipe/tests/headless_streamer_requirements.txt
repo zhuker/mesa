@@ -1,0 +1,85 @@
+HeadlessStreamer capture requirements (2026-08-09, Tesla T4, placeId=123921593837160)
+==================================================================================
+
+Source: /tmp/headless_streamer_20260809T231703.gfxr (captured with --softwareEncoder)
+Device: Tesla T4, driver 595.84, Vulkan 1.4.329
+Pipelines: 77 graphics, 2 compute, 0 raytracing
+Shader stages: vertex + fragment only (no geometry/tessellation)
+
+FORMATS REQUIRED
+----------------
+Color (sampled + render target):
+  R8G8B8A8_UNORM            - primary color format, also 3D textures and cubemaps
+  B8G8R8A8_UNORM            - color attachment
+  B10G11R11_UFLOAT_PACK32   - HDR color, also cubemap (6 layers, 8 mips)
+  A2B10G10R10_UNORM_PACK32  - color attachment (also 4x MSAA)
+  R16G16B16A16_SFLOAT       - HDR color
+  R16G16_SFLOAT             - color
+  R16G16_UNORM              - color
+  R16_SFLOAT                - color
+  R8_UNORM                  - color + storage (also 4x MSAA)
+  R8G8_UNORM                - sampled, also 3D
+  R32_SINT                  - storage + sampled (3D)
+  R16_SINT                  - storage + sampled (3D)
+
+Depth:
+  D32_SFLOAT                - depth attachment (1x and 4x MSAA)
+  D16_UNORM                 - depth attachment
+
+Compressed (sampled only):
+  BC1_RGB_UNORM_BLOCK       - 576 images total BC family
+  BC3_UNORM_BLOCK
+
+Probed but not necessarily used as images:
+  D24_UNORM_S8_UINT, X8_D24_UNORM_PACK32, D32_SFLOAT_S8_UINT
+  BC6H_UFLOAT_BLOCK, BC6H_SFLOAT_BLOCK
+  ASTC_4x4_UNORM_BLOCK
+  G8_B8R8_2PLANE_420_UNORM, G8_B8_R8_3PLANE_420_UNORM
+
+IMAGE TYPES
+-----------
+  2D:   majority
+  3D:   R8G8B8A8_UNORM, R8G8_UNORM, R32_SINT, R16_SINT
+  Cube: R8G8B8A8_UNORM (6 layers), B10G11R11_UFLOAT (6 layers, 8 mips)
+
+MIPMAPS: up to 12 levels
+
+MSAA: 4x samples
+  - D32_SFLOAT depth (4x)
+  - A2B10G10R10_UNORM_PACK32 color (4x)
+  - R8_UNORM color (4x)
+
+SAMPLERS
+--------
+  LINEAR/LINEAR/LINEAR   + CLAMP_TO_EDGE           (most common)
+  LINEAR/LINEAR/LINEAR   + REPEAT
+  NEAREST/NEAREST/NEAREST + CLAMP_TO_EDGE
+  NEAREST/NEAREST/NEAREST + REPEAT
+  LINEAR + anisotropic    + REPEAT
+  LINEAR + anisotropic    + CLAMP_TO_EDGE
+  No compare samplers used.
+
+PIPELINE STATE
+--------------
+  Topologies: TRIANGLE_LIST (dominant), TRIANGLE_STRIP, POINT_LIST
+  Max color targets: 1
+  Blend: yes (many pipelines)
+  Depth test: yes
+  Stencil: not used
+  MSAA: 1x and 4x
+
+COMPUTE
+-------
+  2 compute pipelines
+
+EXTENSIONS REQUESTED
+--------------------
+  VK_KHR_bind_memory2
+  VK_KHR_get_memory_requirements2
+  VK_KHR_get_physical_device_properties2
+  VK_KHR_maintenance1
+  VK_KHR_sampler_ycbcr_conversion
+  VK_KHR_surface (can be ignored - offscreen)
+  VK_KHR_swapchain (can be ignored - offscreen)
+  VK_KHR_synchronization2
+  VK_KHR_video_maintenance1 (can be ignored - software encoder)

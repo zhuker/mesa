@@ -345,6 +345,43 @@ cp_fetch_texel(const struct cp_texture_info *tex, unsigned level,
          out.a = 1.0f;
          break;
       }
+      case CP_TEXEL_R16_SFLOAT: {
+         const unsigned short *s = (const unsigned short *)t;
+         out.r = cp_half_to_float(s[0]);
+         out.g = 0.0f; out.b = 0.0f; out.a = 1.0f;
+         break;
+      }
+      case CP_TEXEL_R16G16_SFLOAT: {
+         const unsigned short *s = (const unsigned short *)t;
+         out.r = cp_half_to_float(s[0]); out.g = cp_half_to_float(s[1]);
+         out.b = 0.0f; out.a = 1.0f;
+         break;
+      }
+      case CP_TEXEL_R16G16_UNORM: {
+         const unsigned short *s = (const unsigned short *)t;
+         out.r = (float)s[0] * (1.0f / 65535.0f);
+         out.g = (float)s[1] * (1.0f / 65535.0f);
+         out.b = 0.0f; out.a = 1.0f;
+         break;
+      }
+      case CP_TEXEL_A2B10G10R10_UNORM: {
+         unsigned p = *(const unsigned *)t;
+         out.r = (float)(p & 0x3FF) * (1.0f / 1023.0f);
+         out.g = (float)((p >> 10) & 0x3FF) * (1.0f / 1023.0f);
+         out.b = (float)((p >> 20) & 0x3FF) * (1.0f / 1023.0f);
+         out.a = (float)((p >> 30) & 0x3) * (1.0f / 3.0f);
+         break;
+      }
+      case CP_TEXEL_R32_SINT: {
+         int v = *(const int *)t;
+         out.r = __int_as_float(v); out.g = 0.0f; out.b = 0.0f; out.a = 1.0f;
+         break;
+      }
+      case CP_TEXEL_R16_SINT: {
+         short v = *(const short *)t;
+         out.r = __int_as_float((int)v); out.g = 0.0f; out.b = 0.0f; out.a = 1.0f;
+         break;
+      }
       default:
          /* Format we don't decode yet: opaque black is at least deterministic. */
          out.r = out.g = out.b = 0.0f; out.a = 1.0f;

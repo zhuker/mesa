@@ -67,6 +67,10 @@ cp_resource_create(struct pipe_screen *screen,
 
    uint64_t size = cp_resource_layout(res, tmpl);
 
+   /* Multisample surfaces store nr_samples copies of every pixel. */
+   unsigned nr_samples = MAX2(tmpl->nr_samples, 1);
+   size *= nr_samples;
+
    if (size > 0) {
       CUresult err = cuMemAllocManaged(&res->device_ptr, size,
                                        CU_MEM_ATTACH_GLOBAL);
@@ -207,7 +211,74 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
 static void
 cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
 {
-   /* TODO: Phase 6 - blit kernel */
+   struct cp_resource *src_res = cp_resource(info->src.resource);
+   struct cp_resource *dst_res = cp_resource(info->dst.resource);
+   void *src_data = cp_resource_data(src_res);
+   void *dst_data = cp_resource_data(dst_res);
+   if (!src_data || !dst_data)
+      return;
+
+   unsigned src_stride = src_res->lpr.row_stride[info->src.level];
+   unsigned dst_stride = dst_res->lpr.row_stride[info->dst.level];
+   unsigned src_pixel_size = util_format_get_blocksize(info->src.resource->format);
+   unsigned dst_pixel_size = util_format_get_blocksize(info->dst.resource->format);
+
+   unsigned src_img_stride = src_res->lpr.img_stride[info->src.level];
+   unsigned dst_img_stride = dst_res->lpr.img_stride[info->dst.level];
+
+   if (!src_stride) src_stride = info->src.resource->width0 * src_pixel_size;
+   if (!dst_stride) dst_stride = info->dst.resource->width0 * dst_pixel_size;
+
+   int src_w = info->src.box.width;
+   int src_h = info->src.box.height;
+   int dst_w = info->dst.box.width;
+   int dst_h = info->dst.box.height;
+
+   /* Same format and same size: straight memcpy per row */
+   if (info->src.format == info->dst.format && src_w == dst_w && src_h == dst_h) {
+      for (int z = 0; z < info->src.box.depth; z++) {
+         for (int y = 0; y < src_h; y++) {
+            char *s = (char *)src_data +
+                      src_res->lpr.mip_offsets[info->src.level] +
+                      (info->src.box.z + z) * src_img_stride +
+                      (info->src.box.y + y) * src_stride +
+                      info->src.box.x * src_pixel_size;
+            char *d = (char *)dst_data +
+                      dst_res->lpr.mip_offsets[info->dst.level] +
+                      (info->dst.box.z + z) * dst_img_stride +
+                      (info->dst.box.y + y) * dst_stride +
+                      info->dst.box.x * dst_pixel_size;
+            memcpy(d, s, src_w * src_pixel_size);
+         }
+      }
+      return;
+   }
+
+   /* Different size: nearest-neighbor scale (covers MSAA resolve too since
+    * the src is always sample 0 in our flat multisample layout) */
+   for (int z = 0; z < info->dst.box.depth; z++) {
+      int sz = info->src.box.depth > 1
+         ? info->src.box.z + z * info->src.box.depth / info->dst.box.depth
+         : info->src.box.z;
+      for (int y = 0; y < dst_h; y++) {
+         int sy = src_h == dst_h ? y : y * src_h / dst_h;
+         for (int x = 0; x < dst_w; x++) {
+            int sx = src_w == dst_w ? x : x * src_w / dst_w;
+            char *s = (char *)src_data +
+                      src_res->lpr.mip_offsets[info->src.level] +
+                      sz * src_img_stride +
+                      (info->src.box.y + sy) * src_stride +
+                      (info->src.box.x + sx) * src_pixel_size;
+            char *d = (char *)dst_data +
+                      dst_res->lpr.mip_offsets[info->dst.level] +
+                      (info->dst.box.z + z) * dst_img_stride +
+                      (info->dst.box.y + y) * dst_stride +
+                      (info->dst.box.x + x) * dst_pixel_size;
+            unsigned copy = MIN2(src_pixel_size, dst_pixel_size);
+            memcpy(d, s, copy);
+         }
+      }
+   }
 }
 
 static void
@@ -438,11 +509,11 @@ cp_unmap_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
 
 static bool
 cp_resource_bind_backing(struct pipe_screen *screen, struct pipe_resource *pt,
-                         struct pipe_memory_allocation *mem, uint64_t offset,
-                         uint64_t size, uint64_t alignment)
+                         struct pipe_memory_allocation *mem, uint64_t fd_offset,
+                         uint64_t size, uint64_t mem_offset)
 {
    struct cp_resource *res = cp_resource(pt);
-   void *ptr = (char *)mem + offset;
+   void *ptr = (char *)mem + mem_offset;
    res->lpr.data = ptr;
    res->lpr.tex_data = ptr;
    return true;
