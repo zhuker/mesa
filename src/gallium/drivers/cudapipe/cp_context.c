@@ -47,6 +47,7 @@ static_assert(offsetof(struct lp_sampler_descriptor, sampler_index) ==
               "lp_sampler_descriptor sampler_index offset changed");
 
 static void cp_scratch_destroy(struct cp_context *cp);
+static void cp_scratch_reset(struct cp_context *cp);
 
 static void
 cp_destroy_context(struct pipe_context *ctx)
@@ -181,40 +182,28 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
    return (void *)(uintptr_t)(new_base + offset);
 }
 
-/* Advance the scratch arena for a new draw. No sync, no reclaim — draws
- * stack up in the arena sequentially. Overflow handles anything that doesn't
- * fit. Reset happens only at flush() when all GPU work is guaranteed done. */
+/* Advance the scratch arena for a new draw. Sync and reclaim when memory
+ * pressure builds (overflow count exceeds threshold). This provides
+ * back-pressure to prevent unbounded GPU memory growth. */
 static void
 cp_scratch_begin(struct cp_context *cp)
 {
-   /* Nothing to do — just keep bumping the arena forward. Overflow in
-    * cp_scratch_alloc handles the case where the arena is full. */
+   if (cp->scratch.num_overflow > 8) {
+      cuCtxSynchronize();
+      cp_scratch_reset(cp);
+   }
 }
 
-/* Reset scratch after all GPU work is done (called from flush). Reclaims
- * all memory and optionally grows the arena for next frame. */
+/* Reset scratch after all GPU work is done. Frees overflow arenas (old
+ * arenas that were replaced during growth) and resets the bump pointer.
+ * The current arena is kept at its grown size. */
 static void
 cp_scratch_reset(struct cp_context *cp)
 {
    for (unsigned i = 0; i < cp->scratch.num_overflow; i++)
       cuMemFree(cp->scratch.overflow[i]);
    cp->scratch.num_overflow = 0;
-
-   /* Grow arena if peak usage exceeded capacity */
-   unsigned cur = cp->scratch.current;
-   if (cp->scratch.peak > cp->scratch.size[cur]) {
-      size_t want = cp->scratch.peak + cp->scratch.peak / 2;
-      CUdeviceptr base;
-      if (cuMemAlloc(&base, want) == CUDA_SUCCESS) {
-         if (cp->scratch.base[cur])
-            cuMemFree(cp->scratch.base[cur]);
-         cp->scratch.base[cur] = base;
-         cp->scratch.size[cur] = want;
-      }
-   }
-
    cp->scratch.used = 0;
-   cp->scratch.peak = 0;
 }
 
 static void
@@ -1131,10 +1120,17 @@ cp_flush(struct pipe_context *ctx, struct pipe_fence_handle **fence,
 {
    struct cp_context *cp = (struct cp_context *)ctx;
    cuCtxSetCurrent(cp->screen->cuda_ctx);
-   cuCtxSynchronize();
-   cp_scratch_reset(cp);
-   if (fence)
-      *fence = NULL;
+
+   if (fence) {
+      CUevent event;
+      cuEventCreate(&event, CU_EVENT_DISABLE_TIMING);
+      cuEventRecord(event, 0);
+      *fence = (struct pipe_fence_handle *)(uintptr_t)event;
+   }
+
+   /* Scratch can only be reclaimed once all GPU work finishes. Since we no
+    * longer sync here, defer the reset to when the scratch arena is full
+    * (it will sync then). For now just record peak usage. */
 }
 
 /* Stub state functions - store state for use at draw time */

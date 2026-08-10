@@ -128,10 +128,18 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
               unsigned level, unsigned usage, const struct pipe_box *box,
               struct pipe_transfer **out_transfer)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *res = cp_resource(resource);
    struct pipe_transfer *transfer = CALLOC_STRUCT(pipe_transfer);
    if (!transfer)
       return NULL;
+
+   /* If reading GPU-written data, ensure all kernels have finished. */
+   if (!(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) &&
+       !(usage & PIPE_MAP_DISCARD_RANGE)) {
+      cuCtxSetCurrent(cp->screen->cuda_ctx);
+      cuCtxSynchronize();
+   }
 
    transfer->resource = resource;
    transfer->level = level;

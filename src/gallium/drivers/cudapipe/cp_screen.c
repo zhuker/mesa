@@ -336,8 +336,11 @@ static bool
 cp_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
                 struct pipe_fence_handle *fence, uint64_t timeout)
 {
-   /* TODO: cuEventSynchronize */
-   return true;
+   if (!fence)
+      return true;
+   CUevent event = (CUevent)(uintptr_t)fence;
+   CUresult err = cuEventSynchronize(event);
+   return err == CUDA_SUCCESS;
 }
 
 static void
