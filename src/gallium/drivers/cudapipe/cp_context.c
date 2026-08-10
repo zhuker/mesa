@@ -776,38 +776,43 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    if (!refs)
       return;
 
-   /* Positions straight from the vertex buffer. If a vertex shader runs it
-    * overwrites these; otherwise they are passed through as clip space. */
    CUdeviceptr packed_positions = 0;
    CUdeviceptr vs_output_buf = 0;
    bool vs_ran = false;
-   if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
-      struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
-      void *vb_data = cp_resource_data(vb_res);
-      if (vb_data) {
-         char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
-         unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
 
-         packed_positions =
-            (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)total_verts * 16);
-         if (!packed_positions) {
-            FREE(refs);
-            return;
-         }
-         float *dst = (float *)(uintptr_t)packed_positions;
+   /* If no VS will run, pack positions from VB directly (passthrough).
+    * When a VS is present, skip this — VS output provides positions. */
+   bool has_vs = cp->vs_shader && cp->vs_shader->kernel &&
+                 cp->num_vertex_buffers > 0 &&
+                 cp->vertex_buffers[0].buffer.resource;
+   if (!has_vs) {
+      if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
+         struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
+         void *vb_data = cp_resource_data(vb_res);
+         if (vb_data) {
+            char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
+            unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
 
-         for (unsigned v = 0; v < total_verts; v++) {
-            const float *src = (const float *)(vb_start +
-                                               (size_t)refs[v].vertex * stride);
-            memcpy(dst + v * 4, src, 16);
+            packed_positions =
+               (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)total_verts * 16);
+            if (!packed_positions) {
+               FREE(refs);
+               return;
+            }
+            float *dst = (float *)(uintptr_t)packed_positions;
+
+            for (unsigned v = 0; v < total_verts; v++) {
+               const float *src = (const float *)(vb_start +
+                                                  (size_t)refs[v].vertex * stride);
+               memcpy(dst + v * 4, src, 16);
+            }
+            rast_args.positions = packed_positions;
          }
-         rast_args.positions = packed_positions;
       }
-   }
-
-   if (rast_args.positions == 0) {
-      FREE(refs);
-      return;
+      if (rast_args.positions == 0) {
+         FREE(refs);
+         return;
+      }
    }
    timing.assemble_ms = cp_lap(&mark);
 
