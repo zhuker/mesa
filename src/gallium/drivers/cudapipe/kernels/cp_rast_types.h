@@ -267,6 +267,85 @@ struct cp_sampler_info {
 #define CP_DESC_IMAGE_FUNCTIONS_OFFSET 48  /* lp_image_descriptor.functions */
 #define CP_DESC_SAMPLER_INDEX_OFFSET   28  /* lp_sampler_descriptor.sampler_index */
 
+/*
+ * Persistent GPU-visible state. Written by CPU on pipe state changes
+ * (between draws), read by all GPU kernels during draws. Lives in
+ * managed memory for the lifetime of the context.
+ */
+struct cp_gpu_state {
+   /* Vertex fetch */
+   uint64_t vb_bases[16];
+   uint32_t elem_vb_idx[16];
+   uint32_t elem_src_offset[16];
+   uint32_t elem_src_stride[16];
+   uint32_t elem_attr_size[16];
+   uint32_t elem_instance_divisor[16];
+   uint32_t num_elements;
+   uint32_t vs_in_stride;
+   uint64_t index_buffer;
+   uint32_t index_size;
+
+   /* Shader UBOs */
+   uint64_t vs_ubos[16];
+   uint64_t fs_ubos[16];
+
+   /* Viewport */
+   float vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y;
+
+   /* Rasterizer */
+   uint32_t cull_mode;
+   uint32_t front_face;
+
+   /* Depth */
+   uint32_t depth_test;
+   uint32_t depth_func;
+   uint32_t depth_write;
+   uint32_t depth_key_invert;
+
+   /* Blend */
+   uint32_t blend_enable;
+   uint32_t rgb_src_factor, rgb_dst_factor, rgb_func;
+   uint32_t alpha_src_factor, alpha_dst_factor, alpha_func;
+   uint32_t colormask;
+
+   /* Framebuffer */
+   uint64_t color_attachment;
+   uint64_t visbuf;
+   uint64_t depthbuf;
+   uint32_t fb_width, fb_height;
+   uint32_t color_encoding;
+
+   /* Sampler */
+   uint64_t sampler_table;
+
+   /* VS/FS layout */
+   uint32_t num_vs_outputs;
+   uint32_t num_fs_inputs;
+   int32_t fs_input_vs_slot[16];
+};
+
+/* Per-draw parameters passed as kernel arguments (by value, not device memory) */
+struct cp_draw_params {
+   uint64_t gpu_state;      /* Pointer to cp_gpu_state */
+   uint64_t vs_input;       /* Arena offset: packed vertex attributes */
+   uint64_t vs_output;      /* Arena offset: VS output buffer */
+   uint64_t pixel_list;     /* Arena offset: covered pixel indices */
+   uint64_t pixel_counter;  /* Arena offset: atomic pixel count */
+   uint64_t fs_input;       /* Arena offset: interpolated FS inputs */
+   uint64_t fs_output;      /* Arena offset: FS color output */
+   uint64_t fs_deriv;       /* Arena offset: screen-space derivatives */
+   uint64_t frag_coord;     /* Arena offset: fragment coordinates */
+   uint32_t total_verts;
+   uint32_t first_vertex;
+   int32_t  index_bias;
+   uint32_t start_instance;
+   uint32_t instance_count;
+   uint32_t num_vs_outputs;
+   uint32_t fs_in_stride;
+   uint32_t fs_out_stride;
+   uint32_t max_pixels;
+};
+
 #define CP_MAX_VERTEX_ELEMENTS_VF 16
 #define CP_MAX_VERTEX_BUFFERS_VF 16
 

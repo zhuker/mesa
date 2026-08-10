@@ -90,6 +90,21 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
       }
       cp->depthbuf_cleared = false;
    }
+
+   if (cp->gpu_state) {
+      cp->gpu_state->visbuf = cp->visbuf;
+      cp->gpu_state->depthbuf = cp->depthbuf;
+      cp->gpu_state->fb_width = w;
+      cp->gpu_state->fb_height = h;
+      if (state->nr_cbufs && state->cbufs[0].texture) {
+         struct cp_resource *cres = cp_resource(state->cbufs[0].texture);
+         cp->gpu_state->color_attachment = (uint64_t)(uintptr_t)cp_resource_data(cres);
+         cp->gpu_state->color_encoding = (uint32_t)MAX2(
+            cp_color_encoding_from_format(state->cbufs[0].format), 0);
+      } else {
+         cp->gpu_state->color_attachment = 0;
+      }
+   }
 }
 
 /* Sortable-uint form of a depth value: monotonic in the float, so the
@@ -122,8 +137,15 @@ cp_set_viewport_states(struct pipe_context *ctx, unsigned start_slot,
                        const struct pipe_viewport_state *viewports)
 {
    struct cp_context *cp = (struct cp_context *)ctx;
-   if (num_viewports > 0)
+   if (num_viewports > 0) {
       cp->viewport = viewports[0];
+      if (cp->gpu_state) {
+         cp->gpu_state->vp_scale_x = viewports[0].scale[0];
+         cp->gpu_state->vp_scale_y = viewports[0].scale[1];
+         cp->gpu_state->vp_trans_x = viewports[0].translate[0];
+         cp->gpu_state->vp_trans_y = viewports[0].translate[1];
+      }
+   }
 }
 
 static void
@@ -168,7 +190,7 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
    size_t want = MAX2(end, cp->scratch.size[cur] * 2);
    want = MAX2(want, 1 << 20); /* at least 1MB */
    CUdeviceptr new_base;
-   if (cuMemAlloc(&new_base, want) != CUDA_SUCCESS)
+   if (cuMemAllocManaged(&new_base, want, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
       return NULL;
 
    /* Stash the old arena pointer for freeing at flush */
@@ -1152,9 +1174,24 @@ cp_bind_blend_state(struct pipe_context *ctx, void *state)
    if (state) {
       cp->blend_state = *(struct pipe_blend_state *)state;
       cp->blend_enabled = cp->blend_state.rt[0].blend_enable;
+      if (cp->gpu_state) {
+         const struct pipe_rt_blend_state *rt = &cp->blend_state.rt[0];
+         cp->gpu_state->blend_enable = rt->blend_enable;
+         cp->gpu_state->rgb_src_factor = rt->rgb_src_factor;
+         cp->gpu_state->rgb_dst_factor = rt->rgb_dst_factor;
+         cp->gpu_state->rgb_func = rt->rgb_func;
+         cp->gpu_state->alpha_src_factor = rt->alpha_src_factor;
+         cp->gpu_state->alpha_dst_factor = rt->alpha_dst_factor;
+         cp->gpu_state->alpha_func = rt->alpha_func;
+         cp->gpu_state->colormask = rt->colormask ? rt->colormask : 0xF;
+      }
    } else {
       memset(&cp->blend_state, 0, sizeof(cp->blend_state));
       cp->blend_enabled = false;
+      if (cp->gpu_state) {
+         cp->gpu_state->blend_enable = 0;
+         cp->gpu_state->colormask = 0xF;
+      }
    }
 }
 
@@ -1200,10 +1237,23 @@ static void
 cp_bind_depth_stencil_alpha_state(struct pipe_context *ctx, void *state)
 {
    struct cp_context *cp = (struct cp_context *)ctx;
-   if (state)
+   if (state) {
       cp->depth_stencil = *(struct pipe_depth_stencil_alpha_state *)state;
-   else
+      if (cp->gpu_state) {
+         cp->gpu_state->depth_test = cp->depth_stencil.depth_enabled;
+         cp->gpu_state->depth_func = cp->depth_stencil.depth_func;
+         cp->gpu_state->depth_write = cp->depth_stencil.depth_writemask;
+         cp->gpu_state->depth_key_invert = cp->depth_stencil.depth_enabled &&
+            (cp->depth_stencil.depth_func == PIPE_FUNC_GREATER ||
+             cp->depth_stencil.depth_func == PIPE_FUNC_GEQUAL);
+      }
+   } else {
       memset(&cp->depth_stencil, 0, sizeof(cp->depth_stencil));
+      if (cp->gpu_state) {
+         cp->gpu_state->depth_test = 0;
+         cp->gpu_state->depth_write = 0;
+      }
+   }
 }
 
 static void
@@ -1239,6 +1289,19 @@ cp_bind_vertex_elements_state(struct pipe_context *ctx, void *state)
       memcpy(cp->vertex_elements, ve->elements, ve->num_elements * sizeof(struct pipe_vertex_element));
       cp->num_vertex_elements = ve->num_elements;
       cp->vertex_stride = ve->stride;
+
+      /* Update GPU-resident state */
+      if (cp->gpu_state) {
+         cp->gpu_state->num_elements = ve->num_elements;
+         cp->gpu_state->vs_in_stride = ve->num_elements * 16;
+         for (unsigned i = 0; i < ve->num_elements && i < 16; i++) {
+            cp->gpu_state->elem_vb_idx[i] = ve->elements[i].vertex_buffer_index;
+            cp->gpu_state->elem_src_offset[i] = ve->elements[i].src_offset;
+            cp->gpu_state->elem_src_stride[i] = ve->elements[i].src_stride;
+            cp->gpu_state->elem_attr_size[i] = util_format_get_blocksize(ve->elements[i].src_format);
+            cp->gpu_state->elem_instance_divisor[i] = ve->elements[i].instance_divisor;
+         }
+      }
    }
 }
 
@@ -1553,8 +1616,12 @@ cp_set_constant_buffer(struct pipe_context *ctx, mesa_shader_stage shader,
       SET_UBO(compute);
    } else if (shader == MESA_SHADER_FRAGMENT) {
       SET_UBO(fs);
+      if (cp->gpu_state)
+         cp->gpu_state->fs_ubos[index] = (uint64_t)(uintptr_t)buf_ptr;
    } else {
       SET_UBO(vs);
+      if (cp->gpu_state)
+         cp->gpu_state->vs_ubos[index] = (uint64_t)(uintptr_t)buf_ptr;
    }
 #undef SET_UBO
 }
@@ -1567,8 +1634,19 @@ cp_set_vertex_buffers(struct pipe_context *ctx, unsigned count,
    for (unsigned i = 0; i < count; i++) {
       if (buffers) {
          cp->vertex_buffers[i] = buffers[i];
+         /* Update GPU-resident state */
+         if (cp->gpu_state && buffers[i].buffer.resource) {
+            struct cp_resource *res = cp_resource(buffers[i].buffer.resource);
+            void *data = cp_resource_data(res);
+            cp->gpu_state->vb_bases[i] = data
+               ? (uint64_t)(uintptr_t)data + buffers[i].buffer_offset : 0;
+         } else if (cp->gpu_state) {
+            cp->gpu_state->vb_bases[i] = 0;
+         }
       } else {
          memset(&cp->vertex_buffers[i], 0, sizeof(cp->vertex_buffers[i]));
+         if (cp->gpu_state)
+            cp->gpu_state->vb_bases[i] = 0;
       }
    }
    cp->num_vertex_buffers = count;
@@ -2075,6 +2153,20 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.const_uploader = ctx->base.stream_uploader;
 
    cudapipe_init_context_resource_funcs(&ctx->base);
+
+   /* Allocate persistent GPU state (managed) and device-only arena */
+   cuCtxSetCurrent(ctx->screen->cuda_ctx);
+   CUdeviceptr state_dev;
+   if (cuMemAllocManaged(&state_dev, sizeof(struct cp_gpu_state),
+                         CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
+      ctx->gpu_state = (struct cp_gpu_state *)(uintptr_t)state_dev;
+      memset(ctx->gpu_state, 0, sizeof(struct cp_gpu_state));
+   }
+
+   /* 256MB arena — device-only, never touched by CPU */
+   cuMemAlloc(&ctx->arena_base, 256 * 1024 * 1024);
+   ctx->arena_size = 256 * 1024 * 1024;
+   ctx->arena_offset = 0;
 
    return &ctx->base;
 }

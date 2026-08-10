@@ -97,20 +97,23 @@ struct cp_context {
    struct cp_sampler_info sampler_table_host[CP_MAX_SAMPLERS];
    unsigned num_samplers;
 
-   /*
-    * Scratch arena for the buffers a draw needs.
-    *
-    * A draw wants a dozen or so short-lived device allocations, and managed
-    * allocation is expensive enough that doing it per draw dominated frame
-    * time. Bump-allocate from one buffer instead and reset it per draw; it is
-    * grown between draws, when nothing points into it.
-    */
+   /* GPU-resident pipeline state — managed memory, written by CPU on state
+    * changes, read by GPU kernels during draws. */
+   struct cp_gpu_state *gpu_state;
+
+   /* Device-only arena for per-draw scratch buffers. CPU never touches this
+    * memory — just tracks offsets as integers. */
+   CUdeviceptr arena_base;
+   size_t arena_size;
+   size_t arena_offset;
+
+   /* Old scratch system — kept during transition */
    struct {
       CUdeviceptr base[2];
       size_t size[2];
       size_t used;
       size_t peak;
-      unsigned current;  /* 0 or 1: which arena is active */
+      unsigned current;
       CUdeviceptr overflow[64];
       unsigned num_overflow;
    } scratch;
