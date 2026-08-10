@@ -528,7 +528,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       return;
 
    uint32_t fs_stride_host = fs_in_stride;
-   cuMemcpyHtoD(stride_dev, &fs_stride_host, 4);
+   *(uint32_t*)(uintptr_t)stride_dev = fs_stride_host;
 
    void *fs_args_host[64] = {0};
    fs_args_host[0] = (void *)(uintptr_t)counter;
@@ -539,7 +539,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
       fs_args_host[18 + i] = cp->fs_ubos[i].buffer;
 
-   cuMemcpyHtoD(fs_args_dev, fs_args_host, 64 * sizeof(void *));
+   memcpy((void*)(uintptr_t)fs_args_dev, fs_args_host, 64 * sizeof(void*));
 
    if (getenv("CUDAPIPE_DEBUG_TEX")) {
       fprintf(stderr, "cudapipe: sampler table %p (%u entries) for FS module\n",
@@ -865,8 +865,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                vid_host[v] = refs[v].vertex;
                iid_host[v] = refs[v].instance;
             }
-            cuMemcpyHtoD(vfetch_vid, vid_host, (size_t)total_verts * 4);
-            cuMemcpyHtoD(vfetch_iid, iid_host, (size_t)total_verts * 4);
+            memcpy((void*)(uintptr_t)vfetch_vid, vid_host, (size_t)total_verts * 4);
+            memcpy((void*)(uintptr_t)vfetch_iid, iid_host, (size_t)total_verts * 4);
             free(vid_host);
             free(iid_host);
          }
@@ -939,8 +939,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             vid_host[v] = refs[v].vertex;
             iid_host[v] = refs[v].instance;
          }
-         cuMemcpyHtoD(vid_buf, vid_host, (size_t)total_verts * 4);
-         cuMemcpyHtoD(iid_buf, iid_host, (size_t)total_verts * 4);
+         memcpy((void*)(uintptr_t)vid_buf, vid_host, (size_t)total_verts * 4);
+         memcpy((void*)(uintptr_t)iid_buf, iid_host, (size_t)total_verts * 4);
          free(vid_host);
          free(iid_host);
 
@@ -954,9 +954,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             drawid_offset,
          };
 
-         cuMemcpyHtoD(stride_dev, &stride_host, 4);
-         cuMemcpyHtoD(vcount_dev, &vcount_host, 4);
-         cuMemcpyHtoD(draw_params, draw_params_host, 12);
+         *(uint32_t*)(uintptr_t)stride_dev = stride_host;
+         *(uint32_t*)(uintptr_t)vcount_dev = vcount_host;
+         memcpy((void*)(uintptr_t)draw_params, draw_params_host, 12);
 
          vs_args_host[0] = (void*)(uintptr_t)vcount_dev;
          vs_args_host[1] = NULL;
@@ -970,7 +970,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          for (unsigned i = 0; i < cp->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
             vs_args_host[18 + i] = cp->vs_ubos[i].buffer;
 
-         cuMemcpyHtoD(vs_args_dev, vs_args_host, 64 * sizeof(void *));
+         memcpy((void*)(uintptr_t)vs_args_dev, vs_args_host, 64 * sizeof(void*));
 
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
@@ -1094,11 +1094,11 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    uint32_t grid_size[3] = { grid[0], grid[1], grid[2] };
 
    CUdeviceptr args_dev;
-   cuMemAlloc(&args_dev, 34 * sizeof(void *));
+   cuMemAllocManaged(&args_dev, 34 * sizeof(void *), CU_MEM_ATTACH_GLOBAL);
 
    CUdeviceptr grid_dev;
-   cuMemAlloc(&grid_dev, sizeof(grid_size));
-   cuMemcpyHtoD(grid_dev, grid_size, sizeof(grid_size));
+   cuMemAllocManaged(&grid_dev, sizeof(grid_size), CU_MEM_ATTACH_GLOBAL);
+   memcpy((void*)(uintptr_t)grid_dev, grid_size, sizeof(grid_size));
 
    void *arg_ptrs_host[34] = {0};
    arg_ptrs_host[0] = (void *)(uintptr_t)grid_dev;
@@ -1110,7 +1110,7 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++)
       arg_ptrs_host[18 + i] = cp->compute_ubos[i].buffer;
 
-   cuMemcpyHtoD(args_dev, arg_ptrs_host, 34 * sizeof(void *));
+   memcpy((void*)(uintptr_t)args_dev, arg_ptrs_host, 34 * sizeof(void*));
 
    void *args_ptr_val = (void *)(uintptr_t)args_dev;
    void *kernel_params[] = { &args_ptr_val };
