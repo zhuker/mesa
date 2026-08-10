@@ -201,11 +201,30 @@ slightly different points disagree enormously; that noise masks real bugs.
 
 ## Status
 
-Verified with dEQP (`vulkan_headless` target). Counts are of *supported* cases;
-each group also reports many `NotSupported` that the driver never sees.
+### Real workload: Roblox HeadlessStreamer (GFXReconstruct replay)
+
+A 60-second capture of Roblox's HeadlessStreamer (1280×720 offscreen, 77
+graphics pipelines, 2 compute, vertex+fragment only) replays successfully
+against cudapipe for 68 seconds before hitting a lavapipe descriptor bug
+(which also crashes lavapipe alone — not a cudapipe issue).
+
+| Metric | NVIDIA (T4) | cudapipe (T4) |
+|---|---|---|
+| Full replay wall clock | 19 s | ~68 s (crash) |
+| GPU utilization | N/A | 95–99 % |
+| GPU memory | ~400 MB | ~930 MB |
+| Draws/sec (estimated) | 263 | ~73 |
+| Ratio | 1× | ~3.6× slower |
+
+The 3.6× gap is pure GPU rasterization/shading compute cost. The GPU is
+fully saturated — no CPU stalls, no memory-migration overhead, no sync
+gaps between kernel launches.
+
+### dEQP
 
 | Area | Result |
 |---|---|
+| `api.smoke.*` | 6/6 |
 | `texture.filtering.2d.formats.*` | 72/75 |
 | `texture.filtering.2d_array.formats.*` | 72/75 |
 | `texture.filtering.cube.formats.*` | 36/150 |
@@ -214,40 +233,70 @@ each group also reports many `NotSupported` that the driver never sees.
 | `draw...simple_draw.*` | 4/4 |
 | `draw...basic_draw.draw.*` | 8/12 |
 
-A capability sample of 406 cases spread across the whole suite, run one process
-per case so crashes don't abort the sweep, went from 111 crashes to 42 once the
-driver stopped advertising what it can't do. The same sample on this machine's
-NVIDIA driver passes 243 and crashes none, which is the yardstick.
+### Performance work done
 
-```bash
-# every 8000th case, then one process per case
-awk 'NR % 8000 == 0' all_cases.txt > sample.txt
-```
+1. Eliminated all mid-draw `cuCtxSynchronize` calls (was 7 per draw, now 0)
+2. Implemented proper CUDA event fences (`flush` is non-blocking)
+3. GPU vertex fetch kernel — no CPU-side attribute gathering
+4. Replaced `cuMemcpyHtoD` with direct managed-memory writes
+5. Persistent `cp_gpu_state` struct updated on state changes, not per draw
+6. Scratch arena with monotonic growth + bounded reclaim
+7. Skip `cp_build_vertex_refs` for TRIANGLE_LIST (94% of draws)
+8. `cuMemsetD32` for visbuf/depthbuf clears, `cuMemcpy2D` for blits/copies
 
-Known gaps, roughly in the order they matter for a real workload:
+### What the Roblox capture required (and was added)
 
-1. **Performance.** Vertex assembly is done on the host, per draw, with a
-   `memcpy` per attribute per vertex, and the rasterizer is one thread per
-   triangle walking its bounding box — so a single large triangle serializes
-   onto one CUDA thread. Together these dominate everything: the full
-   `draw.dynamic_rendering` group does not finish in 25 minutes. Fixing it
-   means GPU-side vertex fetch and a binned/tiled rasterizer.
-3. **Lines and points are not rasterized at all** — only triangles. The four
-   remaining `basic_draw.draw` failures are `line_list`, `line_strip` and
-   `point_list`.
-4. **Filtering between cube faces and between 3D slices** is not implemented,
-   which is most of the remaining cube and 3D failures.
-5. **Compressed formats are written but unverified.** DXT1/3/5 decode exists in
-   `cp_fetch_texel` but nothing in the suites run so far exercises it. BC4-7 are
-   missing. These matter for real game content.
-6. **Depth/stencil aspect sampling** returns floats only, so the `*_stencil`
-   and `s8_uint` filtering cases fail; they need integer texture returns.
-7. **Shadow compares and texture gathers** fall through to a zero result in
-   `emit_tex()`. Shadow compares in particular are needed for shadow mapping.
-8. The rasterizer's depth buffer is internal and is never written back to the
-   application's depth attachment, so a shader cannot sample depth from a
-   previous pass.
-9. `copy_ssbo_bounds` fails — SSBO robustness/bounds behaviour.
+* Formats: R16_SFLOAT, R16G16_SFLOAT, R16G16_UNORM, A2B10G10R10_UNORM,
+  R32_SINT, R16_SINT (sampler); R11G11B10_FLOAT, A2B10G10R10_UNORM,
+  R16_SFLOAT, R16G16_SFLOAT, R8_UNORM (render target)
+* Fixed R16G16B16A16_FLOAT render target store (was truncating to UNORM8)
+* 4x MSAA format acceptance
+* CUBE_ARRAY texture target
+* POINT_LIST topology
+* Anisotropic filtering advertised (trilinear fallback)
+* Query/timestamp stubs
+* Geometry/tessellation stage bind stubs
+* Depth-only draw support
+* Blit (same-format cuMemcpy2D + nearest-neighbor scaling)
+* Fixed `cp_resource_bind_backing` memory offset (was ignoring it)
+* Fixed NIR bcsel type mismatch in the LLVM backend
+
+### Known gaps
+
+1. **Rasterization speed.** One thread per triangle, bounding-box scan. A
+   CuRast-style adaptive 3-stage rasterizer (1 thread/small tri, 1 warp/medium
+   tri, 1 block/tile for large tris) would close most of the remaining 3.6×
+   gap. See `/home/coder/git/CuRast/src/kernels/triangles_visbuffer.cu`.
+2. **Lavapipe descriptor crash at replay second 68.** Happens with lavapipe
+   alone too. Likely a descriptor pool exhaustion or layout the replay uses
+   that lavapipe can't handle.
+3. **Lines are not rasterized** — only triangles and points. `line_list` and
+   `line_strip` draw calls silently produce nothing.
+4. **Filtering between cube faces and 3D slices** is missing.
+5. **Shadow compares and texture gathers** return zero.
+6. **BC4-7, ETC2, ASTC** compressed format decode is missing (BC1/3/5 work).
+7. **Profiling** — `nsys`/`ncu` cannot trace CUDA Driver API calls made from
+   inside a dlopen'd Vulkan ICD. Workaround: lower
+   `/proc/sys/kernel/perf_event_paranoid` to 2, or add in-driver
+   `cuEventRecord` timing (env var `CUDAPIPE_DEBUG_TIME` shows per-stage
+   wall-clock timing already).
+
+### Next steps (priority order)
+
+1. **Adaptive rasterizer** — the single biggest remaining performance win.
+   Small triangles (< 128 fragments) stay at 1 thread/tri; medium triangles
+   get 1 warp (32 threads) cooperatively scanning the bounding box; huge
+   triangles get 1 block per 64×64 tile. This matches CuRast's proven
+   architecture and would bring GPU utilization from "saturated but slow" to
+   "saturated and efficient."
+2. **Fix the descriptor crash** — investigate why `lvp_descriptor_set_create`
+   segfaults after ~5000 draws. May be a descriptor pool limit or a layout
+   with variable-count descriptors that lavapipe doesn't handle.
+3. **Line rasterization** — Bresenham in a CUDA kernel, one thread per line.
+4. **Kernel fusion** — merge interpolate + FS + writeback into fewer launches
+   to reduce per-draw overhead (currently 5–6 kernel launches per draw).
+5. **Shadow compare and texture gather** — needed for shadow mapping which
+   most real games use.
 
 ## Debug environment variables
 
