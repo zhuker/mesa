@@ -772,6 +772,10 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    /* Reclaim last draw's scratch and size the arena for this one. */
    cp_scratch_begin(cp);
 
+   bool has_vs = cp->vs_shader && cp->vs_shader->kernel &&
+                 cp->num_vertex_buffers > 0 &&
+                 cp->vertex_buffers[0].buffer.resource;
+
    const void *ib_base = NULL;
    if (indexed && info->index.resource) {
       struct cp_resource *ib_res = cp_resource(info->index.resource);
@@ -779,11 +783,18 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    }
 
    unsigned total_verts = num_triangles * 3;
-   struct cp_vertex_ref *refs = cp_build_vertex_refs(info, draws, num_draws,
-                                                     instance_count, ib_base,
-                                                     num_triangles);
-   if (!refs)
-      return;
+
+   /* For TRIANGLE_LIST with a VS and single instance, the vertex fetch kernel
+    * indexes the IB directly on GPU — no CPU-side topology expansion needed. */
+   bool skip_refs = has_vs && info->mode == MESA_PRIM_TRIANGLES &&
+                    instance_count == 1 && num_draws == 1;
+   struct cp_vertex_ref *refs = NULL;
+   if (!skip_refs) {
+      refs = cp_build_vertex_refs(info, draws, num_draws,
+                                  instance_count, ib_base, num_triangles);
+      if (!refs)
+         return;
+   }
 
    CUdeviceptr packed_positions = 0;
    CUdeviceptr vs_output_buf = 0;
@@ -791,9 +802,6 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    /* If no VS will run, pack positions from VB directly (passthrough).
     * When a VS is present, skip this — VS output provides positions. */
-   bool has_vs = cp->vs_shader && cp->vs_shader->kernel &&
-                 cp->num_vertex_buffers > 0 &&
-                 cp->vertex_buffers[0].buffer.resource;
    if (!has_vs) {
       if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
          struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
@@ -918,31 +926,56 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             cp_scratch_alloc(cp, 64 * sizeof(void *));
          CUdeviceptr stride_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
          CUdeviceptr vcount_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
-         CUdeviceptr vid_buf = (CUdeviceptr)(uintptr_t)
-            cp_scratch_alloc(cp, (size_t)total_verts * 4);
-         CUdeviceptr iid_buf = (CUdeviceptr)(uintptr_t)
-            cp_scratch_alloc(cp, (size_t)total_verts * 4);
+         CUdeviceptr vid_buf = 0, iid_buf = 0;
          CUdeviceptr draw_params = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 3 * 4);
-         if (!vs_args_dev || !stride_dev || !vcount_dev || !vid_buf ||
-             !iid_buf || !draw_params) {
+
+         if (skip_refs) {
+            /* TRIANGLE_LIST fast path: VS reads vertex IDs from the index buffer
+             * directly (or sequentially for non-indexed). No CPU loop needed. */
+            if (indexed && ib_base) {
+               /* Point vid at the IB data — VS reads IB[thread_id] as vertex_id.
+                * Note: this only works for 32-bit indices. For 16-bit we still
+                * need a conversion (the VS expects uint32 per vertex). */
+               if (info->index_size == 4) {
+                  vid_buf = (CUdeviceptr)(uintptr_t)ib_base +
+                            (size_t)draws[0].start * 4;
+               } else {
+                  /* 16-bit IB: allocate and let the vertex_fetch kernel handle it */
+                  vid_buf = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, total_verts * 4);
+               }
+            } else {
+               /* Non-indexed: vertex_id = thread_id + first. Allocate a sequential
+                * array. Actually — we can pass NULL and have the VS use thread_id. */
+               vid_buf = 0;
+            }
+            /* instance_id = 0 for all vertices (single instance) */
+            iid_buf = 0;
+         } else {
+            vid_buf = (CUdeviceptr)(uintptr_t)
+               cp_scratch_alloc(cp, (size_t)total_verts * 4);
+            iid_buf = (CUdeviceptr)(uintptr_t)
+               cp_scratch_alloc(cp, (size_t)total_verts * 4);
+            if (!vid_buf || !iid_buf) { FREE(refs); return; }
+
+            uint32_t *vid_host = malloc((size_t)total_verts * 4);
+            uint32_t *iid_host = malloc((size_t)total_verts * 4);
+            if (!vid_host || !iid_host) {
+               free(vid_host); free(iid_host); FREE(refs); return;
+            }
+            for (unsigned v = 0; v < total_verts; v++) {
+               vid_host[v] = refs[v].vertex;
+               iid_host[v] = refs[v].instance;
+            }
+            memcpy((void*)(uintptr_t)vid_buf, vid_host, (size_t)total_verts * 4);
+            memcpy((void*)(uintptr_t)iid_buf, iid_host, (size_t)total_verts * 4);
+            free(vid_host);
+            free(iid_host);
+         }
+
+         if (!vs_args_dev || !stride_dev || !vcount_dev || !draw_params) {
             FREE(refs);
             return;
          }
-
-         /* Build vertex_id and instance_id arrays on the host, then upload */
-         uint32_t *vid_host = malloc((size_t)total_verts * 4);
-         uint32_t *iid_host = malloc((size_t)total_verts * 4);
-         if (!vid_host || !iid_host) {
-            free(vid_host); free(iid_host); FREE(refs); return;
-         }
-         for (unsigned v = 0; v < total_verts; v++) {
-            vid_host[v] = refs[v].vertex;
-            iid_host[v] = refs[v].instance;
-         }
-         memcpy((void*)(uintptr_t)vid_buf, vid_host, (size_t)total_verts * 4);
-         memcpy((void*)(uintptr_t)iid_buf, iid_host, (size_t)total_verts * 4);
-         free(vid_host);
-         free(iid_host);
 
          /* Build the VS args table on the stack, upload in one shot */
          void *vs_args_host[64] = {0};
