@@ -173,17 +173,12 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
                         unsigned dstz, struct pipe_resource *src,
                         unsigned src_level, const struct pipe_box *src_box)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *src_res = cp_resource(src);
    struct cp_resource *dst_res = cp_resource(dst);
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
 
-   if (getenv("CUDAPIPE_DEBUG_COPY"))
-      fprintf(stderr, "cudapipe: copy_region src=%p(t=%u lvl=%u) -> dst=%p(t=%u lvl=%u) "
-              "box=%d,%d %dx%d dst=%u,%u src_data=%p dst_data=%p\n",
-              (void *)src, src->target, src_level, (void *)dst, dst->target,
-              dst_level, src_box->x, src_box->y, src_box->width, src_box->height,
-              dstx, dsty, src_data, dst_data);
    if (!src_data || !dst_data)
       return;
 
@@ -197,20 +192,32 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
    unsigned src_img_stride = src_res->lpr.img_stride[src_level];
    unsigned dst_img_stride = dst_res->lpr.img_stride[dst_level];
 
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+
    for (int z = 0; z < src_box->depth; z++) {
-      for (int y = 0; y < src_box->height; y++) {
-         char *s = (char *)src_data + (src_box->z + z) * src_img_stride +
-                   (src_box->y + y) * src_stride + src_box->x * pixel_size;
-         char *d = (char *)dst_data + (dstz + z) * dst_img_stride +
-                   (dsty + y) * dst_stride + dstx * pixel_size;
-         memcpy(d, s, src_box->width * pixel_size);
-      }
+      CUDA_MEMCPY2D copy = {0};
+      copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+      copy.srcDevice = (CUdeviceptr)(uintptr_t)src_data +
+                       (src_box->z + z) * src_img_stride +
+                       (unsigned)src_box->y * src_stride +
+                       (unsigned)src_box->x * pixel_size;
+      copy.srcPitch = src_stride;
+      copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+      copy.dstDevice = (CUdeviceptr)(uintptr_t)dst_data +
+                       (dstz + z) * dst_img_stride +
+                       dsty * dst_stride +
+                       dstx * pixel_size;
+      copy.dstPitch = dst_stride;
+      copy.WidthInBytes = (unsigned)src_box->width * pixel_size;
+      copy.Height = (unsigned)src_box->height;
+      cuMemcpy2D(&copy);
    }
 }
 
 static void
 cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *src_res = cp_resource(info->src.resource);
    struct cp_resource *dst_res = cp_resource(info->dst.resource);
    void *src_data = cp_resource_data(src_res);
@@ -234,28 +241,33 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    int dst_w = info->dst.box.width;
    int dst_h = info->dst.box.height;
 
-   /* Same format and same size: straight memcpy per row */
+   /* Same format and same size: use cuMemcpy2D for GPU-accelerated copy */
    if (info->src.format == info->dst.format && src_w == dst_w && src_h == dst_h) {
+      cuCtxSetCurrent(cp->screen->cuda_ctx);
       for (int z = 0; z < info->src.box.depth; z++) {
-         for (int y = 0; y < src_h; y++) {
-            char *s = (char *)src_data +
-                      src_res->lpr.mip_offsets[info->src.level] +
-                      (info->src.box.z + z) * src_img_stride +
-                      (info->src.box.y + y) * src_stride +
-                      info->src.box.x * src_pixel_size;
-            char *d = (char *)dst_data +
-                      dst_res->lpr.mip_offsets[info->dst.level] +
-                      (info->dst.box.z + z) * dst_img_stride +
-                      (info->dst.box.y + y) * dst_stride +
-                      info->dst.box.x * dst_pixel_size;
-            memcpy(d, s, src_w * src_pixel_size);
-         }
+         CUDA_MEMCPY2D copy = {0};
+         copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+         copy.srcDevice = (CUdeviceptr)(uintptr_t)src_data +
+                          src_res->lpr.mip_offsets[info->src.level] +
+                          (info->src.box.z + z) * src_img_stride +
+                          (unsigned)info->src.box.y * src_stride +
+                          (unsigned)info->src.box.x * src_pixel_size;
+         copy.srcPitch = src_stride;
+         copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+         copy.dstDevice = (CUdeviceptr)(uintptr_t)dst_data +
+                          dst_res->lpr.mip_offsets[info->dst.level] +
+                          (info->dst.box.z + z) * dst_img_stride +
+                          (unsigned)info->dst.box.y * dst_stride +
+                          (unsigned)info->dst.box.x * dst_pixel_size;
+         copy.dstPitch = dst_stride;
+         copy.WidthInBytes = (unsigned)src_w * src_pixel_size;
+         copy.Height = (unsigned)src_h;
+         cuMemcpy2D(&copy);
       }
       return;
    }
 
-   /* Different size: nearest-neighbor scale (covers MSAA resolve too since
-    * the src is always sample 0 in our flat multisample layout) */
+   /* Different size: nearest-neighbor scale on CPU (rare path) */
    for (int z = 0; z < info->dst.box.depth; z++) {
       int sz = info->src.box.depth > 1
          ? info->src.box.z + z * info->src.box.depth / info->dst.box.depth
@@ -286,14 +298,27 @@ cp_clear_buffer(struct pipe_context *ctx, struct pipe_resource *res,
                 unsigned offset, unsigned size,
                 const void *clear_value, int clear_value_size)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *cp_res = cp_resource(res);
    void *data = cp_resource_data(cp_res);
    if (!data)
       return;
 
-   char *dst = (char *)data + offset;
-   for (unsigned i = 0; i < size; i += clear_value_size)
-      memcpy(dst + i, clear_value, clear_value_size);
+   CUdeviceptr dev = (CUdeviceptr)(uintptr_t)data + offset;
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+
+   /* Use cuMemsetD32 for common 4-byte patterns, cuMemsetD8 for 1-byte */
+   if (clear_value_size == 4) {
+      uint32_t val;
+      memcpy(&val, clear_value, 4);
+      cuMemsetD32(dev, val, size / 4);
+   } else if (clear_value_size == 1) {
+      cuMemsetD8(dev, *(const unsigned char *)clear_value, size);
+   } else {
+      char *dst = (char *)data + offset;
+      for (unsigned i = 0; i < size; i += clear_value_size)
+         memcpy(dst + i, clear_value, clear_value_size);
+   }
 }
 
 static void
@@ -305,6 +330,7 @@ cp_clear_render_target(struct pipe_context *ctx, struct pipe_surface *dst,
 {
    if (!dst || !dst->texture)
       return;
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *res = cp_resource(dst->texture);
    void *data = cp_resource_data(res);
    if (!data)
@@ -313,14 +339,20 @@ cp_clear_render_target(struct pipe_context *ctx, struct pipe_surface *dst,
    unsigned pixel_size = util_format_get_blocksize(dst->format);
    unsigned stride = res->lpr.row_stride[dst->level];
 
-   uint32_t clear_val[4] = {0};
-   util_format_pack_rgba(dst->format, clear_val, color, 1);
+   struct cp_clear_args args = {
+      .target = (uint64_t)(uintptr_t)data,
+      .width = width, .height = height,
+      .stride = stride,
+      .pixel_size = pixel_size,
+   };
+   util_format_pack_rgba(dst->format, args.clear_value, color, 1);
 
-   for (unsigned y = dsty; y < dsty + height; y++) {
-      char *row = (char *)data + y * stride + dstx * pixel_size;
-      for (unsigned x = 0; x < width; x++)
-         memcpy(row + x * pixel_size, clear_val, pixel_size);
-   }
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   void *params[] = { &args };
+   cuLaunchKernel(cp->screen->kernels.clear_kernel,
+      (width + 15) / 16, (height + 15) / 16, 1,
+      16, 16, 1,
+      0, NULL, params, NULL);
 }
 
 static void
