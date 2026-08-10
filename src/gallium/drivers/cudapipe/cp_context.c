@@ -827,9 +827,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          vs_output_buf = (CUdeviceptr)(uintptr_t)
             cp_scratch_alloc(cp, (size_t)total_verts * out_stride);
 
-         /* Build VS input buffer: lay out all attributes at base*16 offsets.
-          * VS load_input(base=N) reads from offset vertex_id * vs_stride + N*16.
-          * vs_stride = num_elements * 16 (each attribute gets 16 bytes even if smaller). */
+         /* Build VS input buffer on GPU: the vertex fetch kernel gathers
+          * attributes in parallel, one thread per assembled vertex. */
          unsigned vs_in_stride = cp->num_vertex_elements * 16;
          CUdeviceptr vs_input_buf = (CUdeviceptr)(uintptr_t)
             cp_scratch_alloc(cp, (size_t)total_verts * vs_in_stride);
@@ -837,41 +836,61 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             FREE(refs);
             return;
          }
-         char *vs_in = (char*)(uintptr_t)vs_input_buf;
-         memset(vs_in, 0, total_verts * vs_in_stride);
 
-         /* Gather each attribute for every assembled vertex. Attributes with a
-          * non-zero instance divisor advance per instance rather than per
-          * vertex, which is how instanced draws vary their per-instance data. */
-         for (unsigned v = 0; v < total_verts; v++) {
-            char *out = vs_in + (size_t)v * vs_in_stride;
-
-            for (unsigned e = 0; e < cp->num_vertex_elements; e++) {
-               const struct pipe_vertex_element *elem = &cp->vertex_elements[e];
-               unsigned vb_idx = elem->vertex_buffer_index;
-               if (vb_idx >= cp->num_vertex_buffers ||
-                   !cp->vertex_buffers[vb_idx].buffer.resource)
-                  continue;
-
-               struct cp_resource *evb =
-                  cp_resource(cp->vertex_buffers[vb_idx].buffer.resource);
-               void *evb_data = cp_resource_data(evb);
-               if (!evb_data)
-                  continue;
-
-               unsigned index = elem->instance_divisor
-                  ? info->start_instance +
-                    refs[v].instance / elem->instance_divisor
-                  : refs[v].vertex;
-
-               const char *src = (const char *)evb_data +
-                  cp->vertex_buffers[vb_idx].buffer_offset +
-                  (size_t)index * elem->src_stride + elem->src_offset;
-
-               unsigned attr_size = util_format_get_blocksize(elem->src_format);
-               memcpy(out + e * 16, src, MIN2(attr_size, 16));
+         /* Upload vertex_id and instance_id arrays for topology-expanded draws */
+         CUdeviceptr vfetch_vid = 0, vfetch_iid = 0;
+         bool need_refs_on_gpu = (info->mode != MESA_PRIM_TRIANGLES) || instance_count > 1;
+         if (need_refs_on_gpu) {
+            vfetch_vid = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, total_verts * 4);
+            vfetch_iid = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, total_verts * 4);
+            if (!vfetch_vid || !vfetch_iid) { FREE(refs); return; }
+            uint32_t *vid_arr = (uint32_t *)(uintptr_t)vfetch_vid;
+            uint32_t *iid_arr = (uint32_t *)(uintptr_t)vfetch_iid;
+            for (unsigned v = 0; v < total_verts; v++) {
+               vid_arr[v] = refs[v].vertex;
+               iid_arr[v] = refs[v].instance;
             }
          }
+
+         struct cp_vertex_fetch_args vf_args = {
+            .output = vs_input_buf,
+            .num_elements = cp->num_vertex_elements,
+            .num_verts = total_verts,
+            .vs_in_stride = vs_in_stride,
+            .index_size = need_refs_on_gpu ? 0 : info->index_size,
+            .first_vertex = indexed ? (unsigned)draws[0].index_bias : draws[0].start,
+            .start_instance = info->start_instance,
+            .vertex_ids = vfetch_vid,
+            .instance_ids = vfetch_iid,
+         };
+
+         /* Set up index buffer for direct GPU indexing (triangle list only) */
+         if (!need_refs_on_gpu && indexed && ib_base)
+            vf_args.index_buffer = (uint64_t)(uintptr_t)ib_base;
+
+         for (unsigned e = 0; e < cp->num_vertex_elements && e < 16; e++) {
+            const struct pipe_vertex_element *elem = &cp->vertex_elements[e];
+            unsigned vb_idx = elem->vertex_buffer_index;
+            if (vb_idx < cp->num_vertex_buffers &&
+                cp->vertex_buffers[vb_idx].buffer.resource) {
+               struct cp_resource *evb = cp_resource(cp->vertex_buffers[vb_idx].buffer.resource);
+               void *evb_data = cp_resource_data(evb);
+               if (evb_data)
+                  vf_args.vb_bases[vb_idx] = (uint64_t)(uintptr_t)evb_data +
+                     cp->vertex_buffers[vb_idx].buffer_offset;
+            }
+            vf_args.elem_vb_idx[e] = vb_idx;
+            vf_args.elem_src_offset[e] = elem->src_offset;
+            vf_args.elem_src_stride[e] = elem->src_stride;
+            vf_args.elem_attr_size[e] = util_format_get_blocksize(elem->src_format);
+            vf_args.elem_instance_divisor[e] = elem->instance_divisor;
+         }
+
+         cuMemsetD8(vs_input_buf, 0, (size_t)total_verts * vs_in_stride);
+         void *vf_params[] = { &vf_args };
+         cuLaunchKernel(screen->kernels.vertex_fetch,
+            (total_verts + 255) / 256, 1, 1, 256, 1, 1,
+            0, NULL, vf_params, NULL);
 
          stride = vs_in_stride;
 

@@ -24,6 +24,10 @@ struct cp_kernels {
    CUfunction fs_interpolate;
    CUfunction fs_writeback;
 
+   /* Vertex fetch kernel — gathers attributes on GPU */
+   CUmodule vfetch_module;
+   CUfunction vertex_fetch;
+
    /* Relocatable PTX for the texture sampler, linked into each shader that
     * samples textures. Owned here; see cp_compile_nir_to_ptx(). */
    char *sampler_ptx;

@@ -12,7 +12,7 @@ cu_to_inc = files('kernels/cu_to_inc.py')
 
 cudapipe_kernel_incs = []
 foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_fs.cu',
-                  'cp_rast_types.h']
+                  'cp_vertex_fetch.cu', 'cp_rast_types.h']
   cudapipe_kernel_incs += custom_target(
     kernel + '.inc',
     input : files('kernels/' + kernel),

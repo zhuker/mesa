@@ -24,6 +24,10 @@ static const char cp_sampler_src[] =
 #include "cp_sampler.cu.inc"
 ;
 
+static const char cp_vertex_fetch_src[] =
+#include "cp_vertex_fetch.cu.inc"
+;
+
 /* The kernels share this header; NVRTC has no filesystem, so hand it over
  * in memory rather than pointing it at an include directory. */
 static const char cp_rast_types_src[] =
@@ -126,6 +130,10 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
       goto fail;
    cuModuleGetFunction(&k->fs_interpolate, k->fs_module, "cp_fs_interpolate");
    cuModuleGetFunction(&k->fs_writeback, k->fs_module, "cp_fs_writeback");
+
+   if (!build_module(&k->vfetch_module, cp_vertex_fetch_src, "cp_vertex_fetch.cu", screen))
+      goto fail;
+   cuModuleGetFunction(&k->vertex_fetch, k->vfetch_module, "cp_vertex_fetch");
 
    /* Kept as relocatable PTX rather than a module: it is linked into each
     * shader that samples textures, not launched on its own. */

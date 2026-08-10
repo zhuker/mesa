@@ -267,4 +267,26 @@ struct cp_sampler_info {
 #define CP_DESC_IMAGE_FUNCTIONS_OFFSET 48  /* lp_image_descriptor.functions */
 #define CP_DESC_SAMPLER_INDEX_OFFSET   28  /* lp_sampler_descriptor.sampler_index */
 
+#define CP_MAX_VERTEX_ELEMENTS_VF 16
+#define CP_MAX_VERTEX_BUFFERS_VF 16
+
+struct cp_vertex_fetch_args {
+   uint64_t output;
+   uint64_t index_buffer;
+   uint64_t vb_bases[CP_MAX_VERTEX_BUFFERS_VF];
+   uint32_t elem_vb_idx[CP_MAX_VERTEX_ELEMENTS_VF];
+   uint32_t elem_src_offset[CP_MAX_VERTEX_ELEMENTS_VF];
+   uint32_t elem_src_stride[CP_MAX_VERTEX_ELEMENTS_VF];
+   uint32_t elem_attr_size[CP_MAX_VERTEX_ELEMENTS_VF];
+   uint32_t elem_instance_divisor[CP_MAX_VERTEX_ELEMENTS_VF];
+   uint32_t num_elements;
+   uint32_t num_verts;
+   uint32_t vs_in_stride;
+   uint32_t index_size;
+   uint32_t first_vertex;
+   uint32_t start_instance;
+   uint64_t vertex_ids;
+   uint64_t instance_ids;
+};
+
 #endif /* CP_RAST_TYPES_H */
