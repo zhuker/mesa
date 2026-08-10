@@ -104,12 +104,11 @@ struct cp_context {
     * grown between draws, when nothing points into it.
     */
    struct {
-      CUdeviceptr base;
-      size_t size;
+      CUdeviceptr base[2];
+      size_t size[2];
       size_t used;
       size_t peak;
-      /* Allocations that didn't fit this draw. Freed at the end of it, and the
-       * arena grows to cover them next time. */
+      unsigned current;  /* 0 or 1: which arena is active */
       CUdeviceptr overflow[32];
       unsigned num_overflow;
    } scratch;
