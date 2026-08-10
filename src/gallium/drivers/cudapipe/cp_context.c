@@ -188,6 +188,10 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
 static void
 cp_scratch_begin(struct cp_context *cp)
 {
+   /* Ensure GPU kernels from the previous draw are done before we reclaim
+    * scratch memory they might still be reading. */
+   cuCtxSynchronize();
+
    for (unsigned i = 0; i < cp->scratch.num_overflow; i++)
       cuMemFree(cp->scratch.overflow[i]);
    cp->scratch.num_overflow = 0;
@@ -488,15 +492,12 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
                       (w * h + 255) / 256, 1, 1, 256, 1, 1,
                       0, NULL, interp_params, NULL) != CUDA_SUCCESS)
       return;
-   if (cuCtxSynchronize() != CUDA_SUCCESS)
-      return;
    timing->interpolate_ms = cp_lap(&mark);
 
-   unsigned num_pixels = *(uint32_t *)(uintptr_t)counter;
-   if (num_pixels > max_pixels)
-      num_pixels = max_pixels;
-   if (num_pixels == 0)
-      return;
+   /* Launch FS and writeback over max_pixels — each kernel reads the actual
+    * pixel count from the counter (device-visible managed memory) and exits
+    * early for threads beyond it. This avoids a sync just to read the count. */
+   unsigned num_pixels = max_pixels;
 
    /* The shader reads its arguments through the same pointer-array ABI the
     * compute path uses; see cp_launch_grid(). */
@@ -508,10 +509,11 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 
    void **fs_args = (void **)(uintptr_t)fs_args_dev;
    memset(fs_args, 0, 64 * sizeof(void *));
-   *(uint32_t *)(uintptr_t)count_dev = num_pixels;
    *(uint32_t *)(uintptr_t)stride_dev = fs_in_stride;
 
-   fs_args[0] = (void *)(uintptr_t)count_dev;
+   /* Point the FS bounds check at the interpolation counter so it self-limits
+    * without a host-side sync to read the count. */
+   fs_args[0] = (void *)(uintptr_t)counter;
    fs_args[2] = (void *)(uintptr_t)fs_in;
    fs_args[3] = (void *)(uintptr_t)stride_dev;
    fs_args[4] = (void *)(uintptr_t)fs_out;
@@ -566,8 +568,6 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    if (cuLaunchKernel(fs->kernel, (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
                       0, NULL, fs_params, NULL) != CUDA_SUCCESS)
       return;
-   if (cuCtxSynchronize() != CUDA_SUCCESS)
-      return;
    timing->fragment_ms = cp_lap(&mark);
 
    const struct pipe_rt_blend_state *rt = &cp->blend_state.rt[0];
@@ -577,6 +577,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .color_out = (uint64_t)(uintptr_t)color_data,
       .visbuf = visbuf,
       .depthbuf = cp->depthbuf,
+      .pixel_counter = counter,
       .depth_write = cp->depth_stencil.depth_writemask,
       .depth_key_invert = cp->depth_stencil.depth_enabled &&
          (cp->depth_stencil.depth_func == PIPE_FUNC_GREATER ||
@@ -600,7 +601,6 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    cuLaunchKernel(screen->kernels.fs_writeback,
                   (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
                   0, NULL, wb_params, NULL);
-   cuCtxSynchronize();
    timing->writeback_ms = cp_lap(&mark);
 
    if (getenv("CUDAPIPE_DEBUG_DRAW"))
@@ -927,29 +927,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             0, NULL, vs_params, NULL);
 
          if (vs_err == CUDA_SUCCESS) {
-            cuCtxSynchronize();
-            /* Copy VS output positions back to packed_positions */
-            float *vs_out = (float*)(uintptr_t)vs_output_buf;
-            float *pos_dst = (float*)(uintptr_t)packed_positions;
-            for (unsigned v = 0; v < total_verts; v++) {
-               pos_dst[v*4+0] = vs_out[v * num_vs_outputs * 4 + 0];
-               pos_dst[v*4+1] = vs_out[v * num_vs_outputs * 4 + 1];
-               pos_dst[v*4+2] = vs_out[v * num_vs_outputs * 4 + 2];
-               pos_dst[v*4+3] = vs_out[v * num_vs_outputs * 4 + 3];
-            }
             vs_ran = true;
+            /* The rasterizer reads positions directly from VS output */
+            rast_args.positions = vs_output_buf;
+            rast_args.num_varyings = num_vs_outputs - 1;
          } else {
             fprintf(stderr, "  VS launch failed: %d\n", vs_err);
-         }
-
-         /* Check for async GPU errors */
-         CUresult sync_err = cuCtxSynchronize();
-         if (sync_err != CUDA_SUCCESS) {
-            const char *err_str = NULL;
-            cuGetErrorString(sync_err, &err_str);
-            fprintf(stderr, "  VS sync error: %d (%s)\n", sync_err, err_str ? err_str : "?");
-            /* VS failed — fall back to passthrough (don't use vs output) */
-            vs_ran = false;
          }
       }
    }
@@ -974,16 +957,15 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       0, NULL, rast_params, NULL);
    if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
       fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
-
-   cuCtxSynchronize();
    timing.rasterize_ms = cp_lap(&mark);
 
    /* Shade every covered pixel by running the fragment shader on the GPU:
     * interpolate its inputs, launch it, then blend its output into the
     * attachment. */
-   cp_shade_fragments(cp, info, visbuf, packed_positions, vs_output_buf,
-                      num_triangles, w, h, color_data,
-                      vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y, &timing);
+   if (color_data)
+      cp_shade_fragments(cp, info, visbuf, rast_args.positions, vs_output_buf,
+                         num_triangles, w, h, color_data,
+                         vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y, &timing);
 
    if (cp_timing_enabled()) {
       double total = timing.assemble_ms + timing.vertex_ms +
@@ -998,8 +980,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    }
 
 
-   cuCtxSynchronize();
-   /* visbuf and depthbuf outlive the draw; see cp_set_framebuffer_state() */
+   /* No sync needed here: kernels in the default stream are serialized, and
+    * the next draw's rasterizer reads the depth buffer on the GPU — not the
+    * host. Sync only when the host must read GPU results (e.g., readback). */
    FREE(refs);
 }
 
@@ -1103,7 +1086,9 @@ static void
 cp_flush(struct pipe_context *ctx, struct pipe_fence_handle **fence,
          unsigned flags)
 {
-   /* TODO: cuStreamSynchronize + create CUevent fence */
+   struct cp_context *cp = (struct cp_context *)ctx;
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   cuCtxSynchronize();
    if (fence)
       *fence = NULL;
 }

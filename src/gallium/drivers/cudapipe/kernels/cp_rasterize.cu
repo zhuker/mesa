@@ -55,10 +55,14 @@ cp_rasterize_triangles(struct cp_rasterize_args args)
    float4 *positions = (float4 *)(uintptr_t)args.positions;
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
 
+   /* Position stride: 1 float4 when packed, (num_varyings+1) when reading
+    * directly from VS output that interleaves position with varyings. */
+   uint32_t pos_stride = args.num_varyings + 1;
+
    /* Load triangle vertices (already in clip space from VS) */
-   float4 v0 = positions[tri_id * 3 + 0];
-   float4 v1 = positions[tri_id * 3 + 1];
-   float4 v2 = positions[tri_id * 3 + 2];
+   float4 v0 = positions[(tri_id * 3 + 0) * pos_stride];
+   float4 v1 = positions[(tri_id * 3 + 1) * pos_stride];
+   float4 v2 = positions[(tri_id * 3 + 2) * pos_stride];
 
    /* Perspective divide: clip → NDC */
    float inv_w0 = 1.0f / v0.w;

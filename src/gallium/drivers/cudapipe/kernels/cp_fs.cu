@@ -37,9 +37,11 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
    uint32_t tri_id = ~(uint32_t)(entry & 0xFFFFFFFFu);
 
    const float4 *positions = (const float4 *)(uintptr_t)args.positions;
-   float4 v0 = positions[tri_id * 3 + 0];
-   float4 v1 = positions[tri_id * 3 + 1];
-   float4 v2 = positions[tri_id * 3 + 2];
+   uint32_t pos_stride = args.vs_out_stride / 16;
+   if (pos_stride == 0) pos_stride = 1;
+   float4 v0 = positions[(tri_id * 3 + 0) * pos_stride];
+   float4 v1 = positions[(tri_id * 3 + 1) * pos_stride];
+   float4 v2 = positions[(tri_id * 3 + 2) * pos_stride];
 
    float inv_w0 = 1.0f / v0.w;
    float inv_w1 = 1.0f / v1.w;
@@ -419,7 +421,10 @@ extern "C" __global__ void
 cp_fs_writeback(struct cp_fs_writeback_args args)
 {
    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-   if (i >= args.num_pixels)
+   uint32_t limit = args.pixel_counter
+      ? *(const uint32_t *)(uintptr_t)args.pixel_counter
+      : args.num_pixels;
+   if (i >= limit)
       return;
 
    uint32_t pixel = ((const uint32_t *)(uintptr_t)args.pixel_list)[i];

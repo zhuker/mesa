@@ -152,6 +152,7 @@ struct cp_fs_writeback_args {
    uint64_t color_out;
    uint64_t visbuf;         /* Source of the depth to commit */
    uint64_t depthbuf;
+   uint64_t pixel_counter;  /* Device pointer to actual pixel count (0 = use num_pixels) */
    uint32_t depth_write;
    uint32_t depth_key_invert;
    uint32_t width;
