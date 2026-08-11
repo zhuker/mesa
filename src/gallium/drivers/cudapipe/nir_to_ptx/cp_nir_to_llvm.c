@@ -169,6 +169,86 @@ emit_local_invocation_id(struct ntl_context *ctx, unsigned component)
    return emit_nvptx_read_sreg(ctx, names[component]);
 }
 
+/*
+ * The base pointer of the buffer a load_ubo/load_ssbo addresses.
+ *
+ * Two forms reach us, distinguished by the width of the source — the same
+ * split lp_llvm_buffer_member() makes:
+ *
+ *   64 bit: the address of an lp_jit_buffer descriptor, whose first member is
+ *           the base pointer. One dereference.
+ *   32 bit: an index into the stage's constant buffer array. Our kernel arg
+ *           table already holds base pointers, so args[18 + index] *is* the
+ *           base and must not be dereferenced.
+ *
+ * Push constants arrive as the index form with index 0, which is why missing
+ * this case faulted every shader that used them.
+ */
+static LLVMValueRef
+emit_buffer_base(struct ntl_context *ctx, nir_src *src)
+{
+   LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+   LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+   LLVMValueRef val = get_src(ctx, src);
+
+   if (nir_src_bit_size(*src) == 64) {
+      LLVMValueRef desc_ptr = LLVMBuildIntToPtr(ctx->builder, val, ptr_ptr_type, "");
+      return LLVMBuildLoad2(ctx->builder, ptr_type, desc_ptr, "buf_base");
+   }
+
+   LLVMValueRef args = LLVMBuildBitCast(ctx->builder, ctx->kernel_args[0],
+                                        ptr_ptr_type, "");
+   LLVMValueRef idx = LLVMBuildAdd(ctx->builder, val,
+                                   LLVMConstInt(LLVMInt32TypeInContext(ctx->llvm_ctx),
+                                                18, false), "");
+   idx = LLVMBuildZExt(ctx->builder, idx, i64, "");
+   return LLVMBuildLoad2(ctx->builder, ptr_type,
+      LLVMBuildGEP2(ctx->builder, ptr_type, args, &idx, 1, ""), "buf_base");
+}
+
+/*
+ * `discard`. One thread shades one covered pixel, so a discarded fragment is
+ * recorded in a mask that cp_fs_writeback consults instead of being killed
+ * outright — the shader has already been laid out to run to completion.
+ *
+ * Visibility was resolved before the shader ran, so a discarded fragment can
+ * still have occluded another fragment of the same draw. Alpha-tested geometry
+ * that overlaps itself is therefore not exact; separate draws are fine.
+ */
+static void
+emit_terminate(struct ntl_context *ctx, LLVMValueRef cond)
+{
+   LLVMTypeRef i8 = LLVMInt8TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef ptr_type = LLVMPointerType(i8, 0);
+   LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+
+   LLVMValueRef args = LLVMBuildBitCast(ctx->builder, ctx->kernel_args[0],
+                                        ptr_ptr_type, "");
+   LLVMValueRef mask = LLVMBuildLoad2(ctx->builder, ptr_type,
+      LLVMBuildGEP2(ctx->builder, ptr_type, args,
+         &(LLVMValueRef){LLVMConstInt(i64, CP_ARG_SLOT_DISCARD, false)}, 1, ""),
+      "discard_mask");
+
+   LLVMValueRef bid = emit_workgroup_id(ctx, 0);
+   LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
+   LLVMValueRef idx = LLVMBuildAdd(ctx->builder,
+      LLVMBuildMul(ctx->builder, bid, LLVMConstInt(i32, 256, false), ""),
+      tid, "");
+   idx = LLVMBuildZExt(ctx->builder, idx, i64, "");
+
+   LLVMValueRef slot = LLVMBuildGEP2(ctx->builder, i8, mask, &idx, 1, "");
+
+   /* Store 1 where the condition holds, leaving the mask untouched otherwise,
+    * so no branch is needed around the store. */
+   LLVMValueRef old = LLVMBuildLoad2(ctx->builder, i8, slot, "");
+   LLVMValueRef set = LLVMBuildSelect(ctx->builder, cond,
+                                      LLVMConstInt(i8, 1, false), old, "");
+   LLVMBuildStore(ctx->builder, set, slot);
+}
+
 static void
 emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
 {
@@ -489,14 +569,8 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
        * descriptor struct: { ptr base; u32 num_elements; }
        * We read the base pointer from the descriptor, then access base[offset].
        */
-      LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
+      LLVMValueRef buf_ptr = emit_buffer_base(ctx, &instr->src[0]);
       LLVMValueRef byte_offset = get_src(ctx, &instr->src[1]);
-      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      /* Read the base pointer from the descriptor (first 8 bytes) */
-      LLVMValueRef desc_ptr = LLVMBuildIntToPtr(ctx->builder, desc_addr, ptr_ptr_type, "");
-      LLVMValueRef buf_ptr = LLVMBuildLoad2(ctx->builder, ptr_type, desc_ptr, "ssbo_base");
       /* Access buf_ptr + byte_offset */
       LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), buf_ptr, &byte_offset, 1, "");
@@ -512,13 +586,8 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
    case nir_intrinsic_store_ssbo: {
       /* src[0] = data, src[1] = 64-bit descriptor address, src[2] = byte offset */
       LLVMValueRef data = get_src(ctx, &instr->src[0]);
-      LLVMValueRef desc_addr = get_src(ctx, &instr->src[1]);
+      LLVMValueRef buf_ptr = emit_buffer_base(ctx, &instr->src[1]);
       LLVMValueRef byte_offset = get_src(ctx, &instr->src[2]);
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      /* Read the base pointer from the descriptor */
-      LLVMValueRef desc_ptr = LLVMBuildIntToPtr(ctx->builder, desc_addr, ptr_ptr_type, "");
-      LLVMValueRef buf_ptr = LLVMBuildLoad2(ctx->builder, ptr_type, desc_ptr, "ssbo_base");
       /* Access buf_ptr + byte_offset */
       LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), buf_ptr, &byte_offset, 1, "");
@@ -528,18 +597,30 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMBuildStore(ctx->builder, data, typed_ptr);
       break;
    }
+   case nir_intrinsic_terminate:
+      emit_terminate(ctx, LLVMConstInt(LLVMInt1TypeInContext(ctx->llvm_ctx), 1, false));
+      break;
+   case nir_intrinsic_terminate_if: {
+      LLVMValueRef cond = get_src(ctx, &instr->src[0]);
+      /* NIR conditions arrive as i32 booleans from this backend's lowering. */
+      if (LLVMGetTypeKind(LLVMTypeOf(cond)) == LLVMIntegerTypeKind &&
+          LLVMGetIntTypeWidth(LLVMTypeOf(cond)) != 1)
+         cond = LLVMBuildICmp(ctx->builder, LLVMIntNE, cond,
+                              LLVMConstInt(LLVMTypeOf(cond), 0, false), "");
+      else if (LLVMGetTypeKind(LLVMTypeOf(cond)) == LLVMFloatTypeKind)
+         cond = LLVMBuildFCmp(ctx->builder, LLVMRealONE, cond,
+                              LLVMConstReal(LLVMTypeOf(cond), 0.0), "");
+      emit_terminate(ctx, cond);
+      break;
+   }
    case nir_intrinsic_load_ubo: {
       /*
        * After lavapipe lowering, src[0] is a 64-bit descriptor address
        * pointing to lp_jit_buffer {ptr base, u32 num_elements}.
        * Same pattern as load_ssbo.
        */
-      LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
+      LLVMValueRef buf_ptr = emit_buffer_base(ctx, &instr->src[0]);
       LLVMValueRef byte_offset = get_src(ctx, &instr->src[1]);
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMValueRef desc_ptr = LLVMBuildIntToPtr(ctx->builder, desc_addr, ptr_ptr_type, "");
-      LLVMValueRef buf_ptr = LLVMBuildLoad2(ctx->builder, ptr_type, desc_ptr, "ubo_base");
       LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), buf_ptr, &byte_offset, 1, "");
       unsigned bit_size = instr->def.bit_size;

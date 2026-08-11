@@ -46,6 +46,140 @@ struct tri_setup {
    int ix_min, iy_min, ix_max, iy_max;
 };
 
+/*
+ * Clipping against the two planes that make the perspective divide meaningful,
+ * one thread per input triangle.
+ *
+ * Vulkan's view volume is 0 <= z <= w. Two of its planes matter here:
+ *
+ *   z >= 0      the near plane. A ground plane running to the horizon crosses
+ *               it, and the part behind the eye must be cut or it reappears
+ *               mirrored in front.
+ *   w >  0      not a clip plane of its own but implied by z <= w. A vertex
+ *               with w <= 0 divides to a garbage position however small its z,
+ *               so it has to go before setup_triangle() touches it.
+ *
+ * Clipping on either plane alone is not enough: samples exist that only the
+ * first fixes and samples that only the second fixes.
+ *
+ * Interpolation happens in clip space, before the divide, which is what makes
+ * the split exact for both position and varyings.
+ */
+#define CP_CLIP_MAX_VERTS 5   /* a triangle cut by two planes */
+
+static __device__ __forceinline__ float
+clip_dist(const float4 *v, int plane)
+{
+   return plane == 0 ? v[0].z : v[0].w - 1e-6f;
+}
+
+static __device__ __forceinline__ void
+clip_lerp(float4 *dst, const float4 *a, const float4 *b, float t, uint32_t slots)
+{
+   for (uint32_t s = 0; s < slots; s++) {
+      float4 va = a[s], vb = b[s];
+      dst[s] = make_float4(va.x + (vb.x - va.x) * t,
+                           va.y + (vb.y - va.y) * t,
+                           va.z + (vb.z - va.z) * t,
+                           va.w + (vb.w - va.w) * t);
+   }
+}
+
+static __device__ __forceinline__ void
+clip_copy(float4 *dst, const float4 *src, uint32_t slots)
+{
+   for (uint32_t s = 0; s < slots; s++)
+      dst[s] = src[s];
+}
+
+/* Sutherland-Hodgman against one plane. Returns the new vertex count. */
+static __device__ int
+clip_poly(float4 *dst, const float4 *src, int n, uint32_t slots, int plane)
+{
+   int out_n = 0;
+
+   for (int i = 0; i < n; i++) {
+      const float4 *cur = src + (size_t)i * slots;
+      const float4 *nxt = src + (size_t)((i + 1) % n) * slots;
+      float dc = clip_dist(cur, plane);
+      float dn = clip_dist(nxt, plane);
+      bool in_c = dc >= 0.0f, in_n = dn >= 0.0f;
+
+      if (in_c && out_n < CP_CLIP_MAX_VERTS)
+         clip_copy(dst + (size_t)out_n++ * slots, cur, slots);
+
+      if (in_c != in_n && out_n < CP_CLIP_MAX_VERTS) {
+         float denom = dc - dn;
+         if (denom != 0.0f)
+            clip_lerp(dst + (size_t)out_n++ * slots, cur, nxt, dc / denom, slots);
+      }
+   }
+
+   return out_n;
+}
+
+static __device__ __forceinline__ float4 *
+clip_emit(struct cp_clip_args *args, float4 *out, uint32_t slots)
+{
+   uint32_t o = atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
+   if (o >= args->max_triangles)
+      return NULL;
+   return out + (size_t)o * 3 * slots;
+}
+
+extern "C" __global__ void
+cp_clip_triangles(struct cp_clip_args args)
+{
+   uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x;
+   if (tri >= args.num_triangles)
+      return;
+
+   uint32_t slots = args.num_slots;
+   if (slots > CP_MAX_CLIP_SLOTS)
+      slots = CP_MAX_CLIP_SLOTS;
+
+   const float4 *in = (const float4 *)(uintptr_t)args.vs_out;
+   float4 *out = (float4 *)(uintptr_t)args.out;
+   const float4 *v = in + (size_t)tri * 3 * slots;
+
+   /* The overwhelming majority of triangles are wholly inside, so check that
+    * first and copy straight through — the polygon buffers below live in local
+    * memory and are worth avoiding. */
+   int inside = 0;
+   for (int i = 0; i < 3; i++) {
+      const float4 *vi = v + (size_t)i * slots;
+      if (clip_dist(vi, 0) >= 0.0f && clip_dist(vi, 1) >= 0.0f)
+         inside++;
+   }
+
+   if (inside == 3) {
+      float4 *dst = clip_emit(&args, out, slots);
+      if (dst)
+         clip_copy(dst, v, 3 * slots);
+      return;
+   }
+
+   float4 poly_a[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
+   float4 poly_b[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
+
+   int n = clip_poly(poly_a, v, 3, slots, 0);
+   if (n < 3)
+      return;
+   n = clip_poly(poly_b, poly_a, n, slots, 1);
+   if (n < 3)
+      return;
+
+   /* Fan-triangulate the clipped polygon, which keeps the original winding. */
+   for (int i = 1; i + 1 < n; i++) {
+      float4 *dst = clip_emit(&args, out, slots);
+      if (!dst)
+         return;
+      clip_copy(dst, poly_b, slots);
+      clip_copy(dst + slots, poly_b + (size_t)i * slots, slots);
+      clip_copy(dst + 2 * slots, poly_b + (size_t)(i + 1) * slots, slots);
+   }
+}
+
 static __device__ __forceinline__ bool
 setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
                struct tri_setup *s)
@@ -159,7 +293,12 @@ extern "C" __global__ void
 cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
    uint32_t tri_id = blockIdx.x * blockDim.x + threadIdx.x;
-   if (tri_id >= args.num_triangles)
+   /* After clipping the count lives on the device, so the grid is sized for
+    * the worst case and each thread bounds itself. */
+   uint32_t num_triangles = args.tri_count
+      ? *(const volatile uint32_t *)(uintptr_t)args.tri_count
+      : args.num_triangles;
+   if (tri_id >= num_triangles)
       return;
 
    struct tri_setup s;

@@ -427,6 +427,10 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
    if (i >= limit)
       return;
 
+   /* A discarded fragment contributes neither colour nor depth. */
+   if (args.discard_mask && ((const unsigned char *)(uintptr_t)args.discard_mask)[i])
+      return;
+
    uint32_t pixel = ((const uint32_t *)(uintptr_t)args.pixel_list)[i];
 
    /* This fragment survived the depth test during rasterization, so commit its

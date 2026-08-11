@@ -20,6 +20,7 @@ struct cp_kernels {
    CUfunction rasterize_stage1;
    CUfunction rasterize_stage2;
    CUfunction rasterize_stage3;
+   CUfunction clip_triangles;
    CUfunction clear_visbuf;
    CUfunction resolve_visbuf;
 

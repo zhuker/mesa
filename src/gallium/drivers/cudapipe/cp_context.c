@@ -198,8 +198,14 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
    size_t want = MAX2(end, cp->scratch.size[cur] * 2);
    want = MAX2(want, 1 << 20); /* at least 1MB */
    CUdeviceptr new_base;
-   if (cuMemAllocManaged(&new_base, want, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+   CUresult err = cuMemAllocManaged(&new_base, want, CU_MEM_ATTACH_GLOBAL);
+   if (err != CUDA_SUCCESS) {
+      /* Callers treat NULL as "skip this stage", which renders nothing and
+       * looks like a shader bug, so say what actually happened. */
+      fprintf(stderr, "cudapipe: scratch arena grow to %zu bytes failed (%d)\n",
+              want, err);
       return NULL;
+   }
 
    /* Stash the old arena pointer for freeing at flush */
    if (cp->scratch.base[cur] &&
@@ -450,10 +456,14 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    struct cp_screen *screen = cp->screen;
    struct cp_shader_binary *fs = cp->fs_shader;
 
-   if (!fs || !fs->kernel || !vs_output_buf || !cp->vs_shader)
+   if (!fs || !fs->kernel || !vs_output_buf || !cp->vs_shader ||
+       !screen->kernels.fs_interpolate || !screen->kernels.fs_writeback) {
+      if (getenv("CUDAPIPE_DEBUG_DRAW"))
+         fprintf(stderr, "  no fragment stage: fs=%p kernel=%p vs_out=%p vs=%p\n",
+                 (void *)fs, fs ? (void *)fs->kernel : NULL,
+                 (void *)(uintptr_t)vs_output_buf, (void *)cp->vs_shader);
       return;
-   if (!screen->kernels.fs_interpolate || !screen->kernels.fs_writeback)
-      return;
+   }
 
    unsigned num_fs_inputs = MIN2(fs->nir_num_inputs, CP_MAX_FS_INPUTS);
    unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs
@@ -474,12 +484,16 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    CUdeviceptr fs_out = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * fs_out_stride);
    CUdeviceptr fs_deriv = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * fs_deriv_stride);
    CUdeviceptr frag_coord = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * 16);
+   /* One byte per shaded pixel, set by `discard` in the fragment shader. */
+   CUdeviceptr discard_mask = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, max_pixels);
    CUdeviceptr fs_args_dev = 0, count_dev = 0, stride_dev = 0;
 
-   if (!pixel_list || !counter || !fs_in || !fs_out || !fs_deriv || !frag_coord)
+   if (!pixel_list || !counter || !fs_in || !fs_out || !fs_deriv || !frag_coord ||
+       !discard_mask)
       return;
 
    cuMemsetD32(counter, 0, 1);
+   cuMemsetD8(discard_mask, 0, max_pixels);
 
    struct cp_fs_interp_args interp = {
       .visbuf = visbuf,
@@ -517,10 +531,13 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    double mark = cp_timing_enabled() ? cp_now_ms() : 0.0;
 
    void *interp_params[] = { &interp };
-   if (cuLaunchKernel(screen->kernels.fs_interpolate,
-                      (w * h + 255) / 256, 1, 1, 256, 1, 1,
-                      0, NULL, interp_params, NULL) != CUDA_SUCCESS)
+   CUresult interp_err = cuLaunchKernel(screen->kernels.fs_interpolate,
+                                        (w * h + 255) / 256, 1, 1, 256, 1, 1,
+                                        0, NULL, interp_params, NULL);
+   if (interp_err != CUDA_SUCCESS) {
+      fprintf(stderr, "cudapipe: fs_interpolate launch failed (%d)\n", interp_err);
       return;
+   }
    timing->interpolate_ms = cp_lap(&mark);
 
    /* Launch FS and writeback over max_pixels — each kernel reads the actual
@@ -544,6 +561,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    fs_args_host[3] = (void *)(uintptr_t)stride_dev;
    fs_args_host[4] = (void *)(uintptr_t)fs_out;
    fs_args_host[6] = (void *)(uintptr_t)frag_coord;
+   fs_args_host[CP_ARG_SLOT_DISCARD] = (void *)(uintptr_t)discard_mask;
    for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
       fs_args_host[18 + i] = cp->fs_ubos[i].buffer;
 
@@ -593,9 +611,12 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 
    void *fs_arg_ptr = (void *)(uintptr_t)fs_args_dev;
    void *fs_params[] = { &fs_arg_ptr };
-   if (cuLaunchKernel(fs->kernel, (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
-                      0, NULL, fs_params, NULL) != CUDA_SUCCESS)
+   CUresult fs_err = cuLaunchKernel(fs->kernel, (num_pixels + 255) / 256, 1, 1,
+                                    256, 1, 1, 0, NULL, fs_params, NULL);
+   if (fs_err != CUDA_SUCCESS) {
+      fprintf(stderr, "cudapipe: fragment shader launch failed (%d)\n", fs_err);
       return;
+   }
    timing->fragment_ms = cp_lap(&mark);
 
    const struct pipe_rt_blend_state *rt = &cp->blend_state.rt[0];
@@ -606,6 +627,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .visbuf = visbuf,
       .depthbuf = cp->depthbuf,
       .pixel_counter = counter,
+      .discard_mask = discard_mask,
       .depth_write = cp->depth_stencil.depth_writemask,
       .depth_key_invert = cp->depth_stencil.depth_enabled &&
          (cp->depth_stencil.depth_func == PIPE_FUNC_GREATER ||
@@ -711,6 +733,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    if (total_triangles == 0)
       return;
    unsigned num_triangles = total_triangles;
+   /* Near-plane clipping can split triangles, so the rasterizer grid is sized
+    * for the post-clip worst case while the count itself lives on the GPU. */
+   unsigned rast_num_triangles = total_triangles;
 
    /* Get the color output surface (may be NULL for depth-only passes) */
    void *color_data = NULL;
@@ -1029,6 +1054,51 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             /* The rasterizer reads positions directly from VS output */
             rast_args.positions = vs_output_buf;
             rast_args.num_varyings = num_vs_outputs - 1;
+
+            /*
+             * Cut the triangles that cross the near plane. Anything with a
+             * vertex behind the eye projects to a mirrored position, so this
+             * has to happen before the rasterizer divides by w. The result
+             * has the same per-vertex layout, so the rasterizer and the
+             * interpolator just read the clipped buffer instead.
+             */
+            if (screen->kernels.clip_triangles &&
+                num_vs_outputs <= CP_MAX_CLIP_SLOTS) {
+               /* Two planes turn one triangle into at most three. */
+               unsigned max_clipped = num_triangles * 3;
+               CUdeviceptr clipped = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(
+                  cp, (size_t)max_clipped * 3 * out_stride);
+               CUdeviceptr clip_count =
+                  (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
+
+               if (clipped && clip_count) {
+                  cuMemsetD32(clip_count, 0, 1);
+
+                  struct cp_clip_args clip = {
+                     .vs_out = vs_output_buf,
+                     .out = clipped,
+                     .out_count = clip_count,
+                     .num_triangles = num_triangles,
+                     .num_slots = num_vs_outputs,
+                     .max_triangles = max_clipped,
+                  };
+                  void *clip_params[] = { &clip };
+                  CUresult clip_err = cuLaunchKernel(
+                     screen->kernels.clip_triangles,
+                     (num_triangles + 63) / 64, 1, 1, 64, 1, 1,
+                     0, NULL, clip_params, NULL);
+
+                  if (clip_err == CUDA_SUCCESS) {
+                     vs_output_buf = clipped;
+                     rast_args.positions = clipped;
+                     rast_args.tri_count = clip_count;
+                     rast_num_triangles = max_clipped;
+                  } else {
+                     fprintf(stderr, "cudapipe: clip launch failed (%d)\n",
+                             clip_err);
+                  }
+               }
+            }
          } else {
             fprintf(stderr, "  VS launch failed: %d\n", vs_err);
          }
@@ -1063,7 +1133,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
    void *s1_params[] = { &rast_args, &rast_queues };
    CUresult rast_err = cuLaunchKernel(screen->kernels.rasterize_stage1,
-      (num_triangles + 255) / 256, 1, 1, 256, 1, 1,
+      (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
       0, NULL, s1_params, NULL);
 
    /* Stage 2: warp-cooperative, fixed grid self-bounding from counter */

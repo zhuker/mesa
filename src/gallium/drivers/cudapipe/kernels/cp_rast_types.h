@@ -74,7 +74,32 @@ struct cp_rasterize_args {
    uint32_t depth_test;     /* Enable the comparison below */
    uint32_t depth_func;     /* enum pipe_compare_func */
    uint32_t depth_key_invert; /* Depth function prefers the farthest fragment */
+   /* Device pointer to the triangle count produced by near-plane clipping.
+    * Zero means the count is not known on the GPU and num_triangles applies. */
+   uint64_t tri_count;
 };
+
+/*
+ * Near-plane clipping. A triangle crossing the plane has a vertex with w <= 0,
+ * whose perspective divide produces a position that is not merely wrong but
+ * mirrored, so it has to be cut before projection. Clipping one plane splits a
+ * triangle into at most two, so the output buffer holds 2x the input.
+ */
+struct cp_clip_args {
+   uint64_t vs_out;         /* Input: 3 vertices per triangle, num_slots float4 each */
+   uint64_t out;            /* Output: same layout, compacted */
+   uint64_t out_count;      /* Output: uint32 triangle counter */
+   uint32_t num_triangles;
+   uint32_t num_slots;      /* Position plus varyings, i.e. num_varyings + 1 */
+   uint32_t max_triangles;  /* Capacity of `out`, in triangles */
+   uint32_t pad;
+};
+
+#define CP_MAX_CLIP_SLOTS 16
+
+/* Shader kernel argument slots. 0..7 are the fixed stage inputs and 18.. are
+ * the uniform/descriptor buffers; the gap in between is free. */
+#define CP_ARG_SLOT_DISCARD 8
 
 /* enum pipe_compare_func */
 enum cp_compare_func {
@@ -153,6 +178,7 @@ struct cp_fs_writeback_args {
    uint64_t visbuf;         /* Source of the depth to commit */
    uint64_t depthbuf;
    uint64_t pixel_counter;  /* Device pointer to actual pixel count (0 = use num_pixels) */
+   uint64_t discard_mask;   /* One byte per shaded pixel, set by `discard` (0 = none) */
    uint32_t depth_write;
    uint32_t depth_key_invert;
    uint32_t width;
