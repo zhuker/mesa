@@ -210,8 +210,8 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
    .KHR_shader_untyped_pointers           = true,
    .KHR_spirv_1_4                         = true,
    .KHR_storage_buffer_storage_class      = true,
-#ifdef LVP_USE_WSI_PLATFORM
    .KHR_swapchain                         = true,
+#ifdef LVP_USE_WSI_PLATFORM
    .KHR_swapchain_maintenance1            = true,
    .KHR_swapchain_mutable_format          = true,
 #endif
@@ -961,7 +961,7 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .driverVersion = vk_get_driver_version(),
       .vendorID = VK_VENDOR_ID_MESA,
       .deviceID = 0,
-      .deviceType = VK_PHYSICAL_DEVICE_TYPE_CPU,
+      .deviceType = VK_PHYSICAL_DEVICE_TYPE_OTHER,
       .maxImageDimension1D                      = device->pscreen->caps.max_texture_2d_size,
       .maxImageDimension2D                      = device->pscreen->caps.max_texture_2d_size,
       .maxImageDimension3D                      = (1 << device->pscreen->caps.max_texture_3d_levels),

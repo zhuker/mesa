@@ -15,8 +15,11 @@ struct cp_kernels {
    CUfunction clear_kernel;
    CUfunction clear_depth_kernel;
 
-   /* Rasterization kernels */
-   CUfunction rasterize_triangles;
+   /* Rasterization kernels (3-stage adaptive) */
+   CUfunction rasterize_triangles; /* alias for stage1, used by legacy code */
+   CUfunction rasterize_stage1;
+   CUfunction rasterize_stage2;
+   CUfunction rasterize_stage3;
    CUfunction clear_visbuf;
    CUfunction resolve_visbuf;
 

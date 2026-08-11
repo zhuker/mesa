@@ -338,9 +338,10 @@ cp_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
 {
    if (!fence)
       return true;
-   CUevent event = (CUevent)(uintptr_t)fence;
-   CUresult err = cuEventSynchronize(event);
-   return err == CUDA_SUCCESS;
+   struct cp_screen *cp = (struct cp_screen *)screen;
+   cuCtxSetCurrent(cp->cuda_ctx);
+   cuCtxSynchronize();
+   return true;
 }
 
 static void

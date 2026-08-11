@@ -94,6 +94,7 @@ cp_resource_create_unbacked(struct pipe_screen *screen,
                             const struct pipe_resource *tmpl,
                             uint64_t *size_required)
 {
+   struct cp_screen *cp = (struct cp_screen *)screen;
    struct cp_resource *res = CALLOC_STRUCT(cp_resource);
    if (!res)
       return NULL;
@@ -106,6 +107,7 @@ cp_resource_create_unbacked(struct pipe_screen *screen,
 
    if (size_required)
       *size_required = size;
+
 
    return &res->lpr.base;
 }
@@ -153,6 +155,11 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
    void *data = cp_resource_data(res);
    if (!data)
       return NULL;
+   if (getenv("CUDAPIPE_DEBUG_DRAW") && (usage & PIPE_MAP_READ) &&
+       resource->width0 * resource->height0 >= 921600)
+      fprintf(stderr, "cudapipe: map READ %ux%u data=%p managed=%d tex=%d\n",
+              resource->width0, resource->height0, data, res->cuda_managed,
+              llvmpipe_resource_is_texture(&res->lpr.base));
 
    if (resource->target == PIPE_BUFFER)
       return (char *)data + box->x;
@@ -196,24 +203,21 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
    unsigned dst_img_stride = dst_res->lpr.img_stride[dst_level];
 
    cuCtxSetCurrent(cp->screen->cuda_ctx);
+   cuCtxSynchronize();
 
    for (int z = 0; z < src_box->depth; z++) {
-      CUDA_MEMCPY2D copy = {0};
-      copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-      copy.srcDevice = (CUdeviceptr)(uintptr_t)src_data +
-                       (src_box->z + z) * src_img_stride +
-                       (unsigned)src_box->y * src_stride +
-                       (unsigned)src_box->x * pixel_size;
-      copy.srcPitch = src_stride;
-      copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-      copy.dstDevice = (CUdeviceptr)(uintptr_t)dst_data +
-                       (dstz + z) * dst_img_stride +
-                       dsty * dst_stride +
-                       dstx * pixel_size;
-      copy.dstPitch = dst_stride;
-      copy.WidthInBytes = (unsigned)src_box->width * pixel_size;
-      copy.Height = (unsigned)src_box->height;
-      cuMemcpy2D(&copy);
+      char *s = (char *)src_data +
+                (src_box->z + z) * src_img_stride +
+                (unsigned)src_box->y * src_stride +
+                (unsigned)src_box->x * pixel_size;
+      char *d = (char *)dst_data +
+                (dstz + z) * dst_img_stride +
+                dsty * dst_stride +
+                dstx * pixel_size;
+      unsigned row_bytes = (unsigned)src_box->width * pixel_size;
+      for (int y = 0; y < src_box->height; y++) {
+         memcpy(d + y * dst_stride, s + y * src_stride, row_bytes);
+      }
    }
 }
 
@@ -225,6 +229,10 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    struct cp_resource *dst_res = cp_resource(info->dst.resource);
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
+   if (getenv("CUDAPIPE_DEBUG_DRAW"))
+      fprintf(stderr, "cudapipe: blit %ux%u -> %ux%u src=%p dst=%p\n",
+              info->src.box.width, info->src.box.height,
+              info->dst.box.width, info->dst.box.height, src_data, dst_data);
    if (!src_data || !dst_data)
       return;
 
@@ -244,33 +252,57 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    int dst_w = info->dst.box.width;
    int dst_h = info->dst.box.height;
 
-   /* Same format and same size: use cuMemcpy2D for GPU-accelerated copy */
+   /* Same format and same size */
    if (info->src.format == info->dst.format && src_w == dst_w && src_h == dst_h) {
       cuCtxSetCurrent(cp->screen->cuda_ctx);
-      for (int z = 0; z < info->src.box.depth; z++) {
-         CUDA_MEMCPY2D copy = {0};
-         copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-         copy.srcDevice = (CUdeviceptr)(uintptr_t)src_data +
-                          src_res->lpr.mip_offsets[info->src.level] +
-                          (info->src.box.z + z) * src_img_stride +
-                          (unsigned)info->src.box.y * src_stride +
-                          (unsigned)info->src.box.x * src_pixel_size;
-         copy.srcPitch = src_stride;
-         copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-         copy.dstDevice = (CUdeviceptr)(uintptr_t)dst_data +
-                          dst_res->lpr.mip_offsets[info->dst.level] +
-                          (info->dst.box.z + z) * dst_img_stride +
-                          (unsigned)info->dst.box.y * dst_stride +
-                          (unsigned)info->dst.box.x * dst_pixel_size;
-         copy.dstPitch = dst_stride;
-         copy.WidthInBytes = (unsigned)src_w * src_pixel_size;
-         copy.Height = (unsigned)src_h;
-         cuMemcpy2D(&copy);
+      /* If both are CUDA-managed, use GPU copy (stays in stream order).
+       * Otherwise sync and memcpy (one side is host-only memory). */
+      if (src_res->cuda_managed && dst_res->cuda_managed) {
+         for (int z = 0; z < info->src.box.depth; z++) {
+            CUDA_MEMCPY2D copy = {0};
+            copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            copy.srcDevice = (CUdeviceptr)(uintptr_t)src_data +
+                             src_res->lpr.mip_offsets[info->src.level] +
+                             (info->src.box.z + z) * src_img_stride +
+                             (unsigned)info->src.box.y * src_stride +
+                             (unsigned)info->src.box.x * src_pixel_size;
+            copy.srcPitch = src_stride;
+            copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            copy.dstDevice = (CUdeviceptr)(uintptr_t)dst_data +
+                             dst_res->lpr.mip_offsets[info->dst.level] +
+                             (info->dst.box.z + z) * dst_img_stride +
+                             (unsigned)info->dst.box.y * dst_stride +
+                             (unsigned)info->dst.box.x * dst_pixel_size;
+            copy.dstPitch = dst_stride;
+            copy.WidthInBytes = (unsigned)src_w * src_pixel_size;
+            copy.Height = (unsigned)src_h;
+            cuMemcpy2D(&copy);
+         }
+      } else {
+         cuCtxSynchronize();
+         for (int z = 0; z < info->src.box.depth; z++) {
+            char *s = (char *)src_data +
+                      src_res->lpr.mip_offsets[info->src.level] +
+                      (info->src.box.z + z) * src_img_stride +
+                      (unsigned)info->src.box.y * src_stride +
+                      (unsigned)info->src.box.x * src_pixel_size;
+            char *d = (char *)dst_data +
+                      dst_res->lpr.mip_offsets[info->dst.level] +
+                      (info->dst.box.z + z) * dst_img_stride +
+                      (unsigned)info->dst.box.y * dst_stride +
+                      (unsigned)info->dst.box.x * dst_pixel_size;
+            unsigned row_bytes = (unsigned)src_w * src_pixel_size;
+            for (int y = 0; y < src_h; y++)
+               memcpy(d + y * dst_stride, s + y * src_stride, row_bytes);
+         }
       }
       return;
    }
 
-   /* Different size: nearest-neighbor scale on CPU (rare path) */
+   /* Different size: nearest-neighbor scale on CPU.
+    * Sync first — preceding GPU kernels may have written src_data. */
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   cuCtxSynchronize();
    for (int z = 0; z < info->dst.box.depth; z++) {
       int sz = info->src.box.depth > 1
          ? info->src.box.z + z * info->src.box.depth / info->dst.box.depth
@@ -517,26 +549,20 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
 static struct pipe_memory_allocation *
 cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
 {
-   /* VkDeviceMemory allocations may be host-mapped later (vkMapMemory), so
-    * these stay as managed memory. Internal driver buffers use cuMemAlloc. */
-   CUdeviceptr ptr;
-   if (cuMemAllocManaged(&ptr, size, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
-      return NULL;
-   cuMemsetD8(ptr, 0, size);
-   return (struct pipe_memory_allocation *)(uintptr_t)ptr;
+   void *ptr = calloc(1, size);
+   return (struct pipe_memory_allocation *)ptr;
 }
 
 static void
 cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
 {
-   cuMemFree((CUdeviceptr)(uintptr_t)mem);
+   free(mem);
 }
 
 static void *
 cp_map_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
 {
-   /* For managed memory, the device pointer IS host-accessible */
-   return (void *)(uintptr_t)mem;
+   return (void *)mem;
 }
 
 static void

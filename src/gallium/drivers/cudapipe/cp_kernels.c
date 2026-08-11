@@ -122,7 +122,10 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
 
    if (!build_module(&k->module, cp_rasterize_src, "cp_rasterize.cu", screen))
       goto fail;
-   cuModuleGetFunction(&k->rasterize_triangles, k->module, "cp_rasterize_triangles");
+   cuModuleGetFunction(&k->rasterize_stage1, k->module, "cp_rasterize_stage1");
+   cuModuleGetFunction(&k->rasterize_stage2, k->module, "cp_rasterize_stage2");
+   cuModuleGetFunction(&k->rasterize_stage3, k->module, "cp_rasterize_stage3");
+   k->rasterize_triangles = k->rasterize_stage1;
    cuModuleGetFunction(&k->clear_visbuf, k->module, "cp_clear_visbuf");
    cuModuleGetFunction(&k->resolve_visbuf, k->module, "cp_resolve_visbuf");
 

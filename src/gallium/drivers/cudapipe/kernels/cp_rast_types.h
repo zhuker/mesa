@@ -346,6 +346,26 @@ struct cp_draw_params {
    uint32_t max_pixels;
 };
 
+/* Adaptive rasterizer thresholds and queue sizes */
+#define CP_SMALL_THRESHOLD   999999
+#define CP_MEDIUM_THRESHOLD  4096
+#define CP_TILE_SIZE         64
+#define CP_MAX_NONTRIVIAL    1000000
+#define CP_MAX_HUGE_TILES    2000000
+
+struct cp_tile_pair {
+   uint32_t tri_id;
+   uint16_t tile_x;
+   uint16_t tile_y;
+};
+
+struct cp_rast_queues {
+   uint64_t nontrivial;        /* Device ptr to uint32_t[CP_MAX_NONTRIVIAL] */
+   uint64_t nontrivial_count;  /* Device ptr to atomic uint32_t */
+   uint64_t huge_tiles;        /* Device ptr to cp_tile_pair[CP_MAX_HUGE_TILES] */
+   uint64_t huge_count;        /* Device ptr to atomic uint32_t */
+};
+
 #define CP_MAX_VERTEX_ELEMENTS_VF 16
 #define CP_MAX_VERTEX_BUFFERS_VF 16
 

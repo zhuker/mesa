@@ -57,6 +57,14 @@ cp_destroy_context(struct pipe_context *ctx)
       cuMemFree(cp->visbuf);
    if (cp->depthbuf)
       cuMemFree(cp->depthbuf);
+   if (cp->rast_nontrivial)
+      cuMemFree(cp->rast_nontrivial);
+   if (cp->rast_nontrivial_count)
+      cuMemFree(cp->rast_nontrivial_count);
+   if (cp->rast_huge_tiles)
+      cuMemFree(cp->rast_huge_tiles);
+   if (cp->rast_huge_count)
+      cuMemFree(cp->rast_huge_count);
    if (cp->sampler_table)
       cuMemFree(cp->sampler_table);
    cp_scratch_destroy(cp);
@@ -710,6 +718,11 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       struct cp_resource *color_res = cp_resource(fb->cbufs[0].texture);
       color_data = cp_resource_data(color_res);
    }
+   if (getenv("CUDAPIPE_DEBUG_DRAW") && !color_data)
+      fprintf(stderr, "  color=(nil) reason: nr_cbufs=%u tex=%p data=%p\n",
+              fb->nr_cbufs, fb->nr_cbufs ? (void*)fb->cbufs[0].texture : NULL,
+              fb->nr_cbufs && fb->cbufs[0].texture ?
+                 cp_resource_data(cp_resource(fb->cbufs[0].texture)) : NULL);
 
    unsigned w = fb->width;
    unsigned h = fb->height;
@@ -1035,11 +1048,36 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                  cp->vertex_elements[e].vertex_buffer_index);
    }
 
-   /* Rasterize */
-   void *rast_params[] = { &rast_args };
-   CUresult rast_err = cuLaunchKernel(screen->kernels.rasterize_triangles,
+   /* 3-stage adaptive rasterize — cuMemsetD32 is enqueued on the default
+    * stream, so it serializes properly with the preceding draw's kernels. */
+   cuMemsetD32(cp->rast_nontrivial_count, 0, 1);
+   cuMemsetD32(cp->rast_huge_count, 0, 1);
+
+   struct cp_rast_queues rast_queues = {
+      .nontrivial = cp->rast_nontrivial,
+      .nontrivial_count = cp->rast_nontrivial_count,
+      .huge_tiles = cp->rast_huge_tiles,
+      .huge_count = cp->rast_huge_count,
+   };
+
+   /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
+   void *s1_params[] = { &rast_args, &rast_queues };
+   CUresult rast_err = cuLaunchKernel(screen->kernels.rasterize_stage1,
       (num_triangles + 255) / 256, 1, 1, 256, 1, 1,
-      0, NULL, rast_params, NULL);
+      0, NULL, s1_params, NULL);
+
+   /* Stage 2: warp-cooperative, fixed grid self-bounding from counter */
+   void *s2_params[] = { &rast_args, &rast_queues };
+   cuLaunchKernel(screen->kernels.rasterize_stage2,
+      512, 1, 1, 32, 1, 1,
+      0, NULL, s2_params, NULL);
+
+   /* Stage 3: block per tile, fixed grid self-bounding from counter */
+   void *s3_params[] = { &rast_args, &rast_queues };
+   cuLaunchKernel(screen->kernels.rasterize_stage3,
+      2048, 1, 1, 64, 1, 1,
+      0, NULL, s3_params, NULL);
+
    if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
       fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
    timing.rasterize_ms = cp_lap(&mark);
@@ -1126,11 +1164,14 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
     */
    uint32_t grid_size[3] = { grid[0], grid[1], grid[2] };
 
-   CUdeviceptr args_dev;
-   cuMemAllocManaged(&args_dev, 34 * sizeof(void *), CU_MEM_ATTACH_GLOBAL);
-
-   CUdeviceptr grid_dev;
-   cuMemAllocManaged(&grid_dev, sizeof(grid_size), CU_MEM_ATTACH_GLOBAL);
+   CUdeviceptr args_dev = 0;
+   CUdeviceptr grid_dev = 0;
+   if (cuMemAllocManaged(&args_dev, 34 * sizeof(void *), CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
+       cuMemAllocManaged(&grid_dev, sizeof(grid_size), CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
+      if (args_dev) cuMemFree(args_dev);
+      if (grid_dev) cuMemFree(grid_dev);
+      return;
+   }
    memcpy((void*)(uintptr_t)grid_dev, grid_size, sizeof(grid_size));
 
    void *arg_ptrs_host[34] = {0};
@@ -2201,6 +2242,16 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    cuMemAlloc(&ctx->arena_base, 256 * 1024 * 1024);
    ctx->arena_size = 256 * 1024 * 1024;
    ctx->arena_offset = 0;
+
+   /* Adaptive rasterizer queues — allocated once, reused across draws.
+    * Counters are allocated as 256 bytes each (minimum practical GPU alloc)
+    * and zeroed per draw via cuMemsetD32. */
+   cuMemAlloc(&ctx->rast_nontrivial,
+              (size_t)CP_MAX_NONTRIVIAL * sizeof(uint32_t));
+   cuMemAlloc(&ctx->rast_nontrivial_count, 256);
+   cuMemAlloc(&ctx->rast_huge_tiles,
+              (size_t)CP_MAX_HUGE_TILES * sizeof(struct cp_tile_pair));
+   cuMemAlloc(&ctx->rast_huge_count, 256);
 
    return &ctx->base;
 }

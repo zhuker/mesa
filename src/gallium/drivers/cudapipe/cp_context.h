@@ -32,6 +32,12 @@ struct cp_context {
    unsigned depthbuf_w, depthbuf_h;
    bool depthbuf_cleared;
 
+   /* Adaptive rasterizer queues (allocated once, reused across draws) */
+   CUdeviceptr rast_nontrivial;       /* uint32_t[CP_MAX_NONTRIVIAL] */
+   CUdeviceptr rast_nontrivial_count; /* atomic uint32_t */
+   CUdeviceptr rast_huge_tiles;       /* cp_tile_pair[CP_MAX_HUGE_TILES] */
+   CUdeviceptr rast_huge_count;       /* atomic uint32_t */
+
    struct pipe_depth_stencil_alpha_state depth_stencil;
 
    struct cp_shader_binary *compute_shader;
