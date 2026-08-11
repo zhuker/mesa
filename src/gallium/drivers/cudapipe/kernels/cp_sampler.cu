@@ -39,6 +39,9 @@ enum {
    CP_FILTER_LINEAR,
 };
 
+/* Upper bound on separate samples taken along an anisotropic footprint. */
+#define CP_MAX_ANISO_TAPS 16
+
 /* pipe_tex_mipfilter */
 enum {
    CP_MIPFILTER_NEAREST = 0,
@@ -696,6 +699,8 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
    /* Level of detail from how fast the coordinate moves across the screen. */
    float lod = 0.0f;
    bool have_lod = false;
+   int aniso_taps = 1;
+   float aniso_du = 0.0f, aniso_dv = 0.0f;
    if (coord_slot >= 0 && cp_fs_deriv) {
       unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
       const float4 *d = (const float4 *)(cp_fs_deriv +
@@ -724,6 +729,121 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
       float dudy = d->z * w0 * sx, dvdy = d->w * h0 * sy;
       float rho = fmaxf(sqrtf(dudx * dudx + dvdx * dvdx),
                         sqrtf(dudy * dudy + dvdy * dvdy));
+
+      /*
+       * Anisotropic filtering. A surface seen at a grazing angle has a
+       * footprint far longer in one direction than the other, and an isotropic
+       * level of detail has to cover the longer one — which is what blurs a
+       * ground plane running to the horizon. Instead pick the level that suits
+       * the shorter axis and take several samples spread along the longer one.
+       *
+       * The footprint is the parallelogram spanned by the two derivative
+       * vectors; the ellipse through it is
+       *
+       *     ec_a u^2 + ec_b u v + ec_c v^2 = ec_f
+       *
+       * whose axes are what the filter needs. Taking the longer of the two
+       * derivative vectors instead is the cheap approximation, and it only
+       * corrects blur along whichever of them is picked — on a surface whose
+       * stretch direction does not line up with either, such as a tunnel
+       * receding around the view axis, the perpendicular blur survives.
+       */
+      /*
+       * Anisotropic filtering, following llvmpipe's lp_build_rho_aniso() and
+       * lp_apply_ellipse_transform() in gallivm/lp_bld_sample.c.
+       *
+       * A surface at a grazing angle has a footprint far longer in one
+       * direction than the other, and an isotropic level of detail has to
+       * cover the longer one — which is what blurs a plane running to the
+       * horizon. Take the level that suits the short axis instead, and several
+       * samples spread along the long one.
+       *
+       * The footprint is the parallelogram spanned by the two derivative
+       * vectors, and its long axis generally lines up with neither. Rather
+       * than find that axis by angle, rewrite the pair into an equivalent one
+       * aligned to the ellipse's own axes; then simply taking the longer of
+       * the two is correct, and no trigonometry is involved — an angle from
+       * atan2 is pure noise on a near-isotropic footprint, which scatters the
+       * taps on surfaces facing the viewer.
+       */
+      if (samp.max_anisotropy > 1.0f) {
+         float dx_s = dudx, dx_t = dvdx;
+         float dy_s = dudy, dy_t = dvdy;
+
+         float len2_dx = dx_s * dx_s + dx_t * dx_t;
+         float len2_dy = dy_s * dy_s + dy_t * dy_t;
+         float det = dx_s * dy_t - dy_s * dx_t;
+         float dot = dx_s * dy_s + dx_t * dy_t;
+
+         float ax_s2 = dx_s * dx_s, ax_t2 = dx_t * dx_t;
+         float ay_s2 = dy_s * dy_s, ay_t2 = dy_t * dy_t;
+
+         /*
+          * Three degenerate cases must be excluded before transforming: a
+          * zero-length derivative, parallel derivatives (zero determinant),
+          * and derivatives already perpendicular, for which the pair is its
+          * own ellipse frame and the transform would divide by zero.
+          */
+         const float eps = 1e-6f, eps2 = 1e-12f;
+         if (len2_dx >= eps2 && len2_dy >= eps2 &&
+             det * det >= eps2 && fabsf(dot) >= eps) {
+            float ec_A = ax_t2 + ay_t2;
+            float ec_C = ax_s2 + ay_s2;
+            float ec_B = -2.0f * (dx_s * dx_t + dy_s * dy_t);
+            float ec_F = det * det;
+
+            float p = ec_A - ec_C;
+            float q = ec_A + ec_C;
+            float t = sqrtf(p * p + ec_B * ec_B);
+
+            float tp = t * (q + t), tm = t * (q - t);
+            if (tp > 0.0f && tm > 0.0f) {
+               float Fp = ec_F * (t + p), Fm = ec_F * (t - p);
+               ax_s2 = Fp / tp; ax_t2 = Fm / tp;
+               ay_s2 = Fm / tm; ay_t2 = Fp / tm;
+            }
+         }
+
+         float rho_x2 = ax_s2 + ax_t2;
+         float rho_y2 = ay_s2 + ay_t2;
+         float rho_max2 = fmaxf(rho_x2, rho_y2);
+         float rho_min2 = fminf(rho_x2, rho_y2);
+
+         if (rho_min2 > 0.0f) {
+            float max_aniso2 = samp.max_anisotropy * samp.max_anisotropy;
+            float eta2 = rho_max2 / rho_min2;
+            if (!(eta2 >= 1.0f))
+               eta2 = 1.0f;
+            if (eta2 > max_aniso2)
+               eta2 = max_aniso2;
+
+            int rate = (int)ceilf(sqrtf(eta2));
+            if (rate > CP_MAX_ANISO_TAPS)
+               rate = CP_MAX_ANISO_TAPS;
+
+            if (rate > 1) {
+               aniso_taps = rate;
+
+               /* Step along the longer of the transformed axes. Clamping eta2
+                * raises this basis, so the loop never skips texels. */
+               float major2 = rho_max2;
+               float axis = sqrtf(major2);
+               if (rho_x2 >= rho_y2) {
+                  aniso_du = (dudx / fmaxf(sqrtf(len2_dx), eps)) * axis / w0;
+                  aniso_dv = (dvdx / fmaxf(sqrtf(len2_dx), eps)) * axis / h0;
+               } else {
+                  aniso_du = (dudy / fmaxf(sqrtf(len2_dy), eps)) * axis / w0;
+                  aniso_dv = (dvdy / fmaxf(sqrtf(len2_dy), eps)) * axis / h0;
+               }
+
+               /* The level of detail divides by the unrounded ratio: ceil()
+                * would drop it below the minor axis and render sharper than
+                * the hardware. */
+               rho = sqrtf(rho_max2 / eta2);
+            }
+         }
+      }
+
       if (rho > 0.0f) {
          lod = __log2f(rho);
          have_lod = true;
@@ -747,15 +867,27 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
    lod = fminf(lod, samp.max_lod);
    lod = fmaxf(lod, 0.0f);
 
+   /* Offsets of the anisotropic taps, spread symmetrically about the centre
+    * of the footprint's long axis. One tap degenerates to the centre. */
+   float tap_scale = aniso_taps > 1 ? 1.0f / (float)aniso_taps : 0.0f;
+   float tap_base = -0.5f * (float)(aniso_taps - 1) * tap_scale;
+
    if (samp.min_mip_filter == CP_MIPFILTER_NEAREST) {
       /* Round to nearest level, matching the usual ceil(lod - 0.5) rule. */
       unsigned level = base_level + (unsigned)ceilf(lod - 0.5f);
       if (level > max_level)
          level = max_level;
-      struct cp_rgba c =
-         cp_sample_level_layer(tex, &samp, level, u, v, layer, filter,
-                               target == CP_TEX_3D, c2);
-      return make_float4(c.r, c.g, c.b, c.a);
+      struct cp_rgba acc = { 0.0f, 0.0f, 0.0f, 0.0f };
+      for (int t = 0; t < aniso_taps; t++) {
+         float off = tap_base + (float)t * tap_scale;
+         struct cp_rgba c =
+            cp_sample_level_layer(tex, &samp, level, u + aniso_du * off,
+                                  v + aniso_dv * off, layer, filter,
+                                  target == CP_TEX_3D, c2);
+         acc.r += c.r; acc.g += c.g; acc.b += c.b; acc.a += c.a;
+      }
+      float inv = 1.0f / (float)aniso_taps;
+      return make_float4(acc.r * inv, acc.g * inv, acc.b * inv, acc.a * inv);
    }
 
    /* Trilinear: blend the two levels bracketing the LOD. */
@@ -765,12 +897,19 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
    if (lo > max_level) lo = max_level;
    if (hi > max_level) hi = max_level;
 
-   struct cp_rgba a = cp_sample_level_layer(tex, &samp, lo, u, v, layer, filter,
-                                              target == CP_TEX_3D, c2);
-   struct cp_rgba b = cp_sample_level_layer(tex, &samp, hi, u, v, layer, filter,
-                                              target == CP_TEX_3D, c2);
-   return make_float4(a.r + (b.r - a.r) * frac,
-                      a.g + (b.g - a.g) * frac,
-                      a.b + (b.b - a.b) * frac,
-                      a.a + (b.a - a.a) * frac);
+   struct cp_rgba acc = { 0.0f, 0.0f, 0.0f, 0.0f };
+   for (int t = 0; t < aniso_taps; t++) {
+      float off = tap_base + (float)t * tap_scale;
+      float tu = u + aniso_du * off, tv = v + aniso_dv * off;
+      struct cp_rgba a = cp_sample_level_layer(tex, &samp, lo, tu, tv, layer,
+                                               filter, target == CP_TEX_3D, c2);
+      struct cp_rgba b = cp_sample_level_layer(tex, &samp, hi, tu, tv, layer,
+                                               filter, target == CP_TEX_3D, c2);
+      acc.r += a.r + (b.r - a.r) * frac;
+      acc.g += a.g + (b.g - a.g) * frac;
+      acc.b += a.b + (b.b - a.b) * frac;
+      acc.a += a.a + (b.a - a.a) * frac;
+   }
+   float inv = 1.0f / (float)aniso_taps;
+   return make_float4(acc.r * inv, acc.g * inv, acc.b * inv, acc.a * inv);
 }

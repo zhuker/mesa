@@ -2150,6 +2150,7 @@ cp_register_sampler(struct cp_context *cp, const struct pipe_sampler_state *stat
       .min_lod = state->min_lod,
       .max_lod = state->max_lod,
       .lod_bias = state->lod_bias,
+      .max_anisotropy = state->max_anisotropy,
    };
    memcpy(info.border_color, state->border_color.f, sizeof(info.border_color));
 

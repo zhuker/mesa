@@ -280,6 +280,9 @@ struct cp_sampler_info {
    uint32_t min_img_filter, mag_img_filter, min_mip_filter;
    uint32_t unnormalized_coords;
    float min_lod, max_lod, lod_bias;
+   /* Ratio of the longest to the shortest footprint axis the sampler may take
+    * separate samples along. 1 (or 0) means isotropic filtering. */
+   float max_anisotropy;
    float border_color[4];
 };
 
