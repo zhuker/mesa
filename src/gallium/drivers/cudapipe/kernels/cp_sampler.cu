@@ -565,6 +565,43 @@ cp_sample_level_layer(const struct cp_texture_info *tex,
  * coordinate's screen-space derivatives and pick a mip level; without one we
  * sample the base level.
  */
+/*
+ * textureSize(). A blur kernel derives its tap offsets from one over this, so
+ * returning zero does not merely lose detail — it sends every tap to an
+ * infinite coordinate and the whole pass comes out black.
+ *
+ * `component` picks width, height or depth so the caller needs no struct
+ * layout knowledge, and the size is that of the requested mip level.
+ */
+extern "C" __device__ int
+cp_tex_size(unsigned long long tex_handle, int lod, int component)
+{
+   if (!tex_handle)
+      return 0;
+
+   const struct cp_texture_info *tex =
+      *(const struct cp_texture_info *const *)(tex_handle +
+                                               CP_DESC_IMAGE_FUNCTIONS_OFFSET);
+   if (!tex)
+      return 0;
+
+   unsigned level = (unsigned)lod + tex->first_level;
+   unsigned size;
+   switch (component) {
+   case 0:  size = tex->width;  break;
+   case 1:  size = tex->height; break;
+   default: size = tex->depth;  break;
+   }
+
+   /* Layer counts do not halve with the mip chain; the spatial axes do. */
+   if (component < 2 || tex->target == CP_TEX_3D) {
+      size >>= level;
+      if (!size)
+         size = 1;
+   }
+   return (int)size;
+}
+
 extern "C" __device__ float4
 cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
               float c0, float c1, float c2, float explicit_lod,

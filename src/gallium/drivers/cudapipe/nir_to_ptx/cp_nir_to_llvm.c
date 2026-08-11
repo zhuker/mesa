@@ -1534,6 +1534,47 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
        tex->op == nir_texop_txb || tex->op == nir_texop_txf ||
        tex->op == nir_texop_txf_ms);
 
+   /*
+    * textureSize(). Its result is an integer vector, and shaders divide by it
+    * to step a texel at a time, so a zero here does not degrade quality — it
+    * sends every subsequent sample to an infinite coordinate. bloom's gaussian
+    * blur does exactly that and came out black.
+    */
+   if (tex->op == nir_texop_txs && tex_handle) {
+      LLVMTypeRef size_params[] = { i64, i32, i32 };
+      LLVMTypeRef size_fn_type = LLVMFunctionType(i32, size_params, 3, false);
+      LLVMValueRef size_fn = LLVMGetNamedFunction(ctx->module, "cp_tex_size");
+      if (!size_fn)
+         size_fn = LLVMAddFunction(ctx->module, "cp_tex_size", size_fn_type);
+
+      LLVMValueRef lod_src = LLVMConstInt(i32, 0, false);
+      for (unsigned i = 0; i < tex->num_srcs; i++) {
+         if (tex->src[i].src_type == nir_tex_src_lod)
+            lod_src = get_src(ctx, &tex->src[i].src);
+      }
+      if (LLVMGetTypeKind(LLVMTypeOf(lod_src)) == LLVMFloatTypeKind)
+         lod_src = LLVMBuildFPToSI(ctx->builder, lod_src, i32, "");
+
+      ctx->uses_tex = true;
+
+      unsigned comps = tex->def.num_components;
+      LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(i32, comps));
+      for (unsigned c = 0; c < comps; c++) {
+         LLVMValueRef size_args[] = { tex_handle, lod_src,
+                                      LLVMConstInt(i32, c, false) };
+         LLVMValueRef sz = LLVMBuildCall2(ctx->builder, size_fn_type, size_fn,
+                                          size_args, 3, "texsize");
+         if (comps == 1) {
+            set_ssa_def(ctx, &tex->def, sz);
+            return;
+         }
+         vec = LLVMBuildInsertElement(ctx->builder, vec, sz,
+                                      LLVMConstInt(i32, c, false), "");
+      }
+      set_ssa_def(ctx, &tex->def, vec);
+      return;
+   }
+
    /* Shadow compares, gathers and derivative-explicit samples still have to
     * produce a value even though the sampler cannot serve them yet. */
    if (!supported) {
