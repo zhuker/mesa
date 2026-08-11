@@ -93,10 +93,10 @@ Differing pixels versus the NVIDIA driver at tolerance 8/255:
 | computeshader | 0.31% | |
 | texturecubemap | 1.32% | reflections too sharp, see gaps |
 | particlesystem | 2.51% | no POINT_LIST rasterization |
-| multisampling | 2.92% | no MSAA |
+| multisampling | 2.58% | no MSAA |
 | pbribl | 3.02% | reflections too sharp |
-| texturemipmapgen | 3.91% | |
-| gltfscenerendering | 5.12% | some alpha-tested leaves missing |
+| texturemipmapgen | 3.50% | anisotropic filter differences |
+| gltfscenerendering | 5.11% | some alpha-tested leaves missing |
 | instancing | 0.38% | |
 
 Ten of eighteen are within a handful of pixels, from one before this work.

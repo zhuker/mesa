@@ -6,6 +6,7 @@
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
+#include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_inlines.h"
 #include "util/u_transfer_helper.h"
@@ -14,6 +15,7 @@
 #include "util/format/u_format_pack.h"
 
 #include <cuda.h>
+#include <math.h>
 #include <string.h>
 #include <stddef.h>
 
@@ -325,12 +327,28 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
       return;
    }
 
-   /* Different size: nearest-neighbor scale, converting each row as it is
-    * gathered so the two resolutions and the two formats are handled in one
-    * pass. */
+   /*
+    * Different size. A linear blit is not a nicety here: an application builds
+    * its mip chain by blitting each level into the next, so dropping to
+    * nearest decimates instead of averaging and the error compounds down the
+    * chain — some levels alias close to the right answer and others badly,
+    * which is what banded agreement across a mipmapped surface looks like.
+    *
+    * Work in float RGBA so the filtering is done once, in one place, whatever
+    * the two formats are.
+    */
+   bool linear = info->filter == PIPE_TEX_FILTER_LINEAR &&
+                 !util_format_is_pure_integer(info->src.format);
+
    void *row = malloc((size_t)dst_w * src_pixel_size);
-   if (!row)
+   float (*taps)[4] = linear ? malloc(sizeof(*taps) * (size_t)src_w * 2) : NULL;
+   float (*out_rgba)[4] = linear ? malloc(sizeof(*out_rgba) * (size_t)dst_w) : NULL;
+   if (!row || (linear && (!taps || !out_rgba))) {
+      free(row);
+      free(taps);
+      free(out_rgba);
       return;
+   }
 
    for (int z = 0; z < info->dst.box.depth; z++) {
       int sz = info->src.box.depth > 1
@@ -343,6 +361,54 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
                          sz * src_img_stride +
                          (info->src.box.y + sy) * src_stride +
                          (unsigned)info->src.box.x * src_pixel_size;
+
+         if (linear) {
+            /* Sample at pixel centres, matching the usual blit convention. */
+            float fy = ((float)y + 0.5f) * (float)src_h / (float)dst_h - 0.5f;
+            int y0 = (int)floorf(fy);
+            float wy = fy - (float)y0;
+            int y1 = CLAMP(y0 + 1, 0, src_h - 1);
+            y0 = CLAMP(y0, 0, src_h - 1);
+
+            const char *r0 = (const char *)src_data +
+                             src_res->lpr.mip_offsets[info->src.level] +
+                             sz * src_img_stride +
+                             (info->src.box.y + y0) * src_stride +
+                             (unsigned)info->src.box.x * src_pixel_size;
+            const char *r1 = (const char *)src_data +
+                             src_res->lpr.mip_offsets[info->src.level] +
+                             sz * src_img_stride +
+                             (info->src.box.y + y1) * src_stride +
+                             (unsigned)info->src.box.x * src_pixel_size;
+            util_format_unpack_rgba(info->src.format, taps, r0, src_w);
+            util_format_unpack_rgba(info->src.format, taps + src_w, r1, src_w);
+
+            for (int x = 0; x < dst_w; x++) {
+               float fx = ((float)x + 0.5f) * (float)src_w / (float)dst_w - 0.5f;
+               int x0 = (int)floorf(fx);
+               float wx = fx - (float)x0;
+               int x1 = CLAMP(x0 + 1, 0, src_w - 1);
+               x0 = CLAMP(x0, 0, src_w - 1);
+
+               for (int c = 0; c < 4; c++) {
+                  float a = taps[x0][c] + (taps[x1][c] - taps[x0][c]) * wx;
+                  float b = taps[src_w + x0][c] +
+                            (taps[src_w + x1][c] - taps[src_w + x0][c]) * wx;
+                  out_rgba[x][c] = a + (b - a) * wy;
+               }
+            }
+
+            char *d = (char *)dst_data +
+                      dst_res->lpr.mip_offsets[info->dst.level] +
+                      (info->dst.box.z + z) * dst_img_stride;
+            util_format_pack_rgba(info->dst.format,
+                                  d + (size_t)(info->dst.box.y + y) * dst_stride +
+                                  (size_t)info->dst.box.x *
+                                     util_format_get_blocksize(info->dst.format),
+                                  out_rgba, dst_w);
+            continue;
+         }
+
          for (int x = 0; x < dst_w; x++) {
             int sx = src_w == dst_w ? x : x * src_w / dst_w;
             memcpy((char *)row + (unsigned)x * src_pixel_size,
@@ -360,6 +426,8 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    }
 
    free(row);
+   free(taps);
+   free(out_rgba);
 }
 
 static void
