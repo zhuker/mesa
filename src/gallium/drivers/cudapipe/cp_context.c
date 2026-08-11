@@ -57,6 +57,10 @@ cp_destroy_context(struct pipe_context *ctx)
       cuMemFree(cp->visbuf);
    if (cp->depthbuf)
       cuMemFree(cp->depthbuf);
+   if (cp->reject)
+      cuMemFree(cp->reject);
+   if (cp->resolved)
+      cuMemFree(cp->resolved);
    if (cp->rast_nontrivial)
       cuMemFree(cp->rast_nontrivial);
    if (cp->rast_nontrivial_count)
@@ -87,14 +91,23 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
          cuMemFree(cp->visbuf);
       if (cp->depthbuf)
          cuMemFree(cp->depthbuf);
+      if (cp->reject)
+         cuMemFree(cp->reject);
+      if (cp->resolved)
+         cuMemFree(cp->resolved);
       cp->visbuf = 0;
       cp->depthbuf = 0;
+      cp->reject = 0;
+      cp->resolved = 0;
       cp->visbuf_w = cp->depthbuf_w = w;
       cp->visbuf_h = cp->depthbuf_h = h;
       if (w > 0 && h > 0) {
          cuCtxSetCurrent(cp->screen->cuda_ctx);
          CUresult e1 = cuMemAlloc(&cp->visbuf, (size_t)w * h * sizeof(uint64_t));
          CUresult e2 = cuMemAlloc(&cp->depthbuf, (size_t)w * h * sizeof(uint32_t));
+         cuMemAlloc(&cp->reject,
+                    (size_t)w * h * CP_DISCARD_LAYERS * sizeof(uint32_t));
+         cuMemAlloc(&cp->resolved, (size_t)w * h);
          if (e1 != CUDA_SUCCESS || e2 != CUDA_SUCCESS)
             fprintf(stderr, "cudapipe: visbuf/depthbuf alloc %ux%u failed "
                     "(%d, %d)\n", w, h, e1, e2);
@@ -488,6 +501,8 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
                    unsigned w, unsigned h, void *color_data,
                    float vp_scale_x, float vp_scale_y,
                    float vp_trans_x, float vp_trans_y,
+                   CUdeviceptr reject, CUdeviceptr resolved,
+                   unsigned reject_pass,
                    struct cp_draw_timing *timing)
 {
    struct cp_screen *screen = cp->screen;
@@ -665,6 +680,10 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .depthbuf = cp->depthbuf,
       .pixel_counter = counter,
       .discard_mask = discard_mask,
+      .reject = reject,
+      .resolved = resolved,
+      .reject_layers = CP_DISCARD_LAYERS,
+      .reject_pass = reject_pass,
       .depth_write = cp->depth_stencil.depth_writemask,
       .depth_key_invert = cp->depth_stencil.depth_enabled &&
          (cp->depth_stencil.depth_func == PIPE_FUNC_GREATER ||
@@ -689,6 +708,17 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
                   (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
                   0, NULL, wb_params, NULL);
    timing->writeback_ms = cp_lap(&mark);
+
+   if (getenv("CUDAPIPE_DEBUG_DISCARD")) {
+      cuCtxSynchronize();
+      unsigned covered = *(const uint32_t *)(uintptr_t)counter;
+      const unsigned char *dm = (const unsigned char *)(uintptr_t)discard_mask;
+      unsigned nd = 0;
+      for (unsigned k = 0; k < covered && k < max_pixels; k++)
+         nd += dm[k] ? 1u : 0u;
+      fprintf(stderr, "  pass %u: covered %u, discarded %u\n",
+              reject_pass, covered, nd);
+   }
 
    if (getenv("CUDAPIPE_DEBUG_DRAW"))
       fprintf(stderr, "  shaded %u pixels (%u fs inputs, %u tris) "
@@ -1232,35 +1262,68 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .huge_count = cp->rast_huge_count,
    };
 
-   /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
-   void *s1_params[] = { &rast_args, &rast_queues };
-   CUresult rast_err = cuLaunchKernel(screen->kernels.rasterize_stage1,
-      (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
-      0, NULL, s1_params, NULL);
+   /*
+    * Alpha-tested geometry needs more than one go. Visibility resolves before
+    * the shader runs, so a fragment that discards has already displaced the one
+    * behind it — a leaf's transparent texel hides the leaf further back. Each
+    * pass records what discarded where and repeats, letting the next fragment
+    * win, until every pixel has settled or the layers run out.
+    */
+   bool retry = cp->fs_shader && cp->fs_shader->uses_discard &&
+                cp->reject && cp->resolved && color_data;
+   unsigned passes = retry ? CP_DISCARD_LAYERS : 1;
 
-   /* Stage 2: warp-cooperative, fixed grid self-bounding from counter */
-   void *s2_params[] = { &rast_args, &rast_queues };
-   cuLaunchKernel(screen->kernels.rasterize_stage2,
-      512, 1, 1, 32, 1, 1,
-      0, NULL, s2_params, NULL);
+   if (retry) {
+      cuMemsetD8(cp->resolved, 0, (size_t)w * h);
+      cuMemsetD32(cp->reject, 0xFFFFFFFF,
+                  (size_t)w * h * CP_DISCARD_LAYERS);
+      rast_args.reject = cp->reject;
+      rast_args.resolved = cp->resolved;
+      rast_args.reject_layers = CP_DISCARD_LAYERS;
+   }
 
-   /* Stage 3: block per tile, fixed grid self-bounding from counter */
-   void *s3_params[] = { &rast_args, &rast_queues };
-   cuLaunchKernel(screen->kernels.rasterize_stage3,
-      2048, 1, 1, 64, 1, 1,
-      0, NULL, s3_params, NULL);
+   for (unsigned pass = 0; pass < passes; pass++) {
+      if (pass) {
+         /* Each pass resolves visibility afresh, minus what has been rejected. */
+         cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2);
+         rast_args.reject_passes = pass;
+      }
+      cuMemsetD32(cp->rast_nontrivial_count, 0, 1);
+      cuMemsetD32(cp->rast_huge_count, 0, 1);
 
-   if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
-      fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
-   timing.rasterize_ms = cp_lap(&mark);
+      /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
+      void *s1_params[] = { &rast_args, &rast_queues };
+      CUresult rast_err = cuLaunchKernel(screen->kernels.rasterize_stage1,
+         (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
+         0, NULL, s1_params, NULL);
 
-   /* Shade every covered pixel by running the fragment shader on the GPU:
-    * interpolate its inputs, launch it, then blend its output into the
-    * attachment. */
-   if (color_data)
-      cp_shade_fragments(cp, info, visbuf, rast_args.positions, vs_output_buf,
-                         num_triangles, w, h, color_data,
-                         vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y, &timing);
+      /* Stage 2: warp-cooperative, fixed grid self-bounding from counter */
+      void *s2_params[] = { &rast_args, &rast_queues };
+      cuLaunchKernel(screen->kernels.rasterize_stage2,
+         512, 1, 1, 32, 1, 1,
+         0, NULL, s2_params, NULL);
+
+      /* Stage 3: block per tile, fixed grid self-bounding from counter */
+      void *s3_params[] = { &rast_args, &rast_queues };
+      cuLaunchKernel(screen->kernels.rasterize_stage3,
+         2048, 1, 1, 64, 1, 1,
+         0, NULL, s3_params, NULL);
+
+      if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
+         fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
+      timing.rasterize_ms += cp_lap(&mark);
+
+      /* Shade every covered pixel by running the fragment shader on the GPU:
+       * interpolate its inputs, launch it, then blend its output into the
+       * attachment. */
+      if (color_data)
+         cp_shade_fragments(cp, info, visbuf, rast_args.positions, vs_output_buf,
+                            num_triangles, w, h, color_data,
+                            vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
+                            retry ? cp->reject : 0,
+                            retry ? cp->resolved : 0,
+                            pass, &timing);
+   }
 
    if (cp_timing_enabled()) {
       double total = timing.assemble_ms + timing.vertex_ms +

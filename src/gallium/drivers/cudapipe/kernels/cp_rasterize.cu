@@ -241,10 +241,34 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
    return true;
 }
 
+/*
+ * Whether this triangle already discarded at this pixel on an earlier pass of
+ * an alpha-tested draw. Visibility is resolved before shading, so without this
+ * the pixel would keep choosing the same transparent fragment and whatever is
+ * behind it would never be drawn.
+ */
+static __device__ __forceinline__ bool
+cp_tri_rejected(const struct cp_rasterize_args *args, uint32_t tri_id,
+                int px, int py)
+{
+   if (!args->reject || !args->reject_passes)
+      return false;
+
+   const uint32_t *rej = (const uint32_t *)(uintptr_t)args->reject +
+      (size_t)((uint32_t)py * args->width + (uint32_t)px) * args->reject_layers;
+   for (uint32_t i = 0; i < args->reject_passes; i++)
+      if (rej[i] == tri_id)
+         return true;
+   return false;
+}
+
 static __device__ __forceinline__ void
 rasterize_pixel(struct cp_rasterize_args *args, struct tri_setup *s,
                 uint32_t tri_id, int px, int py)
 {
+   if (cp_tri_rejected(args, tri_id, px, py))
+      return;
+
    float cx = (float)px + 0.5f;
    float cy = (float)py + 0.5f;
 
@@ -374,9 +398,11 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
                }
             }
 
-            uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
-            uint64_t packed = PACK_VISBUF(key, tri_id);
-            atomicMin(&visbuf[py * args.width + px], packed);
+            if (!cp_tri_rejected(&args, tri_id, px, py)) {
+               uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
+               uint64_t packed = PACK_VISBUF(key, tri_id);
+               atomicMin(&visbuf[py * args.width + px], packed);
+            }
          }
          e0 += s.e0_dx;
          e1 += s.e1_dx;
@@ -544,9 +570,13 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
             continue;
       }
 
-      uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
-      uint64_t packed = PACK_VISBUF(key, tri_id);
-      atomicMin(&visbuf[py * args.width + px], packed);
+      if (!cp_tri_rejected(&args, tri_id, px, py)) {
+         if (!cp_tri_rejected(&args, tri_id, px, py)) {
+            uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
+            uint64_t packed = PACK_VISBUF(key, tri_id);
+            atomicMin(&visbuf[py * args.width + px], packed);
+         }
+      }
    }
 }
 
@@ -709,9 +739,11 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
             }
          }
 
-         uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
-         uint64_t packed = PACK_VISBUF(key, tri_id);
-         atomicMin(&visbuf[py * args.width + px], packed);
+         if (!cp_tri_rejected(&args, tri_id, px, py)) {
+            uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
+            uint64_t packed = PACK_VISBUF(key, tri_id);
+            atomicMin(&visbuf[py * args.width + px], packed);
+         }
       }
 
       e0 += sh_e0_dy;

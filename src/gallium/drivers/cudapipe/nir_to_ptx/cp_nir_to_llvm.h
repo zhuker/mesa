@@ -24,6 +24,10 @@ struct cp_shader_binary {
     * draw have to materialise the vertex id array the shader reads from. */
    bool reads_vertex_id;
 
+   /* Whether the shader can discard. An alpha-tested draw needs several passes
+    * because visibility is resolved before shading. */
+   bool uses_discard;
+
    /* Which VARYING_SLOT_* each I/O slot carries, so a fragment shader's inputs
     * can be matched to the vertex shader's outputs by location rather than by
     * position. Slots with no variable are VARYING_SLOT_MAX. */

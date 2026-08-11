@@ -96,7 +96,7 @@ Differing pixels versus the NVIDIA driver at tolerance 8/255:
 | multisampling | 2.58% | no MSAA |
 | pbribl | 3.02% | reflections too sharp |
 | texturemipmapgen | 3.50% | anisotropic filter differences |
-| gltfscenerendering | 5.11% | some alpha-tested leaves missing |
+| gltfscenerendering | 1.84% | |
 | instancing | 0.38% | |
 
 Ten of eighteen are within a handful of pixels, from one before this work.
@@ -151,9 +151,12 @@ array of pointers:
    sharply. Narrow and worth checking before the item above.
 3. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
 4. **No line or point rasterization.** The capture uses POINT_LIST.
-5. **Alpha-tested geometry that overlaps itself within one draw** is not exact:
-   visibility resolves before the shader runs, so a discarded fragment can
-   already have occluded another of the same draw. Separate draws are fine.
+5. **Alpha-tested geometry** costs CP_DISCARD_LAYERS passes over the draw.
+   Visibility resolves before shading, so a fragment that discards has already
+   displaced the one behind it; each pass records what discarded where and
+   repeats so the next fragment can win. Four layers took Sponza's foliage from
+   543 discards to 1 across the passes. Anything still discarding after the
+   last layer is lost.
 6. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
    compressed textures, and the capture has 576 BC images.
 7. `multithreading` (0.23%) has no diagnosis yet.
@@ -196,6 +199,7 @@ ever needed, llvmpipe's `lp_build_sin`/`lp_build_cos` carry the polynomial.
 | `CUDAPIPE_DEBUG_FS` | per-pixel fragment inputs/outputs, VS output positions |
 | `CUDAPIPE_DEBUG_LAUNCH` | compute UBO/SSBO bindings |
 | `CUDAPIPE_DEBUG_VFETCH` | dump what the GPU vertex fetch gathered (syncs) |
+| `CUDAPIPE_DEBUG_DISCARD` | covered and discarded pixels per alpha-test pass (syncs) |
 | `CUDAPIPE_DEBUG_SHADER` | warn on unhandled NIR intrinsics |
 | `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
 

@@ -427,11 +427,28 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
    if (i >= limit)
       return;
 
-   /* A discarded fragment contributes neither colour nor depth. */
-   if (args.discard_mask && ((const unsigned char *)(uintptr_t)args.discard_mask)[i])
+   uint32_t pixel = ((const uint32_t *)(uintptr_t)args.pixel_list)[i];
+
+   /* Once a pixel has taken a fragment, later passes of an alpha-tested draw
+    * must leave it alone rather than blend into it again. */
+   unsigned char *resolved = (unsigned char *)(uintptr_t)args.resolved;
+   if (resolved && resolved[pixel])
       return;
 
-   uint32_t pixel = ((const uint32_t *)(uintptr_t)args.pixel_list)[i];
+   /* A discarded fragment contributes neither colour nor depth. Record which
+    * triangle it was so the next pass can pick the one behind it. */
+   if (args.discard_mask && ((const unsigned char *)(uintptr_t)args.discard_mask)[i]) {
+      if (args.reject && args.reject_pass < args.reject_layers && args.visbuf) {
+         uint64_t entry = ((const uint64_t *)(uintptr_t)args.visbuf)[pixel];
+         uint32_t tri = ~(uint32_t)(entry & 0xFFFFFFFFu);
+         ((uint32_t *)(uintptr_t)args.reject)[(size_t)pixel * args.reject_layers +
+                                              args.reject_pass] = tri;
+      }
+      return;
+   }
+
+   if (resolved)
+      resolved[pixel] = 1;
 
    /* This fragment survived the depth test during rasterization, so commit its
     * depth before the next draw tests against it. */

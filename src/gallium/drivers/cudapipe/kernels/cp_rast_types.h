@@ -77,7 +77,20 @@ struct cp_rasterize_args {
    /* Device pointer to the triangle count produced by near-plane clipping.
     * Zero means the count is not known on the GPU and num_triangles applies. */
    uint64_t tri_count;
+   /*
+    * Alpha-tested geometry. Visibility is resolved before the shader runs, so
+    * a fragment that turns out to discard has already displaced the one behind
+    * it. The draw is repeated: each pass records the triangle that discarded
+    * at a pixel here, and later passes skip it so the next fragment can win.
+    */
+   uint64_t reject;         /* uint32[reject_layers] per pixel, 0 if unused */
+   uint64_t resolved;       /* one byte per pixel, set once a pixel is written */
+   uint32_t reject_layers;
+   uint32_t reject_passes;  /* how many layers hold a triangle so far */
 };
+
+/* Passes an alpha-tested draw gets to find a fragment that survives. */
+#define CP_DISCARD_LAYERS 4
 
 /*
  * Near-plane clipping. A triangle crossing the plane has a vertex with w <= 0,
@@ -179,6 +192,10 @@ struct cp_fs_writeback_args {
    uint64_t depthbuf;
    uint64_t pixel_counter;  /* Device pointer to actual pixel count (0 = use num_pixels) */
    uint64_t discard_mask;   /* One byte per shaded pixel, set by `discard` (0 = none) */
+   uint64_t reject;         /* Out: triangle that discarded, per pixel (0 = unused) */
+   uint64_t resolved;       /* Out: marks pixels that have been written */
+   uint32_t reject_layers;
+   uint32_t reject_pass;    /* Which reject slot this pass writes */
    uint32_t depth_write;
    uint32_t depth_key_invert;
    uint32_t width;

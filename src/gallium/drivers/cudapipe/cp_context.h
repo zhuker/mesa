@@ -24,6 +24,8 @@ struct cp_context {
    /* Visibility buffer, rebuilt per draw: it resolves which triangle of the
     * current draw wins each pixel. */
    CUdeviceptr visbuf;
+   CUdeviceptr reject;      /* per-pixel discarded triangles, CP_DISCARD_LAYERS deep */
+   CUdeviceptr resolved;    /* per-pixel byte: a fragment has been written */
    unsigned visbuf_w, visbuf_h;
 
    /* Depth buffer for the render pass, one sortable uint32 per pixel. This is
