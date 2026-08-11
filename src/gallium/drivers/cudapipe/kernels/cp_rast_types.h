@@ -403,6 +403,12 @@ struct cp_vertex_fetch_args {
    uint32_t elem_src_offset[CP_MAX_VERTEX_ELEMENTS_VF];
    uint32_t elem_src_stride[CP_MAX_VERTEX_ELEMENTS_VF];
    uint32_t elem_attr_size[CP_MAX_VERTEX_ELEMENTS_VF];
+   /* Vulkan fills the components a vertex format does not supply with
+    * (0, 0, 0, 1), so an attribute with fewer than four components needs a
+    * one written into its w slot. Holds the bit pattern of that one, which is
+    * 1.0f for float formats and integer 1 for the rest, or zero when the
+    * format already supplies all four components. */
+   uint32_t elem_fill_w[CP_MAX_VERTEX_ELEMENTS_VF];
    uint32_t elem_instance_divisor[CP_MAX_VERTEX_ELEMENTS_VF];
    uint32_t num_elements;
    uint32_t num_verts;

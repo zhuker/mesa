@@ -400,6 +400,40 @@ cp_build_vertex_refs(const struct pipe_draw_info *info,
    return refs;
 }
 
+/*
+ * The value a vertex attribute's fourth component reads as when the format
+ * doesn't supply one. Vulkan defines the missing components of a vertex
+ * attribute as (0, 0, 0, 1), and the zero-filled slot already covers y and z.
+ * Returns 0 when the format supplies all four components and nothing is due.
+ */
+static uint32_t
+cp_vertex_fill_w(enum pipe_format format)
+{
+   const struct util_format_description *desc =
+      util_format_description(format);
+
+   if (!desc || desc->nr_channels >= 4)
+      return 0;
+
+   if (desc->channel[0].type == UTIL_FORMAT_TYPE_FLOAT) {
+      float one = 1.0f;
+      uint32_t bits;
+      memcpy(&bits, &one, 4);
+      return bits;
+   }
+
+   /* Normalised formats also read as 1.0, and this driver hands the shader
+    * floats for them, so only the plain integer formats want an integer 1. */
+   if (desc->channel[0].normalized) {
+      float one = 1.0f;
+      uint32_t bits;
+      memcpy(&bits, &one, 4);
+      return bits;
+   }
+
+   return 1;
+}
+
 /* Which colour encoding the fragment writeback can produce, or -1 if it can't
  * write this format at all. */
 int
@@ -654,8 +688,11 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    timing->writeback_ms = cp_lap(&mark);
 
    if (getenv("CUDAPIPE_DEBUG_DRAW"))
-      fprintf(stderr, "  shaded %u pixels (%u fs inputs, %u tris)\n",
-              num_pixels, num_fs_inputs, num_triangles);
+      fprintf(stderr, "  shaded %u pixels (%u fs inputs, %u tris) "
+              "blend=%u src=%u dst=%u mask=0x%x\n",
+              num_pixels, num_fs_inputs, num_triangles,
+              rt->blend_enable, rt->rgb_src_factor, rt->rgb_dst_factor,
+              wb.colormask);
 
    if (getenv("CUDAPIPE_DEBUG_FS")) {
       const float *vs_out = (const float *)(uintptr_t)vs_output_buf;
@@ -810,9 +847,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    /* Reclaim last draw's scratch and size the arena for this one. */
    cp_scratch_begin(cp);
 
+   /* A shader with no declared inputs needs no vertex buffer: it builds its
+    * positions from gl_VertexIndex, which is how a fullscreen pass is drawn. */
    bool has_vs = cp->vs_shader && cp->vs_shader->kernel &&
-                 cp->num_vertex_buffers > 0 &&
-                 cp->vertex_buffers[0].buffer.resource;
+                 ((cp->num_vertex_buffers > 0 &&
+                   cp->vertex_buffers[0].buffer.resource) ||
+                  cp->num_vertex_elements == 0);
 
    const void *ib_base = NULL;
    if (indexed && info->index.resource) {
@@ -875,11 +915,19 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
     * The output replaces packed_positions for the rasterizer. */
    /* VS execution */
-   if (cp->vs_shader && cp->vs_shader->kernel && cp->num_vertex_buffers > 0 &&
-       cp->vertex_buffers[0].buffer.resource) {
-      struct cp_resource *vb_res2 = cp_resource(cp->vertex_buffers[0].buffer.resource);
-      void *vb_data2 = cp_resource_data(vb_res2);
-      if (vb_data2) {
+   if (cp->vs_shader && cp->vs_shader->kernel) {
+      void *vb_data2 = NULL;
+      if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
+         struct cp_resource *vb_res2 =
+            cp_resource(cp->vertex_buffers[0].buffer.resource);
+         vb_data2 = cp_resource_data(vb_res2);
+      }
+
+      /* A vertex shader may build its positions from gl_VertexIndex alone and
+       * declare no inputs at all, which is how a fullscreen pass is drawn.
+       * That draw binds no vertex buffer, and skipping it loses every
+       * post-processing and skybox pass. */
+      if (vb_data2 || cp->num_vertex_elements == 0) {
          unsigned stride;
          unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
          unsigned out_stride = num_vs_outputs * 16;
@@ -890,9 +938,11 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          /* Build VS input buffer on GPU: the vertex fetch kernel gathers
           * attributes in parallel, one thread per assembled vertex. */
          unsigned vs_in_stride = cp->num_vertex_elements * 16;
-         CUdeviceptr vs_input_buf = (CUdeviceptr)(uintptr_t)
-            cp_scratch_alloc(cp, (size_t)total_verts * vs_in_stride);
-         if (!vs_output_buf || !vs_input_buf) {
+         CUdeviceptr vs_input_buf = vs_in_stride
+            ? (CUdeviceptr)(uintptr_t)cp_scratch_alloc(
+                 cp, (size_t)total_verts * vs_in_stride)
+            : 0;
+         if (!vs_output_buf || (vs_in_stride && !vs_input_buf)) {
             FREE(refs);
             return;
          }
@@ -929,9 +979,14 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             .instance_ids = vfetch_iid,
          };
 
-         /* Set up index buffer for direct GPU indexing (triangle list only) */
+         /* Set up index buffer for direct GPU indexing (triangle list only).
+          * The fetch kernel indexes from the start of what it is given, so the
+          * draw's first index has to be folded into the pointer — a glTF model
+          * draws every primitive out of one shared buffer this way, and
+          * ignoring it draws the first primitive over and over. */
          if (!need_refs_on_gpu && indexed && ib_base)
-            vf_args.index_buffer = (uint64_t)(uintptr_t)ib_base;
+            vf_args.index_buffer = (uint64_t)(uintptr_t)ib_base +
+                                   (uint64_t)draws[0].start * info->index_size;
 
          for (unsigned e = 0; e < cp->num_vertex_elements && e < 16; e++) {
             const struct pipe_vertex_element *elem = &cp->vertex_elements[e];
@@ -948,14 +1003,18 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             vf_args.elem_src_offset[e] = elem->src_offset;
             vf_args.elem_src_stride[e] = elem->src_stride;
             vf_args.elem_attr_size[e] = util_format_get_blocksize(elem->src_format);
+            vf_args.elem_fill_w[e] = cp_vertex_fill_w(elem->src_format);
             vf_args.elem_instance_divisor[e] = elem->instance_divisor;
          }
 
-         cuMemsetD8(vs_input_buf, 0, (size_t)total_verts * vs_in_stride);
-         void *vf_params[] = { &vf_args };
-         cuLaunchKernel(screen->kernels.vertex_fetch,
-            (total_verts + 255) / 256, 1, 1, 256, 1, 1,
-            0, NULL, vf_params, NULL);
+         /* Nothing to gather when the shader declares no inputs. */
+         if (vs_input_buf) {
+            cuMemsetD8(vs_input_buf, 0, (size_t)total_verts * vs_in_stride);
+            void *vf_params[] = { &vf_args };
+            cuLaunchKernel(screen->kernels.vertex_fetch,
+               (total_verts + 255) / 256, 1, 1, 256, 1, 1,
+               0, NULL, vf_params, NULL);
+         }
 
          stride = vs_in_stride;
 
@@ -981,9 +1040,20 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                   /* 16-bit IB: allocate and let the vertex_fetch kernel handle it */
                   vid_buf = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, total_verts * 4);
                }
+            } else if (cp->vs_shader->reads_vertex_id) {
+               /* Non-indexed: vertex_id is just thread_id + first, but the
+                * shader reads it out of this array rather than computing it,
+                * so it has to exist. Only materialised for the shaders that
+                * ask — a fullscreen pass building its corners from
+                * gl_VertexIndex is the usual one. */
+               vid_buf = (CUdeviceptr)(uintptr_t)
+                  cp_scratch_alloc(cp, (size_t)total_verts * 4);
+               if (vid_buf) {
+                  uint32_t *ids = (uint32_t *)(uintptr_t)vid_buf;
+                  for (unsigned v = 0; v < total_verts; v++)
+                     ids[v] = draws[0].start + v;
+               }
             } else {
-               /* Non-indexed: vertex_id = thread_id + first. Allocate a sequential
-                * array. Actually — we can pass NULL and have the VS use thread_id. */
                vid_buf = 0;
             }
             /* instance_id = 0 for all vertices (single instance) */

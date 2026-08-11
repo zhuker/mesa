@@ -20,6 +20,10 @@ struct cp_shader_binary {
    unsigned nir_num_outputs;
    unsigned nir_num_inputs;
 
+   /* Whether the shader reads gl_VertexIndex. Only then does a non-indexed
+    * draw have to materialise the vertex id array the shader reads from. */
+   bool reads_vertex_id;
+
    /* Which VARYING_SLOT_* each I/O slot carries, so a fragment shader's inputs
     * can be matched to the vertex shader's outputs by location rather than by
     * position. Slots with no variable are VARYING_SLOT_MAX. */

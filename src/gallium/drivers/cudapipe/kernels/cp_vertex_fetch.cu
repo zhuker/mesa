@@ -75,5 +75,13 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
          for (uint32_t b = 0; b < size; b++)
             dst[b] = src[b];
       }
+
+      /* A format with fewer than four components reads as (0, 0, 0, 1). The
+       * slot was zero-filled, so only the one has to be written — and it
+       * matters: a shader taking a vec3 position as vec4 otherwise gets w = 0
+       * and loses the translation column of its matrix. */
+      uint32_t fill_w = args.elem_fill_w[e];
+      if (fill_w)
+         ((uint32_t *)dst)[3] = fill_w;
    }
 }

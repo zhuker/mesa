@@ -2071,6 +2071,23 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    bin->shared_size = nir->info.shared_size;
    bin->nir_num_outputs = nir->num_outputs;
    bin->nir_num_inputs = nir->num_inputs;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_load_vertex_id:
+            case nir_intrinsic_load_vertex_id_zero_base:
+               bin->reads_vertex_id = true;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
    capture_io_locations(nir, bin);
 
    /* Shaders that sample textures need the sampler linked in; the rest load
