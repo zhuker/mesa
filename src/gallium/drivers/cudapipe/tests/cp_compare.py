@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Compare two PNGs rendered by different drivers.
+"""Compare two images rendered by different drivers.
+
+Reads PNG and binary PPM (P6), so it works both on the offscreen bench and on
+the ppm files the Sascha Willems samples write with --offscreen.
 
 Reports the fraction of pixels that differ beyond a tolerance, plus a coarse
 ASCII map of where they differ, which is usually enough to tell a geometry bug
@@ -53,12 +56,45 @@ def read_png(path):
     return width, height, channels, rows
 
 
+def read_ppm(path):
+    """Binary PPM (P6), which is what the samples write in offscreen mode."""
+    raw = open(path, 'rb').read()
+
+    # Header is "P6" plus width, height and maxval, whitespace separated, with
+    # '#' comments allowed in between. A single whitespace byte follows maxval.
+    fields, pos = [], 2
+    while len(fields) < 3:
+        while raw[pos:pos + 1].isspace():
+            pos += 1
+        if raw[pos:pos + 1] == b'#':
+            while raw[pos:pos + 1] not in (b'\n', b''):
+                pos += 1
+            continue
+        start = pos
+        while not raw[pos:pos + 1].isspace():
+            pos += 1
+        fields.append(int(raw[start:pos]))
+    pos += 1
+
+    width, height, maxval = fields
+    if maxval != 255:
+        raise ValueError(f'{path}: only 8 bit PPMs are supported (maxval {maxval})')
+
+    stride = width * 3
+    rows = [raw[pos + y * stride:pos + (y + 1) * stride] for y in range(height)]
+    return width, height, 3, rows
+
+
+def read_image(path):
+    return read_ppm(path) if path.lower().endswith('.ppm') else read_png(path)
+
+
 def main():
     ref_path, test_path = sys.argv[1], sys.argv[2]
     tol = int(sys.argv[3]) if len(sys.argv) > 3 else 8
 
-    w, h, ch, ref = read_png(ref_path)
-    w2, h2, ch2, test = read_png(test_path)
+    w, h, ch, ref = read_image(ref_path)
+    w2, h2, ch2, test = read_image(test_path)
     if (w, h) != (w2, h2):
         print(f'size mismatch: {w}x{h} vs {w2}x{h2}')
         return 1

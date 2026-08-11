@@ -1,0 +1,66 @@
+# Minimal Sascha Willems sample set for the HeadlessStreamer requirements
+# ======================================================================
+#
+# Derived from headless_streamer_requirements.txt (2026-08-09 Tesla T4 capture).
+# Samples live in ~/git/Vulkan and all run offscreen; see that repo's
+# OFFSCREEN.md. Each entry below is the simplest sample covering a capability
+# the capture actually requires — drop any one and a requirement loses its
+# only test.
+#
+#   SAMPLES="$(grep -v '^#' headless_streamer_samples.txt | tr '\n' ' ')"
+#   VK_DRIVER_FILES=<icd>.json ./run_offscreen.sh
+#
+# Sample                 Requirement it is the only cover for
+# ---------------------  ----------------------------------------------------
+# triangle               vertex+fragment draw, TRIANGLE_LIST, depth, blend
+# pushconstants          push constants
+# dynamicuniformbuffer   dynamic UBO offsets
+# instancing             instanced + indexed draws, second vertex buffer
+# particlesystem         POINT_LIST topology, alpha blend
+# texture                2D sampled textures, mip chains, filters, wrap modes
+# texture3d              3D images (R8G8B8A8, R8G8, R32_SINT, R16_SINT)
+# texturecubemap         cube images, 6 layers, mipmapped
+# texturemipmapgen       runtime mip generation by blit (up to 12 levels)
+# bloom                  render to colour+depth offscreen, then sample it back
+# multisampling          4x MSAA (D32_SFLOAT, A2B10G10R10, R8_UNORM)
+# pbribl                 HDR render targets (R16G16B16A16_SFLOAT, B10G11R11)
+# computeshader          compute pipelines, storage images
+# negativeviewportheight VK_KHR_maintenance1 (a requested extension)
+# multithreading         multi-threaded submission (CUDA context contention)
+# renderheadless         host readback of a rendered image (black-frames bug)
+# gltfscenerendering     real scene: many pipelines, materials, normal mapping
+# vulkanscene            mixed-geometry demo scene, kept by preference
+#
+# NOT COVERED by any sample in the upstream repo:
+#   BC1_RGB / BC3 compressed textures (576 images in the capture). The only
+#   sample touching compressed formats is deferredshadows, which needs
+#   geometry shaders. Exercise BC through the GFXReconstruct replay instead.
+#
+# Note on the sample named "offscreen": it is not about running without a
+# window (every sample does that with --offscreen). It is a two-pass
+# render-to-texture mirror effect. It is left out because bloom exercises the
+# same render-to-texture-then-sample path.
+#
+# Deliberately excluded as not required: stencil, multiple colour attachments,
+# geometry and tessellation stages, ray tracing, compare/shadow samplers,
+# occlusion queries. See examples_in_scope.txt in ~/git/Vulkan for the wider
+# set that adds redundant coverage on top of this one.
+
+triangle
+pushconstants
+dynamicuniformbuffer
+instancing
+particlesystem
+texture
+texture3d
+texturecubemap
+texturemipmapgen
+bloom
+multisampling
+pbribl
+computeshader
+negativeviewportheight
+multithreading
+renderheadless
+gltfscenerendering
+vulkanscene
