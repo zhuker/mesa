@@ -7,19 +7,16 @@ only cares that the two directories hold images with matching names.
     ./run_offscreen.sh                  # once per driver, into two directories
     cp_gallery.py ref_dir cuda_dir -o compare.html
 
-Every thumbnail is embedded as a data URI, so the page is one file that can be
-copied or served from anywhere. Thumbnails are point sampled rather than
-filtered, so what the page shows is real pixels rather than an average that
-could invent or hide a difference. The difference map is computed at full
-resolution and then reduced by taking the worst pixel in each block, so a single
-differing pixel still lights up after downscaling.
+Images are written as full resolution PNGs next to the page and referenced from
+it, so every panel can be opened one to one. The page scales them down for
+layout; clicking one opens it at its native size with nearest neighbour
+sampling, so a single differing pixel stays a single crisp pixel.
 
 Reads PNG and binary PPM through cp_compare, and needs nothing outside the
 standard library.
 """
 
 import argparse
-import base64
 import glob
 import os
 import struct
@@ -44,38 +41,38 @@ def write_png(width, height, rows):
             chunk(b'IEND', b''))
 
 
-def data_uri(png):
-    return 'data:image/png;base64,' + base64.b64encode(png).decode('ascii')
+def write_png_file(path, width, height, rows):
+    with open(path, 'wb') as f:
+        f.write(write_png(width, height, rows))
 
 
-def thumbnail(rows, w, h, ch, out_w):
-    """Point sampled downscale to out_w, preserving aspect."""
-    out_w = min(out_w, w)
-    out_h = max(1, h * out_w // w)
+def as_rgb(rows, w, ch):
+    """Drop the alpha channel, which the PNG writer does not emit."""
+    if ch == 3:
+        return rows
     out = []
-    for y in range(out_h):
-        sy = y * h // out_h
-        src = rows[sy]
-        row = bytearray(out_w * 3)
-        for x in range(out_w):
-            sx = (x * w // out_w) * ch
-            row[x * 3:x * 3 + 3] = src[sx:sx + 3]
+    for src in rows:
+        row = bytearray(w * 3)
+        for x in range(w):
+            row[x * 3:x * 3 + 3] = src[x * ch:x * ch + 3]
         out.append(row)
-    return out, out_w, out_h
+    return out
 
 
-def compare(ref, test, w, h, ch_ref, ch_test, tol, out_w):
-    """Per-pixel stats plus a difference map reduced by worst-in-block."""
-    out_w = min(out_w, w)
-    out_h = max(1, h * out_w // w)
-    block = [[0] * out_w for _ in range(out_h)]
+def compare(ref, test, w, h, ch_ref, ch_test, tol):
+    """Per-pixel stats plus a full resolution difference map.
 
+    The map is kept at the source resolution so it can be inspected one to one;
+    it is black where the two agree, which is most of it, so PNG compresses it
+    to a fraction of what a photographic image of the same size would cost.
+    """
     diff_count = 0
     max_delta = 0
+    rows = []
 
     for y in range(h):
         r, t = ref[y], test[y]
-        by = block[min(y * out_h // h, out_h - 1)]
+        row = bytearray(w * 3)
         for x in range(w):
             ri, ti = x * ch_ref, x * ch_test
             d = max(abs(r[ri] - t[ti]),
@@ -85,22 +82,12 @@ def compare(ref, test, w, h, ch_ref, ch_test, tol, out_w):
                 max_delta = d
             if d > tol:
                 diff_count += 1
-                bx = min(x * out_w // w, out_w - 1)
-                if d > by[bx]:
-                    by[bx] = d
-
-    # Black where the two agree, heat where they do not.
-    rows = []
-    for by in block:
-        row = bytearray(out_w * 3)
-        for x, d in enumerate(by):
-            if d:
                 s = min(255, 64 + d)
                 row[x * 3] = s
                 row[x * 3 + 1] = max(0, s - 160)
         rows.append(row)
 
-    return diff_count, max_delta, rows, out_w, out_h
+    return diff_count, max_delta, rows
 
 
 PAGE = """<title>{title}</title>
@@ -147,10 +134,30 @@ a {{ color: var(--accent); }}
 figure {{ margin: 0; }}
 figcaption {{ font-size: 12px; color: var(--muted); margin-bottom: .3rem; }}
 img {{ width: 100%; height: auto; display: block; border-radius: 5px; background: #000; }}
-.flip {{ position: relative; cursor: pointer; }}
+.flip {{ position: relative; }}
 .flip img.b {{ position: absolute; inset: 0; opacity: 0; }}
 .flip:hover img.b {{ opacity: 1; }}
 .hint {{ font-size: 12px; color: var(--muted); margin-top: .5rem; }}
+img.zoomable {{ cursor: zoom-in; }}
+#lightbox {{
+  display: none; position: fixed; inset: 0; z-index: 50; overflow: auto;
+  background: rgba(0, 0, 0, .92); cursor: zoom-out; padding: 0;
+}}
+#lightbox.on {{ display: block; }}
+/* Natural size, nearest neighbour: a single differing pixel has to stay a
+   single crisp pixel when the map is inspected one to one. */
+#lb-stack {{ position: relative; display: table; margin: 0 auto; }}
+#lightbox img {{
+  width: auto; max-width: none; border-radius: 0; display: block;
+  image-rendering: pixelated;
+}}
+#lb-b {{ position: absolute; inset: 0; opacity: 0; }}
+#lb-stack:hover #lb-b {{ opacity: 1; }}
+#lb-hint {{
+  position: fixed; left: 0; right: 0; bottom: 0; margin: 0; padding: .5rem;
+  text-align: center; font-size: 13px; color: #cfcfd8;
+  background: rgba(0, 0, 0, .65); pointer-events: none;
+}}
 </style>
 <div class="wrap">
 <h1>{title}</h1>
@@ -165,6 +172,30 @@ img {{ width: 100%; height: auto; display: block; border-radius: 5px; background
 </div>
 {cards}
 </div>
+<div id="lightbox" onclick="this.classList.remove('on')">
+<div id="lb-stack"><img id="lb-a" alt=""><img id="lb-b" alt=""></div>
+<p id="lb-hint"></p>
+</div>
+<script>
+function zoom(src, flip, label) {{
+  var lb = document.getElementById('lightbox');
+  var b = document.getElementById('lb-b');
+  document.getElementById('lb-a').src = src;
+  if (flip) {{
+    b.src = flip;
+    b.style.display = '';
+  }} else {{
+    b.removeAttribute('src');
+    b.style.display = 'none';
+  }}
+  document.getElementById('lb-hint').textContent = label || '';
+  lb.classList.add('on');
+  return false;
+}}
+document.addEventListener('keydown', function (e) {{
+  if (e.key === 'Escape') document.getElementById('lightbox').classList.remove('on');
+}});
+</script>
 """
 
 CARD = """<div class="card" id="{name}">
@@ -172,11 +203,17 @@ CARD = """<div class="card" id="{name}">
 <span class="stat">{diff:,} / {total:,} px ({pct:.2f}%) &middot; max &Delta; {delta}</span>
 <span class="{cls}">{verdict}</span></div>
 <div class="grid">
-<figure><figcaption>{ref_label}</figcaption><img src="{ref}" alt="{name} {ref_label}"></figure>
+<figure><figcaption>{ref_label}</figcaption>
+<img class="zoomable" loading="lazy" src="{ref}" alt="{name} {ref_label}"
+     onclick="zoom('{ref}', null, '{name} &mdash; {ref_label}')"></figure>
 <figure><figcaption>{test_label} &mdash; hover to flip to {ref_label}</figcaption>
-<div class="flip"><img src="{test}" alt="{name} {test_label}">
-<img class="b" src="{ref}" alt="{name} {ref_label}"></div></figure>
-<figure><figcaption>difference &gt; {tol}/255</figcaption><img src="{diffmap}" alt="{name} difference"></figure>
+<div class="flip zoomable"
+     onclick="zoom('{test}', '{ref}', '{name} &mdash; {test_label}, hover to flip to {ref_label}')">
+<img loading="lazy" src="{test}" alt="{name} {test_label}">
+<img class="b" loading="lazy" src="{ref}" alt="{name} {ref_label}"></div></figure>
+<figure><figcaption>difference &gt; {tol}/255</figcaption>
+<img class="zoomable" loading="lazy" src="{diffmap}" alt="{name} difference"
+     onclick="zoom('{diffmap}', null, '{name} &mdash; difference')"></figure>
 </div>
 </div>
 """
@@ -190,12 +227,17 @@ def main():
     ap.add_argument('-o', '--out', default='compare.html', help='output HTML file')
     ap.add_argument('-t', '--tol', type=int, default=8,
                     help='per-channel tolerance, 0-255 (default 8)')
-    ap.add_argument('-w', '--width', type=int, default=480,
-                    help='thumbnail width in pixels (default 480)')
+    ap.add_argument('--images', default=None,
+                    help='directory for the PNGs the page references '
+                         '(default: <out>_images next to the page)')
     ap.add_argument('--ref-label', default='reference')
     ap.add_argument('--test-label', default='cudapipe')
     ap.add_argument('--title', default='Renderer comparison')
     args = ap.parse_args()
+
+    img_dir = args.images or os.path.splitext(args.out)[0] + '_images'
+    os.makedirs(img_dir, exist_ok=True)
+    rel = os.path.relpath(img_dir, os.path.dirname(os.path.abspath(args.out)))
 
     # A directory may hold the same render as both .ppm and .png; one entry per
     # sample, preferring the ppm the samples write themselves.
@@ -223,10 +265,13 @@ def main():
             print(f'{base}: size mismatch {rw}x{rh} vs {tw}x{th}, skipped')
             continue
 
-        diff, delta, dmap, dw, dh = compare(ref, test, rw, rh, rch, tch,
-                                            args.tol, args.width)
-        ref_t, w1, h1 = thumbnail(ref, rw, rh, rch, args.width)
-        test_t, w2, h2 = thumbnail(test, tw, th, tch, args.width)
+        diff, delta, dmap = compare(ref, test, rw, rh, rch, tch, args.tol)
+
+        write_png_file(os.path.join(img_dir, base + '_ref.png'),
+                       rw, rh, as_rgb(ref, rw, rch))
+        write_png_file(os.path.join(img_dir, base + '_test.png'),
+                       tw, th, as_rgb(test, tw, tch))
+        write_png_file(os.path.join(img_dir, base + '_diff.png'), rw, rh, dmap)
 
         results.append({
             'name': base,
@@ -234,9 +279,9 @@ def main():
             'total': rw * rh,
             'pct': 100.0 * diff / (rw * rh),
             'delta': delta,
-            'ref': data_uri(write_png(w1, h1, ref_t)),
-            'test': data_uri(write_png(w2, h2, test_t)),
-            'diffmap': data_uri(write_png(dw, dh, dmap)),
+            'ref': f'{rel}/{base}_ref.png',
+            'test': f'{rel}/{base}_test.png',
+            'diffmap': f'{rel}/{base}_diff.png',
         })
         print(f'{base:24s} {diff:>8}/{rw * rh} ({100.0 * diff / (rw * rh):6.2f}%)')
 
@@ -267,7 +312,8 @@ def main():
                 f'more differ in under 0.1% of pixels, at a tolerance of '
                 f'{args.tol}/255. Left is {args.ref_label}, middle is '
                 f'{args.test_label} (hover to flip), right marks where they '
-                f'disagree. Sorted worst first.')
+                f'disagree. Click any panel to open it at full resolution. '
+                f'Sorted worst first.')
 
     html = PAGE.format(title=args.title, subtitle=subtitle,
                        rows='\n'.join(rows), cards='\n'.join(cards))
@@ -275,8 +321,11 @@ def main():
         f.write(html)
 
     size = os.path.getsize(args.out)
+    imgs = sum(os.path.getsize(os.path.join(img_dir, f))
+               for f in os.listdir(img_dir))
     print(f'\n{matched}/{len(results)} match exactly, {near} near  ->  '
-          f'{args.out} ({size / 1e6:.1f} MB)')
+          f'{args.out} ({size / 1e3:.0f} kB, images {imgs / 1e6:.0f} MB in '
+          f'{img_dir})')
     return 0
 
 
