@@ -96,9 +96,11 @@ static const struct vk_instance_extension_table lvp_instance_extensions_supporte
    .KHR_get_physical_device_properties2      = true,
    .EXT_debug_report                         = true,
    .EXT_debug_utils                          = true,
+   /* Advertised without WSI so offscreen apps can enable it for the
+    * PRESENT_SRC_KHR image layout. No surface is ever created. */
+   .KHR_surface                              = true,
 #ifdef LVP_USE_WSI_PLATFORM
    .KHR_get_surface_capabilities2            = true,
-   .KHR_surface                              = true,
    .KHR_surface_maintenance1                 = true,
    .KHR_surface_protected_capabilities       = true,
    .EXT_swapchain_colorspace                 = true,
