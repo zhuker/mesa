@@ -6,8 +6,9 @@ A Mesa Vulkan ICD (`libvulkan_cudapipe.so`) that rasterizes on NVIDIA GPUs using
 CUDA compute kernels instead of fixed-function hardware. It reuses lavapipe as
 the Vulkan frontend and replaces the Gallium driver underneath.
 
-The feature set is driven entirely by what Roblox's HeadlessStreamer actually
-requires, measured from a GFXReconstruct capture — not guessed from specs.
+The feature set is driven by what Roblox's HeadlessStreamer actually requires,
+measured from a GFXReconstruct capture — see
+`src/gallium/drivers/cudapipe/tests/headless_streamer_requirements.txt`.
 
 ## Build
 
@@ -19,9 +20,20 @@ meson setup build-cudapipe -Dvulkan-drivers=swrast \
 ninja -C build-cudapipe
 ```
 
-Needs meson >= 1.4, LLVM 18 with the NVPTX backend, and CUDA toolkit at
-`/usr/local/cuda`. The Vulkan SDK at `~/vulkan-sdk/` provides glslangValidator
-and SPIRV-Tools. Add its bin/ and include/ to PATH/C_INCLUDE_PATH when building.
+meson and ninja come from a pip venv at `./venv` (the distro's meson is too
+old); it also needs `mako`, `packaging` and `pyyaml`. If the venv is missing,
+`ninja` fails before compiling anything, because `build.ninja` records the
+absolute path of the meson that generated it — recover with
+`./venv/bin/meson setup --reconfigure build-cudapipe`.
+
+CUDA is 12.8 at `/usr/local/cuda`, so `cuCtxCreate` takes three arguments;
+code written against CUDA 13's four-argument form does not compile. The Vulkan
+SDK is at `~/vulkan-sdk/1.4.357.1/x86_64` — put its `bin` on `PATH`.
+
+```bash
+export PATH="$PWD/venv/bin:$HOME/vulkan-sdk/1.4.357.1/x86_64/bin:$PATH"
+ninja -C build-cudapipe src/gallium/targets/cudapipe/libvulkan_cudapipe.so
+```
 
 Run without installing:
 
@@ -30,124 +42,123 @@ VK_DRIVER_FILES=$PWD/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv
   <vulkan app>
 ```
 
-## Current Status
+## Testing: the sample sweep
 
-### Adaptive Rasterizer (NEW)
+The Sascha Willems samples at `~/git/Vulkan` all render offscreen and
+reproducibly, which makes them a differential oracle: run the same binary
+against the NVIDIA ICD and against cudapipe, and diff the frames. This is a far
+stronger signal than dEQP's per-feature pass/fail, and it found every bug fixed
+so far.
 
-The single-thread-per-triangle rasterizer has been replaced with a 3-stage
-adaptive dispatch:
-
-| Stage | Scope | Method |
-|---|---|---|
-| Stage 1 | bbox ≤ 128 px | 1 thread/tri, incremental edge stepping |
-| Stage 2 | bbox ≤ 4096 px | 1 warp (32 threads) per tri, `__shfl_sync` broadcast |
-| Stage 3 | bbox > 4096 px | 1 block (64 threads) per 64×64 tile, trivial accept/reject |
-
-**Performance (GFXReconstruct replay):**
-
-| Metric | Before | After (adaptive) |
-|---|---|---|
-| ms/draw average | 0.35 | 0.18 |
-| Draws before crash | 522 (15s) | 3042 |
-| GPU utilization | 95–99% | 57–64% |
-
-The ~2× raster speedup shifts the bottleneck from GPU compute to CPU draw
-submission (single-threaded `cuLaunchKernel` calls).
-
-### Roblox HeadlessStreamer (live)
-
-HeadlessStreamer now runs live against cudapipe with software encoding.
-Device creation succeeds, draws execute on GPU, video frames are produced.
-Frames are currently **black** due to a memory-model mismatch (see "Known
-Issues" below).
-
-**Command:**
-```bash
-ICD=build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv_icd.x86_64.json
-VK_DRIVER_FILES=$ICD ./HeadlessStreamer \
-    --authCookie "$COOKIE" --placeId "$PLACEID" \
-    --softwareEncoder \
-    --setFlags=FFlagHeadlessStreamerEnableGIR=false,FFlagVulkanVideoEncodingEnabled=false,FFlagSupportHeadlessDeviceVulkan=true
-```
-
-Required app-side change: in `DeviceVulkan.cpp:2271`, remove the
-`FFlag::VulkanVideoEncodingEnabled` guard from the headless framebuffer
-creation so it fires unconditionally in headless mode:
-```cpp
-// Before:  if (FFlag::SupportHeadlessDeviceVulkan && FFlag::VulkanVideoEncodingEnabled)
-// After:   if (FFlag::SupportHeadlessDeviceVulkan)
-```
-
-**Fixes applied for live mode:**
-- `VK_KHR_swapchain` advertised unconditionally (app requests it at device
-  creation even in headless mode)
-- `VK_PHYSICAL_DEVICE_TYPE_OTHER` instead of `CPU` (app rejects CPU devices
-  when video encoding flag is set on non-Linux-client builds)
-- `cp_fence_finish` uses `cuCtxSynchronize()` (the fence handle from
-  lavapipe's threaded submit isn't a real CUevent)
-- `cp_launch_grid` guards `cuMemAllocManaged` failure (returns early instead
-  of crashing on NULL)
-- `cp_blit` CPU fallback path syncs GPU before reading managed memory
-- `cp_resource_copy_region` syncs GPU then uses memcpy (destination may be
-  host-only memory)
-
-### dEQP
-
-`dEQP-VK.api.smoke.*`: 6/6 pass.
-`dEQP-VK.texture.filtering.2d.formats.r8g8b8a8_unorm*`: 6/6 pass (12 unsupported).
-
-### GFXReconstruct replay
+`tests/headless_streamer_samples.txt` is the minimal set — each entry is the
+simplest sample covering a capability the capture needs, with the mapping in the
+file.
 
 ```bash
-ICD=build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv_icd.x86_64.json
-GFX=~/gfxreconstruct/build
-CUDAPIPE_DEBUG_TIME=1 VK_DRIVER_FILES=$ICD \
-    $GFX/tools/replay/gfxrecon-replay -m remap --remove-unsupported \
-    /tmp/headless_streamer_20260809T231703.gfxr
+cd ~/git/Vulkan
+S="$(grep -v '^#' ~/mesa/src/gallium/drivers/cudapipe/tests/headless_streamer_samples.txt | tr '\n' ' ')"
+ICD=~/mesa/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv_icd.x86_64.json
+
+SAMPLES="$S" VALIDATION=0 OUT=build/compare/ref \
+  VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json ./run_offscreen.sh
+SAMPLES="$S" VALIDATION=0 OUT=build/compare/cuda \
+  VK_DRIVER_FILES=$ICD ./run_offscreen.sh
+
+cd build/compare
+python3 ~/mesa/src/gallium/drivers/cudapipe/tests/cp_gallery.py ref cuda \
+    -o cudapipe_vs_nvidia.html
 ```
 
-Runs 3042 draws at 0.18 ms/draw, ~14 seconds total, then crashes (lavapipe
-descriptor bug — see below).
+`cp_compare.py` diffs two images (PNG or the PPM the samples write) and prints a
+percentage plus an ASCII map. `cp_gallery.py` builds an HTML page: summary table
+sorted worst-first, then reference / result / difference per sample, every panel
+full resolution and clickable, with the result hover-flipping to the reference.
 
-## Known Issues
+## Status
 
-### 1. Black frames in live HeadlessStreamer (BLOCKING)
+Differing pixels versus the NVIDIA driver at tolerance 8/255, on the committed
+tree (`f713031fc91`, i.e. without the in-progress anisotropy work):
 
-**Root cause:** `pipe_screen::allocate_memory` (backing for `VkDeviceMemory`)
-uses `calloc` because `cuMemAllocManaged` fails from lavapipe's submit thread
-(CUDA context not current). The app maps `VkDeviceMemory` directly to read
-framebuffer pixels, but the GPU rasterizer writes to a separate CUDA-managed
-buffer (from `cp_resource_create`). These are different physical memory.
+| Sample | Differing | Note |
+|---|---|---|
+| triangle | 0 | |
+| pushconstants | 0 | |
+| negativeviewportheight | 0 | |
+| renderheadless | 0 | host readback path |
+| texture | 4 | |
+| texture3d | 4 | |
+| bloom | 10 | |
+| dynamicuniformbuffer | 15 | |
+| vulkanscene | 34 | |
+| multithreading | 0.23% | speckle, cause unknown |
+| computeshader | 0.31% | |
+| texturecubemap | 1.32% | reflections too sharp, see below |
+| particlesystem | 2.65% | no POINT_LIST rasterization |
+| pbribl | 3.02% | reflections too sharp |
+| multisampling | 3.20% | no MSAA |
+| gltfscenerendering | 6.48% | some alpha-tested leaves missing |
+| instancing | 8.47% | cause unknown |
+| texturemipmapgen | 18.37% | no anisotropic filtering |
 
-**What works:** The GFX replay uses `--remove-unsupported` and doesn't do
-`vkMapMemory`-based readback — it just exercises the draw path. dEQP passes
-because its readback goes through `pipe_transfer_map` which returns the
-CUDA-managed `tex_data` pointer (after sync).
+Ten of eighteen are within a handful of pixels, from one before this work.
 
-**Fix direction:** Make `allocate_memory` return CUDA-accessible memory from
-any thread. Options:
-- Use CUDA's primary context API (`cuDevicePrimaryCtxRetain`) which is
-  thread-safe, instead of `cuCtxCreate`. Failed previously because something
-  in the process releases the primary context (error 716). Needs investigation.
-- Use `cuMemAllocHost` (pinned host memory, GPU-accessible, no context needed
-  per-thread). Needs context current at allocation time but memory is
-  accessible from any thread after.
-- Preallocate a pool of CUDA-managed memory on the main thread and hand out
-  chunks from it (avoids per-allocation CUDA calls from the submit thread).
+## In progress: anisotropic filtering
 
-### 2. Lavapipe descriptor crash (GFX replay only, ~3042 draws)
+**Uncommitted, in the working tree.** `texturemipmapgen` renders a plane at a
+grazing angle with `maxAnisotropy` at the device limit, and without aniso the
+tunnel blurs out; the Roblox capture also lists anisotropic samplers, so this is
+required work rather than polish.
 
-Segfault in `lvp_descriptor_set_create` → `memset(NULL)` when
-`allocate_memory` returns NULL. With the `calloc` fallback this doesn't
-crash (calloc doesn't fail for small sizes). With `cuMemAllocManaged` it
-fails from the submit thread. This is the same underlying issue as #1.
+`max_anisotropy` is plumbed from `pipe_sampler_state` through `cp_sampler_info`
+into `cp_tex_sample`, which computes a tap count and steps along the footprint's
+long axis, averaging. Where it stands:
 
-### 3. Stage 2/3 rasterizer needs pixel bounds check
+| Sample | committed | current WIP |
+|---|---|---|
+| texturemipmapgen | 18.37% | 5.50% |
+| instancing | 8.47% | 8.96% |
+| gltfscenerendering | 6.48% | 9.24% |
+| texture | 0.00% | 0.51% |
 
-Stage 2's warp-parallel loop can produce pixel coordinates outside the
-framebuffer when edge cases in floating-point screen-space positions occur.
-A bounds check (`px < 0 || px >= width || py < 0 || py >= height`) is in
-place and prevents CUDA_ERROR_ILLEGAL_ADDRESS.
+**What is left, and it is mechanical.** The current code derives the major axis
+direction as `theta = 0.5 * atan2(B, A - C)` and then `cos`/`sin`. On a
+near-isotropic footprint both `B` and `A - C` are near zero, so the angle is
+numerical noise and the taps scatter — which is why `texture`, a flat quad
+facing the camera, regressed.
+
+llvmpipe solves this without trig. `lp_apply_ellipse_transform`
+(`src/gallium/auxiliary/gallivm/lp_bld_sample.c:278`) rewrites the two
+derivative vectors into an equivalent pair aligned to the ellipse's own axes, so
+the cheap "longer of x or y" choice becomes correct:
+
+```
+A = dx.t² + dy.t²      C = dx.s² + dy.s²
+B = -2(dx.s·dx.t + dy.s·dy.t)
+F = det²,  det = dx.s·dy.t − dy.s·dx.t
+p = A − C,  q = A + C,  t = sqrt(p² + B²)
+
+newDx.s² = F(t+p) / (t(q+t))    newDx.t² = F(t−p) / (t(q+t))
+newDy.s² = F(t−p) / (t(q−t))    newDy.t² = F(t+p) / (t(q−t))
+```
+
+guarded by three degeneracies that must be checked *before* applying it, and
+which are the part hardest to rediscover: zero-length derivative, zero
+determinant (parallel vectors), and zero dot product (already perpendicular, so
+the transform is unnecessary). Then, from `lp_build_rho_aniso`:
+
+```
+eta² = clamp(rho_max² / rho_min², 1, aniso²)
+rate = ceil(sqrt(eta²))          // tap count
+rho_min² = rho_max² / eta²       // LOD basis — the UNROUNDED ratio
+```
+
+Dividing the level of detail by the rounded tap count instead of `eta²` drops it
+below the minor axis and renders sharper than the hardware; that was the
+over-sharpening in the first attempt, and correcting it recovered most of the
+`instancing` and `gltfscenerendering` regression.
+
+Replace the `atan2`/`cos`/`sin` block in `cp_sampler.cu` with the closed forms
+and the three guards, keep the existing tap loop, and re-run the sweep.
 
 ## Architecture
 
@@ -159,84 +170,106 @@ lavapipe frontend (reused as-is)
 cudapipe Gallium driver
     ├── State changes write into persistent cp_gpu_state (managed memory)
     ├── draw_vbo:
-    │   1. cuMemsetD32 queue counters
-    │   2. cp_vertex_fetch kernel (GPU gathers attributes)
-    │   3. Vertex shader kernel (NIR → PTX)
-    │   4. cp_rasterize_stage1 (small tris in-place, large → queue)
-    │   5. cp_rasterize_stage2 (warp-cooperative, huge → tile queue)
-    │   6. cp_rasterize_stage3 (block per tile, trivial accept/reject)
-    │   7. cp_fs_interpolate (compact pixels, interpolate varyings)
-    │   8. Fragment shader kernel (one thread per covered pixel)
-    │   9. cp_fs_writeback (blend into colour attachment)
+    │   1. cp_vertex_fetch      (GPU gathers attributes)
+    │   2. Vertex shader kernel (NIR → PTX)
+    │   3. cp_clip_triangles    (near plane and w > 0)
+    │   4. cp_rasterize_stage1/2/3 (adaptive: thread, warp, block per tile)
+    │   5. cp_fs_interpolate    (compact covered pixels, interpolate varyings)
+    │   6. Fragment shader kernel (one thread per covered pixel)
+    │   7. cp_fs_writeback      (discard mask, blend, into the attachment)
     └── flush: cuCtxSynchronize + scratch reclaim
 ```
 
-## Files Modified (this session)
+Shaders run as CUDA kernels named `main` taking one argument, a pointer to an
+array of pointers:
 
-| File | Change |
+| Slot | Meaning |
 |---|---|
-| `kernels/cp_rast_types.h` | Queue structs, thresholds, `cp_tile_pair` |
-| `kernels/cp_rasterize.cu` | 3-stage adaptive rasterizer |
-| `cp_context.h` | Queue device pointers |
-| `cp_context.c` | Queue alloc, 3-stage launch, `launch_grid` error guard |
-| `cp_kernels.h` | Stage 1/2/3 function handles |
-| `cp_kernels.c` | Load 3 kernel functions |
-| `cp_screen.c` | `cuCtxCreate` (private context), `fence_finish` sync, device name |
-| `cp_resource.c` | `allocate_memory`→calloc, `free_memory`→free, blit/copy sync |
-| `lvp_device.c` | `VK_KHR_swapchain` unconditional, `DEVICE_TYPE_OTHER` |
+| 0 | thread/vertex/pixel count |
+| 2 | input buffer (vertex attributes, or interpolated varyings) |
+| 3 | input stride |
+| 4 | output buffer |
+| 5 | vertex-id array |
+| 6 | fragment coordinates |
+| 7 | draw parameters |
+| 8 | discard mask (fragment stage) |
+| 18.. | uniform/descriptor buffers |
 
-## Performance Design
+## Known gaps, roughly by how much they matter
 
-| Principle | Implementation |
-|---|---|
-| No per-draw sync | `cuCtxSynchronize` only at flush/readback |
-| GPU vertex fetch | `cp_vertex_fetch.cu`; TRIANGLE_LIST reads IB on GPU |
-| Adaptive rasterize | 3-stage dispatch matches triangle size to parallelism |
-| No CPU topology expansion | `cp_build_vertex_refs` skipped for 94% of draws |
-| Direct managed writes | Small arg structs written directly (no cuMemcpyHtoD) |
-| Bounded memory | Scratch grows monotonically, reclaimed at flush |
-
-## Next Steps (priority order)
-
-1. **Fix black frames** — solve the `allocate_memory` threading problem so
-   `VkDeviceMemory` and the GPU render target share the same physical memory.
-   This is the only blocker for live HeadlessStreamer producing video.
-
-2. **Restore adaptive rasterizer threshold** — currently `CP_SMALL_THRESHOLD`
-   is set to 999999 (all stage 1) for debugging. Restore to 128 once the
-   stage 2 bounds issue is fully resolved.
-
-3. **Kernel fusion** — merge interpolate + FS + writeback to reduce launch
-   count from 9 to 6 per draw.
-
-4. **Line rasterization** — Bresenham kernel for `line_list`/`line_strip`.
+1. **Derivatives only exist for varyings.** `emit_tex` traces a texture
+   coordinate back to its `load_input` slot at compile time, because
+   `cp_fs_interpolate` computes derivatives analytically per varying. A
+   coordinate computed inside the shader — `reflect(-V, N)` for an environment
+   map — gets none and samples the base level, which is why the spheres in
+   `pbribl` and `texturecubemap` reflect too sharply. Fixing it properly means
+   shading in 2x2 quads with cross-lane derivatives, which is also what
+   `textureGrad` and the remaining `emit_tex` gaps need.
+2. **Explicit LOD on cube samples** may not be honoured — `pbribl` uses
+   `textureLod(prefilteredMap, R, roughness * mips)` and still reflects too
+   sharply. Narrow and worth checking before the item above.
+3. **Anisotropic filtering** — in progress, see above.
+4. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
+5. **No line or point rasterization.** The capture uses POINT_LIST.
+6. **Alpha-tested geometry that overlaps itself within one draw** is not exact:
+   visibility resolves before the shader runs, so a discarded fragment can
+   already have occluded another of the same draw. Separate draws are fine.
+7. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
+   compressed textures, and the capture has 576 BC images.
+8. `multithreading` (0.23%) and `instancing` (8.47%) have no diagnosis yet.
 
 ## Debug
 
 | Variable | Effect |
 |---|---|
+| `CUDAPIPE_DEBUG_DRAW` | draws, blend state, why a draw was skipped, clears, blits |
 | `CUDAPIPE_DEBUG_TIME` | per-draw timing breakdown |
-| `CUDAPIPE_DEBUG_DRAW` | draw call summary, blit info, pixel count |
 | `CUDAPIPE_DEBUG_TEX` | sampler/texture descriptor resolution |
-| `CUDAPIPE_DEBUG_FS` | per-pixel fragment inputs/outputs |
+| `CUDAPIPE_DEBUG_FS` | per-pixel fragment inputs/outputs, VS output positions |
+| `CUDAPIPE_DEBUG_LAUNCH` | compute UBO/SSBO bindings |
 | `CUDAPIPE_DEBUG_SHADER` | warn on unhandled NIR intrinsics |
 | `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
 
-## Implementation Notes
+**`compute-sanitizer` is the fastest way to diagnose a CUDA fault.** Errors 700
+(illegal address) and 716 (misaligned) are sticky and surface at whatever launch
+comes next, so the reported site is rarely the cause:
+
+```bash
+/usr/local/cuda/bin/compute-sanitizer --tool memcheck --print-limit 2 \
+    env VK_DRIVER_FILES=$ICD ./sample --offscreen -ofn out.ppm
+```
+
+That is how the vertex-fetch alignment fault and the out-of-bounds `imageLoad`
+were found — the latter killed the whole frame, because once the context faults
+even `cuMemAlloc` fails, and draws then bailed out for want of a visibility
+buffer several stages away from the cause.
+
+## Implementation notes
 
 * `.cu` kernels are stringified at build time by `kernels/cu_to_inc.py`.
-* `struct cp_resource` embeds `struct llvmpipe_resource` first — lavapipe
-  reads its fields at fixed offsets. Don't reorder.
-* The visibility buffer stores triangle index complemented (`~triID`) so
+* `struct cp_resource` embeds `struct llvmpipe_resource` first — lavapipe reads
+  its fields at fixed offsets. Don't reorder.
+* The visibility buffer stores the triangle index complemented (`~triID`) so
   `atomicMin` resolves coplanar triangles in primitive order.
-* Resources use `cuMemAllocManaged` (in `cp_resource_create`) because
-  lavapipe accesses `lpr.data` directly from CPU. Internal buffers (visbuf,
-  depthbuf, scratch, rasterizer queues) use `cuMemAlloc`.
-* `pipe_screen::allocate_memory` uses `calloc` as a workaround for CUDA
-  context threading. This is why `VkDeviceMemory`-backed resources can't be
-  GPU-rendered (the black frames issue).
-* `cuCtxCreate` gives cudapipe a private CUDA context. `cuCtxSetCurrent` is
-  called before every CUDA operation. The submit thread and main thread
-  contend for the context — only one can use it at a time.
-* `VK_KHR_swapchain` is advertised but not implemented (HeadlessStreamer
-  requests it at device creation but never calls swapchain functions).
+* `pipe_screen::allocate_memory` returns `cuMemAllocManaged` memory with
+  `cuCtxSetCurrent` first, because lavapipe allocates from its submit thread. A
+  context may be current on several threads at once.
+* **An unimplemented operation that returns zero destroys everything
+  downstream.** `textureSize` read as zero made a blur kernel compute `1/0` for
+  its tap offsets and sample at infinity, blackening the whole frame;
+  `terminate_if` returning undef collapsed shaders; `gl_InstanceIndex` silently
+  did nothing for a while. `CUDAPIPE_DEBUG_SHADER=1` lists them.
+* **Read the other Mesa backends before deriving an algorithm.** llvmpipe is in
+  the same tree, and `lp_bld_sample.c` had a better answer for anisotropic
+  filtering than two hand-derived attempts, including the degenerate-case guards.
+* NIR keeps a storage image's format on the intrinsic and hands the shader
+  whatever type it asked for, so the driver owns both the texel stride and the
+  packing. Taking the stride from the destination type walks the image at the
+  wrong rate.
+* Vertex attributes with fewer than four components read as `(0, 0, 0, 1)`. A
+  shader taking a vec3 position as vec4 otherwise loses its transform's
+  translation column — the geometry still draws and still writes depth, so it
+  looks like a missing object rather than a broken one.
+* LLVM's NVPTX backend only knows architectures that existed when it was
+  released, so `CP_MAX_PTX_SM` in `cp_nir_to_llvm.c` caps the architecture and
+  lets the driver JIT forward. Raise it together with the PTX ISA version.
