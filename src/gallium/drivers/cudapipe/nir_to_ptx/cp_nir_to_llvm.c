@@ -249,6 +249,32 @@ emit_terminate(struct ntl_context *ctx, LLVMValueRef cond)
    LLVMBuildStore(ctx->builder, set, slot);
 }
 
+/*
+ * Storage image formats. NIR keeps the format on the intrinsic and hands the
+ * shader whatever type it asked for, so the driver is responsible both for the
+ * texel stride and for packing to and from it.
+ */
+static bool
+cp_image_format_is_unorm8(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static unsigned
+cp_image_format_size(enum pipe_format format, unsigned fallback_bits)
+{
+   unsigned size = format != PIPE_FORMAT_NONE
+      ? util_format_get_blocksize(format) : 0;
+   return size ? size : MAX2(fallback_bits / 8, 1u);
+}
+
 static void
 emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
 {
@@ -831,7 +857,14 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
 
       /* byte_offset = base_offset + z * img_stride + y * row_stride + x * pixel_size */
       unsigned bit_size = instr->def.bit_size;
-      unsigned pixel_size = bit_size / 8;
+      /*
+       * The texel's size comes from the image format, not from the type the
+       * shader wants back. NIR asks for a vec4 of float32 out of an 8 bit per
+       * channel image, and taking the destination's width as the stride walks
+       * the image four times too fast.
+       */
+      unsigned pixel_size = cp_image_format_size(nir_intrinsic_format(instr),
+                                                 bit_size);
       LLVMValueRef offset_val = LLVMBuildAdd(ctx->builder, base_offset,
          LLVMBuildAdd(ctx->builder,
             LLVMBuildAdd(ctx->builder,
@@ -842,13 +875,42 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       /* Load pixel */
       LLVMValueRef pixel_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), base_ptr, &offset_val, 1, "");
+      unsigned num_comp = instr->def.num_components;
+
+      /*
+       * An 8 bit per channel image has to be unpacked: the shader asked for
+       * floats in [0, 1], and handing it the raw word leaves the emboss filter
+       * convolving bit patterns.
+       */
+      if (cp_image_format_is_unorm8(nir_intrinsic_format(instr))) {
+         LLVMTypeRef f32t = LLVMFloatTypeInContext(ctx->llvm_ctx);
+         LLVMValueRef word = LLVMBuildLoad2(ctx->builder, i32,
+            LLVMBuildBitCast(ctx->builder, pixel_ptr,
+                             LLVMPointerType(i32, 0), ""), "img_word");
+         LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(f32t, num_comp));
+         for (unsigned c = 0; c < num_comp; c++) {
+            LLVMValueRef byte = LLVMBuildAnd(ctx->builder,
+               LLVMBuildLShr(ctx->builder, word,
+                             LLVMConstInt(i32, c * 8, false), ""),
+               LLVMConstInt(i32, 0xFF, false), "");
+            LLVMValueRef f = LLVMBuildFMul(ctx->builder,
+               LLVMBuildUIToFP(ctx->builder, byte, f32t, ""),
+               LLVMConstReal(f32t, 1.0 / 255.0), "");
+            vec = LLVMBuildInsertElement(ctx->builder, vec, f,
+                                         LLVMConstInt(i32, c, false), "");
+         }
+         set_ssa_def(ctx, &instr->def, num_comp > 1 ? vec :
+            LLVMBuildExtractElement(ctx->builder, vec,
+                                    LLVMConstInt(i32, 0, false), ""));
+         break;
+      }
+
       LLVMTypeRef pixel_type = get_llvm_type(ctx, bit_size, 1);
       LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, pixel_ptr,
          LLVMPointerType(pixel_type, 0), "");
       LLVMValueRef pixel_val = LLVMBuildLoad2(ctx->builder, pixel_type, typed_ptr, "img_load");
 
       /* Return as vec4 (only .x is meaningful for r32 formats) */
-      unsigned num_comp = instr->def.num_components;
       if (num_comp > 1) {
          LLVMValueRef vec = LLVMGetUndef(get_llvm_type(ctx, bit_size, num_comp));
          vec = LLVMBuildInsertElement(ctx->builder, vec, pixel_val,
@@ -904,14 +966,45 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef z = LLVMBuildExtractElement(ctx->builder, coord,
          LLVMConstInt(i32, 2, false), "z");
 
-      /* Extract first component of data for single-component formats */
+      /* An 8 bit per channel image takes a packed word, not the shader's
+       * float vector; storing one component of that wrote a quarter of the
+       * texel and left the rest of the image untouched. */
+      bool pack_unorm8 = cp_image_format_is_unorm8(nir_intrinsic_format(instr)) &&
+                         LLVMGetTypeKind(LLVMTypeOf(data)) == LLVMVectorTypeKind;
       LLVMValueRef store_val = data;
-      if (LLVMGetTypeKind(LLVMTypeOf(data)) == LLVMVectorTypeKind)
+
+      if (pack_unorm8) {
+         LLVMTypeRef f32t = LLVMFloatTypeInContext(ctx->llvm_ctx);
+         unsigned comps = LLVMGetVectorSize(LLVMTypeOf(data));
+         LLVMValueRef word = LLVMConstInt(i32, 0, false);
+         for (unsigned c = 0; c < comps && c < 4; c++) {
+            LLVMValueRef f = LLVMBuildExtractElement(ctx->builder, data,
+               LLVMConstInt(i32, c, false), "");
+            /* Clamp before scaling so an out of range value saturates instead
+             * of wrapping into a neighbouring channel. */
+            LLVMValueRef lo = LLVMConstReal(f32t, 0.0);
+            LLVMValueRef hi = LLVMConstReal(f32t, 1.0);
+            f = LLVMBuildSelect(ctx->builder,
+                   LLVMBuildFCmp(ctx->builder, LLVMRealOLT, f, lo, ""), lo, f, "");
+            f = LLVMBuildSelect(ctx->builder,
+                   LLVMBuildFCmp(ctx->builder, LLVMRealOGT, f, hi, ""), hi, f, "");
+            LLVMValueRef b = LLVMBuildFPToUI(ctx->builder,
+               LLVMBuildFAdd(ctx->builder,
+                  LLVMBuildFMul(ctx->builder, f, LLVMConstReal(f32t, 255.0), ""),
+                  LLVMConstReal(f32t, 0.5), ""), i32, "");
+            word = LLVMBuildOr(ctx->builder, word,
+               LLVMBuildShl(ctx->builder, b,
+                            LLVMConstInt(i32, c * 8, false), ""), "");
+         }
+         store_val = word;
+      } else if (LLVMGetTypeKind(LLVMTypeOf(data)) == LLVMVectorTypeKind) {
          store_val = LLVMBuildExtractElement(ctx->builder, data,
             LLVMConstInt(i32, 0, false), "");
+      }
 
-      unsigned pixel_size = LLVMGetIntTypeWidth(LLVMTypeOf(store_val)) / 8;
-      if (pixel_size == 0) pixel_size = 4;
+      unsigned pixel_size = cp_image_format_size(nir_intrinsic_format(instr),
+         LLVMGetTypeKind(LLVMTypeOf(store_val)) == LLVMIntegerTypeKind
+            ? LLVMGetIntTypeWidth(LLVMTypeOf(store_val)) : 32);
 
       LLVMValueRef offset_val = LLVMBuildAdd(ctx->builder, base_offset,
          LLVMBuildAdd(ctx->builder,
