@@ -17,11 +17,12 @@
  * into each linked module before launching. */
 __device__ unsigned long long cp_sampler_table;
 
-/* Screen-space derivatives of the fragment shader's inputs, produced by
- * cp_fs_interpolate and indexed by the same thread id the shader runs under.
- * Used to pick a mip level when the coordinate comes straight from a varying. */
-__device__ unsigned long long cp_fs_deriv;
-__device__ unsigned int cp_fs_deriv_stride;
+/*
+ * Non-zero while a fragment shader is running, where threads are laid out four
+ * to a 2x2 quad and screen-space derivatives can be taken by shuffling between
+ * them. Compute shaders have no such neighbourhood and sample the base level.
+ */
+__device__ int cp_quad_derivs;
 
 enum {
    CP_WRAP_REPEAT = 0,
@@ -701,32 +702,33 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
    bool have_lod = false;
    int aniso_taps = 1;
    float aniso_du = 0.0f, aniso_dv = 0.0f;
-   if (coord_slot >= 0 && cp_fs_deriv) {
-      unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
-      const float4 *d = (const float4 *)(cp_fs_deriv +
-                                         (size_t)tid * cp_fs_deriv_stride +
-                                         (size_t)coord_slot * 16);
+   if (flags & CP_TEX_LOD) {
+      /* textureLod names the level outright — a prefiltered environment map
+       * indexed by roughness depends on it, and deriving one from the
+       * coordinate instead ignores what the shader asked for. */
+      lod = explicit_lod;
+      have_lod = true;
+   } else if (cp_quad_derivs) {
+      /*
+       * Derivatives by shuffling across the 2x2 quad, which is how hardware
+       * does it. Differencing the *final* texture coordinate — after the cube
+       * face projection, after any array or 3D handling — means every target
+       * is covered by the same code, and a coordinate the shader computed for
+       * itself, such as a reflection vector, gets a level of detail like any
+       * other. The lane's parity decides the sign of the difference; only
+       * magnitudes and a symmetric tap direction are used, so it does not
+       * matter.
+       */
+      const unsigned full = 0xFFFFFFFFu;
+      float du_dx = __shfl_xor_sync(full, u, 1) - u;
+      float dv_dx = __shfl_xor_sync(full, v, 1) - v;
+      float du_dy = __shfl_xor_sync(full, u, 2) - u;
+      float dv_dy = __shfl_xor_sync(full, v, 2) - v;
+
       float w0 = (float)tex->width;
       float h0 = (float)tex->height;
-      float sx = 1.0f, sy = 1.0f;
-
-      if (target == CP_TEX_CUBE || target == CP_TEX_CUBE_ARRAY) {
-         /*
-          * A cube coordinate is a direction of arbitrary length — a skybox
-          * hands us its cube's corner positions — so the derivative of the
-          * raw components says nothing about texel density until it is put
-          * into face space. Dividing by the major axis is what the face
-          * projection does, and the extra half maps [-1, 1] onto [0, 1].
-          * Skipping this scales the level of detail by the size of the
-          * application's skybox, which sampled a far too coarse mip.
-          */
-         float ma = fmaxf(fmaxf(fabsf(c0), fabsf(c1)), fabsf(c2));
-         if (ma > 0.0f)
-            sx = sy = 0.5f / ma;
-      }
-
-      float dudx = d->x * w0 * sx, dvdx = d->y * h0 * sy;
-      float dudy = d->z * w0 * sx, dvdy = d->w * h0 * sy;
+      float dudx = du_dx * w0, dvdx = dv_dx * h0;
+      float dudy = du_dy * w0, dvdy = dv_dy * h0;
       float rho = fmaxf(sqrtf(dudx * dudx + dvdx * dvdx),
                         sqrtf(dudy * dudy + dvdy * dvdy));
 
@@ -849,6 +851,8 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
          have_lod = true;
       }
    }
+   if (flags & CP_TEX_BIAS)
+      lod += explicit_lod;
    lod += samp.lod_bias;
 
    /* Minification uses the min filter and may cross mip levels; magnification

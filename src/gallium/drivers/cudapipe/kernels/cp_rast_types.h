@@ -169,12 +169,15 @@ struct cp_fs_interp_args {
    uint64_t vs_out;         /* Vertex shader output buffer */
    uint64_t pixel_list;     /* Out: y * width + x for each covered pixel */
    uint64_t counter;        /* Out: number of covered pixels */
-   uint64_t fs_in;          /* Out: interpolated varyings, per covered pixel */
-   uint64_t frag_coord;     /* Out: float4 (x, y, z, 1/w) per covered pixel */
-   /* Out: screen-space derivatives of each input, float4 per input slot per
-    * pixel as (du/dx, dv/dx, du/dy, dv/dy). The sampler needs these to pick a
-    * mip level, and this stage can compute them from the triangle directly. */
-   uint64_t fs_deriv;
+   uint64_t fs_in;          /* Out: interpolated varyings, per shaded pixel */
+   uint64_t frag_coord;     /* Out: float4 (x, y, z, 1/w) per shaded pixel */
+   /*
+    * Out: one byte per slot, zero for a helper lane. Pixels are compacted in
+    * 2x2 quads so the shader can take screen-space derivatives across one, and
+    * an uncovered corner still has to be shaded to supply them — it just must
+    * not reach the framebuffer.
+    */
+   uint64_t coverage;
    uint32_t width, height;
    uint32_t vs_out_stride;  /* Bytes per vertex in vs_out */
    uint32_t fs_in_stride;   /* Bytes per pixel in fs_in */
@@ -183,6 +186,7 @@ struct cp_fs_interp_args {
    /* Which vertex shader output slot feeds each fragment shader input slot,
     * matched by varying location on the host. -1 means nothing drives it. */
    int32_t input_vs_slot[CP_MAX_FS_INPUTS];
+   uint32_t quad_width;     /* Quads across the framebuffer */
    float vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y;
 };
 
@@ -194,6 +198,7 @@ struct cp_fs_writeback_args {
    uint64_t depthbuf;
    uint64_t pixel_counter;  /* Device pointer to actual pixel count (0 = use num_pixels) */
    uint64_t discard_mask;   /* One byte per shaded pixel, set by `discard` (0 = none) */
+   uint64_t coverage;       /* One byte per slot; helper lanes are zero */
    uint64_t reject;         /* Out: triangle that discarded, per pixel (0 = unused) */
    uint64_t resolved;       /* Out: marks pixels that have been written */
    uint32_t reject_layers;
@@ -292,6 +297,10 @@ enum cp_tex_target {
 #define CP_TEX_TARGET_MASK 0xF
 /* Coordinates are integer texels and the level is explicit (texelFetch). */
 #define CP_TEX_FETCH       0x10
+/* textureLod: explicit_lod is the level, derivatives are not consulted. */
+#define CP_TEX_LOD         0x20
+/* texture(..., bias): explicit_lod is added to the computed level. */
+#define CP_TEX_BIAS        0x40
 
 /* Mirrors the subset of pipe_sampler_state the sampler actually uses. */
 struct cp_sampler_info {

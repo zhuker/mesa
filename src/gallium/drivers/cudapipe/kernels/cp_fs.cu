@@ -20,24 +20,26 @@ cp_edge(float ax, float ay, float bx, float by, float cx, float cy)
    return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax);
 }
 
-extern "C" __global__ void
-cp_fs_interpolate(struct cp_fs_interp_args args)
+/*
+ * Interpolate one 2x2 quad of pixels.
+ *
+ * Pixels are compacted in quads rather than one by one so the fragment shader
+ * can take screen-space derivatives by shuffling across the four lanes, the way
+ * hardware does. That is what lets a texture coordinate computed inside the
+ * shader — a reflection vector, say — pick a mip level at all; tracing the
+ * coordinate back to a varying at compile time only ever worked for coordinates
+ * that came straight from one.
+ *
+ * A corner of the quad that no triangle covers is still shaded, as a helper
+ * lane, using a covered corner's triangle so its interpolated values lie on the
+ * same surface. cp_fs_writeback drops it.
+ */
+static __device__ __forceinline__ bool
+cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
+                uint32_t pixel, uint32_t slot)
 {
-   uint32_t pixel = blockIdx.x * blockDim.x + threadIdx.x;
-   if (pixel >= args.width * args.height)
-      return;
-
-   const uint64_t *visbuf = (const uint64_t *)(uintptr_t)args.visbuf;
-   uint64_t entry = visbuf[pixel];
-   if (entry == VISBUF_EMPTY)
-      return;
-
-   /* Triangle index is stored complemented so atomicMin favours the last
-    * primitive on ties; see PACK_VISBUF in cp_rasterize.cu. */
-   uint32_t tri_id = ~(uint32_t)(entry & 0xFFFFFFFFu);
-
-   const float4 *positions = (const float4 *)(uintptr_t)args.positions;
-   uint32_t pos_stride = args.vs_out_stride / 16;
+   const float4 *positions = (const float4 *)(uintptr_t)args->positions;
+   uint32_t pos_stride = args->vs_out_stride / 16;
    if (pos_stride == 0) pos_stride = 1;
    float4 v0 = positions[(tri_id * 3 + 0) * pos_stride];
    float4 v1 = positions[(tri_id * 3 + 1) * pos_stride];
@@ -47,12 +49,12 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
    float inv_w1 = 1.0f / v1.w;
    float inv_w2 = 1.0f / v2.w;
 
-   float sx0 = v0.x * inv_w0 * args.vp_scale_x + args.vp_trans_x;
-   float sy0 = v0.y * inv_w0 * args.vp_scale_y + args.vp_trans_y;
-   float sx1 = v1.x * inv_w1 * args.vp_scale_x + args.vp_trans_x;
-   float sy1 = v1.y * inv_w1 * args.vp_scale_y + args.vp_trans_y;
-   float sx2 = v2.x * inv_w2 * args.vp_scale_x + args.vp_trans_x;
-   float sy2 = v2.y * inv_w2 * args.vp_scale_y + args.vp_trans_y;
+   float sx0 = v0.x * inv_w0 * args->vp_scale_x + args->vp_trans_x;
+   float sy0 = v0.y * inv_w0 * args->vp_scale_y + args->vp_trans_y;
+   float sx1 = v1.x * inv_w1 * args->vp_scale_x + args->vp_trans_x;
+   float sy1 = v1.y * inv_w1 * args->vp_scale_y + args->vp_trans_y;
+   float sx2 = v2.x * inv_w2 * args->vp_scale_x + args->vp_trans_x;
+   float sy2 = v2.y * inv_w2 * args->vp_scale_y + args->vp_trans_y;
 
    float ndc_z0 = v0.z * inv_w0;
    float ndc_z1 = v1.z * inv_w1;
@@ -73,89 +75,133 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
       area = -area;
    }
    if (area == 0.0f)
-      return;
+      return false;
 
    float inv_area = 1.0f / area;
-   float cx = (float)(pixel % args.width) + 0.5f;
-   float cy = (float)(pixel / args.width) + 0.5f;
+   float cx = (float)(pixel % args->width) + 0.5f;
+   float cy = (float)(pixel / args->width) + 0.5f;
 
+   /* A helper lane lies outside the triangle, so its barycentrics go negative.
+    * That is exactly what makes the derivative across the quad correct. */
    float b0 = cp_edge(sx1, sy1, sx2, sy2, cx, cy) * inv_area;
    float b1 = cp_edge(sx2, sy2, sx0, sy0, cx, cy) * inv_area;
    float b2 = 1.0f - b0 - b1;
 
-   uint32_t slot = atomicAdd((unsigned int *)(uintptr_t)args.counter, 1u);
-   if (slot >= args.max_pixels)
-      return;
+   ((uint32_t *)(uintptr_t)args->pixel_list)[slot] = pixel;
 
-   ((uint32_t *)(uintptr_t)args.pixel_list)[slot] = pixel;
-
-   /* Perspective-correct weights: interpolate attribute/w, then divide by the
-    * interpolated 1/w. */
    float persp0 = b0 * inv_w0;
    float persp1 = b1 * inv_w1;
    float persp2 = b2 * inv_w2;
    float inv_persp = 1.0f / (persp0 + persp1 + persp2);
 
-   if (args.frag_coord) {
+   if (args->frag_coord) {
       float4 fc;
       fc.x = cx;
       fc.y = cy;
       fc.z = (b0 * ndc_z0 + b1 * ndc_z1 + b2 * ndc_z2) * 0.5f + 0.5f;
       fc.w = persp0 + persp1 + persp2;
-      ((float4 *)(uintptr_t)args.frag_coord)[slot] = fc;
+      ((float4 *)(uintptr_t)args->frag_coord)[slot] = fc;
    }
 
-   const char *vs_out = (const char *)(uintptr_t)args.vs_out;
-   char *fs_in = (char *)(uintptr_t)args.fs_in + (size_t)slot * args.fs_in_stride;
-   char *fs_deriv = args.fs_deriv
-      ? (char *)(uintptr_t)args.fs_deriv +
-        (size_t)slot * args.num_fs_inputs * 16 : 0;
+   const char *vs_out = (const char *)(uintptr_t)args->vs_out;
+   char *fs_in = (char *)(uintptr_t)args->fs_in + (size_t)slot * args->fs_in_stride;
 
-   /* Perspective-correct weights one pixel to the right and one down, so the
-    * varyings' screen-space derivatives fall out as plain differences. */
-   float dx_b0 = cp_edge(sx1, sy1, sx2, sy2, cx + 1.0f, cy) * inv_area;
-   float dx_b1 = cp_edge(sx2, sy2, sx0, sy0, cx + 1.0f, cy) * inv_area;
-   float dx_p0 = dx_b0 * inv_w0, dx_p1 = dx_b1 * inv_w1;
-   float dx_p2 = (1.0f - dx_b0 - dx_b1) * inv_w2;
-   float dx_inv = 1.0f / (dx_p0 + dx_p1 + dx_p2);
-
-   float dy_b0 = cp_edge(sx1, sy1, sx2, sy2, cx, cy + 1.0f) * inv_area;
-   float dy_b1 = cp_edge(sx2, sy2, sx0, sy0, cx, cy + 1.0f) * inv_area;
-   float dy_p0 = dy_b0 * inv_w0, dy_p1 = dy_b1 * inv_w1;
-   float dy_p2 = (1.0f - dy_b0 - dy_b1) * inv_w2;
-   float dy_inv = 1.0f / (dy_p0 + dy_p1 + dy_p2);
-
-   for (uint32_t i = 0; i < args.num_fs_inputs && i < CP_MAX_FS_INPUTS; i++) {
-      int32_t src = args.input_vs_slot[i];
+   for (uint32_t i = 0; i < args->num_fs_inputs && i < CP_MAX_FS_INPUTS; i++) {
+      int32_t src = args->input_vs_slot[i];
       float4 value = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
-      float4 deriv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
       if (src >= 0) {
          const float4 *a0 = (const float4 *)(vs_out +
-            (size_t)(tri_id * 3 + vidx[0]) * args.vs_out_stride + src * 16);
+            (size_t)(tri_id * 3 + vidx[0]) * args->vs_out_stride + src * 16);
          const float4 *a1 = (const float4 *)(vs_out +
-            (size_t)(tri_id * 3 + vidx[1]) * args.vs_out_stride + src * 16);
+            (size_t)(tri_id * 3 + vidx[1]) * args->vs_out_stride + src * 16);
          const float4 *a2 = (const float4 *)(vs_out +
-            (size_t)(tri_id * 3 + vidx[2]) * args.vs_out_stride + src * 16);
+            (size_t)(tri_id * 3 + vidx[2]) * args->vs_out_stride + src * 16);
 
          value.x = (a0->x * persp0 + a1->x * persp1 + a2->x * persp2) * inv_persp;
          value.y = (a0->y * persp0 + a1->y * persp1 + a2->y * persp2) * inv_persp;
          value.z = (a0->z * persp0 + a1->z * persp1 + a2->z * persp2) * inv_persp;
          value.w = (a0->w * persp0 + a1->w * persp1 + a2->w * persp2) * inv_persp;
-
-         if (fs_deriv) {
-            float ux = (a0->x * dx_p0 + a1->x * dx_p1 + a2->x * dx_p2) * dx_inv;
-            float vx = (a0->y * dx_p0 + a1->y * dx_p1 + a2->y * dx_p2) * dx_inv;
-            float uy = (a0->x * dy_p0 + a1->x * dy_p1 + a2->x * dy_p2) * dy_inv;
-            float vy = (a0->y * dy_p0 + a1->y * dy_p1 + a2->y * dy_p2) * dy_inv;
-            deriv = make_float4(ux - value.x, vx - value.y,
-                                uy - value.x, vy - value.y);
-         }
       }
 
       *(float4 *)(fs_in + i * 16) = value;
-      if (fs_deriv)
-         *(float4 *)(fs_deriv + i * 16) = deriv;
+   }
+   return true;
+}
+
+extern "C" __global__ void
+cp_fs_interpolate(struct cp_fs_interp_args args)
+{
+   uint32_t quad = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t quad_h = (args.height + 1) / 2;
+   if (quad >= args.quad_width * quad_h)
+      return;
+
+   uint32_t qx = (quad % args.quad_width) * 2;
+   uint32_t qy = (quad / args.quad_width) * 2;
+
+   const uint64_t *visbuf = (const uint64_t *)(uintptr_t)args.visbuf;
+   uint32_t pix[4];
+   uint32_t tri[4];
+   bool covered[4];
+   int first = -1;
+
+   for (int i = 0; i < 4; i++) {
+      uint32_t x = qx + (i & 1);
+      uint32_t y = qy + (i >> 1);
+      covered[i] = false;
+      tri[i] = 0;
+      /* Clamp so an odd-sized framebuffer still shades a full quad. */
+      pix[i] = (y < args.height ? y : args.height - 1) * args.width +
+               (x < args.width ? x : args.width - 1);
+      if (x >= args.width || y >= args.height)
+         continue;
+      uint64_t entry = visbuf[pix[i]];
+      if (entry == VISBUF_EMPTY)
+         continue;
+      /* Complemented so atomicMin favours the last primitive on ties. */
+      tri[i] = ~(uint32_t)(entry & 0xFFFFFFFFu);
+      covered[i] = true;
+      if (first < 0)
+         first = i;
+   }
+
+   if (first < 0)
+      return;
+
+   /*
+    * A quad must belong to a single triangle. Two triangles meeting inside one
+    * 2x2 block would otherwise be differenced against each other, and the
+    * derivative at every silhouette and every seam would be meaningless —
+    * which costs far more than the seams are worth. Emit one quad per distinct
+    * triangle instead, marking only that triangle's pixels as covered; the
+    * rest ride along as helpers on the same surface.
+    */
+   uint32_t tris[4];
+   int ntris = 0;
+   for (int i = 0; i < 4; i++) {
+      if (!covered[i])
+         continue;
+      bool seen = false;
+      for (int t = 0; t < ntris; t++)
+         seen |= (tris[t] == tri[i]);
+      if (!seen)
+         tris[ntris++] = tri[i];
+   }
+
+   unsigned char *coverage = (unsigned char *)(uintptr_t)args.coverage;
+
+   for (int t = 0; t < ntris; t++) {
+      uint32_t base = atomicAdd((unsigned int *)(uintptr_t)args.counter, 4u);
+      if (base + 4 > args.max_pixels)
+         return;
+
+      for (int i = 0; i < 4; i++) {
+         bool cov = covered[i] && tri[i] == tris[t];
+         bool ok = cp_interp_pixel(&args, tris[t], pix[i], base + i);
+         if (coverage)
+            coverage[base + i] = (ok && cov) ? 1 : 0;
+      }
    }
 }
 
@@ -425,6 +471,10 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
       ? *(const uint32_t *)(uintptr_t)args.pixel_counter
       : args.num_pixels;
    if (i >= limit)
+      return;
+
+   /* A helper lane exists only to supply derivatives to its quad. */
+   if (args.coverage && !((const unsigned char *)(uintptr_t)args.coverage)[i])
       return;
 
    uint32_t pixel = ((const uint32_t *)(uintptr_t)args.pixel_list)[i];

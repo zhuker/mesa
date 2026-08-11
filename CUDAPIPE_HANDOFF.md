@@ -138,18 +138,15 @@ array of pointers:
 
 ## Known gaps, roughly by how much they matter
 
-1. **Derivatives only exist for varyings.** `emit_tex` traces a texture
-   coordinate back to its `load_input` slot at compile time, because
-   `cp_fs_interpolate` computes derivatives analytically per varying. A
-   coordinate computed inside the shader — `reflect(-V, N)` for an environment
-   map — gets none and samples the base level, which is why the spheres in
-   `pbribl` and `texturecubemap` reflect too sharply. Fixing it properly means
-   shading in 2x2 quads with cross-lane derivatives, which is also what
-   `textureGrad` and the remaining `emit_tex` gaps need.
-2. **Explicit LOD on cube samples** may not be honoured — `pbribl` uses
-   `textureLod(prefilteredMap, R, roughness * mips)` and still reflects too
-   sharply. Narrow and worth checking before the item above.
-3. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
+1. **`pbribl`'s prefiltered environment map is wrong above level 0.** The
+   sample builds it by rendering at 512x512 and copying into each mip of a
+   cube, and the driver only ever sees 512x512 and 64x64 render targets — so
+   the mips come from `cp_resource_copy_region`, into a level and an array
+   layer. This was invisible until `textureLod` started being honoured, since
+   everything used to sample level 0; now the spheres lose their reflections
+   and go dark, and the sample reads 5.58% where it used to read 3.02%. The
+   earlier number was luck, not correctness.
+2. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
 4. **No line or point rasterization.** The capture uses POINT_LIST.
 5. **Alpha-tested geometry** costs CP_DISCARD_LAYERS passes over the draw.
    Visibility resolves before shading, so a fragment that discards has already

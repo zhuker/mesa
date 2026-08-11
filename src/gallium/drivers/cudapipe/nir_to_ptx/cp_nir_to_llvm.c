@@ -1684,6 +1684,10 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
 
    if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
       flags |= CP_TEX_FETCH;
+   else if (tex->op == nir_texop_txl)
+      flags |= CP_TEX_LOD;
+   else if (tex->op == nir_texop_txb)
+      flags |= CP_TEX_BIAS;
 
    bool supported = flags >= 0 && tex_handle && coord &&
       (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||

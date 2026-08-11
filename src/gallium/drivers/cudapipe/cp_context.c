@@ -544,23 +544,25 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    /* Fragment shader I/O buffers are indexed by thread, and the shader is
     * launched in whole blocks, so round up to keep the tail threads in
     * bounds. */
-   unsigned max_pixels = ALIGN_POT(w * h, 256);
+   /* Quads are emitted per triangle, so a block straddling a seam produces
+    * more than one. Boundary blocks are a minority; twice the pixel count is
+    * ample and anything past it is dropped rather than scribbling. */
+   unsigned max_pixels = ALIGN_POT(w * h, 256) * 2;
    unsigned fs_in_stride = MAX2(num_fs_inputs, 1u) * 16;
    unsigned fs_out_stride = MAX2(fs->nir_num_outputs, 1u) * 16;
 
-   unsigned fs_deriv_stride = MAX2(num_fs_inputs, 1u) * 16;
 
    CUdeviceptr pixel_list = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, max_pixels * 4);
    CUdeviceptr counter = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
    CUdeviceptr fs_in = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * fs_in_stride);
    CUdeviceptr fs_out = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * fs_out_stride);
-   CUdeviceptr fs_deriv = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * fs_deriv_stride);
+   CUdeviceptr coverage = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, max_pixels);
    CUdeviceptr frag_coord = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * 16);
    /* One byte per shaded pixel, set by `discard` in the fragment shader. */
    CUdeviceptr discard_mask = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, max_pixels);
    CUdeviceptr fs_args_dev = 0, count_dev = 0, stride_dev = 0;
 
-   if (!pixel_list || !counter || !fs_in || !fs_out || !fs_deriv || !frag_coord ||
+   if (!pixel_list || !counter || !fs_in || !fs_out || !coverage || !frag_coord ||
        !discard_mask)
       return;
 
@@ -575,12 +577,13 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .counter = counter,
       .fs_in = fs_in,
       .frag_coord = frag_coord,
-      .fs_deriv = fs_deriv,
+      .coverage = coverage,
       .width = w, .height = h,
       .vs_out_stride = num_vs_outputs * 16,
       .fs_in_stride = fs_in_stride,
       .num_fs_inputs = num_fs_inputs,
       .max_pixels = max_pixels,
+      .quad_width = (w + 1) / 2,
       .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
       .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
    };
@@ -603,8 +606,11 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    double mark = cp_timing_enabled() ? cp_now_ms() : 0.0;
 
    void *interp_params[] = { &interp };
+   /* One thread per 2x2 quad, and the shader then runs four threads per quad
+    * so it can difference across one. */
+   unsigned num_quads = ((w + 1) / 2) * ((h + 1) / 2);
    CUresult interp_err = cuLaunchKernel(screen->kernels.fs_interpolate,
-                                        (w * h + 255) / 256, 1, 1, 256, 1, 1,
+                                        (num_quads + 255) / 256, 1, 1, 256, 1, 1,
                                         0, NULL, interp_params, NULL);
    if (interp_err != CUDA_SUCCESS) {
       fprintf(stderr, "cudapipe: fs_interpolate launch failed (%d)\n", interp_err);
@@ -671,14 +677,13 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
          uint64_t addr = (uint64_t)cp->sampler_table;
          cuMemcpyHtoD(sym, &addr, sizeof(addr));
       }
+      /* Fragment threads are laid out four to a quad, so the sampler may take
+       * derivatives by shuffling between them. */
       if (cuModuleGetGlobal(&sym, &sym_size, fs->module,
-                            "cp_fs_deriv") == CUDA_SUCCESS) {
-         uint64_t addr = (uint64_t)fs_deriv;
-         cuMemcpyHtoD(sym, &addr, sizeof(addr));
+                            "cp_quad_derivs") == CUDA_SUCCESS) {
+         int on = 1;
+         cuMemcpyHtoD(sym, &on, sizeof(on));
       }
-      if (cuModuleGetGlobal(&sym, &sym_size, fs->module,
-                            "cp_fs_deriv_stride") == CUDA_SUCCESS)
-         cuMemcpyHtoD(sym, &fs_deriv_stride, sizeof(fs_deriv_stride));
    }
 
    void *fs_arg_ptr = (void *)(uintptr_t)fs_args_dev;
@@ -700,6 +705,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .depthbuf = cp->depthbuf,
       .pixel_counter = counter,
       .discard_mask = discard_mask,
+      .coverage = coverage,
       .reject = reject,
       .resolved = resolved,
       .reject_layers = CP_DISCARD_LAYERS,
