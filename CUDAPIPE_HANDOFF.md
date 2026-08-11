@@ -156,7 +156,25 @@ array of pointers:
    already have occluded another of the same draw. Separate draws are fine.
 6. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
    compressed textures, and the capture has 576 BC images.
-7. `multithreading` (0.23%) and `instancing` (8.56%) have no diagnosis yet.
+7. `multithreading` (0.23%) has no diagnosis yet.
+
+`instancing` (8.56%) is measured and is largely not a defect. Its differing
+pixels break down as ~19k where the starfield disagrees, ~47k of small
+symmetric differences over the rock field, and ~6k in empty space. No rock is
+displaced: the best sub-pixel alignment between the two images is (0.00, 0.00)
+at quarter-pixel resolution, and the mean signed difference over lit geometry
+is -0.3 with 59% of it on edges, so it is coverage and texture filtering rather
+than geometry or shading bias. The starfield is inherent — `starfield.frag`
+builds stars from a hash that multiplies by ~440 and takes `fract`, which turns
+any last-bit difference in the interpolated varying into a different star, so
+two correct implementations disagree. Treat a procedural hash like the
+checkerboard note above: it is a poor oracle, not a bug report.
+
+Related: `nir_op_fsin`, `fcos`, `fexp2` and `flog2` emit the NVVM `.approx`
+intrinsics unconditionally (`cp_nir_to_llvm.c:1316`), because the generic LLVM
+ones lower to device-less libcalls. Roughly 2 ULP, which is looser than Vulkan
+wants, though far too small to move geometry visibly. If tighter precision is
+ever needed, llvmpipe's `lp_build_sin`/`lp_build_cos` carry the polynomial.
 
 ## Debug
 
