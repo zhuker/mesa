@@ -299,33 +299,67 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
       return;
    }
 
-   /* Different size: nearest-neighbor scale on CPU.
-    * Sync first — preceding GPU kernels may have written src_data. */
+   /* Anything else is done on the CPU. Sync first — preceding GPU kernels may
+    * have written src_data. */
    cuCtxSetCurrent(cp->screen->cuda_ctx);
    cuCtxSynchronize();
+
+   /* Same size but a different format: a straight format conversion. This is
+    * the path a readback takes, where an application blits its B8G8R8A8
+    * render target into an R8G8B8A8 staging image and expects the blit to
+    * reorder the channels for it. */
+   if (src_w == dst_w && src_h == dst_h) {
+      for (int z = 0; z < info->src.box.depth; z++) {
+         const char *s = (const char *)src_data +
+                         src_res->lpr.mip_offsets[info->src.level] +
+                         (info->src.box.z + z) * src_img_stride;
+         char *d = (char *)dst_data +
+                   dst_res->lpr.mip_offsets[info->dst.level] +
+                   (info->dst.box.z + z) * dst_img_stride;
+         util_format_translate(info->dst.format, d, dst_stride,
+                               info->dst.box.x, info->dst.box.y,
+                               info->src.format, s, src_stride,
+                               info->src.box.x, info->src.box.y,
+                               src_w, src_h);
+      }
+      return;
+   }
+
+   /* Different size: nearest-neighbor scale, converting each row as it is
+    * gathered so the two resolutions and the two formats are handled in one
+    * pass. */
+   void *row = malloc((size_t)dst_w * src_pixel_size);
+   if (!row)
+      return;
+
    for (int z = 0; z < info->dst.box.depth; z++) {
       int sz = info->src.box.depth > 1
          ? info->src.box.z + z * info->src.box.depth / info->dst.box.depth
          : info->src.box.z;
       for (int y = 0; y < dst_h; y++) {
          int sy = src_h == dst_h ? y : y * src_h / dst_h;
+         const char *s = (const char *)src_data +
+                         src_res->lpr.mip_offsets[info->src.level] +
+                         sz * src_img_stride +
+                         (info->src.box.y + sy) * src_stride +
+                         (unsigned)info->src.box.x * src_pixel_size;
          for (int x = 0; x < dst_w; x++) {
             int sx = src_w == dst_w ? x : x * src_w / dst_w;
-            char *s = (char *)src_data +
-                      src_res->lpr.mip_offsets[info->src.level] +
-                      sz * src_img_stride +
-                      (info->src.box.y + sy) * src_stride +
-                      (info->src.box.x + sx) * src_pixel_size;
-            char *d = (char *)dst_data +
-                      dst_res->lpr.mip_offsets[info->dst.level] +
-                      (info->dst.box.z + z) * dst_img_stride +
-                      (info->dst.box.y + y) * dst_stride +
-                      (info->dst.box.x + x) * dst_pixel_size;
-            unsigned copy = MIN2(src_pixel_size, dst_pixel_size);
-            memcpy(d, s, copy);
+            memcpy((char *)row + (unsigned)x * src_pixel_size,
+                   s + (unsigned)sx * src_pixel_size, src_pixel_size);
          }
+
+         char *d = (char *)dst_data +
+                   dst_res->lpr.mip_offsets[info->dst.level] +
+                   (info->dst.box.z + z) * dst_img_stride;
+         util_format_translate(info->dst.format, d, dst_stride,
+                               info->dst.box.x, info->dst.box.y + y,
+                               info->src.format, row, 0, 0, 0,
+                               dst_w, 1);
       }
    }
+
+   free(row);
 }
 
 static void
@@ -546,17 +580,39 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
    cuCtxSynchronize();
 }
 
+/*
+ * Backing for VkDeviceMemory. This has to be memory the GPU can read: the
+ * vertex fetch and shader kernels dereference application buffers directly,
+ * so host-only memory here faults the kernel with CUDA_ERROR_ILLEGAL_ADDRESS.
+ *
+ * lavapipe allocates from its submit thread, which has no current context of
+ * its own, hence the cuCtxSetCurrent. A context may be current on several
+ * threads at once, so binding it here doesn't disturb the main thread.
+ */
 static struct pipe_memory_allocation *
 cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
 {
-   void *ptr = calloc(1, size);
-   return (struct pipe_memory_allocation *)ptr;
+   struct cp_screen *cp = (struct cp_screen *)screen;
+   CUdeviceptr dev = 0;
+
+   cuCtxSetCurrent(cp->cuda_ctx);
+   if (cuMemAllocManaged(&dev, size, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+      return NULL;
+
+   cuMemsetD8(dev, 0, size);
+   return (struct pipe_memory_allocation *)(uintptr_t)dev;
 }
 
 static void
 cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
 {
-   free(mem);
+   struct cp_screen *cp = (struct cp_screen *)screen;
+
+   if (!mem)
+      return;
+
+   cuCtxSetCurrent(cp->cuda_ctx);
+   cuMemFree((CUdeviceptr)(uintptr_t)mem);
 }
 
 static void *
@@ -579,6 +635,11 @@ cp_resource_bind_backing(struct pipe_screen *screen, struct pipe_resource *pt,
    void *ptr = (char *)mem + mem_offset;
    res->lpr.data = ptr;
    res->lpr.tex_data = ptr;
+   /* cp_allocate_memory hands out managed memory, so the GPU paths (blit,
+    * vertex fetch) can use this resource directly. The allocation itself is
+    * owned by the VkDeviceMemory, not by the resource. */
+   res->cuda_managed = true;
+   res->device_ptr = (CUdeviceptr)(uintptr_t)ptr;
    return true;
 }
 
