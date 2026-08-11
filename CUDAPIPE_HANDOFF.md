@@ -158,17 +158,44 @@ array of pointers:
    compressed textures, and the capture has 576 BC images.
 7. `multithreading` (0.23%) has no diagnosis yet.
 
-`instancing` (8.56%) is measured and is largely not a defect. Its differing
-pixels break down as ~19k where the starfield disagrees, ~47k of small
-symmetric differences over the rock field, and ~6k in empty space. No rock is
-displaced: the best sub-pixel alignment between the two images is (0.00, 0.00)
-at quarter-pixel resolution, and the mean signed difference over lit geometry
-is -0.3 with 59% of it on edges, so it is coverage and texture filtering rather
-than geometry or shading bias. The starfield is inherent — `starfield.frag`
-builds stars from a hash that multiplies by ~440 and takes `fract`, which turns
-any last-bit difference in the interpolated varying into a different star, so
-two correct implementations disagree. Treat a procedural hash like the
-checkerboard note above: it is a poor oracle, not a bug report.
+`instancing` (8.56%) is a real defect and is narrowed, not solved. The rocks
+are genuinely displaced: on the two rocks isolated enough to correlate cleanly,
+shifting the cudapipe image by ~1.7 px cuts the mean absolute difference from
+4.48 to 1.63. Per-rock silhouette centroids move a median of 0.76 px, with 39%
+over 1 px and a tail to 9 px.
+
+Ruled out by measurement, so as not to be re-derived:
+
+* The application's random seed. `getRandomSeed()` returns a literal 0 offscreen
+  (`base/vulkanexamplebase.cpp:283`) and three runs per driver are bit
+  identical, so the instance data is the same before Vulkan sees it.
+* Any global transform. The best 2D translation or affine barely improves the
+  residual, and the planet — same projection and modelview, no instancing — does
+  not move at all (best shift 0.00, 0.00). That also invalidates a "global orbit
+  angle is slightly off" theory, and note a rotation about Y in 3D is not a 2D
+  affine, so a screen-space affine fit cannot test for one.
+* Shading. Mean signed difference over lit geometry is -0.3.
+* The instanced attribute fetch. `CUDAPIPE_DEBUG_VFETCH=1` dumps what the fetch
+  gathered; the per-instance position, rotation, scale and texture index are all
+  correct and shared correctly between the vertices of an instance.
+* `cp_build_vertex_refs`, reviewed for the indexed and instanced case.
+* UBO truncation. The 112 byte buffer the driver binds is lavapipe's descriptor
+  set, not the application's 152 byte uniform block, which is reached through a
+  descriptor inside it.
+
+What is left is the per-instance transform in the shader: `rotMat` and `gRotMat`
+in `shaders/glsl/instancing/instancing.vert`, both built from `sin`/`cos`. The
+arithmetic argues against it — 1.7 px at that ring radius needs an angular error
+around 2e-3 rad, and the NVVM `.approx` intrinsics are near 1e-6 — but it is the
+only candidate still standing and has not been tested directly. The way to test
+it is to link a precise sin/cos into the shader (the sampler module is already
+NVRTC-compiled and linked, so it can carry them) and see whether the rocks move.
+
+About a quarter of the sample's differing pixels are a separate and inherent
+effect: `starfield.frag` builds stars from a hash that multiplies by ~440 and
+takes `fract`, so any last-bit difference in an interpolated varying relocates
+stars. Two correct implementations disagree there. Treat a procedural hash like
+the checkerboard note above — a poor oracle, not a bug report.
 
 Related: `nir_op_fsin`, `fcos`, `fexp2` and `flog2` emit the NVVM `.approx`
 intrinsics unconditionally (`cp_nir_to_llvm.c:1316`), because the generic LLVM
@@ -185,6 +212,7 @@ ever needed, llvmpipe's `lp_build_sin`/`lp_build_cos` carry the polynomial.
 | `CUDAPIPE_DEBUG_TEX` | sampler/texture descriptor resolution |
 | `CUDAPIPE_DEBUG_FS` | per-pixel fragment inputs/outputs, VS output positions |
 | `CUDAPIPE_DEBUG_LAUNCH` | compute UBO/SSBO bindings |
+| `CUDAPIPE_DEBUG_VFETCH` | dump what the GPU vertex fetch gathered (syncs) |
 | `CUDAPIPE_DEBUG_SHADER` | warn on unhandled NIR intrinsics |
 | `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
 

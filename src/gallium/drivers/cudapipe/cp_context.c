@@ -1027,6 +1027,29 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
          stride = vs_in_stride;
 
+         /* Dump what the GPU fetch actually gathered, which is the quickest way to
+          * tell a bad attribute layout from a bad shader. Syncs, so debug only. */
+         if (getenv("CUDAPIPE_DEBUG_VFETCH") && vs_input_buf) {
+            cuCtxSynchronize();
+            const float *in = (const float *)(uintptr_t)vs_input_buf;
+            for (unsigned e = 0; e < cp->num_vertex_elements && e < 8; e++)
+               fprintf(stderr, "  elem%u vb=%u off=%u stride=%u div=%u sz=%u\n",
+                       e, cp->vertex_elements[e].vertex_buffer_index,
+                       cp->vertex_elements[e].src_offset,
+                       cp->vertex_elements[e].src_stride,
+                       cp->vertex_elements[e].instance_divisor,
+                       vf_args.elem_attr_size[e]);
+            for (unsigned v = 0; v < 2 && v < total_verts; v++) {
+               fprintf(stderr, "  vfetch v%u:", v);
+               for (unsigned e = 0; e < cp->num_vertex_elements && e < 8; e++)
+                  fprintf(stderr, " e%u=[%.3f %.3f %.3f]", e,
+                          in[(v * vs_in_stride) / 4 + e * 4 + 0],
+                          in[(v * vs_in_stride) / 4 + e * 4 + 1],
+                          in[(v * vs_in_stride) / 4 + e * 4 + 2]);
+               fprintf(stderr, "\n");
+            }
+         }
+
          /* Allocate device-side buffers for VS kernel args and metadata */
          CUdeviceptr vs_args_dev = (CUdeviceptr)(uintptr_t)
             cp_scratch_alloc(cp, 64 * sizeof(void *));
