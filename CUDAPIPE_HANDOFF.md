@@ -87,16 +87,16 @@ Differing pixels versus the NVIDIA driver at tolerance 8/255:
 | texture3d | 4 | |
 | bloom | 10 | |
 | dynamicuniformbuffer | 15 | |
-| vulkanscene | 34 | |
+| vulkanscene | 27 | |
 | texture | 593 | anisotropic taps on a slightly tilted quad |
-| multithreading | 0.23% | speckle, cause unknown |
+| multithreading | 0.22% | speckle, cause unknown |
 | computeshader | 0.31% | |
 | texturecubemap | 1.32% | reflections too sharp, see gaps |
 | particlesystem | 2.51% | no POINT_LIST rasterization |
 | multisampling | 2.58% | no MSAA |
 | pbribl | 3.02% | reflections too sharp |
 | texturemipmapgen | 3.50% | anisotropic filter differences |
-| gltfscenerendering | 1.84% | |
+| gltfscenerendering | 1.70% | |
 | instancing | 0.38% | |
 
 Ten of eighteen are within a handful of pixels, from one before this work.

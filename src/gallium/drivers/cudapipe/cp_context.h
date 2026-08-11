@@ -23,6 +23,7 @@ struct cp_context {
 
    /* Visibility buffer, rebuilt per draw: it resolves which triangle of the
     * current draw wins each pixel. */
+   struct pipe_rasterizer_state rasterizer;
    CUdeviceptr visbuf;
    CUdeviceptr reject;      /* per-pixel discarded triangles, CP_DISCARD_LAYERS deep */
    CUdeviceptr resolved;    /* per-pixel byte: a fragment has been written */

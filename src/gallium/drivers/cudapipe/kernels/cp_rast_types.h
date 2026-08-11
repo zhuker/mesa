@@ -89,8 +89,10 @@ struct cp_rasterize_args {
    uint32_t reject_passes;  /* how many layers hold a triangle so far */
 };
 
-/* Passes an alpha-tested draw gets to find a fragment that survives. */
-#define CP_DISCARD_LAYERS 4
+/* Passes an alpha-tested draw gets to find a fragment that survives. Each one
+ * is a full rasterize and shade of the draw, so this is bought with time:
+ * dropping it to 4 costs Sponza 0.14% of its pixels. */
+#define CP_DISCARD_LAYERS 8
 
 /*
  * Near-plane clipping. A triangle crossing the plane has a vertex with w <= 0,

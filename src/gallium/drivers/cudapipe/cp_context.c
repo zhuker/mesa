@@ -450,6 +450,26 @@ cp_vertex_fill_w(enum pipe_format format)
    return 1;
 }
 
+/* 0 = keep everything, 1 = drop positive-area triangles, 2 = drop negative. */
+static uint32_t
+cp_cull_mode(const struct pipe_rasterizer_state *rs)
+{
+   bool cull_back = (rs->cull_face & PIPE_FACE_BACK) != 0;
+   bool cull_front = (rs->cull_face & PIPE_FACE_FRONT) != 0;
+
+   if (!cull_back && !cull_front)
+      return 0;
+   if (cull_back && cull_front)
+      return 0;   /* handled by skipping the draw */
+
+   /* After the viewport transform a front face has positive area when the
+    * front is counter-clockwise, since Vulkan's clip space already has y
+    * running downward and the viewport scale does not flip it again. */
+   if (cull_back)
+      return rs->front_ccw ? 2 : 1;
+   return rs->front_ccw ? 1 : 2;
+}
+
 /* Which colour encoding the fragment writeback can produce, or -1 if it can't
  * write this format at all. */
 int
@@ -870,8 +890,16 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .vp_near = 0.0f, .vp_far = 1.0f,
       .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
       .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
-      .cull_mode = 0,
-      .front_face = 0,
+      /*
+       * Which winding to drop. The rasterizer's area is positive for one
+       * winding after the viewport transform, so front_ccw picks which sign
+       * front-facing means. Drawing what should have been culled is not merely
+       * wasted work: a back face can win the depth test and hide the surface
+       * in front of it, which is what cost Sponza the leaves whose backs face
+       * the camera.
+       */
+      .cull_mode = cp_cull_mode(&cp->rasterizer),
+      .front_face = cp->rasterizer.front_ccw,
       .depthbuf = cp->depthbuf,
       .depth_test = cp->depth_stencil.depth_enabled,
       .depth_func = cp->depth_stencil.depth_func,
@@ -1524,6 +1552,11 @@ cp_create_rasterizer_state(struct pipe_context *ctx,
 static void
 cp_bind_rasterizer_state(struct pipe_context *ctx, void *state)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
+   if (state)
+      cp->rasterizer = *(struct pipe_rasterizer_state *)state;
+   else
+      memset(&cp->rasterizer, 0, sizeof(cp->rasterizer));
 }
 
 static void
