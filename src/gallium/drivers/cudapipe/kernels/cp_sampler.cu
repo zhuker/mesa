@@ -666,8 +666,25 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
                                          (size_t)coord_slot * 16);
       float w0 = (float)tex->width;
       float h0 = (float)tex->height;
-      float dudx = d->x * w0, dvdx = d->y * h0;
-      float dudy = d->z * w0, dvdy = d->w * h0;
+      float sx = 1.0f, sy = 1.0f;
+
+      if (target == CP_TEX_CUBE || target == CP_TEX_CUBE_ARRAY) {
+         /*
+          * A cube coordinate is a direction of arbitrary length — a skybox
+          * hands us its cube's corner positions — so the derivative of the
+          * raw components says nothing about texel density until it is put
+          * into face space. Dividing by the major axis is what the face
+          * projection does, and the extra half maps [-1, 1] onto [0, 1].
+          * Skipping this scales the level of detail by the size of the
+          * application's skybox, which sampled a far too coarse mip.
+          */
+         float ma = fmaxf(fmaxf(fabsf(c0), fabsf(c1)), fabsf(c2));
+         if (ma > 0.0f)
+            sx = sy = 0.5f / ma;
+      }
+
+      float dudx = d->x * w0 * sx, dvdx = d->y * h0 * sy;
+      float dudy = d->z * w0 * sx, dvdy = d->w * h0 * sy;
       float rho = fmaxf(sqrtf(dudx * dudx + dvdx * dvdx),
                         sqrtf(dudy * dudy + dvdy * dvdy));
       if (rho > 0.0f) {
