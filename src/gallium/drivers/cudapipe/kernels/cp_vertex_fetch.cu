@@ -55,21 +55,24 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
       /* Copy attribute bytes into the 16-byte slot. The output was zero-filled
        * by the caller (scratch arena is zeroed on grow). */
       uint32_t size = args.elem_attr_size[e];
+      if (size > 16)
+         size = 16;
       char *dst = out + e * 16;
 
-      /* Unrolled copy for common sizes */
-      if (size >= 16) {
+      /*
+       * Vulkan only requires a vertex attribute to be aligned to its component
+       * size, so a vec2 may sit on a 4 byte boundary and an 8 bit format on any
+       * byte at all. A float4/float2 load on those faults the kernel with
+       * CUDA_ERROR_MISALIGNED_ADDRESS, so use the widest unit the source
+       * address actually allows. dst is always 16 byte aligned.
+       */
+      if (size == 16 && ((uintptr_t)src & 15) == 0) {
          *(float4 *)dst = *(const float4 *)src;
-      } else if (size == 12) {
-         *(float *)dst = *(const float *)src;
-         *(float *)(dst + 4) = *(const float *)(src + 4);
-         *(float *)(dst + 8) = *(const float *)(src + 8);
-      } else if (size == 8) {
-         *(float2 *)dst = *(const float2 *)src;
-      } else if (size == 4) {
-         *(float *)dst = *(const float *)src;
+      } else if (((uintptr_t)src & 3) == 0 && (size & 3) == 0) {
+         for (uint32_t w = 0; w < size / 4; w++)
+            ((uint32_t *)dst)[w] = ((const uint32_t *)src)[w];
       } else {
-         for (uint32_t b = 0; b < size && b < 16; b++)
+         for (uint32_t b = 0; b < size; b++)
             dst[b] = src[b];
       }
    }
