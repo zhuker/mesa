@@ -395,7 +395,8 @@ cudapipe_create_screen(struct sw_winsys *winsys)
    }
 
    {
-      CUresult err = cuCtxCreate(&screen->cuda_ctx, NULL, 0, screen->cuda_device);
+      /* CUDA 13 added a ctx-params argument; 12.x takes (ctx, flags, dev). */
+      CUresult err = cuCtxCreate(&screen->cuda_ctx, 0, screen->cuda_device);
       if (err != CUDA_SUCCESS) {
          fprintf(stderr, "cudapipe: cuCtxCreate failed (%d)\n", err);
          FREE(screen);
