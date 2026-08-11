@@ -278,6 +278,9 @@ static const struct nir_shader_compiler_options cp_nir_options = {
     * llvm.sin fail instruction selection and take the backend down with them.
     * Let NIR express them in terms of exp2/log2 and the fractional-turn
     * reductions, which do select. */
+   /* Unlike sincos, pow stays lowered. Routing it to the CUDA library version
+    * was tried and changed the image without moving it closer to the reference,
+    * so the approximation is accurate enough here and is not worth a call. */
    .lower_fpow = true,
    /* Keep fsin/fcos: the backend routes them to the CUDA library versions,
     * which are far more accurate than NIR's lowered polynomial. That accuracy
