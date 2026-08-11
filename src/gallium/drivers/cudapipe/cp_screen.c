@@ -279,7 +279,13 @@ static const struct nir_shader_compiler_options cp_nir_options = {
     * Let NIR express them in terms of exp2/log2 and the fractional-turn
     * reductions, which do select. */
    .lower_fpow = true,
-   .lower_sincos = true,
+   /* Keep fsin/fcos: the backend routes them to the CUDA library versions,
+    * which are far more accurate than NIR's lowered polynomial. That accuracy
+    * matters where a shader rotates a position rather than a direction — the
+    * instancing sample's asteroids orbit at radius 7 with vertices spanning
+    * 0.06, an 80x lever that turned the polynomial's error into a visible
+    * displacement of every rock. llvmpipe leaves this off for the same reason. */
+   .lower_sincos = false,
    .lower_hadd = true,
    .lower_uadd_sat = true,
    .lower_usub_sat = true,

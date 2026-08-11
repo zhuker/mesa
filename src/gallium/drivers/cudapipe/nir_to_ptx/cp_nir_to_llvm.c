@@ -38,6 +38,7 @@ struct ntl_context {
 
    /* Set when the shader samples a texture, so the sampler PTX gets linked in. */
    bool uses_tex;
+   bool needs_link;   /* pull in cp_sampler.cu for its device helpers */
 
    LLVMBasicBlockRef break_block;
    LLVMBasicBlockRef continue_block;
@@ -1158,6 +1159,34 @@ build_nvvm_intrinsic(struct ntl_context *ctx, const char *name,
    return LLVMBuildCall2(ctx->builder, fn_type, fn, args, num_args, "");
 }
 
+/*
+ * Call a device function linked in from cp_sampler.cu.
+ *
+ * Used for transcendentals whose NVVM approximation is too coarse. sin.approx
+ * and friends are accurate enough to shade with, but not to place geometry: a
+ * shader that rotates an object's position by a per-instance angle multiplies
+ * the error by the orbit radius, which visibly displaced every asteroid in the
+ * instancing sample. Setting needs_link pulls the module in the same way a
+ * texture sample does.
+ */
+static LLVMValueRef
+build_device_call(struct ntl_context *ctx, const char *name,
+                  LLVMValueRef *args, unsigned num_args)
+{
+   LLVMTypeRef f32 = LLVMFloatTypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef params[4];
+   for (unsigned i = 0; i < num_args && i < 4; i++)
+      params[i] = f32;
+
+   LLVMTypeRef fn_type = LLVMFunctionType(f32, params, num_args, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, name);
+   if (!fn)
+      fn = LLVMAddFunction(ctx->module, name, fn_type);
+
+   ctx->needs_link = true;
+   return LLVMBuildCall2(ctx->builder, fn_type, fn, args, num_args, "");
+}
+
 /* Call an LLVM intrinsic by name, e.g. "llvm.sqrt" — overloaded intrinsics are
  * specialised on the type of their first argument. */
 static LLVMValueRef
@@ -1326,12 +1355,12 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       break;
    case nir_op_fsin:
       result = bit_size == 32
-         ? build_nvvm_intrinsic(ctx, "llvm.nvvm.sin.approx.f", src, 1)
+         ? build_device_call(ctx, "cp_sinf", src, 1)
          : build_intrinsic(ctx, "llvm.sin", src, 1);
       break;
    case nir_op_fcos:
       result = bit_size == 32
-         ? build_nvvm_intrinsic(ctx, "llvm.nvvm.cos.approx.f", src, 1)
+         ? build_device_call(ctx, "cp_cosf", src, 1)
          : build_intrinsic(ctx, "llvm.cos", src, 1);
       break;
    case nir_op_ffma:
@@ -2258,10 +2287,10 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    }
    capture_io_locations(nir, bin);
 
-   /* Shaders that sample textures need the sampler linked in; the rest load
-    * their PTX directly. */
+   /* Shaders that sample textures, or that call one of the module's device
+    * helpers, need it linked in; the rest load their PTX directly. */
    CUresult err;
-   if (ctx.uses_tex && sampler_ptx)
+   if ((ctx.uses_tex || ctx.needs_link) && sampler_ptx)
       err = link_shader_module(&bin->module, ptx, sampler_ptx);
    else
       err = cuModuleLoadData(&bin->module, ptx);

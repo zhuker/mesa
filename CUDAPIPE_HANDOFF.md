@@ -97,7 +97,7 @@ Differing pixels versus the NVIDIA driver at tolerance 8/255:
 | pbribl | 3.02% | reflections too sharp |
 | texturemipmapgen | 3.91% | |
 | gltfscenerendering | 5.12% | some alpha-tested leaves missing |
-| instancing | 8.56% | cause unknown |
+| instancing | 0.38% | |
 
 Ten of eighteen are within a handful of pixels, from one before this work.
 
@@ -158,38 +158,21 @@ array of pointers:
    compressed textures, and the capture has 576 BC images.
 7. `multithreading` (0.23%) has no diagnosis yet.
 
-`instancing` (8.56%) is a real defect and is narrowed, not solved. The rocks
-are genuinely displaced: on the two rocks isolated enough to correlate cleanly,
-shifting the cudapipe image by ~1.7 px cuts the mean absolute difference from
-4.48 to 1.63. Per-rock silhouette centroids move a median of 0.76 px, with 39%
-over 1 px and a tail to 9 px.
+`instancing` was 8.56% and is now 0.38%: NIR was lowering sin/cos to a cheap
+polynomial (`.lower_sincos`), whose error is harmless when a shader rotates a
+direction but not when it rotates a *position*. The sample's asteroids orbit at
+radius 7 while their own vertices span 0.06 — an 80x lever that turned the
+polynomial's error into a visible displacement of every rock, while the very
+same sin in their local rotation was fine. The planet, which shares every
+matrix but is not instanced, never moved, which is what localised it.
 
-Ruled out by measurement, so as not to be re-derived:
-
-* The application's random seed. `getRandomSeed()` returns a literal 0 offscreen
-  (`base/vulkanexamplebase.cpp:283`) and three runs per driver are bit
-  identical, so the instance data is the same before Vulkan sees it.
-* Any global transform. The best 2D translation or affine barely improves the
-  residual, and the planet — same projection and modelview, no instancing — does
-  not move at all (best shift 0.00, 0.00). That also invalidates a "global orbit
-  angle is slightly off" theory, and note a rotation about Y in 3D is not a 2D
-  affine, so a screen-space affine fit cannot test for one.
-* Shading. Mean signed difference over lit geometry is -0.3.
-* The instanced attribute fetch. `CUDAPIPE_DEBUG_VFETCH=1` dumps what the fetch
-  gathered; the per-instance position, rotation, scale and texture index are all
-  correct and shared correctly between the vertices of an instance.
-* `cp_build_vertex_refs`, reviewed for the indexed and instanced case.
-* UBO truncation. The 112 byte buffer the driver binds is lavapipe's descriptor
-  set, not the application's 152 byte uniform block, which is reached through a
-  descriptor inside it.
-
-What is left is the per-instance transform in the shader: `rotMat` and `gRotMat`
-in `shaders/glsl/instancing/instancing.vert`, both built from `sin`/`cos`. The
-arithmetic argues against it — 1.7 px at that ring radius needs an angular error
-around 2e-3 rad, and the NVVM `.approx` intrinsics are near 1e-6 — but it is the
-only candidate still standing and has not been tested directly. The way to test
-it is to link a precise sin/cos into the shader (the sampler module is already
-NVRTC-compiled and linked, so it can carry them) and see whether the rocks move.
+Worth remembering how it was found, because static reasoning got it wrong twice:
+the sample's shader was edited directly (identity rotations, then each rotation
+restored one at a time, then the hardware sin/cos swapped for a Taylor
+polynomial) and re-run against both drivers. That bisect took minutes and was
+conclusive where estimating error magnitudes was not — an approximation good to
+1e-6 was dismissed as far too small to matter, and the real error was nearer
+1e-3.
 
 About a quarter of the sample's differing pixels are a separate and inherent
 effect: `starfield.frag` builds stars from a hash that multiplies by ~440 and

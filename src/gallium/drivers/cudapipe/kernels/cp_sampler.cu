@@ -913,3 +913,17 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
    float inv = 1.0f / (float)aniso_taps;
    return make_float4(acc.r * inv, acc.g * inv, acc.b * inv, acc.a * inv);
 }
+
+/*
+ * Precise transcendentals for shaders.
+ *
+ * The NVVM sin/cos approximations the backend would otherwise emit are fine for
+ * shading but not for geometry. An instanced draw that rotates each object's
+ * *position* by a per-instance angle multiplies the error by the orbit radius,
+ * and in the instancing sample that lever — a rock 7 units out, whose own
+ * vertices span 0.06 — displaced every asteroid by a visible pixel or two while
+ * the same sin in its local rotation was harmless. NVRTC gives us the CUDA
+ * library versions, which range-reduce properly.
+ */
+extern "C" __device__ float cp_sinf(float x) { return sinf(x); }
+extern "C" __device__ float cp_cosf(float x) { return cosf(x); }
