@@ -795,6 +795,40 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef z = LLVMBuildExtractElement(ctx->builder, coord,
          LLVMConstInt(i32, 2, false), "z");
 
+      /*
+       * Clamp to the image before touching memory. A convolution reads a
+       * neighbourhood, so it addresses (-1, -1) at the first pixel; computing
+       * that offset unclamped reads before the allocation and faults the
+       * kernel, and a CUDA fault is sticky — every later launch and even
+       * buffer allocation in the context fails with it, so one out of range
+       * texel took down the rest of the frame.
+       *
+       * Descriptor layout: width is 32 bits at offset 8, height 16 bits at 12.
+       */
+      LLVMValueRef width = LLVMBuildLoad2(ctx->builder, i32,
+         LLVMBuildIntToPtr(ctx->builder,
+            LLVMBuildAdd(ctx->builder, desc_addr, LLVMConstInt(i64, 8, false), ""),
+            LLVMPointerType(i32, 0), ""), "img_width");
+      LLVMTypeRef i16 = LLVMInt16TypeInContext(ctx->llvm_ctx);
+      LLVMValueRef height = LLVMBuildZExt(ctx->builder,
+         LLVMBuildLoad2(ctx->builder, i16,
+            LLVMBuildIntToPtr(ctx->builder,
+               LLVMBuildAdd(ctx->builder, desc_addr, LLVMConstInt(i64, 12, false), ""),
+               LLVMPointerType(i16, 0), ""), "img_height16"), i32, "img_height");
+
+      LLVMValueRef zero_i = LLVMConstInt(i32, 0, false);
+      LLVMValueRef one_i = LLVMConstInt(i32, 1, false);
+      x = LLVMBuildSelect(ctx->builder,
+             LLVMBuildICmp(ctx->builder, LLVMIntSLT, x, zero_i, ""), zero_i, x, "");
+      y = LLVMBuildSelect(ctx->builder,
+             LLVMBuildICmp(ctx->builder, LLVMIntSLT, y, zero_i, ""), zero_i, y, "");
+      LLVMValueRef xmax = LLVMBuildSub(ctx->builder, width, one_i, "");
+      LLVMValueRef ymax = LLVMBuildSub(ctx->builder, height, one_i, "");
+      x = LLVMBuildSelect(ctx->builder,
+             LLVMBuildICmp(ctx->builder, LLVMIntSGT, x, xmax, ""), xmax, x, "");
+      y = LLVMBuildSelect(ctx->builder,
+             LLVMBuildICmp(ctx->builder, LLVMIntSGT, y, ymax, ""), ymax, y, "");
+
       /* byte_offset = base_offset + z * img_stride + y * row_stride + x * pixel_size */
       unsigned bit_size = instr->def.bit_size;
       unsigned pixel_size = bit_size / 8;

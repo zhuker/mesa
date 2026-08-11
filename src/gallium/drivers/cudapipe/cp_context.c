@@ -93,8 +93,11 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
       cp->visbuf_h = cp->depthbuf_h = h;
       if (w > 0 && h > 0) {
          cuCtxSetCurrent(cp->screen->cuda_ctx);
-         cuMemAlloc(&cp->visbuf, (size_t)w * h * sizeof(uint64_t));
-         cuMemAlloc(&cp->depthbuf, (size_t)w * h * sizeof(uint32_t));
+         CUresult e1 = cuMemAlloc(&cp->visbuf, (size_t)w * h * sizeof(uint64_t));
+         CUresult e2 = cuMemAlloc(&cp->depthbuf, (size_t)w * h * sizeof(uint32_t));
+         if (e1 != CUDA_SUCCESS || e2 != CUDA_SUCCESS)
+            fprintf(stderr, "cudapipe: visbuf/depthbuf alloc %ux%u failed "
+                    "(%d, %d)\n", w, h, e1, e2);
       }
       cp->depthbuf_cleared = false;
    }
@@ -751,7 +754,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    if (!screen->kernels.initialized || !screen->kernels.rasterize_triangles)
       return;
    if (!fb->nr_cbufs && !fb->zsbuf.texture)
-      return;
+      do { if (getenv("CUDAPIPE_DEBUG_DRAW"))
+            fprintf(stderr, "  skipped: no colour or depth attachment\n");
+         return; } while (0);
    if (num_draws == 0 || draws[0].count == 0)
       return;
 
@@ -768,7 +773,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    total_triangles *= instance_count;
 
    if (total_triangles == 0)
-      return;
+      do { if (getenv("CUDAPIPE_DEBUG_DRAW"))
+            fprintf(stderr, "  skipped: no triangles\n");
+         return; } while (0);
    unsigned num_triangles = total_triangles;
    /* Near-plane clipping can split triangles, so the rasterizer grid is sized
     * for the post-clip worst case while the count itself lives on the GPU. */
@@ -795,7 +802,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
     * Occlusion between draws is carried by the depth buffer instead. */
    CUdeviceptr visbuf = cp->visbuf;
    if (!visbuf)
-      return;
+      do { if (getenv("CUDAPIPE_DEBUG_DRAW"))
+            fprintf(stderr, "  skipped: no visibility buffer\n");
+         return; } while (0);
 
    /* Clear visbuf to VISBUF_EMPTY (all-ones). cuMemsetD32 fills 32-bit words
     * which is faster than a kernel launch for a bulk fill. */
