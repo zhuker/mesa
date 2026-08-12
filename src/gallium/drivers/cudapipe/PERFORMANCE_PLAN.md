@@ -53,8 +53,12 @@ standing regressions (`gltfscenerendering`, `texture3d`) included.
 
 | | baseline | now |  |
 |---|---|---|---|
-| **total over the sweep** | **3792.15 ms** | **205.32 ms** | **18.5x** |
+| **total over the sweep** | **3792.15 ms** | **205.3 / 206.7 ms** | **~18.4x** |
 | llvmpipe, same sweep | 233.00 ms | 233.00 ms | — |
+
+Two runs of the final build are quoted because they differ by 0.6%, which is
+about the run-to-run spread of the sweep and worth carrying so that a later
+change of that size is not read as a result.
 
 cudapipe began 16x slower than llvmpipe over the set and is now slightly ahead
 of it, and ahead on seven of the seventeen samples.
