@@ -993,6 +993,29 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    float vp_x = vp_trans_x - fabsf(vp_scale_x);
    float vp_y = vp_trans_y - fabsf(vp_scale_y);
 
+   /*
+    * Where a fragment is allowed to land. Clipping to the view volume is what
+    * confines a primitive to its viewport, and there is nothing in this driver
+    * that clips x or y — the near plane is the only plane cp_clip_triangles
+    * cuts — so the rasterizer is where it happens, as the bound on the pixels
+    * it walks. Without it a sample drawing two viewports side by side spills
+    * the geometry that runs past NDC +-1 into its neighbour.
+    *
+    * Half-pixel centres, matching lp_setup_set_viewports(); the scissor
+    * arrives with an exclusive maximum, as llvmpipe's lp_setup_set_scissors()
+    * has it.
+    */
+   int clip_x0 = MAX2(0, (int)(vp_x + 0.499f));
+   int clip_y0 = MAX2(0, (int)(vp_y + 0.499f));
+   int clip_x1 = MIN2((int)w - 1, (int)(vp_x + vp_w - 0.501f));
+   int clip_y1 = MIN2((int)h - 1, (int)(vp_y + vp_h - 0.501f));
+   if (cp->rasterizer.scissor) {
+      clip_x0 = MAX2(clip_x0, (int)cp->scissor.minx);
+      clip_y0 = MAX2(clip_y0, (int)cp->scissor.miny);
+      clip_x1 = MIN2(clip_x1, (int)cp->scissor.maxx - 1);
+      clip_y1 = MIN2(clip_y1, (int)cp->scissor.maxy - 1);
+   }
+
    struct cp_rasterize_args rast_args = {
       .framebuffer = visbuf,
       .color_buffer = (uint64_t)(uintptr_t)color_data,
@@ -1002,6 +1025,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .num_varyings = 0,
       .vp_x = vp_x, .vp_y = vp_y,
       .vp_w = vp_w, .vp_h = vp_h,
+      .clip_x0 = clip_x0, .clip_y0 = clip_y0,
+      .clip_x1 = clip_x1, .clip_y1 = clip_y1,
       .vp_near = 0.0f, .vp_far = 1.0f,
       .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
       .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,

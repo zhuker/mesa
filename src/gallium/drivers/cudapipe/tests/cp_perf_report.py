@@ -24,10 +24,13 @@ a third of a second, and there is nothing to install. Results are cached in
 _diffs.json keyed by tolerance, so re-running to change the layout is free;
 --recompute discards it.
 
-Frames are exported to JPEG alongside, so the page can show any frame of any
-driver next to the reference — the chart says which frame went wrong and the
-viewer under it says what it looked like. --no-frames skips the export and
-leaves the charts alone.
+Frames are exported as PNG alongside — never JPEG, see export_frames() — so
+the page can show any frame of any driver next to the reference: the chart says
+which frame went wrong and the viewer under it says what it looked like.
+--no-frames skips the export and leaves the charts alone. The export skips a
+sample whose images are already there, so re-rendering a driver means deleting
+its directory under the image directory, and its `_diff` one, or the page keeps
+the old pictures beside the new numbers.
 
 Nothing here is specific to this set of samples or to 60 frames.
 """

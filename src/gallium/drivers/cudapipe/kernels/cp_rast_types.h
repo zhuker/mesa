@@ -64,6 +64,18 @@ struct cp_rasterize_args {
    float vp_x, vp_y, vp_w, vp_h;
    float vp_near, vp_far;
    float vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y;
+   /*
+    * The rectangle of pixels a fragment may land in, inclusive on both ends:
+    * the framebuffer intersected with the viewport rectangle and, when the
+    * rasterizer state asks for it, the scissor. Vulkan clips primitives to the
+    * view volume, which after the viewport transform is exactly the viewport
+    * rectangle, so geometry running past NDC +-1 must not reach the pixels
+    * beside the viewport — with two viewports side by side those pixels belong
+    * to the other one. Computed on the host in the same half-pixel convention
+    * llvmpipe uses in lp_setup_set_viewports(); an empty rectangle (x1 < x0)
+    * draws nothing.
+    */
+   int32_t clip_x0, clip_y0, clip_x1, clip_y1;
    /* Rasterizer state */
    uint32_t cull_mode;      /* 0=none, 1=front, 2=back */
    uint32_t front_face;     /* 0=CCW, 1=CW */

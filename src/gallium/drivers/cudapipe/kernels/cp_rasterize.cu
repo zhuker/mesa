@@ -302,11 +302,11 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
       s->sx0 = cx; s->sy0 = cy;
       s->inv_area = 1.0f;
 
-      s->ix_min = max((int)floorf(s->pt_x0), 0);
-      s->iy_min = max((int)floorf(s->pt_y0), 0);
-      s->ix_max = min((int)ceilf(s->pt_x1), (int)args->width - 1);
-      s->iy_max = min((int)ceilf(s->pt_y1), (int)args->height - 1);
-      return true;
+      s->ix_min = max((int)floorf(s->pt_x0), args->clip_x0);
+      s->iy_min = max((int)floorf(s->pt_y0), args->clip_y0);
+      s->ix_max = min((int)ceilf(s->pt_x1), args->clip_x1);
+      s->iy_max = min((int)ceilf(s->pt_y1), args->clip_y1);
+      return s->ix_min <= s->ix_max && s->iy_min <= s->iy_max;
    }
 
    s->is_point = false;
@@ -350,12 +350,19 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
    float max_x = fmaxf(fmaxf(s->sx0, s->sx1), s->sx2);
    float max_y = fmaxf(fmaxf(s->sy0, s->sy1), s->sy2);
 
-   s->ix_min = max((int)floorf(min_x), 0);
-   s->iy_min = max((int)floorf(min_y), 0);
-   s->ix_max = min((int)ceilf(max_x), (int)args->width - 1);
-   s->iy_max = min((int)ceilf(max_y), (int)args->height - 1);
+   /*
+    * The bounding box is clamped to the clip rectangle rather than to the
+    * framebuffer, which is what keeps a primitive inside its viewport. An
+    * empty box means the primitive is entirely outside it: say so, so that no
+    * stage walks a box with a negative width — two negative sides multiply
+    * into a plausible-looking area.
+    */
+   s->ix_min = max((int)floorf(min_x), args->clip_x0);
+   s->iy_min = max((int)floorf(min_y), args->clip_y0);
+   s->ix_max = min((int)ceilf(max_x), args->clip_x1);
+   s->iy_max = min((int)ceilf(max_y), args->clip_y1);
 
-   return true;
+   return s->ix_min <= s->ix_max && s->iy_min <= s->iy_max;
 }
 
 /*
@@ -769,16 +776,23 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
    if (col >= CP_TILE_SIZE)
       return;
 
+   /*
+    * A tile is enumerated from the bounding box but covers whole tiles, so its
+    * edges run past it — the clip rectangle has to be applied here rather than
+    * inherited from the clamped box the way the other two stages do.
+    */
    int px = tile_x + col;
-   if (px >= (int)args.width)
+   if (px < args.clip_x0 || px > args.clip_x1)
       return;
 
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
 
    for (int row = 0; row < CP_TILE_SIZE; row++) {
       int py = tile_y + row;
-      if (py >= (int)args.height)
+      if (py > args.clip_y1)
          break;
+      if (py < args.clip_y0)
+         continue;
 
       for (int sm = 0; sm < (int)args.num_samples; sm++) {
          float ox, oy;

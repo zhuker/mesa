@@ -110,8 +110,10 @@ runs for seconds rather than milliseconds.
 does, and sixty frames of one is sixty copies of the same image. Those run with
 `--offscreenorbit`, which walks the camera around the subject. The list is a
 default in the script; `ORBIT=all` orbits everything, `ORBIT=` orbits nothing.
-This is not cosmetic: `computeshader` matches NVIDIA exactly on a static frame
-and diverges by 28,805 pixels within five frames of the camera moving.
+This is not cosmetic: `computeshader` matched NVIDIA exactly on a static frame
+and diverged by 28,805 pixels within five frames of the camera moving, because
+nothing clipped its geometry to the viewport and the sample draws two of them
+side by side. Nothing but an orbit could have found that.
 
 ### `cp_compare_frames.py`
 
@@ -138,6 +140,12 @@ each chart is a frame inspector:
   default 12)
 
 `--no-frames` skips the image export and leaves the charts.
+
+**Re-rendering a driver means clearing its exported images.** The export skips
+any sample that already has its frames, and the differences are cached in
+`_diffs.json`, so a second run over new frames otherwise puts the old pictures
+beside the new numbers. Delete `<images>/<driver>` and `<images>/_diff/<driver>`
+and pass `--recompute`.
 
 ---
 
@@ -198,11 +206,14 @@ for weeks because only the images were being looked at, and one of those was
 then misdiagnosed as a 60-frame regression when it reproduced at one frame in
 under a second.
 
-**Three samples are not deterministic.** `multithreading`, `gltfscenerendering`
+**Six samples are not deterministic.** `multithreading`, `gltfscenerendering`
 and `instancing` differ run to run on the same build — thread scheduling changes
-the order command buffers are recorded. Before attributing a small delta to a
-change, run the sample twice against itself. Their last few hundred pixels are
-not signal.
+the order command buffers are recorded. `multisampling`, `vulkanscene` and
+`particlesystem` do too, for a reason not yet established, though only barely:
+over sixty frames two runs of one build move by 36, 1 and 0 pixels at tolerance
+8, with `particlesystem` differing byte-wise on 13 frames without any pixel
+crossing the tolerance. Before attributing a small delta to a change, run the
+sample twice against itself. Their last few hundred pixels are not signal.
 
 **Rebuild a sample after editing it.** Editing a sample's `.cpp` to bisect
 something and restoring the source afterwards does not rebuild the binary. An

@@ -95,8 +95,8 @@ quad-derivative work, and far more before that.
 
 | Sample | Differing | Note |
 |---|---|---|
-| texturemipmapgen | 3.50% | anisotropic filter, accepted — see gap 5 |
-| gltfscenerendering | 1.70% | anisotropic filter, accepted — see gap 5 |
+| texturemipmapgen | 3.50% | anisotropic filter, accepted — see gap 4 |
+| gltfscenerendering | 1.70% | anisotropic filter, accepted — see gap 4 |
 | texturecubemap | 0.45% | reflection sharper than the reference at grazing angles |
 | instancing | 0.38% | mostly the procedural starfield, see below |
 | multithreading | 0.23% | speckle, no diagnosis, and the sample is nondeterministic |
@@ -116,7 +116,14 @@ quad-derivative work, and far more before that.
 
 Eleven of eighteen are within a handful of pixels and five match exactly, from
 one at the start of this work. Everything still above 0.2% is the anisotropic
-filter difference that gap 3 closes out.
+filter difference that gap 4 closes out.
+
+Summed over the sixty frame animated sweep instead of frame 0, the set totals
+4,259,670 against llvmpipe's 4,482,580 — the same conclusion the single frame
+gives, and the sweep that has to be run to draw it, since a frame 0 of 0 says
+nothing about the other fifty-nine. `computeshader` is 470 across the animation
+where it was 608,619 before the viewport clipping went in, against llvmpipe's
+9,505 over the same motion.
 
 ### Calibrate against llvmpipe, not against zero
 
@@ -152,7 +159,7 @@ with nothing left unimplemented in it. On gltfscenerendering it is closer to
 NVIDIA by a factor of 1.7, and that holds region by region across the surfaces
 where the difference is most visible — the curtains, the pillars, the arches.
 The numbers above are worth re-measuring rather than trusted to the last
-hundred: three samples are nondeterministic (gap 10).
+hundred: six samples are nondeterministic (gap 9).
 
 Worth re-running whenever a sampler or rasterizer change looks like it is not
 paying off; llvmpipe is the honest target.
@@ -202,7 +209,7 @@ which is how it beats cudapipe on wall clock while doing four times the work.
 
 **The two worst samples are both the peel loop.** particlesystem and bloom are
 the blended draws, at 5x and 2.4x the next worst. Up to 256 passes per draw,
-each with a `cuStreamSynchronize` — gap 6, and the obvious first target.
+each with a `cuStreamSynchronize` — gap 5, and the obvious first target.
 
 **pbribl is the one cudapipe already wins**, 14.2 s against llvmpipe's 16.0.
 
@@ -219,7 +226,8 @@ cudapipe Gallium driver
     │   1. cp_vertex_fetch      (GPU gathers attributes)
     │   2. Vertex shader kernel (NIR → PTX)
     │   3. cp_clip_triangles    (near plane and w > 0)
-    │   4. cp_rasterize_stage1/2/3 (adaptive: thread, warp, block per tile)
+    │   4. cp_rasterize_stage1/2/3 (adaptive: thread, warp, block per tile),
+    │      bounded by the clip rectangle: framebuffer ∩ viewport ∩ scissor
     │   5. cp_fs_interpolate    (compact into 2x2 quads, interpolate varyings)
     │   6. Fragment shader kernel (four threads per quad)
     │   7. cp_fs_writeback      (drop helpers, discard mask, blend, attachment)
@@ -308,25 +316,20 @@ smooth.
 
 ## Known gaps, roughly by how much they matter
 
-1. **`computeshader` falls apart as soon as the camera moves.** It matches
-   NVIDIA exactly on a static frame — one of the five that do — and reaches
-   28,805 differing pixels by frame 5 of an orbit, against llvmpipe's 373 over
-   the same motion. So it is a cudapipe defect, not the scene. Undiagnosed, and
-   the largest correctness problem in the set.
-2. **`texture3d` drifts over an animation.** 2 differing pixels at frame 0,
-   3,090 at frame 24; llvmpipe is 0 across all sixty. Also undiagnosed.
+1. **`texture3d` drifts over an animation.** 2 differing pixels at frame 0,
+   3,090 at frame 24; llvmpipe is 0 across all sixty. Undiagnosed.
 
-   Neither of these is visible in the single frame sweep, which is what the
-   animated one exists for — see `tests/TESTING.md`. Both open on their worst
-   frame in the report.
-3. **No line rasterization.** POINT_LIST and multisampling both work — see
+   It is not visible in the single frame sweep, which is what the animated one
+   exists for — see `tests/TESTING.md`. It opens on its worst frame in the
+   report.
+2. **No line rasterization.** POINT_LIST and multisampling both work — see
    Architecture. Nothing else in the sample set is unimplemented.
-4. **Sample shading is per fragment only.** `minSampleShading` and
+3. **Sample shading is per fragment only.** `minSampleShading` and
    `sampleShadingEnable` are ignored, so a pipeline asking for per-sample
    shading gets per-pixel shading written to the covered samples. The
    multisampling sample builds such a pipeline but only binds it from the UI,
    which the offscreen runs do not touch.
-5. **Anisotropic filtering under-blurs relative to NVIDIA's — accepted, closed.**
+4. **Anisotropic filtering under-blurs relative to NVIDIA's — accepted, closed.**
    Vulkan leaves the anisotropic filter implementation-defined, llvmpipe differs
    from NVIDIA in the same direction, and cudapipe is closer to NVIDIA than
    llvmpipe on the samples where it is most visible. Recorded here as a
@@ -369,32 +372,42 @@ smooth.
    `gltfscenerendering` 15697 -> 25036, `instancing` 3506 -> 5346,
    `texturecubemap` 4144 -> 4774. Do not re-apply it wholesale; the two halves of
    it have not been measured separately.
-6. **A blended draw costs one `cuStreamSynchronize` per layer.** The host reads
+5. **A blended draw costs one `cuStreamSynchronize` per layer.** The host reads
    a managed flag between passes to decide whether another is worth launching.
    That is the first thing to attack if blended draws ever dominate a frame; the
    flag could instead drive a device-side loop or a launch graph.
-7. **Peeling does not combine with the alpha-test retry loop.** Both want the
+6. **Peeling does not combine with the alpha-test retry loop.** Both want the
    same multi-pass machinery for different reasons, so a shader that discards
    keeps the retry path and gets the old single-layer blending. No sample in the
    set needs both at once.
-8. **Alpha-tested geometry costs CP_DISCARD_LAYERS passes over the draw.**
+7. **Alpha-tested geometry costs CP_DISCARD_LAYERS passes over the draw.**
    Visibility resolves before shading, so a fragment that discards has already
    displaced the one behind it; each pass records what discarded where and
    repeats so the next fragment can win. Sponza's foliage falls from 543
    discards to 1 within four passes; halving the layers from 8 to 4 costs it
    0.14% of the frame, and anything still discarding after the last layer is
    lost.
-9. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
+8. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
    compressed textures, and the capture has 576 BC images.
-10. **`multithreading` (0.23%) has no diagnosis**, and the sample is
+9. **`multithreading` (0.23%) has no diagnosis**, and the sample is
    nondeterministic: two runs of the same build differ, because thread
    scheduling changes the order its command buffers are recorded. Do not read
    its last few hundred pixels as signal.
-11. **`bindless_image_store` has no bounds check.** A latent memory-safety hole
+
+   Five others vary run to run as well, measured by rendering the same build
+   twice: `gltfscenerendering` and `instancing` for the same reason as
+   `multithreading`, and `multisampling`, `vulkanscene` and `particlesystem`
+   for one not yet established — over sixty frames they move by 36, 1 and 0
+   pixels at tolerance 8, `particlesystem` differing byte-wise on 13 frames
+   without any pixel crossing the tolerance. Small enough not to matter for a
+   verdict, large enough to be mistaken for the effect of a change: the
+   viewport-clip fix below appeared to move three of them by a handful of
+   pixels until the same build was run against itself.
+10. **`bindless_image_store` has no bounds check.** A latent memory-safety hole
    rather than a visible bug — the one sample that stores dispatches
    `width / 16`, so it never addresses out of range. The load path clamps the
    address and selects the value back to zero; the store should drop instead.
-12. `nir_op_fexp2`, `flog2` and lowered `fpow` still use the NVVM `.approx`
+11. `nir_op_fexp2`, `flog2` and lowered `fpow` still use the NVVM `.approx`
    intrinsics. Routing pow to the CUDA library version was tried and changed the
    image without moving it closer to the reference, so it was reverted. `fsin`
    and `fcos` do *not* — see below.
@@ -435,6 +448,20 @@ the three edge values and the fill rule flags for every triangle that touched
 it. It took one build and disproved a hypothesis that had already survived two
 plausible arguments. Kernel `printf` guarded by a hardcoded pixel is cheap;
 reason about float rounding only with the numbers in front of you.
+
+**The near plane is not the only plane.** `cp_clip_triangles` cuts w <= 0 and
+nothing else, on the usual reasoning that x and y need no geometric clipping
+because the rasterizer walks a bounding box anyway — true only if that box is
+bounded by the viewport, and it was bounded by the framebuffer. Nothing showed
+it for as long as every sample drew one viewport covering the whole
+framebuffer. `computeshader` draws two side by side, so the moment its geometry
+ran past NDC +-1 the right pane's quad appeared 40 columns into the left pane:
+0 differing pixels at frame 0 and 28,805 by frame 5 of an orbit, which had been
+sitting at the top of the gap list undiagnosed. Clipping in x and y is now the
+clip rectangle the stages are bounded by — framebuffer, viewport and scissor
+intersected on the host, in llvmpipe's half-pixel convention
+(`lp_setup_set_viewports`). Stage 3 needs the test explicitly: it walks whole
+tiles, so its edges run past the box it was enumerated from.
 
 **A derivative taken after a projection is wrong wherever the projection is
 discontinuous.** Differencing the final texture coordinate across the quad
