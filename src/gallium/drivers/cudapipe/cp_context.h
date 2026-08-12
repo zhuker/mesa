@@ -41,9 +41,13 @@ struct cp_context {
 
    /* Adaptive rasterizer queues (allocated once, reused across draws) */
    CUdeviceptr rast_nontrivial;       /* uint32_t[CP_MAX_NONTRIVIAL] */
-   CUdeviceptr rast_nontrivial_count; /* atomic uint32_t */
    CUdeviceptr rast_huge_tiles;       /* cp_tile_pair[CP_MAX_HUGE_TILES] */
-   CUdeviceptr rast_huge_count;       /* atomic uint32_t */
+   /* Both queue counters, adjacent in one allocation so a pass zeroes them
+    * with one cuMemsetD32. rast_counts owns the memory; the two below point
+    * into it and are not freed. */
+   CUdeviceptr rast_counts;
+   CUdeviceptr rast_nontrivial_count; /* atomic uint32_t, = rast_counts[0] */
+   CUdeviceptr rast_huge_count;       /* atomic uint32_t, = rast_counts[1] */
 
    struct pipe_depth_stencil_alpha_state depth_stencil;
 

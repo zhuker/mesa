@@ -33,6 +33,25 @@ struct cp_shader_binary {
     * position. Slots with no variable are VARYING_SLOT_MAX. */
    unsigned in_location[CP_MAX_IO_SLOTS];
    unsigned out_location[CP_MAX_IO_SLOTS];
+
+   /*
+    * The linked sampler reads two things through module globals rather than
+    * through the argument block: the sampler table, and whether fragment
+    * threads are laid out four to a quad so derivatives can be shuffled
+    * between them. Both were resolved and rewritten on every draw, which is
+    * two cuModuleGetGlobal and two cuMemcpyHtoD per draw to store bytes that
+    * almost never change — and a draw of a dozen triangles is host-bound.
+    *
+    * The addresses are resolved once and the last value written is kept, so
+    * the copy happens only when the value actually differs. `globals_resolved`
+    * distinguishes "not looked up yet" from "this module has no sampler", the
+    * latter leaving both symbols zero.
+    */
+   bool globals_resolved;
+   CUdeviceptr sym_sampler_table;
+   CUdeviceptr sym_quad_derivs;
+   uint64_t last_sampler_table;
+   int last_quad_derivs;
 };
 
 /* `sampler_ptx` is the relocatable PTX of the texture sampler, linked in when

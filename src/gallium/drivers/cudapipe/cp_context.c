@@ -65,12 +65,12 @@ cp_destroy_context(struct pipe_context *ctx)
       cuMemFree(cp->resolved);
    if (cp->rast_nontrivial)
       cuMemFree(cp->rast_nontrivial);
-   if (cp->rast_nontrivial_count)
-      cuMemFree(cp->rast_nontrivial_count);
    if (cp->rast_huge_tiles)
       cuMemFree(cp->rast_huge_tiles);
-   if (cp->rast_huge_count)
-      cuMemFree(cp->rast_huge_count);
+   /* One allocation behind both counters; the two pointers into it are not
+    * separately owned. */
+   if (cp->rast_counts)
+      cuMemFree(cp->rast_counts);
    if (cp->sampler_table)
       cuMemFree(cp->sampler_table);
    cp_scratch_destroy(cp);
@@ -893,23 +893,45 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       }
    }
 
-   /* Hand the linked sampler the state it reads through module globals: the
-    * sampler table and the varying derivatives it needs for mip selection. */
+   /*
+    * Hand the linked sampler the state it reads through module globals: the
+    * sampler table and the fact that fragment threads are laid out four to a
+    * quad, so it may take derivatives by shuffling between them.
+    *
+    * Resolved once per module and written only when the value changes. Both
+    * used to be looked up and copied on every draw — four host API calls to
+    * store sixteen bytes that are the same as last time, on a path where a
+    * draw of a dozen triangles is limited by how fast the host can issue
+    * calls rather than by anything the device does.
+    */
    {
       CUdeviceptr sym;
       size_t sym_size;
-      if (cp->sampler_table &&
-          cuModuleGetGlobal(&sym, &sym_size, fs->module,
-                            "cp_sampler_table") == CUDA_SUCCESS) {
-         uint64_t addr = (uint64_t)cp->sampler_table;
-         cuMemcpyHtoD(sym, &addr, sizeof(addr));
+      if (!fs->globals_resolved) {
+         if (cuModuleGetGlobal(&sym, &sym_size, fs->module,
+                               "cp_sampler_table") == CUDA_SUCCESS)
+            fs->sym_sampler_table = sym;
+         if (cuModuleGetGlobal(&sym, &sym_size, fs->module,
+                               "cp_quad_derivs") == CUDA_SUCCESS)
+            fs->sym_quad_derivs = sym;
+         /* Nothing has been written yet, and zero is a value the sampler
+          * table can legitimately take, so neither cache is valid until the
+          * first write below. */
+         fs->last_sampler_table = ~(uint64_t)0;
+         fs->last_quad_derivs = -1;
+         fs->globals_resolved = true;
       }
-      /* Fragment threads are laid out four to a quad, so the sampler may take
-       * derivatives by shuffling between them. */
-      if (cuModuleGetGlobal(&sym, &sym_size, fs->module,
-                            "cp_quad_derivs") == CUDA_SUCCESS) {
+
+      if (cp->sampler_table && fs->sym_sampler_table &&
+          fs->last_sampler_table != (uint64_t)cp->sampler_table) {
+         uint64_t addr = (uint64_t)cp->sampler_table;
+         cuMemcpyHtoD(fs->sym_sampler_table, &addr, sizeof(addr));
+         fs->last_sampler_table = addr;
+      }
+      if (fs->sym_quad_derivs && fs->last_quad_derivs != 1) {
          int on = 1;
-         cuMemcpyHtoD(sym, &on, sizeof(on));
+         cuMemcpyHtoD(fs->sym_quad_derivs, &on, sizeof(on));
+         fs->last_quad_derivs = 1;
       }
    }
 
@@ -1593,11 +1615,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                  cp->vertex_elements[e].vertex_buffer_index);
    }
 
-   /* 3-stage adaptive rasterize — cuMemsetD32 is enqueued on the default
-    * stream, so it serializes properly with the preceding draw's kernels. */
-   cuMemsetD32(cp->rast_nontrivial_count, 0, 1);
-   cuMemsetD32(cp->rast_huge_count, 0, 1);
-
+   /* 3-stage adaptive rasterize. The queue counters are zeroed inside the pass
+    * loop below, which runs for pass 0 as well — clearing them here too was
+    * two host calls per draw that the first pass immediately repeated. */
    struct cp_rast_queues rast_queues = {
       .nontrivial = cp->rast_nontrivial,
       .nontrivial_count = cp->rast_nontrivial_count,
@@ -1686,8 +1706,10 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       }
       if (peel)
          *(volatile uint32_t *)(uintptr_t)cp->peel_any = 0;
-      cuMemsetD32(cp->rast_nontrivial_count, 0, 1);
-      cuMemsetD32(cp->rast_huge_count, 0, 1);
+      /* Both counters in one call; they are adjacent for this reason. The
+       * memset is enqueued on the default stream, so it serializes properly
+       * with the preceding pass's kernels. */
+      cuMemsetD32(cp->rast_counts, 0, 2);
 
       /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
       void *s1_params[] = { &rast_args, &rast_queues };
@@ -2928,14 +2950,19 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
       ctx->upload_size = 8 * 1024 * 1024;
 
    /* Adaptive rasterizer queues — allocated once, reused across draws.
-    * Counters are allocated as 256 bytes each (minimum practical GPU alloc)
-    * and zeroed per draw via cuMemsetD32. */
+    *
+    * The two queue counters share one allocation and sit adjacent, so the
+    * pass loop zeroes both with a single cuMemsetD32 of two words rather than
+    * one call each. They are zeroed once per rasterizer pass and a blended
+    * draw runs hundreds of passes, so this is two host calls per pass rather
+    * than two bytes of memory. Only the base is freed. */
    cuMemAlloc(&ctx->rast_nontrivial,
               (size_t)CP_MAX_NONTRIVIAL * sizeof(uint32_t));
-   cuMemAlloc(&ctx->rast_nontrivial_count, 256);
+   cuMemAlloc(&ctx->rast_counts, 256);
+   ctx->rast_nontrivial_count = ctx->rast_counts;
+   ctx->rast_huge_count = ctx->rast_counts + sizeof(uint32_t);
    cuMemAlloc(&ctx->rast_huge_tiles,
               (size_t)CP_MAX_HUGE_TILES * sizeof(struct cp_tile_pair));
-   cuMemAlloc(&ctx->rast_huge_count, 256);
 
    return &ctx->base;
 }
