@@ -1995,8 +1995,23 @@ emit_function(struct ntl_context *ctx)
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "entry");
    LLVMPositionBuilderAtEnd(ctx->builder, entry);
 
-   /* For vertex shaders: add bounds check (if vertex_id >= num_verts, return) */
-   if (ctx->nir->info.stage == MESA_SHADER_VERTEX) {
+   /*
+    * Bounds check: the count is on the device, so both grids are sized for the
+    * worst case and each thread bounds itself against slot 0 — the vertex
+    * count for a vertex shader, the covered pixel count for a fragment one.
+    *
+    * The fragment case is the one that pays. Its grid covers the whole
+    * framebuffer twice over, because a pixel list that quads may append to
+    * more than once cannot be sized more tightly on the host, while a draw's
+    * actual coverage is whatever it rasterized: over a frame of multithreading
+    * the median draw covers 588 pixels and the grid carries 1,843,200. Without
+    * this the shader ran its whole body on every one of them — sampling
+    * textures on uninitialised varyings — and the writeback then dropped all
+    * but the first `counter` results, which is why the arithmetic came out
+    * right and the frame took 400 times longer than the work in it.
+    */
+   if (ctx->nir->info.stage == MESA_SHADER_VERTEX ||
+       ctx->nir->info.stage == MESA_SHADER_FRAGMENT) {
       LLVMTypeRef i32_t = LLVMInt32TypeInContext(ctx->llvm_ctx);
       LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
       LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
@@ -2006,17 +2021,17 @@ emit_function(struct ntl_context *ctx)
       LLVMValueRef cnt_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
          LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
             &(LLVMValueRef){LLVMConstInt(i64_t, 0, false)}, 1, ""), "cnt_ptr");
-      LLVMValueRef num_verts = LLVMBuildLoad2(ctx->builder, i32_t,
-         LLVMBuildBitCast(ctx->builder, cnt_ptr, LLVMPointerType(i32_t, 0), ""), "num_verts");
+      LLVMValueRef count = LLVMBuildLoad2(ctx->builder, i32_t,
+         LLVMBuildBitCast(ctx->builder, cnt_ptr, LLVMPointerType(i32_t, 0), ""), "invoc_count");
 
       LLVMValueRef bid = emit_workgroup_id(ctx, 0);
       LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
       LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
          LLVMBuildMul(ctx->builder, bid, LLVMConstInt(i32_t, 256, false), ""), tid, "");
-      LLVMValueRef oob = LLVMBuildICmp(ctx->builder, LLVMIntUGE, vid, num_verts, "");
+      LLVMValueRef oob = LLVMBuildICmp(ctx->builder, LLVMIntUGE, vid, count, "");
 
-      LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "vs_body");
-      LLVMBasicBlockRef early_ret = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "vs_ret");
+      LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "shader_body");
+      LLVMBasicBlockRef early_ret = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "shader_ret");
       LLVMBuildCondBr(ctx->builder, oob, early_ret, body);
       LLVMPositionBuilderAtEnd(ctx->builder, early_ret);
       LLVMBuildRetVoid(ctx->builder);
