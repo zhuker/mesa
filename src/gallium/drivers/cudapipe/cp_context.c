@@ -1694,8 +1694,20 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
       /* Stage 2: warp-cooperative, fixed grid self-bounding from counter */
       void *s2_params[] = { &rast_args, &rast_queues };
+      /*
+       * Both later stages stride their queue, so the grid is not a bound on
+       * the work — it is a statement of how much of the machine to use, and
+       * these two were set far below it. Stage 2 ran 512 blocks of one warp:
+       * 16,384 threads, under a twentieth of what this device holds, and one
+       * warp per block pays a block's scheduling for a warp's work.
+       *
+       * A warp still takes one primitive, so this is 4,096 of them in flight
+       * rather than 512. particlesystem is the case that shows it — every
+       * sprite is a queued primitive and its peel passes run this kernel
+       * hundreds of times a frame.
+       */
       cuLaunchKernel(screen->kernels.rasterize_stage2,
-         512, 1, 1, 32, 1, 1,
+         512, 1, 1, 256, 1, 1,
          0, NULL, s2_params, NULL);
 
       /* Stage 3: block per tile, fixed grid self-bounding from counter */

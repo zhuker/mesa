@@ -654,17 +654,18 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
          continue;
       cp_broadcast_setup(&s);
 
-      /* A point has a square rather than edges, and the warp strides it. */
-      if (s.is_point) {
-         rasterize_point(&args, &s, tri_id, lane_id, 32);
-         continue;
-      }
-
       int bb_w = s.ix_max - s.ix_min + 1;
       int bb_h = s.iy_max - s.iy_min + 1;
       int bb_area = bb_w * bb_h;
 
-      /* Huge triangles: decompose into tiles and push to stage 3 */
+      /*
+       * Huge primitives: decompose into tiles and push to stage 3. Points come
+       * this way too. A warp is 32 lanes however large the primitive, and a
+       * particle sprite covering some seven thousand pixels leaves each lane
+       * a couple of hundred atomicMins to issue back to back — which is
+       * latency, not arithmetic, and the way to hide it is more threads.
+       * Stage 3 gives the same sprite a block per tile.
+       */
       if (bb_area > CP_MEDIUM_THRESHOLD) {
          if (lane_id == 0) {
             int tile_x_min = s.ix_min / CP_TILE_SIZE;
@@ -692,6 +693,13 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
                }
             }
          }
+         continue;
+      }
+
+      /* A point of this size has a square rather than edges; the warp strides
+       * it the same way it would a bounding box. */
+      if (s.is_point) {
+         rasterize_point(&args, &s, tri_id, lane_id, 32);
          continue;
       }
 
@@ -740,11 +748,13 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
    struct cp_tile_pair *huge_queue =
       (struct cp_tile_pair *)(uintptr_t)queues.huge_tiles;
 
-   /* Setup triangle (shared across block via shared memory) */
-   __shared__ float sh_sx0, sh_sy0, sh_sx1, sh_sy1, sh_sx2, sh_sy2;
-   __shared__ float sh_ndc_z0, sh_ndc_z1, sh_ndc_z2;
-   __shared__ float sh_inv_area;
-   __shared__ int sh_e0_tl, sh_e1_tl, sh_e2_tl;
+   /*
+    * The setup, shared across the block. The whole struct rather than the
+    * fields a triangle happens to need, for the reason cp_broadcast_setup()
+    * gives: a point carries a square where a triangle carries edges, and a
+    * copy that names fields has to be extended for each new kind.
+    */
+   __shared__ struct tri_setup sh_s;
    __shared__ int sh_valid;
 
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
@@ -769,15 +779,14 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
          struct tri_setup s;
          sh_valid = 0;
          if (tri_id < num_triangles && setup_triangle(&args, tri_id, &s)) {
-            sh_sx0 = s.sx0; sh_sy0 = s.sy0;
-            sh_sx1 = s.sx1; sh_sy1 = s.sy1;
-            sh_sx2 = s.sx2; sh_sy2 = s.sy2;
-            sh_ndc_z0 = s.ndc_z0; sh_ndc_z1 = s.ndc_z1; sh_ndc_z2 = s.ndc_z2;
-            sh_inv_area = s.inv_area;
-            sh_e0_tl = s.e0_top_left;
-            sh_e1_tl = s.e1_top_left;
-            sh_e2_tl = s.e2_top_left;
+            sh_s = s;
 
+            /* A point's square is tested per pixel below; it has no edges to
+             * reject a tile with, and its bounding box already selected the
+             * tiles it was filed under. */
+            if (s.is_point) {
+               sh_valid = 1;
+            } else {
             /*
              * Trivial reject: an edge that is outside at all four tile corners
              * is outside everywhere in the tile, because the edge function is
@@ -809,6 +818,7 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
             }
 
             sh_valid = reject ? 0 : 1;
+            }
          }
       }
       __syncthreads();
@@ -835,19 +845,26 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
                cp_sample_pos(args.num_samples, sm, &ox, &oy);
                float sx = (float)px + ox, sy = (float)py + oy;
 
-               float e0 = edge_function(sh_sx1, sh_sy1, sh_sx2, sh_sy2, sx, sy);
-               float e1 = edge_function(sh_sx2, sh_sy2, sh_sx0, sh_sy0, sx, sy);
-               float e2 = edge_function(sh_sx0, sh_sy0, sh_sx1, sh_sy1, sx, sy);
+               if (sh_s.is_point) {
+                  if (sx >= sh_s.pt_x0 && sx < sh_s.pt_x1 &&
+                      sy >= sh_s.pt_y0 && sy < sh_s.pt_y1)
+                     emit_fragment(&args, tri_id, px, py, sm, sh_s.ndc_z0);
+                  continue;
+               }
 
-               if (edge_inside(e0, sh_e0_tl) &&
-                   edge_inside(e1, sh_e1_tl) &&
-                   edge_inside(e2, sh_e2_tl)) {
-                  float w0 = e0 * sh_inv_area;
-                  float w1 = e1 * sh_inv_area;
+               float e0 = edge_function(sh_s.sx1, sh_s.sy1, sh_s.sx2, sh_s.sy2, sx, sy);
+               float e1 = edge_function(sh_s.sx2, sh_s.sy2, sh_s.sx0, sh_s.sy0, sx, sy);
+               float e2 = edge_function(sh_s.sx0, sh_s.sy0, sh_s.sx1, sh_s.sy1, sx, sy);
+
+               if (edge_inside(e0, sh_s.e0_top_left) &&
+                   edge_inside(e1, sh_s.e1_top_left) &&
+                   edge_inside(e2, sh_s.e2_top_left)) {
+                  float w0 = e0 * sh_s.inv_area;
+                  float w1 = e1 * sh_s.inv_area;
 
                   emit_fragment(&args, tri_id, px, py, sm,
-                                w0 * sh_ndc_z0 + w1 * sh_ndc_z1 +
-                                (1.0f - w0 - w1) * sh_ndc_z2);
+                                w0 * sh_s.ndc_z0 + w1 * sh_s.ndc_z1 +
+                                (1.0f - w0 - w1) * sh_s.ndc_z2);
                }
             }
          }
