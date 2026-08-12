@@ -91,10 +91,10 @@ Differing pixels versus the NVIDIA driver at tolerance 8/255:
 | texture | 593 | anisotropic taps on a slightly tilted quad |
 | multithreading | 0.22% | speckle, cause unknown |
 | computeshader | 0.31% | |
-| texturecubemap | 1.32% | reflections too sharp, see gaps |
+| texturecubemap | 0.53% | |
 | particlesystem | 2.51% | no POINT_LIST rasterization |
 | multisampling | 2.58% | no MSAA |
-| pbribl | 3.02% | reflections too sharp |
+| pbribl | 0.14% | |
 | texturemipmapgen | 3.50% | anisotropic filter differences |
 | gltfscenerendering | 1.70% | |
 | instancing | 0.38% | |
@@ -138,15 +138,7 @@ array of pointers:
 
 ## Known gaps, roughly by how much they matter
 
-1. **`pbribl`'s prefiltered environment map is wrong above level 0.** The
-   sample builds it by rendering at 512x512 and copying into each mip of a
-   cube, and the driver only ever sees 512x512 and 64x64 render targets — so
-   the mips come from `cp_resource_copy_region`, into a level and an array
-   layer. This was invisible until `textureLod` started being honoured, since
-   everything used to sample level 0; now the spheres lose their reflections
-   and go dark, and the sample reads 5.58% where it used to read 3.02%. The
-   earlier number was luck, not correctness.
-2. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
+1. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
 4. **No line or point rasterization.** The capture uses POINT_LIST.
 5. **Alpha-tested geometry** costs CP_DISCARD_LAYERS passes over the draw.
    Visibility resolves before shading, so a fragment that discards has already

@@ -207,12 +207,22 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
    cuCtxSetCurrent(cp->screen->cuda_ctx);
    cuCtxSynchronize();
 
+   /*
+    * Each mip level sits at its own offset inside the resource. Leaving that
+    * out does not merely lose the small levels: every copy lands on level 0
+    * instead, so a mip chain built by copying into successive levels ends up
+    * with one level written over and over and the rest untouched. It stays
+    * invisible until something samples above level 0.
+    */
+   unsigned src_off = src_res->lpr.mip_offsets[src_level];
+   unsigned dst_off = dst_res->lpr.mip_offsets[dst_level];
+
    for (int z = 0; z < src_box->depth; z++) {
-      char *s = (char *)src_data +
+      char *s = (char *)src_data + src_off +
                 (src_box->z + z) * src_img_stride +
                 (unsigned)src_box->y * src_stride +
                 (unsigned)src_box->x * pixel_size;
-      char *d = (char *)dst_data +
+      char *d = (char *)dst_data + dst_off +
                 (dstz + z) * dst_img_stride +
                 dsty * dst_stride +
                 dstx * pixel_size;
