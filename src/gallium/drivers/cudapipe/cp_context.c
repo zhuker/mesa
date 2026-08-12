@@ -289,6 +289,58 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
    return (void *)(uintptr_t)(new_base + offset);
 }
 
+/*
+ * Hand the device a block of per-draw constants.
+ *
+ * Every kernel here takes its parameters through a block in memory — the
+ * argument pointer array the generated shaders read, the strides, the counts.
+ * Those were being written by the host straight into the managed scratch
+ * arena, which is the worst place for them: the host's write pulls the page
+ * over to the host, and then the first warp of the shader that reads it stalls
+ * while the page comes back. That stall is charged to the kernel, so it reads
+ * as a slow vertex shader rather than as what it is. A frame of multithreading
+ * makes roughly 1,800 such round trips.
+ *
+ * Device-only memory cannot fault, so the block goes in the arena that has
+ * been sitting unused since the context was created and reaches it by DMA.
+ * The copy is stream ordered, so it lands after the previous draw's kernels
+ * have finished reading whatever occupied that space, and both offsets reset
+ * at flush, which is already a synchronisation point.
+ */
+static CUdeviceptr
+cp_upload(struct cp_context *cp, const void *data, size_t size)
+{
+   if (!cp->arena_base || !cp->upload_host || !size)
+      return 0;
+
+   /* 256 bytes keeps every block on its own cache line and matches the
+    * alignment the constant-buffer path already promises. */
+   size_t dev_off = ALIGN_POT(cp->arena_offset, 256);
+   size_t host_off = ALIGN_POT(cp->upload_offset, 256);
+
+   if (dev_off + size > cp->arena_size || host_off + size > cp->upload_size) {
+      /*
+       * Out of room before a flush came round. Rewinding would let this draw
+       * overwrite staging a previous draw's copy has not read yet, so fall
+       * back to a synchronous copy from the caller's own memory, which cannot
+       * be reused early because it does not return until the copy is made.
+       */
+      cuCtxSynchronize();
+      cp->arena_offset = cp->upload_offset = 0;
+      dev_off = host_off = 0;
+      if (size > cp->arena_size || size > cp->upload_size)
+         return 0;
+   }
+
+   CUdeviceptr dst = cp->arena_base + dev_off;
+   memcpy((char *)cp->upload_host + host_off, data, size);
+   cuMemcpyHtoDAsync(dst, (char *)cp->upload_host + host_off, size, NULL);
+
+   cp->arena_offset = dev_off + size;
+   cp->upload_offset = host_off + size;
+   return dst;
+}
+
 static void
 cp_scratch_begin(struct cp_context *cp)
 {
@@ -320,6 +372,11 @@ cp_scratch_reset(struct cp_context *cp)
       cuMemFree(cp->scratch.overflow[i]);
    cp->scratch.num_overflow = 0;
    cp->scratch.used = 0;
+
+   /* Callers of this have already waited for the device, so the staging the
+    * uploads were copied out of is free to be written over again. */
+   cp->arena_offset = 0;
+   cp->upload_offset = 0;
 }
 
 static void
@@ -726,14 +783,13 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    unsigned num_pixels = max_pixels;
 
    /* The shader reads its arguments through the same pointer-array ABI the
-    * compute path uses; see cp_launch_grid(). */
-   fs_args_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 64 * sizeof(void *));
-   stride_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
-   if (!fs_args_dev || !stride_dev)
-      return;
-
+    * compute path uses; see cp_launch_grid(). Both blocks go to the device by
+    * DMA rather than through managed memory the host has just dirtied — see
+    * cp_upload(). */
    uint32_t fs_stride_host = fs_in_stride;
-   *(uint32_t*)(uintptr_t)stride_dev = fs_stride_host;
+   stride_dev = cp_upload(cp, &fs_stride_host, sizeof(fs_stride_host));
+   if (!stride_dev)
+      return;
 
    void *fs_args_host[64] = {0};
    fs_args_host[0] = (void *)(uintptr_t)counter;
@@ -745,7 +801,9 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
       fs_args_host[18 + i] = cp->fs_ubos[i].buffer;
 
-   memcpy((void*)(uintptr_t)fs_args_dev, fs_args_host, 64 * sizeof(void*));
+   fs_args_dev = cp_upload(cp, fs_args_host, sizeof(fs_args_host));
+   if (!fs_args_dev)
+      return;
 
    if (getenv("CUDAPIPE_DEBUG_TEX")) {
       fprintf(stderr, "cudapipe: sampler table %p (%u entries) for FS module\n",
@@ -1257,13 +1315,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             }
          }
 
-         /* Allocate device-side buffers for VS kernel args and metadata */
-         CUdeviceptr vs_args_dev = (CUdeviceptr)(uintptr_t)
-            cp_scratch_alloc(cp, 64 * sizeof(void *));
-         CUdeviceptr stride_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
-         CUdeviceptr vcount_dev = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
          CUdeviceptr vid_buf = 0, iid_buf = 0;
-         CUdeviceptr draw_params = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 3 * 4);
 
          if (skip_refs) {
             /* TRIANGLE_LIST fast path: VS reads vertex IDs from the index buffer
@@ -1319,38 +1371,51 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             free(iid_host);
          }
 
-         if (!vs_args_dev || !stride_dev || !vcount_dev || !draw_params) {
+         /*
+          * The scalars the shader dereferences, in one block and so in one
+          * upload: they are read by every thread of the launch, and three
+          * separate managed allocations meant three pages to fault back from
+          * the host after the host had just written them.
+          */
+         struct cp_vs_meta {
+            uint32_t vcount;
+            uint32_t stride;
+            uint32_t draw_params[3];
+         } meta = {
+            .vcount = total_verts,
+            .stride = stride,
+            .draw_params = {
+               indexed ? (uint32_t)draws[0].index_bias : draws[0].start,
+               info->start_instance,
+               drawid_offset,
+            },
+         };
+
+         CUdeviceptr meta_dev = cp_upload(cp, &meta, sizeof(meta));
+         if (!meta_dev) {
             FREE(refs);
             return;
          }
 
          /* Build the VS args table on the stack, upload in one shot */
          void *vs_args_host[64] = {0};
-         uint32_t stride_host = stride;
-         uint32_t vcount_host = total_verts;
-         uint32_t draw_params_host[3] = {
-            indexed ? (uint32_t)draws[0].index_bias : draws[0].start,
-            info->start_instance,
-            drawid_offset,
-         };
-
-         *(uint32_t*)(uintptr_t)stride_dev = stride_host;
-         *(uint32_t*)(uintptr_t)vcount_dev = vcount_host;
-         memcpy((void*)(uintptr_t)draw_params, draw_params_host, 12);
-
-         vs_args_host[0] = (void*)(uintptr_t)vcount_dev;
+         vs_args_host[0] = (void*)(uintptr_t)(meta_dev + offsetof(struct cp_vs_meta, vcount));
          vs_args_host[1] = NULL;
          vs_args_host[2] = (void*)(uintptr_t)vs_input_buf;
-         vs_args_host[3] = (void*)(uintptr_t)stride_dev;
+         vs_args_host[3] = (void*)(uintptr_t)(meta_dev + offsetof(struct cp_vs_meta, stride));
          vs_args_host[4] = (void*)(uintptr_t)vs_output_buf;
          vs_args_host[5] = (void*)(uintptr_t)vid_buf;
          vs_args_host[6] = (void*)(uintptr_t)iid_buf;
-         vs_args_host[7] = (void*)(uintptr_t)draw_params;
+         vs_args_host[7] = (void*)(uintptr_t)(meta_dev + offsetof(struct cp_vs_meta, draw_params));
 
          for (unsigned i = 0; i < cp->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
             vs_args_host[18 + i] = cp->vs_ubos[i].buffer;
 
-         memcpy((void*)(uintptr_t)vs_args_dev, vs_args_host, 64 * sizeof(void*));
+         CUdeviceptr vs_args_dev = cp_upload(cp, vs_args_host, sizeof(vs_args_host));
+         if (!vs_args_dev) {
+            FREE(refs);
+            return;
+         }
 
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
@@ -2728,6 +2793,11 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    cuMemAlloc(&ctx->arena_base, 256 * 1024 * 1024);
    ctx->arena_size = 256 * 1024 * 1024;
    ctx->arena_offset = 0;
+
+   /* Staging for it. A frame of the heaviest sample in the sweep uploads
+    * under a megabyte, and running out only costs a synchronisation. */
+   if (cuMemAllocHost(&ctx->upload_host, 8 * 1024 * 1024) == CUDA_SUCCESS)
+      ctx->upload_size = 8 * 1024 * 1024;
 
    /* Adaptive rasterizer queues — allocated once, reused across draws.
     * Counters are allocated as 256 bytes each (minimum practical GPU alloc)

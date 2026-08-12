@@ -115,10 +115,18 @@ struct cp_context {
    struct cp_gpu_state *gpu_state;
 
    /* Device-only arena for per-draw scratch buffers. CPU never touches this
-    * memory — just tracks offsets as integers. */
+    * memory — just tracks offsets as integers. See cp_upload(). */
    CUdeviceptr arena_base;
    size_t arena_size;
    size_t arena_offset;
+
+   /* Pinned host staging for cp_upload(). Pinned rather than ordinary malloc
+    * because only a pinned source lets cuMemcpyHtoDAsync be genuinely
+    * asynchronous; from pageable memory the driver synchronises the stream
+    * first, which per draw would cost more than the upload saves. */
+   void *upload_host;
+   size_t upload_size;
+   size_t upload_offset;
 
    /* Old scratch system — kept during transition */
    struct {
