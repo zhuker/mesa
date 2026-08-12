@@ -82,19 +82,22 @@ wrong; back the `.spv` up first and restore it afterwards.
 ## Status
 
 Differing pixels versus the NVIDIA driver at tolerance 8/255, worst first.
-Total across the set: 83,638, from 105,212 before ordered blending, 110,015
+Total across the set: 61,622 — under llvmpipe's 62,574, with no unimplemented
+feature left in the set. From 83,638 before multisampling, 105,212 before
+ordered blending, 110,015
 before the watertight-coverage and cube-derivative work, 143,856 before the
 quad-derivative work, and far more before that.
 
 | Sample | Differing | Note |
 |---|---|---|
 | texturemipmapgen | 3.50% | anisotropic filter, accepted — see gap 3 |
-| multisampling | 2.58% | no MSAA, the only unimplemented feature left |
+
 | gltfscenerendering | 1.70% | anisotropic filter, accepted — see gap 3 |
 | texturecubemap | 0.45% | reflection sharper than the reference at grazing angles |
 | instancing | 0.38% | mostly the procedural starfield, see below |
 | multithreading | 0.23% | speckle, no diagnosis, and the sample is nondeterministic |
 | particlesystem | 0.17% | |
+| multisampling | 0.19% | |
 | texture | 589 px | anisotropic taps on a slightly tilted quad |
 | pbribl | 28 px | |
 | vulkanscene | 25 px | |
@@ -108,9 +111,8 @@ quad-derivative work, and far more before that.
 | triangle | 0 | |
 
 Eleven of eighteen are within a handful of pixels and five match exactly, from
-one at the start of this work. Of the rest, only multisampling is an
-unimplemented feature; the others are the anisotropic filter difference that
-gap 3 closes out.
+one at the start of this work. Everything still above 0.2% is the anisotropic
+filter difference that gap 3 closes out.
 
 ### Calibrate against llvmpipe, not against zero
 
@@ -120,7 +122,7 @@ sampler and clipper were ported from, and which shares lavapipe as its frontend:
 | Sample | llvmpipe vs NVIDIA | cudapipe vs NVIDIA | cudapipe vs llvmpipe |
 |---|---|---|---|
 | texturemipmapgen | **21070** | 32237 | 17921 |
-| multisampling | **1454** | 23773 | 23145 |
+| multisampling | **1454** | 1757 | ~2000 |
 | gltfscenerendering | 26263 | **15698** | 5976 |
 | texturecubemap | 5165 | **4144** | 3792 |
 | instancing | 5829 | **3506** | 1869 |
@@ -130,7 +132,7 @@ sampler and clipper were ported from, and which shares lavapipe as its frontend:
 | pbribl | 73 | **28** | 96 |
 | vulkanscene | **11** | 25 | 20 |
 | everything else | ~0 | ~0 | ~0 |
-| **total** | **62574** | 83638 | 77405 |
+| **total** | 62574 | **61622** | ~55000 |
 
 Two things follow, and both change how the status table above should be read.
 
@@ -141,11 +143,12 @@ mean error runs to +12.7/255 in the top luminance band against cudapipe's
 +20.5, the same sign and shape, about 60% of the size. So there is real
 headroom there, but the floor is llvmpipe's number, not zero.
 
-**Excluding MSAA, cudapipe is ahead of llvmpipe.** Take out multisampling, the
-one feature it does not implement, and it is 59865 against llvmpipe's 61120. On
-gltfscenerendering cudapipe is closer to NVIDIA by a factor of 1.7, and that
-holds region by region across the surfaces where the difference is most visible
-— the curtains, the pillars, the arches.
+**cudapipe is now ahead of llvmpipe over the whole set**, 61622 against 62574,
+with nothing left unimplemented in it. On gltfscenerendering it is closer to
+NVIDIA by a factor of 1.7, and that holds region by region across the surfaces
+where the difference is most visible — the curtains, the pillars, the arches.
+The numbers above are worth re-measuring rather than trusted to the last
+hundred: three samples are nondeterministic (gap 8).
 
 Worth re-running whenever a sampler or rasterizer change looks like it is not
 paying off; llvmpipe is the honest target.
@@ -245,11 +248,32 @@ draws that do not overlap themselves. particlesystem's fire is 512 additive
 sprites piled tens deep and converges at 256 layers; 1024 gives a bit-identical
 image.
 
+**Multisampling resolves coverage and depth per sample and shades per pixel.**
+The rasterizer tests each sample position in turn — the standard Vulkan
+locations, with one sample being the pixel centre so 1x stays exactly what it
+was — and resolves a winner per sample. The fragment shader still runs once per
+pixel, and its colour goes to whichever samples that primitive won, which is
+what per-fragment shading means. Visibility, depth and colour all hold the
+samples plane after plane, so a sample is one multiply away and the
+single-sample path indexes plane zero.
+
+`cp_fs_interpolate` gathers distinct triangles across all of a block's samples
+rather than its four pixels, since more of them can meet inside a block once it
+holds sixteen or more sample points, and the coverage byte becomes a mask of
+which samples each fragment won. `cp_resolve_samples` averages the planes, on
+decoded values rather than packed bytes — an sRGB attachment has to average in
+linear light or the resolve darkens exactly the edges multisampling exists to
+smooth.
+
 ## Known gaps, roughly by how much they matter
 
-1. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
-   This is the only unimplemented feature left, and all of `multisampling`.
-2. **No line rasterization.** POINT_LIST works — see Architecture above.
+1. **No line rasterization.** POINT_LIST and multisampling both work — see
+   Architecture. Nothing else in the sample set is unimplemented.
+2. **Sample shading is per fragment only.** `minSampleShading` and
+   `sampleShadingEnable` are ignored, so a pipeline asking for per-sample
+   shading gets per-pixel shading written to the covered samples. The
+   multisampling sample builds such a pipeline but only binds it from the UI,
+   which the offscreen runs do not touch.
 3. **Anisotropic filtering under-blurs relative to NVIDIA's — accepted, closed.**
    Vulkan leaves the anisotropic filter implementation-defined, llvmpipe differs
    from NVIDIA in the same direction, and cudapipe is closer to NVIDIA than
