@@ -1953,8 +1953,32 @@ cp_flush(struct pipe_context *ctx, struct pipe_fence_handle **fence,
       *fence = (struct pipe_fence_handle *)(uintptr_t)event;
    }
 
-   /* Sync and reclaim scratch — keeps memory bounded. The sync is cheap
-    * here because the GPU is typically already caught up (99% utilized). */
+   /*
+    * Sync and reclaim the scratch arenas.
+    *
+    * The plan asks for this drain to go, on the grounds that it is the host
+    * waiting for work it could be queueing behind — and the premise is sound:
+    * the GPU is no longer the "99% utilized" the original comment claimed,
+    * but 66-80% on the launch-heavy samples by tests/cp_gpu_busy.sh.
+    *
+    * Removing it is nonetheless a regression, measured: +0.4% over the sweep,
+    * pbribl +14.5%, negativeviewportheight +9.2%, texture +8.5%,
+    * texturecubemap +6.4%. Correctness and memory were both fine — the peak
+    * stayed at 3.4 GB of 32, because cp_scratch_alloc() still reclaims at
+    * CP_SCRATCH_RECLAIM_BYTES.
+    *
+    * That reclaim is exactly why it loses. Resetting here costs a drain and
+    * nothing else, because the arena is rewound to zero and the next frame
+    * reuses the same pages. Deferring it until an arena has handed out a
+    * gigabyte means the reclaim path runs instead, and that one frees and
+    * reallocates the overflow buffers — cuMemAlloc and cuMemFree are tens of
+    * microseconds each where a drain of an almost-idle queue is a few. Trading
+    * many cheap syncs for occasional expensive reallocation is the wrong way
+    * round.
+    *
+    * So this stays until the arena can be reclaimed without reallocating,
+    * which is a change to cp_scratch_alloc() rather than to this line.
+    */
    cuCtxSynchronize();
    cp_scratch_reset(cp);
 }

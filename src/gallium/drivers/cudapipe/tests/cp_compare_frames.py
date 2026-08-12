@@ -21,11 +21,23 @@ multiple plus a constant floor for samples whose frame 0 is near zero.
 Prints a line per sample with the worst frame and where it was, then a
 verdict. Exit status is 1 if any sample regressed, so it can gate a
 benchmark run.
+
+Unlike the rest of the tests this one needs numpy: it is the only tool that
+counts pixels over every frame of every sample rather than over one image, so
+the count runs a thousand times a sweep. In pure Python that was 0.16 s per
+720p frame pair, minutes per driver; in numpy it is half a millisecond. Run it
+with the repo venv's interpreter, $MESA/venv/bin/python3, which is what
+cp_iterate.sh does.
 """
 
 import argparse
 import os
 import sys
+
+try:
+    import numpy as np
+except ImportError:
+    sys.exit('cp_compare_frames.py needs numpy: run it with $MESA/venv/bin/python3')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cp_compare import read_image
@@ -38,17 +50,36 @@ def frames_of(driver_dir, sample):
     return sorted(f for f in os.listdir(d) if f.endswith(('.ppm', '.png')))
 
 
-def differing(a, b, w, h, ch_a, ch_b, tol):
-    n = 0
-    for y in range(h):
-        ra, rb = a[y], b[y]
-        for x in range(w):
-            ia, ib = x * ch_a, x * ch_b
-            if max(abs(ra[ia] - rb[ib]),
-                   abs(ra[ia + 1] - rb[ib + 1]),
-                   abs(ra[ia + 2] - rb[ib + 2])) > tol:
-                n += 1
-    return n
+def read_rgb(path):
+    """One image as an (h, w, 3) uint8 array, dropping alpha if it has one.
+
+    The reader hands back one bytes object per row; joining them is a single
+    memcpy of the frame, which is nothing beside what is done with it.
+    """
+    w, h, ch, rows = read_image(path)
+    flat = np.frombuffer(b''.join(rows), dtype=np.uint8)
+    if flat.size != w * h * ch:
+        raise ValueError('%s: %d bytes of pixels for %dx%d and %d channels'
+                         % (path, flat.size, w, h, ch))
+    return flat.reshape(h, w, ch)[:, :, :3]
+
+
+def differing(a, b, tol):
+    """Pixels where any of the three channels differs by more than tol.
+
+    max minus min is the absolute difference without leaving uint8, so the
+    count runs at one byte a pixel-channel and never promotes to int.
+
+    The three channels are then reduced by name rather than with
+    delta.max(axis=2). A numpy reduction along a length 3 contiguous axis is
+    far slower than two whole-plane maxima over strided views — 13 ms against
+    1 ms on a 720p frame here, which is most of what this function costs.
+    """
+    delta = np.maximum(a, b)
+    delta -= np.minimum(a, b)
+    worst = np.maximum(np.maximum(delta[:, :, 0], delta[:, :, 1]),
+                       delta[:, :, 2])
+    return int(np.count_nonzero(worst > tol))
 
 
 def main():
@@ -96,12 +127,12 @@ def main():
             first = worst = None
             worst_at = 0
             for i in range(0, n, args.stride):
-                rw, rh, rch, ri = read_image(os.path.join(ref_dir, sample, rf[i]))
-                tw, th, tch, ti = read_image(os.path.join(test_dir, sample, tf[i]))
-                if (rw, rh) != (tw, th):
+                ri = read_rgb(os.path.join(ref_dir, sample, rf[i]))
+                ti = read_rgb(os.path.join(test_dir, sample, tf[i]))
+                if ri.shape != ti.shape:
                     first = worst = -1
                     break
-                d = differing(ri, ti, rw, rh, rch, tch, args.tol)
+                d = differing(ri, ti, args.tol)
                 if first is None:
                     first = d
                 if worst is None or d > worst:

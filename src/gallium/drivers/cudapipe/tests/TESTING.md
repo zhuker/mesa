@@ -40,8 +40,12 @@ run's images.
 | `cp_gallery.py` | HTML for the single frame sweep, two or three drivers |
 | `cp_perf_report.py` | HTML for the animated sweep: cost, GPU, per-frame differences, frame inspector |
 
-Everything is Python standard library or shell. `cp_perf_report.py` additionally
-needs `ffmpeg`, which does all the image work.
+Everything is Python standard library or shell, with two exceptions.
+`cp_perf_report.py` needs `ffmpeg`, which does all its image work, and
+`cp_compare_frames.py` needs `numpy` — it is the one tool that counts pixels
+over a whole sweep rather than over one image, and the loop belongs in C.
+Both live in the repo venv, so run it as `$MESA/venv/bin/python3
+cp_compare_frames.py`; `cp_iterate.sh` already does.
 
 ---
 

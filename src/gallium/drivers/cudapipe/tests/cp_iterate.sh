@@ -81,11 +81,23 @@ if [ "${BENCH_ONLY:-0}" != "1" ]; then
     "$T/cp_perf_run.sh" "$DRIVER" "$ICD" "$FRAMEROOT/$LABEL" "$FRAMES" || exit 1
 
     echo "=== [$LABEL] correctness against nvidia ==="
-    python3 "$T/cp_compare_frames.py" "$FRAMEROOT" --ref nvidia --test "$LABEL" \
+    "$MESA/venv/bin/python3" "$T/cp_compare_frames.py" \
+        "$FRAMEROOT" --ref nvidia --test "$LABEL" \
         > "$OUT/verdict.txt" 2>&1
     verdict=$?
     tail -32 "$OUT/verdict.txt"
     echo "(cp_compare_frames exit $verdict -> $OUT/verdict.txt)"
+
+    # A gate that can be skipped without saying so is worse than no gate. The
+    # exit status alone does not distinguish "a sample regressed" from "the
+    # comparison never ran" — both are 1 — and the second reads like the first
+    # while a cost number prints underneath it either way. Refuse to go on
+    # unless a verdict table was actually produced.
+    if ! grep -q "^sample " "$OUT/verdict.txt"; then
+        echo "FATAL: no verdict table in $OUT/verdict.txt -- the correctness" \
+             "gate did not run, so the cost delta below would be unguarded" >&2
+        exit 1
+    fi
 fi
 
 # The cost delta. ms/frame is the per-frame number; wall carries start up and
