@@ -95,8 +95,8 @@ quad-derivative work, and far more before that.
 
 | Sample | Differing | Note |
 |---|---|---|
-| texturemipmapgen | 3.50% | anisotropic filter, accepted — see gap 3 |
-| gltfscenerendering | 1.70% | anisotropic filter, accepted — see gap 3 |
+| texturemipmapgen | 3.50% | anisotropic filter, accepted — see gap 5 |
+| gltfscenerendering | 1.70% | anisotropic filter, accepted — see gap 5 |
 | texturecubemap | 0.45% | reflection sharper than the reference at grazing angles |
 | instancing | 0.38% | mostly the procedural starfield, see below |
 | multithreading | 0.23% | speckle, no diagnosis, and the sample is nondeterministic |
@@ -152,14 +152,14 @@ with nothing left unimplemented in it. On gltfscenerendering it is closer to
 NVIDIA by a factor of 1.7, and that holds region by region across the surfaces
 where the difference is most visible — the curtains, the pillars, the arches.
 The numbers above are worth re-measuring rather than trusted to the last
-hundred: three samples are nondeterministic (gap 8).
+hundred: three samples are nondeterministic (gap 10).
 
 Worth re-running whenever a sampler or rasterizer change looks like it is not
 paying off; llvmpipe is the honest target.
 
-Note also that all 18 samples run clean under llvmpipe, while renderheadless,
-gltfscenerendering and pbribl segfault during teardown under cudapipe after
-writing their images. Those are cudapipe bugs, not sample bugs.
+All 18 samples now exit cleanly on both. Four of them used to render correctly
+and then segfault on the way out, which went unnoticed because only the images
+were being compared — see the lessons.
 
     VK_ICD_FILENAMES=build-cudapipe/src/gallium/targets/lavapipe/lvp_devenv_icd.x86_64.json \
       VALIDATION=0 OUT=build/compare/llvmpipe ./run_offscreen.sh
@@ -176,6 +176,35 @@ and can invalidate the comparison set without touching cudapipe at all. After
 editing anything under `src/gallium/frontends/lavapipe`, re-render llvmpipe and
 `cmp` it against the stored set before trusting a comparison — the sample count
 limits below were exactly such a change, and llvmpipe came out bit-identical.
+
+### What it costs
+
+Sixty frames of each sample, the still scenes orbited, wall clock and CPU
+seconds:
+
+| | nvidia | cudapipe | llvmpipe |
+|---|---|---|---|
+| particlesystem | 0.99 / 0.97 | **83.3 / 83.2** | 1.25 / 5.71 |
+| bloom | 1.02 / 1.00 | 35.5 / 35.4 | 0.44 / 3.65 |
+| gltfscenerendering | 1.13 / 1.11 | 21.2 / 21.1 | 1.35 / 16.9 |
+| instancing | 0.98 / 0.96 | 16.2 / 16.2 | 4.59 / 15.6 |
+| pbribl | 1.16 / 1.05 | 14.2 / 14.1 | 16.0 / 22.5 |
+| **total, 18 samples** | **16.3 / 16.9** | **274 / 271** | **33.1 / 110** |
+
+Peak GPU: 367 MiB and 51% for NVIDIA, 3.3 GiB and 100% for cudapipe.
+
+Three things to take from it, none of them worked on yet:
+
+**cudapipe is single threaded on the host.** Wall clock tracks CPU on every
+sample — 83.27 against 83.22 on particlesystem — so it is one core blocking on
+the GPU. llvmpipe's 33 s wall against 110 s CPU is it spreading across cores,
+which is how it beats cudapipe on wall clock while doing four times the work.
+
+**The two worst samples are both the peel loop.** particlesystem and bloom are
+the blended draws, at 5x and 2.4x the next worst. Up to 256 passes per draw,
+each with a `cuStreamSynchronize` — gap 6, and the obvious first target.
+
+**pbribl is the one cudapipe already wins**, 14.2 s against llvmpipe's 16.0.
 
 ## Architecture
 
@@ -279,14 +308,25 @@ smooth.
 
 ## Known gaps, roughly by how much they matter
 
-1. **No line rasterization.** POINT_LIST and multisampling both work — see
+1. **`computeshader` falls apart as soon as the camera moves.** It matches
+   NVIDIA exactly on a static frame — one of the five that do — and reaches
+   28,805 differing pixels by frame 5 of an orbit, against llvmpipe's 373 over
+   the same motion. So it is a cudapipe defect, not the scene. Undiagnosed, and
+   the largest correctness problem in the set.
+2. **`texture3d` drifts over an animation.** 2 differing pixels at frame 0,
+   3,090 at frame 24; llvmpipe is 0 across all sixty. Also undiagnosed.
+
+   Neither of these is visible in the single frame sweep, which is what the
+   animated one exists for — see `tests/TESTING.md`. Both open on their worst
+   frame in the report.
+3. **No line rasterization.** POINT_LIST and multisampling both work — see
    Architecture. Nothing else in the sample set is unimplemented.
-2. **Sample shading is per fragment only.** `minSampleShading` and
+4. **Sample shading is per fragment only.** `minSampleShading` and
    `sampleShadingEnable` are ignored, so a pipeline asking for per-sample
    shading gets per-pixel shading written to the covered samples. The
    multisampling sample builds such a pipeline but only binds it from the UI,
    which the offscreen runs do not touch.
-3. **Anisotropic filtering under-blurs relative to NVIDIA's — accepted, closed.**
+5. **Anisotropic filtering under-blurs relative to NVIDIA's — accepted, closed.**
    Vulkan leaves the anisotropic filter implementation-defined, llvmpipe differs
    from NVIDIA in the same direction, and cudapipe is closer to NVIDIA than
    llvmpipe on the samples where it is most visible. Recorded here as a
@@ -329,35 +369,32 @@ smooth.
    `gltfscenerendering` 15697 -> 25036, `instancing` 3506 -> 5346,
    `texturecubemap` 4144 -> 4774. Do not re-apply it wholesale; the two halves of
    it have not been measured separately.
-4. **A blended draw costs one `cuStreamSynchronize` per layer.** The host reads
+6. **A blended draw costs one `cuStreamSynchronize` per layer.** The host reads
    a managed flag between passes to decide whether another is worth launching.
    That is the first thing to attack if blended draws ever dominate a frame; the
    flag could instead drive a device-side loop or a launch graph.
-5. **Peeling does not combine with the alpha-test retry loop.** Both want the
+7. **Peeling does not combine with the alpha-test retry loop.** Both want the
    same multi-pass machinery for different reasons, so a shader that discards
    keeps the retry path and gets the old single-layer blending. No sample in the
    set needs both at once.
-6. **Alpha-tested geometry costs CP_DISCARD_LAYERS passes over the draw.**
+8. **Alpha-tested geometry costs CP_DISCARD_LAYERS passes over the draw.**
    Visibility resolves before shading, so a fragment that discards has already
    displaced the one behind it; each pass records what discarded where and
    repeats so the next fragment can win. Sponza's foliage falls from 543
    discards to 1 within four passes; halving the layers from 8 to 4 costs it
    0.14% of the frame, and anything still discarding after the last layer is
    lost.
-7. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
+9. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
    compressed textures, and the capture has 576 BC images.
-8. **`multithreading` (0.23%) has no diagnosis**, and the sample is
+10. **`multithreading` (0.23%) has no diagnosis**, and the sample is
    nondeterministic: two runs of the same build differ, because thread
    scheduling changes the order its command buffers are recorded. Do not read
    its last few hundred pixels as signal.
-9. **`renderheadless`, `gltfscenerendering` and `pbribl` segfault during
-   teardown**, after writing their images. All 18 run clean under llvmpipe, so
-   these are cudapipe bugs rather than sample bugs. Never diagnosed.
-10. **`bindless_image_store` has no bounds check.** A latent memory-safety hole
+11. **`bindless_image_store` has no bounds check.** A latent memory-safety hole
    rather than a visible bug — the one sample that stores dispatches
    `width / 16`, so it never addresses out of range. The load path clamps the
    address and selects the value back to zero; the store should drop instead.
-11. `nir_op_fexp2`, `flog2` and lowered `fpow` still use the NVVM `.approx`
+12. `nir_op_fexp2`, `flog2` and lowered `fpow` still use the NVVM `.approx`
    intrinsics. Routing pow to the CUDA library version was tried and changed the
    image without moving it closer to the reference, so it was reverted. `fsin`
    and `fcos` do *not* — see below.
@@ -460,6 +497,37 @@ order its command buffers are recorded. That was quietly polluting a few
 hundred pixels of every comparison until two identical runs were diffed against
 each other. Before attributing a small delta to a change, check the sample
 against itself.
+
+**A bump allocator that is only reset between draws will eat the machine.**
+Scratch is handed out per draw and reclaimed when the arena has expanded a few
+times, which works until something allocates inside a loop. The ordered
+blending pass loop called the shading stage once per pass without rewinding, so
+a 256 layer draw asked for a couple of hundred megabytes of buffers 256 times
+over. It is `cuMemAllocManaged`, so it is backed by system RAM and does not
+fail — it invoked the OOM killer and took the desktop down. Counting expansions
+did not catch it either: once the arena is big enough that nothing has to grow,
+that counter stops moving and the pointer climbs for the rest of the frame, and
+a frame of bloom reached eleven gigabytes. Reclaim now triggers on bytes handed
+out as well, the pass loop rewinds, and a hard cap turns any future variant into
+a black frame and a message. Watch `nvidia-smi` and `free` when running
+something new for the first time; the trace of that run showed the GPU pinned at
+32,072 MiB of 32,607 for five minutes before the kill.
+
+**Reusing a buffer exposes what it relied on being zero.** Rewinding the arena
+between passes broke four samples, because the pixel counter and the discard
+mask were read where they had not been written and had been getting a fresh
+`cuMemAllocManaged`, which happens to be zeroed. Anything reused has to be
+initialised explicitly.
+
+**Read the exit codes, not just the images.** Four samples rendered correctly
+and then took SIGSEGV during teardown, and had been doing so for weeks:
+`pipe_resource_release()` dispatches through the *context*, and cudapipe set the
+screen's `resource_destroy` but never `pipe->resource_release`, so the call went
+to address zero. One line, and llvmpipe had the same line. It survived that long
+because the sweep's images were being compared while `exit=139` sat unread in
+`_summary.txt` — and then it was misdiagnosed as a 60-frame regression, when it
+reproduced at one frame in under a second. `gdb` gave the answer in a single
+run after a long time spent speculating.
 
 **A capability you advertise but clamp is worse than one you refuse.** lavapipe
 named a fixed set of sample counts regardless of the driver under it, so the
