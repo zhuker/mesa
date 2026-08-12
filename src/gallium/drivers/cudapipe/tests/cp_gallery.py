@@ -273,15 +273,19 @@ def main():
                        tw, th, as_rgb(test, tw, tch))
         write_png_file(os.path.join(img_dir, base + '_diff.png'), rw, rh, dmap)
 
+        # A cache-busting stamp: the page keeps the same file names across
+        # runs, and a browser will happily show the previous run's images.
+        stamp = int(os.path.getmtime(os.path.join(img_dir, base + '_diff.png')))
+
         results.append({
             'name': base,
             'diff': diff,
             'total': rw * rh,
             'pct': 100.0 * diff / (rw * rh),
             'delta': delta,
-            'ref': f'{rel}/{base}_ref.png',
-            'test': f'{rel}/{base}_test.png',
-            'diffmap': f'{rel}/{base}_diff.png',
+            'ref': f'{rel}/{base}_ref.png?v={stamp}',
+            'test': f'{rel}/{base}_test.png?v={stamp}',
+            'diffmap': f'{rel}/{base}_diff.png?v={stamp}',
         })
         print(f'{base:24s} {diff:>8}/{rw * rh} ({100.0 * diff / (rw * rh):6.2f}%)')
 
