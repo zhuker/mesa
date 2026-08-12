@@ -208,6 +208,19 @@ cp_set_scissor_states(struct pipe_context *ctx, unsigned start_slot,
 }
 
 /*
+ * A backstop, not a budget. The arena accumulates across the draws of a frame
+ * and only resets after a few expansions, so a frame with a dozen draws at
+ * 1280x720 legitimately reaches two or three gigabytes. What this catches is
+ * the runaway: a stage allocating per pass rather than reusing asks for tens
+ * of gigabytes, and since the arena is managed memory it is backed by system
+ * RAM, so that does not fail — it invokes the OOM killer on the whole machine.
+ */
+#define CP_SCRATCH_MAX_BYTES ((size_t)8 << 30)
+
+/* Sync and reclaim once a frame's draws have run up this much. */
+#define CP_SCRATCH_RECLAIM_BYTES ((size_t)1 << 30)
+
+/*
  * Hand out a slice of the draw's scratch arena.
  *
  * Returns managed memory, so the pointer is valid on both host and device. The
@@ -238,6 +251,23 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
     * since the GPU may still be reading it). */
    size_t want = MAX2(end, cp->scratch.size[cur] * 2);
    want = MAX2(want, 1 << 20); /* at least 1MB */
+
+   /*
+    * Refuse to grow past a size no legitimate draw needs. The arena is
+    * managed memory, so it is backed by system RAM as much as by the GPU, and
+    * an allocation loop that runs away does not fail — it takes the machine
+    * down with the OOM killer. That is not hypothetical: a multi-pass draw
+    * that allocated its shading buffers per pass instead of reusing them
+    * asked for tens of gigabytes and did exactly that. Failing here turns the
+    * same mistake into a black frame and a message.
+    */
+   if (want > CP_SCRATCH_MAX_BYTES) {
+      fprintf(stderr, "cudapipe: scratch arena wants %zu bytes, over the %zu "
+              "cap — refusing. A stage is almost certainly allocating per "
+              "pass instead of reusing.\n",
+              want, (size_t)CP_SCRATCH_MAX_BYTES);
+      return NULL;
+   }
    CUdeviceptr new_base;
    CUresult err = cuMemAllocManaged(&new_base, want, CU_MEM_ATTACH_GLOBAL);
    if (err != CUDA_SUCCESS) {
@@ -262,10 +292,19 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
 static void
 cp_scratch_begin(struct cp_context *cp)
 {
-   /* Cap memory growth: sync and reclaim after a few arena expansions.
-    * With each expansion doubling (1MB→2→4→8→16→32), 5 expansions = 32MB
-    * which is enough to pipeline many draws without exhausting GPU memory. */
-   if (cp->scratch.num_overflow >= 5) {
+   /*
+    * Reclaim when the arena has expanded a few times, or when it has simply
+    * handed out too much. The bump pointer is not reset between draws, so that
+    * one draw's kernels can still be reading their buffers while the host sets
+    * up the next — but that means a frame's draws accumulate, and counting
+    * expansions alone does not notice: once the arena is large enough that
+    * nothing has to grow, the counter stops moving and the pointer climbs
+    * forever. A frame of bloom reached eleven gigabytes that way. Reclaiming
+    * costs a sync, so the limit is high enough that ordinary draws still
+    * pipeline.
+    */
+   if (cp->scratch.num_overflow >= 5 ||
+       cp->scratch.used > CP_SCRATCH_RECLAIM_BYTES) {
       cuCtxSynchronize();
       cp_scratch_reset(cp);
    }
@@ -600,6 +639,19 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    CUdeviceptr frag_coord = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * 16);
    /* One byte per shaded pixel, set by `discard` in the fragment shader. */
    CUdeviceptr discard_mask = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, max_pixels);
+
+   /*
+    * These two are read where they were not written, so they have to start
+    * clean rather than inherit whatever the arena last held. A fresh
+    * cuMemAllocManaged happens to be zeroed, which hid the dependency for as
+    * long as every pass of a multi-pass draw got its own allocation — and
+    * turned into double-blended frames the moment the passes started reusing
+    * one, which they must, or a 256 layer draw asks for tens of gigabytes.
+    */
+   if (counter)
+      cuMemsetD32(counter, 0, 1);
+   if (discard_mask)
+      cuMemsetD8(discard_mask, 0, max_pixels);
    CUdeviceptr fs_args_dev = 0, count_dev = 0, stride_dev = 0;
 
    if (!pixel_list || !counter || !fs_in || !fs_out || !coverage || !frag_coord ||
@@ -1416,7 +1468,19 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       rast_args.reject_layers = CP_DISCARD_LAYERS;
    }
 
+   /*
+    * Every pass shades into the same scratch. Without this the arena grows by
+    * a pass's worth of buffers each time round — for a 1280x720 draw with
+    * five fragment inputs that is a couple of hundred megabytes a pass, which
+    * a 256 layer blended draw turns into tens of gigabytes of managed memory
+    * and an out-of-memory kill. Rewinding is safe because kernels in the
+    * default stream are serialized: the next pass cannot start writing these
+    * buffers until this pass has finished reading them.
+    */
+   size_t shade_mark = cp->scratch.used;
+
    for (unsigned pass = 0; pass < passes; pass++) {
+      cp->scratch.used = shade_mark;
       if (pass) {
          /* Each pass resolves visibility afresh, minus what has been rejected. */
          cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples);
