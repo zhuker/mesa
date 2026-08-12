@@ -186,32 +186,46 @@ limits below were exactly such a change, and llvmpipe came out bit-identical.
 
 ### What it costs
 
-Sixty frames of each sample, the still scenes orbited, wall clock and CPU
-seconds:
+Sixty frames of each sample, the still scenes orbited, timed rather than stored
+— milliseconds per frame, the mean over the sixty (`cp_perf_run.sh ... 60 1`):
 
 | | nvidia | cudapipe | llvmpipe |
 |---|---|---|---|
-| particlesystem | 0.99 / 0.97 | **83.3 / 83.2** | 1.25 / 5.71 |
-| bloom | 1.02 / 1.00 | 35.5 / 35.4 | 0.44 / 3.65 |
-| gltfscenerendering | 1.13 / 1.11 | 21.2 / 21.1 | 1.35 / 16.9 |
-| instancing | 0.98 / 0.96 | 16.2 / 16.2 | 4.59 / 15.6 |
-| pbribl | 1.16 / 1.05 | 14.2 / 14.1 | 16.0 / 22.5 |
-| **total, 18 samples** | **16.3 / 16.9** | **274 / 271** | **33.1 / 110** |
+| particlesystem | 0.0 | **1364.5** | 15.9 |
+| bloom | 0.0 | 557.4 | 3.5 |
+| gltfscenerendering | 0.0 | 341.7 | 14.9 |
+| instancing | 0.1 | 241.9 | 82.4 |
+| multithreading | 0.3 | 155.4 | 97.0 |
+| pbribl | 0.1 | 135.4 | 2.6 |
+| **total, one frame of each** | **0.9** | **3789** | **242** |
 
 Peak GPU: 367 MiB and 51% for NVIDIA, 3.3 GiB and 100% for cudapipe.
 
+NVIDIA's column is not a rendering time. Offscreen benchmarking measures
+recording and submitting a frame, and nothing waits for the GPU until the pass
+ends, so a driver that submits asynchronously is timed on its CPU side alone —
+`tests/TESTING.md` says which column to compare across drivers and why. It is
+the honest number for cudapipe, which blocks the host on every draw.
+
 Three things to take from it, none of them worked on yet:
 
-**cudapipe is single threaded on the host.** Wall clock tracks CPU on every
-sample — 83.27 against 83.22 on particlesystem — so it is one core blocking on
-the GPU. llvmpipe's 33 s wall against 110 s CPU is it spreading across cores,
-which is how it beats cudapipe on wall clock while doing four times the work.
+**cudapipe is single threaded on the host.** Over the storing run, where both
+were measured, wall clock tracks CPU on every sample — 83.27 against 83.22 on
+particlesystem — so it is one core blocking on the GPU. llvmpipe's 33 s wall
+against 110 s CPU is it spreading across cores.
 
 **The two worst samples are both the peel loop.** particlesystem and bloom are
-the blended draws, at 5x and 2.4x the next worst. Up to 256 passes per draw,
-each with a `cuStreamSynchronize` — gap 5, and the obvious first target.
+the blended draws, at 4.0x and 1.6x gltfscenerendering, the worst draw that is
+not blended. Up to 256 passes per draw, each with a `cuStreamSynchronize` —
+gap 5, and the obvious first target.
 
-**pbribl is the one cudapipe already wins**, 14.2 s against llvmpipe's 16.0.
+**cudapipe does not win pbribl, and never did.** It was recorded here as the
+one sample it beat llvmpipe on, 14.2 s against 16.0 — but those were whole
+process times, and llvmpipe spends 16.6 s of pbribl before the first frame,
+precomputing the IBL textures. Per frame it renders at 2.6 ms against
+cudapipe's 135. Nothing in the set is faster than llvmpipe, which is what the
+timed pass exists to say; the wall clock of a run that also stores 60 images
+could not.
 
 ## Architecture
 

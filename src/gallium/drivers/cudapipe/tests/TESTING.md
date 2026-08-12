@@ -6,17 +6,26 @@ ICD, against cudapipe, and against lavapipe/llvmpipe, and the frames are
 compared. That is a far stronger signal than a pass/fail suite, and it has found
 every rendering bug fixed so far.
 
-There are two sweeps, and they answer different questions.
+There are three sweeps, and they answer different questions.
 
 | | frames | answers |
 |---|---|---|
 | **single frame** | 1 | does the driver draw the scene |
 | **animated** | 60 | does it keep drawing it |
+| **benchmark** | 60 | what those same sixty frames cost |
 
 The single frame sweep is the cheap one and catches most things. The animated
 one catches what a still image cannot: state that leaks between frames, a
 particle system settling, anything that only goes wrong once the camera moves.
 Two of the regressions in the set are invisible at frame 0.
+
+The benchmark sweep renders exactly what the animated one renders — same loop,
+same fixed frame time, same orbit — and stores none of it. That split is not a
+convenience: storing a 1280x720 frame takes about 10 ms, which is longer than
+several of these samples spend rendering one, so a pass that writes images
+cannot be timed. Correctness and cost therefore come from two runs of one
+workload, which is what lets a slow frame in the chart be looked at in the other
+run's images.
 
 ---
 
@@ -76,18 +85,73 @@ $T/cp_perf_run.sh cudapipe $M/cudapipe/cudapipe_devenv_icd.x86_64.json $R/cuda  
 $T/cp_perf_run.sh llvmpipe $M/lavapipe/lvp_devenv_icd.x86_64.json      $R/llvmpipe 60
 
 python3 $T/cp_perf_report.py $R --ref nvidia --drivers nvidia cuda llvmpipe \
-    -o build/compare/perf60.html
+    --bench $PWD/build/bench60 -o build/compare/perf60.html
 ```
+
+`--bench` points at the benchmark pass below and is where the page's cost
+section and its GPU charts come from. Without it they come from this run, whose
+times are mostly image writing — the page says which it used.
 
 Roughly five minutes for the three passes and half a minute for the report.
 It writes about 8 GB of frames and 2.7 GB of report images.
 
-Benchmark mode instead of frames — the samples' own timing loop, no files
-written, fps reported:
+### Benchmark
+
+The same command with `1` as a fifth argument times those sixty frames instead
+of storing them. Pass the same frame count — a different one measures a
+different workload, and the script refuses `0`:
 
 ```bash
-$T/cp_perf_run.sh cudapipe "$ICD" $R/bench_cuda 0 1
+B=$PWD/build/bench60
+
+$T/cp_perf_run.sh nvidia   ""                                          $B/nvidia   60 1
+$T/cp_perf_run.sh cudapipe $M/cudapipe/cudapipe_devenv_icd.x86_64.json $B/cuda     60 1
+$T/cp_perf_run.sh llvmpipe $M/lavapipe/lvp_devenv_icd.x86_64.json      $B/llvmpipe 60 1
 ```
+
+It writes `_bench.csv` — `sample,frames,fps,ms_avg,ms_best,ms_worst,wall_s,exit`
+— and one csv of every frame's time per sample, and no images. Under a minute
+for cudapipe's pass, against the four and a half the same frames take when they
+are stored.
+
+**The fps figure times recording and submitting a frame, not finishing it.**
+Nothing waits for the GPU until the pass ends, so a driver that submits
+asynchronously is measured on its CPU side alone — NVIDIA reports around 48,000
+fps on `triangle`, which is the rate it queues frames at, not the rate it draws
+them. It is the honest number for cudapipe, which blocks the host on every draw,
+and close to it for llvmpipe. **Across drivers compare `wall_s`**, which cannot
+miss anything because the process does not exit until `vkDeviceWaitIdle`
+returns, at the cost of also containing start up and shader compilation. Both
+columns are there so the comparison is possible without re-running anything.
+
+`renderheadless` and `computeheadless` never enter the offscreen loop — they
+drive their own frames — so they have nothing to time and get no row.
+`renderheadless` writes its image itself, in the working directory, benchmark
+mode or not; the script deletes it so that a timed pass really does leave
+nothing behind.
+
+**The flags have to mirror the storing run exactly**, which is the whole point
+and is easy to get wrong, because offscreen benchmarking quietly ignores the
+options a windowed benchmark uses:
+
+| | storing | timing |
+|---|---|---|
+| count | `--offscreenframes 60` | `--offscreenframes 60`, **not** `--benchruntime` |
+| motion | `--offscreenorbit` per the ORBIT list | the same list, or the still samples benchmark a static scene |
+| output | `--offscreenfilename` | none — nothing is stored |
+
+`--benchruntime` is what a windowed benchmark uses to run for N seconds, and
+offscreen it does nothing but print a note. The mode this script had before
+passed it and no frame count and no orbit, so it timed an unstated number of
+frames of a workload the correctness run never rendered. A benchmark that does
+not render the same thing is not measuring the thing you are comparing.
+
+**Warm up is a second per sample, and it lands in `wall_s`.** The samples
+render frame 0 repeatedly for `WARMUP` seconds before the timed loop, and
+deliberately do not advance their state while doing it, so how many warm up
+frames a fast machine gets through cannot change which frames are measured.
+Eighteen samples means eighteen seconds, which is most of llvmpipe's wall and
+none of cudapipe's — do not read a `wall_s` total as rendering time.
 
 ---
 
@@ -96,9 +160,10 @@ $T/cp_perf_run.sh cudapipe "$ICD" $R/bench_cuda 0 1
 ### `cp_perf_run.sh`
 
 Per sample: wall clock, user and system CPU, peak RSS and exit status, into
-`_timing.csv`. For the whole pass: GPU utilisation, memory used and total, and
-power at 2 Hz into `_gpu.csv`, and per-process GPU memory into
-`_gpu_procs.csv`.
+`_timing.csv`, in both modes. For the whole pass: GPU utilisation, memory used
+and total, and power at 2 Hz into `_gpu.csv`, and per-process GPU memory into
+`_gpu_procs.csv`. In benchmark mode also `_bench.csv` and the samples' own
+per-frame times, described above.
 
 The GPU samplers cover the pass rather than each sample deliberately. Several
 samples finish in well under a second, so a per-sample capture would get a
@@ -128,6 +193,16 @@ Exit status is 1 if anything regressed, so it can gate a benchmark run.
 
 The page has three sections: cost, the GPU over the run, and differences over
 the animation.
+
+Cost and GPU come from the `--bench` pass when one is given, differences always
+from the frame pass — the two render the same work, so a slow frame in the cost
+section and a wrong frame in the difference charts are the same frame. The cost
+table carries both `ms/frame` and `wall` because neither is enough on its own:
+`ms/frame` times recording and submitting a frame rather than finishing it, so
+it under-reports any driver that submits asynchronously, and `wall` catches
+everything but also carries start up, shader compilation and the warm up
+second. `pbribl` on llvmpipe is the clearest case — 2.6 ms a frame and 16.6 s
+of wall, nearly all of it precomputing its IBL textures before the first frame.
 
 Each sample gets a difference-over-time chart scaled to itself — a shared axis
 would flatten every small one, and the small ones are where the signal is. Under
@@ -223,3 +298,23 @@ reference, and produced a confident and completely wrong conclusion.
 **Sample every frame.** A stride of 10 missed `texture3d` entirely, reporting
 855 differing pixels where the full pass finds 3,090 — the excursion is narrower
 than the sampling interval. Strided passes are for a quick look, not a verdict.
+
+**A whole-process time is not a rendering time.** `pbribl` was recorded in the
+handoff as the one sample cudapipe beat llvmpipe on, 14.2 s against 16.0. Those
+were process wall clocks, and llvmpipe spends 16.6 s of `pbribl` before its
+first frame, precomputing the IBL textures; per frame it renders at 2.6 ms
+against cudapipe's 135, a factor of fifty the other way. Any measure that
+contains start up will eventually be read as if it did not. This is what the
+`ms/frame` column exists for, and why the page prints both.
+
+**A per-frame minimum is not the cost of a frame.** The samples keep two frames
+in flight, so the fence wait for one lands in the time of another:
+`computeshader` on cudapipe reports a best of 1.6 ms and a worst of 191 against
+a mean of 133. The mean over sixty is the number; `ms_best` and `ms_worst` are
+for spotting a genuine outlier, and only when they are wide of the mean on both
+sides.
+
+**Run the timing passes one at a time, with nothing else on the GPU.** Three
+drivers over eighteen samples is a few minutes, and it is tempting to overlap
+them. Two passes sharing the card measure each other. The same goes for a sweep
+running while a build does — `nvidia-smi` during the pass is the check.

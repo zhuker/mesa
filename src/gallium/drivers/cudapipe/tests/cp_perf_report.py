@@ -12,6 +12,15 @@ cost, and did it stay correct for the whole animation.
 
     cp_perf_report.py build/frames60 --ref nvidia -o perf.html
 
+A run that stores its frames cannot be timed: writing a 1280x720 frame takes
+about 10 ms, longer than several of these samples spend rendering one. So the
+cost comes from a second pass of the same sixty frames with nothing stored, and
+--bench points at it. Without it the page falls back to the times of the run
+that wrote the images, and says on the page that that is what they are.
+
+    cp_perf_run.sh cudapipe "$CUDA"   build/bench60/cuda      60 1
+    cp_perf_report.py build/frames60 --bench build/bench60 -o perf.html
+
 Drivers are discovered from the directories present unless --drivers names them;
 the order given is the order they are drawn in, and a driver keeps its colour
 across every chart on the page.
@@ -78,6 +87,32 @@ def read_timing(driver_dir):
                 'wall': float(r['wall_s']),
                 'cpu': float(r['user_s']) + float(r['sys_s']),
                 'rss_mb': float(r['maxrss_kb']) / 1024.0,
+                'exit': int(r['exit']),
+            }
+        except (ValueError, KeyError):
+            continue
+    return out
+
+
+def read_bench(driver_dir):
+    """sample -> {fps, ms, best, worst, wall, exit} from _bench.csv.
+
+    Written by a pass that timed the frames instead of storing them. Samples
+    that never enter the offscreen loop have no row at all rather than a row of
+    zeroes, so a missing entry means "nothing to time", not "took no time".
+    """
+    path = os.path.join(driver_dir, '_bench.csv')
+    out = {}
+    if not os.path.exists(path):
+        return out
+    for r in csv.DictReader(open(path)):
+        try:
+            out[r['sample']] = {
+                'fps': float(r['fps']),
+                'ms': float(r['ms_avg']),
+                'best': float(r['ms_best']),
+                'worst': float(r['ms_worst']),
+                'wall': float(r['wall_s']),
                 'exit': int(r['exit']),
             }
         except (ValueError, KeyError):
@@ -515,6 +550,11 @@ def main():
                     help='gain on the difference images (default 12)')
     ap.add_argument('--recompute', action='store_true',
                     help='ignore the cached frame differences')
+    ap.add_argument('--bench', default=None,
+                    help='directory of a benchmark pass over the same frames, '
+                         'laid out the same way; its _bench.csv and _gpu.csv '
+                         'supply the cost section, since the run that stores '
+                         'the frames is timing the disk as much as the driver')
     ap.add_argument('--title', default='Driver sweep')
     args = ap.parse_args()
 
@@ -526,7 +566,17 @@ def main():
     slot = {d: i + 1 for i, d in enumerate(drivers)}
 
     timing = {d: read_timing(os.path.join(args.root, d)) for d in drivers}
-    gpu = {d: read_gpu(os.path.join(args.root, d)) for d in drivers}
+    bench = ({d: read_bench(os.path.join(args.bench, d)) for d in drivers}
+             if args.bench else {})
+    if bench and not any(bench.values()):
+        print(f'no _bench.csv under {args.bench} for any of '
+              f'{", ".join(drivers)} — falling back to the frame run\'s times')
+        bench = {}
+    # The GPU samplers only say anything useful about a pass whose samples run
+    # for seconds rather than milliseconds, which is the benchmark pass: the
+    # other one spends most of its time writing images.
+    gpu_root = args.bench if bench else args.root
+    gpu = {d: read_gpu(os.path.join(gpu_root, d)) for d in drivers}
     samples = samples_in(os.path.join(args.root, args.ref)) or sorted(
         {s for t in timing.values() for s in t})
 
@@ -550,48 +600,84 @@ def main():
     body = []
 
     # ---- cost ----
+    #
+    # From the benchmark pass when there is one. The run that stores the frames
+    # spends about 10 ms a frame writing them, which is more than several of
+    # these samples spend rendering one, so its times say as much about the disk
+    # as about the driver.
+    cost = bench or timing
+    if bench:
+        cols = [('ms/frame', 'ms', '{:.1f}'), ('wall', 'wall', '{:.2f}')]
+        rank = 'ms'
+        bar = ('Frame time by sample', 'ms', '{:.1f} ms')
+        note = ('The same sixty frames as the difference charts below, timed '
+                'rather than stored. <b>ms/frame is the mean time to record '
+                'and submit a frame, not to finish it</b> — nothing waits for '
+                'the GPU until the pass ends, so a driver that submits '
+                'asynchronously is measured on its CPU side alone, which is '
+                'why NVIDIA reads as thousands of frames a second. It is the '
+                'honest number for a driver that blocks the host. <b>wall</b> '
+                'is the whole process and cannot miss any GPU work, since it '
+                'does not exit before vkDeviceWaitIdle returns, but it also '
+                'carries start up, shader compilation and the warm up second '
+                'before each sample — which is most of it for a fast driver. '
+                'Compare a driver against itself on ms/frame and against '
+                'another on wall.')
+    else:
+        cols = [('wall', 'wall', '{:.2f}'), ('cpu', 'cpu', '{:.2f}')]
+        rank = 'wall'
+        bar = ('Wall clock by sample', 'wall', '{:.2f}s')
+        note = ('Wall clock is what the run took; CPU is how much processor '
+                'time it burned. Wall well under CPU means the driver spread '
+                'across cores; wall tracking CPU means one core doing the '
+                'work. <b>These are the times of the run that stored every '
+                'frame</b>, so they include roughly 10 ms per frame of image '
+                'writing — pass --bench a timed pass to measure the driver '
+                'instead.')
+
     body.append('<h2>Cost</h2>')
-    body.append('<p class="note">Wall clock is what the run took; CPU is how '
-                'much processor time it burned. Wall well under CPU means the '
-                'driver spread across cores; wall tracking CPU means one core '
-                'doing the work.</p>')
+    body.append(f'<p class="note">{note}</p>')
     body.append(legend(drivers))
     body.append('<div class="scroll"><table><thead><tr><th>Sample</th>' +
-                ''.join(f'<th class="num">{html.escape(d)} wall</th>'
-                        f'<th class="num">cpu</th>' for d in drivers) +
+                ''.join(''.join(
+                    f'<th class="num">'
+                    f'{html.escape(d) + " " if i == 0 else ""}{label}</th>'
+                    for i, (label, _, _) in enumerate(cols))
+                    for d in drivers) +
                 '<th class="num">exit</th></tr></thead><tbody>')
 
     order = sorted(samples,
-                   key=lambda s: -max((timing[d].get(s, {}).get('wall', 0)
+                   key=lambda s: -max((cost[d].get(s, {}).get(rank, 0)
                                        for d in drivers), default=0))
-    totals = {d: [0.0, 0.0] for d in drivers}
+    totals = {d: [0.0] * len(cols) for d in drivers}
     for s in order:
         cells = ''
-        bad = False
         for d in drivers:
-            t = timing[d].get(s)
+            t = cost[d].get(s)
             if not t:
-                cells += '<td class="num">-</td><td class="num">-</td>'
+                cells += '<td class="num">-</td>' * len(cols)
                 continue
-            totals[d][0] += t['wall']
-            totals[d][1] += t['cpu']
-            bad |= t['exit'] != 0
-            cells += (f'<td class="num">{t["wall"]:.2f}</td>'
-                      f'<td class="num">{t["cpu"]:.2f}</td>')
-        mark = ('<td class="num bad">nonzero</td>' if bad
+            for i, (_, key, fmt) in enumerate(cols):
+                totals[d][i] += t[key]
+                cells += f'<td class="num">{fmt.format(t[key])}</td>'
+        # A sample no driver has a row for was not measured — renderheadless
+        # drives its own frames and never enters the loop the benchmark times.
+        # That is not the same as having exited cleanly, so it says neither.
+        codes = [t['exit'] for t in (cost[d].get(s) for d in drivers) if t]
+        mark = ('<td class="num">-</td>' if not codes
+                else '<td class="num bad">nonzero</td>' if any(codes)
                 else '<td class="num good">0</td>')
         body.append(f'<tr><td>{html.escape(s)}</td>{cells}{mark}</tr>')
     body.append('<tr><td><b>total</b></td>' + ''.join(
-        f'<td class="num"><b>{totals[d][0]:.1f}</b></td>'
-        f'<td class="num"><b>{totals[d][1]:.1f}</b></td>' for d in drivers) +
-        '<td></td></tr>')
+        ''.join(f'<td class="num"><b>{v:.1f}</b></td>' for v in totals[d])
+        for d in drivers) + '<td></td></tr>')
     body.append('</tbody></table></div>')
 
-    body.append('<h2>Wall clock by sample</h2>')
+    body.append(f'<h2>{bar[0]}</h2>')
     body.append(legend(drivers))
     body.append('<div class="card">' + bar_rows(
-        [(s, [(d, slot[d], timing[d].get(s, {}).get('wall', 0.0))
-              for d in drivers]) for s in order], slot, '{:.2f}s') + '</div>')
+        [(s, [(d, slot[d], cost[d].get(s, {}).get(bar[1], 0.0))
+              for d in drivers]) for s in order], slot, bar[2]) + '</div>')
 
     # ---- gpu ----
     if any(gpu.values()):

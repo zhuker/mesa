@@ -11,8 +11,27 @@
 #     ICD     VK_ICD_FILENAMES value, empty for the system default (NVIDIA)
 #     OUTDIR  written: _timing.csv, _gpu.csv, _gpu_procs.csv, _logs/, frames
 #     FRAMES  frames per sample; >1 gives each sample a directory of its own
-#     BENCH   1 to run the samples' own benchmark mode instead, which writes
-#             no images and reports fps
+#     BENCH   1 to time the same frames instead of storing them
+#
+# The two modes render exactly the same work. Offscreen benchmarking walks the
+# same `for i in 0..FRAMES` loop with the same fixed frame time and the same
+# orbit, and only leaves out the storing — so correctness and cost are two runs
+# of one workload rather than two workloads, and the frame a chart blames can be
+# looked at in the other run's images. Storing a 1280x720 frame costs about
+# 10 ms, which is more than several of these samples spend rendering one, so a
+# pass that writes images cannot be timed and a pass that is timed must not
+# write them.
+#
+# **The fps figure times recording and submitting a frame, not finishing it.**
+# There is no presentation engine to throttle the loop and nothing waits for the
+# GPU until the pass ends, so a driver that submits asynchronously is measured
+# on its CPU side alone: NVIDIA reports around 48,000 fps on triangle, which is
+# the rate it can queue frames at. It is the honest number for cudapipe, which
+# blocks the host on every draw, and close to it for llvmpipe, which shades on
+# the CPU. Across drivers compare `wall_s` instead — the process does not exit
+# before vkDeviceWaitIdle returns, so that one contains all the work, at the
+# cost of also containing start up and shader compilation. Both are in
+# _bench.csv for that reason.
 #
 # Several samples render a still scene — nothing in them moves unless the
 # camera does, so a multi-frame run of one is sixty copies of the same image
@@ -32,6 +51,11 @@
 #   $T/cp_perf_run.sh cudapipe $M/cudapipe/cudapipe_devenv_icd.x86_64.json $R/cuda     60
 #   $T/cp_perf_run.sh llvmpipe $M/lavapipe/lvp_devenv_icd.x86_64.json      $R/llvmpipe 60
 #
+# The same sixty frames, timed rather than stored — writes _bench.csv and one
+# csv of frame times per sample, and no images at all:
+#
+#   $T/cp_perf_run.sh cudapipe $M/cudapipe/cudapipe_devenv_icd.x86_64.json $R/bench_cuda 60 1
+#
 # Kept in the tree because the numbers are only worth anything if the run
 # behind them can be repeated exactly.
 set -u
@@ -48,9 +72,20 @@ SAMPLES=${SAMPLES:-$(grep -v '^#' "$LIST" | tr '\n' ' ')}
 ORBIT=${ORBIT-triangle pushconstants texture negativeviewportheight \
 texturecubemap computeshader vulkanscene pbribl gltfscenerendering}
 
+# Benchmark mode measures the frames of a correctness run, so it needs the same
+# count. Rendering some other number would time a different workload and the
+# comparison the two runs exist for would not hold.
+if [ "$BENCH" = "1" ] && [ "$FRAMES" -lt 1 ]; then
+    echo "FRAMES must be the frame count the correctness run used, e.g. 60" >&2
+    exit 1
+fi
+
 mkdir -p "$OUT/_logs"
 CSV=$OUT/_timing.csv
 echo "sample,wall_s,user_s,sys_s,maxrss_kb,exit" > "$CSV"
+BCSV=$OUT/_bench.csv
+[ "$BENCH" = "1" ] &&
+    echo "sample,frames,fps,ms_avg,ms_best,ms_worst,wall_s,exit" > "$BCSV"
 
 # Whole-GPU load and memory. Runs for the pass, not per sample: several samples
 # finish in well under a second, so a per-sample capture would get one poll.
@@ -73,8 +108,18 @@ for name in $SAMPLES; do
     [ -x "$bin" ] || continue
 
     if [ "$BENCH" = "1" ]; then
-        args=(--offscreen --benchmark --benchwarmup "${WARMUP:-1}"
-              --benchruntime "${DURATION:-3}" --benchfilename "$OUT/$name.csv")
+        # No file name: nothing is stored, so there is nothing to name. The
+        # warm up frames are rendered before the loop and do not advance the
+        # sample, so how many of them a fast machine gets through cannot change
+        # which frames are measured. --benchframetimes keeps every frame's
+        # time, which is what shows a single frame costing ten times its
+        # neighbours rather than the mean absorbing it.
+        args=(--offscreen --benchmark --offscreenframes "$FRAMES"
+              --benchwarmup "${WARMUP:-1}" --benchframetimes
+              --benchfilename "$OUT/$name.csv")
+        case " $ORBIT " in
+            *" all "*|*" $name "*) args+=(--offscreenorbit) ;;
+        esac
     elif [ "$FRAMES" -gt 1 ]; then
         mkdir -p "$OUT/$name"
         args=(--offscreen --offscreenframes "$FRAMES"
@@ -97,8 +142,45 @@ for name in $SAMPLES; do
     wall=${1:-0}; user=${2:-0}; sys=${3:-0}; rss=${4:-0}
 
     echo "$name,$wall,$user,$sys,$rss,$code" >> "$CSV"
-    printf "%-24s wall %8ss  cpu %8ss  rss %6sMB  exit %s\n" \
-        "$name" "$wall" "$(echo "$user + $sys" | bc)" "$((rss / 1024))" "$code"
+
+    if [ "$BENCH" != "1" ]; then
+        printf "%-24s wall %8ss  cpu %8ss  rss %6sMB  exit %s\n" \
+            "$name" "$wall" "$(echo "$user + $sys" | bc)" "$((rss / 1024))" "$code"
+        continue
+    fi
+
+    # The sample's own csv: a header, one row of totals, then the frame times
+    # under a second header. The totals are read from the end of the row rather
+    # than by column, because the first field is the device name and llvmpipe's
+    # has a comma in it.
+    set -- $(awk -F, '
+        NR == 2 && NF >= 5     { fps = $NF; frames = $(NF - 1) }
+        $0 == "frame,ms"       { times = 1; next }
+        times && /^[0-9]+,/    { n++; t = $2 + 0; s += t
+                                 if (n == 1 || t < mn) mn = t
+                                 if (t > mx) mx = t }
+        END { printf "%.1f %d %.2f %.2f %.2f",
+                     fps + 0, frames + 0, (n ? s / n : 0), mn + 0, mx + 0 }
+    ' "$OUT/$name.csv" 2>/dev/null)
+    fps=${1:-0}; frames=${2:-0}; avg=${3:-0}; best=${4:-0}; worst=${5:-0}
+
+    # renderheadless and computeheadless drive their own frames and never enter
+    # the offscreen loop, so there is nothing to time. Say so rather than write
+    # a row of zeroes, which reads as a sample that rendered nothing in no time.
+    if [ "$frames" = "0" ]; then
+        printf "%-24s no benchmark — drives its own frames        exit %s\n" \
+            "$name" "$code"
+        continue
+    fi
+
+    echo "$name,$frames,$fps,$avg,$best,$worst,$wall,$code" >> "$BCSV"
+    printf "%-24s %9s fps  frame %8s ms (best %s, worst %s)  wall %6ss  exit %s\n" \
+        "$name" "$fps" "$avg" "$best" "$worst" "$wall" "$code"
 done
+
+# renderheadless never touches the offscreen path — it writes its image itself,
+# in the working directory, benchmark mode or not. A timed pass claims to leave
+# nothing behind, so drop it rather than let one sample make that false.
+[ "$BENCH" = "1" ] && rm -f headless.ppm
 
 echo "[$LABEL] done -> $OUT"
