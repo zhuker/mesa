@@ -17,6 +17,19 @@ struct cp_context {
 
    struct cp_screen *screen;
 
+   /*
+    * The stream every launch, memset and copy in the frame path goes on.
+    *
+    * Created with CU_STREAM_DEFAULT rather than CU_STREAM_NON_BLOCKING on
+    * purpose: a default-flagged stream still synchronises implicitly with the
+    * legacy NULL stream, so anything left on NULL — an allocation-time clear,
+    * or a path added later that forgets to thread this through — stays
+    * correctly ordered against the rest instead of racing it. The point of
+    * having a real stream is to be able to express overlap at all; nothing
+    * yet depends on it being isolated.
+    */
+   CUstream stream;
+
    struct pipe_framebuffer_state framebuffer;
    struct pipe_viewport_state viewport;
    struct pipe_scissor_state scissor;

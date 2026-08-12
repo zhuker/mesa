@@ -307,7 +307,7 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
       void *params[] = { &ra };
       cuLaunchKernel(cp->screen->kernels.resolve_samples,
                      (src_w + 15) / 16, (src_h + 15) / 16, 1, 16, 16, 1,
-                     0, NULL, params, NULL);
+                     0, cp->stream, params, NULL);
       return;
    }
 
@@ -505,9 +505,10 @@ cp_clear_buffer(struct pipe_context *ctx, struct pipe_resource *res,
    if (clear_value_size == 4) {
       uint32_t val;
       memcpy(&val, clear_value, 4);
-      cuMemsetD32(dev, val, size / 4);
+      cuMemsetD32Async(dev, val, size / 4, cp->stream);
    } else if (clear_value_size == 1) {
-      cuMemsetD8(dev, *(const unsigned char *)clear_value, size);
+      cuMemsetD8Async(dev, *(const unsigned char *)clear_value, size,
+                      cp->stream);
    } else {
       char *dst = (char *)data + offset;
       for (unsigned i = 0; i < size; i += clear_value_size)
@@ -546,7 +547,7 @@ cp_clear_render_target(struct pipe_context *ctx, struct pipe_surface *dst,
    cuLaunchKernel(cp->screen->kernels.clear_kernel,
       (width + 15) / 16, (height + 15) / 16, 1,
       16, 16, 1,
-      0, NULL, params, NULL);
+      0, cp->stream, params, NULL);
 }
 
 static void
@@ -665,7 +666,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
             cuLaunchKernel(screen->kernels.clear_kernel,
                (w + 15) / 16, (h + 15) / 16, 1,
                16, 16, 1,
-               0, NULL, params, NULL);
+               0, cp_ctx->stream, params, NULL);
          }
       }
    }
@@ -705,7 +706,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
          cuLaunchKernel(screen->kernels.clear_depth_kernel,
             (w + 15) / 16, (h + 15) / 16, 1,
             16, 16, 1,
-            0, NULL, params, NULL);
+            0, cp_ctx->stream, params, NULL);
       }
    }
 

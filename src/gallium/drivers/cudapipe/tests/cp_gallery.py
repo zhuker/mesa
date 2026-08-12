@@ -22,8 +22,9 @@ it, so every panel can be opened one to one. The page scales them down for
 layout; clicking one opens it at its native size with nearest neighbour
 sampling, so a single differing pixel stays a single crisp pixel.
 
-Reads PNG and binary PPM through cp_compare, and needs nothing outside the
-standard library.
+Reads PNG and binary PPM through cp_compare, which uses Pillow when it is
+installed and its own reader when it is not, so this runs under a bare
+interpreter as well as under the venv.
 """
 
 import argparse

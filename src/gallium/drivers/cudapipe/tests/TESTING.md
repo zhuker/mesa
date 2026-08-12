@@ -40,12 +40,16 @@ run's images.
 | `cp_gallery.py` | HTML for the single frame sweep, two or three drivers |
 | `cp_perf_report.py` | HTML for the animated sweep: cost, GPU, per-frame differences, frame inspector |
 
-Everything is Python standard library or shell, with two exceptions.
-`cp_perf_report.py` needs `ffmpeg`, which does all its image work, and
-`cp_compare_frames.py` needs `numpy` — it is the one tool that counts pixels
-over a whole sweep rather than over one image, and the loop belongs in C.
-Both live in the repo venv, so run it as `$MESA/venv/bin/python3
-cp_compare_frames.py`; `cp_iterate.sh` already does.
+**Run these with the repo venv's interpreter**, `$MESA/venv/bin/python3`
+(`pip install numpy pillow` beyond what the build needs), which is what
+`cp_iterate.sh` does. `cp_compare_frames.py` requires `numpy`: it is the one
+tool that counts pixels over a whole sweep rather than over one image, which
+is a thousand 720p images a run and belongs in C rather than in a loop. The
+rest only get faster — `cp_compare.py` decodes through Pillow when it is
+importable and falls back to its own PNG reader when it is not, so the tools
+that read images still run under a bare `python3`, about a hundred times
+slower per filtered PNG. `cp_perf_report.py` additionally needs `ffmpeg`,
+which does all of its image work.
 
 ---
 

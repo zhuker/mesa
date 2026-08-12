@@ -176,7 +176,7 @@ cp_clear_depthbuf(struct cp_context *cp, float depth)
    size_t count = (size_t)cp->depthbuf_w * cp->depthbuf_h;
 
    cuCtxSetCurrent(cp->screen->cuda_ctx);
-   cuMemsetD32(cp->depthbuf, value, count * MAX2(cp->visbuf_samples, 1u));
+   cuMemsetD32Async(cp->depthbuf, value, count * MAX2(cp->visbuf_samples, 1u), cp->stream);
    cp->depthbuf_cleared = true;
 }
 
@@ -384,7 +384,7 @@ cp_upload(struct cp_context *cp, const void *data, size_t size)
 
    CUdeviceptr dst = cp->arena_base + dev_off;
    memcpy((char *)cp->upload_host + host_off, data, size);
-   cuMemcpyHtoDAsync(dst, (char *)cp->upload_host + host_off, size, NULL);
+   cuMemcpyHtoDAsync(dst, (char *)cp->upload_host + host_off, size, cp->stream);
 
    cp->arena_offset = dev_off + size;
    cp->upload_offset = host_off + size;
@@ -781,9 +781,9 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
     * turned into double-blended frames the moment the passes started reusing
     * one, which they must, or a 256 layer draw asks for tens of gigabytes.
     */
-   cuMemsetD32(counter, 0, 1);
+   cuMemsetD32Async(counter, 0, 1, cp->stream);
    if (discard_mask)
-      cuMemsetD8(discard_mask, 0, max_pixels);
+      cuMemsetD8Async(discard_mask, 0, max_pixels, cp->stream);
 
    struct cp_fs_interp_args interp = {
       .visbuf = visbuf,
@@ -837,7 +837,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    unsigned num_quads = ((w + 1) / 2) * ((h + 1) / 2);
    CUresult interp_err = cuLaunchKernel(screen->kernels.fs_interpolate,
                                         (num_quads + 255) / 256, 1, 1, 256, 1, 1,
-                                        0, NULL, interp_params, NULL);
+                                        0, cp->stream, interp_params, NULL);
    if (interp_err != CUDA_SUCCESS) {
       fprintf(stderr, "cudapipe: fs_interpolate launch failed (%d)\n", interp_err);
       return;
@@ -938,7 +938,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    void *fs_arg_ptr = (void *)(uintptr_t)fs_args_dev;
    void *fs_params[] = { &fs_arg_ptr };
    CUresult fs_err = cuLaunchKernel(fs->kernel, (num_pixels + 255) / 256, 1, 1,
-                                    256, 1, 1, 0, NULL, fs_params, NULL);
+                                    256, 1, 1, 0, cp->stream, fs_params, NULL);
    if (fs_err != CUDA_SUCCESS) {
       fprintf(stderr, "cudapipe: fragment shader launch failed (%d)\n", fs_err);
       return;
@@ -987,7 +987,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    void *wb_params[] = { &wb };
    cuLaunchKernel(screen->kernels.fs_writeback,
                   (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
-                  0, NULL, wb_params, NULL);
+                  0, cp->stream, wb_params, NULL);
    timing->writeback_ms = cp_lap(&mark);
 
    if (getenv("CUDAPIPE_DEBUG_DISCARD")) {
@@ -1151,7 +1151,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    /* Clear visbuf to VISBUF_EMPTY (all-ones). cuMemsetD32 fills 32-bit words
     * which is faster than a kernel launch for a bulk fill. */
-   cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples);
+   cuMemsetD32Async(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples, cp->stream);
 
    if (!cp->depthbuf_cleared)
       cp_clear_depthbuf(cp, 1.0f);
@@ -1401,11 +1401,11 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
          /* Nothing to gather when the shader declares no inputs. */
          if (vs_input_buf) {
-            cuMemsetD8(vs_input_buf, 0, (size_t)total_verts * vs_in_stride);
+            cuMemsetD8Async(vs_input_buf, 0, (size_t)total_verts * vs_in_stride, cp->stream);
             void *vf_params[] = { &vf_args };
             cuLaunchKernel(screen->kernels.vertex_fetch,
                (total_verts + 255) / 256, 1, 1, 256, 1, 1,
-               0, NULL, vf_params, NULL);
+               0, cp->stream, vf_params, NULL);
          }
 
          stride = vs_in_stride;
@@ -1545,7 +1545,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          void *vs_params[] = { &vs_arg_ptr };
          CUresult vs_err = cuLaunchKernel(cp->vs_shader->kernel,
             (total_verts + 255) / 256, 1, 1, 256, 1, 1,
-            0, NULL, vs_params, NULL);
+            0, cp->stream, vs_params, NULL);
 
          if (vs_err == CUDA_SUCCESS) {
             vs_ran = true;
@@ -1569,7 +1569,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                CUdeviceptr clip_count = cp_scratch_alloc_device(cp, 4);
 
                if (clipped && clip_count) {
-                  cuMemsetD32(clip_count, 0, 1);
+                  cuMemsetD32Async(clip_count, 0, 1, cp->stream);
 
                   struct cp_clip_args clip = {
                      .vs_out = vs_output_buf,
@@ -1583,7 +1583,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                   CUresult clip_err = cuLaunchKernel(
                      screen->kernels.clip_triangles,
                      (num_triangles + 63) / 64, 1, 1, 64, 1, 1,
-                     0, NULL, clip_params, NULL);
+                     0, cp->stream, clip_params, NULL);
 
                   if (clip_err == CUDA_SUCCESS) {
                      vs_output_buf = clipped;
@@ -1664,16 +1664,16 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                    : peel ? peel_passes : 1;
 
    if (peel) {
-      cuMemsetD32(cp->peel_next, 0, (size_t)w * h);
+      cuMemsetD32Async(cp->peel_next, 0, (size_t)w * h, cp->stream);
       rast_args.peel_next = cp->peel_next;
       rast_args.peel_any = cp->peel_any;
       rast_args.blend_peel = 1;
    }
 
    if (retry) {
-      cuMemsetD8(cp->resolved, 0, (size_t)w * h);
-      cuMemsetD32(cp->reject, 0xFFFFFFFF,
-                  (size_t)w * h * CP_DISCARD_LAYERS);
+      cuMemsetD8Async(cp->resolved, 0, (size_t)w * h, cp->stream);
+      cuMemsetD32Async(cp->reject, 0xFFFFFFFF,
+                  (size_t)w * h * CP_DISCARD_LAYERS, cp->stream);
       rast_args.reject = cp->reject;
       rast_args.resolved = cp->resolved;
       rast_args.reject_layers = CP_DISCARD_LAYERS;
@@ -1729,7 +1729,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       cp->dscratch.used = shade_dmark;
       if (pass) {
          /* Each pass resolves visibility afresh, minus what has been rejected. */
-         cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples);
+         cuMemsetD32Async(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples, cp->stream);
          rast_args.reject_passes = pass;
       }
       /* Cleared at the start of each interval, not each pass: the question
@@ -1739,13 +1739,13 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       /* Both counters in one call; they are adjacent for this reason. The
        * memset is enqueued on the default stream, so it serializes properly
        * with the preceding pass's kernels. */
-      cuMemsetD32(cp->rast_counts, 0, 2);
+      cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
 
       /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
       void *s1_params[] = { &rast_args, &rast_queues };
       CUresult rast_err = cuLaunchKernel(screen->kernels.rasterize_stage1,
          (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
-         0, NULL, s1_params, NULL);
+         0, cp->stream, s1_params, NULL);
 
       /*
        * Both later stages stride their queue, so any grid is correct and the
@@ -1771,13 +1771,13 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       void *s2_params[] = { &rast_args, &rast_queues };
       cuLaunchKernel(screen->kernels.rasterize_stage2,
          s2_blocks, 1, 1, 256, 1, 1,
-         0, NULL, s2_params, NULL);
+         0, cp->stream, s2_params, NULL);
 
       /* Stage 3: block per tile, grid-strided over the huge-tile queue */
       void *s3_params[] = { &rast_args, &rast_queues };
       cuLaunchKernel(screen->kernels.rasterize_stage3,
          s3_blocks, 1, 1, 64, 1, 1,
-         0, NULL, s3_params, NULL);
+         0, cp->stream, s3_params, NULL);
 
       if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
          fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
@@ -1801,10 +1801,10 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          void *pa_params[] = { &visbuf, &cp->peel_next, &w, &h };
          cuLaunchKernel(screen->kernels.peel_advance,
                         (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
-                        0, NULL, pa_params, NULL);
+                        0, cp->stream, pa_params, NULL);
 
          if (pass + 1 >= interval_start + check_interval) {
-            cuStreamSynchronize(NULL);
+            cuStreamSynchronize(cp->stream);
             if (!*(volatile uint32_t *)(uintptr_t)cp->peel_any)
                break;
             interval_start = pass + 1;
@@ -1927,7 +1927,7 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
       bin->kernel,
       grid[0], grid[1], grid[2],
       info->block[0], info->block[1], info->block[2],
-      bin->shared_size, NULL, kernel_params, NULL);
+      bin->shared_size, cp->stream, kernel_params, NULL);
 
    if (err != CUDA_SUCCESS)
       fprintf(stderr, "cudapipe: cuLaunchKernel failed (%d) grid=[%u,%u,%u] block=[%u,%u,%u]\n",
@@ -2742,8 +2742,8 @@ cp_register_sampler(struct cp_context *cp, const struct pipe_sampler_state *stat
       if (cuMemAlloc(&cp->sampler_table,
                      CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info)) != CUDA_SUCCESS)
          return 0;
-      cuMemsetD8(cp->sampler_table, 0,
-                 CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info));
+      cuMemsetD8Async(cp->sampler_table, 0,
+                 CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info), cp->stream);
       cp->num_samplers = 0;
       memset(cp->sampler_table_host, 0, sizeof(cp->sampler_table_host));
    }
@@ -2997,6 +2997,13 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    /* Allocate persistent GPU state (managed) and device-only arena */
    cuCtxSetCurrent(ctx->screen->cuda_ctx);
+
+   /* Every frame-path launch, memset and copy goes here; see cp_context.h for
+    * why it is a default-flagged stream rather than a non-blocking one. If it
+    * cannot be created the field stays zero, which is the legacy NULL stream
+    * and exactly the behaviour this replaces. */
+   if (cuStreamCreate(&ctx->stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS)
+      ctx->stream = NULL;
    CUdeviceptr state_dev;
    if (cuMemAllocManaged(&state_dev, sizeof(struct cp_gpu_state),
                          CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
