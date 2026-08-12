@@ -82,8 +82,9 @@ wrong; back the `.spv` up first and restore it afterwards.
 ## Status
 
 Differing pixels versus the NVIDIA driver at tolerance 8/255, worst first.
-Total across the set: 110,015, from 143,856 before the quad-derivative work and
-far more before that.
+Total across the set: 105,212, from 110,015 before the watertight-coverage and
+cube-derivative work, 143,856 before the quad-derivative work, and far more
+before that.
 
 | Sample | Differing | Note |
 |---|---|---|
@@ -91,11 +92,11 @@ far more before that.
 | multisampling | 2.58% | no MSAA |
 | particlesystem | 2.51% | no POINT_LIST rasterization |
 | gltfscenerendering | 1.70% | no diagnosis |
-| texturecubemap | 0.53% | |
+| texturecubemap | 0.45% | reflection sharper than the reference at grazing angles |
 | instancing | 0.38% | mostly the procedural starfield, see below |
-| computeshader | 0.31% | |
+| computeshader | 0 | |
 | multithreading | 0.22% | speckle, no diagnosis |
-| pbribl | 0.14% | |
+| pbribl | 28 px | |
 | texture | 591 px | anisotropic taps on a slightly tilted quad |
 | vulkanscene | 27 px | |
 | dynamicuniformbuffer | 15 px | |
@@ -191,6 +192,38 @@ texel outside its image killed a whole frame: the context faulted, the next
 `cuMemAlloc` failed, and draws then bailed out for want of a visibility buffer
 several stages away from the cause. `compute-sanitizer` turns this back into a
 kernel name and a line.
+
+**Floating point contraction breaks exact symmetry, and the rasterizer depends
+on it.** Coverage is watertight only if the two triangles sharing an edge
+compute exactly opposite values for it, so that the fill rule can hand a pixel
+sitting on the edge to one of them. Writing the edge function as a cross
+product of the vectors from the pixel makes it antisymmetric on paper — swap
+the endpoints and the same two products change places around the subtraction.
+nvcc then contracts `a * b - c * d` into `fma(a, b, -(c * d))`, which keeps only
+one product exact, and *which* one depends on the order they were written in.
+The contracted form is not antisymmetric: on the quad in computeshader both
+triangles computed the same small negative, `-3.87569889e-06`, rather than
+opposite values, and both rejected — a one pixel crack down the shared edge for
+its whole length. `__fmul_rn` and `__fsub_rn` prevent the contraction. For the
+same reason the edge tests are evaluated from the vertices at every pixel
+rather than stepped by their gradients, and stage 3 has no trivial accept.
+
+**Confirm which arithmetic actually ran before theorising about it.** The
+diagnosis above came from a `printf` in the rasterizer for one pixel, printing
+the three edge values and the fill rule flags for every triangle that touched
+it. It took one build and disproved a hypothesis that had already survived two
+plausible arguments. Kernel `printf` guarded by a hardcoded pixel is cheap;
+reason about float rounding only with the numbers in front of you.
+
+**A derivative taken after a projection is wrong wherever the projection is
+discontinuous.** Differencing the final texture coordinate across the quad
+covers every target with one piece of code, which is why it was written that
+way, but a cube's u and v jump between parameterisations at a face boundary. A
+quad straddling a seam gets a huge derivative, the level of detail collapses to
+the coarsest mip, and the seam draws itself — a wireframe of the cube over
+every reflective surface. Differentiate the continuous quantity, the direction
+vector, and push it through the projection analytically. The same caution
+applies to anything else computed from a coordinate after a branch.
 
 **Read the other Mesa backends before deriving an algorithm.** llvmpipe is in
 the same tree. `lp_bld_sample.c` had a better answer for anisotropic filtering
