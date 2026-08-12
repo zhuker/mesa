@@ -448,9 +448,27 @@ struct cp_draw_params {
    uint32_t max_pixels;
 };
 
-/* Adaptive rasterizer thresholds and queue sizes */
-#define CP_SMALL_THRESHOLD   999999
+/*
+ * Adaptive rasterizer thresholds and queue sizes.
+ *
+ * A triangle goes to the stage that can afford its bounding box: one thread
+ * up to CP_SMALL_THRESHOLD pixels, one warp up to CP_MEDIUM_THRESHOLD, and a
+ * block per tile above that. The thresholds are what decides how much of the
+ * machine a triangle gets, so they are the rasterizer's main tuning knob and
+ * both can be overridden with -D at NVRTC time; see cp_kernels.c.
+ *
+ * Getting the small one wrong is expensive in one direction only. Too low
+ * costs a queue round trip on a triangle a single thread could have finished;
+ * too high runs a whole triangle on one lane while the other 127 SMs idle,
+ * and since a warp cannot retire until its slowest lane does, one large
+ * triangle also holds up the 31 small ones sharing its warp.
+ */
+#ifndef CP_SMALL_THRESHOLD
+#define CP_SMALL_THRESHOLD   128
+#endif
+#ifndef CP_MEDIUM_THRESHOLD
 #define CP_MEDIUM_THRESHOLD  4096
+#endif
 #define CP_TILE_SIZE         64
 
 /* Bound on the per-point rasterization loop, and the point size clamp. */

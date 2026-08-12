@@ -1,0 +1,731 @@
+# cudapipe performance plan
+
+Correctness is at 14 of 18 samples within a handful of pixels. This is the plan
+for the performance pass that follows, ordered by dependency rather than by
+size.
+
+Every item names the reference implementation it comes from. That is deliberate:
+each of these ideas exists in shipped code somewhere in this tree or in CuRast,
+and reading the original is faster than rediscovering the reasoning. Paths of
+the form `src/...` are relative to the Mesa checkout; CuRast paths are relative
+to `~/git/CuRast`.
+
+## Ordering, and why
+
+The phases are numbered by dependency, not by when they were thought of, so the
+first one done is 1a and Phase 0 comes third.
+
+The reason is that **Phase 0's wins are unmeasurable until Phase 1a lands.**
+Today every flush drains the device (`cp_context.c:1498`) and every blend peel
+pass drains it again (`cp_context.c:1531`). If the GPU spends its time idle
+waiting on the host, making a kernel 20% faster changes nothing observable, and
+any profile taken beforehand reports stall time rather than kernel time. Phase 1a
+is the cheapest change that makes subsequent measurement mean anything.
+
+There is a comment at `cp_context.c:1531` asserting the flush sync is cheap
+"because the GPU is typically already caught up (99% utilized)". That may be
+true. It is an assumption written under the current serialized design, not a
+measurement, and Phase 1a is what lets it be checked.
+
+```
+1a ──► measure ──┬──► 0   (kernel-bound)
+                 └──► 1b  (memory/transfer-bound) ──► 2 ──► 3
+```
+
+---
+
+# Phase 1a — submission and synchronization
+
+Pure cudapipe. No lavapipe changes. This is the phase that makes the GPU
+pipeline instead of ping-ponging with the host.
+
+## 1a.1 Put every launch on a real stream
+
+All 14 `cuLaunchKernel` calls in `cp_context.c` pass `hStream = NULL` — the
+legacy default stream. Correctness is fine (everything is ordered), but there is
+no infrastructure for overlap, and no way to express "encode frame N while
+rendering frame N+1".
+
+Create a stream per context, thread it through every launch and every
+`cuMemcpy`/`cuMemset`. The `cuMemcpyHtoD` calls in the UBO and sampler-table
+paths (`cp_context.c:678, 1953, 2291, 2363`) should become the `Async` variants
+on the same stream.
+
+## 1a.2 Delete the per-frame host syncs
+
+`cuCtxSynchronize()` appears 12 times. Four are debug-only or teardown and can
+stay. These are in the frame path:
+
+| site | fires | replacement |
+|---|---|---|
+| `cp_context.c:1498` (flush) | every submit | stream-ordered event; sync only where Gallium requires it |
+| `cp_context.c:1477` (compute dispatch) | every dispatch | free the arg buffers via a stream callback or an arena |
+| `cp_context.c:1531` (peel advance) | **every blend layer** | device-side early-out; see below |
+| `cp_resource.c:658` (`cp_clear`) | every frame | remove; the clear kernels are already stream-ordered |
+| `cp_resource.c:145` (map for READ) | every readback | keep, but it should stop firing once the frame stays on the GPU |
+| `cp_resource.c:208, 294, 317` (copy/blit CPU paths) | every readback | removed by 1a.3 |
+
+The peel loop is the worst of these. It launches `peel_advance`, syncs, reads
+`cp->peel_any` on the host, and breaks if nothing was composited. For
+particlesystem — "tens of additive sprites deep", per the comment at
+`cp_context.c:1431` — that is tens of full device drains per draw.
+
+Replace with a device-side counter and either a fixed pass count bounded by the
+primitive count (already computed at `cp_context.c:1448`) or a persistent kernel
+that loops internally. The host round-trip per layer is the thing to remove; the
+peeling algorithm itself is addressed in Phase 3.
+
+## 1a.3 Move the remaining CPU paths onto kernels
+
+These run on the host today and force a device drain plus, under managed memory,
+a page migration of everything they touch:
+
+- `cp_resource_copy_region` (`cp_resource.c:183-234`) — always a CPU `memcpy`
+  loop, even when it is a straight same-format copy that `cuMemcpy2DAsync`
+  handles directly.
+- `cp_blit` same-size format conversion (`cp_resource.c:323-338`) —
+  `util_format_translate`. This is the readback path an application takes when
+  it blits B8G8R8A8 into an R8G8B8A8 staging image.
+- `cp_blit` scaling path (`cp_resource.c:340-441`) — per-row unpack, lerp, pack
+  in float. This is runtime mip-chain generation; it runs once per level per
+  texture.
+- `cp_clear_texture` (`cp_resource.c:540-560`) and `cp_clear_depth_stencil`
+  (`cp_resource.c:506-537`) — CPU loops, while `cp_clear_render_target` right
+  next to them already uses a kernel.
+
+None of these need lavapipe involvement. Format pack/unpack on the device can
+follow what `cp_fs.cu` already does for framebuffer writeback.
+
+## 1a.4 Check the timing hooks before measuring
+
+`cp_lap()` and `timing->writeback_ms` (`cp_context.c:739` and nearby) need to be
+CUDA-event based. Host-side wall-clock timing around asynchronous launches
+measures launch latency, not kernel duration, and will report the same distorted
+picture the syncs currently do.
+
+## Exit criteria
+
+A frame issues with no host synchronization between the first clear and the
+final readback, and per-kernel timings come from CUDA events.
+
+---
+
+# Measurement gate
+
+Before choosing between Phase 0 and Phase 1b, get per-stage timings for two or
+three representative samples — something geometry-heavy, something
+fragment-heavy, something blend-heavy (`particlesystem` is the obvious third).
+
+The question to answer is: **is the frame kernel-bound or transfer-bound?**
+
+- Kernel-bound → Phase 0 pays immediately.
+- Transfer-bound, or dominated by page-fault stalls → Phase 1b first.
+
+Also worth recording at this point: draws per frame. The capture requirements
+list 77 graphics pipelines and 2 compute but no draw counts, and per-draw CPU
+cost in `lvp_execute.c` is the one argument that would eventually favour
+replacing lavapipe.
+
+---
+
+# Phase 0 — rasterizer inner loop
+
+Pure cudapipe, local edits to `kernels/cp_rasterize.cu`. Every item here comes
+from CuRast (`~/git/CuRast`), which is the direct ancestor of cudapipe's
+three-stage design and has already paid for these lessons.
+
+## 0.1 Specialize on sample count
+
+`cp_rasterize.cu:530` runs
+
+```c
+for (int sm = 0; sm < (int)args.num_samples; sm++) {
+   float ox, oy;
+   cp_sample_pos(args.num_samples, sm, &ox, &oy);
+   ...
+}
+```
+
+in the innermost scope of the hottest loop in the driver: a runtime trip count
+wrapping a function call that computes a compile-time constant. For the
+overwhelmingly common single-sample case a template specialization collapses the
+whole thing.
+
+**Reference:** `CuRast/src/kernels/triangles_visbuffer.cu:33-35` —
+
+> Some compile-time template specializations here because for perf reasons, we
+> need each variation of getVertex to be a separately compiled function.
+> Branching at runtime may increase rendering duration by a couple of percent.
+
+They emit 14 separate `extern "C" __global__` entry points across index-fetch ×
+compression × instancing to avoid a *branch*. cudapipe's case is a loop, so the
+cost is higher.
+
+## 0.2 Fold the half-pixel offset into setup
+
+cudapipe computes `cx = (float)px + ox` per pixel, per sample. The alternative
+is to subtract 0.5 from the screen-space vertices once during triangle setup and
+sample at integer coordinates.
+
+**Reference:** `CuRast/src/kernels/triangles_visbuffer.cu:163-176`, which is
+worth quoting because the magnitude is surprising:
+
+> For unclear reasons, specifying a SAMPLE_OFFSET of 0.5f can be up to 40%
+> slower compared to offsetting the screen-space coordinates by 0.5f. E.g. in
+> Zorah, it can make the difference between 74ms and 102ms per frame.
+
+Safe for watertightness: it is the same affine translation applied to every
+triangle, so two triangles sharing an edge still see exactly opposite edge
+function values.
+
+## 0.3 Fast division where it cannot affect coverage
+
+cudapipe uses zero fast-math intrinsics. `__fdividef` is safe for the area
+reciprocal and the perspective depth reciprocal, because those feed
+*interpolation* only — the inside test uses the raw `e0`/`e1`/`e2` values with
+the top-left rule (`cp_rasterize.cu:534-536`), so coverage is unaffected.
+
+**Reference:** CuRast uses `__fdividef` in stage 1
+(`triangles_visbuffer.cu:244, 247-249, 287`) and deliberately reverts to exact
+division in stage 2 (`563-565`, with the fast versions commented out), because
+precision matters more once triangles are large. Worth copying that split.
+
+## 0.4 Replace the discard boolean with an early/late-ZS table
+
+Today the entire decision is one bit:
+
+```c
+bool retry = cp->fs_shader && cp->fs_shader->uses_discard && ...   /* cp_context.c:1424 */
+```
+
+so every discarding shader pays the full multi-pass retry loop. Mali has
+cudapipe's exact hazard — fixed-function depth/stencil potentially resolving
+before the shader runs — and solves it by classifying the shader instead of
+retrying.
+
+**Reference:** `src/panfrost/lib/pan_earlyzs.c:30-90` and
+`src/panfrost/lib/pan_earlyzs.h:15-28`. The state is a precomputed lookup table
+(`states[2][2][2][MODE_COUNT]`) read inline in the draw hot path, driven by:
+
+```c
+bool shader_writes_zs = s->fs.writes_depth || s->fs.writes_stencil;
+bool late_update      = shader_writes_zs || alpha_to_coverage;
+bool late_kill        = shader_writes_zs;
+bool force_early_kill = s->fs.early_fragment_tests;
+bool late_coverage    = s->fs.writes_coverage || s->fs.can_discard || alpha_to_coverage;
+```
+
+plus `best_early_mode()`, which uses `zs_always_passes` to pick *weak early*
+(test early, shader still always runs) over *force early*.
+
+Three gaps this exposes in cudapipe:
+
+1. **`early_fragment_tests` is not honoured anywhere** — no references in the
+   driver. A shader carrying SPIR-V's `EarlyFragmentTests` execution mode has
+   explicitly declared that depth/stencil runs before shading regardless of
+   discard. Those should skip the retry loop entirely.
+2. **The always-passes case is free and unused.** If depth test is disabled or
+   `depth_func == PIPE_FUNC_ALWAYS`, nothing is being displaced by the early
+   resolve, so there is no hazard and no retry is needed even with discard.
+   `cp->depth_stencil.depth_enabled` and `depth_func` are already read a few
+   lines below the retry decision (`cp_context.c:1028-1029`). This covers UI and
+   overlay draws, and many blended draws.
+3. **`writes_depth` is not handled at all** — no references to `frag_depth` in
+   the driver. If a fragment shader writes `gl_FragDepth`, the visibility buffer
+   resolved on the interpolated depth computed before the shader ran, which the
+   shader was about to change. That is a correctness gap rather than a
+   performance one.
+
+**Measured priority: low for this workload.** All 1001 SPIR-V modules in
+`~/git/Vulkan` were disassembled and scanned for `BuiltIn FragDepth` and
+`ExecutionMode DepthReplacing`, and the GLSL/Slang sources for `gl_FragDepth`
+and the `depth_*` layout qualifiers:
+
+- **`gl_FragDepth`: zero hits**, repo-wide — gap 3 is not live.
+- **`EarlyFragmentTests`: 3 modules, all the `oit` sample**, which is not in the
+  in-scope list — gap 1 has nothing to fire on.
+- **`discard`: one in-scope sample, `gltfscenerendering`.** The entire retry
+  path is driven by that sample's alpha-tested foliage, and it needs ordinary
+  depth testing, so gap 2 does not apply to it either.
+
+So §0.4 buys nothing measurable on the current sample set. Keep it on the plan
+as robustness — a shader writing `gl_FragDepth` would be silently wrong today,
+and the classification is the right structure — but do not sequence it ahead of
+anything. Re-check if the sample set grows: the scan is
+`spirv-dis <f> | grep -E "BuiltIn FragDepth|ExecutionMode .* DepthReplacing"`
+over `find shaders -name '*.spv'`.
+
+Corollary worth carrying into Phase 3: with one discarding sample in scope, the
+retry path's cost is not what makes Phase 3 worthwhile — the blend peeling is.
+
+## 0.5 Fix the silent geometry drop (correctness, not performance)
+
+`cp_rast_types.h:469-470` caps the queues, and on overflow the triangle is
+discarded with no error, no counter, and no log:
+
+```c
+if (idx < CP_MAX_NONTRIVIAL) { queue[idx] = tri_id; }   /* else it vanishes */
+```
+
+Same at `cp_rasterize.cu:642` for `CP_MAX_HUGE_TILES`. At minimum, count the
+drops and report them. The real fix is growable allocation (Phase 1b.4).
+
+## 0.6 Cheap early-outs worth taking while in the file
+
+- **Tiny-triangle sample-miss cull** — a triangle whose bounding box falls
+  between sample positions can be dropped before any per-pixel work.
+  Reference: `CuRast/src/kernels/triangles_visbuffer.cu:190-196`.
+- **View-space backface cull** — `dot(a_view, cross(ab, ac))` needs no
+  projection and no division, and handles negative-determinant (mirrored)
+  instances explicitly via `det(worldView) < 0`.
+  Reference: `CuRast/src/kernels/triangles_visbuffer.cu:206-226`.
+
+---
+
+# Phase 1b — memory model
+
+This is the phase that touches lavapipe. It is the enabler for Phases 2 and 3,
+not an alternative to them: optimal-tiled images are only possible once images
+can be device-only, because **an image the CPU can map must have a layout the
+CPU can compute.**
+
+## 1b.1 Fix the `pipe_memory_allocation` ABI leak first
+
+`struct pipe_memory_allocation` is never defined — `p_state.h:606` is a bare
+forward declaration. It is an opaque handle, minted by the driver in
+`allocate_memory` and handed back to `map_memory` / `free_memory` /
+`resource_bind_backing`. llvmpipe puts a heap struct behind it; cudapipe makes
+the handle *be* the `CUdeviceptr`. Both are legal.
+
+Lavapipe breaks the contract in three places by fabricating a handle out of
+llvmpipe's private struct layout:
+
+```c
+struct llvmpipe_memory_allocation alloc = { .cpu_addr = mem };
+pscreen->resource_bind_backing(pscreen, pres, (void *)&alloc, 0, 0, 0);
+```
+
+| site | address source | lifetime |
+|---|---|---|
+| `lvp_execute.c:283` | `VkDeviceAddress` | **stack local** |
+| `lvp_descriptor_set.c:299` | `VkDeviceAddress` | **stack local** |
+| `lvp_device.c:2225` | `VK_EXT_external_memory_host` pointer | field in `lvp_device_memory` |
+
+Under cudapipe, `&alloc` — the address of the struct — becomes the buffer base.
+For the first two that is a stack address handed to a kernel.
+
+Reached through `VK_KHR_buffer_device_address` (`lvp_execute.c:1296, 1324, 3003,
+3032, 3649, 3680`) and `VK_EXT_descriptor_buffer` (`lvp_execute.c:4784, 4886`,
+`lvp_descriptor_set.c:1143, 1294`). The capture's extension list requests
+neither, so it is latent for the current workload — but lavapipe advertises both
+unconditionally (`lvp_device.c:134, 244`).
+
+**Fix — two `pipe_screen` entry points:**
+
+```c
+/* Bind a resource to an address the caller already holds. For buffer-device-
+ * address and descriptor-buffer resources, where no allocation object exists. */
+bool (*resource_bind_backing_address)(struct pipe_screen *screen,
+                                      struct pipe_resource *pt,
+                                      uint64_t address, uint64_t offset);
+
+/* Import application-owned host memory (VK_EXT_external_memory_host).
+ * Released through free_memory. */
+struct pipe_memory_allocation *(*import_memory_host)(struct pipe_screen *screen,
+                                                     void *ptr, uint64_t size);
+```
+
+The third site needs the second hook rather than the first because it is a real
+`VkDeviceMemory` that must support bind, map and free — and note that
+`lvp_FreeMemory` currently skips both `unmap_memory` and `free_memory` for the
+`USER_PTR` case, so anything cudapipe registers there would leak. That needs
+fixing in the same patch.
+
+cudapipe implements `resource_bind_backing_address` by validating the pointer
+with `cuPointerGetAttribute(CU_POINTER_ATTRIBUTE_MEMORY_TYPE)` and rejecting
+addresses the GPU cannot reach, and `import_memory_host` with
+`cuMemHostRegister` (the `minImportedHostPointerAlignment = 4096` at
+`lvp_device.c:1238` already guarantees the required page alignment).
+
+This must land before 1b.2, because once `map_memory` can legitimately return
+NULL, the current `(char *)mem + offset` shortcut cannot distinguish "device-only"
+from "foreign address" and the ambiguity becomes load-bearing.
+
+With this done, `llvmpipe_memory_allocation` disappears from lavapipe entirely
+(the only two references are `lvp_private.h:256` and `lvp_device.c:2225`, both
+removed), and cudapipe's allocation struct becomes its own:
+
+```c
+struct cp_memory_allocation {
+   CUdeviceptr device_ptr;
+   void       *cpu_addr;         /* NULL when device-only */
+   uint64_t    size;
+   bool        device_only;
+   bool        host_registered;
+};
+```
+
+`cp_map_memory` returns `cpu_addr`, which is NULL exactly when the memory is not
+mappable — the property falls out of the struct rather than needing a check.
+
+## 1b.2 Split the memory types
+
+`lvp_GetPhysicalDeviceMemoryProperties` (`lvp_device.c:1778`) advertises exactly
+one type on one heap, with all four flags:
+
+```c
+DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT | HOST_CACHED
+```
+
+That is correct for llvmpipe, where device-local and host-visible describe the
+same malloc'd pages. It is wrong across a PCIe bus, and it is why every cudapipe
+allocation is `cuMemAllocManaged` today.
+
+The assumption is baked in at three levels, and all three need touching:
+
+**Memory properties** — make it driver-queryable via a new `pipe_screen` hook.
+llvmpipe returns exactly what is hardcoded now; cudapipe returns two types
+(device-only, and host-visible/coherent).
+
+**`memoryTypeBits`** — hardcoded to `1` at seven sites: `lvp_device.c:1827, 2381,
+2409, 2458, 2491, 2667` and `lvp_device_generated_commands.c:327`. These become
+real bitmasks. Host-pointer import (1827) and fd properties (2667) stay
+host-visible-only.
+
+**Eager mapping** — `lvp_AllocateMemory` calls `map_memory` immediately in every
+branch (`lvp_device.c:2229, 2259, 2271, 2283`), not lazily at `vkMapMemory`. That
+must be skipped for device-only types, which in turn means `poison_mem` and
+`VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT` (`lvp_device.c:2284-2290`) become
+driver-side clears rather than CPU `memset`. `lvp_MapMemory2KHR`
+(`lvp_device.c:2337`) can assert for device-only memory, since Vulkan forbids
+mapping non-`HOST_VISIBLE` memory.
+
+**Lavapipe's own allocations** must keep requesting mappable memory:
+`lvp_descriptor_set.c:398` (descriptor sets) and `lvp_pipeline.c:374` (embedded
+samplers) both allocate, map, and then write through the CPU pointer while the
+GPU reads the same bytes. `pipe_screen::allocate_memory` has no flags parameter
+(`p_screen.h:654`), so it needs one.
+
+**cudapipe side:** two allocators (`cuMemAlloc` for device-only,
+`cuMemAllocManaged` or `cuMemHostAlloc` for mappable); `map_memory` returns NULL
+for device-only; `resource_copy_region` and `blit` dispatch on which side is
+which and become `cuMemcpyHtoDAsync` / `DtoHAsync` / `DtoDAsync`.
+`cp_resource_create` (`cp_resource.c:77`) also allocates directly and needs the
+same decision, taken from `tmpl->bind` and `tmpl->usage` — render targets and
+depth attachments device-only, staging mappable.
+
+## 1b.3 Make residency deterministic
+
+Even before the split, `cuMemAdvise` gives device residency without changing the
+memory model — cudapipe uses it zero times today:
+
+```c
+cuMemAdvise(ptr, size, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, dev);
+cuMemAdvise(ptr, size, CU_MEM_ADVISE_SET_ACCESSED_BY, CU_DEVICE_CPU);
+```
+
+Preferred-location pins pages on the device; accessed-by establishes a direct
+CPU mapping so host access maps over PCIe rather than migrating.
+
+The reason to do the full split anyway rather than stop here: managed residency
+is *emergent*. One unplanned CPU read — a debug path, a query result, an
+application mapping something unexpected — silently costs thousands of page
+migrations with no error and no log line. Device-only memory turns that into a
+hard failure at map time. For something with a frame budget, a property you can
+rely on beats one that currently happens to hold. Kernels touching a
+non-resident managed page also stall the warp on a host round-trip, which
+`cuMemAlloc` memory structurally cannot do.
+
+## 1b.4 Growable queues instead of fixed caps
+
+`CP_MAX_NONTRIVIAL` (1,000,000) and `CP_MAX_HUGE_TILES` (2,000,000) are fixed
+reservations that silently drop geometry on overflow.
+
+**Reference:** `src/panfrost/lib/pan_tiler.c:57-69` describes Mali's approach —
+the tiler heap is a huge *reservation* with lazy commit, growing on page fault
+via the kernel's growable-memory path. CUDA has the same primitive, and CuRast
+already wraps it: `CuRast/src/CudaVirtualMemory.h:84-137`
+(`cuMemAddressReserve` → `cuMemCreate` → `cuMemMap`).
+
+Note that the huge-tile queue is the one most likely to overflow, and Phase 3's
+hierarchical bin sizes is what actually fixes the underlying cause.
+
+---
+
+# Phase 2 — image layout
+
+Requires 1b. Enables the full value of Phase 3.
+
+## 2.1 Swizzled layout for `VK_IMAGE_TILING_OPTIMAL`
+
+`cp_resource_layout` (`cp_resource.c:30-56`) computes
+`row_stride = nblocksx * block_size` — pitch-linear, tightly packed, zero
+alignment. Vertically adjacent texels are `row_stride` bytes apart, so every
+bilinear tap touches at least two cache lines, and neighbouring quads get no
+vertical reuse. Real GPUs use swizzled or Morton-order layouts precisely so a 2D
+neighbourhood lands in one cache line. The same applies to quad writes: a 2×2
+pixel block spans two rows.
+
+This is more achievable than it first appears. **Vulkan forbids
+`vkGetImageSubresourceLayout` on `OPTIMAL`-tiling images** — it is legal only for
+`LINEAR` and DRM-modifier images. Lavapipe's implementation
+(`lvp_image.c:476-496`) just forwards to
+`resource_get_param(PIPE_RESOURCE_PARAM_STRIDE)`, so the app-visible stride
+contract binds only images where linear is required anyway.
+
+So: swizzle `OPTIMAL`, keep `LINEAR` pitch-linear, exactly as real drivers do.
+
+What genuinely stays linear:
+
+- The bindless / descriptor-buffer path. `struct lp_jit_texture`
+  (`src/gallium/auxiliary/gallivm/lp_bld_jit_types.h:59-77`) describes an image
+  as `base` + `row_stride[]` + `img_stride[]` + `mip_offsets[]`. There is no
+  tiling mode or swizzle parameter — pitch-linear is the only thing it can
+  express, and lavapipe fills it in at 44 sites in `lvp_descriptor_set.c`.
+- `llvmpipe_get_texel_offset` in the sparse-binding path
+  (`lvp_image.c:1053`).
+
+The ordinary sampler path is unaffected: cudapipe's shaders go through its own
+`cp_texture_info` (`cp_context.c:2317-2363`), not `lp_jit_texture`, so cudapipe
+already describes textures in its own terms.
+
+## 2.2 Aligned strides
+
+`cp_resource_layout` currently applies no alignment at all. Aligned rows matter
+for coalesced writes independently of swizzling, and would matter for a
+fixed-function encoder if one were ever used (the current plan is a CUDA-based
+encoder, which removes that constraint but not the coalescing one).
+
+## 2.3 Convert on upload
+
+Layout conversion belongs in the blit and copy kernels from 1a.3, which by this
+point already run on the device.
+
+---
+
+# Phase 3 — tiled rasterization
+
+The largest change, and the one every reference design agrees on.
+
+## 3.1 Why this is the convergent answer
+
+| design | binning |
+|---|---|
+| Mali | hardware tiler, hierarchical bin sizes, tile-local framebuffer |
+| llvmpipe | bins per tile, replays each tile's list in submission order |
+| CuRast | per-tile sort + one block per tile (translucent path) |
+| Nanite | visibility buffer, clustered/binned upstream |
+| **cudapipe** | **none** — tiles exist only to split huge triangles |
+
+cudapipe's two worst known behaviours are direct consequences, and both have the
+same shape — *the whole screen pays for the worst pixel*:
+
+- **Blend peeling**: N full-screen passes, one per layer
+  (`cp_context.c:1428-1444`), with a host sync between each.
+- **Discard retry**: N full-screen passes, same structure
+  (`cp_context.c:1418-1423`).
+
+The comment at `cp_context.c:1435` already identifies the alternative:
+
+> llvmpipe has no such problem because it never defers: it bins primitives per
+> tile and replays each tile's list in submission order, shading and blending
+> inline, so ordering falls out of the data structure.
+
+Phase 3 is building that.
+
+## 3.2 The structure
+
+- Bin primitives into per-tile lists.
+- One block per tile. The tile's colour and depth live in **shared memory** for
+  the duration.
+- Walk the tile's list in submission order, shading and blending inline.
+- Write the tile out once, coalesced.
+
+What this subsumes:
+
+- Blend peeling collapses to a single pass. Depth complexity is paid per tile
+  rather than per screen — a tile with 40 overlapping sprites is one block
+  iterating 40 primitives, not 40 screen-wide passes.
+- Discard resolves inside the tile loop; the retry machinery disappears.
+- Framebuffer traffic becomes one store per tile instead of scattered atomics.
+- Swizzled layout (Phase 2) becomes natural, since the tile is the unit of both
+  storage and work.
+- Quad derivatives survive — a tile block has the 2×2 neighbourhood, which is
+  the part that would be expected to block this and does not.
+
+## 3.3 Sort key: submission order, not depth
+
+**Reference:** CuRast's translucent path
+(`CuRast/src/kernels/triangles_translucent.cu`) is the closest existing
+implementation of this data flow:
+
+- 64-bit sort key `tile_y(8) | tile_x(8) | depth(24) | queueIndex(24)`
+  (lines 143-159)
+- CUB radix sort over the whole queue (hence `CuRast/src/CubSort.cu`)
+- `tileRanges[tileID]` gives each tile's `[start, end)` after sorting
+- One block per tile, prefetching 256 primitives at a time into shared memory
+  (`kernel_stage4_blend`, lines 460-680)
+
+But its **semantics are wrong for a Vulkan driver** and must not be copied:
+
+- It sorts by **depth**, not submission order. Vulkan defines blending by
+  primitive order. Additive sprites give the same answer either way, which is
+  why it works for their content; `VK_BLEND_OP_ADD` with
+  src_alpha/one_minus_src_alpha over coplanar geometry does not.
+- One hardcoded blend equation (`rgba += c.rgb*c.a*T; T *= (1-c.a)`), where
+  Vulkan has ~19 factors × 5 ops, separate RGB/alpha, per attachment.
+- The 4-slot fragment stash exists because the key holds one depth per triangle
+  *piece*, not per fragment, so ordering within a tile is approximate. More than
+  four overlapping fragments and it blends wrong.
+- 24-bit truncated depth keys (`__float_as_uint(depth) & 0xffffff00`).
+
+**The fix is the sort key.** Replace depth with submission index:
+
+```
+tile_y(8) | tile_x(8) | submissionIndex(32)
+```
+
+The sort becomes exact — submission index has no per-pixel variation — so the
+stash disappears entirely, and the ordering is Vulkan-correct by construction.
+Take the machinery, not the semantics.
+
+## 3.4 Hierarchical bin sizes
+
+cudapipe (following CuRast) splits huge triangles at a **fixed** tile size, so
+one screen-covering triangle at 1080p with 64×64 tiles produces 30×17 = 510
+queue entries. That is also why `CP_MAX_HUGE_TILES` is the cap most likely to
+blow.
+
+**Reference:** `src/panfrost/lib/pan_tiler.c:18-28`. Mali keeps bins at multiple
+tile sizes simultaneously (16×16 through 4096×4096) and files each triangle at
+the level matching its bounding box:
+
+> The idea behind hierarchical tiling is to use low tiling levels for small
+> triangles and high levels for large triangles, to minimize memory bandwidth
+> and repeated fragment shader invocations.
+
+Choosing the split tile size from the bounding box turns 510 entries into a
+handful, and keeps entries-per-triangle roughly constant regardless of size.
+
+Note the tiler itself is fixed-function hardware — there is no binning algorithm
+to port from panfrost or panvk, only the concept. `pan_tiler.c` is nonetheless
+worth reading in full; it is effectively a design document for this problem.
+
+**Also from that file (`pan_tiler.c:93-126`):** a heuristic for choosing the
+minimum tile size, `triangle area ≈ screen area / triangle count` — few triangles
+on a large screen means UI compositing, many means a 3D mesh. cudapipe's
+`CP_SMALL_THRESHOLD` is a fixed constant today. cudapipe has an advantage Mali
+does not: vertex positions are already on the device when stage 1 runs, so the
+real distribution can be measured rather than guessed.
+
+## 3.5 Persistent blocks with atomic work claiming
+
+Stage 1 launches `(n + 255) / 256` blocks, one thread per triangle
+(`cp_context.c:1464`). A batch containing one huge triangle and 255 tiny ones
+runs at the speed of the huge one.
+
+**Reference:** `CuRast/src/kernels/triangles_visbuffer.cu:315-426` (stage 1) and
+`442-531` (stage 2). Launch exactly enough blocks to fill the device, then loop
+claiming work from a global counter: one `atomicAdd` per block with the mesh
+cursor in shared memory for stage 1, one per warp with `warp.shfl` broadcast for
+stage 2.
+
+Stage 2 also has a trick worth taking on its own: thread 0 does all the transform
+and setup, then ~15 `warp.shfl()` calls broadcast the result, instead of 32 lanes
+redundantly computing the same values (lines 460-531).
+
+## 3.6 Fixed-point subpixel edge stepping
+
+The biggest single win in the rasterizer, and the most care required.
+
+cudapipe deliberately re-evaluates edge functions from the vertices at every
+pixel rather than stepping by gradients. The reasoning is recorded at
+`cp_rasterize.cu:511-521`: stepping in float accumulates rounding, so the two
+triangles either side of a shared edge stop seeing exactly opposite values, and
+coverage stops being watertight.
+
+That is a real difference in requirements, not an oversight. CuRast steps in
+float (`triangles_visbuffer.cu:251-309`) because it renders opaque photogrammetry
+meshes where a one-pixel crack is invisible — its README states blending and
+transparency are unsupported. A Vulkan driver cannot make that trade.
+
+The resolution is the one cudapipe's own comment names: snap vertices to a
+subpixel grid and iterate in integers, the way `src/gallium/drivers/llvmpipe/
+lp_setup_tri.c` does. That gives incremental stepping *and* exactness, which is
+what hardware does. It removes the per-pixel edge-function evaluation entirely.
+
+## 3.7 Stage 3: consider ray-tracing
+
+**Reference:** `CuRast/src/kernels/triangles_visbuffer.cu:688-800`. Their stage 3
+ray-traces huge triangles rather than rasterizing them (`#define RAYTRACE`).
+Notably their rasterize path carries a "TODO: Proper perspective-correct
+interpolation" while the ray-trace path computes exact depth from
+`dot(t·rayDir, viewDir)`. Möller–Trumbore returns barycentrics directly, so
+attribute interpolation still works.
+
+Worth evaluating for cudapipe's stage 3, where the same precision problem exists.
+
+---
+
+# Explicitly not on the plan
+
+**Replacing lavapipe with a native driver.** Nothing above requires it. The three
+arguments that would favour it are each defused for this workload:
+
+- **Barriers** — a CUDA-based encoder on the same stream gets render→encode
+  ordering implicitly. No barrier information is needed to sequence them.
+- **Memory types** — Phase 1b fixes this inside the current architecture.
+- **WSI forcing CPU images** — `lvp_init_wsi` sets `sw_device = true`
+  (`lvp_wsi.c:42-46`), which makes every swapchain image a `WSI_IMAGE_TYPE_CPU`
+  image (`src/vulkan/wsi/wsi_common_headless.c:485`). Irrelevant with no
+  swapchain.
+
+What remains is per-draw CPU cost in `lvp_execute.c`, which interprets
+`vk_cmd_queue_entry` records at submit time through 6127 lines of handler
+dispatch. That cost does not shrink as the kernels get faster.
+
+**Revisit if** the measurement gate shows per-draw CPU time is binding. Note
+that the kernels and the NIR→PTX backend port to a native driver unchanged —
+lavapipe is the part that would be discarded, and it is the part that was not
+written here.
+
+One coupling worth recording even though it is not actionable: lavapipe writes
+descriptor sets directly in llvmpipe's JIT ABI (44 `lp_jit_*` call sites in
+`lvp_descriptor_set.c`), so any driver behind lavapipe inherits llvmpipe's
+descriptor layout. Unlike the memory model, that has no clean incremental fix.
+
+---
+
+# References
+
+**CuRast** — Schütz, Lipp, Kristmann, Wimmer; *CuRast: Cuda-Based Software
+Rasterization for Billions of Triangles*, Computer Graphics Forum 2026.
+`~/git/CuRast`, paper at `docs/CuRast_arxiv.pdf`. The direct ancestor of
+cudapipe's three-stage design.
+
+**Mali / panfrost** — `src/panfrost/lib/pan_tiler.c` (hierarchical tiling,
+growable heap, tile-size heuristic) and `src/panfrost/lib/pan_earlyzs.c`
+(early/late depth-stencil classification). Both are in the shared lib used by
+panfrost and panvk. The tiler is fixed-function hardware; these files are the
+driver's reasoning about it.
+
+**llvmpipe** — `src/gallium/drivers/llvmpipe/lp_setup_tri.c` (fixed-point
+subpixel rasterization), `lp_rast.c` / `lp_setup.c` (binned tile replay in
+submission order), `src/gallium/auxiliary/gallivm/lp_bld_sample.c` (anisotropic
+filtering, already borrowed once).
+
+**Nanite** — Karis, *Nanite: A Deep Dive*, SIGGRAPH 2021. Source of the
+visibility-buffer-with-packed-atomic approach cudapipe already uses, and of the
+finding that software rasterization beats fixed-function below roughly a pixel
+or two per triangle.
+
+**FreePipe** — Liu et al. 2010. First use of `atomicMin` for direct
+rasterization without sorting.
+
+**CUDARaster** — Laine & Karras, HPG 2011. Hierarchical software rasterization
+with persistent threads and queue-based work distribution.
+
+**cuRE** — Kenzel et al., SIGGRAPH 2018. A persistent megakernel that keeps data
+in registers across pipeline stages, arguing against the multi-kernel structure
+cudapipe currently has. Worth reading before committing to Phase 3's kernel
+decomposition.

@@ -61,12 +61,34 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
    snprintf(arch_opt, sizeof(arch_opt), "--gpu-architecture=compute_%d%d",
             sm_major, sm_minor);
 
-   const char *opts[3];
+   /*
+    * The rasterizer thresholds decide how much of the machine a triangle
+    * gets, and the right values are a property of the workload rather than
+    * something to be reasoned out once. NVRTC compiles at run time, so they
+    * can be swept from the environment without a rebuild, which is what makes
+    * a sweep of them repeatable rather than a series of builds nobody can
+    * reproduce. Unset means the header's default.
+    */
+   char small_opt[64], medium_opt[64];
+   const char *opts[5];
    unsigned num_opts = 0;
    opts[num_opts++] = arch_opt;
    opts[num_opts++] = "--std=c++14";
    if (relocatable)
       opts[num_opts++] = "--relocatable-device-code=true";
+
+   const char *small_env = getenv("CUDAPIPE_SMALL_THRESHOLD");
+   if (small_env && *small_env) {
+      snprintf(small_opt, sizeof(small_opt), "-DCP_SMALL_THRESHOLD=%d",
+               atoi(small_env));
+      opts[num_opts++] = small_opt;
+   }
+   const char *medium_env = getenv("CUDAPIPE_MEDIUM_THRESHOLD");
+   if (medium_env && *medium_env) {
+      snprintf(medium_opt, sizeof(medium_opt), "-DCP_MEDIUM_THRESHOLD=%d",
+               atoi(medium_env));
+      opts[num_opts++] = medium_opt;
+   }
 
    res = nvrtcCompileProgram(prog, num_opts, opts);
    if (res != NVRTC_SUCCESS) {

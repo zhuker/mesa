@@ -259,6 +259,34 @@ cp_clip_triangles(struct cp_clip_args args)
    }
 }
 
+/*
+ * How many triangles this draw actually has.
+ *
+ * Clipping runs on the device and writes its output count there, so when it
+ * has run the host only knows the worst case it sized the buffer for. Every
+ * stage has to agree on this: reading args.num_triangles directly is reading
+ * the count from before the clipper ran, and a clipped triangle's id can be up
+ * to three times that.
+ */
+static __device__ __forceinline__ uint32_t
+cp_num_triangles(const struct cp_rasterize_args *args)
+{
+   return args->tri_count
+      ? *(const volatile uint32_t *)(uintptr_t)args->tri_count
+      : args->num_triangles;
+}
+
+/*
+ * How many entries of a queue are readable. The counter is an unclamped
+ * atomicAdd, so on overflow it counts past the end of the allocation and the
+ * entries beyond it were never written.
+ */
+static __device__ __forceinline__ uint32_t
+cp_queue_used(uint32_t count, uint32_t capacity)
+{
+   return count < capacity ? count : capacity;
+}
+
 static __device__ __forceinline__ bool
 setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
                struct tri_setup *s)
@@ -479,10 +507,7 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
    uint32_t tri_id = blockIdx.x * blockDim.x + threadIdx.x;
    /* After clipping the count lives on the device, so the grid is sized for
     * the worst case and each thread bounds itself. */
-   uint32_t num_triangles = args.tri_count
-      ? *(const volatile uint32_t *)(uintptr_t)args.tri_count
-      : args.num_triangles;
-   if (tri_id >= num_triangles)
+   if (tri_id >= cp_num_triangles(&args))
       return;
 
    struct tri_setup s;
@@ -559,134 +584,139 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
 extern "C" __global__ void
 cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
-   /* Each warp claims one triangle from the nontrivial queue */
    uint32_t lane_id = threadIdx.x % 32;
    uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+   uint32_t num_warps = (gridDim.x * blockDim.x) / 32;
 
    uint32_t *nt_counter = (uint32_t *)(uintptr_t)queues.nontrivial_count;
-   uint32_t num_nontrivial = *nt_counter;
-   if (warp_id >= num_nontrivial)
-      return;
-
+   uint32_t num_nontrivial = cp_queue_used(*nt_counter, CP_MAX_NONTRIVIAL);
    uint32_t *nt_queue = (uint32_t *)(uintptr_t)queues.nontrivial;
-   uint32_t tri_id = nt_queue[warp_id];
+   uint32_t num_triangles = cp_num_triangles(&args);
 
-   /* Bounds check: tri_id must be < num_triangles */
-   if (tri_id >= args.num_triangles)
-      return;
-
-   /* Lane 0 does triangle setup */
-   float sx0, sy0, sx1, sy1, sx2, sy2;
-   float ndc_z0, ndc_z1, ndc_z2;
-   float inv_area;
-   int e0_tl, e1_tl, e2_tl;
-   int ix_min, iy_min, ix_max, iy_max;
-   int valid = 0;
-
-   if (lane_id == 0) {
-      struct tri_setup s;
-      if (setup_triangle(&args, tri_id, &s)) {
-         sx0 = s.sx0; sy0 = s.sy0;
-         sx1 = s.sx1; sy1 = s.sy1;
-         sx2 = s.sx2; sy2 = s.sy2;
-         ndc_z0 = s.ndc_z0; ndc_z1 = s.ndc_z1; ndc_z2 = s.ndc_z2;
-         inv_area = s.inv_area;
-         e0_tl = s.e0_top_left;
-         e1_tl = s.e1_top_left;
-         e2_tl = s.e2_top_left;
-         ix_min = s.ix_min; iy_min = s.iy_min;
-         ix_max = s.ix_max; iy_max = s.iy_max;
-         valid = 1;
-      }
-   }
-
-   /* Broadcast setup from lane 0 to all lanes */
-   valid   = __shfl_sync(0xFFFFFFFF, valid, 0);
-   if (!valid)
-      return;
-
-   sx0     = __shfl_sync(0xFFFFFFFF, sx0, 0);
-   sy0     = __shfl_sync(0xFFFFFFFF, sy0, 0);
-   sx1     = __shfl_sync(0xFFFFFFFF, sx1, 0);
-   sy1     = __shfl_sync(0xFFFFFFFF, sy1, 0);
-   sx2     = __shfl_sync(0xFFFFFFFF, sx2, 0);
-   sy2     = __shfl_sync(0xFFFFFFFF, sy2, 0);
-   ndc_z0  = __shfl_sync(0xFFFFFFFF, ndc_z0, 0);
-   ndc_z1  = __shfl_sync(0xFFFFFFFF, ndc_z1, 0);
-   ndc_z2  = __shfl_sync(0xFFFFFFFF, ndc_z2, 0);
-   inv_area = __shfl_sync(0xFFFFFFFF, inv_area, 0);
-   e0_tl   = __shfl_sync(0xFFFFFFFF, e0_tl, 0);
-   e1_tl   = __shfl_sync(0xFFFFFFFF, e1_tl, 0);
-   e2_tl   = __shfl_sync(0xFFFFFFFF, e2_tl, 0);
-   ix_min  = __shfl_sync(0xFFFFFFFF, ix_min, 0);
-   iy_min  = __shfl_sync(0xFFFFFFFF, iy_min, 0);
-   ix_max  = __shfl_sync(0xFFFFFFFF, ix_max, 0);
-   iy_max  = __shfl_sync(0xFFFFFFFF, iy_max, 0);
-
-   int bb_w = ix_max - ix_min + 1;
-   int bb_h = iy_max - iy_min + 1;
-   int bb_area = bb_w * bb_h;
-
-   /* Huge triangles: decompose into tiles and push to stage 3 */
-   if (bb_area > CP_MEDIUM_THRESHOLD) {
-      if (lane_id == 0) {
-         int tile_x_min = ix_min / CP_TILE_SIZE;
-         int tile_y_min = iy_min / CP_TILE_SIZE;
-         int tile_x_max = ix_max / CP_TILE_SIZE;
-         int tile_y_max = iy_max / CP_TILE_SIZE;
-         int num_tiles = (tile_x_max - tile_x_min + 1) *
-                         (tile_y_max - tile_y_min + 1);
-
-         uint32_t *huge_counter = (uint32_t *)(uintptr_t)queues.huge_count;
-         uint32_t base_idx = atomicAdd(huge_counter, (uint32_t)num_tiles);
-
-         struct cp_tile_pair *huge_queue =
-            (struct cp_tile_pair *)(uintptr_t)queues.huge_tiles;
-
-         int idx = 0;
-         for (int ty = tile_y_min; ty <= tile_y_max; ty++) {
-            for (int tx = tile_x_min; tx <= tile_x_max; tx++) {
-               if (base_idx + idx < CP_MAX_HUGE_TILES) {
-                  huge_queue[base_idx + idx].tri_id = tri_id;
-                  huge_queue[base_idx + idx].tile_x = (uint16_t)(tx * CP_TILE_SIZE);
-                  huge_queue[base_idx + idx].tile_y = (uint16_t)(ty * CP_TILE_SIZE);
-               }
-               idx++;
-            }
-         }
-      }
-      return;
-   }
-
-   /* Medium triangle: all 32 lanes iterate the bounding box with stride 32 */
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
 
-   for (int i = (int)lane_id; i < bb_area; i += 32) {
-      int px = ix_min + (i % bb_w);
-      int py = iy_min + (i / bb_w);
-
-      if (px < 0 || px >= (int)args.width || py < 0 || py >= (int)args.height)
+   /*
+    * A warp claims queue entries by striding the grid, rather than the grid
+    * being one warp per entry. The grid cannot be sized to the queue: stage 1
+    * fills it on the device and the host would have to synchronise to read the
+    * count. Striding a fixed grid is what covers a queue of any length without
+    * that round trip — and without it every entry past the grid was dropped,
+    * which at 512 warps meant a mesh silently lost everything after its 512th
+    * non-trivial triangle.
+    */
+   for (uint32_t q = warp_id; q < num_nontrivial; q += num_warps) {
+      uint32_t tri_id = nt_queue[q];
+      if (tri_id >= num_triangles)
          continue;
 
-      for (int sm = 0; sm < (int)args.num_samples; sm++) {
-         float ox, oy;
-         cp_sample_pos(args.num_samples, sm, &ox, &oy);
-         float cx = (float)px + ox, cy = (float)py + oy;
+      /* Lane 0 does triangle setup for the whole warp. */
+      float sx0, sy0, sx1, sy1, sx2, sy2;
+      float ndc_z0, ndc_z1, ndc_z2;
+      float inv_area;
+      int e0_tl, e1_tl, e2_tl;
+      int ix_min, iy_min, ix_max, iy_max;
+      int valid = 0;
 
-         float e0 = edge_function(sx1, sy1, sx2, sy2, cx, cy);
-         float e1 = edge_function(sx2, sy2, sx0, sy0, cx, cy);
-         float e2 = edge_function(sx0, sy0, sx1, sy1, cx, cy);
+      if (lane_id == 0) {
+         struct tri_setup s;
+         if (setup_triangle(&args, tri_id, &s)) {
+            sx0 = s.sx0; sy0 = s.sy0;
+            sx1 = s.sx1; sy1 = s.sy1;
+            sx2 = s.sx2; sy2 = s.sy2;
+            ndc_z0 = s.ndc_z0; ndc_z1 = s.ndc_z1; ndc_z2 = s.ndc_z2;
+            inv_area = s.inv_area;
+            e0_tl = s.e0_top_left;
+            e1_tl = s.e1_top_left;
+            e2_tl = s.e2_top_left;
+            ix_min = s.ix_min; iy_min = s.iy_min;
+            ix_max = s.ix_max; iy_max = s.iy_max;
+            valid = 1;
+         }
+      }
 
-         if (!edge_inside(e0, e0_tl) ||
-             !edge_inside(e1, e1_tl) ||
-             !edge_inside(e2, e2_tl))
-            continue;
+      /* Broadcast setup from lane 0 to all lanes */
+      valid   = __shfl_sync(0xFFFFFFFF, valid, 0);
+      if (!valid)
+         continue;
 
-         float w0 = e0 * inv_area;
-         float w1 = e1 * inv_area;
+      sx0     = __shfl_sync(0xFFFFFFFF, sx0, 0);
+      sy0     = __shfl_sync(0xFFFFFFFF, sy0, 0);
+      sx1     = __shfl_sync(0xFFFFFFFF, sx1, 0);
+      sy1     = __shfl_sync(0xFFFFFFFF, sy1, 0);
+      sx2     = __shfl_sync(0xFFFFFFFF, sx2, 0);
+      sy2     = __shfl_sync(0xFFFFFFFF, sy2, 0);
+      ndc_z0  = __shfl_sync(0xFFFFFFFF, ndc_z0, 0);
+      ndc_z1  = __shfl_sync(0xFFFFFFFF, ndc_z1, 0);
+      ndc_z2  = __shfl_sync(0xFFFFFFFF, ndc_z2, 0);
+      inv_area = __shfl_sync(0xFFFFFFFF, inv_area, 0);
+      e0_tl   = __shfl_sync(0xFFFFFFFF, e0_tl, 0);
+      e1_tl   = __shfl_sync(0xFFFFFFFF, e1_tl, 0);
+      e2_tl   = __shfl_sync(0xFFFFFFFF, e2_tl, 0);
+      ix_min  = __shfl_sync(0xFFFFFFFF, ix_min, 0);
+      iy_min  = __shfl_sync(0xFFFFFFFF, iy_min, 0);
+      ix_max  = __shfl_sync(0xFFFFFFFF, ix_max, 0);
+      iy_max  = __shfl_sync(0xFFFFFFFF, iy_max, 0);
 
-         emit_fragment(&args, tri_id, px, py, sm,
-                       w0 * ndc_z0 + w1 * ndc_z1 + (1.0f - w0 - w1) * ndc_z2);
+      int bb_w = ix_max - ix_min + 1;
+      int bb_h = iy_max - iy_min + 1;
+      int bb_area = bb_w * bb_h;
+
+      /* Huge triangles: decompose into tiles and push to stage 3 */
+      if (bb_area > CP_MEDIUM_THRESHOLD) {
+         if (lane_id == 0) {
+            int tile_x_min = ix_min / CP_TILE_SIZE;
+            int tile_y_min = iy_min / CP_TILE_SIZE;
+            int tile_x_max = ix_max / CP_TILE_SIZE;
+            int tile_y_max = iy_max / CP_TILE_SIZE;
+            int num_tiles = (tile_x_max - tile_x_min + 1) *
+                            (tile_y_max - tile_y_min + 1);
+
+            uint32_t *huge_counter = (uint32_t *)(uintptr_t)queues.huge_count;
+            uint32_t base_idx = atomicAdd(huge_counter, (uint32_t)num_tiles);
+
+            struct cp_tile_pair *huge_queue =
+               (struct cp_tile_pair *)(uintptr_t)queues.huge_tiles;
+
+            int idx = 0;
+            for (int ty = tile_y_min; ty <= tile_y_max; ty++) {
+               for (int tx = tile_x_min; tx <= tile_x_max; tx++) {
+                  if (base_idx + idx < CP_MAX_HUGE_TILES) {
+                     huge_queue[base_idx + idx].tri_id = tri_id;
+                     huge_queue[base_idx + idx].tile_x = (uint16_t)(tx * CP_TILE_SIZE);
+                     huge_queue[base_idx + idx].tile_y = (uint16_t)(ty * CP_TILE_SIZE);
+                  }
+                  idx++;
+               }
+            }
+         }
+         continue;
+      }
+
+      /* Medium triangle: all 32 lanes iterate the bounding box with stride 32 */
+      for (int i = (int)lane_id; i < bb_area; i += 32) {
+         int px = ix_min + (i % bb_w);
+         int py = iy_min + (i / bb_w);
+
+         for (int sm = 0; sm < (int)args.num_samples; sm++) {
+            float ox, oy;
+            cp_sample_pos(args.num_samples, sm, &ox, &oy);
+            float cx = (float)px + ox, cy = (float)py + oy;
+
+            float e0 = edge_function(sx1, sy1, sx2, sy2, cx, cy);
+            float e1 = edge_function(sx2, sy2, sx0, sy0, cx, cy);
+            float e2 = edge_function(sx0, sy0, sx1, sy1, cx, cy);
+
+            if (!edge_inside(e0, e0_tl) ||
+                !edge_inside(e1, e1_tl) ||
+                !edge_inside(e2, e2_tl))
+               continue;
+
+            float w0 = e0 * inv_area;
+            float w1 = e1 * inv_area;
+
+            emit_fragment(&args, tri_id, px, py, sm,
+                          w0 * ndc_z0 + w1 * ndc_z1 + (1.0f - w0 - w1) * ndc_z2);
+         }
       }
    }
 }
@@ -699,19 +729,12 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
 extern "C" __global__ void
 cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
-   uint32_t tile_idx = blockIdx.x;
-
    uint32_t *huge_counter = (uint32_t *)(uintptr_t)queues.huge_count;
-   uint32_t num_tiles = *huge_counter;
-   if (tile_idx >= num_tiles)
-      return;
+   uint32_t num_tiles = cp_queue_used(*huge_counter, CP_MAX_HUGE_TILES);
+   uint32_t num_triangles = cp_num_triangles(&args);
 
    struct cp_tile_pair *huge_queue =
       (struct cp_tile_pair *)(uintptr_t)queues.huge_tiles;
-
-   uint32_t tri_id = huge_queue[tile_idx].tri_id;
-   int tile_x = (int)huge_queue[tile_idx].tile_x;
-   int tile_y = (int)huge_queue[tile_idx].tile_y;
 
    /* Setup triangle (shared across block via shared memory) */
    __shared__ float sh_sx0, sh_sy0, sh_sx1, sh_sy1, sh_sx2, sh_sy2;
@@ -720,98 +743,109 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
    __shared__ int sh_e0_tl, sh_e1_tl, sh_e2_tl;
    __shared__ int sh_valid;
 
-   if (threadIdx.x == 0) {
-      struct tri_setup s;
-      sh_valid = 0;
-      if (setup_triangle(&args, tri_id, &s)) {
-         sh_sx0 = s.sx0; sh_sy0 = s.sy0;
-         sh_sx1 = s.sx1; sh_sy1 = s.sy1;
-         sh_sx2 = s.sx2; sh_sy2 = s.sy2;
-         sh_ndc_z0 = s.ndc_z0; sh_ndc_z1 = s.ndc_z1; sh_ndc_z2 = s.ndc_z2;
-         sh_inv_area = s.inv_area;
-         sh_e0_tl = s.e0_top_left;
-         sh_e1_tl = s.e1_top_left;
-         sh_e2_tl = s.e2_top_left;
-
-         /*
-          * Trivial reject: an edge that is outside at all four tile corners is
-          * outside everywhere in the tile, because the edge function is
-          * linear.
-          *
-          * There is no matching trivial accept any more. The mirror test —
-          * every corner inside, so skip that edge per pixel — cannot be made
-          * to respect the fill rule: a corner sitting exactly on an exclusive
-          * edge reads as inside, and the tile would then claim a row of
-          * pixels that belongs to its neighbour. Restoring it needs corner
-          * values that bound the per-pixel ones, which the exact subpixel
-          * form noted in stage 1 would give.
-          */
-         float tx0 = (float)tile_x + 0.5f;
-         float ty0 = (float)tile_y + 0.5f;
-         float tx1 = tx0 + (float)(CP_TILE_SIZE - 1);
-         float ty1 = ty0 + (float)(CP_TILE_SIZE - 1);
-
-         bool reject = false;
-         for (int e = 0; e < 3 && !reject; e++) {
-            float ax = e == 0 ? s.sx1 : (e == 1 ? s.sx2 : s.sx0);
-            float ay = e == 0 ? s.sy1 : (e == 1 ? s.sy2 : s.sy0);
-            float bx = e == 0 ? s.sx2 : (e == 1 ? s.sx0 : s.sx1);
-            float by = e == 0 ? s.sy2 : (e == 1 ? s.sy0 : s.sy1);
-            reject = edge_function(ax, ay, bx, by, tx0, ty0) < 0.0f &&
-                     edge_function(ax, ay, bx, by, tx1, ty0) < 0.0f &&
-                     edge_function(ax, ay, bx, by, tx0, ty1) < 0.0f &&
-                     edge_function(ax, ay, bx, by, tx1, ty1) < 0.0f;
-         }
-
-         sh_valid = reject ? 0 : 1;
-      }
-   }
-   __syncthreads();
-
-   if (!sh_valid)
-      return;
-
-   /* Each thread handles one column of the tile */
-   int col = (int)threadIdx.x;
-   if (col >= CP_TILE_SIZE)
-      return;
-
-   /*
-    * A tile is enumerated from the bounding box but covers whole tiles, so its
-    * edges run past it — the clip rectangle has to be applied here rather than
-    * inherited from the clamped box the way the other two stages do.
-    */
-   int px = tile_x + col;
-   if (px < args.clip_x0 || px > args.clip_x1)
-      return;
-
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
 
-   for (int row = 0; row < CP_TILE_SIZE; row++) {
-      int py = tile_y + row;
-      if (py > args.clip_y1)
-         break;
-      if (py < args.clip_y0)
-         continue;
+   /*
+    * A block strides the tile queue for the same reason stage 2 strides its
+    * own: the length is only known on the device. Nothing below may return
+    * early, because every thread of the block has to reach the barriers that
+    * guard the shared setup — a lane leaving the loop while its neighbours
+    * wait at __syncthreads() is what turns a dropped tile into a hang.
+    */
+   for (uint32_t tile_idx = blockIdx.x; tile_idx < num_tiles;
+        tile_idx += gridDim.x) {
+      uint32_t tri_id = huge_queue[tile_idx].tri_id;
+      int tile_x = (int)huge_queue[tile_idx].tile_x;
+      int tile_y = (int)huge_queue[tile_idx].tile_y;
 
-      for (int sm = 0; sm < (int)args.num_samples; sm++) {
-         float ox, oy;
-         cp_sample_pos(args.num_samples, sm, &ox, &oy);
-         float sx = (float)px + ox, sy = (float)py + oy;
+      /* The previous iteration's readers must be done before it is rewritten. */
+      __syncthreads();
 
-         float e0 = edge_function(sh_sx1, sh_sy1, sh_sx2, sh_sy2, sx, sy);
-         float e1 = edge_function(sh_sx2, sh_sy2, sh_sx0, sh_sy0, sx, sy);
-         float e2 = edge_function(sh_sx0, sh_sy0, sh_sx1, sh_sy1, sx, sy);
+      if (threadIdx.x == 0) {
+         struct tri_setup s;
+         sh_valid = 0;
+         if (tri_id < num_triangles && setup_triangle(&args, tri_id, &s)) {
+            sh_sx0 = s.sx0; sh_sy0 = s.sy0;
+            sh_sx1 = s.sx1; sh_sy1 = s.sy1;
+            sh_sx2 = s.sx2; sh_sy2 = s.sy2;
+            sh_ndc_z0 = s.ndc_z0; sh_ndc_z1 = s.ndc_z1; sh_ndc_z2 = s.ndc_z2;
+            sh_inv_area = s.inv_area;
+            sh_e0_tl = s.e0_top_left;
+            sh_e1_tl = s.e1_top_left;
+            sh_e2_tl = s.e2_top_left;
 
-         if (edge_inside(e0, sh_e0_tl) &&
-             edge_inside(e1, sh_e1_tl) &&
-             edge_inside(e2, sh_e2_tl)) {
-            float w0 = e0 * sh_inv_area;
-            float w1 = e1 * sh_inv_area;
+            /*
+             * Trivial reject: an edge that is outside at all four tile corners
+             * is outside everywhere in the tile, because the edge function is
+             * linear.
+             *
+             * There is no matching trivial accept any more. The mirror test —
+             * every corner inside, so skip that edge per pixel — cannot be
+             * made to respect the fill rule: a corner sitting exactly on an
+             * exclusive edge reads as inside, and the tile would then claim a
+             * row of pixels that belongs to its neighbour. Restoring it needs
+             * corner values that bound the per-pixel ones, which the exact
+             * subpixel form noted in stage 1 would give.
+             */
+            float tx0 = (float)tile_x + 0.5f;
+            float ty0 = (float)tile_y + 0.5f;
+            float tx1 = tx0 + (float)(CP_TILE_SIZE - 1);
+            float ty1 = ty0 + (float)(CP_TILE_SIZE - 1);
 
-            emit_fragment(&args, tri_id, px, py, sm,
-                          w0 * sh_ndc_z0 + w1 * sh_ndc_z1 +
-                          (1.0f - w0 - w1) * sh_ndc_z2);
+            bool reject = false;
+            for (int e = 0; e < 3 && !reject; e++) {
+               float ax = e == 0 ? s.sx1 : (e == 1 ? s.sx2 : s.sx0);
+               float ay = e == 0 ? s.sy1 : (e == 1 ? s.sy2 : s.sy0);
+               float bx = e == 0 ? s.sx2 : (e == 1 ? s.sx0 : s.sx1);
+               float by = e == 0 ? s.sy2 : (e == 1 ? s.sy0 : s.sy1);
+               reject = edge_function(ax, ay, bx, by, tx0, ty0) < 0.0f &&
+                        edge_function(ax, ay, bx, by, tx1, ty0) < 0.0f &&
+                        edge_function(ax, ay, bx, by, tx0, ty1) < 0.0f &&
+                        edge_function(ax, ay, bx, by, tx1, ty1) < 0.0f;
+            }
+
+            sh_valid = reject ? 0 : 1;
+         }
+      }
+      __syncthreads();
+
+      /*
+       * A tile is enumerated from the bounding box but covers whole tiles, so
+       * its edges run past it — the clip rectangle has to be applied here
+       * rather than inherited from the clamped box the other two stages walk.
+       */
+      int col = (int)threadIdx.x;
+      int px = tile_x + col;
+
+      if (sh_valid && col < CP_TILE_SIZE &&
+          px >= args.clip_x0 && px <= args.clip_x1) {
+         for (int row = 0; row < CP_TILE_SIZE; row++) {
+            int py = tile_y + row;
+            if (py > args.clip_y1)
+               break;
+            if (py < args.clip_y0)
+               continue;
+
+            for (int sm = 0; sm < (int)args.num_samples; sm++) {
+               float ox, oy;
+               cp_sample_pos(args.num_samples, sm, &ox, &oy);
+               float sx = (float)px + ox, sy = (float)py + oy;
+
+               float e0 = edge_function(sh_sx1, sh_sy1, sh_sx2, sh_sy2, sx, sy);
+               float e1 = edge_function(sh_sx2, sh_sy2, sh_sx0, sh_sy0, sx, sy);
+               float e2 = edge_function(sh_sx0, sh_sy0, sh_sx1, sh_sy1, sx, sy);
+
+               if (edge_inside(e0, sh_e0_tl) &&
+                   edge_inside(e1, sh_e1_tl) &&
+                   edge_inside(e2, sh_e2_tl)) {
+                  float w0 = e0 * sh_inv_area;
+                  float w1 = e1 * sh_inv_area;
+
+                  emit_fragment(&args, tri_id, px, py, sm,
+                                w0 * sh_ndc_z0 + w1 * sh_ndc_z1 +
+                                (1.0f - w0 - w1) * sh_ndc_z2);
+               }
+            }
          }
       }
    }
