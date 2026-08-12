@@ -709,7 +709,13 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
       }
    }
 
-   cuCtxSynchronize();
+   /*
+    * No sync. Both clears above are kernels on the same stream as everything
+    * that reads what they wrote, so the ordering they need is already there;
+    * draining the device for it only stalled the host at the top of every
+    * frame. A host reader of the cleared surface goes through the map path,
+    * which synchronises on its own account.
+    */
 }
 
 /*

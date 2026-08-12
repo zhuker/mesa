@@ -1696,6 +1696,34 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    size_t shade_mark = cp->scratch.used;
    size_t shade_dmark = cp->dscratch.used;
 
+   /*
+    * How many peel passes to launch between convergence checks.
+    *
+    * Reading cp->peel_any is a host read of memory a kernel just wrote, so it
+    * costs a full device drain — the pipeline empties and refills. Doing that
+    * once per layer is the single most expensive synchronisation in the
+    * driver: particlesystem's fire is 512 additive sprites piled tens deep, it
+    * runs the full CP_BLEND_LAYERS passes because it never converges early,
+    * and it was paying a drain for each of them to be told so.
+    *
+    * The check is only ever "has this stopped compositing", and once a pass
+    * composites nothing every later pass does too, because peel_next only
+    * moves forward. So it is safe to ask less often, provided the flag is
+    * reset once per interval rather than once per pass and the answer is read
+    * as "did any pass in this interval do anything".
+    *
+    * Doubling from one keeps the common case exact — a blended draw that does
+    * not overlap itself converges on pass 2 and is still detected on pass 2,
+    * with nothing wasted — while a draw that runs to the cap pays a drain
+    * roughly every CP_PEEL_CHECK_MAX passes instead of every pass. The cap
+    * bounds the overshoot: a draw converging just after a check runs at most
+    * CP_PEEL_CHECK_MAX-1 further passes, which against the 256 layer cap is
+    * a few percent, where unbounded doubling would risk running twice the
+    * passes the draw needed.
+    */
+   unsigned check_interval = 1;
+   unsigned interval_start = 0;
+
    for (unsigned pass = 0; pass < passes; pass++) {
       cp->scratch.used = shade_mark;
       cp->dscratch.used = shade_dmark;
@@ -1704,7 +1732,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples);
          rast_args.reject_passes = pass;
       }
-      if (peel)
+      /* Cleared at the start of each interval, not each pass: the question
+       * asked below is whether any pass since the last check composited. */
+      if (peel && pass == interval_start)
          *(volatile uint32_t *)(uintptr_t)cp->peel_any = 0;
       /* Both counters in one call; they are adjacent for this reason. The
        * memset is enqueued on the default stream, so it serializes properly
@@ -1765,16 +1795,22 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                             pass, &timing);
 
       if (peel) {
-         /* Step past what this pass blended, and stop as soon as a pass finds
-          * nothing left to composite — which is the common case on the second
-          * pass, since most blended draws do not overlap themselves. */
+         /* Step past what this pass blended, and stop once the interval finds
+          * nothing left to composite — which is the common case at pass 2,
+          * since most blended draws do not overlap themselves. */
          void *pa_params[] = { &visbuf, &cp->peel_next, &w, &h };
          cuLaunchKernel(screen->kernels.peel_advance,
                         (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
                         0, NULL, pa_params, NULL);
-         cuStreamSynchronize(NULL);
-         if (!*(volatile uint32_t *)(uintptr_t)cp->peel_any)
-            break;
+
+         if (pass + 1 >= interval_start + check_interval) {
+            cuStreamSynchronize(NULL);
+            if (!*(volatile uint32_t *)(uintptr_t)cp->peel_any)
+               break;
+            interval_start = pass + 1;
+            check_interval = MIN2(check_interval * 2,
+                                  (unsigned)CP_PEEL_CHECK_MAX);
+         }
       }
    }
 
@@ -1852,15 +1888,18 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
     */
    uint32_t grid_size[3] = { grid[0], grid[1], grid[2] };
 
-   CUdeviceptr args_dev = 0;
-   CUdeviceptr grid_dev = 0;
-   if (cuMemAllocManaged(&args_dev, 34 * sizeof(void *), CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
-       cuMemAllocManaged(&grid_dev, sizeof(grid_size), CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
-      if (args_dev) cuMemFree(args_dev);
-      if (grid_dev) cuMemFree(grid_dev);
+   /*
+    * Both blocks go into the upload arena by DMA, the way the draw path's
+    * argument blocks do. They used to be a cuMemAllocManaged pair freed after
+    * the dispatch, which is what the cuCtxSynchronize below them was for —
+    * the memory could not be released until the kernel reading it had
+    * finished. Nothing here needs the host to wait: the arena is reclaimed in
+    * bulk, and a managed block the host has just written is the page-fault
+    * stall cp_upload() exists to avoid.
+    */
+   CUdeviceptr grid_dev = cp_upload(cp, grid_size, sizeof(grid_size));
+   if (!grid_dev)
       return;
-   }
-   memcpy((void*)(uintptr_t)grid_dev, grid_size, sizeof(grid_size));
 
    void *arg_ptrs_host[34] = {0};
    arg_ptrs_host[0] = (void *)(uintptr_t)grid_dev;
@@ -1872,7 +1911,9 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++)
       arg_ptrs_host[18 + i] = cp->compute_ubos[i].buffer;
 
-   memcpy((void*)(uintptr_t)args_dev, arg_ptrs_host, 34 * sizeof(void*));
+   CUdeviceptr args_dev = cp_upload(cp, arg_ptrs_host, sizeof(arg_ptrs_host));
+   if (!args_dev)
+      return;
 
    void *args_ptr_val = (void *)(uintptr_t)args_dev;
    void *kernel_params[] = { &args_ptr_val };
@@ -1893,9 +1934,9 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
               err, info->grid[0], info->grid[1], info->grid[2],
               info->block[0], info->block[1], info->block[2]);
 
-   cuCtxSynchronize();
-   cuMemFree(args_dev);
-   cuMemFree(grid_dev);
+   /* No sync: the argument blocks live in the upload arena, which is
+    * reclaimed in bulk once the work reading it has finished, rather than
+    * being freed here. */
 }
 
 static void

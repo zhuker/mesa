@@ -477,6 +477,17 @@ struct cp_draw_params {
 /* How deep a pile of blended fragments one draw will composite. */
 #define CP_BLEND_LAYERS      256
 
+/*
+ * How many peel passes may be launched between convergence checks.
+ *
+ * Asking whether a pass composited anything means the host reads memory a
+ * kernel just wrote, which drains the device. The check interval doubles from
+ * one so that a draw converging on pass 2 is still caught on pass 2, and this
+ * caps it so that a draw converging just after a check wastes at most this
+ * many further passes rather than up to as many as it has already run.
+ */
+#define CP_PEEL_CHECK_MAX    16
+
 /* Multisampling. 1x, 4x and 8x are advertised, and the visibility, depth and
  * colour buffers all hold the samples plane after plane: sample s of pixel p
  * lives at s * width * height + p. The coverage byte carries one bit per
