@@ -1695,28 +1695,36 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
          0, NULL, s1_params, NULL);
 
-      /* Stage 2: warp-cooperative, fixed grid self-bounding from counter */
-      void *s2_params[] = { &rast_args, &rast_queues };
       /*
-       * Both later stages stride their queue, so the grid is not a bound on
-       * the work — it is a statement of how much of the machine to use, and
-       * these two were set far below it. Stage 2 ran 512 blocks of one warp:
-       * 16,384 threads, under a twentieth of what this device holds, and one
-       * warp per block pays a block's scheduling for a warp's work.
+       * Both later stages stride their queue, so any grid is correct and the
+       * grid is only a statement of how much of the machine to use. That makes
+       * it worth bounding by the draw as well as by the device: the queues can
+       * hold at most one entry per triangle for stage 2, and a draw of a dozen
+       * triangles was launching 131,072 threads at each of them to have all
+       * but a handful read the counter and exit. dynamicuniformbuffer draws 625
+       * cubes of twelve triangles a frame and spends most of it in launches.
        *
-       * A warp still takes one primitive, so this is 4,096 of them in flight
-       * rather than 512. particlesystem is the case that shows it — every
-       * sprite is a queued primitive and its peel passes run this kernel
-       * hundreds of times a frame.
+       * Stage 3 gets no such bound. Its entries are tiles, not primitives, and
+       * how many tiles a primitive covers is only known on the device: a single
+       * full-screen quad is two triangles and 510 tiles. Sizing that grid from
+       * the triangle count was measured and is a clear loss — texturemipmapgen
+       * 17% slower, texturecubemap and computeshader 12% — because the samples
+       * with the fewest triangles are exactly the ones covering whole tiles
+       * with them.
        */
+      unsigned s2_blocks = CLAMP((rast_num_triangles + 7) / 8, 1u, 512u);
+      unsigned s3_blocks = 2048;
+
+      /* Stage 2: warp-cooperative, grid-strided over the nontrivial queue */
+      void *s2_params[] = { &rast_args, &rast_queues };
       cuLaunchKernel(screen->kernels.rasterize_stage2,
-         512, 1, 1, 256, 1, 1,
+         s2_blocks, 1, 1, 256, 1, 1,
          0, NULL, s2_params, NULL);
 
-      /* Stage 3: block per tile, fixed grid self-bounding from counter */
+      /* Stage 3: block per tile, grid-strided over the huge-tile queue */
       void *s3_params[] = { &rast_args, &rast_queues };
       cuLaunchKernel(screen->kernels.rasterize_stage3,
-         2048, 1, 1, 64, 1, 1,
+         s3_blocks, 1, 1, 64, 1, 1,
          0, NULL, s3_params, NULL);
 
       if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
