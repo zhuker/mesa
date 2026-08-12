@@ -473,6 +473,59 @@ cp_cube_face(float x, float y, float z, float *out_u, float *out_v)
    return face;
 }
 
+/*
+ * Screen-space derivative of a cube face's u and v, from the derivative of the
+ * direction vector. The face selection and the sign conventions have to match
+ * cp_cube_face() above exactly.
+ *
+ * Differencing u and v across the quad the way every other target does is
+ * wrong wherever a quad straddles a face boundary: its two lanes are then
+ * parameterised on different faces, so the difference is a jump between two
+ * unrelated coordinate systems rather than a rate of change. The level of
+ * detail derived from it collapses to the coarsest mip, and every face seam
+ * draws itself as a line across the reflection — the wireframe over the sphere
+ * in texturecubemap and pbribl.
+ *
+ * The direction vector is continuous across the seam, so differentiate that
+ * and push it through the projection
+ *
+ *     u = 1/2 (uc / ma + 1)
+ *
+ * by the quotient rule
+ *
+ *     du = 1/2 (duc - uc dma / ma) / ma
+ *
+ * which is what lp_build_cube_lookup() does in llvmpipe.
+ */
+static __device__ void
+cp_cube_derivs(float x, float y, float z, float dx, float dy, float dz,
+               float *out_du, float *out_dv)
+{
+   float ax = fabsf(x), ay = fabsf(y), az = fabsf(z);
+   float ma, uc, vc, dma, duc, dvc;
+
+   if (ax >= ay && ax >= az) {
+      ma = ax;                  dma = x > 0.0f ? dx : -dx;
+      uc = x > 0.0f ? -z : z;   duc = x > 0.0f ? -dz : dz;
+      vc = -y;                  dvc = -dy;
+   } else if (ay >= az) {
+      ma = ay;                  dma = y > 0.0f ? dy : -dy;
+      uc = x;                   duc = dx;
+      vc = y > 0.0f ? z : -z;   dvc = y > 0.0f ? dz : -dz;
+   } else {
+      ma = az;                  dma = z > 0.0f ? dz : -dz;
+      uc = z > 0.0f ? x : -x;   duc = z > 0.0f ? dx : -dx;
+      vc = -y;                  dvc = -dy;
+   }
+
+   if (ma == 0.0f)
+      ma = 1.0f;
+
+   float ima = 1.0f / ma;
+   *out_du = 0.5f * (duc - uc * dma * ima) * ima;
+   *out_dv = 0.5f * (dvc - vc * dma * ima) * ima;
+}
+
 /* Sample one mip level with the given in-level filter. `layer` selects the
  * array slice or cube face, or the 3D slice. */
 static __device__ struct cp_rgba
@@ -720,10 +773,26 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
        * matter.
        */
       const unsigned full = 0xFFFFFFFFu;
-      float du_dx = __shfl_xor_sync(full, u, 1) - u;
-      float dv_dx = __shfl_xor_sync(full, v, 1) - v;
-      float du_dy = __shfl_xor_sync(full, u, 2) - u;
-      float dv_dy = __shfl_xor_sync(full, v, 2) - v;
+      float du_dx, dv_dx, du_dy, dv_dy;
+
+      if (target == CP_TEX_CUBE || target == CP_TEX_CUBE_ARRAY) {
+         /* Except on a cube, where u and v are discontinuous at a face
+          * boundary and the direction vector is not. */
+         float xdx = __shfl_xor_sync(full, c0, 1) - c0;
+         float ydx = __shfl_xor_sync(full, c1, 1) - c1;
+         float zdx = __shfl_xor_sync(full, c2, 1) - c2;
+         float xdy = __shfl_xor_sync(full, c0, 2) - c0;
+         float ydy = __shfl_xor_sync(full, c1, 2) - c1;
+         float zdy = __shfl_xor_sync(full, c2, 2) - c2;
+
+         cp_cube_derivs(c0, c1, c2, xdx, ydx, zdx, &du_dx, &dv_dx);
+         cp_cube_derivs(c0, c1, c2, xdy, ydy, zdy, &du_dy, &dv_dy);
+      } else {
+         du_dx = __shfl_xor_sync(full, u, 1) - u;
+         dv_dx = __shfl_xor_sync(full, v, 1) - v;
+         du_dy = __shfl_xor_sync(full, u, 2) - u;
+         dv_dy = __shfl_xor_sync(full, v, 2) - v;
+      }
 
       float w0 = (float)tex->width;
       float h0 = (float)tex->height;
