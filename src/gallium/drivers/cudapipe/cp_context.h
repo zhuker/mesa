@@ -138,6 +138,30 @@ struct cp_context {
       CUdeviceptr overflow[64];
       unsigned num_overflow;
    } scratch;
+
+   /*
+    * The same, in memory only the device can reach.
+    *
+    * Everything a draw shades through — the vertex shader's output, the
+    * interpolated fragment inputs, the shaded results — is written by one
+    * kernel and read by the next, and never touched by the host at all. Out of
+    * managed memory those buffers still cost as if it did: the arena's bump
+    * pointer climbs, so each draw lands on addresses whose pages are not yet on
+    * the device, and the first kernel to write one pays the migration. That
+    * cost lands on the vertex shader, which is the first to touch its output.
+    *
+    * cuMemAlloc memory has nowhere else to be, so there is nothing to fault.
+    * What the host does write — assembled vertex ids, packed positions — goes
+    * through cp_upload() instead, and the arena below is for that.
+    */
+   struct {
+      CUdeviceptr base;
+      size_t size;
+      size_t used;
+      size_t peak;
+      CUdeviceptr overflow[64];
+      unsigned num_overflow;
+   } dscratch;
 };
 
 struct pipe_context *

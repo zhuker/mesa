@@ -290,6 +290,56 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
 }
 
 /*
+ * The same, out of memory the host cannot reach. See cp_context.h for why the
+ * distinction is worth having; the growth rules are the arena's above.
+ *
+ * Returns a device address rather than a pointer, so that a caller who
+ * dereferences it does not compile.
+ */
+static CUdeviceptr
+cp_scratch_alloc_device(struct cp_context *cp, size_t bytes)
+{
+   if (!bytes)
+      return 0;
+
+   size_t offset = ALIGN_POT(cp->dscratch.used, 256);
+   size_t end = offset + bytes;
+
+   if (end <= cp->dscratch.size) {
+      cp->dscratch.used = end;
+      cp->dscratch.peak = MAX2(cp->dscratch.peak, end);
+      return cp->dscratch.base + offset;
+   }
+
+   cp->dscratch.peak = MAX2(cp->dscratch.peak, end);
+
+   size_t want = MAX2(end, cp->dscratch.size * 2);
+   want = MAX2(want, (size_t)1 << 20);
+   if (want > CP_SCRATCH_MAX_BYTES) {
+      fprintf(stderr, "cudapipe: device scratch wants %zu bytes, over the %zu "
+              "cap — refusing.\n", want, (size_t)CP_SCRATCH_MAX_BYTES);
+      return 0;
+   }
+
+   CUdeviceptr new_base;
+   CUresult err = cuMemAlloc(&new_base, want);
+   if (err != CUDA_SUCCESS) {
+      fprintf(stderr, "cudapipe: device scratch grow to %zu bytes failed (%d)\n",
+              want, err);
+      return 0;
+   }
+
+   if (cp->dscratch.base &&
+       cp->dscratch.num_overflow < ARRAY_SIZE(cp->dscratch.overflow))
+      cp->dscratch.overflow[cp->dscratch.num_overflow++] = cp->dscratch.base;
+
+   cp->dscratch.base = new_base;
+   cp->dscratch.size = want;
+   cp->dscratch.used = end;
+   return new_base + offset;
+}
+
+/*
  * Hand the device a block of per-draw constants.
  *
  * Every kernel here takes its parameters through a block in memory — the
@@ -356,7 +406,9 @@ cp_scratch_begin(struct cp_context *cp)
     * pipeline.
     */
    if (cp->scratch.num_overflow >= 5 ||
-       cp->scratch.used > CP_SCRATCH_RECLAIM_BYTES) {
+       cp->scratch.used > CP_SCRATCH_RECLAIM_BYTES ||
+       cp->dscratch.num_overflow >= 5 ||
+       cp->dscratch.used > CP_SCRATCH_RECLAIM_BYTES) {
       cuCtxSynchronize();
       cp_scratch_reset(cp);
    }
@@ -372,6 +424,11 @@ cp_scratch_reset(struct cp_context *cp)
       cuMemFree(cp->scratch.overflow[i]);
    cp->scratch.num_overflow = 0;
    cp->scratch.used = 0;
+
+   for (unsigned i = 0; i < cp->dscratch.num_overflow; i++)
+      cuMemFree(cp->dscratch.overflow[i]);
+   cp->dscratch.num_overflow = 0;
+   cp->dscratch.used = 0;
 
    /* Callers of this have already waited for the device, so the staging the
     * uploads were copied out of is free to be written over again. */
@@ -390,6 +447,12 @@ cp_scratch_destroy(struct cp_context *cp)
          cuMemFree(cp->scratch.base[i]);
    }
    memset(&cp->scratch, 0, sizeof(cp->scratch));
+
+   for (unsigned i = 0; i < cp->dscratch.num_overflow; i++)
+      cuMemFree(cp->dscratch.overflow[i]);
+   if (cp->dscratch.base)
+      cuMemFree(cp->dscratch.base);
+   memset(&cp->dscratch, 0, sizeof(cp->dscratch));
 }
 
 /*
@@ -688,14 +751,15 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    unsigned fs_out_stride = MAX2(fs->nir_num_outputs, 1u) * 16;
 
 
-   CUdeviceptr pixel_list = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, max_pixels * 4);
-   CUdeviceptr counter = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
-   CUdeviceptr fs_in = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * fs_in_stride);
-   CUdeviceptr fs_out = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * fs_out_stride);
-   CUdeviceptr coverage = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, max_pixels);
-   CUdeviceptr frag_coord = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)max_pixels * 16);
+   /* Written by one kernel and read by the next; the host never sees them. */
+   CUdeviceptr pixel_list = cp_scratch_alloc_device(cp, max_pixels * 4);
+   CUdeviceptr counter = cp_scratch_alloc_device(cp, 4);
+   CUdeviceptr fs_in = cp_scratch_alloc_device(cp, (size_t)max_pixels * fs_in_stride);
+   CUdeviceptr fs_out = cp_scratch_alloc_device(cp, (size_t)max_pixels * fs_out_stride);
+   CUdeviceptr coverage = cp_scratch_alloc_device(cp, max_pixels);
+   CUdeviceptr frag_coord = cp_scratch_alloc_device(cp, (size_t)max_pixels * 16);
    /* One byte per shaded pixel, set by `discard` in the fragment shader. */
-   CUdeviceptr discard_mask = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, max_pixels);
+   CUdeviceptr discard_mask = cp_scratch_alloc_device(cp, max_pixels);
 
    /*
     * These two are read where they were not written, so they have to start
@@ -902,12 +966,22 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    timing->writeback_ms = cp_lap(&mark);
 
    if (getenv("CUDAPIPE_DEBUG_DISCARD")) {
+      /* Both live in device-only memory now, so they have to be fetched
+       * rather than read through the pointer. This path already synchronises,
+       * which is what makes that affordable. */
       cuCtxSynchronize();
-      unsigned covered = *(const uint32_t *)(uintptr_t)counter;
-      const unsigned char *dm = (const unsigned char *)(uintptr_t)discard_mask;
+      uint32_t covered = 0;
+      cuMemcpyDtoH(&covered, counter, sizeof(covered));
+      covered = MIN2(covered, max_pixels);
+
       unsigned nd = 0;
-      for (unsigned k = 0; k < covered && k < max_pixels; k++)
-         nd += dm[k] ? 1u : 0u;
+      unsigned char *dm = covered ? malloc(covered) : NULL;
+      if (dm) {
+         cuMemcpyDtoH(dm, discard_mask, covered);
+         for (unsigned k = 0; k < covered; k++)
+            nd += dm[k] ? 1u : 0u;
+         free(dm);
+      }
       fprintf(stderr, "  pass %u: covered %u, discarded %u\n",
               reject_pass, covered, nd);
    }
@@ -920,7 +994,27 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
               wb.colormask);
 
    if (getenv("CUDAPIPE_DEBUG_FS")) {
-      const float *vs_out = (const float *)(uintptr_t)vs_output_buf;
+      /*
+       * Everything printed below is device-only, so it is fetched whole
+       * first. Wasteful, and correct for a path that already synchronises
+       * and prints eight lines.
+       */
+      cuCtxSynchronize();
+      size_t vs_out_bytes = (size_t)num_triangles * 3 * num_vs_outputs * 16;
+      float *vs_out = malloc(vs_out_bytes);
+      uint32_t *plist_buf = malloc((size_t)num_pixels * 4);
+      float *fin_buf = malloc((size_t)num_pixels * fs_in_stride);
+      float *fout_buf = malloc((size_t)num_pixels * fs_out_stride);
+      if (!vs_out || !plist_buf || !fin_buf || !fout_buf) {
+         free(vs_out); free(plist_buf); free(fin_buf); free(fout_buf);
+         fprintf(stderr, "  (CUDAPIPE_DEBUG_FS: out of memory)\n");
+         return;
+      }
+      cuMemcpyDtoH(vs_out, vs_output_buf, vs_out_bytes);
+      cuMemcpyDtoH(plist_buf, pixel_list, (size_t)num_pixels * 4);
+      cuMemcpyDtoH(fin_buf, fs_in, (size_t)num_pixels * fs_in_stride);
+      cuMemcpyDtoH(fout_buf, fs_out, (size_t)num_pixels * fs_out_stride);
+
       const char *step_env = getenv("CUDAPIPE_DEBUG_FS_VSTEP");
       unsigned vstep = step_env ? (unsigned)atoi(step_env) : 1;
       if (vstep < 1)
@@ -938,9 +1032,9 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       for (unsigned i = 0; i < num_fs_inputs; i++)
          fprintf(stderr, "  fs_in[%u] <- vs slot %d (loc %u)\n", i,
                  interp.input_vs_slot[i], fs->in_location[i]);
-      const uint32_t *plist = (const uint32_t *)(uintptr_t)pixel_list;
-      const float *fin = (const float *)(uintptr_t)fs_in;
-      const float *fout = (const float *)(uintptr_t)fs_out;
+      const uint32_t *plist = plist_buf;
+      const float *fin = fin_buf;
+      const float *fout = fout_buf;
       const char *row_env = getenv("CUDAPIPE_DEBUG_FS_ROW");
       int want_row = row_env ? atoi(row_env) : -1;
       unsigned shown = 0;
@@ -958,6 +1052,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
                  fout[i * (fs_out_stride / 4) + 2], fout[i * (fs_out_stride / 4) + 3],
                  cb[px]);
       }
+      free(vs_out); free(plist_buf); free(fin_buf); free(fout_buf);
    }
 
 }
@@ -1206,15 +1301,13 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
          unsigned out_stride = num_vs_outputs * 16;
 
-         vs_output_buf = (CUdeviceptr)(uintptr_t)
-            cp_scratch_alloc(cp, (size_t)total_verts * out_stride);
+         vs_output_buf = cp_scratch_alloc_device(cp, (size_t)total_verts * out_stride);
 
          /* Build VS input buffer on GPU: the vertex fetch kernel gathers
           * attributes in parallel, one thread per assembled vertex. */
          unsigned vs_in_stride = cp->num_vertex_elements * 16;
          CUdeviceptr vs_input_buf = vs_in_stride
-            ? (CUdeviceptr)(uintptr_t)cp_scratch_alloc(
-                 cp, (size_t)total_verts * vs_in_stride)
+            ? cp_scratch_alloc_device(cp, (size_t)total_verts * vs_in_stride)
             : 0;
          if (!vs_output_buf || (vs_in_stride && !vs_input_buf)) {
             FREE(refs);
@@ -1295,8 +1388,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          /* Dump what the GPU fetch actually gathered, which is the quickest way to
           * tell a bad attribute layout from a bad shader. Syncs, so debug only. */
          if (getenv("CUDAPIPE_DEBUG_VFETCH") && vs_input_buf) {
+            /* Device-only; fetch the two vertices this prints. */
             cuCtxSynchronize();
-            const float *in = (const float *)(uintptr_t)vs_input_buf;
+            unsigned nfetch = MIN2(2u, total_verts);
+            float *in = calloc(nfetch ? nfetch : 1, vs_in_stride);
+            if (in)
+               cuMemcpyDtoH(in, vs_input_buf, (size_t)nfetch * vs_in_stride);
             for (unsigned e = 0; e < cp->num_vertex_elements && e < 8; e++)
                fprintf(stderr, "  elem%u vb=%u off=%u stride=%u div=%u sz=%u\n",
                        e, cp->vertex_elements[e].vertex_buffer_index,
@@ -1304,7 +1401,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                        cp->vertex_elements[e].src_stride,
                        cp->vertex_elements[e].instance_divisor,
                        vf_args.elem_attr_size[e]);
-            for (unsigned v = 0; v < 2 && v < total_verts; v++) {
+            for (unsigned v = 0; in && v < nfetch; v++) {
                fprintf(stderr, "  vfetch v%u:", v);
                for (unsigned e = 0; e < cp->num_vertex_elements && e < 8; e++)
                   fprintf(stderr, " e%u=[%.3f %.3f %.3f]", e,
@@ -1313,6 +1410,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                           in[(v * vs_in_stride) / 4 + e * 4 + 2]);
                fprintf(stderr, "\n");
             }
+            free(in);
          }
 
          CUdeviceptr vid_buf = 0, iid_buf = 0;
@@ -1329,7 +1427,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                             (size_t)draws[0].start * 4;
                } else {
                   /* 16-bit IB: allocate and let the vertex_fetch kernel handle it */
-                  vid_buf = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, total_verts * 4);
+                  /* The fetch kernel widens the indices into this. */
+                  vid_buf = cp_scratch_alloc_device(cp, total_verts * 4);
                }
             } else if (cp->vs_shader->reads_vertex_id) {
                /* Non-indexed: vertex_id is just thread_id + first, but the
@@ -1440,10 +1539,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                 num_vs_outputs <= CP_MAX_CLIP_SLOTS) {
                /* Two planes turn one triangle into at most three. */
                unsigned max_clipped = num_triangles * 3;
-               CUdeviceptr clipped = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(
+               CUdeviceptr clipped = cp_scratch_alloc_device(
                   cp, (size_t)max_clipped * 3 * out_stride);
-               CUdeviceptr clip_count =
-                  (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, 4);
+               CUdeviceptr clip_count = cp_scratch_alloc_device(cp, 4);
 
                if (clipped && clip_count) {
                   cuMemsetD32(clip_count, 0, 1);
@@ -1566,11 +1664,18 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
     * and an out-of-memory kill. Rewinding is safe because kernels in the
     * default stream are serialized: the next pass cannot start writing these
     * buffers until this pass has finished reading them.
+    *
+    * Both arenas, and for the same reason: the shading buffers moved to the
+    * device-only one, and rewinding only the arena they had left produced a
+    * particlesystem whose passes each allocated afresh until the cap refused
+    * them and the stages downstream silently drew nothing.
     */
    size_t shade_mark = cp->scratch.used;
+   size_t shade_dmark = cp->dscratch.used;
 
    for (unsigned pass = 0; pass < passes; pass++) {
       cp->scratch.used = shade_mark;
+      cp->dscratch.used = shade_dmark;
       if (pass) {
          /* Each pass resolves visibility afresh, minus what has been rejected. */
          cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples);
