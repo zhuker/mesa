@@ -615,7 +615,17 @@ def main():
                 f'per frame. Each chart is scaled to its own sample, because a '
                 f'shared axis would flatten every small one. What matters is '
                 f'the shape: flat means the difference is a standing one, a '
-                f'climb means something drifts as the scene animates.</p>')
+                f'climb means something drifts as the scene animates.</p>'
+                f'<p class="note">Click a chart to send the frames under it to '
+                f'that frame. Hovering a driver flips it to '
+                f'{html.escape(args.ref)}; clicking any pane opens it at full '
+                f'resolution, where the same hover works. The difference panes '
+                f'are the per-channel absolute difference brightened '
+                f'{args.diff_gain}&times;, since a few levels out of 255 is '
+                f'invisible otherwise — at that gain anything '
+                f'{255 // args.diff_gain} levels or more apart saturates, so '
+                f'they show where the drivers disagree rather than by how '
+                f'much.</p>')
     tested = [d for d in drivers if d != args.ref]
     body.append(legend(tested) if tested else '')
 
@@ -679,8 +689,15 @@ def main():
                 dsrc = f'{img_rel}/_diff/{d}/{s}/{n4}.png'
                 dfull = f'{img_rel}/_diff/{d}/{s}/full/{n4}.png'
                 panes.append(
-                    f'<figure><figcaption>{html.escape(d)} &minus; '
-                    f'{html.escape(args.ref)} &times;{args.diff_gain}</figcaption>'
+                    f'<figure><figcaption>|{html.escape(d)} &minus; '
+                    f'{html.escape(args.ref)}|, brightness &times;{args.diff_gain}'
+                    f'<span class="hint" title="The per-channel absolute '
+                    f'difference, multiplied by {args.diff_gain} so it is '
+                    f'visible at all. Anything differing by '
+                    f'{255 // args.diff_gain} levels or more saturates, so this '
+                    f'shows where they disagree, not by how much — the chart '
+                    f'above carries the magnitude."> &#9432;</span>'
+                    f'</figcaption>'
                     f'<img class="zoom" loading="lazy" '
                     f'data-diff="{html.escape(d)}" data-full="{dfull}" '
                     f'data-hint="{html.escape(s)} &mdash; {html.escape(d)} minus '
