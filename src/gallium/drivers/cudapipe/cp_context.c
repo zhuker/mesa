@@ -758,8 +758,20 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    CUdeviceptr fs_out = cp_scratch_alloc_device(cp, (size_t)max_pixels * fs_out_stride);
    CUdeviceptr coverage = cp_scratch_alloc_device(cp, max_pixels);
    CUdeviceptr frag_coord = cp_scratch_alloc_device(cp, (size_t)max_pixels * 16);
-   /* One byte per shaded pixel, set by `discard` in the fragment shader. */
-   CUdeviceptr discard_mask = cp_scratch_alloc_device(cp, max_pixels);
+   /*
+    * One byte per shaded pixel, set by `discard` in the fragment shader —
+    * and only for a shader that has one. The writeback already reads the mask
+    * conditionally, so a shader that cannot discard needs neither the
+    * allocation nor the clear, which at this size is 1.8 MB a draw.
+    */
+   CUdeviceptr discard_mask = fs->uses_discard
+      ? cp_scratch_alloc_device(cp, max_pixels) : 0;
+
+   CUdeviceptr fs_args_dev = 0, count_dev = 0, stride_dev = 0;
+
+   if (!pixel_list || !counter || !fs_in || !fs_out || !coverage || !frag_coord ||
+       (fs->uses_discard && !discard_mask))
+      return;
 
    /*
     * These two are read where they were not written, so they have to start
@@ -769,18 +781,9 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
     * turned into double-blended frames the moment the passes started reusing
     * one, which they must, or a 256 layer draw asks for tens of gigabytes.
     */
-   if (counter)
-      cuMemsetD32(counter, 0, 1);
+   cuMemsetD32(counter, 0, 1);
    if (discard_mask)
       cuMemsetD8(discard_mask, 0, max_pixels);
-   CUdeviceptr fs_args_dev = 0, count_dev = 0, stride_dev = 0;
-
-   if (!pixel_list || !counter || !fs_in || !fs_out || !coverage || !frag_coord ||
-       !discard_mask)
-      return;
-
-   cuMemsetD32(counter, 0, 1);
-   cuMemsetD8(discard_mask, 0, max_pixels);
 
    struct cp_fs_interp_args interp = {
       .visbuf = visbuf,
