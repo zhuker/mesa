@@ -88,10 +88,10 @@ before that.
 
 | Sample | Differing | Note |
 |---|---|---|
-| texturemipmapgen | 3.50% | anisotropic filter fidelity |
+| texturemipmapgen | 3.50% | anisotropic filter, accepted — see gap 3 |
 | multisampling | 2.58% | no MSAA |
 | particlesystem | 2.51% | no POINT_LIST rasterization |
-| gltfscenerendering | 1.70% | no diagnosis |
+| gltfscenerendering | 1.70% | anisotropic filter, accepted — see gap 6 |
 | texturecubemap | 0.45% | reflection sharper than the reference at grazing angles |
 | instancing | 0.38% | mostly the procedural starfield, see below |
 | computeshader | 0 | |
@@ -212,9 +212,16 @@ lanes and dropped by the writeback.
 
 1. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
 2. **No line or point rasterization.** The capture uses POINT_LIST.
-3. **Anisotropic filtering under-blurs relative to NVIDIA's.** This is nearly
-   all of what is left in `texturemipmapgen`, and it also drives most of
-   `gltfscenerendering`. Forcing each of that sample's three sampler modes and
+3. **Anisotropic filtering under-blurs relative to NVIDIA's — accepted, closed.**
+   Vulkan leaves the anisotropic filter implementation-defined, llvmpipe differs
+   from NVIDIA in the same direction, and cudapipe is closer to NVIDIA than
+   llvmpipe on the samples where it is most visible. Recorded here as a
+   difference in NVIDIA's filter rather than a cudapipe defect, and not pursued
+   further. Do not reopen it without a reason better than the pixel count; what
+   follows is what is known, so it does not have to be rediscovered.
+
+   This is nearly all of what is left in `texturemipmapgen`, and it also drives
+   most of `gltfscenerendering`. Forcing each of that sample's three sampler modes and
    rendering both drivers separates it cleanly: no mipmaps differs by 19 pixels,
    mipmaps with bilinear by 1095, mipmaps with anisotropy by 32237. So the
    texture upload, the runtime-generated mip chain and LOD selection are all
@@ -244,7 +251,8 @@ lanes and dropped by the writeback.
    lost.
 5. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
    compressed textures, and the capture has 576 BC images.
-6. **`gltfscenerendering` (1.70%) is mostly gap 3 above, amplified.** Its
+6. **`gltfscenerendering` (1.70%) is mostly gap 3 above, amplified — closed
+   with it.** Its
    fragment shader samples a normal map and then raises the result to the 32nd
    power, so an under-blurred normal map turns into scattered specular glints on
    exactly the grazing-angle surfaces where anisotropy applies — the side walls,
