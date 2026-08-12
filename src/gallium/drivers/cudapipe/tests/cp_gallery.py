@@ -100,7 +100,8 @@ def compare(ref, test, w, h, ch_ref, ch_test, tol):
     return diff_count, max_delta, rows
 
 
-PAGE = """<title>{title}</title>
+PAGE = """<meta charset="UTF-8">
+<title>{title}</title>
 <style>
 :root {{
   --bg: #ffffff; --panel: #f5f5f7; --border: #d8d8de; --fg: #1a1a1f;

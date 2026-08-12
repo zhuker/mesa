@@ -14,6 +14,12 @@
 #     BENCH   1 to run the samples' own benchmark mode instead, which writes
 #             no images and reports fps
 #
+# Several samples render a still scene — nothing in them moves unless the
+# camera does, so a multi-frame run of one is sixty copies of the same image
+# and says nothing about whether a driver holds up over an animation. Those get
+# --offscreenorbit, which walks the camera around the subject. ORBIT names them;
+# ORBIT=all orbits everything, ORBIT= orbits nothing.
+#
 # Both GPU samplers run for the whole pass, so a sample's slice is found by
 # timestamp against _timing.csv rather than by a per-sample capture.
 #
@@ -37,6 +43,10 @@ LIST=${LIST:-$HOME/mesa/src/gallium/drivers/cudapipe/tests/headless_streamer_sam
 cd "$VULKAN" || exit 1
 BIN=build/bin
 SAMPLES=${SAMPLES:-$(grep -v '^#' "$LIST" | tr '\n' ' ')}
+
+# Samples with no motion of their own; the camera has to supply it.
+ORBIT=${ORBIT-triangle pushconstants texture negativeviewportheight \
+texturecubemap computeshader vulkanscene pbribl gltfscenerendering}
 
 mkdir -p "$OUT/_logs"
 CSV=$OUT/_timing.csv
@@ -69,6 +79,9 @@ for name in $SAMPLES; do
         mkdir -p "$OUT/$name"
         args=(--offscreen --offscreenframes "$FRAMES"
               --offscreenfilename "$OUT/$name/$name.ppm")
+        case " $ORBIT " in
+            *" all "*|*" $name "*) args+=(--offscreenorbit) ;;
+        esac
     else
         args=(--offscreen --offscreenframes 1 --offscreenfilename "$OUT/$name.ppm")
     fi

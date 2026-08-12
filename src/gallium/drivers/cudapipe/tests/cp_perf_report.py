@@ -301,7 +301,8 @@ def bar_rows(rows, slots, fmt='{:.2f}'):
 
 # ------------------------------------------------------------------- page ---
 
-PAGE = """<title>{title}</title>
+PAGE = """<meta charset="UTF-8">
+<title>{title}</title>
 <style>
 :root {{
   --bg:#ffffff; --panel:#fcfcfb; --border:#d8d8de; --fg:#0b0b0b;
