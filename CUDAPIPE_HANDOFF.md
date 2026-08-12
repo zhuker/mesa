@@ -156,6 +156,13 @@ writing their images. Those are cudapipe bugs, not sample bugs.
     VK_ICD_FILENAMES=build-cudapipe/src/gallium/targets/lavapipe/lvp_devenv_icd.x86_64.json \
       VALIDATION=0 OUT=build/compare/llvmpipe ./run_offscreen.sh
 
+    cp_gallery.py ref cuda llvmpipe -o three.html \
+      --ref-label nvidia --test-label cudapipe --test2-label llvmpipe
+
+cp_gallery.py takes the third directory and lays the two renderers beside the
+same reference, with a panel of the two against each other that goes black
+wherever they agree.
+
 ## Architecture
 
 ```

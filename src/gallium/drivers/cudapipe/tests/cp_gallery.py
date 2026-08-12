@@ -4,8 +4,18 @@
 Intended for the Sascha Willems samples run offscreen against two ICDs, but it
 only cares that the two directories hold images with matching names.
 
-    ./run_offscreen.sh                  # once per driver, into two directories
+    ./run_offscreen.sh                  # once per driver, into its own directory
     cp_gallery.py ref_dir cuda_dir -o compare.html
+
+A third directory may be given, which puts two renderers side by side against
+the same reference and adds a column for how they differ from each other. That
+is how cudapipe gets read against llvmpipe rather than against zero: llvmpipe
+is the backend its sampler and clipper were ported from, so it is the honest
+target, and a residual both of them share is what software rasterization costs
+rather than a cudapipe defect.
+
+    cp_gallery.py ref_dir cuda_dir llvmpipe_dir -o three.html \
+        --test-label cudapipe --test2-label llvmpipe
 
 Images are written as full resolution PNGs next to the page and referenced from
 it, so every panel can be opened one to one. The page scales them down for
@@ -131,6 +141,9 @@ a {{ color: var(--accent); }}
 .head h2 {{ font-size: 1.1rem; margin: 0; }}
 .stat {{ color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }}
 .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .75rem; }}
+.grid3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: .75rem; }}
+@media (max-width: 780px) {{ .grid3 {{ grid-template-columns: 1fr; }} }}
+.closer {{ font-weight: 600; }}
 figure {{ margin: 0; }}
 figcaption {{ font-size: 12px; color: var(--muted); margin-bottom: .3rem; }}
 img {{ width: 100%; height: auto; display: block; border-radius: 5px; background: #000; }}
@@ -164,8 +177,7 @@ img.zoomable {{ cursor: zoom-in; }}
 <p class="sub">{subtitle}</p>
 <div class="summary">
 <table>
-<thead><tr><th>Sample</th><th class="num">Differing</th><th class="num">Share</th>
-<th class="num">Max &Delta;</th><th>Verdict</th></tr></thead>
+{thead}
 <tbody>
 {rows}
 </tbody></table>
@@ -218,12 +230,47 @@ CARD = """<div class="card" id="{name}">
 </div>
 """
 
+CARD3 = """<div class="card" id="{name}">
+<div class="head"><h2>{name}</h2>
+<span class="stat">{test_label} {diff:,} px ({pct:.2f}%) &middot; {test2_label} {diff2:,} px ({pct2:.2f}%)
+&middot; between them {diffx:,} px</span>
+<span class="{cls}">{verdict}</span></div>
+<div class="grid3">
+<figure><figcaption>{ref_label}</figcaption>
+<img class="zoomable" loading="lazy" src="{ref}" alt="{name} {ref_label}"
+     onclick="zoom('{ref}', null, '{name} &mdash; {ref_label}')"></figure>
+<figure><figcaption>{test_label} &mdash; hover to flip to {ref_label}</figcaption>
+<div class="flip zoomable"
+     onclick="zoom('{test}', '{ref}', '{name} &mdash; {test_label}, hover to flip to {ref_label}')">
+<img loading="lazy" src="{test}" alt="{name} {test_label}">
+<img class="b" loading="lazy" src="{ref}" alt="{name} {ref_label}"></div></figure>
+<figure><figcaption>{test2_label} &mdash; hover to flip to {ref_label}</figcaption>
+<div class="flip zoomable"
+     onclick="zoom('{test2}', '{ref}', '{name} &mdash; {test2_label}, hover to flip to {ref_label}')">
+<img loading="lazy" src="{test2}" alt="{name} {test2_label}">
+<img class="b" loading="lazy" src="{ref}" alt="{name} {ref_label}"></div></figure>
+<figure><figcaption>{test_label} vs {test2_label} &gt; {tol}/255</figcaption>
+<img class="zoomable" loading="lazy" src="{diffxmap}" alt="{name} {test_label} vs {test2_label}"
+     onclick="zoom('{diffxmap}', null, '{name} &mdash; {test_label} vs {test2_label}')"></figure>
+<figure><figcaption>{test_label} vs {ref_label} &gt; {tol}/255</figcaption>
+<img class="zoomable" loading="lazy" src="{diffmap}" alt="{name} {test_label} difference"
+     onclick="zoom('{diffmap}', null, '{name} &mdash; {test_label} vs {ref_label}')"></figure>
+<figure><figcaption>{test2_label} vs {ref_label} &gt; {tol}/255</figcaption>
+<img class="zoomable" loading="lazy" src="{diff2map}" alt="{name} {test2_label} difference"
+     onclick="zoom('{diff2map}', null, '{name} &mdash; {test2_label} vs {ref_label}')"></figure>
+</div>
+</div>
+"""
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('ref_dir', help='directory of reference images')
     ap.add_argument('test_dir', help='directory of images under test')
+    ap.add_argument('test2_dir', nargs='?', default=None,
+                    help='optional second directory under test, compared '
+                         'against the same reference and against the first')
     ap.add_argument('-o', '--out', default='compare.html', help='output HTML file')
     ap.add_argument('-t', '--tol', type=int, default=8,
                     help='per-channel tolerance, 0-255 (default 8)')
@@ -232,6 +279,7 @@ def main():
                          '(default: <out>_images next to the page)')
     ap.add_argument('--ref-label', default='reference')
     ap.add_argument('--test-label', default='cudapipe')
+    ap.add_argument('--test2-label', default='llvmpipe')
     ap.add_argument('--title', default='Renderer comparison')
     args = ap.parse_args()
 
@@ -249,12 +297,16 @@ def main():
             continue
         if not os.path.exists(os.path.join(args.test_dir, base + ext)):
             continue
+        if args.test2_dir and \
+           not os.path.exists(os.path.join(args.test2_dir, base + ext)):
+            continue
         if base not in found or ext == '.ppm':
             found[base] = ext
     names = sorted(found.items())
 
     if not names:
-        print(f'no image pairs found between {args.ref_dir} and {args.test_dir}')
+        dirs = ', '.join(d for d in (args.ref_dir, args.test_dir, args.test2_dir) if d)
+        print(f'no images found in common between {dirs}')
         return 1
 
     results = []
@@ -266,6 +318,24 @@ def main():
             continue
 
         diff, delta, dmap = compare(ref, test, rw, rh, rch, tch, args.tol)
+
+        extra = {}
+        if args.test2_dir:
+            uw, uh, uch, test2 = read_image(os.path.join(args.test2_dir, base + ext))
+            if (rw, rh) != (uw, uh):
+                print(f'{base}: size mismatch {rw}x{rh} vs {uw}x{uh} in '
+                      f'{args.test2_dir}, skipped')
+                continue
+            diff2, delta2, d2map = compare(ref, test2, rw, rh, rch, uch, args.tol)
+            # The two renderers against each other, which is where a shared
+            # residual shows up as black.
+            diffx, _, dxmap = compare(test, test2, rw, rh, tch, uch, args.tol)
+            write_png_file(os.path.join(img_dir, base + '_test2.png'),
+                           uw, uh, as_rgb(test2, uw, uch))
+            write_png_file(os.path.join(img_dir, base + '_diff2.png'), rw, rh, d2map)
+            write_png_file(os.path.join(img_dir, base + '_diffx.png'), rw, rh, dxmap)
+            extra = {'diff2': diff2, 'delta2': delta2, 'diffx': diffx,
+                     'pct2': 100.0 * diff2 / (rw * rh)}
 
         write_png_file(os.path.join(img_dir, base + '_ref.png'),
                        rw, rh, as_rgb(ref, rw, rch))
@@ -287,10 +357,22 @@ def main():
             'test': f'{rel}/{base}_test.png?v={stamp}',
             'diffmap': f'{rel}/{base}_diff.png?v={stamp}',
         })
-        print(f'{base:24s} {diff:>8}/{rw * rh} ({100.0 * diff / (rw * rh):6.2f}%)')
+        if extra:
+            results[-1].update(extra)
+            results[-1].update({
+                'test2': f'{rel}/{base}_test2.png?v={stamp}',
+                'diff2map': f'{rel}/{base}_diff2.png?v={stamp}',
+                'diffxmap': f'{rel}/{base}_diffx.png?v={stamp}',
+            })
+            print(f'{base:24s} {diff:>8} vs {extra["diff2"]:>8}  '
+                  f'(between them {extra["diffx"]:>8})')
+        else:
+            print(f'{base:24s} {diff:>8}/{rw * rh} '
+                  f'({100.0 * diff / (rw * rh):6.2f}%)')
 
     results.sort(key=lambda r: -r['pct'])
 
+    three = bool(args.test2_dir)
     rows, cards = [], []
     for r in results:
         # A handful of stray pixels on a triangle edge is a different thing
@@ -301,25 +383,78 @@ def main():
             r['cls'], r['verdict'] = 'near', 'near match'
         else:
             r['cls'], r['verdict'] = 'fail', 'differs'
-        rows.append(
-            f'<tr><td><a href="#{r["name"]}">{r["name"]}</a></td>'
-            f'<td class="num">{r["diff"]:,}</td>'
-            f'<td class="num">{r["pct"]:.2f}%</td>'
-            f'<td class="num">{r["delta"]}</td>'
-            f'<td class="{r["cls"]}">{r["verdict"]}</td></tr>')
-        cards.append(CARD.format(tol=args.tol, ref_label=args.ref_label,
-                                 test_label=args.test_label, **r))
+
+        if three:
+            # Which renderer landed closer to the reference. Ties and margins
+            # under a hundred pixels are not worth calling, since either can
+            # move by that much on a single antialiased edge.
+            if abs(r['diff'] - r['diff2']) < 100:
+                closer, ccls = 'level', 'stat'
+            elif r['diff'] < r['diff2']:
+                closer, ccls = args.test_label, 'pass'
+            else:
+                closer, ccls = args.test2_label, 'near'
+            rows.append(
+                f'<tr><td><a href="#{r["name"]}">{r["name"]}</a></td>'
+                f'<td class="num">{r["diff"]:,}</td>'
+                f'<td class="num">{r["pct"]:.2f}%</td>'
+                f'<td class="num">{r["diff2"]:,}</td>'
+                f'<td class="num">{r["pct2"]:.2f}%</td>'
+                f'<td class="num">{r["diffx"]:,}</td>'
+                f'<td class="closer {ccls}">{closer}</td></tr>')
+            cards.append(CARD3.format(tol=args.tol, ref_label=args.ref_label,
+                                      test_label=args.test_label,
+                                      test2_label=args.test2_label, **r))
+        else:
+            rows.append(
+                f'<tr><td><a href="#{r["name"]}">{r["name"]}</a></td>'
+                f'<td class="num">{r["diff"]:,}</td>'
+                f'<td class="num">{r["pct"]:.2f}%</td>'
+                f'<td class="num">{r["delta"]}</td>'
+                f'<td class="{r["cls"]}">{r["verdict"]}</td></tr>')
+            cards.append(CARD.format(tol=args.tol, ref_label=args.ref_label,
+                                     test_label=args.test_label, **r))
 
     matched = sum(1 for r in results if r['diff'] == 0)
     near = sum(1 for r in results if 0 < r['pct'] < 0.1)
-    subtitle = (f'{matched} of {len(results)} samples match exactly and {near} '
-                f'more differ in under 0.1% of pixels, at a tolerance of '
-                f'{args.tol}/255. Left is {args.ref_label}, middle is '
-                f'{args.test_label} (hover to flip), right marks where they '
-                f'disagree. Click any panel to open it at full resolution. '
-                f'Sorted worst first.')
 
-    html = PAGE.format(title=args.title, subtitle=subtitle,
+    if three:
+        tot = sum(r['diff'] for r in results)
+        tot2 = sum(r['diff2'] for r in results)
+        wins = sum(1 for r in results if r['diff'] < r['diff2'] - 100)
+        thead = (f'<thead><tr><th>Sample</th>'
+                 f'<th class="num">{args.test_label}</th><th class="num">share</th>'
+                 f'<th class="num">{args.test2_label}</th><th class="num">share</th>'
+                 f'<th class="num">between them</th><th>closer</th></tr></thead>')
+        rows.append(
+            f'<tr><td><b>total</b></td>'
+            f'<td class="num"><b>{tot:,}</b></td><td class="num"></td>'
+            f'<td class="num"><b>{tot2:,}</b></td><td class="num"></td>'
+            f'<td class="num"><b>{sum(r["diffx"] for r in results):,}</b></td>'
+            f'<td></td></tr>')
+        subtitle = (
+            f'{args.test_label} and {args.test2_label} against the same '
+            f'{args.ref_label}, at a tolerance of {args.tol}/255. Totals over '
+            f'{len(results)} samples: {tot:,} pixels for {args.test_label}, '
+            f'{tot2:,} for {args.test2_label}; {args.test_label} is closer on '
+            f'{wins}. Read the residual against {args.test2_label} rather than '
+            f'against zero \u2014 a difference both of them share is what '
+            f'software rasterization costs, not a defect. The fourth panel is '
+            f'the two of them against each other, so it goes black wherever '
+            f'they agree. Hover a render to flip it to {args.ref_label}, click '
+            f'any panel for full resolution. Sorted worst first.')
+    else:
+        thead = ('<thead><tr><th>Sample</th><th class="num">Differing</th>'
+                 '<th class="num">Share</th>'
+                 '<th class="num">Max &Delta;</th><th>Verdict</th></tr></thead>')
+        subtitle = (f'{matched} of {len(results)} samples match exactly and {near} '
+                    f'more differ in under 0.1% of pixels, at a tolerance of '
+                    f'{args.tol}/255. Left is {args.ref_label}, middle is '
+                    f'{args.test_label} (hover to flip), right marks where they '
+                    f'disagree. Click any panel to open it at full resolution. '
+                    f'Sorted worst first.')
+
+    html = PAGE.format(title=args.title, subtitle=subtitle, thead=thead,
                        rows='\n'.join(rows), cards='\n'.join(cards))
     with open(args.out, 'w') as f:
         f.write(html)
