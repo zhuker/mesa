@@ -16,11 +16,18 @@ Drivers are discovered from the directories present unless --drivers names them;
 the order given is the order they are drawn in, and a driver keeps its colour
 across every chart on the page.
 
-Per-frame differences are the expensive part — every frame of every sample
-against the reference, in Python. They are cached in _diffs.json next to the
-run, keyed by driver, sample and stride, so re-running to change the layout
-costs nothing. --stride compares every Nth frame; --recompute discards the
-cache.
+Per-frame differences are computed by ffmpeg, one invocation per sample rather
+than one per frame: the difference of the two streams, the max across the three
+channels via two `lighten` blends, a threshold, and signalstats' YAVG of the
+resulting mask, which is the differing fraction. A 60 frame sample takes about
+a third of a second, and there is nothing to install. Results are cached in
+_diffs.json keyed by tolerance, so re-running to change the layout is free;
+--recompute discards it.
+
+Frames are exported to JPEG alongside, so the page can show any frame of any
+driver next to the reference — the chart says which frame went wrong and the
+viewer under it says what it looked like. --no-frames skips the export and
+leaves the charts alone.
 
 Nothing here is specific to this set of samples or to 60 frames.
 """
@@ -35,13 +42,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cp_compare import read_image
 
-# Optional: the frame diff is the whole cost of this script, and numpy makes it
-# roughly a hundred times faster. Everything still runs without it, just slowly,
-# so the script keeps the stdlib-only guarantee the other tools here have.
-try:
-    import numpy as _np
-except ImportError:
-    _np = None
+import re
+import shutil
+import subprocess
 
 # Slots 1-3 of the reference categorical palette, in its fixed order. Each
 # driver keeps its slot on every chart, so colour identifies the driver and
@@ -115,32 +118,54 @@ def samples_in(driver_dir):
                   and not s.startswith('_'))
 
 
-def differing(a, b, w, h, ch_a, ch_b, tol):
-    """Pixels whose worst channel differs by more than tol."""
-    if _np is not None:
-        pa = _np.frombuffer(b''.join(a), dtype=_np.uint8)
-        pb = _np.frombuffer(b''.join(b), dtype=_np.uint8)
-        pa = pa.reshape(h, -1)[:, :w * ch_a].reshape(h, w, ch_a)[:, :, :3]
-        pb = pb.reshape(h, -1)[:, :w * ch_b].reshape(h, w, ch_b)[:, :, :3]
-        d = _np.abs(pa.astype(_np.int16) - pb.astype(_np.int16)).max(axis=2)
-        return int((d > tol).sum())
-
-    n = 0
-    for y in range(h):
-        ra, rb = a[y], b[y]
-        for x in range(w):
-            ia, ib = x * ch_a, x * ch_b
-            if max(abs(ra[ia] - rb[ib]),
-                   abs(ra[ia + 1] - rb[ib + 1]),
-                   abs(ra[ia + 2] - rb[ib + 2])) > tol:
-                n += 1
-    return n
+def frame_pattern(driver_dir, sample):
+    """The ffmpeg image2 pattern for a sample's frames, and how many there are."""
+    names = frames_of(driver_dir, sample)
+    if not names:
+        return None, 0
+    pat = re.sub(r'\d{4}(\.(?:ppm|png))$', r'%04d\1', names[0])
+    if pat == names[0]:
+        return None, 0
+    return os.path.join(driver_dir, sample, pat), len(names)
 
 
-def frame_diffs(root, ref, drivers, samples, tol, stride, recompute):
-    """{driver: {sample: [(frame_index, differing_pixels), ...]}}, cached."""
+# The difference of the two streams, the max across the three channels (two
+# `lighten` blends, since lighten is a per-pixel max), a threshold at the
+# tolerance, and the mean of the resulting 0/255 mask. That mean over 255 is the
+# fraction of pixels differing, which is the same quantity cp_compare.py counts.
+FILTER = (
+    "[0][1]blend=all_mode=difference,format=gbrp,extractplanes=g+b+r[g][b][r];"
+    "[g][b]blend=all_mode=lighten[gb];"
+    "[gb][r]blend=all_mode=lighten,"
+    "lutyuv=y='if(gt(val\\,{tol})\\,255\\,0)',signalstats,metadata=print"
+)
+
+
+def diff_series(ref_pat, test_pat, tol, pixels):
+    """Differing pixels per frame, via one ffmpeg pass over the sequence."""
+    cmd = ['ffmpeg', '-hide_banner', '-i', ref_pat, '-i', test_pat,
+           '-filter_complex', FILTER.format(tol=tol), '-f', 'null', '-']
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=900).stderr
+    except (OSError, subprocess.SubprocessError):
+        return []
+    vals = re.findall(r'YAVG=([0-9.]+)', out)
+    return [[i, int(round(float(v) / 255.0 * pixels))] for i, v in enumerate(vals)]
+
+
+def frame_size(path):
+    """(width, height) of one frame, read through the existing PPM/PNG reader."""
+    try:
+        w, h, _, _ = read_image(path)
+        return w, h
+    except Exception:
+        return 0, 0
+
+
+def frame_diffs(root, ref, drivers, samples, tol, recompute):
+    """{driver: {sample: [[frame, differing_pixels], ...]}}, cached."""
     cache_path = os.path.join(root, '_diffs.json')
-    key = f'tol{tol}.stride{stride}'
+    key = f'tol{tol}'
     cache = {}
     if os.path.exists(cache_path) and not recompute:
         try:
@@ -154,22 +179,17 @@ def frame_diffs(root, ref, drivers, samples, tol, stride, recompute):
         if drv == ref:
             continue
         cache[key].setdefault(drv, {})
-        drv_dir = os.path.join(root, drv)
         for sample in samples:
             if sample in cache[key][drv]:
                 continue
-            rf, tf = frames_of(ref_dir, sample), frames_of(drv_dir, sample)
-            if not rf or not tf:
+            rp, n = frame_pattern(ref_dir, sample)
+            tp, m = frame_pattern(os.path.join(root, drv), sample)
+            if not rp or not tp:
                 cache[key][drv][sample] = []
                 continue
-            series = []
-            for i in range(0, min(len(rf), len(tf)), stride):
-                rw, rh, rch, ri = read_image(os.path.join(ref_dir, sample, rf[i]))
-                tw, th, tch, ti = read_image(os.path.join(drv_dir, sample, tf[i]))
-                if (rw, rh) != (tw, th):
-                    series = []
-                    break
-                series.append([i, differing(ri, ti, rw, rh, rch, tch, tol)])
+            w, h = frame_size(os.path.join(ref_dir, sample,
+                                           frames_of(ref_dir, sample)[0]))
+            series = diff_series(rp, tp, tol, w * h) if w and h else []
             cache[key][drv][sample] = series
             print(f'  {drv}/{sample}: {len(series)} frames', flush=True)
 
@@ -178,6 +198,26 @@ def frame_diffs(root, ref, drivers, samples, tol, stride, recompute):
     except OSError:
         pass
     return cache[key]
+
+
+def export_frames(root, drivers, samples, img_dir, width):
+    """Every frame to JPEG so the page can show it. Skips what already exists."""
+    os.makedirs(img_dir, exist_ok=True)
+    for drv in drivers:
+        for sample in samples:
+            pat, n = frame_pattern(os.path.join(root, drv), sample)
+            if not pat:
+                continue
+            out_dir = os.path.join(img_dir, drv, sample)
+            if os.path.isdir(out_dir) and len(os.listdir(out_dir)) >= n:
+                continue
+            os.makedirs(out_dir, exist_ok=True)
+            subprocess.run(
+                ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                 '-i', pat, '-vf', f'scale={width}:-2', '-q:v', '4',
+                 os.path.join(out_dir, '%04d.jpg')],
+                capture_output=True, timeout=900)
+            print(f'  frames {drv}/{sample}', flush=True)
 
 
 # ----------------------------------------------------------------- charts ---
@@ -330,6 +370,16 @@ circle.s7{{fill:var(--s7)}} circle.s8{{fill:var(--s8)}}
 .bar.s1{{background:var(--s1)}} .bar.s2{{background:var(--s2)}}
 .bar.s3{{background:var(--s3)}} .bar.s4{{background:var(--s4)}}
 .barval{{width:76px;text-align:right;font-variant-numeric:tabular-nums;flex:none}}
+.viewer{{margin-top:.2rem}}
+.seek{{display:flex;align-items:center;gap:.5rem;margin-bottom:.4rem}}
+.seek input{{flex:1;accent-color:var(--accent)}}
+.frameno{{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;
+  width:72px;flex:none}}
+.panes{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+  gap:.4rem}}
+.panes figure{{margin:0}}
+.panes figcaption{{font-size:11px;color:var(--muted);margin-bottom:.2rem}}
+.panes img{{width:100%;height:auto;display:block;border-radius:4px;background:#000}}
 </style>
 <div class="wrap">
 <h1>{title}</h1>
@@ -355,8 +405,10 @@ def main():
     ap.add_argument('-o', '--out', default='perf.html')
     ap.add_argument('-t', '--tol', type=int, default=8,
                     help='per-channel tolerance for the frame diff (default 8)')
-    ap.add_argument('--stride', type=int, default=1,
-                    help='compare every Nth frame (default every frame)')
+    ap.add_argument('--no-frames', action='store_true',
+                    help='skip exporting frames; charts only, no viewer')
+    ap.add_argument('--frame-width', type=int, default=560,
+                    help='width of the exported frames (default 560)')
     ap.add_argument('--recompute', action='store_true',
                     help='ignore the cached frame differences')
     ap.add_argument('--title', default='Driver sweep')
@@ -374,10 +426,19 @@ def main():
     samples = samples_in(os.path.join(args.root, args.ref)) or sorted(
         {s for t in timing.values() for s in t})
 
-    print('computing frame differences (cached in _diffs.json)%s…'
-          % ('' if _np is not None else ', without numpy — this will be slow'))
+    if not shutil.which('ffmpeg'):
+        print('ffmpeg is required for the frame differences and the viewer')
+        return 2
+
+    print('computing frame differences (cached in _diffs.json)…')
     diffs = frame_diffs(args.root, args.ref, drivers, samples,
-                        args.tol, args.stride, args.recompute)
+                        args.tol, args.recompute)
+
+    img_rel = os.path.splitext(os.path.basename(args.out))[0] + '_frames'
+    img_dir = os.path.join(os.path.dirname(os.path.abspath(args.out)), img_rel)
+    if not args.no_frames:
+        print('exporting frames…')
+        export_frames(args.root, drivers, samples, img_dir, args.frame_width)
 
     body = []
 
@@ -460,23 +521,66 @@ def main():
                   for d in tested]
         svg, _ = line_chart(series)
         first = worst = None
+        worst_at = 0
+        nframes = 0
         for _, _, ps in series:
+            nframes = max(nframes, len(ps))
             for i, v in ps:
                 if i == 0 and first is None:
                     first = v
-                worst = v if worst is None else max(worst, v)
+                if worst is None or v > worst:
+                    worst, worst_at = v, i
         cap = ('no frames' if worst is None
-               else f'frame 0: {first:,} · worst: {worst:,}')
+               else f'frame 0: {first:,} · worst: {worst:,} at frame {worst_at}')
+
+        # The viewer: a slider over the frames, and the reference beside each
+        # driver under test at whatever frame is selected. It opens on the worst
+        # frame, because that is the one the chart was pointing at.
+        viewer = ''
+        if not args.no_frames and nframes:
+            panes = ''.join(
+                f'<figure><figcaption>{html.escape(d)}</figcaption>'
+                f'<img loading="lazy" data-driver="{html.escape(d)}" '
+                f'data-sample="{html.escape(s)}" '
+                f'src="{img_rel}/{d}/{s}/{worst_at + 1:04d}.jpg" alt=""></figure>'
+                for d in drivers)
+            viewer = (
+                f'<div class="viewer" data-sample="{html.escape(s)}" '
+                f'data-base="{img_rel}">'
+                f'<div class="seek"><input type="range" min="0" '
+                f'max="{nframes - 1}" value="{worst_at}" '
+                f'aria-label="frame"><span class="frameno">frame '
+                f'{worst_at}</span></div>'
+                f'<div class="panes">{panes}</div></div>')
+
         cards.append(f'<div class="card"><h3>{html.escape(s)}</h3>{svg}'
-                     f'<p class="note" style="margin:.3rem 0 0">{cap}</p></div>')
+                     f'<p class="note" style="margin:.3rem 0 .5rem">{cap}</p>'
+                     f'{viewer}</div>')
     body.append('<div class="grid2">' + ''.join(cards) + '</div>')
 
-    stride_note = ('every frame' if args.stride == 1
-                   else f'every {args.stride}th frame')
-    subtitle = (f'{len(samples)} samples across {len(drivers)} drivers, '
-                f'{stride_note} compared against {html.escape(args.ref)} at '
-                f'tolerance {args.tol}/255. Cost first, then what the GPU was '
-                f'doing, then whether the picture held up for the whole run.')
+    body.append("""<script>
+// Seeking is just swapping the src of each pane; the frames are already on
+// disk, one JPEG per driver per frame.
+document.querySelectorAll('.viewer').forEach(function (v) {
+  var slider = v.querySelector('input[type=range]');
+  var label  = v.querySelector('.frameno');
+  var imgs   = v.querySelectorAll('img');
+  var base   = v.dataset.base, sample = v.dataset.sample;
+  slider.addEventListener('input', function () {
+    var n = String(+slider.value + 1).padStart(4, '0');
+    label.textContent = 'frame ' + slider.value;
+    imgs.forEach(function (img) {
+      img.src = base + '/' + img.dataset.driver + '/' + sample + '/' + n + '.jpg';
+    });
+  });
+});
+</script>""")
+
+    subtitle = (f'{len(samples)} samples across {len(drivers)} drivers, every '
+                f'frame compared against {html.escape(args.ref)} at tolerance '
+                f'{args.tol}/255. Cost first, then what the GPU was doing, then '
+                f'whether the picture held up for the whole run — and for any '
+                f'frame that did not, what it looked like.')
 
     open(args.out, 'w').write(PAGE.format(
         title=html.escape(args.title), subtitle=subtitle, body='\n'.join(body)))
