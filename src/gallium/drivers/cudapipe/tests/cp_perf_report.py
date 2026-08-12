@@ -208,11 +208,14 @@ def _run(cmd):
 
 
 def export_frames(root, drivers, samples, img_dir, width):
-    """Every frame twice: a JPEG to lay out with, and a PNG to inspect.
+    """Every frame twice: scaled down to lay out with, and native to inspect.
 
-    The thumbnails are what the page shows; the full resolution PNGs are what a
-    click opens, because a lossy thumbnail is no good for deciding whether a
-    pixel is wrong.
+    PNG for both. Nothing here may be lossy — the whole page exists to judge
+    whether a pixel is wrong, and JPEG would put its own artefacts in front of
+    that. It is also what hid a bug: PNG output negotiated RGB and looked
+    right, while the JPEG encoder pulled the filter graph into YUV, where a
+    difference leaves U and V at zero and every difference image came out
+    green.
     """
     for drv in drivers:
         for sample in samples:
@@ -222,22 +225,34 @@ def export_frames(root, drivers, samples, img_dir, width):
             small = os.path.join(img_dir, drv, sample)
             full = os.path.join(img_dir, drv, sample, 'full')
             if not (os.path.isdir(small) and
-                    len([f for f in os.listdir(small) if f.endswith('.jpg')]) >= n):
+                    len([f for f in os.listdir(small)
+                         if f.endswith('.png')]) >= n):
                 os.makedirs(small, exist_ok=True)
                 _run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                      '-i', pat, '-vf', f'scale={width}:-2', '-q:v', '4',
-                      os.path.join(small, '%04d.jpg')])
+                      '-i', pat, '-vf', f'format=rgb24,scale={width}:-2',
+                      os.path.join(small, '%04d.png')])
             if not (os.path.isdir(full) and len(os.listdir(full)) >= n):
                 os.makedirs(full, exist_ok=True)
                 _run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                      '-i', pat, os.path.join(full, '%04d.png')])
+                      '-i', pat, '-vf', 'format=rgb24',
+                      os.path.join(full, '%04d.png')])
             print(f'  frames {drv}/{sample}', flush=True)
 
 
-# The difference, contrast stretched so it is visible at all: a handful of
-# levels out of 255 is invisible otherwise. The stretch means the image says
-# "here", not "by how much" — the chart above it carries the magnitude.
-DIFF_FILTER = ("[0][1]blend=all_mode=difference,eq=contrast={gain}:brightness=0.02")
+# The difference, amplified so it is visible at all: a handful of levels out of
+# 255 is invisible otherwise. colorlevels rescales the input range, which is a
+# gain on a near-black image; eq's contrast pivots around mid grey instead and
+# so drives those same values towards black, which is the opposite of what is
+# wanted here. The gain means the image says "here", not "by how much" — the
+# chart above it carries the magnitude.
+# Both inputs are pinned to RGB before the blend. Without that the filter
+# graph negotiates whatever the output encoder wants — YUV, for JPEG — and a
+# difference taken there leaves U and V at zero rather than neutral, which
+# converts back to saturated green. The PNG path negotiated RGB and looked
+# right, so the bug only showed in the thumbnails.
+DIFF_FILTER = ("[0]format=rgb24[a];[1]format=rgb24[b];"
+               "[a][b]blend=all_mode=difference,format=rgb24,"
+               "colorlevels=rimax={imax}:gimax={imax}:bimax={imax}")
 
 
 def export_diffs(root, ref, drivers, samples, img_dir, width, gain):
@@ -254,19 +269,20 @@ def export_diffs(root, ref, drivers, samples, img_dir, width, gain):
             small = os.path.join(img_dir, '_diff', drv, sample)
             full = os.path.join(small, 'full')
             need_small = not (os.path.isdir(small) and len(
-                [f for f in os.listdir(small) if f.endswith('.jpg')]) >= n)
+                [f for f in os.listdir(small) if f.endswith('.png')]) >= n)
             need_full = not (os.path.isdir(full) and len(os.listdir(full)) >= n)
             if need_small:
                 os.makedirs(small, exist_ok=True)
                 _run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
                       '-i', rp, '-i', tp, '-filter_complex',
-                      DIFF_FILTER.format(gain=gain) + f',scale={width}:-2',
-                      '-q:v', '4', os.path.join(small, '%04d.jpg')])
+                      DIFF_FILTER.format(imax=1.0 / max(gain, 1)) +
+                      f',scale={width}:-2',
+                      os.path.join(small, '%04d.png')])
             if need_full:
                 os.makedirs(full, exist_ok=True)
                 _run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
                       '-i', rp, '-i', tp, '-filter_complex',
-                      DIFF_FILTER.format(gain=gain),
+                      DIFF_FILTER.format(imax=1.0 / max(gain, 1)),
                       os.path.join(full, '%04d.png')])
             print(f'  diffs {drv}/{sample}', flush=True)
 
@@ -440,10 +456,20 @@ circle.s7{{fill:var(--s7)}} circle.s8{{fill:var(--s8)}}
 #lightbox{{display:none;position:fixed;inset:0;z-index:50;overflow:auto;
   background:rgba(0,0,0,.93);cursor:zoom-out;padding:0}}
 #lightbox.on{{display:block}}
-#lightbox img{{display:block;margin:0 auto;width:auto;max-width:none;
-  image-rendering:pixelated}}
+/* Natural size, nearest neighbour: one differing pixel has to stay one crisp
+   pixel when the frame is inspected at full resolution. */
+#lb-stack{{position:relative;display:table;margin:0 auto}}
+#lightbox img{{display:block;width:auto;max-width:none;image-rendering:pixelated}}
+#lb-b{{position:absolute;inset:0;opacity:0}}
+#lb-stack:hover #lb-b{{opacity:1}}
+#lb-hint{{position:fixed;left:0;right:0;bottom:0;margin:0;padding:.5rem;
+  text-align:center;font-size:13px;color:#cfcfd8;background:rgba(0,0,0,.65);
+  pointer-events:none}}
 </style>
-<div id="lightbox"><img id="lb-img" alt=""></div>
+<div id="lightbox">
+<div id="lb-stack"><img id="lb-a" alt=""><img id="lb-b" alt=""></div>
+<p id="lb-hint"></p>
+</div>
 <div class="wrap">
 <h1>{title}</h1>
 <p class="sub">{subtitle}</p>
@@ -474,7 +500,7 @@ def main():
                     help='width of the inline frames (default 560); the '
                          'full resolution copies a click opens are native')
     ap.add_argument('--diff-gain', type=int, default=12,
-                    help='contrast stretch on the difference images (default 12)')
+                    help='gain on the difference images (default 12)')
     ap.add_argument('--recompute', action='store_true',
                     help='ignore the cached frame differences')
     ap.add_argument('--title', default='Driver sweep')
@@ -608,35 +634,50 @@ def main():
         viewer = ''
         if not args.no_frames and nframes:
             panes = []
+            n4 = f'{worst_at + 1:04d}'
+            ref_small = f'{img_rel}/{args.ref}/{s}/{n4}.png'
+            ref_full = f'{img_rel}/{args.ref}/{s}/full/{n4}.png'
             for d in drivers:
-                n4 = f'{worst_at + 1:04d}'
-                src = f'{img_rel}/{d}/{s}/{n4}.jpg'
+                src = f'{img_rel}/{d}/{s}/{n4}.png'
                 full = f'{img_rel}/{d}/{s}/full/{n4}.png'
                 if d == args.ref:
                     panes.append(
                         f'<figure><figcaption>{html.escape(d)}</figcaption>'
-                        f'<img class="zoom" loading="lazy" data-driver="{html.escape(d)}" '
-                        f'data-full="{full}" src="{src}" alt=""></figure>')
-                else:
-                    # The driver, flipping to its difference from the reference
-                    # on hover — the same gesture the single frame gallery uses.
-                    dsrc = f'{img_rel}/_diff/{d}/{s}/{n4}.jpg'
-                    dfull = f'{img_rel}/_diff/{d}/{s}/full/{n4}.png'
-                    panes.append(
-                        f'<figure><figcaption>{html.escape(d)} '
-                        f'<span class="hint">hover: difference</span></figcaption>'
-                        f'<span class="flip zoom" data-full="{full}">'
-                        f'<img loading="lazy" data-driver="{html.escape(d)}" '
-                        f'src="{src}" alt="">'
-                        f'<img class="over" loading="lazy" '
-                        f'data-diff="{html.escape(d)}" src="{dsrc}" alt="">'
-                        f'</span></figure>')
-                    panes.append(
-                        f'<figure><figcaption>difference &times;'
-                        f'{args.diff_gain}</figcaption>'
                         f'<img class="zoom" loading="lazy" '
-                        f'data-diff="{html.escape(d)}" data-full="{dfull}" '
-                        f'src="{dsrc}" alt=""></figure>')
+                        f'data-driver="{html.escape(d)}" data-full="{full}" '
+                        f'data-hint="{html.escape(s)} &mdash; {html.escape(d)}" '
+                        f'src="{src}" alt=""></figure>')
+                    continue
+
+                # The driver, flipping to the reference on hover — the same
+                # gesture the single frame gallery uses, and the one that
+                # answers "what should this look like".
+                panes.append(
+                    f'<figure><figcaption>{html.escape(d)} '
+                    f'<span class="hint">hover: {html.escape(args.ref)}</span>'
+                    f'</figcaption>'
+                    f'<span class="flip zoom" data-full="{full}" '
+                    f'data-ref="{ref_full}" '
+                    f'data-hint="{html.escape(s)} &mdash; {html.escape(d)}, '
+                    f'hover to flip to {html.escape(args.ref)}">'
+                    f'<img loading="lazy" data-driver="{html.escape(d)}" '
+                    f'src="{src}" alt="">'
+                    f'<img class="over" loading="lazy" '
+                    f'data-driver="{html.escape(args.ref)}" '
+                    f'src="{ref_small}" alt=""></span></figure>')
+                # And the difference against the reference, on its own, since
+                # wanting to look at one is not the same as wanting to A/B.
+                dsrc = f'{img_rel}/_diff/{d}/{s}/{n4}.png'
+                dfull = f'{img_rel}/_diff/{d}/{s}/full/{n4}.png'
+                panes.append(
+                    f'<figure><figcaption>{html.escape(d)} &minus; '
+                    f'{html.escape(args.ref)} &times;{args.diff_gain}</figcaption>'
+                    f'<img class="zoom" loading="lazy" '
+                    f'data-diff="{html.escape(d)}" data-full="{dfull}" '
+                    f'data-hint="{html.escape(s)} &mdash; {html.escape(d)} minus '
+                    f'{html.escape(args.ref)}, gain {args.diff_gain}" '
+                    f'src="{dsrc}" alt=""></figure>')
+
             viewer = (
                 f'<div class="viewer" data-sample="{html.escape(s)}" '
                 f'data-base="{img_rel}">'
@@ -662,25 +703,38 @@ document.querySelectorAll('.viewer').forEach(function (v) {
     var n = String(+slider.value + 1).padStart(4, '0');
     label.textContent = 'frame ' + slider.value;
     v.querySelectorAll('img[data-driver]').forEach(function (img) {
-      img.src = base + '/' + img.dataset.driver + '/' + sample + '/' + n + '.jpg';
+      img.src = base + '/' + img.dataset.driver + '/' + sample + '/' + n + '.png';
     });
     v.querySelectorAll('img[data-diff]').forEach(function (img) {
-      img.src = base + '/_diff/' + img.dataset.diff + '/' + sample + '/' + n + '.jpg';
+      img.src = base + '/_diff/' + img.dataset.diff + '/' + sample + '/' + n + '.png';
     });
     v.querySelectorAll('[data-full]').forEach(function (el) {
-      var f = el.dataset.full;
-      el.dataset.full = f.replace(/\/[0-9]{4}\.png$/, '/' + n + '.png');
+      el.dataset.full = el.dataset.full.replace(/\/[0-9]{4}\.png$/, '/' + n + '.png');
+      if (el.dataset.ref) {
+        el.dataset.ref = el.dataset.ref.replace(/\/[0-9]{4}\.png$/, '/' + n + '.png');
+      }
     });
   });
 });
 
-// Click any pane for the full resolution PNG. Nearest neighbour, so a single
-// differing pixel stays a single crisp pixel.
+// Click any pane for the full resolution PNG, and keep the hover gesture
+// there: the reference is layered over it, so the same movement that A/Bs a
+// thumbnail A/Bs it at full size.
 var lb = document.getElementById('lightbox');
 document.addEventListener('click', function (e) {
   var z = e.target.closest('.zoom');
   if (z) {
-    document.getElementById('lb-img').src = z.dataset.full;
+    var b = document.getElementById('lb-b');
+    document.getElementById('lb-a').src = z.dataset.full;
+    if (z.dataset.ref) {
+      b.src = z.dataset.ref;
+      b.style.display = '';
+      document.getElementById('lb-hint').textContent = z.dataset.hint || '';
+    } else {
+      b.removeAttribute('src');
+      b.style.display = 'none';
+      document.getElementById('lb-hint').textContent = z.dataset.hint || '';
+    }
     lb.classList.add('on');
     return;
   }
