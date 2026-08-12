@@ -82,33 +82,35 @@ wrong; back the `.spv` up first and restore it afterwards.
 ## Status
 
 Differing pixels versus the NVIDIA driver at tolerance 8/255, worst first.
-Total across the set: 105,212, from 110,015 before the watertight-coverage and
-cube-derivative work, 143,856 before the quad-derivative work, and far more
-before that.
+Total across the set: 83,638, from 105,212 before ordered blending, 110,015
+before the watertight-coverage and cube-derivative work, 143,856 before the
+quad-derivative work, and far more before that.
 
 | Sample | Differing | Note |
 |---|---|---|
 | texturemipmapgen | 3.50% | anisotropic filter, accepted — see gap 3 |
-| multisampling | 2.58% | no MSAA, the last unimplemented feature |
-| particlesystem | 0.17% | |
-| gltfscenerendering | 1.70% | anisotropic filter, accepted — see gap 6 |
+| multisampling | 2.58% | no MSAA, the only unimplemented feature left |
+| gltfscenerendering | 1.70% | anisotropic filter, accepted — see gap 3 |
 | texturecubemap | 0.45% | reflection sharper than the reference at grazing angles |
 | instancing | 0.38% | mostly the procedural starfield, see below |
-| computeshader | 0 | |
-| multithreading | 0.22% | speckle, no diagnosis |
+| multithreading | 0.23% | speckle, no diagnosis, and the sample is nondeterministic |
+| particlesystem | 0.17% | |
+| texture | 589 px | anisotropic taps on a slightly tilted quad |
 | pbribl | 28 px | |
-| texture | 591 px | anisotropic taps on a slightly tilted quad |
-| vulkanscene | 27 px | |
-| dynamicuniformbuffer | 15 px | |
-| bloom | 10 px | |
-| texture3d | 4 px | |
-| renderheadless | 0 | the host readback path |
+| vulkanscene | 25 px | |
+| dynamicuniformbuffer | 14 px | |
+| bloom | 4 px | |
+| texture3d | 2 px | |
+| computeshader | 0 | |
 | negativeviewportheight | 0 | |
 | pushconstants | 0 | |
+| renderheadless | 0 | the host readback path |
 | triangle | 0 | |
 
-Fourteen of eighteen are within a handful of pixels, from one before this work.
-Of the four that are not, two are unimplemented features rather than defects.
+Eleven of eighteen are within a handful of pixels and five match exactly, from
+one at the start of this work. Of the rest, only multisampling is an
+unimplemented feature; the others are the anisotropic filter difference that
+gap 3 closes out.
 
 ### Calibrate against llvmpipe, not against zero
 
@@ -117,18 +119,18 @@ sampler and clipper were ported from, and which shares lavapipe as its frontend:
 
 | Sample | llvmpipe vs NVIDIA | cudapipe vs NVIDIA | cudapipe vs llvmpipe |
 |---|---|---|---|
-| gltfscenerendering | 26263 | **15697** | 5975 |
-| multisampling | **1454** | 23773 | 23145 |
-| particlesystem | **327** | 23106 | 22416 |
 | texturemipmapgen | **21070** | 32237 | 17921 |
-| instancing | 5829 | **3506** | 1869 |
+| multisampling | **1454** | 23773 | 23145 |
+| gltfscenerendering | 26263 | **15698** | 5976 |
 | texturecubemap | 5165 | **4144** | 3792 |
-| multithreading | **1954** | 2087 | 1831 |
+| instancing | 5829 | **3506** | 1869 |
+| multithreading | **1954** | 2085 | 1831 |
+| particlesystem | **327** | 1533 | 818 |
 | texture | **426** | 589 | 320 |
 | pbribl | 73 | **28** | 96 |
 | vulkanscene | **11** | 25 | 20 |
 | everything else | ~0 | ~0 | ~0 |
-| **total** | **62574** | 105212 | 77405 |
+| **total** | **62574** | 83638 | 77405 |
 
 Two things follow, and both change how the status table above should be read.
 
@@ -139,12 +141,11 @@ mean error runs to +12.7/255 in the top luminance band against cudapipe's
 +20.5, the same sign and shape, about 60% of the size. So there is real
 headroom there, but the floor is llvmpipe's number, not zero.
 
-**Excluding the two unimplemented features, cudapipe is already at parity.**
-Take out multisampling and particlesystem, which are MSAA and POINT_LIST and
-nothing to do with fidelity, and it is 58333 for cudapipe against 60793 for
-llvmpipe. On gltfscenerendering cudapipe is closer to NVIDIA than llvmpipe is,
-by a factor of 1.7, and that holds region by region across the surfaces where
-the difference is most visible — the curtains, the pillars, the arches.
+**Excluding MSAA, cudapipe is ahead of llvmpipe.** Take out multisampling, the
+one feature it does not implement, and it is 59865 against llvmpipe's 61120. On
+gltfscenerendering cudapipe is closer to NVIDIA by a factor of 1.7, and that
+holds region by region across the surfaces where the difference is most visible
+— the curtains, the pillars, the arches.
 
 Worth re-running whenever a sampler or rasterizer change looks like it is not
 paying off; llvmpipe is the honest target.
@@ -180,7 +181,8 @@ cudapipe Gallium driver
     │   5. cp_fs_interpolate    (compact into 2x2 quads, interpolate varyings)
     │   6. Fragment shader kernel (four threads per quad)
     │   7. cp_fs_writeback      (drop helpers, discard mask, blend, attachment)
-    │   steps 4-7 repeat up to CP_DISCARD_LAYERS times for an alpha-tested draw
+    │   steps 4-7 repeat: up to CP_DISCARD_LAYERS times for an alpha-tested
+    │   draw, up to CP_BLEND_LAYERS times for a blended one
     └── flush: cuCtxSynchronize + scratch reclaim
 ```
 
@@ -208,54 +210,46 @@ triangle: `cp_fs_interpolate` emits a separate quad per distinct triangle in a
 derivative at every seam. Corners no triangle covers are still shaded as helper
 lanes and dropped by the writeback.
 
+**A point is one vertex wearing a square.** POINT_LIST arrives as one
+degenerate triangle per point; `setup_triangle` turns that into a
+screen-aligned square from `gl_PointSize` and stage 1 walks it with a half-open
+box test, so stages 2 and 3 never see one. Every input takes the vertex's own
+value, since there is nothing to interpolate between. `gl_PointCoord` is the
+one thing that varies and no vertex shader output drives it, so the
+interpolator writes it from the pixel's position inside the square; helper
+lanes land outside [0, 1], which is what makes its derivative come out as
+1/size. Both reach the kernels by varying location, `VARYING_SLOT_PSIZ` and
+`VARYING_SLOT_PNTC`, so the shader compiler has no special case for either.
+
+**A blended draw composites every layer, in submission order.** The visibility
+buffer resolving one winner per pixel is what makes opaque overdraw cost a
+single shade, and it is exactly wrong for transparency. With `blend_peel` set
+the buffer keys on the primitive index instead of depth, so the same atomicMin
+selects the lowest numbered primitive a pixel has not composited yet; the pass
+blends it, `cp_peel_advance` steps that pixel past it, and the draw repeats.
+
+llvmpipe does not need this because it never defers — it bins primitives per
+tile and replays each tile's list in submission order, shading and blending
+inline, so ordering falls out of the data structure (`tri_rasterize_bin` in
+lp_rast.c walks the bin's command blocks in the order lp_setup_tri.c appended
+them, and the blend is generated into the fragment shader itself by
+`generate_unswizzled_blend`). Porting that shape directly would mean calling
+the fragment shader from inside a tile kernel, and it is a separately compiled
+module. Peeling reaches the same semantics: both do one shade per fragment per
+pixel, llvmpipe serializing them within a tile and this serializing them across
+passes while keeping every pixel parallel within one.
+
+Passes are bounded by the primitive count and by `CP_BLEND_LAYERS`, and the
+loop stops as soon as a pass selects nothing — the second pass, for the blended
+draws that do not overlap themselves. particlesystem's fire is 512 additive
+sprites piled tens deep and converges at 256 layers; 1024 gives a bit-identical
+image.
+
 ## Known gaps, roughly by how much they matter
 
 1. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
-2. **No line rasterization.** POINT_LIST works: the host expands it into one
-   degenerate triangle per point, setup_triangle() turns that into a
-   screen-aligned square from gl_PointSize, and the interpolator writes
-   gl_PointCoord from the pixel's position inside it. Both reach the kernels
-   through the ordinary varying-location machinery, so nothing about them is
-   special-cased in the shader compiler.
-
-   `particlesystem` still differs, but no longer because of points — see
-   gap 3a.
-3a. **Blended draws composite every layer, in submission order.** The
-   visibility buffer resolves one winner per pixel, which is what makes opaque
-   overdraw cost a single shade and is exactly wrong for transparency.
-   `particlesystem` was the first sample to lean on it: its fire is 512
-   additive sprites piled tens deep, and it came out as one sprite with holes
-   punched in it where a nearer one hid the rest.
-
-   llvmpipe never has this problem because it does not defer — it bins
-   primitives per tile and replays each tile's list in submission order,
-   shading and blending inline, so ordering falls out of the data structure
-   (`tri_rasterize_bin` in lp_rast.c walks the bin's command blocks in the
-   order lp_setup_tri.c appended them, and the blend is generated into the
-   fragment shader itself by `generate_unswizzled_blend`).
-
-   cudapipe reaches the same semantics by peeling rather than by binning. With
-   `blend_peel` set, the visibility buffer keys on the primitive index instead
-   of depth, so the same atomicMin selects the lowest numbered primitive a
-   pixel has not composited yet; the pass blends it, `cp_peel_advance` steps
-   that pixel past it, and the draw repeats. Both do one shade per fragment
-   per pixel — llvmpipe serializes them within a tile, this serializes them
-   across passes and keeps every pixel parallel within one.
-
-   Passes are bounded by the primitive count and by CP_BLEND_LAYERS, and the
-   loop stops as soon as a pass finds nothing left, which is the second pass
-   for the blended draws that do not overlap themselves. The fire converges at
-   256 layers — 1024 gives a bit-identical image — and goes from 23106
-   differing pixels to 1533.
-
-   Two things to know before touching it. The host reads a managed flag
-   between passes to decide whether to continue, so a blended draw costs one
-   `cuStreamSynchronize` per layer; that is the first thing to attack if
-   blended draws dominate a frame. And peeling does not combine with the
-   alpha-test retry loop yet, which owns the same multi-pass machinery for its
-   own reasons, so a shader that discards keeps the retry path and gets the
-   old single-layer blending.
-
+   This is the only unimplemented feature left, and all of `multisampling`.
+2. **No line rasterization.** POINT_LIST works — see Architecture above.
 3. **Anisotropic filtering under-blurs relative to NVIDIA's — accepted, closed.**
    Vulkan leaves the anisotropic filter implementation-defined, llvmpipe differs
    from NVIDIA in the same direction, and cudapipe is closer to NVIDIA than
@@ -265,17 +259,30 @@ lanes and dropped by the writeback.
    follows is what is known, so it does not have to be rediscovered.
 
    This is nearly all of what is left in `texturemipmapgen`, and it also drives
-   most of `gltfscenerendering`. Forcing each of that sample's three sampler modes and
-   rendering both drivers separates it cleanly: no mipmaps differs by 19 pixels,
-   mipmaps with bilinear by 1095, mipmaps with anisotropy by 32237. So the
-   texture upload, the runtime-generated mip chain and LOD selection are all
-   effectively exact, and the specular `pow` is too — sampler 0 runs the same
-   `pow(dot(R, V), 16)` and still lands within 19 pixels.
+   most of `gltfscenerendering`. Forcing each of that sample's three sampler
+   modes and rendering both drivers separates it cleanly: no mipmaps differs by
+   19 pixels, mipmaps with bilinear by 1095, mipmaps with anisotropy by 32237.
+   So the texture upload, the runtime-generated mip chain and LOD selection are
+   all effectively exact, and the specular `pow` is too — sampler 0 runs the
+   same `pow(dot(R, V), 16)` and still lands within 19 pixels.
 
    The signature is contrast, not brightness: cudapipe is darker than the
    reference where the reference is dark and brighter where it is bright, by up
    to 20/255 in the top luminance band. Turning anisotropy off entirely
    overshoots the other way.
+
+   `gltfscenerendering` is the same thing amplified. Its fragment shader samples
+   a normal map and raises the result to the 32nd power, so an under-blurred
+   normal map becomes scattered specular glints on exactly the grazing-angle
+   surfaces where anisotropy applies — the side walls, the pillars and arches,
+   the curtain folds. Disabling anisotropy cuts the differences on the stone
+   pillars and arch from 2128 to 1233 and on the red curtain from 1723 to 757,
+   while making the frame as a whole worse (15697 to 29726), which is what tells
+   you the filter is under-blurring rather than simply wrong. The remaining
+   large per-pixel differences are paired: one pixel much brighter in cudapipe
+   and its neighbour much darker, on thin high-contrast features. There is no
+   global subpixel shift — a +-1 pixel search puts the minimum at (0, 0) by a
+   factor of fifteen.
 
    Two tap-placement schemes have been measured. The one in the tree spreads N
    taps over `rho_max * (N-1)/N`, which tiles the footprint exactly when
@@ -286,31 +293,35 @@ lanes and dropped by the writeback.
    `gltfscenerendering` 15697 -> 25036, `instancing` 3506 -> 5346,
    `texturecubemap` 4144 -> 4774. Do not re-apply it wholesale; the two halves of
    it have not been measured separately.
-4. **Alpha-tested geometry costs CP_DISCARD_LAYERS passes over the draw.**
+4. **A blended draw costs one `cuStreamSynchronize` per layer.** The host reads
+   a managed flag between passes to decide whether another is worth launching.
+   That is the first thing to attack if blended draws ever dominate a frame; the
+   flag could instead drive a device-side loop or a launch graph.
+5. **Peeling does not combine with the alpha-test retry loop.** Both want the
+   same multi-pass machinery for different reasons, so a shader that discards
+   keeps the retry path and gets the old single-layer blending. No sample in the
+   set needs both at once.
+6. **Alpha-tested geometry costs CP_DISCARD_LAYERS passes over the draw.**
    Visibility resolves before shading, so a fragment that discards has already
    displaced the one behind it; each pass records what discarded where and
    repeats so the next fragment can win. Sponza's foliage falls from 543
    discards to 1 within four passes; halving the layers from 8 to 4 costs it
    0.14% of the frame, and anything still discarding after the last layer is
    lost.
-5. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
+7. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
    compressed textures, and the capture has 576 BC images.
-6. **`gltfscenerendering` (1.70%) is mostly gap 3 above, amplified — closed
-   with it.** Its
-   fragment shader samples a normal map and then raises the result to the 32nd
-   power, so an under-blurred normal map turns into scattered specular glints on
-   exactly the grazing-angle surfaces where anisotropy applies — the side walls,
-   the pillars and arches, the curtain folds. Disabling anisotropy cuts the
-   differences on the stone pillars and arch from 2128 to 1233 and on the red
-   curtain from 1723 to 757, while making the frame as a whole worse (15697 to
-   29726), which is what tells you the filter is under-blurring rather than
-   simply wrong. The remaining large per-pixel differences are paired: one pixel
-   much brighter in cudapipe and its neighbour much darker, on thin
-   high-contrast features. There is no global subpixel shift — a +-1 pixel
-   search puts the minimum at (0, 0) by a factor of fifteen.
-
-   **`multithreading` (0.22%) still has no diagnosis.**
-7. `nir_op_fexp2`, `flog2` and lowered `fpow` still use the NVVM `.approx`
+8. **`multithreading` (0.23%) has no diagnosis**, and the sample is
+   nondeterministic: two runs of the same build differ, because thread
+   scheduling changes the order its command buffers are recorded. Do not read
+   its last few hundred pixels as signal.
+9. **`renderheadless`, `gltfscenerendering` and `pbribl` segfault during
+   teardown**, after writing their images. All 18 run clean under llvmpipe, so
+   these are cudapipe bugs rather than sample bugs. Never diagnosed.
+10. **`bindless_image_store` has no bounds check.** A latent memory-safety hole
+   rather than a visible bug — the one sample that stores dispatches
+   `width / 16`, so it never addresses out of range. The load path clamps the
+   address and selects the value back to zero; the store should drop instead.
+11. `nir_op_fexp2`, `flog2` and lowered `fpow` still use the NVVM `.approx`
    intrinsics. Routing pow to the CUDA library version was tried and changed the
    image without moving it closer to the reference, so it was reverted. `fsin`
    and `fcos` do *not* — see below.
@@ -387,11 +398,39 @@ declared un-displaced because the best *global* shift over a crop was (0.00,
 a median of 0.76 px and a tail to 9. Measure the thing that is claimed to be
 wrong, not an aggregate over it.
 
+**Rebuild the sample after editing it, and check the baseline still
+reproduces.** Forcing `texturemipmapgen` through each of its three sampler
+modes meant editing its `.cpp`; the source was restored afterwards but the
+binary was not rebuilt, so every run for the next hour was a bilinear render
+being compared against an anisotropic reference. It produced a confident and
+completely wrong conclusion — that llvmpipe's tap scheme "overshoots into
+blurrier" — which only came apart because two unrelated experiments returned
+byte-identical images. Re-render the baseline and `cmp` it against the last
+known-good frame before trusting any number that follows a change outside the
+driver.
+
+**Verify a refactor is bit-identical before layering behaviour on it.**
+Ordered blending needed its selection test in one place, so all three
+rasterizer stages were first routed through a single `emit_fragment()` with no
+intended change in behaviour, built, and swept: identical on every
+deterministic sample. Only then did the peel logic go in. When something broke
+afterwards there was no question about which half to look at. The alternative
+had already been demonstrated twice this project — a combined change whose two
+halves each looked plausible and whose failure implicated neither.
+
+**Not every sample is a deterministic oracle.** `multithreading` renders
+differently run to run on the same build, because thread scheduling changes the
+order its command buffers are recorded. That was quietly polluting a few
+hundred pixels of every comparison until two identical runs were diffed against
+each other. Before attributing a small delta to a change, check the sample
+against itself.
+
 **A guard has to sit at every site, not the shared helper.** The alpha-test
 reject check was added to `rasterize_pixel` and changed nothing, because all
 three rasterizer stages have their own inlined pixel loops; there are four
 `atomicMin` sites and only one went through the helper. Identical covered *and*
-discarded counts on every pass was the symptom.
+discarded counts on every pass was the symptom. The stages now all route
+through `emit_fragment()`, so there is one site again — keep it that way.
 
 **Procedural hashes are a poor oracle.** `starfield.frag` builds stars from a
 hash that multiplies by ~440 and takes `fract`, so any last-bit difference in an
