@@ -89,8 +89,8 @@ before that.
 | Sample | Differing | Note |
 |---|---|---|
 | texturemipmapgen | 3.50% | anisotropic filter, accepted — see gap 3 |
-| multisampling | 2.58% | no MSAA |
-| particlesystem | 2.49% | blended fragments composite one layer, gap 3a |
+| multisampling | 2.58% | no MSAA, the last unimplemented feature |
+| particlesystem | 0.17% | |
 | gltfscenerendering | 1.70% | anisotropic filter, accepted — see gap 6 |
 | texturecubemap | 0.45% | reflection sharper than the reference at grazing angles |
 | instancing | 0.38% | mostly the procedural starfield, see below |
@@ -220,27 +220,41 @@ lanes and dropped by the writeback.
 
    `particlesystem` still differs, but no longer because of points — see
    gap 3a.
-3a. **Only the nearest fragment of a blended draw is composited.** The
-   visibility buffer resolves one winner per pixel per draw, which is right for
-   opaque geometry and wrong for transparency: every overlapping fragment has
-   to be blended, not just the closest. `particlesystem` is the first sample to
-   lean on this. Its fire is 512 additive point sprites of 70 to 100 pixels
-   each, piled into a small part of the frame, so a pixel there has tens of
-   fragments and cudapipe keeps one — the fire comes out as a single soft blob
-   with hard squares punched in it where a nearer sprite hid the rest.
+3a. **Blended draws composite every layer, in submission order.** The
+   visibility buffer resolves one winner per pixel, which is what makes opaque
+   overdraw cost a single shade and is exactly wrong for transparency.
+   `particlesystem` was the first sample to lean on it: its fire is 512
+   additive sprites piled tens deep, and it came out as one sprite with holes
+   punched in it where a nearer one hid the rest.
 
-   The machinery to fix it already exists in another guise. The alpha-test
-   retry loop records, per pixel and per layer, which triangle already had its
-   turn, and repeats the draw so the next one can win; that is depth peeling
-   with the layers used for a different purpose. Peeling a blended draw needs
-   the same buffers and roughly as many passes as the deepest pile of
-   fragments, which for this sample is tens rather than the four the alpha-test
-   path settles at. Not attempted.
+   llvmpipe never has this problem because it does not defer — it bins
+   primitives per tile and replays each tile's list in submission order,
+   shading and blending inline, so ordering falls out of the data structure
+   (`tri_rasterize_bin` in lp_rast.c walks the bin's command blocks in the
+   order lp_setup_tri.c appended them, and the blend is generated into the
+   fragment shader itself by `generate_unswizzled_blend`).
 
-   Additive blending is order-independent, so that case could instead shade
-   every fragment and accumulate atomically, without peeling at all. This draw
-   is src=ONE dst=INV_SRC_ALPHA, which is additive exactly when the shader
-   writes alpha 0 — the flame does, the smoke does not.
+   cudapipe reaches the same semantics by peeling rather than by binning. With
+   `blend_peel` set, the visibility buffer keys on the primitive index instead
+   of depth, so the same atomicMin selects the lowest numbered primitive a
+   pixel has not composited yet; the pass blends it, `cp_peel_advance` steps
+   that pixel past it, and the draw repeats. Both do one shade per fragment
+   per pixel — llvmpipe serializes them within a tile, this serializes them
+   across passes and keeps every pixel parallel within one.
+
+   Passes are bounded by the primitive count and by CP_BLEND_LAYERS, and the
+   loop stops as soon as a pass finds nothing left, which is the second pass
+   for the blended draws that do not overlap themselves. The fire converges at
+   256 layers — 1024 gives a bit-identical image — and goes from 23106
+   differing pixels to 1533.
+
+   Two things to know before touching it. The host reads a managed flag
+   between passes to decide whether to continue, so a blended draw costs one
+   `cuStreamSynchronize` per layer; that is the first thing to attack if
+   blended draws dominate a frame. And peeling does not combine with the
+   alpha-test retry loop yet, which owns the same multi-pass machinery for its
+   own reasons, so a shader that discards keeps the retry path and gets the
+   old single-layer blending.
 
 3. **Anisotropic filtering under-blurs relative to NVIDIA's — accepted, closed.**
    Vulkan leaves the anisotropic filter implementation-defined, llvmpipe differs

@@ -386,8 +386,28 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
          return;
    }
 
-   uint32_t key = args->depth_key_invert ? ~depth_uint : depth_uint;
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args->framebuffer;
+
+   /*
+    * Ordered blending picks by submission order rather than by depth: the
+    * lowest numbered primitive this pixel has not composited yet. Keying the
+    * visibility buffer on the primitive index makes the same atomicMin do it.
+    */
+   if (args->blend_peel) {
+      uint32_t idx = py * args->width + px;
+      const uint32_t *next = (const uint32_t *)(uintptr_t)args->peel_next;
+      if (tri_id < next[idx])
+         return;
+      atomicMin(&visbuf[idx], PACK_VISBUF(tri_id, tri_id));
+      /* Tells the host another pass is worth running. Racing writers all store
+       * the same value, so the read first is only there to spare the traffic. */
+      uint32_t *any = (uint32_t *)(uintptr_t)args->peel_any;
+      if (any && !*any)
+         *any = 1u;
+      return;
+   }
+
+   uint32_t key = args->depth_key_invert ? ~depth_uint : depth_uint;
    atomicMin(&visbuf[py * args->width + px], PACK_VISBUF(key, tri_id));
 }
 
@@ -411,58 +431,6 @@ rasterize_point(struct cp_rasterize_args *args, struct tri_setup *s,
          emit_fragment(args, tri_id, px, py, s->ndc_z0);
       }
    }
-}
-
-static __device__ __forceinline__ void
-rasterize_pixel(struct cp_rasterize_args *args, struct tri_setup *s,
-                uint32_t tri_id, int px, int py)
-{
-   if (cp_tri_rejected(args, tri_id, px, py))
-      return;
-
-   float cx = (float)px + 0.5f;
-   float cy = (float)py + 0.5f;
-
-   float e0 = edge_function(s->sx1, s->sy1, s->sx2, s->sy2, cx, cy);
-   float e1 = edge_function(s->sx2, s->sy2, s->sx0, s->sy0, cx, cy);
-   float e2 = edge_function(s->sx0, s->sy0, s->sx1, s->sy1, cx, cy);
-
-   if (!edge_inside(e0, s->e0_top_left) ||
-       !edge_inside(e1, s->e1_top_left) ||
-       !edge_inside(e2, s->e2_top_left))
-      return;
-
-   float w0 = e0 * s->inv_area;
-   float w1 = e1 * s->inv_area;
-   float w2 = 1.0f - w0 - w1;
-
-   float depth = w0 * s->ndc_z0 + w1 * s->ndc_z1 + w2 * s->ndc_z2;
-   depth = depth * 0.5f + 0.5f;
-
-   uint32_t depth_uint = float_to_sortable_uint(depth);
-
-   if (args->depth_test && args->depthbuf) {
-      uint32_t prev =
-         ((const uint32_t *)(uintptr_t)args->depthbuf)[py * args->width + px];
-      bool pass;
-      switch (args->depth_func) {
-      case CP_FUNC_NEVER:     pass = false; break;
-      case CP_FUNC_LESS:      pass = depth_uint <  prev; break;
-      case CP_FUNC_EQUAL:     pass = depth_uint == prev; break;
-      case CP_FUNC_LEQUAL:    pass = depth_uint <= prev; break;
-      case CP_FUNC_GREATER:   pass = depth_uint >  prev; break;
-      case CP_FUNC_NOTEQUAL:  pass = depth_uint != prev; break;
-      case CP_FUNC_GEQUAL:    pass = depth_uint >= prev; break;
-      default:                pass = true; break;
-      }
-      if (!pass)
-         return;
-   }
-
-   uint32_t key = args->depth_key_invert ? ~depth_uint : depth_uint;
-   uint64_t packed = PACK_VISBUF(key, tri_id);
-   uint64_t *visbuf = (uint64_t *)(uintptr_t)args->framebuffer;
-   atomicMin(&visbuf[py * args->width + px], packed);
 }
 
 /*
@@ -539,34 +507,8 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
             float w1 = e1 * s.inv_area;
             float w2 = 1.0f - w0 - w1;
 
-            float depth = w0 * s.ndc_z0 + w1 * s.ndc_z1 + w2 * s.ndc_z2;
-            depth = depth * 0.5f + 0.5f;
-
-            uint32_t depth_uint = float_to_sortable_uint(depth);
-
-            if (args.depth_test && args.depthbuf) {
-               uint32_t prev =
-                  ((const uint32_t *)(uintptr_t)args.depthbuf)[py * args.width + px];
-               bool pass;
-               switch (args.depth_func) {
-               case CP_FUNC_NEVER:     pass = false; break;
-               case CP_FUNC_LESS:      pass = depth_uint <  prev; break;
-               case CP_FUNC_EQUAL:     pass = depth_uint == prev; break;
-               case CP_FUNC_LEQUAL:    pass = depth_uint <= prev; break;
-               case CP_FUNC_GREATER:   pass = depth_uint >  prev; break;
-               case CP_FUNC_NOTEQUAL:  pass = depth_uint != prev; break;
-               case CP_FUNC_GEQUAL:    pass = depth_uint >= prev; break;
-               default:                pass = true; break;
-               }
-               if (!pass)
-                  continue;
-            }
-
-            if (!cp_tri_rejected(&args, tri_id, px, py)) {
-               uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
-               uint64_t packed = PACK_VISBUF(key, tri_id);
-               atomicMin(&visbuf[py * args.width + px], packed);
-            }
+            emit_fragment(&args, tri_id, px, py,
+                          w0 * s.ndc_z0 + w1 * s.ndc_z1 + w2 * s.ndc_z2);
          }
       }
    }
@@ -704,34 +646,8 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
       float w0 = e0 * inv_area;
       float w1 = e1 * inv_area;
 
-      float depth = w0 * ndc_z0 + w1 * ndc_z1 + (1.0f - w0 - w1) * ndc_z2;
-      depth = depth * 0.5f + 0.5f;
-
-      uint32_t depth_uint = float_to_sortable_uint(depth);
-
-      if (args.depth_test && args.depthbuf) {
-         uint32_t prev =
-            ((const uint32_t *)(uintptr_t)args.depthbuf)[py * args.width + px];
-         bool pass;
-         switch (args.depth_func) {
-         case CP_FUNC_NEVER:     pass = false; break;
-         case CP_FUNC_LESS:      pass = depth_uint <  prev; break;
-         case CP_FUNC_EQUAL:     pass = depth_uint == prev; break;
-         case CP_FUNC_LEQUAL:    pass = depth_uint <= prev; break;
-         case CP_FUNC_GREATER:   pass = depth_uint >  prev; break;
-         case CP_FUNC_NOTEQUAL:  pass = depth_uint != prev; break;
-         case CP_FUNC_GEQUAL:    pass = depth_uint >= prev; break;
-         default:                pass = true; break;
-         }
-         if (!pass)
-            continue;
-      }
-
-      if (!cp_tri_rejected(&args, tri_id, px, py)) {
-         uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
-         uint64_t packed = PACK_VISBUF(key, tri_id);
-         atomicMin(&visbuf[py * args.width + px], packed);
-      }
+      emit_fragment(&args, tri_id, px, py,
+                    w0 * ndc_z0 + w1 * ndc_z1 + (1.0f - w0 - w1) * ndc_z2);
    }
 }
 
@@ -845,37 +761,28 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
          float w0 = e0 * sh_inv_area;
          float w1 = e1 * sh_inv_area;
 
-         float depth = w0 * sh_ndc_z0 + w1 * sh_ndc_z1 +
-                       (1.0f - w0 - w1) * sh_ndc_z2;
-         depth = depth * 0.5f + 0.5f;
-
-         uint32_t depth_uint = float_to_sortable_uint(depth);
-
-         if (args.depth_test && args.depthbuf) {
-            uint32_t prev =
-               ((const uint32_t *)(uintptr_t)args.depthbuf)[py * args.width + px];
-            bool pass;
-            switch (args.depth_func) {
-            case CP_FUNC_NEVER:     pass = false; break;
-            case CP_FUNC_LESS:      pass = depth_uint <  prev; break;
-            case CP_FUNC_EQUAL:     pass = depth_uint == prev; break;
-            case CP_FUNC_LEQUAL:    pass = depth_uint <= prev; break;
-            case CP_FUNC_GREATER:   pass = depth_uint >  prev; break;
-            case CP_FUNC_NOTEQUAL:  pass = depth_uint != prev; break;
-            case CP_FUNC_GEQUAL:    pass = depth_uint >= prev; break;
-            default:                pass = true; break;
-            }
-            if (!pass)
-               continue;
-         }
-
-         if (!cp_tri_rejected(&args, tri_id, px, py)) {
-            uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
-            uint64_t packed = PACK_VISBUF(key, tri_id);
-            atomicMin(&visbuf[py * args.width + px], packed);
-         }
+         emit_fragment(&args, tri_id, px, py,
+                       w0 * sh_ndc_z0 + w1 * sh_ndc_z1 +
+                       (1.0f - w0 - w1) * sh_ndc_z2);
       }
    }
+}
+
+/*
+ * Step every pixel past the layer it just composited, so the next pass picks
+ * up the one after it. A pixel the pass did not touch keeps its place.
+ */
+extern "C" __global__ void
+cp_peel_advance(uint64_t *visbuf, uint32_t *peel_next,
+                uint32_t width, uint32_t height)
+{
+   uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+   if (x >= width || y >= height)
+      return;
+   uint64_t entry = visbuf[y * width + x];
+   if (entry != VISBUF_EMPTY)
+      peel_next[y * width + x] = VISBUF_TRIID(entry) + 1u;
 }
 
 /*

@@ -94,6 +94,17 @@ struct cp_rasterize_args {
     */
    uint32_t point_mode;
    int32_t psiz_slot;       /* VS output slot holding VARYING_SLOT_PSIZ, -1 if none */
+   /*
+    * Ordered blending. A blended draw cannot resolve to one fragment per
+    * pixel: every layer has to be composited, in the order the primitives were
+    * submitted. Instead of the nearest fragment, the visibility buffer then
+    * selects the lowest numbered primitive at or after peel_next, and the host
+    * repeats the draw, advancing peel_next past whatever was blended, until
+    * nothing is left.
+    */
+   uint64_t peel_next;      /* uint32 per pixel: first primitive not yet blended */
+   uint64_t peel_any;       /* uint32: set when any pixel still had a layer */
+   uint32_t blend_peel;
 };
 
 /* Passes an alpha-tested draw gets to find a fragment that survives. Each one
@@ -423,6 +434,9 @@ struct cp_draw_params {
 
 /* Bound on the per-point rasterization loop, and the point size clamp. */
 #define CP_MAX_POINT_SIZE    256.0f
+
+/* How deep a pile of blended fragments one draw will composite. */
+#define CP_BLEND_LAYERS      256
 #define CP_MAX_NONTRIVIAL    1000000
 #define CP_MAX_HUGE_TILES    2000000
 

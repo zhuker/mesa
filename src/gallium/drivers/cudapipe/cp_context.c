@@ -59,6 +59,8 @@ cp_destroy_context(struct pipe_context *ctx)
       cuMemFree(cp->depthbuf);
    if (cp->reject)
       cuMemFree(cp->reject);
+   if (cp->peel_any)
+      cuMemFree(cp->peel_any);
    if (cp->resolved)
       cuMemFree(cp->resolved);
    if (cp->rast_nontrivial)
@@ -95,10 +97,13 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
          cuMemFree(cp->reject);
       if (cp->resolved)
          cuMemFree(cp->resolved);
+      if (cp->peel_next)
+         cuMemFree(cp->peel_next);
       cp->visbuf = 0;
       cp->depthbuf = 0;
       cp->reject = 0;
       cp->resolved = 0;
+      cp->peel_next = 0;
       cp->visbuf_w = cp->depthbuf_w = w;
       cp->visbuf_h = cp->depthbuf_h = h;
       if (w > 0 && h > 0) {
@@ -108,6 +113,12 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
          cuMemAlloc(&cp->reject,
                     (size_t)w * h * CP_DISCARD_LAYERS * sizeof(uint32_t));
          cuMemAlloc(&cp->resolved, (size_t)w * h);
+         cuMemAlloc(&cp->peel_next, (size_t)w * h * sizeof(uint32_t));
+         /* Managed, because the host reads it between passes to decide
+          * whether another one is worth launching. */
+         if (!cp->peel_any)
+            cuMemAllocManaged(&cp->peel_any, sizeof(uint32_t),
+                              CU_MEM_ATTACH_GLOBAL);
          if (e1 != CUDA_SUCCESS || e2 != CUDA_SUCCESS)
             fprintf(stderr, "cudapipe: visbuf/depthbuf alloc %ux%u failed "
                     "(%d, %d)\n", w, h, e1, e2);
@@ -1337,7 +1348,41 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
     */
    bool retry = cp->fs_shader && cp->fs_shader->uses_discard &&
                 cp->reject && cp->resolved && color_data;
-   unsigned passes = retry ? CP_DISCARD_LAYERS : 1;
+
+   /*
+    * Blended geometry needs every layer, not the nearest one. The visibility
+    * buffer resolves a single fragment per pixel, which is what makes opaque
+    * overdraw cost one shade — and exactly wrong for transparency, where
+    * particlesystem's fire is tens of additive sprites deep and came out as
+    * one sprite with holes punched in it.
+    *
+    * llvmpipe has no such problem because it never defers: it bins primitives
+    * per tile and replays each tile's list in submission order, shading and
+    * blending inline, so ordering falls out of the data structure. The same
+    * semantics reach the same place here by peeling instead — each pass takes
+    * the earliest primitive a pixel has not composited yet, blends it, and
+    * steps past it. Both do one shade per fragment per pixel; llvmpipe
+    * serializes them within a tile, this serializes them across passes and
+    * keeps every pixel in parallel within one.
+    *
+    * Discard already owns the multi-pass machinery for its own reasons, so the
+    * two do not combine yet and alpha-tested draws keep the retry path.
+    */
+   bool peel = !retry && color_data && cp->blend_enabled &&
+               cp->peel_next && screen->kernels.peel_advance;
+   /* A draw can never stack more layers than it has primitives, so a blended
+    * draw of two triangles costs two passes rather than the cap. */
+   unsigned peel_passes = MIN2((unsigned)CP_BLEND_LAYERS,
+                               MAX2(num_triangles, 1u));
+   unsigned passes = retry ? CP_DISCARD_LAYERS
+                   : peel ? peel_passes : 1;
+
+   if (peel) {
+      cuMemsetD32(cp->peel_next, 0, (size_t)w * h);
+      rast_args.peel_next = cp->peel_next;
+      rast_args.peel_any = cp->peel_any;
+      rast_args.blend_peel = 1;
+   }
 
    if (retry) {
       cuMemsetD8(cp->resolved, 0, (size_t)w * h);
@@ -1354,6 +1399,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2);
          rast_args.reject_passes = pass;
       }
+      if (peel)
+         *(volatile uint32_t *)(uintptr_t)cp->peel_any = 0;
       cuMemsetD32(cp->rast_nontrivial_count, 0, 1);
       cuMemsetD32(cp->rast_huge_count, 0, 1);
 
@@ -1389,6 +1436,19 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                             retry ? cp->reject : 0,
                             retry ? cp->resolved : 0,
                             pass, &timing);
+
+      if (peel) {
+         /* Step past what this pass blended, and stop as soon as a pass finds
+          * nothing left to composite — which is the common case on the second
+          * pass, since most blended draws do not overlap themselves. */
+         void *pa_params[] = { &visbuf, &cp->peel_next, &w, &h };
+         cuLaunchKernel(screen->kernels.peel_advance,
+                        (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
+                        0, NULL, pa_params, NULL);
+         cuStreamSynchronize(NULL);
+         if (!*(volatile uint32_t *)(uintptr_t)cp->peel_any)
+            break;
+      }
    }
 
    if (cp_timing_enabled()) {
