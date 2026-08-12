@@ -200,24 +200,75 @@ def frame_diffs(root, ref, drivers, samples, tol, recompute):
     return cache[key]
 
 
+def _run(cmd):
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=1800)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def export_frames(root, drivers, samples, img_dir, width):
-    """Every frame to JPEG so the page can show it. Skips what already exists."""
-    os.makedirs(img_dir, exist_ok=True)
+    """Every frame twice: a JPEG to lay out with, and a PNG to inspect.
+
+    The thumbnails are what the page shows; the full resolution PNGs are what a
+    click opens, because a lossy thumbnail is no good for deciding whether a
+    pixel is wrong.
+    """
     for drv in drivers:
         for sample in samples:
             pat, n = frame_pattern(os.path.join(root, drv), sample)
             if not pat:
                 continue
-            out_dir = os.path.join(img_dir, drv, sample)
-            if os.path.isdir(out_dir) and len(os.listdir(out_dir)) >= n:
-                continue
-            os.makedirs(out_dir, exist_ok=True)
-            subprocess.run(
-                ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                 '-i', pat, '-vf', f'scale={width}:-2', '-q:v', '4',
-                 os.path.join(out_dir, '%04d.jpg')],
-                capture_output=True, timeout=900)
+            small = os.path.join(img_dir, drv, sample)
+            full = os.path.join(img_dir, drv, sample, 'full')
+            if not (os.path.isdir(small) and
+                    len([f for f in os.listdir(small) if f.endswith('.jpg')]) >= n):
+                os.makedirs(small, exist_ok=True)
+                _run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                      '-i', pat, '-vf', f'scale={width}:-2', '-q:v', '4',
+                      os.path.join(small, '%04d.jpg')])
+            if not (os.path.isdir(full) and len(os.listdir(full)) >= n):
+                os.makedirs(full, exist_ok=True)
+                _run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                      '-i', pat, os.path.join(full, '%04d.png')])
             print(f'  frames {drv}/{sample}', flush=True)
+
+
+# The difference, contrast stretched so it is visible at all: a handful of
+# levels out of 255 is invisible otherwise. The stretch means the image says
+# "here", not "by how much" — the chart above it carries the magnitude.
+DIFF_FILTER = ("[0][1]blend=all_mode=difference,eq=contrast={gain}:brightness=0.02")
+
+
+def export_diffs(root, ref, drivers, samples, img_dir, width, gain):
+    """A difference image per frame, per driver under test, at both sizes."""
+    ref_dir = os.path.join(root, ref)
+    for drv in drivers:
+        if drv == ref:
+            continue
+        for sample in samples:
+            rp, n = frame_pattern(ref_dir, sample)
+            tp, _ = frame_pattern(os.path.join(root, drv), sample)
+            if not rp or not tp:
+                continue
+            small = os.path.join(img_dir, '_diff', drv, sample)
+            full = os.path.join(small, 'full')
+            need_small = not (os.path.isdir(small) and len(
+                [f for f in os.listdir(small) if f.endswith('.jpg')]) >= n)
+            need_full = not (os.path.isdir(full) and len(os.listdir(full)) >= n)
+            if need_small:
+                os.makedirs(small, exist_ok=True)
+                _run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                      '-i', rp, '-i', tp, '-filter_complex',
+                      DIFF_FILTER.format(gain=gain) + f',scale={width}:-2',
+                      '-q:v', '4', os.path.join(small, '%04d.jpg')])
+            if need_full:
+                os.makedirs(full, exist_ok=True)
+                _run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                      '-i', rp, '-i', tp, '-filter_complex',
+                      DIFF_FILTER.format(gain=gain),
+                      os.path.join(full, '%04d.png')])
+            print(f'  diffs {drv}/{sample}', flush=True)
 
 
 # ----------------------------------------------------------------- charts ---
@@ -381,7 +432,18 @@ circle.s7{{fill:var(--s7)}} circle.s8{{fill:var(--s8)}}
 .panes figure{{margin:0}}
 .panes figcaption{{font-size:11px;color:var(--muted);margin-bottom:.2rem}}
 .panes img{{width:100%;height:auto;display:block;border-radius:4px;background:#000}}
+.hint{{opacity:.65}}
+.flip{{position:relative;display:block}}
+.flip img.over{{position:absolute;inset:0;opacity:0;transition:opacity .08s}}
+.flip:hover img.over{{opacity:1}}
+.zoom{{cursor:zoom-in}}
+#lightbox{{display:none;position:fixed;inset:0;z-index:50;overflow:auto;
+  background:rgba(0,0,0,.93);cursor:zoom-out;padding:0}}
+#lightbox.on{{display:block}}
+#lightbox img{{display:block;margin:0 auto;width:auto;max-width:none;
+  image-rendering:pixelated}}
 </style>
+<div id="lightbox"><img id="lb-img" alt=""></div>
 <div class="wrap">
 <h1>{title}</h1>
 <p class="sub">{subtitle}</p>
@@ -409,7 +471,10 @@ def main():
     ap.add_argument('--no-frames', action='store_true',
                     help='skip exporting frames; charts only, no viewer')
     ap.add_argument('--frame-width', type=int, default=560,
-                    help='width of the exported frames (default 560)')
+                    help='width of the inline frames (default 560); the '
+                         'full resolution copies a click opens are native')
+    ap.add_argument('--diff-gain', type=int, default=12,
+                    help='contrast stretch on the difference images (default 12)')
     ap.add_argument('--recompute', action='store_true',
                     help='ignore the cached frame differences')
     ap.add_argument('--title', default='Driver sweep')
@@ -440,6 +505,9 @@ def main():
     if not args.no_frames:
         print('exporting frames…')
         export_frames(args.root, drivers, samples, img_dir, args.frame_width)
+        print('exporting difference images…')
+        export_diffs(args.root, args.ref, drivers, samples, img_dir,
+                     args.frame_width, args.diff_gain)
 
     body = []
 
@@ -539,12 +607,36 @@ def main():
         # frame, because that is the one the chart was pointing at.
         viewer = ''
         if not args.no_frames and nframes:
-            panes = ''.join(
-                f'<figure><figcaption>{html.escape(d)}</figcaption>'
-                f'<img loading="lazy" data-driver="{html.escape(d)}" '
-                f'data-sample="{html.escape(s)}" '
-                f'src="{img_rel}/{d}/{s}/{worst_at + 1:04d}.jpg" alt=""></figure>'
-                for d in drivers)
+            panes = []
+            for d in drivers:
+                n4 = f'{worst_at + 1:04d}'
+                src = f'{img_rel}/{d}/{s}/{n4}.jpg'
+                full = f'{img_rel}/{d}/{s}/full/{n4}.png'
+                if d == args.ref:
+                    panes.append(
+                        f'<figure><figcaption>{html.escape(d)}</figcaption>'
+                        f'<img class="zoom" loading="lazy" data-driver="{html.escape(d)}" '
+                        f'data-full="{full}" src="{src}" alt=""></figure>')
+                else:
+                    # The driver, flipping to its difference from the reference
+                    # on hover — the same gesture the single frame gallery uses.
+                    dsrc = f'{img_rel}/_diff/{d}/{s}/{n4}.jpg'
+                    dfull = f'{img_rel}/_diff/{d}/{s}/full/{n4}.png'
+                    panes.append(
+                        f'<figure><figcaption>{html.escape(d)} '
+                        f'<span class="hint">hover: difference</span></figcaption>'
+                        f'<span class="flip zoom" data-full="{full}">'
+                        f'<img loading="lazy" data-driver="{html.escape(d)}" '
+                        f'src="{src}" alt="">'
+                        f'<img class="over" loading="lazy" '
+                        f'data-diff="{html.escape(d)}" src="{dsrc}" alt="">'
+                        f'</span></figure>')
+                    panes.append(
+                        f'<figure><figcaption>difference &times;'
+                        f'{args.diff_gain}</figcaption>'
+                        f'<img class="zoom" loading="lazy" '
+                        f'data-diff="{html.escape(d)}" data-full="{dfull}" '
+                        f'src="{dsrc}" alt=""></figure>')
             viewer = (
                 f'<div class="viewer" data-sample="{html.escape(s)}" '
                 f'data-base="{img_rel}">'
@@ -552,28 +644,50 @@ def main():
                 f'max="{nframes - 1}" value="{worst_at}" '
                 f'aria-label="frame"><span class="frameno">frame '
                 f'{worst_at}</span></div>'
-                f'<div class="panes">{panes}</div></div>')
+                f'<div class="panes">{"".join(panes)}</div></div>')
 
         cards.append(f'<div class="card"><h3>{html.escape(s)}</h3>{svg}'
                      f'<p class="note" style="margin:.3rem 0 .5rem">{cap}</p>'
                      f'{viewer}</div>')
     body.append('<div class="grid2">' + ''.join(cards) + '</div>')
 
-    body.append("""<script>
-// Seeking is just swapping the src of each pane; the frames are already on
-// disk, one JPEG per driver per frame.
+    body.append(r"""<script>
+// Seeking swaps the src of every pane, the driver frames and the difference
+// images alike; they are all on disk, one file per driver per frame.
 document.querySelectorAll('.viewer').forEach(function (v) {
   var slider = v.querySelector('input[type=range]');
   var label  = v.querySelector('.frameno');
-  var imgs   = v.querySelectorAll('img');
   var base   = v.dataset.base, sample = v.dataset.sample;
   slider.addEventListener('input', function () {
     var n = String(+slider.value + 1).padStart(4, '0');
     label.textContent = 'frame ' + slider.value;
-    imgs.forEach(function (img) {
+    v.querySelectorAll('img[data-driver]').forEach(function (img) {
       img.src = base + '/' + img.dataset.driver + '/' + sample + '/' + n + '.jpg';
     });
+    v.querySelectorAll('img[data-diff]').forEach(function (img) {
+      img.src = base + '/_diff/' + img.dataset.diff + '/' + sample + '/' + n + '.jpg';
+    });
+    v.querySelectorAll('[data-full]').forEach(function (el) {
+      var f = el.dataset.full;
+      el.dataset.full = f.replace(/\/[0-9]{4}\.png$/, '/' + n + '.png');
+    });
   });
+});
+
+// Click any pane for the full resolution PNG. Nearest neighbour, so a single
+// differing pixel stays a single crisp pixel.
+var lb = document.getElementById('lightbox');
+document.addEventListener('click', function (e) {
+  var z = e.target.closest('.zoom');
+  if (z) {
+    document.getElementById('lb-img').src = z.dataset.full;
+    lb.classList.add('on');
+    return;
+  }
+  if (e.target.closest('#lightbox')) lb.classList.remove('on');
+});
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') lb.classList.remove('on');
 });
 </script>""")
 
