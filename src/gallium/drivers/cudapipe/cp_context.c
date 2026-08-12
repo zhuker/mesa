@@ -2651,6 +2651,13 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.sampler_view_destroy = cp_sampler_view_destroy;
    ctx->base.set_sampler_views = cp_set_sampler_views;
 
+   /*
+    * pipe_resource_release() calls this through the context, not the screen,
+    * and a driver that leaves it null gets a jump to address zero when
+    * lavapipe tears its upload manager down. Four samples were dying there
+    * after rendering correctly. llvmpipe uses the same default.
+    */
+   ctx->base.resource_release = u_default_resource_release;
    ctx->base.set_framebuffer_state = cp_set_framebuffer_state;
    ctx->base.set_viewport_states = cp_set_viewport_states;
    ctx->base.set_scissor_states = cp_set_scissor_states;
