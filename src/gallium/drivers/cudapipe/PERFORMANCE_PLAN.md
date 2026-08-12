@@ -53,7 +53,7 @@ standing regressions (`gltfscenerendering`, `texture3d`) included.
 
 | | baseline | now |  |
 |---|---|---|---|
-| **total over the sweep** | **3792.15 ms** | **209.04 ms** | **18.1x** |
+| **total over the sweep** | **3792.15 ms** | **205.32 ms** | **18.5x** |
 | llvmpipe, same sweep | 233.00 ms | 233.00 ms | — |
 
 cudapipe began 16x slower than llvmpipe over the set and is now slightly ahead
@@ -93,17 +93,31 @@ more of them before starting anything structural.
 
 | sample | ms | vs llvmpipe | why |
 |---|---|---|---|
-| particlesystem | 55.57 | 3.5x slower | 260 peel passes a frame; Phase 3 |
-| multithreading | 49.94 | **2x faster** | 343 draws each paying full-screen costs |
-| instancing | 28.44 | **2.6x faster** | |
-| dynamicuniformbuffer | 22.94 | **21x slower** | the clearest outlier left, unexplained |
-| gltfscenerendering | 19.85 | 1.3x slower | |
-| bloom | 12.68 | 3.6x slower | full-screen passes |
+| particlesystem | 55.11 | 3.5x slower | 260 peel passes a frame; Phase 3 |
+| multithreading | 48.39 | **2x faster** | 343 draws each paying full-screen costs |
+| instancing | 27.62 | **2.7x faster** | |
+| dynamicuniformbuffer | 22.42 | **20x slower** | launch-bound; see below |
+| gltfscenerendering | 19.79 | 1.3x slower | |
+| bloom | 12.44 | 3.5x slower | full-screen passes |
 
 Two things stand out, and neither needs Phase 3:
 
-- **`dynamicuniformbuffer` is 21x slower than llvmpipe**, and nothing else in
-  the set is off by that margin. It has not been profiled. Do that first.
+- **`dynamicuniformbuffer` is 20x slower than llvmpipe**, and nothing else in
+  the set is off by that margin. Profiled: it is **launch-bound**, not
+  kernel-bound. It draws 625 cubes of twelve triangles a frame, and each draw
+  costs nine kernel launches and five memsets — 5,635 launches a frame, 10.4 ms
+  of host time in `cuLaunchKernel` alone against a 22 ms frame. Its vertex
+  shader launches one block for 36 vertices. Sizing the grids down helped by 2%
+  and could not help more, because the cost is the number of launches rather
+  than their size.
+
+  Two ways out, both structural. Merge stages, so a draw costs fewer kernels —
+  cuRE's argument for a persistent megakernel (see References) is exactly this,
+  and it is the one reference in this document that argues against cudapipe's
+  present decomposition. Or batch draws, which is Phase 3: if primitives from
+  several draws can share a binning pass, per-draw cost stops scaling with draw
+  count. Note that llvmpipe is 20x faster here for the structural reason that it
+  has no per-draw launch at all.
 - **Per-draw full-screen work.** `cp_fs_interpolate` launches one thread per
   quad of the whole framebuffer on every draw and every peel pass, and the
   visibility buffer is memset whole (7.4 MB) just as often — both regardless of
