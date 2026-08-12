@@ -46,9 +46,8 @@ VK_DRIVER_FILES=$PWD/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv
 
 The Sascha Willems samples at `~/git/Vulkan` all render offscreen and
 reproducibly, which makes them a differential oracle: run the same binary
-against the NVIDIA ICD and against cudapipe, and diff the frames. This is a far
-stronger signal than dEQP's per-feature pass/fail, and it found every bug fixed
-so far.
+against the NVIDIA ICD and against cudapipe, and diff the frames. That is a far
+stronger signal than dEQP's pass/fail, and it found every bug fixed so far.
 
 `tests/headless_streamer_samples.txt` is the minimal set — each entry is the
 simplest sample covering a capability the capture needs, with the mapping in the
@@ -69,37 +68,46 @@ python3 ~/mesa/src/gallium/drivers/cudapipe/tests/cp_gallery.py ref cuda \
     -o cudapipe_vs_nvidia.html
 ```
 
-`cp_compare.py` diffs two images (PNG or the PPM the samples write) and prints a
+`cp_compare.py` diffs two images (PNG, or the PPM the samples write) and prints a
 percentage plus an ASCII map. `cp_gallery.py` builds an HTML page: summary table
 sorted worst-first, then reference / result / difference per sample, every panel
-full resolution and clickable, with the result hover-flipping to the reference.
+full resolution and clickable, the result hover-flipping to the reference.
+
+**Editing a sample's shader is the fastest way to bisect a difference.** The
+samples load `.spv` at runtime, so `glslangValidator -V shader.vert -o
+shader.vert.spv` and re-running both drivers takes seconds and needs no C++
+rebuild. Two bugs below were found that way after static reasoning got them
+wrong; back the `.spv` up first and restore it afterwards.
 
 ## Status
 
-Differing pixels versus the NVIDIA driver at tolerance 8/255:
+Differing pixels versus the NVIDIA driver at tolerance 8/255, worst first.
+Total across the set: 110,015, from 143,856 before the quad-derivative work and
+far more before that.
 
 | Sample | Differing | Note |
 |---|---|---|
-| triangle | 0 | |
-| pushconstants | 0 | |
-| negativeviewportheight | 0 | |
-| renderheadless | 0 | host readback path |
-| texture3d | 4 | |
-| bloom | 10 | |
-| dynamicuniformbuffer | 15 | |
-| vulkanscene | 27 | |
-| texture | 593 | anisotropic taps on a slightly tilted quad |
-| multithreading | 0.22% | speckle, cause unknown |
-| computeshader | 0.31% | |
-| texturecubemap | 0.53% | |
-| particlesystem | 2.51% | no POINT_LIST rasterization |
+| texturemipmapgen | 3.50% | anisotropic filter fidelity |
 | multisampling | 2.58% | no MSAA |
+| particlesystem | 2.51% | no POINT_LIST rasterization |
+| gltfscenerendering | 1.70% | no diagnosis |
+| texturecubemap | 0.53% | |
+| instancing | 0.38% | mostly the procedural starfield, see below |
+| computeshader | 0.31% | |
+| multithreading | 0.22% | speckle, no diagnosis |
 | pbribl | 0.14% | |
-| texturemipmapgen | 3.50% | anisotropic filter differences |
-| gltfscenerendering | 1.70% | |
-| instancing | 0.38% | |
+| texture | 591 px | anisotropic taps on a slightly tilted quad |
+| vulkanscene | 27 px | |
+| dynamicuniformbuffer | 15 px | |
+| bloom | 10 px | |
+| texture3d | 4 px | |
+| renderheadless | 0 | the host readback path |
+| negativeviewportheight | 0 | |
+| pushconstants | 0 | |
+| triangle | 0 | |
 
-Ten of eighteen are within a handful of pixels, from one before this work.
+Fourteen of eighteen are within a handful of pixels, from one before this work.
+Of the four that are not, two are unimplemented features rather than defects.
 
 ## Architecture
 
@@ -115,9 +123,10 @@ cudapipe Gallium driver
     │   2. Vertex shader kernel (NIR → PTX)
     │   3. cp_clip_triangles    (near plane and w > 0)
     │   4. cp_rasterize_stage1/2/3 (adaptive: thread, warp, block per tile)
-    │   5. cp_fs_interpolate    (compact covered pixels, interpolate varyings)
-    │   6. Fragment shader kernel (one thread per covered pixel)
-    │   7. cp_fs_writeback      (discard mask, blend, into the attachment)
+    │   5. cp_fs_interpolate    (compact into 2x2 quads, interpolate varyings)
+    │   6. Fragment shader kernel (four threads per quad)
+    │   7. cp_fs_writeback      (drop helpers, discard mask, blend, attachment)
+    │   steps 4-7 repeat up to CP_DISCARD_LAYERS times for an alpha-tested draw
     └── flush: cuCtxSynchronize + scratch reclaim
 ```
 
@@ -136,47 +145,94 @@ array of pointers:
 | 8 | discard mask (fragment stage) |
 | 18.. | uniform/descriptor buffers |
 
+**Fragments are shaded four to a 2x2 quad**, so the sampler can take
+screen-space derivatives by shuffling between lanes rather than reading a stored
+per-varying derivative. That is what lets a coordinate the shader computed for
+itself — a reflection vector — pick a mip level at all. A quad belongs to one
+triangle: `cp_fs_interpolate` emits a separate quad per distinct triangle in a
+2x2 block, because differencing across two triangles produces a meaningless
+derivative at every seam. Corners no triangle covers are still shaded as helper
+lanes and dropped by the writeback.
+
 ## Known gaps, roughly by how much they matter
 
 1. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
-4. **No line or point rasterization.** The capture uses POINT_LIST.
-5. **Alpha-tested geometry** costs CP_DISCARD_LAYERS passes over the draw.
+2. **No line or point rasterization.** The capture uses POINT_LIST.
+3. **Anisotropic filtering does not match NVIDIA's**, which is most of what is
+   left in `texturemipmapgen`. The implementation follows llvmpipe; the residual
+   peaks at mid distance where the filter does the most work.
+4. **Alpha-tested geometry costs CP_DISCARD_LAYERS passes over the draw.**
    Visibility resolves before shading, so a fragment that discards has already
    displaced the one behind it; each pass records what discarded where and
-   repeats so the next fragment can win. Four layers took Sponza's foliage from
-   543 discards to 1 across the passes. Anything still discarding after the
-   last layer is lost.
-6. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
+   repeats so the next fragment can win. Sponza's foliage falls from 543
+   discards to 1 within four passes; halving the layers from 8 to 4 costs it
+   0.14% of the frame, and anything still discarding after the last layer is
+   lost.
+5. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
    compressed textures, and the capture has 576 BC images.
-7. `multithreading` (0.23%) has no diagnosis yet.
+6. **`gltfscenerendering` (1.70%) and `multithreading` (0.22%) have no
+   diagnosis.**
+7. `nir_op_fexp2`, `flog2` and lowered `fpow` still use the NVVM `.approx`
+   intrinsics. Routing pow to the CUDA library version was tried and changed the
+   image without moving it closer to the reference, so it was reverted. `fsin`
+   and `fcos` do *not* — see below.
 
-`instancing` was 8.56% and is now 0.38%: NIR was lowering sin/cos to a cheap
-polynomial (`.lower_sincos`), whose error is harmless when a shader rotates a
-direction but not when it rotates a *position*. The sample's asteroids orbit at
-radius 7 while their own vertices span 0.06 — an 80x lever that turned the
-polynomial's error into a visible displacement of every rock, while the very
-same sin in their local rotation was fine. The planet, which shares every
-matrix but is not instanced, never moved, which is what localised it.
+## Lessons that cost the most to learn
 
-Worth remembering how it was found, because static reasoning got it wrong twice:
-the sample's shader was edited directly (identity rotations, then each rotation
-restored one at a time, then the hardware sin/cos swapped for a Taylor
-polynomial) and re-run against both drivers. That bisect took minutes and was
-conclusive where estimating error magnitudes was not — an approximation good to
-1e-6 was dismissed as far too small to matter, and the real error was nearer
-1e-3.
+**An unimplemented operation that returns zero destroys everything downstream.**
+`textureSize` reading as zero made a blur kernel compute `1/0` for its tap
+offsets and sample at infinity, blackening a whole frame; `terminate_if`
+returning undef collapsed shaders; `gl_InstanceIndex` silently did nothing for a
+while. `CUDAPIPE_DEBUG_SHADER=1` lists them. Treat a zero from a missing feature
+as a fault, not a default.
 
-About a quarter of the sample's differing pixels are a separate and inherent
-effect: `starfield.frag` builds stars from a hash that multiplies by ~440 and
-takes `fract`, so any last-bit difference in an interpolated varying relocates
-stars. Two correct implementations disagree there. Treat a procedural hash like
-the checkerboard note above — a poor oracle, not a bug report.
+**A CUDA fault is sticky and surfaces at the wrong place.** An `imageLoad` one
+texel outside its image killed a whole frame: the context faulted, the next
+`cuMemAlloc` failed, and draws then bailed out for want of a visibility buffer
+several stages away from the cause. `compute-sanitizer` turns this back into a
+kernel name and a line.
 
-Related: `nir_op_fsin`, `fcos`, `fexp2` and `flog2` emit the NVVM `.approx`
-intrinsics unconditionally (`cp_nir_to_llvm.c:1316`), because the generic LLVM
-ones lower to device-less libcalls. Roughly 2 ULP, which is looser than Vulkan
-wants, though far too small to move geometry visibly. If tighter precision is
-ever needed, llvmpipe's `lp_build_sin`/`lp_build_cos` carry the polynomial.
+**Read the other Mesa backends before deriving an algorithm.** llvmpipe is in
+the same tree. `lp_bld_sample.c` had a better answer for anisotropic filtering
+than two hand-derived attempts, including the degenerate-case guards that are
+the hard part: `lp_apply_ellipse_transform` rewrites the derivative pair into
+the ellipse's own axes in closed form, and `lp_build_rho_aniso` divides the
+level of detail by the unrounded clamped ratio rather than the rounded tap
+count.
+
+**Bisect in the application's shader rather than estimating error magnitudes.**
+`instancing` was 8.56% because NIR lowered sin/cos to a cheap polynomial
+(`.lower_sincos`). The error is harmless when a shader rotates a *direction* and
+not when it rotates a *position*: those asteroids orbit at radius 7 with
+vertices spanning 0.06, an 80x lever. Static reasoning dismissed it twice — an
+approximation good to 1e-6 was "far too small to matter" and the real error was
+nearer 1e-3. Editing the shader to identity rotations, then restoring each in
+turn, then swapping the hardware sin/cos for a Taylor polynomial, settled it in
+minutes. `fsin`/`fcos` now call the CUDA library versions, carried by the
+sampler module which is already NVRTC-compiled and linked on demand.
+
+**Symmetric statistics hide per-object errors.** The same sample's rocks were
+declared un-displaced because the best *global* shift over a crop was (0.00,
+0.00) — a measure dominated by the unmoved majority. Per-object centroids showed
+a median of 0.76 px and a tail to 9. Measure the thing that is claimed to be
+wrong, not an aggregate over it.
+
+**A guard has to sit at every site, not the shared helper.** The alpha-test
+reject check was added to `rasterize_pixel` and changed nothing, because all
+three rasterizer stages have their own inlined pixel loops; there are four
+`atomicMin` sites and only one went through the helper. Identical covered *and*
+discarded counts on every pass was the symptom.
+
+**Procedural hashes are a poor oracle.** `starfield.frag` builds stars from a
+hash that multiplies by ~440 and takes `fract`, so any last-bit difference in an
+interpolated varying relocates a star. Two correct implementations disagree
+there; about a quarter of `instancing`'s remaining pixels are this. The same
+applies to a checkerboard test texture, where aliasing makes correct renderers
+disagree enormously — the offscreen bench uses a smooth gradient on purpose.
+
+**Record negative results.** Precise `pow` and forcing base-level LOD were both
+tried, measured, and reverted; without the note in the commit they would be
+retried.
 
 ## Debug
 
@@ -192,19 +248,10 @@ ever needed, llvmpipe's `lp_build_sin`/`lp_build_cos` carry the polynomial.
 | `CUDAPIPE_DEBUG_SHADER` | warn on unhandled NIR intrinsics |
 | `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
 
-**`compute-sanitizer` is the fastest way to diagnose a CUDA fault.** Errors 700
-(illegal address) and 716 (misaligned) are sticky and surface at whatever launch
-comes next, so the reported site is rarely the cause:
-
 ```bash
 /usr/local/cuda/bin/compute-sanitizer --tool memcheck --print-limit 2 \
     env VK_DRIVER_FILES=$ICD ./sample --offscreen -ofn out.ppm
 ```
-
-That is how the vertex-fetch alignment fault and the out-of-bounds `imageLoad`
-were found — the latter killed the whole frame, because once the context faults
-even `cuMemAlloc` fails, and draws then bailed out for want of a visibility
-buffer several stages away from the cause.
 
 ## Implementation notes
 
@@ -216,18 +263,12 @@ buffer several stages away from the cause.
 * `pipe_screen::allocate_memory` returns `cuMemAllocManaged` memory with
   `cuCtxSetCurrent` first, because lavapipe allocates from its submit thread. A
   context may be current on several threads at once.
-* **An unimplemented operation that returns zero destroys everything
-  downstream.** `textureSize` read as zero made a blur kernel compute `1/0` for
-  its tap offsets and sample at infinity, blackening the whole frame;
-  `terminate_if` returning undef collapsed shaders; `gl_InstanceIndex` silently
-  did nothing for a while. `CUDAPIPE_DEBUG_SHADER=1` lists them.
-* **Read the other Mesa backends before deriving an algorithm.** llvmpipe is in
-  the same tree, and `lp_bld_sample.c` had a better answer for anisotropic
-  filtering than two hand-derived attempts, including the degenerate-case
-  guards. The filter now follows `lp_build_rho_aniso()` and
-  `lp_apply_ellipse_transform()`: the derivative pair is rewritten into the
-  ellipse's own axes in closed form, and the level of detail divides by the
-  unrounded clamped ratio rather than the rounded tap count.
+* **Every level of a resource sits at its own `mip_offsets[level]`.** Leaving it
+  out of an address does not merely lose the small levels: `cp_resource_copy_region`
+  omitted it, so a mip chain built by copying into successive levels had level 0
+  written over and over and the rest untouched. That stayed invisible until
+  `textureLod` started being honoured. The same class of bug is why uploads of
+  level 1 once landed on level 0.
 * NIR keeps a storage image's format on the intrinsic and hands the shader
   whatever type it asked for, so the driver owns both the texel stride and the
   packing. Taking the stride from the destination type walks the image at the
@@ -236,6 +277,13 @@ buffer several stages away from the cause.
   shader taking a vec3 position as vec4 otherwise loses its transform's
   translation column — the geometry still draws and still writes depth, so it
   looks like a missing object rather than a broken one.
+* A draw with no vertex buffer is legitimate: a vertex shader may build its
+  positions from `gl_VertexIndex` alone, which is how a fullscreen pass is
+  drawn. `load_vertex_id` reads the id array rather than recomputing it, so
+  shaders carry `reads_vertex_id` and the array is materialised only for those.
+* `bind_rasterizer_state` carries the cull mode. Drawing what should have been
+  culled is not just wasted work — a back face can win the depth test and hide
+  the surface in front of it.
 * LLVM's NVPTX backend only knows architectures that existed when it was
   released, so `CP_MAX_PTX_SM` in `cp_nir_to_llvm.c` caps the architecture and
   lets the driver JIT forward. Raise it together with the PTX ISA version.
