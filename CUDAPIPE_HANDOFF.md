@@ -189,24 +189,31 @@ limits below were exactly such a change, and llvmpipe came out bit-identical.
 Sixty frames of each sample, the still scenes orbited, timed rather than stored
 — milliseconds per frame, the mean over the sixty (`cp_perf_run.sh ... 60 1`):
 
-| | nvidia | cudapipe | llvmpipe | cudapipe before the perf pass |
-|---|---|---|---|---|
-| particlesystem | 0.1 | **55.2** | 15.7 | 1361.7 |
-| multithreading | 0.3 | **50.2** | 96.6 | 156.6 |
-| instancing | 0.1 | **27.2** | 74.3 | 241.7 |
-| dynamicuniformbuffer | 0.0 | **22.5** | 1.1 | 128.5 |
-| gltfscenerendering | 0.1 | **19.9** | 14.8 | 343.9 |
-| bloom | 0.0 | **12.4** | 3.5 | 558.0 |
-| pbribl | 0.0 | **3.8** | 2.6 | 135.4 |
-| **total, one frame of each** | **0.9** | **206.7** | **233.0** | **3792.2** |
+| | nvidia | cudapipe | llvmpipe | before phase 1a | before any perf work |
+|---|---|---|---|---|---|
+| particlesystem | 0.1 | **50.1** | 15.7 | 55.2 | 1361.7 |
+| multithreading | 0.3 | **29.7** | 96.9 | 50.2 | 156.6 |
+| instancing | 0.1 | **27.1** | 73.0 | 27.2 | 241.7 |
+| dynamicuniformbuffer | 0.0 | **17.4** | 1.0 | 22.5 | 128.5 |
+| gltfscenerendering | 0.0 | **15.0** | 15.2 | 19.9 | 343.9 |
+| bloom | 0.0 | **12.1** | 3.6 | 12.4 | 558.0 |
+| pbribl | 0.0 | **1.7** | 2.7 | 3.8 | 135.4 |
+| **total, one frame of each** | **0.9** | **168.1** | **232.1** | **206.7** | **3792.2** |
 
-**cudapipe now finishes the sweep ahead of llvmpipe**, and ahead of it on seven
-of the seventeen samples individually. It was 16x behind. The whole of that
-change, what each step of it was worth, and what was *not* done to get it, is
-`src/gallium/drivers/cudapipe/PERFORMANCE_PROGRESS.md`; the short version is that
-96% of it was three defects rather than any optimization, the largest being that
-`CP_SMALL_THRESHOLD` was set above the size of the framebuffer and two of the
-rasterizer's three stages had therefore never executed.
+**cudapipe finishes the sweep 1.38x ahead of llvmpipe**, and ahead of it on ten
+of the seventeen samples individually. It was 16x behind. Two passes got it
+there and each has its own write-up:
+
+- `PERFORMANCE_PROGRESS.md` — the first pass, 3792 -> 207 ms. 96% of it was
+  three defects rather than any optimization, the largest being that
+  `CP_SMALL_THRESHOLD` was set above the size of the framebuffer so two of the
+  rasterizer's three stages had never executed.
+- `PHASE_1A.md` — submission and synchronization, 207 -> 168 ms. The phase the
+  plan had demoted, on a profile that had gone stale. The largest single win in
+  it was not a phase 1a item but something the phase's measurement gate found:
+  the device scratch arena reached 5.1 GB inside one frame, because it carried
+  every draw at once and each draw's shading buffers are sized to twice the
+  framebuffer rather than to what the draw covers.
 
 NVIDIA's column is not a rendering time. Offscreen benchmarking measures
 recording and submitting a frame, and nothing waits for the GPU until the pass
@@ -223,13 +230,21 @@ despite shading on the CPU — and why the samples cudapipe now beats it on are
 the ones with the most geometry.
 
 **The peel loop is still the worst thing in the driver.** particlesystem runs
-about 260 passes a frame, each re-rasterizing and re-shading the whole draw with
-a host sync between them, and it remains 3.5x slower than llvmpipe when nothing
-else in the set is. Phase 3 of the performance plan is what addresses it.
+about 260 passes a frame, each re-rasterizing and re-shading the whole draw. The
+host sync between them is now taken on a doubling interval rather than every
+layer, which is worth 7%, but the passes themselves remain and it is 3.2x
+slower than llvmpipe when nothing else in the set is. Phase 3 addresses it.
 
-**`dynamicuniformbuffer` is the other outlier**, 20x slower than llvmpipe, and
-it is launch-bound rather than kernel-bound: 625 twelve-triangle cubes a frame,
-nine kernels and five memsets each, 5,635 launches. Also structural.
+**`instancing` is the clearest lead in the set.** 39% GPU busy — more than half
+its frame is the host — and it is the one sample the per-draw scratch rewind
+did not help. Its profile looks like nothing else: 15 draws a frame,
+`cp_vertex_fetch` at 57% of GPU time with a grid of 17,280 blocks and a median
+launch of 2.4 ms.
+
+**`dynamicuniformbuffer` is still an outlier**, 17x slower than llvmpipe and
+launch-bound rather than kernel-bound: 625 twelve-triangle cubes a frame, nine
+kernels each. Streams and the scratch rewind took it from 22.5 to 17.4 ms; the
+rest is structural.
 
 **cudapipe does not win pbribl, and never did** by the measure originally used.
 It was once recorded as the one sample it beat llvmpipe on, 14.2 s against 16.0

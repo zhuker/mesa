@@ -51,10 +51,10 @@ and compared to NVIDIA after every step; `tests/cp_iterate.sh` runs both passes
 and the comparison. No verdict against NVIDIA changed at any point, the two
 standing regressions (`gltfscenerendering`, `texture3d`) included.
 
-| | baseline | now |  |
-|---|---|---|---|
-| **total over the sweep** | **3792.15 ms** | **205.3 / 206.7 ms** | **~18.4x** |
-| llvmpipe, same sweep | 233.00 ms | 233.00 ms | — |
+| | baseline | after the first pass | after phase 1a |  |
+|---|---|---|---|---|
+| **total over the sweep** | **3792.15 ms** | **205.3 / 206.7 ms** | **168.10 ms** | **~22.6x** |
+| llvmpipe, same sweep | 233.00 ms | 233.00 ms | 232.14 ms | — |
 
 Two runs of the final build are quoted because they differ by 0.6%, which is
 about the run-to-run spread of the sweep and worth carrying so that a later
@@ -138,12 +138,30 @@ Two things stand out, and neither needs Phase 3:
 Pure cudapipe. No lavapipe changes. This is the phase that makes the GPU
 pipeline instead of ping-ponging with the host.
 
-**Not done, and demoted.** The profile that opens this document found the host
-syncs at 0.5% of the frame and the GPU already ~100% busy, so none of this is on
-the critical path today. It becomes worth doing when something else has made the
-GPU idle enough for submission latency to show, and 1a.4 — CUDA-event timing —
-becomes worth doing the moment any of it lands, since `cp_lap()` measures launch
-latency rather than kernel duration as soon as launches stop being synchronous.
+**Done, and the demotion below was correct when written and then went stale.**
+
+The paragraph that stood here said the host syncs were 0.5% of the frame and
+the GPU ~100% busy, so none of this was on the critical path. That held for the
+profile it came from. The previous pass's 18.4x then made the kernels short
+enough that per-launch host cost became visible, and the conclusion decayed
+without anything being wrong with the reasoning that produced it — the GPU was
+66-80% busy on the launch-heavy samples by the time anyone asked again.
+
+The phase is written up in `PHASE_1A.md`: 206.65 -> 168.10 ms over the sweep,
+cudapipe going from 1.13x to 1.38x faster than llvmpipe. 1a.1 and 1a.4 are
+done, 1a.2 is done bar two syncs that measured as worth keeping, and 1a.3 is
+measured as not worth doing for this workload. The exit criterion is not met.
+
+Two things there are worth carrying back into how this document is read:
+
+- **nsys cannot answer the measurement gate for this driver.** CUPTI adds
+  host-side cost to every `cuLaunchKernel` and cudapipe issues thousands a
+  frame, so a traced run manufactures the host-side gap the gate looks for.
+  `tests/cp_gpu_busy.sh` asks `nvidia-smi` over an untraced run instead.
+- **An ordering argument decays.** This section is the second one in this
+  document to have been ranked correctly and then overtaken by a change
+  elsewhere. Re-measure a phase before trusting where it sits.
+
 Line numbers below predate the changes since and are stale.
 
 ## 1a.1 Put every launch on a real stream
