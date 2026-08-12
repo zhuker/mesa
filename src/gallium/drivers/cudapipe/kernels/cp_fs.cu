@@ -14,10 +14,15 @@
 
 #define VISBUF_EMPTY 0xFFFFFFFFFFFFFFFFULL
 
+/* Same form as edge_function in cp_rasterize.cu, and it has to stay the same:
+ * the sign of the area decides whether the triangle's vertices are swapped,
+ * and if the two kernels disagreed on a sliver the varyings here would be
+ * fetched in a different order than the one the depth was interpolated in. */
 static __device__ __forceinline__ float
-cp_edge(float ax, float ay, float bx, float by, float cx, float cy)
+cp_edge(float ax, float ay, float bx, float by, float px, float py)
 {
-   return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax);
+   return __fsub_rn(__fmul_rn(bx - px, ay - py),
+                    __fmul_rn(by - py, ax - px));
 }
 
 /*

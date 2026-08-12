@@ -830,6 +830,18 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
        * buffer allocation in the context fails with it, so one out of range
        * texel took down the rest of the frame.
        *
+       * The clamp only keeps the address legal. The value has to read as zero,
+       * which is what robustImageAccess requires and what the hardware does,
+       * so it is selected back in below. Clamping the value too — returning
+       * the edge texel — is a visible bug rather than a subtle one: it turns
+       * the border of an emboss or edge detect filter into a frame around the
+       * image, because a convolution whose outside taps repeat the edge comes
+       * out flat where it should saturate.
+       *
+       * llvmpipe does the same in lp_build_sample_image_nearest(): force the
+       * offset inside with an andnot, fetch, then select the out of bounds
+       * value over the result.
+       *
        * Descriptor layout: width is 32 bits at offset 8, height 16 bits at 12.
        */
       LLVMValueRef width = LLVMBuildLoad2(ctx->builder, i32,
@@ -845,12 +857,21 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
 
       LLVMValueRef zero_i = LLVMConstInt(i32, 0, false);
       LLVMValueRef one_i = LLVMConstInt(i32, 1, false);
+      LLVMValueRef xmax = LLVMBuildSub(ctx->builder, width, one_i, "");
+      LLVMValueRef ymax = LLVMBuildSub(ctx->builder, height, one_i, "");
+
+      LLVMValueRef oob = LLVMBuildOr(ctx->builder,
+         LLVMBuildOr(ctx->builder,
+            LLVMBuildICmp(ctx->builder, LLVMIntSLT, x, zero_i, ""),
+            LLVMBuildICmp(ctx->builder, LLVMIntSGT, x, xmax, ""), ""),
+         LLVMBuildOr(ctx->builder,
+            LLVMBuildICmp(ctx->builder, LLVMIntSLT, y, zero_i, ""),
+            LLVMBuildICmp(ctx->builder, LLVMIntSGT, y, ymax, ""), ""), "img_oob");
+
       x = LLVMBuildSelect(ctx->builder,
              LLVMBuildICmp(ctx->builder, LLVMIntSLT, x, zero_i, ""), zero_i, x, "");
       y = LLVMBuildSelect(ctx->builder,
              LLVMBuildICmp(ctx->builder, LLVMIntSLT, y, zero_i, ""), zero_i, y, "");
-      LLVMValueRef xmax = LLVMBuildSub(ctx->builder, width, one_i, "");
-      LLVMValueRef ymax = LLVMBuildSub(ctx->builder, height, one_i, "");
       x = LLVMBuildSelect(ctx->builder,
              LLVMBuildICmp(ctx->builder, LLVMIntSGT, x, xmax, ""), xmax, x, "");
       y = LLVMBuildSelect(ctx->builder,
@@ -888,6 +909,8 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
          LLVMValueRef word = LLVMBuildLoad2(ctx->builder, i32,
             LLVMBuildBitCast(ctx->builder, pixel_ptr,
                              LLVMPointerType(i32, 0), ""), "img_word");
+         word = LLVMBuildSelect(ctx->builder, oob,
+                                LLVMConstInt(i32, 0, false), word, "");
          LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(f32t, num_comp));
          for (unsigned c = 0; c < num_comp; c++) {
             LLVMValueRef byte = LLVMBuildAnd(ctx->builder,
@@ -910,6 +933,8 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef typed_ptr = LLVMBuildBitCast(ctx->builder, pixel_ptr,
          LLVMPointerType(pixel_type, 0), "");
       LLVMValueRef pixel_val = LLVMBuildLoad2(ctx->builder, pixel_type, typed_ptr, "img_load");
+      pixel_val = LLVMBuildSelect(ctx->builder, oob,
+                                  LLVMConstNull(pixel_type), pixel_val, "");
 
       /* Return as vec4 (only .x is meaningful for r32 formats) */
       if (num_comp > 1) {

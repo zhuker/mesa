@@ -24,10 +24,61 @@
 #define VISBUF_TRIID(packed) (~(uint32_t)((packed) & 0xFFFFFFFF))
 #define VISBUF_EMPTY 0xFFFFFFFFFFFFFFFFULL
 
+/*
+ * Signed area of the triangle (a, b, p), positive when p is on the inside of
+ * the directed edge a -> b.
+ *
+ * Two properties make coverage watertight, and both are load bearing.
+ *
+ * It is a cross product of the two vectors from p rather than the more obvious
+ * (p - a) x (b - a). Swapping a and b then reorders the same two products
+ * around the subtraction, so the result negates bit for bit. Two triangles
+ * that share an edge walk it in opposite directions, so they see exactly
+ * opposite values and the fill rule below can hand the pixel to one of them.
+ * The (p - a) form rounds differently for each ordering instead, which lets
+ * both triangles compute a small negative and drop the pixel.
+ *
+ * The products and the subtraction are the explicit round-to-nearest
+ * intrinsics, because nvcc contracts a * b - c * d into fma(a, b, -(c * d)) by
+ * default. That keeps only one of the two products exact, and which one it is
+ * depends on the order they were written in — so the contracted form is not
+ * antisymmetric either, and swapping a and b gives a value that is not the
+ * negation but, at a pixel centre almost exactly on the edge, the very same
+ * small negative. Both triangles then reject.
+ *
+ * That is what put a one pixel diagonal line through the quads in
+ * computeshader: the shared edge runs corner to corner, so it grazes pixel
+ * centres for its whole length.
+ */
 static __device__ __forceinline__ float
-edge_function(float ax, float ay, float bx, float by, float cx, float cy)
+edge_function(float ax, float ay, float bx, float by, float px, float py)
 {
-   return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax);
+   return __fsub_rn(__fmul_rn(bx - px, ay - py),
+                    __fmul_rn(by - py, ax - px));
+}
+
+/*
+ * The top-left fill rule, which breaks the +-0 tie above so that exactly one
+ * of the two triangles claims a pixel centred on their shared edge.
+ *
+ * The inside of the edge a -> b lies towards (dy, -dx), so with y pointing
+ * down a left edge is one with dy > 0, and a top edge is horizontal with its
+ * inside below it.
+ */
+static __device__ __forceinline__ bool
+edge_is_top_left(float ax, float ay, float bx, float by)
+{
+   float dx = bx - ax;
+   float dy = by - ay;
+   return dy > 0.0f || (dy == 0.0f && dx < 0.0f);
+}
+
+static __device__ __forceinline__ bool
+edge_inside(float e, bool top_left)
+{
+   /* -0.0f >= 0.0f is true, so an inclusive edge takes the pixel whichever
+    * sign of zero it computed. */
+   return top_left ? (e >= 0.0f) : (e > 0.0f);
 }
 
 static __device__ __forceinline__ uint32_t
@@ -42,7 +93,7 @@ struct tri_setup {
    float sx0, sy0, sx1, sy1, sx2, sy2;
    float ndc_z0, ndc_z1, ndc_z2;
    float inv_area;
-   float e0_dx, e0_dy, e1_dx, e1_dy, e2_dx, e2_dy;
+   bool e0_top_left, e1_top_left, e2_top_left;
    int ix_min, iy_min, ix_max, iy_max;
 };
 
@@ -220,13 +271,11 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
    }
    s->inv_area = 1.0f / area;
 
-   /* Edge function gradients for incremental stepping */
-   s->e0_dx = s->sy2 - s->sy1;
-   s->e0_dy = s->sx1 - s->sx2;
-   s->e1_dx = s->sy0 - s->sy2;
-   s->e1_dy = s->sx2 - s->sx0;
-   s->e2_dx = s->sy1 - s->sy0;
-   s->e2_dy = s->sx0 - s->sx1;
+   /* After the flip the winding is fixed, so the fill rule can be decided
+    * once per triangle rather than per pixel. */
+   s->e0_top_left = edge_is_top_left(s->sx1, s->sy1, s->sx2, s->sy2);
+   s->e1_top_left = edge_is_top_left(s->sx2, s->sy2, s->sx0, s->sy0);
+   s->e2_top_left = edge_is_top_left(s->sx0, s->sy0, s->sx1, s->sy1);
 
    float min_x = fminf(fminf(s->sx0, s->sx1), s->sx2);
    float min_y = fminf(fminf(s->sy0, s->sy1), s->sy2);
@@ -272,12 +321,18 @@ rasterize_pixel(struct cp_rasterize_args *args, struct tri_setup *s,
    float cx = (float)px + 0.5f;
    float cy = (float)py + 0.5f;
 
-   float w0 = edge_function(s->sx1, s->sy1, s->sx2, s->sy2, cx, cy) * s->inv_area;
-   float w1 = edge_function(s->sx2, s->sy2, s->sx0, s->sy0, cx, cy) * s->inv_area;
-   float w2 = 1.0f - w0 - w1;
+   float e0 = edge_function(s->sx1, s->sy1, s->sx2, s->sy2, cx, cy);
+   float e1 = edge_function(s->sx2, s->sy2, s->sx0, s->sy0, cx, cy);
+   float e2 = edge_function(s->sx0, s->sy0, s->sx1, s->sy1, cx, cy);
 
-   if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f)
+   if (!edge_inside(e0, s->e0_top_left) ||
+       !edge_inside(e1, s->e1_top_left) ||
+       !edge_inside(e2, s->e2_top_left))
       return;
+
+   float w0 = e0 * s->inv_area;
+   float w1 = e1 * s->inv_area;
+   float w2 = 1.0f - w0 - w1;
 
    float depth = w0 * s->ndc_z0 + w1 * s->ndc_z1 + w2 * s->ndc_z2;
    depth = depth * 0.5f + 0.5f;
@@ -346,27 +401,31 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
       return;
    }
 
-   /* Incremental edge stepping for small triangles */
+   /*
+    * Small triangles, one pixel at a time. The edge functions are evaluated
+    * from the vertices at every pixel rather than stepped by their gradients
+    * across the bounding box: stepping accumulates rounding, and then the two
+    * triangles either side of a shared edge no longer see exactly opposite
+    * values, which is the property the fill rule needs to keep coverage
+    * watertight. Stepping is worth restoring only with a form that stays
+    * exact, such as snapping the vertices to a subpixel grid and iterating in
+    * integers the way llvmpipe's lp_setup_tri.c does.
+    */
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
 
-   float start_x = (float)s.ix_min + 0.5f;
-   float start_y = (float)s.iy_min + 0.5f;
-
-   float e0_init = edge_function(s.sx1, s.sy1, s.sx2, s.sy2, start_x, start_y);
-   float e1_init = edge_function(s.sx2, s.sy2, s.sx0, s.sy0, start_x, start_y);
-   float e2_init = edge_function(s.sx0, s.sy0, s.sx1, s.sy1, start_x, start_y);
-
-   float e0_row = e0_init;
-   float e1_row = e1_init;
-   float e2_row = e2_init;
-
    for (int py = s.iy_min; py <= s.iy_max; py++) {
-      float e0 = e0_row;
-      float e1 = e1_row;
-      float e2 = e2_row;
+      float cy = (float)py + 0.5f;
 
       for (int px = s.ix_min; px <= s.ix_max; px++) {
-         if (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f) {
+         float cx = (float)px + 0.5f;
+
+         float e0 = edge_function(s.sx1, s.sy1, s.sx2, s.sy2, cx, cy);
+         float e1 = edge_function(s.sx2, s.sy2, s.sx0, s.sy0, cx, cy);
+         float e2 = edge_function(s.sx0, s.sy0, s.sx1, s.sy1, cx, cy);
+
+         if (edge_inside(e0, s.e0_top_left) &&
+             edge_inside(e1, s.e1_top_left) &&
+             edge_inside(e2, s.e2_top_left)) {
             float w0 = e0 * s.inv_area;
             float w1 = e1 * s.inv_area;
             float w2 = 1.0f - w0 - w1;
@@ -390,12 +449,8 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
                case CP_FUNC_GEQUAL:    pass = depth_uint >= prev; break;
                default:                pass = true; break;
                }
-               if (!pass) {
-                  e0 += s.e0_dx;
-                  e1 += s.e1_dx;
-                  e2 += s.e2_dx;
+               if (!pass)
                   continue;
-               }
             }
 
             if (!cp_tri_rejected(&args, tri_id, px, py)) {
@@ -404,13 +459,7 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
                atomicMin(&visbuf[py * args.width + px], packed);
             }
          }
-         e0 += s.e0_dx;
-         e1 += s.e1_dx;
-         e2 += s.e2_dx;
       }
-      e0_row += s.e0_dy;
-      e1_row += s.e1_dy;
-      e2_row += s.e2_dy;
    }
 }
 
@@ -442,7 +491,7 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
    float sx0, sy0, sx1, sy1, sx2, sy2;
    float ndc_z0, ndc_z1, ndc_z2;
    float inv_area;
-   float e0_dx, e0_dy, e1_dx, e1_dy, e2_dx, e2_dy;
+   int e0_tl, e1_tl, e2_tl;
    int ix_min, iy_min, ix_max, iy_max;
    int valid = 0;
 
@@ -454,9 +503,9 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
          sx2 = s.sx2; sy2 = s.sy2;
          ndc_z0 = s.ndc_z0; ndc_z1 = s.ndc_z1; ndc_z2 = s.ndc_z2;
          inv_area = s.inv_area;
-         e0_dx = s.e0_dx; e0_dy = s.e0_dy;
-         e1_dx = s.e1_dx; e1_dy = s.e1_dy;
-         e2_dx = s.e2_dx; e2_dy = s.e2_dy;
+         e0_tl = s.e0_top_left;
+         e1_tl = s.e1_top_left;
+         e2_tl = s.e2_top_left;
          ix_min = s.ix_min; iy_min = s.iy_min;
          ix_max = s.ix_max; iy_max = s.iy_max;
          valid = 1;
@@ -478,12 +527,9 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
    ndc_z1  = __shfl_sync(0xFFFFFFFF, ndc_z1, 0);
    ndc_z2  = __shfl_sync(0xFFFFFFFF, ndc_z2, 0);
    inv_area = __shfl_sync(0xFFFFFFFF, inv_area, 0);
-   e0_dx   = __shfl_sync(0xFFFFFFFF, e0_dx, 0);
-   e0_dy   = __shfl_sync(0xFFFFFFFF, e0_dy, 0);
-   e1_dx   = __shfl_sync(0xFFFFFFFF, e1_dx, 0);
-   e1_dy   = __shfl_sync(0xFFFFFFFF, e1_dy, 0);
-   e2_dx   = __shfl_sync(0xFFFFFFFF, e2_dx, 0);
-   e2_dy   = __shfl_sync(0xFFFFFFFF, e2_dy, 0);
+   e0_tl   = __shfl_sync(0xFFFFFFFF, e0_tl, 0);
+   e1_tl   = __shfl_sync(0xFFFFFFFF, e1_tl, 0);
+   e2_tl   = __shfl_sync(0xFFFFFFFF, e2_tl, 0);
    ix_min  = __shfl_sync(0xFFFFFFFF, ix_min, 0);
    iy_min  = __shfl_sync(0xFFFFFFFF, iy_min, 0);
    ix_max  = __shfl_sync(0xFFFFFFFF, ix_max, 0);
@@ -537,11 +583,13 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
       float cx = (float)px + 0.5f;
       float cy = (float)py + 0.5f;
 
-      float e0 = (cx - sx1) * (sy2 - sy1) - (cy - sy1) * (sx2 - sx1);
-      float e1 = (cx - sx2) * (sy0 - sy2) - (cy - sy2) * (sx0 - sx2);
-      float e2 = (cx - sx0) * (sy1 - sy0) - (cy - sy0) * (sx1 - sx0);
+      float e0 = edge_function(sx1, sy1, sx2, sy2, cx, cy);
+      float e1 = edge_function(sx2, sy2, sx0, sy0, cx, cy);
+      float e2 = edge_function(sx0, sy0, sx1, sy1, cx, cy);
 
-      if (e0 < 0.0f || e1 < 0.0f || e2 < 0.0f)
+      if (!edge_inside(e0, e0_tl) ||
+          !edge_inside(e1, e1_tl) ||
+          !edge_inside(e2, e2_tl))
          continue;
 
       float w0 = e0 * inv_area;
@@ -571,11 +619,9 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
       }
 
       if (!cp_tri_rejected(&args, tri_id, px, py)) {
-         if (!cp_tri_rejected(&args, tri_id, px, py)) {
-            uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
-            uint64_t packed = PACK_VISBUF(key, tri_id);
-            atomicMin(&visbuf[py * args.width + px], packed);
-         }
+         uint32_t key = args.depth_key_invert ? ~depth_uint : depth_uint;
+         uint64_t packed = PACK_VISBUF(key, tri_id);
+         atomicMin(&visbuf[py * args.width + px], packed);
       }
    }
 }
@@ -606,8 +652,7 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
    __shared__ float sh_sx0, sh_sy0, sh_sx1, sh_sy1, sh_sx2, sh_sy2;
    __shared__ float sh_ndc_z0, sh_ndc_z1, sh_ndc_z2;
    __shared__ float sh_inv_area;
-   __shared__ float sh_e0_dx, sh_e0_dy, sh_e1_dx, sh_e1_dy, sh_e2_dx, sh_e2_dy;
-   __shared__ uint32_t sh_plane_mask;
+   __shared__ int sh_e0_tl, sh_e1_tl, sh_e2_tl;
    __shared__ int sh_valid;
 
    if (threadIdx.x == 0) {
@@ -619,56 +664,41 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
          sh_sx2 = s.sx2; sh_sy2 = s.sy2;
          sh_ndc_z0 = s.ndc_z0; sh_ndc_z1 = s.ndc_z1; sh_ndc_z2 = s.ndc_z2;
          sh_inv_area = s.inv_area;
-         sh_e0_dx = s.e0_dx; sh_e0_dy = s.e0_dy;
-         sh_e1_dx = s.e1_dx; sh_e1_dy = s.e1_dy;
-         sh_e2_dx = s.e2_dx; sh_e2_dy = s.e2_dy;
+         sh_e0_tl = s.e0_top_left;
+         sh_e1_tl = s.e1_top_left;
+         sh_e2_tl = s.e2_top_left;
 
-         /* Trivial accept/reject: evaluate edges at tile corners */
+         /*
+          * Trivial reject: an edge that is outside at all four tile corners is
+          * outside everywhere in the tile, because the edge function is
+          * linear.
+          *
+          * There is no matching trivial accept any more. The mirror test —
+          * every corner inside, so skip that edge per pixel — cannot be made
+          * to respect the fill rule: a corner sitting exactly on an exclusive
+          * edge reads as inside, and the tile would then claim a row of
+          * pixels that belongs to its neighbour. Restoring it needs corner
+          * values that bound the per-pixel ones, which the exact subpixel
+          * form noted in stage 1 would give.
+          */
          float tx0 = (float)tile_x + 0.5f;
          float ty0 = (float)tile_y + 0.5f;
          float tx1 = tx0 + (float)(CP_TILE_SIZE - 1);
          float ty1 = ty0 + (float)(CP_TILE_SIZE - 1);
 
-         /* Edge 0 at 4 corners */
-         float e0_tl = (tx0 - s.sx1) * (s.sy2 - s.sy1) - (ty0 - s.sy1) * (s.sx2 - s.sx1);
-         float e0_tr = e0_tl + s.e0_dx * (float)(CP_TILE_SIZE - 1);
-         float e0_bl = e0_tl + s.e0_dy * (float)(CP_TILE_SIZE - 1);
-         float e0_br = e0_tl + s.e0_dx * (float)(CP_TILE_SIZE - 1) +
-                       s.e0_dy * (float)(CP_TILE_SIZE - 1);
-
-         /* Edge 1 at 4 corners */
-         float e1_tl = (tx0 - s.sx2) * (s.sy0 - s.sy2) - (ty0 - s.sy2) * (s.sx0 - s.sx2);
-         float e1_tr = e1_tl + s.e1_dx * (float)(CP_TILE_SIZE - 1);
-         float e1_bl = e1_tl + s.e1_dy * (float)(CP_TILE_SIZE - 1);
-         float e1_br = e1_tl + s.e1_dx * (float)(CP_TILE_SIZE - 1) +
-                       s.e1_dy * (float)(CP_TILE_SIZE - 1);
-
-         /* Edge 2 at 4 corners */
-         float e2_tl = (tx0 - s.sx0) * (s.sy1 - s.sy0) - (ty0 - s.sy0) * (s.sx1 - s.sx0);
-         float e2_tr = e2_tl + s.e2_dx * (float)(CP_TILE_SIZE - 1);
-         float e2_bl = e2_tl + s.e2_dy * (float)(CP_TILE_SIZE - 1);
-         float e2_br = e2_tl + s.e2_dx * (float)(CP_TILE_SIZE - 1) +
-                       s.e2_dy * (float)(CP_TILE_SIZE - 1);
-
-         /* Check for trivial reject (any edge fully outside) */
-         bool e0_reject = (e0_tl < 0) && (e0_tr < 0) && (e0_bl < 0) && (e0_br < 0);
-         bool e1_reject = (e1_tl < 0) && (e1_tr < 0) && (e1_bl < 0) && (e1_br < 0);
-         bool e2_reject = (e2_tl < 0) && (e2_tr < 0) && (e2_bl < 0) && (e2_br < 0);
-
-         if (e0_reject || e1_reject || e2_reject) {
-            sh_valid = 0;
-         } else {
-            sh_valid = 1;
-            /* Determine which edges need per-pixel testing */
-            uint32_t mask = 0;
-            bool e0_accept = (e0_tl >= 0) && (e0_tr >= 0) && (e0_bl >= 0) && (e0_br >= 0);
-            bool e1_accept = (e1_tl >= 0) && (e1_tr >= 0) && (e1_bl >= 0) && (e1_br >= 0);
-            bool e2_accept = (e2_tl >= 0) && (e2_tr >= 0) && (e2_bl >= 0) && (e2_br >= 0);
-            if (!e0_accept) mask |= 1;
-            if (!e1_accept) mask |= 2;
-            if (!e2_accept) mask |= 4;
-            sh_plane_mask = mask;
+         bool reject = false;
+         for (int e = 0; e < 3 && !reject; e++) {
+            float ax = e == 0 ? s.sx1 : (e == 1 ? s.sx2 : s.sx0);
+            float ay = e == 0 ? s.sy1 : (e == 1 ? s.sy2 : s.sy0);
+            float bx = e == 0 ? s.sx2 : (e == 1 ? s.sx0 : s.sx1);
+            float by = e == 0 ? s.sy2 : (e == 1 ? s.sy0 : s.sy1);
+            reject = edge_function(ax, ay, bx, by, tx0, ty0) < 0.0f &&
+                     edge_function(ax, ay, bx, by, tx1, ty0) < 0.0f &&
+                     edge_function(ax, ay, bx, by, tx0, ty1) < 0.0f &&
+                     edge_function(ax, ay, bx, by, tx1, ty1) < 0.0f;
          }
+
+         sh_valid = reject ? 0 : 1;
       }
    }
    __syncthreads();
@@ -686,28 +716,23 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
       return;
 
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
-   uint32_t plane_mask = sh_plane_mask;
 
-   /* Compute edge values at the start of this column */
    float cx = (float)px + 0.5f;
-   float cy = (float)tile_y + 0.5f;
-
-   float e0 = (cx - sh_sx1) * (sh_sy2 - sh_sy1) - (cy - sh_sy1) * (sh_sx2 - sh_sx1);
-   float e1 = (cx - sh_sx2) * (sh_sy0 - sh_sy2) - (cy - sh_sy2) * (sh_sx0 - sh_sx2);
-   float e2 = (cx - sh_sx0) * (sh_sy1 - sh_sy0) - (cy - sh_sy0) * (sh_sx1 - sh_sx0);
 
    for (int row = 0; row < CP_TILE_SIZE; row++) {
       int py = tile_y + row;
       if (py >= (int)args.height)
          break;
 
-      /* Test only partial edges */
-      bool inside = true;
-      if (plane_mask & 1) inside &= (e0 >= 0.0f);
-      if (plane_mask & 2) inside &= (e1 >= 0.0f);
-      if (plane_mask & 4) inside &= (e2 >= 0.0f);
+      float cy = (float)py + 0.5f;
 
-      if (inside) {
+      float e0 = edge_function(sh_sx1, sh_sy1, sh_sx2, sh_sy2, cx, cy);
+      float e1 = edge_function(sh_sx2, sh_sy2, sh_sx0, sh_sy0, cx, cy);
+      float e2 = edge_function(sh_sx0, sh_sy0, sh_sx1, sh_sy1, cx, cy);
+
+      if (edge_inside(e0, sh_e0_tl) &&
+          edge_inside(e1, sh_e1_tl) &&
+          edge_inside(e2, sh_e2_tl)) {
          float w0 = e0 * sh_inv_area;
          float w1 = e1 * sh_inv_area;
 
@@ -731,12 +756,8 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
             case CP_FUNC_GEQUAL:    pass = depth_uint >= prev; break;
             default:                pass = true; break;
             }
-            if (!pass) {
-               e0 += sh_e0_dy;
-               e1 += sh_e1_dy;
-               e2 += sh_e2_dy;
+            if (!pass)
                continue;
-            }
          }
 
          if (!cp_tri_rejected(&args, tri_id, px, py)) {
@@ -745,10 +766,6 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
             atomicMin(&visbuf[py * args.width + px], packed);
          }
       }
-
-      e0 += sh_e0_dy;
-      e1 += sh_e1_dy;
-      e2 += sh_e2_dy;
    }
 }
 
