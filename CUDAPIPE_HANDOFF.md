@@ -159,9 +159,29 @@ lanes and dropped by the writeback.
 
 1. **No MSAA.** The capture needs 4x on D32_SFLOAT, A2B10G10R10 and R8_UNORM.
 2. **No line or point rasterization.** The capture uses POINT_LIST.
-3. **Anisotropic filtering does not match NVIDIA's**, which is most of what is
-   left in `texturemipmapgen`. The implementation follows llvmpipe; the residual
-   peaks at mid distance where the filter does the most work.
+3. **Anisotropic filtering under-blurs relative to NVIDIA's.** This is nearly
+   all of what is left in `texturemipmapgen`, and it also drives most of
+   `gltfscenerendering`. Forcing each of that sample's three sampler modes and
+   rendering both drivers separates it cleanly: no mipmaps differs by 19 pixels,
+   mipmaps with bilinear by 1095, mipmaps with anisotropy by 32237. So the
+   texture upload, the runtime-generated mip chain and LOD selection are all
+   effectively exact, and the specular `pow` is too — sampler 0 runs the same
+   `pow(dot(R, V), 16)` and still lands within 19 pixels.
+
+   The signature is contrast, not brightness: cudapipe is darker than the
+   reference where the reference is dark and brighter where it is bright, by up
+   to 20/255 in the top luminance band. Turning anisotropy off entirely
+   overshoots the other way.
+
+   Two tap-placement schemes have been measured. The one in the tree spreads N
+   taps over `rho_max * (N-1)/N`, which tiles the footprint exactly when
+   `N == eta`. Switching to llvmpipe's — step along the raw ddx or ddy rather
+   than a unit vector rescaled to the transformed axis, and space taps by the
+   Vulkan specification's `(t - N/2 + 1/2)/(N + 1)` — improves `texture`
+   (589 -> 164) and regresses everything else: `texturemipmapgen` 32237 -> 38864,
+   `gltfscenerendering` 15697 -> 25036, `instancing` 3506 -> 5346,
+   `texturecubemap` 4144 -> 4774. Do not re-apply it wholesale; the two halves of
+   it have not been measured separately.
 4. **Alpha-tested geometry costs CP_DISCARD_LAYERS passes over the draw.**
    Visibility resolves before shading, so a fragment that discards has already
    displaced the one behind it; each pass records what discarded where and
@@ -171,8 +191,20 @@ lanes and dropped by the writeback.
    lost.
 5. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
    compressed textures, and the capture has 576 BC images.
-6. **`gltfscenerendering` (1.70%) and `multithreading` (0.22%) have no
-   diagnosis.**
+6. **`gltfscenerendering` (1.70%) is mostly gap 3 above, amplified.** Its
+   fragment shader samples a normal map and then raises the result to the 32nd
+   power, so an under-blurred normal map turns into scattered specular glints on
+   exactly the grazing-angle surfaces where anisotropy applies — the side walls,
+   the pillars and arches, the curtain folds. Disabling anisotropy cuts the
+   differences on the stone pillars and arch from 2128 to 1233 and on the red
+   curtain from 1723 to 757, while making the frame as a whole worse (15697 to
+   29726), which is what tells you the filter is under-blurring rather than
+   simply wrong. The remaining large per-pixel differences are paired: one pixel
+   much brighter in cudapipe and its neighbour much darker, on thin
+   high-contrast features. There is no global subpixel shift — a +-1 pixel
+   search puts the minimum at (0, 0) by a factor of fifteen.
+
+   **`multithreading` (0.22%) still has no diagnosis.**
 7. `nir_op_fexp2`, `flog2` and lowered `fpow` still use the NVVM `.approx`
    intrinsics. Routing pow to the CUDA library version was tried and changed the
    image without moving it closer to the reference, so it was reverted. `fsin`
