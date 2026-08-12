@@ -10,27 +10,108 @@ and reading the original is faster than rediscovering the reasoning. Paths of
 the form `src/...` are relative to the Mesa checkout; CuRast paths are relative
 to `~/git/CuRast`.
 
-## Ordering, and why
+## Ordering, and why — superseded by measurement
 
-The phases are numbered by dependency, not by when they were thought of, so the
-first one done is 1a and Phase 0 comes third.
+This section argued that the phases had to be done in dependency order, 1a
+first, because **Phase 0's wins would be unmeasurable until Phase 1a landed**:
+if the GPU spends its time idle waiting on the host, making a kernel faster
+changes nothing observable, and a profile taken beforehand reports stall time
+rather than kernel time.
 
-The reason is that **Phase 0's wins are unmeasurable until Phase 1a lands.**
-Today every flush drains the device (`cp_context.c:1498`) and every blend peel
-pass drains it again (`cp_context.c:1531`). If the GPU spends its time idle
-waiting on the host, making a kernel 20% faster changes nothing observable, and
-any profile taken beforehand reports stall time rather than kernel time. Phase 1a
-is the cheapest change that makes subsequent measurement mean anything.
+That was wrong, and the way to find out was to profile first rather than to
+argue about whether profiling would mean anything. `tests/cp_profile.sh` exists
+for that now. On the three samples the measurement gate asks for, the answer was
+the same and it was not close:
 
-There is a comment at `cp_context.c:1531` asserting the flush sync is cheap
-"because the GPU is typically already caught up (99% utilized)". That may be
-true. It is an assumption written under the current serialized design, not a
-measurement, and Phase 1a is what lets it be checked.
+| sample | dominant kernel | share of GPU time | `cuCtxSynchronize` |
+|---|---|---|---|
+| instancing | `cp_rasterize_stage1` | 92.5% | 0.5% |
+| particlesystem | `cp_rasterize_stage1` | 92.3% | — |
+| bloom | `cp_rasterize_stage1` | 92.3% | 0.5% |
+
+The frame was **kernel-bound from the start**, by a wide margin, and the comment
+asserting the GPU is "typically already caught up (99% utilized)" was simply
+correct. Phase 1a has not been done and has not been needed; nothing below was
+blocked on it.
+
+The general lesson is what the rest of this document now rests on: **an ordering
+argument is a hypothesis about where time goes, and such hypotheses are cheap to
+test and usually wrong.** Profile, then order.
 
 ```
-1a ──► measure ──┬──► 0   (kernel-bound)
-                 └──► 1b  (memory/transfer-bound) ──► 2 ──► 3
+measure ──► 0 (kernel-bound) ──► 1b (in part) ──► 2 ──► 3
 ```
+
+---
+
+# What has been done, and what it bought
+
+Sixty frames per sample, mean ms per frame, against the same sixty frames stored
+and compared to NVIDIA after every step; `tests/cp_iterate.sh` runs both passes
+and the comparison. No verdict against NVIDIA changed at any point, the two
+standing regressions (`gltfscenerendering`, `texture3d`) included.
+
+| | baseline | now |  |
+|---|---|---|---|
+| **total over the sweep** | **3792.15 ms** | **209.04 ms** | **18.1x** |
+| llvmpipe, same sweep | 233.00 ms | 233.00 ms | — |
+
+cudapipe began 16x slower than llvmpipe over the set and is now slightly ahead
+of it, and ahead on seven of the seventeen samples.
+
+The changes, in order, each measured on its own:
+
+1. **The rasterizer had three stages and used one.** `CP_SMALL_THRESHOLD` was
+   999999, larger than a 1280x720 frame, so every triangle took stage 1's
+   one-thread-per-triangle path and stages 2 and 3 never ran. A full-screen quad
+   was two threads walking 921,600 pixels each. Lowering it exposed two bugs in
+   the stages that had never executed: neither strided its queue, so stage 2
+   dropped everything past its 512th primitive and stage 3 past its 2048th tile,
+   and stage 2 bounded triangle ids by the pre-clip count. **2.3x.**
+2. **Points were exempt from all of it**, on the grounds that the point-size
+   clamp bounded the loop — at 256 pixels a side, to 65,536 pixels on one lane.
+   **particlesystem 10.9x.**
+3. **The fragment shader had no bounds check**, so every draw ran the whole
+   shader body on 1,843,200 threads and the writeback then kept as many results
+   as the draw had covered. The median draw in multithreading covers 588 pixels.
+   **1.5x overall.**
+4. **Per-draw constants were written by the host into managed memory** that the
+   next kernel read, so the first warp of each launch stalled on a page coming
+   back. They go by DMA into device-only memory now. **1.2x overall.**
+5. **The shading buffers were managed too**, and the arena's bump pointer means
+   each draw lands on fresh, non-resident pages. The vertex shader paid for it,
+   being the first to touch its output. **multithreading 2x.**
+6. **A sprite got one warp** however many pixels it covered, leaving each lane
+   hundreds of atomicMins to issue back to back. Large points now decompose into
+   tiles like any other large primitive. **particlesystem 1.2x.**
+
+Four of those six are one mistake in different places: **work sized to the worst
+case the host can compute rather than to what the draw does.** Worth looking for
+more of them before starting anything structural.
+
+## What is left, biggest first
+
+| sample | ms | vs llvmpipe | why |
+|---|---|---|---|
+| particlesystem | 55.57 | 3.5x slower | 260 peel passes a frame; Phase 3 |
+| multithreading | 49.94 | **2x faster** | 343 draws each paying full-screen costs |
+| instancing | 28.44 | **2.6x faster** | |
+| dynamicuniformbuffer | 22.94 | **21x slower** | the clearest outlier left, unexplained |
+| gltfscenerendering | 19.85 | 1.3x slower | |
+| bloom | 12.68 | 3.6x slower | full-screen passes |
+
+Two things stand out, and neither needs Phase 3:
+
+- **`dynamicuniformbuffer` is 21x slower than llvmpipe**, and nothing else in
+  the set is off by that margin. It has not been profiled. Do that first.
+- **Per-draw full-screen work.** `cp_fs_interpolate` launches one thread per
+  quad of the whole framebuffer on every draw and every peel pass, and the
+  visibility buffer is memset whole (7.4 MB) just as often — both regardless of
+  what the draw covers. On multithreading that is 18 ms of 50. The visbuf clear
+  has an exact answer already available: `pixel_list` holds precisely the
+  entries a draw made non-empty, so clearing those rather than the buffer needs
+  no host-side count. The interpolator wants the draw's bounding box, which
+  stage 1 could accumulate on the device.
 
 ---
 
@@ -38,6 +119,14 @@ measurement, and Phase 1a is what lets it be checked.
 
 Pure cudapipe. No lavapipe changes. This is the phase that makes the GPU
 pipeline instead of ping-ponging with the host.
+
+**Not done, and demoted.** The profile that opens this document found the host
+syncs at 0.5% of the frame and the GPU already ~100% busy, so none of this is on
+the critical path today. It becomes worth doing when something else has made the
+GPU idle enough for submission latency to show, and 1a.4 — CUDA-event timing —
+becomes worth doing the moment any of it lands, since `cp_lap()` measures launch
+latency rather than kernel duration as soon as launches stop being synchronous.
+Line numbers below predate the changes since and are stale.
 
 ## 1a.1 Put every launch on a real stream
 
@@ -133,6 +222,19 @@ replacing lavapipe.
 Pure cudapipe, local edits to `kernels/cp_rasterize.cu`. Every item here comes
 from CuRast (`~/git/CuRast`), which is the direct ancestor of cudapipe's
 three-stage design and has already paid for these lessons.
+
+**None of the items below has been done, and the rasterizer is nonetheless off
+the top of the profile.** What it needed was not a faster inner loop but for the
+loop to run on more than one thread: `CP_SMALL_THRESHOLD` at 999999 meant every
+triangle in the driver took the single-thread path and the other two stages were
+dead code. That is worth remembering when reading the rest of this section,
+which is a list of constant-factor improvements to a loop that was being run
+with a factor of a thousand left on the table. Measure before taking any of
+them; the profile that made 0.1 and 0.2 look attractive was taken when stage 1
+was 92% of the frame, and it no longer is.
+
+The threshold is now overridable at NVRTC time with `CUDAPIPE_SMALL_THRESHOLD`
+and `CUDAPIPE_MEDIUM_THRESHOLD`, so a sweep of it needs no rebuild.
 
 ## 0.1 Specialize on sample count
 
@@ -267,8 +369,15 @@ discarded with no error, no counter, and no log:
 if (idx < CP_MAX_NONTRIVIAL) { queue[idx] = tri_id; }   /* else it vanishes */
 ```
 
-Same at `cp_rasterize.cu:642` for `CP_MAX_HUGE_TILES`. At minimum, count the
-drops and report them. The real fix is growable allocation (Phase 1b.4).
+Same for `CP_MAX_HUGE_TILES`. At minimum, count the drops and report them. The
+real fix is growable allocation (Phase 1b.4).
+
+**More urgent than it was.** Until the threshold was lowered these queues were
+never written at all, so the cap could not be hit; now every non-trivial
+primitive in every draw goes through them. The counters are also now clamped on
+the read side (`cp_queue_used()`), because they are unclamped `atomicAdd`s that
+on overflow count past entries nobody wrote — which turns a silent drop into a
+read of uninitialised memory. That clamp makes overflow safe, not visible.
 
 ## 0.6 Cheap early-outs worth taking while in the file
 
@@ -414,10 +523,10 @@ which and become `cuMemcpyHtoDAsync` / `DtoHAsync` / `DtoDAsync`.
 same decision, taken from `tmpl->bind` and `tmpl->usage` — render targets and
 depth attachments device-only, staging mappable.
 
-## 1b.3 Make residency deterministic
+## 1b.3 Make residency deterministic — tried, and it does not work
 
-Even before the split, `cuMemAdvise` gives device residency without changing the
-memory model — cudapipe uses it zero times today:
+The idea was that `cuMemAdvise` gives device residency without changing the
+memory model:
 
 ```c
 cuMemAdvise(ptr, size, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, dev);
@@ -426,6 +535,25 @@ cuMemAdvise(ptr, size, CU_MEM_ADVISE_SET_ACCESSED_BY, CU_DEVICE_CPU);
 
 Preferred-location pins pages on the device; accessed-by establishes a direct
 CPU mapping so host access maps over PCIe rather than migrating.
+
+**Measured, and it is a large regression whichever allocations it is applied
+to.** Over the whole sweep: 84% slower applied to all of them, still 26% slower
+applied only to resources, with particlesystem going from 79 to 267 ms a frame
+and `dynamicuniformbuffer` from 42 to 123.
+
+The reason is the second line. The driver writes managed memory from the host
+constantly — a per-draw argument block, strides and counts, descriptor and
+uniform data lavapipe writes straight through the mapping — and pinning the
+pages on the device turns every one of those into an uncached PCIe write. That
+costs far more than the migrations it avoids.
+
+This is the argument for doing 1b.2 properly rather than taking the shortcut:
+the advice cannot tell host-written memory from device-only memory, because the
+driver does not currently distinguish them. Where that distinction *has* been
+made explicitly — the shading buffers, which no host code touches, moved to a
+`cuMemAlloc` arena of their own — the same underlying win was available and
+real, and multithreading halved. The residency is worth having; the hint is not
+the way to get it.
 
 The reason to do the full split anyway rather than stop here: managed residency
 is *emergent*. One unplanned CPU read — a debug path, a query result, an
