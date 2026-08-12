@@ -318,8 +318,12 @@ def line_chart(series, width=340, height=130, pad_l=48, pad_b=22, pad_t=10,
     def sy(y):
         return pad_t + ih - (y - y0) / (y1 - y0) * ih
 
+    # The geometry travels with the chart so a click can be turned back into
+    # an x value without the page having to know how it was drawn.
     out = [f'<svg viewBox="0 0 {width} {height}" class="chart" '
-           f'preserveAspectRatio="none" role="img">']
+           f'preserveAspectRatio="none" role="img" '
+           f'data-x0="{x0}" data-x1="{x1}" data-pl="{pad_l}" '
+           f'data-pr="{pad_r}" data-w="{width}">']
 
     # Recessive gridlines and value labels at the two ends of the range.
     for frac in (0.0, 0.5, 1.0):
@@ -344,6 +348,9 @@ def line_chart(series, width=340, height=130, pad_l=48, pad_b=22, pad_t=10,
         out.append(f'<circle class="dot s{slot}" cx="{sx(ex):.1f}" '
                    f'cy="{sy(ey):.1f}" r="3"/>')
 
+    # Where the viewer is currently parked. Hidden until something sets it.
+    out.append(f'<line class="cursor" x1="0" y1="{pad_t}" x2="0" '
+               f'y2="{pad_t + ih}" style="display:none"/>')
     out.append('</svg>')
     return '\n'.join(out), [(lbl, slot) for lbl, slot, _ in series]
 
@@ -417,6 +424,8 @@ td.num{{text-align:right;font-variant-numeric:tabular-nums}}
 .chart{{width:100%;height:auto;display:block;overflow:visible}}
 .grid{{stroke:var(--border);stroke-width:1}}
 .tick{{fill:var(--muted);font-size:9px}}
+.cursor{{stroke:var(--fg);stroke-width:1;opacity:.55}}
+.card .chart{{cursor:crosshair}}
 .line{{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}}
 .empty{{color:var(--muted);font-size:13px;margin:.6rem 0}}
 .s1{{stroke:var(--s1)}} .s2{{stroke:var(--s2)}} .s3{{stroke:var(--s3)}}
@@ -699,7 +708,40 @@ document.querySelectorAll('.viewer').forEach(function (v) {
   var slider = v.querySelector('input[type=range]');
   var label  = v.querySelector('.frameno');
   var base   = v.dataset.base, sample = v.dataset.sample;
+  var chart  = v.closest('.card').querySelector('svg.chart');
+  var cursor = chart && chart.querySelector('.cursor');
+
+  // The chart is the index: click where the difference spikes and the panes
+  // below jump to that frame.
+  function place() {
+    if (!cursor) return;
+    var x0 = +chart.dataset.x0, x1 = +chart.dataset.x1;
+    var pl = +chart.dataset.pl, pr = +chart.dataset.pr, w = +chart.dataset.w;
+    var f = x1 > x0 ? (+slider.value - x0) / (x1 - x0) : 0;
+    var x = pl + f * (w - pl - pr);
+    cursor.setAttribute('x1', x);
+    cursor.setAttribute('x2', x);
+    cursor.style.display = '';
+  }
+
+  if (chart) {
+    chart.addEventListener('click', function (e) {
+      var r = chart.getBoundingClientRect();
+      var x0 = +chart.dataset.x0, x1 = +chart.dataset.x1;
+      var pl = +chart.dataset.pl, pr = +chart.dataset.pr, w = +chart.dataset.w;
+      // viewBox starts at 0 and the aspect is not preserved, so the pointer
+      // maps straight through as a fraction of the rendered width.
+      var sx = (e.clientX - r.left) / r.width * w;
+      var f = (sx - pl) / (w - pl - pr);
+      var frame = Math.round(x0 + f * (x1 - x0));
+      frame = Math.max(+slider.min, Math.min(+slider.max, frame));
+      slider.value = frame;
+      slider.dispatchEvent(new Event('input'));
+    });
+  }
+
   slider.addEventListener('input', function () {
+    place();
     var n = String(+slider.value + 1).padStart(4, '0');
     label.textContent = 'frame ' + slider.value;
     v.querySelectorAll('img[data-driver]').forEach(function (img) {
@@ -715,6 +757,7 @@ document.querySelectorAll('.viewer').forEach(function (v) {
       }
     });
   });
+  place();
 });
 
 // Click any pane for the full resolution PNG, and keep the hover gesture
