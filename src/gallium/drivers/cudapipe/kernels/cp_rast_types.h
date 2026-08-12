@@ -105,6 +105,9 @@ struct cp_rasterize_args {
    uint64_t peel_next;      /* uint32 per pixel: first primitive not yet blended */
    uint64_t peel_any;       /* uint32: set when any pixel still had a layer */
    uint32_t blend_peel;
+   /* Samples per pixel, 1 or CP_MAX_SAMPLES. Coverage and depth are resolved
+    * per sample; shading stays per pixel. */
+   uint32_t num_samples;
 };
 
 /* Passes an alpha-tested draw gets to find a fragment that survives. Each one
@@ -212,6 +215,7 @@ struct cp_fs_interp_args {
    uint32_t point_mode;
    int32_t psiz_slot;
    int32_t pntc_input;
+   uint32_t num_samples;
 };
 
 struct cp_fs_writeback_args {
@@ -238,6 +242,11 @@ struct cp_fs_writeback_args {
    uint32_t rgb_src_factor, rgb_dst_factor, rgb_func;
    uint32_t alpha_src_factor, alpha_dst_factor, alpha_func;
    uint32_t colormask;
+   /* Samples per pixel, and the distance between one sample's plane of the
+    * colour attachment and the next, in bytes. */
+   uint32_t num_samples;
+   uint32_t sample_stride;   /* bytes between colour sample planes */
+   uint32_t height;          /* with width, the stride between visbuf planes */
 };
 
 /*
@@ -437,6 +446,26 @@ struct cp_draw_params {
 
 /* How deep a pile of blended fragments one draw will composite. */
 #define CP_BLEND_LAYERS      256
+
+/* Multisampling. 1x, 4x and 8x are advertised, and the visibility, depth and
+ * colour buffers all hold the samples plane after plane: sample s of pixel p
+ * lives at s * width * height + p. The coverage byte carries one bit per
+ * sample, so eight is the most this layout takes without widening it. */
+#define CP_MAX_SAMPLES       8
+
+/* Distinct primitives one 2x2 block will shade. With multisampling a block
+ * covers 16 samples, so more triangles can meet inside it than without. */
+#define CP_MAX_BLOCK_TRIS    8
+
+struct cp_resolve_msaa_args {
+   uint64_t src;
+   uint64_t dst;
+   uint32_t width, height;
+   uint32_t src_stride, dst_stride;
+   uint32_t sample_stride;
+   uint32_t num_samples;
+   int32_t encoding;
+};
 #define CP_MAX_NONTRIVIAL    1000000
 #define CP_MAX_HUGE_TILES    2000000
 

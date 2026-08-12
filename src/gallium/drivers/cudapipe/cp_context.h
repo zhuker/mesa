@@ -27,6 +27,8 @@ struct cp_context {
    CUdeviceptr visbuf;
    CUdeviceptr reject;      /* per-pixel discarded triangles, CP_DISCARD_LAYERS deep */
    CUdeviceptr resolved;    /* per-pixel byte: a fragment has been written */
+   unsigned fb_samples;     /* samples per pixel of the bound framebuffer */
+   unsigned visbuf_samples; /* what the visibility and depth buffers were sized for */
    CUdeviceptr peel_next;   /* per-pixel: first primitive not yet blended */
    CUdeviceptr peel_any;    /* one uint32, managed: a pass found work to do */
    unsigned visbuf_w, visbuf_h;

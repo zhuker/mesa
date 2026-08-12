@@ -81,6 +81,31 @@ edge_inside(float e, bool top_left)
    return top_left ? (e >= 0.0f) : (e > 0.0f);
 }
 
+/*
+ * Where a sample sits inside its pixel. One sample is the centre, which keeps
+ * the single-sample path bit-identical; the four are Vulkan's standard
+ * locations for VK_SAMPLE_COUNT_4_BIT.
+ */
+static __device__ __forceinline__ void
+cp_sample_pos(uint32_t num_samples, int s, float *ox, float *oy)
+{
+   if (num_samples <= 1) {
+      *ox = 0.5f; *oy = 0.5f;
+      return;
+   }
+   if (num_samples <= 4) {
+      const float xs[4] = { 0.375f, 0.875f, 0.125f, 0.625f };
+      const float ys[4] = { 0.125f, 0.375f, 0.625f, 0.875f };
+      *ox = xs[s & 3]; *oy = ys[s & 3];
+      return;
+   }
+   const float xs[8] = { 0.5625f, 0.4375f, 0.8125f, 0.3125f,
+                         0.1875f, 0.0625f, 0.6875f, 0.9375f };
+   const float ys[8] = { 0.3125f, 0.6875f, 0.5625f, 0.1875f,
+                         0.8125f, 0.4375f, 0.9375f, 0.0625f };
+   *ox = xs[s & 7]; *oy = ys[s & 7];
+}
+
 static __device__ __forceinline__ uint32_t
 float_to_sortable_uint(float f)
 {
@@ -361,16 +386,18 @@ cp_tri_rejected(const struct cp_rasterize_args *args, uint32_t tri_id,
  */
 static __device__ __forceinline__ void
 emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
-              int px, int py, float ndc_z)
+              int px, int py, int sample, float ndc_z)
 {
    if (cp_tri_rejected(args, tri_id, px, py))
       return;
 
+   uint32_t plane = (uint32_t)sample * args->width * args->height;
+   uint32_t at = plane + (uint32_t)py * args->width + (uint32_t)px;
+
    uint32_t depth_uint = float_to_sortable_uint(ndc_z * 0.5f + 0.5f);
 
    if (args->depth_test && args->depthbuf) {
-      uint32_t prev =
-         ((const uint32_t *)(uintptr_t)args->depthbuf)[py * args->width + px];
+      uint32_t prev = ((const uint32_t *)(uintptr_t)args->depthbuf)[at];
       bool pass;
       switch (args->depth_func) {
       case CP_FUNC_NEVER:     pass = false; break;
@@ -394,11 +421,10 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
     * visibility buffer on the primitive index makes the same atomicMin do it.
     */
    if (args->blend_peel) {
-      uint32_t idx = py * args->width + px;
       const uint32_t *next = (const uint32_t *)(uintptr_t)args->peel_next;
-      if (tri_id < next[idx])
+      if (tri_id < next[(uint32_t)py * args->width + (uint32_t)px])
          return;
-      atomicMin(&visbuf[idx], PACK_VISBUF(tri_id, tri_id));
+      atomicMin(&visbuf[at], PACK_VISBUF(tri_id, tri_id));
       /* Tells the host another pass is worth running. Racing writers all store
        * the same value, so the read first is only there to spare the traffic. */
       uint32_t *any = (uint32_t *)(uintptr_t)args->peel_any;
@@ -408,7 +434,7 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
    }
 
    uint32_t key = args->depth_key_invert ? ~depth_uint : depth_uint;
-   atomicMin(&visbuf[py * args->width + px], PACK_VISBUF(key, tri_id));
+   atomicMin(&visbuf[at], PACK_VISBUF(key, tri_id));
 }
 
 /*
@@ -421,14 +447,16 @@ rasterize_point(struct cp_rasterize_args *args, struct tri_setup *s,
                 uint32_t tri_id)
 {
    for (int py = s->iy_min; py <= s->iy_max; py++) {
-      float cy = (float)py + 0.5f;
-      if (cy < s->pt_y0 || cy >= s->pt_y1)
-         continue;
       for (int px = s->ix_min; px <= s->ix_max; px++) {
-         float cx = (float)px + 0.5f;
-         if (cx < s->pt_x0 || cx >= s->pt_x1)
-            continue;
-         emit_fragment(args, tri_id, px, py, s->ndc_z0);
+         for (int sm = 0; sm < (int)args->num_samples; sm++) {
+            float ox, oy;
+            cp_sample_pos(args->num_samples, sm, &ox, &oy);
+            float cx = (float)px + ox, cy = (float)py + oy;
+            if (cx < s->pt_x0 || cx >= s->pt_x1 ||
+                cy < s->pt_y0 || cy >= s->pt_y1)
+               continue;
+            emit_fragment(args, tri_id, px, py, sm, s->ndc_z0);
+         }
       }
    }
 }
@@ -491,24 +519,26 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
 
    for (int py = s.iy_min; py <= s.iy_max; py++) {
-      float cy = (float)py + 0.5f;
-
       for (int px = s.ix_min; px <= s.ix_max; px++) {
-         float cx = (float)px + 0.5f;
+         for (int sm = 0; sm < (int)args.num_samples; sm++) {
+            float ox, oy;
+            cp_sample_pos(args.num_samples, sm, &ox, &oy);
+            float cx = (float)px + ox, cy = (float)py + oy;
 
-         float e0 = edge_function(s.sx1, s.sy1, s.sx2, s.sy2, cx, cy);
-         float e1 = edge_function(s.sx2, s.sy2, s.sx0, s.sy0, cx, cy);
-         float e2 = edge_function(s.sx0, s.sy0, s.sx1, s.sy1, cx, cy);
+            float e0 = edge_function(s.sx1, s.sy1, s.sx2, s.sy2, cx, cy);
+            float e1 = edge_function(s.sx2, s.sy2, s.sx0, s.sy0, cx, cy);
+            float e2 = edge_function(s.sx0, s.sy0, s.sx1, s.sy1, cx, cy);
 
-         if (edge_inside(e0, s.e0_top_left) &&
-             edge_inside(e1, s.e1_top_left) &&
-             edge_inside(e2, s.e2_top_left)) {
-            float w0 = e0 * s.inv_area;
-            float w1 = e1 * s.inv_area;
-            float w2 = 1.0f - w0 - w1;
+            if (edge_inside(e0, s.e0_top_left) &&
+                edge_inside(e1, s.e1_top_left) &&
+                edge_inside(e2, s.e2_top_left)) {
+               float w0 = e0 * s.inv_area;
+               float w1 = e1 * s.inv_area;
+               float w2 = 1.0f - w0 - w1;
 
-            emit_fragment(&args, tri_id, px, py,
-                          w0 * s.ndc_z0 + w1 * s.ndc_z1 + w2 * s.ndc_z2);
+               emit_fragment(&args, tri_id, px, py, sm,
+                             w0 * s.ndc_z0 + w1 * s.ndc_z1 + w2 * s.ndc_z2);
+            }
          }
       }
    }
@@ -631,23 +661,26 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
       if (px < 0 || px >= (int)args.width || py < 0 || py >= (int)args.height)
          continue;
 
-      float cx = (float)px + 0.5f;
-      float cy = (float)py + 0.5f;
+      for (int sm = 0; sm < (int)args.num_samples; sm++) {
+         float ox, oy;
+         cp_sample_pos(args.num_samples, sm, &ox, &oy);
+         float cx = (float)px + ox, cy = (float)py + oy;
 
-      float e0 = edge_function(sx1, sy1, sx2, sy2, cx, cy);
-      float e1 = edge_function(sx2, sy2, sx0, sy0, cx, cy);
-      float e2 = edge_function(sx0, sy0, sx1, sy1, cx, cy);
+         float e0 = edge_function(sx1, sy1, sx2, sy2, cx, cy);
+         float e1 = edge_function(sx2, sy2, sx0, sy0, cx, cy);
+         float e2 = edge_function(sx0, sy0, sx1, sy1, cx, cy);
 
-      if (!edge_inside(e0, e0_tl) ||
-          !edge_inside(e1, e1_tl) ||
-          !edge_inside(e2, e2_tl))
-         continue;
+         if (!edge_inside(e0, e0_tl) ||
+             !edge_inside(e1, e1_tl) ||
+             !edge_inside(e2, e2_tl))
+            continue;
 
-      float w0 = e0 * inv_area;
-      float w1 = e1 * inv_area;
+         float w0 = e0 * inv_area;
+         float w1 = e1 * inv_area;
 
-      emit_fragment(&args, tri_id, px, py,
-                    w0 * ndc_z0 + w1 * ndc_z1 + (1.0f - w0 - w1) * ndc_z2);
+         emit_fragment(&args, tri_id, px, py, sm,
+                       w0 * ndc_z0 + w1 * ndc_z1 + (1.0f - w0 - w1) * ndc_z2);
+      }
    }
 }
 
@@ -742,28 +775,30 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
 
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
 
-   float cx = (float)px + 0.5f;
-
    for (int row = 0; row < CP_TILE_SIZE; row++) {
       int py = tile_y + row;
       if (py >= (int)args.height)
          break;
 
-      float cy = (float)py + 0.5f;
+      for (int sm = 0; sm < (int)args.num_samples; sm++) {
+         float ox, oy;
+         cp_sample_pos(args.num_samples, sm, &ox, &oy);
+         float sx = (float)px + ox, sy = (float)py + oy;
 
-      float e0 = edge_function(sh_sx1, sh_sy1, sh_sx2, sh_sy2, cx, cy);
-      float e1 = edge_function(sh_sx2, sh_sy2, sh_sx0, sh_sy0, cx, cy);
-      float e2 = edge_function(sh_sx0, sh_sy0, sh_sx1, sh_sy1, cx, cy);
+         float e0 = edge_function(sh_sx1, sh_sy1, sh_sx2, sh_sy2, sx, sy);
+         float e1 = edge_function(sh_sx2, sh_sy2, sh_sx0, sh_sy0, sx, sy);
+         float e2 = edge_function(sh_sx0, sh_sy0, sh_sx1, sh_sy1, sx, sy);
 
-      if (edge_inside(e0, sh_e0_tl) &&
-          edge_inside(e1, sh_e1_tl) &&
-          edge_inside(e2, sh_e2_tl)) {
-         float w0 = e0 * sh_inv_area;
-         float w1 = e1 * sh_inv_area;
+         if (edge_inside(e0, sh_e0_tl) &&
+             edge_inside(e1, sh_e1_tl) &&
+             edge_inside(e2, sh_e2_tl)) {
+            float w0 = e0 * sh_inv_area;
+            float w1 = e1 * sh_inv_area;
 
-         emit_fragment(&args, tri_id, px, py,
-                       w0 * sh_ndc_z0 + w1 * sh_ndc_z1 +
-                       (1.0f - w0 - w1) * sh_ndc_z2);
+            emit_fragment(&args, tri_id, px, py, sm,
+                          w0 * sh_ndc_z0 + w1 * sh_ndc_z1 +
+                          (1.0f - w0 - w1) * sh_ndc_z2);
+         }
       }
    }
 }

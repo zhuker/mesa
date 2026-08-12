@@ -52,3 +52,4 @@ cp_clear_depth_kernel(struct cp_clear_args args)
       *(uint16_t *)pixel = (uint16_t)args.clear_value[0];
    }
 }
+

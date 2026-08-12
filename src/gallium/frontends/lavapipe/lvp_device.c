@@ -950,6 +950,22 @@ static VkImageLayout lvp_host_copy_image_layouts[] = {
 static void
 lvp_get_properties(const struct lvp_physical_device *device, struct vk_properties *p)
 {
+   /*
+    * Ask the driver which sample counts it can actually render, rather than
+    * naming a fixed set. An application that picks the highest advertised
+    * count gets one the driver silently clamps otherwise, which is how
+    * cudapipe ended up rasterizing four samples into an eight sample
+    * attachment and resolving the four it never wrote.
+    */
+   struct pipe_screen *sample_screen = device->pscreen;
+   VkSampleCountFlags lvp_sample_counts = VK_SAMPLE_COUNT_1_BIT;
+   for (unsigned n = 2; n <= 8; n *= 2) {
+      if (sample_screen->is_format_supported(sample_screen,
+                                             PIPE_FORMAT_R8G8B8A8_UNORM,
+                                             PIPE_TEXTURE_2D, n, n,
+                                             PIPE_BIND_RENDER_TARGET))
+         lvp_sample_counts |= (VkSampleCountFlags)n;
+   }
    const unsigned *grid_size = device->pscreen->compute_caps.max_grid_size;
    const unsigned *block_size = device->pscreen->compute_caps.max_block_size;
 
@@ -1046,16 +1062,16 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .maxFramebufferWidth                      = device->pscreen->caps.max_texture_2d_size,
       .maxFramebufferHeight                     = device->pscreen->caps.max_texture_2d_size,
       .maxFramebufferLayers                     = device->pscreen->caps.max_texture_array_layers,
-      .framebufferColorSampleCounts             = LVP_SAMPLE_COUNTS,
-      .framebufferDepthSampleCounts             = LVP_SAMPLE_COUNTS,
-      .framebufferStencilSampleCounts           = LVP_SAMPLE_COUNTS,
-      .framebufferNoAttachmentsSampleCounts     = LVP_SAMPLE_COUNTS,
+      .framebufferColorSampleCounts             = lvp_sample_counts,
+      .framebufferDepthSampleCounts             = lvp_sample_counts,
+      .framebufferStencilSampleCounts           = lvp_sample_counts,
+      .framebufferNoAttachmentsSampleCounts     = lvp_sample_counts,
       .maxColorAttachments                      = max_render_targets,
-      .sampledImageColorSampleCounts            = LVP_SAMPLE_COUNTS,
-      .sampledImageIntegerSampleCounts          = LVP_SAMPLE_COUNTS,
-      .sampledImageDepthSampleCounts            = LVP_SAMPLE_COUNTS,
-      .sampledImageStencilSampleCounts          = LVP_SAMPLE_COUNTS,
-      .storageImageSampleCounts                 = LVP_SAMPLE_COUNTS,
+      .sampledImageColorSampleCounts            = lvp_sample_counts,
+      .sampledImageIntegerSampleCounts          = lvp_sample_counts,
+      .sampledImageDepthSampleCounts            = lvp_sample_counts,
+      .sampledImageStencilSampleCounts          = lvp_sample_counts,
+      .storageImageSampleCounts                 = lvp_sample_counts,
       .maxSampleMaskWords                       = 1,
       .timestampComputeAndGraphics              = true,
       .timestampPeriod                          = 1,
@@ -1347,7 +1363,7 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .prefersCompactPrimitiveOutput = false,
 
       /* VK_EXT_sample_locations */
-      .sampleLocationSampleCounts = ~VK_SAMPLE_COUNT_1_BIT & LVP_SAMPLE_COUNTS,
+      .sampleLocationSampleCounts = ~VK_SAMPLE_COUNT_1_BIT & lvp_sample_counts,
       .maxSampleLocationGridSize.width = 1,
       .maxSampleLocationGridSize.height = 1,
       .sampleLocationCoordinateRange[0] = 0.0f,

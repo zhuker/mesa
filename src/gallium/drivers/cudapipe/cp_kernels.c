@@ -135,6 +135,7 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
       goto fail;
    cuModuleGetFunction(&k->fs_interpolate, k->fs_module, "cp_fs_interpolate");
    cuModuleGetFunction(&k->fs_writeback, k->fs_module, "cp_fs_writeback");
+   cuModuleGetFunction(&k->resolve_samples, k->fs_module, "cp_resolve_samples");
 
    if (!build_module(&k->vfetch_module, cp_vertex_fetch_src, "cp_vertex_fetch.cu", screen))
       goto fail;

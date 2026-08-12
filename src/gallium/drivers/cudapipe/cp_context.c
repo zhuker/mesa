@@ -86,9 +86,20 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
    struct cp_context *cp = (struct cp_context *)ctx;
    util_copy_framebuffer_state(&cp->framebuffer, state);
 
+   /* Coverage and depth are per sample, so the buffers scale with the sample
+    * count and it has to force a reallocation the same way the size does. */
+   unsigned samples = 1;
+   if (state->nr_cbufs && state->cbufs[0].texture)
+      samples = MAX2(state->cbufs[0].texture->nr_samples, 1u);
+   else if (state->zsbuf.texture)
+      samples = MAX2(state->zsbuf.texture->nr_samples, 1u);
+   if (samples > CP_MAX_SAMPLES)
+      samples = CP_MAX_SAMPLES;
+   cp->fb_samples = samples;
+
    /* Reallocate the visibility and depth buffers if the size changed */
    unsigned w = state->width, h = state->height;
-   if (w != cp->visbuf_w || h != cp->visbuf_h) {
+   if (w != cp->visbuf_w || h != cp->visbuf_h || samples != cp->visbuf_samples) {
       if (cp->visbuf)
          cuMemFree(cp->visbuf);
       if (cp->depthbuf)
@@ -106,10 +117,13 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
       cp->peel_next = 0;
       cp->visbuf_w = cp->depthbuf_w = w;
       cp->visbuf_h = cp->depthbuf_h = h;
+      cp->visbuf_samples = samples;
       if (w > 0 && h > 0) {
          cuCtxSetCurrent(cp->screen->cuda_ctx);
-         CUresult e1 = cuMemAlloc(&cp->visbuf, (size_t)w * h * sizeof(uint64_t));
-         CUresult e2 = cuMemAlloc(&cp->depthbuf, (size_t)w * h * sizeof(uint32_t));
+         CUresult e1 = cuMemAlloc(&cp->visbuf,
+                                  (size_t)w * h * samples * sizeof(uint64_t));
+         CUresult e2 = cuMemAlloc(&cp->depthbuf,
+                                  (size_t)w * h * samples * sizeof(uint32_t));
          cuMemAlloc(&cp->reject,
                     (size_t)w * h * CP_DISCARD_LAYERS * sizeof(uint32_t));
          cuMemAlloc(&cp->resolved, (size_t)w * h);
@@ -162,7 +176,7 @@ cp_clear_depthbuf(struct cp_context *cp, float depth)
    size_t count = (size_t)cp->depthbuf_w * cp->depthbuf_h;
 
    cuCtxSetCurrent(cp->screen->cuda_ctx);
-   cuMemsetD32(cp->depthbuf, value, count);
+   cuMemsetD32(cp->depthbuf, value, count * MAX2(cp->visbuf_samples, 1u));
    cp->depthbuf_cleared = true;
 }
 
@@ -614,6 +628,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
    };
 
+   interp.num_samples = MAX2(cp->fb_samples, 1u);
    interp.point_mode = info->mode == MESA_PRIM_POINTS;
    interp.psiz_slot = cp_slot_for_location(cp->vs_shader->out_location,
                                            num_vs_outputs, VARYING_SLOT_PSIZ);
@@ -762,6 +777,12 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .alpha_dst_factor = rt->alpha_dst_factor,
       .alpha_func = rt->alpha_func,
       .colormask = rt->colormask ? rt->colormask : 0xF,
+      .num_samples = MAX2(cp->fb_samples, 1u),
+      .height = h,
+      .sample_stride = cp->framebuffer.nr_cbufs &&
+                       cp->framebuffer.cbufs[0].texture
+         ? (uint32_t)cp_resource(cp->framebuffer.cbufs[0].texture)->lpr.sample_stride
+         : 0,
    };
 
    void *wb_params[] = { &wb };
@@ -886,6 +907,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    unsigned w = fb->width;
    unsigned h = fb->height;
+   unsigned fb_samples = MAX2(cp->fb_samples, 1u);
 
    /* The visibility buffer only ever holds this draw's triangles: its entries
     * are triangle indices into this draw's vertex arrays, so carrying it
@@ -899,7 +921,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    /* Clear visbuf to VISBUF_EMPTY (all-ones). cuMemsetD32 fills 32-bit words
     * which is faster than a kernel launch for a bulk fill. */
-   cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2);
+   cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples);
 
    if (!cp->depthbuf_cleared)
       cp_clear_depthbuf(cp, 1.0f);
@@ -944,6 +966,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       .front_face = cp->rasterizer.front_ccw,
       /* Points have no winding to cull and no edges to test; the square comes
        * from gl_PointSize, wherever the vertex shader put it. */
+      .num_samples = fb_samples,
       .point_mode = info->mode == MESA_PRIM_POINTS,
       .psiz_slot = cp->vs_shader
          ? cp_slot_for_location(cp->vs_shader->out_location,
@@ -1316,9 +1339,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    timing.vertex_ms = cp_lap(&mark);
 
    if (getenv("CUDAPIPE_DEBUG_DRAW")) {
-      fprintf(stderr, "cudapipe: draw %u tris (%u instances), fb=%ux%u, "
+      fprintf(stderr, "cudapipe: [samples=%u] draw %u tris (%u instances), fb=%ux%u, "
               "vp=[%.0f,%.0f,%.0f,%.0f] stride=%u scale=[%.1f,%.1f] color=%p\n",
-              num_triangles, instance_count, w, h, vp_x, vp_y, vp_w, vp_h,
+              fb_samples, num_triangles, instance_count, w, h, vp_x, vp_y, vp_w, vp_h,
               cp->vertex_stride,
               cp->viewport.scale[0], cp->viewport.scale[1], color_data);
       for (unsigned e = 0; e < cp->num_vertex_elements && e < 4; e++)
@@ -1396,7 +1419,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    for (unsigned pass = 0; pass < passes; pass++) {
       if (pass) {
          /* Each pass resolves visibility afresh, minus what has been rejected. */
-         cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2);
+         cuMemsetD32(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples);
          rast_args.reject_passes = pass;
       }
       if (peel)

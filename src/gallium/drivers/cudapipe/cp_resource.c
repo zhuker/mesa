@@ -69,8 +69,10 @@ cp_resource_create(struct pipe_screen *screen,
 
    uint64_t size = cp_resource_layout(res, tmpl);
 
-   /* Multisample surfaces store nr_samples copies of every pixel. */
+   /* Multisample surfaces store nr_samples copies of every pixel, one whole
+    * plane after another, so a sample's plane starts at s * sample_stride. */
    unsigned nr_samples = MAX2(tmpl->nr_samples, 1);
+   res->lpr.sample_stride = size;
    size *= nr_samples;
 
    if (size > 0) {
@@ -106,6 +108,12 @@ cp_resource_create_unbacked(struct pipe_screen *screen,
    pipe_reference_init(&res->lpr.base.reference, 1);
 
    uint64_t size = cp_resource_layout(res, tmpl);
+
+   /* Same sample layout as the backed path, and the same multiplication — a
+    * multisample attachment created this way was reporting one sample's worth
+    * of memory, so its later planes had nothing behind them. */
+   res->lpr.sample_stride = size;
+   size *= MAX2(tmpl->nr_samples, 1);
 
    if (size_required)
       *size_required = size;
@@ -242,9 +250,12 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
    if (getenv("CUDAPIPE_DEBUG_DRAW"))
-      fprintf(stderr, "cudapipe: blit %ux%u -> %ux%u src=%p dst=%p\n",
+      fprintf(stderr, "cudapipe: blit %ux%u -> %ux%u src=%p dst=%p "
+              "srcsamples=%u dstsamples=%u fmt=%u->%u\n",
               info->src.box.width, info->src.box.height,
-              info->dst.box.width, info->dst.box.height, src_data, dst_data);
+              info->dst.box.width, info->dst.box.height, src_data, dst_data,
+              info->src.resource->nr_samples, info->dst.resource->nr_samples,
+              info->src.format, info->dst.format);
    if (!src_data || !dst_data)
       return;
 
@@ -263,6 +274,42 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    int src_h = info->src.box.height;
    int dst_w = info->dst.box.width;
    int dst_h = info->dst.box.height;
+
+   /*
+    * Resolve: a multisample source read into a single-sample destination is
+    * the average of the sample planes, which is the whole point of rendering
+    * multisampled in the first place. Same format and size, so it is the
+    * copy below with an averaging step in front of it.
+    */
+   unsigned src_samples = MAX2(info->src.resource->nr_samples, 1u);
+   unsigned dst_samples = MAX2(info->dst.resource->nr_samples, 1u);
+   if (src_samples > 1 && dst_samples == 1 &&
+       info->src.format == info->dst.format &&
+       src_w == dst_w && src_h == dst_h &&
+       src_res->cuda_managed && dst_res->cuda_managed &&
+       cp->screen->kernels.resolve_samples) {
+      cuCtxSetCurrent(cp->screen->cuda_ctx);
+      struct cp_resolve_msaa_args ra = {
+         .src = (uint64_t)(uintptr_t)src_data,
+         .dst = (uint64_t)(uintptr_t)dst_data,
+         .width = (uint32_t)src_w,
+         .height = (uint32_t)src_h,
+         .src_stride = src_stride,
+         .dst_stride = dst_stride,
+         .sample_stride = (uint32_t)src_res->lpr.sample_stride,
+         .num_samples = src_samples,
+         .encoding = cp_color_encoding_from_format(info->src.format),
+      };
+      if (getenv("CUDAPIPE_DEBUG_DRAW"))
+         fprintf(stderr, "  resolve %ux%u samples=%u sstride=%u srcstride=%u "
+                 "dststride=%u enc=%d\n", ra.width, ra.height, ra.num_samples,
+                 ra.sample_stride, ra.src_stride, ra.dst_stride, ra.encoding);
+      void *params[] = { &ra };
+      cuLaunchKernel(cp->screen->kernels.resolve_samples,
+                     (src_w + 15) / 16, (src_h + 15) / 16, 1, 16, 16, 1,
+                     0, NULL, params, NULL);
+      return;
+   }
 
    /* Same format and same size */
    if (info->src.format == info->dst.format && src_w == dst_w && src_h == dst_h) {
@@ -608,11 +655,18 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
          union pipe_color_union clamped = *color;
          util_format_pack_rgba(surf->format, args.clear_value, &clamped, 1);
 
-         void *params[] = { &args };
-         cuLaunchKernel(screen->kernels.clear_kernel,
-            (w + 15) / 16, (h + 15) / 16, 1,
-            16, 16, 1,
-            0, NULL, params, NULL);
+         /* Every sample plane, or a multisample attachment keeps whatever was
+          * left in samples 1..n-1 and the resolve averages it in. */
+         unsigned samples = MAX2(surf->texture->nr_samples, 1u);
+         for (unsigned smp = 0; smp < samples; smp++) {
+            args.target = (uint64_t)(uintptr_t)data +
+                          (uint64_t)smp * res->lpr.sample_stride;
+            void *params[] = { &args };
+            cuLaunchKernel(screen->kernels.clear_kernel,
+               (w + 15) / 16, (h + 15) / 16, 1,
+               16, 16, 1,
+               0, NULL, params, NULL);
+         }
       }
    }
 

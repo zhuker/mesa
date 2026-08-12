@@ -23,6 +23,7 @@ struct cp_kernels {
    CUfunction clip_triangles;
    CUfunction clear_visbuf;
    CUfunction peel_advance;
+   CUfunction resolve_samples;
    CUfunction resolve_visbuf;
 
    /* Fragment stage kernels bracketing the compiled fragment shader */

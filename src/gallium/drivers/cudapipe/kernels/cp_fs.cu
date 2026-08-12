@@ -188,53 +188,53 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
    uint32_t qy = (quad / args.quad_width) * 2;
 
    const uint64_t *visbuf = (const uint64_t *)(uintptr_t)args.visbuf;
+   uint32_t samples = args.num_samples ? args.num_samples : 1u;
+   uint32_t plane = args.width * args.height;
    uint32_t pix[4];
-   uint32_t tri[4];
-   bool covered[4];
-   int first = -1;
+   bool in_fb[4];
 
    for (int i = 0; i < 4; i++) {
       uint32_t x = qx + (i & 1);
       uint32_t y = qy + (i >> 1);
-      covered[i] = false;
-      tri[i] = 0;
+      in_fb[i] = x < args.width && y < args.height;
       /* Clamp so an odd-sized framebuffer still shades a full quad. */
       pix[i] = (y < args.height ? y : args.height - 1) * args.width +
                (x < args.width ? x : args.width - 1);
-      if (x >= args.width || y >= args.height)
-         continue;
-      uint64_t entry = visbuf[pix[i]];
-      if (entry == VISBUF_EMPTY)
-         continue;
-      /* Complemented so atomicMin favours the last primitive on ties. */
-      tri[i] = ~(uint32_t)(entry & 0xFFFFFFFFu);
-      covered[i] = true;
-      if (first < 0)
-         first = i;
    }
-
-   if (first < 0)
-      return;
 
    /*
     * A quad must belong to a single triangle. Two triangles meeting inside one
     * 2x2 block would otherwise be differenced against each other, and the
     * derivative at every silhouette and every seam would be meaningless —
     * which costs far more than the seams are worth. Emit one quad per distinct
-    * triangle instead, marking only that triangle's pixels as covered; the
-    * rest ride along as helpers on the same surface.
+    * triangle instead; the pixels that triangle does not cover ride along as
+    * helpers on the same surface.
+    *
+    * Multisampling widens the search: a block holds 4 pixels times as many
+    * samples, so more triangles can meet inside it, and a triangle counts if
+    * it won any one sample.
     */
-   uint32_t tris[4];
+   uint32_t tris[CP_MAX_BLOCK_TRIS];
    int ntris = 0;
-   for (int i = 0; i < 4; i++) {
-      if (!covered[i])
+   for (int i = 0; i < 4 && ntris < CP_MAX_BLOCK_TRIS; i++) {
+      if (!in_fb[i])
          continue;
-      bool seen = false;
-      for (int t = 0; t < ntris; t++)
-         seen |= (tris[t] == tri[i]);
-      if (!seen)
-         tris[ntris++] = tri[i];
+      for (uint32_t sm = 0; sm < samples && ntris < CP_MAX_BLOCK_TRIS; sm++) {
+         uint64_t entry = visbuf[(size_t)sm * plane + pix[i]];
+         if (entry == VISBUF_EMPTY)
+            continue;
+         /* Complemented so atomicMin favours the last primitive on ties. */
+         uint32_t t = ~(uint32_t)(entry & 0xFFFFFFFFu);
+         bool seen = false;
+         for (int k = 0; k < ntris; k++)
+            seen |= (tris[k] == t);
+         if (!seen)
+            tris[ntris++] = t;
+      }
    }
+
+   if (ntris == 0)
+      return;
 
    unsigned char *coverage = (unsigned char *)(uintptr_t)args.coverage;
 
@@ -244,10 +244,21 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
          return;
 
       for (int i = 0; i < 4; i++) {
-         bool cov = covered[i] && tri[i] == tris[t];
+         /* Which of this pixel's samples this triangle actually won. Zero
+          * makes the lane a helper: shaded for its derivatives, dropped by
+          * the writeback. */
+         uint32_t mask = 0;
+         if (in_fb[i]) {
+            for (uint32_t sm = 0; sm < samples; sm++) {
+               uint64_t entry = visbuf[(size_t)sm * plane + pix[i]];
+               if (entry != VISBUF_EMPTY &&
+                   (~(uint32_t)(entry & 0xFFFFFFFFu)) == tris[t])
+                  mask |= 1u << sm;
+            }
+         }
          bool ok = cp_interp_pixel(&args, tris[t], pix[i], base + i);
          if (coverage)
-            coverage[base + i] = (ok && cov) ? 1 : 0;
+            coverage[base + i] = ok ? (unsigned char)mask : 0;
       }
    }
 }
@@ -354,6 +365,22 @@ cp_half_to_float_wb(unsigned short h)
    else
       bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
    return __int_as_float((int)bits);
+}
+
+static __device__ void
+cp_load_dst(const void *ptr, uint32_t encoding, float *out);
+
+static __device__ __forceinline__ uint32_t
+cp_bytes_per_pixel(uint32_t encoding)
+{
+   switch (encoding) {
+   case CP_COLOR_R32G32B32A32_FLOAT: return 16;
+   case CP_COLOR_R16G16B16A16_FLOAT: return 8;
+   case CP_COLOR_R16G16_SFLOAT:      return 4;
+   case CP_COLOR_R16_SFLOAT:         return 2;
+   case CP_COLOR_R8_UNORM:           return 1;
+   default:                          return 4;
+   }
 }
 
 static __device__ void
@@ -520,11 +547,19 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
    if (i >= limit)
       return;
 
-   /* A helper lane exists only to supply derivatives to its quad. */
-   if (args.coverage && !((const unsigned char *)(uintptr_t)args.coverage)[i])
+   /* A helper lane exists only to supply derivatives to its quad. Without
+    * multisampling the mask is 0 or 1; with it, one bit per sample won. */
+   uint32_t cov = args.coverage
+      ? ((const unsigned char *)(uintptr_t)args.coverage)[i] : 1u;
+   if (!cov)
       return;
 
+   uint32_t samples = args.num_samples ? args.num_samples : 1u;
    uint32_t pixel = ((const uint32_t *)(uintptr_t)args.pixel_list)[i];
+   uint32_t plane = args.width * args.height;
+   /* The lowest sample this fragment won, for the per-pixel bookkeeping that
+    * has no per-sample equivalent. */
+   uint32_t first_sample = __ffs((int)cov) - 1;
 
    /* Once a pixel has taken a fragment, later passes of an alpha-tested draw
     * must leave it alone rather than blend into it again. */
@@ -536,7 +571,8 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
     * triangle it was so the next pass can pick the one behind it. */
    if (args.discard_mask && ((const unsigned char *)(uintptr_t)args.discard_mask)[i]) {
       if (args.reject && args.reject_pass < args.reject_layers && args.visbuf) {
-         uint64_t entry = ((const uint64_t *)(uintptr_t)args.visbuf)[pixel];
+         uint64_t entry = ((const uint64_t *)(uintptr_t)args.visbuf)
+            [(size_t)first_sample * plane + pixel];
          uint32_t tri = ~(uint32_t)(entry & 0xFFFFFFFFu);
          ((uint32_t *)(uintptr_t)args.reject)[(size_t)pixel * args.reject_layers +
                                               args.reject_pass] = tri;
@@ -550,10 +586,15 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
    /* This fragment survived the depth test during rasterization, so commit its
     * depth before the next draw tests against it. */
    if (args.depth_write && args.depthbuf && args.visbuf) {
-      uint64_t entry = ((const uint64_t *)(uintptr_t)args.visbuf)[pixel];
-      uint32_t key = (uint32_t)(entry >> 32);
-      ((uint32_t *)(uintptr_t)args.depthbuf)[pixel] =
-         args.depth_key_invert ? ~key : key;
+      /* Depth is per sample: only the samples this fragment won advance. */
+      for (uint32_t sm = 0; sm < samples; sm++) {
+         if (!(cov & (1u << sm)))
+            continue;
+         size_t at = (size_t)sm * plane + pixel;
+         uint32_t key = (uint32_t)(((const uint64_t *)(uintptr_t)args.visbuf)[at] >> 32);
+         ((uint32_t *)(uintptr_t)args.depthbuf)[at] =
+            args.depth_key_invert ? ~key : key;
+      }
    }
 
    const float4 *fs_out =
@@ -562,15 +603,18 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
    float src[4] = { fs_out->x, fs_out->y, fs_out->z, fs_out->w };
 
    uint32_t bpp;
-   switch (args.color_encoding) {
-   case CP_COLOR_R32G32B32A32_FLOAT: bpp = 16; break;
-   case CP_COLOR_R16G16B16A16_FLOAT: bpp = 8; break;
-   case CP_COLOR_R16G16_SFLOAT: bpp = 4; break;
-   case CP_COLOR_R16_SFLOAT: bpp = 2; break;
-   case CP_COLOR_R8_UNORM: bpp = 1; break;
-   default: bpp = 4; break;
-   }
-   void *dst_ptr = (char *)(uintptr_t)args.color_out + (size_t)pixel * bpp;
+   bpp = cp_bytes_per_pixel(args.color_encoding);
+   /*
+    * The shader ran once for the pixel, so every sample it covers takes the
+    * same colour — that is what per-fragment shading means. Blending reads and
+    * writes each sample's own plane, so a fragment covering two of four
+    * samples blends into two of them and the resolve weights it accordingly.
+    */
+   for (uint32_t sm = 0; sm < samples; sm++) {
+   if (!(cov & (1u << sm)))
+      continue;
+   void *dst_ptr = (char *)(uintptr_t)args.color_out +
+      (size_t)sm * args.sample_stride + (size_t)pixel * bpp;
 
    float out[4];
    if (args.blend_enable) {
@@ -602,4 +646,43 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
    }
 
    cp_store_dst(dst_ptr, args.color_encoding, out);
+   }
+}
+
+/*
+ * Resolve a multisample attachment: the average of its sample planes.
+ *
+ * Averaging the decoded values rather than the packed bytes, because an sRGB
+ * attachment has to average in linear light — meaning the encoded bytes would
+ * darken exactly the edges the multisampling is there to smooth.
+ */
+extern "C" __global__ void
+cp_resolve_samples(struct cp_resolve_msaa_args args)
+{
+   uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+   if (x >= args.width || y >= args.height)
+      return;
+
+   uint32_t bpp = cp_bytes_per_pixel((uint32_t)args.encoding);
+   uint32_t n = args.num_samples ? args.num_samples : 1u;
+   float sum[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+   for (uint32_t s = 0; s < n; s++) {
+      const void *px = (const char *)(uintptr_t)args.src +
+         (size_t)s * args.sample_stride +
+         (size_t)y * args.src_stride + (size_t)x * bpp;
+      float c[4];
+      cp_load_dst(px, (uint32_t)args.encoding, c);
+      for (int k = 0; k < 4; k++)
+         sum[k] += c[k];
+   }
+
+   float inv = 1.0f / (float)n;
+   for (int k = 0; k < 4; k++)
+      sum[k] *= inv;
+
+   void *out = (char *)(uintptr_t)args.dst +
+      (size_t)y * args.dst_stride + (size_t)x * bpp;
+   cp_store_dst(out, (uint32_t)args.encoding, sum);
 }

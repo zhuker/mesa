@@ -177,10 +177,11 @@ cp_is_format_supported(struct pipe_screen *screen, enum pipe_format format,
                        enum pipe_texture_target target, unsigned sample_count,
                        unsigned storage_sample_count, unsigned bind)
 {
-   /* Support 1x and 4x multisampling. */
-   if (sample_count > 4)
+   /* Standard sample locations are implemented for 4x and 8x. */
+   if (sample_count > 8)
       return false;
-   if (sample_count == 3 || sample_count == 2)
+   if (sample_count == 2 || sample_count == 3 ||
+       (sample_count > 4 && sample_count < 8))
       return false;
    if (MAX2(1, sample_count) != MAX2(1, storage_sample_count))
       return false;
