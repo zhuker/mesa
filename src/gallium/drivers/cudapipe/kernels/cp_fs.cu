@@ -69,7 +69,8 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
     * positive; mirror that here, and carry the swap through to the vertex
     * indices so varyings are fetched in the matching order. */
    int vidx[3] = { 0, 1, 2 };
-   float area = cp_edge(sx0, sy0, sx1, sy1, sx2, sy2);
+   float area = args->point_mode ? 1.0f
+              : cp_edge(sx0, sy0, sx1, sy1, sx2, sy2);
    if (area < 0.0f) {
       float t;
       t = sx1; sx1 = sx2; sx2 = t;
@@ -88,8 +89,10 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
 
    /* A helper lane lies outside the triangle, so its barycentrics go negative.
     * That is exactly what makes the derivative across the quad correct. */
-   float b0 = cp_edge(sx1, sy1, sx2, sy2, cx, cy) * inv_area;
-   float b1 = cp_edge(sx2, sy2, sx0, sy0, cx, cy) * inv_area;
+   float b0 = args->point_mode ? 1.0f
+            : cp_edge(sx1, sy1, sx2, sy2, cx, cy) * inv_area;
+   float b1 = args->point_mode ? 0.0f
+            : cp_edge(sx2, sy2, sx0, sy0, cx, cy) * inv_area;
    float b2 = 1.0f - b0 - b1;
 
    ((uint32_t *)(uintptr_t)args->pixel_list)[slot] = pixel;
@@ -110,6 +113,45 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
 
    const char *vs_out = (const char *)(uintptr_t)args->vs_out;
    char *fs_in = (char *)(uintptr_t)args->fs_in + (size_t)slot * args->fs_in_stride;
+
+   /*
+    * A point has one vertex, so there is nothing to interpolate: every input
+    * takes that vertex's value outright. What the fragment shader does vary
+    * over is gl_PointCoord, which no vertex shader output drives — it is the
+    * position within the point's square, and it is written here.
+    *
+    * Helper lanes land outside the square and so read outside [0, 1], which is
+    * what a derivative of gl_PointCoord needs to come out as 1/size. The
+    * particle shaders pick a mip level from it.
+    */
+   if (args->point_mode) {
+      for (uint32_t i = 0; i < args->num_fs_inputs && i < CP_MAX_FS_INPUTS; i++) {
+         float4 value = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+         int32_t src = args->input_vs_slot[i];
+         if (src >= 0)
+            value = *(const float4 *)(vs_out +
+               (size_t)(tri_id * 3) * args->vs_out_stride + src * 16);
+         *(float4 *)(fs_in + i * 16) = value;
+      }
+
+      if (args->pntc_input >= 0 &&
+          (uint32_t)args->pntc_input < args->num_fs_inputs) {
+         float size = 1.0f;
+         if (args->psiz_slot >= 0)
+            size = ((const float4 *)(vs_out +
+               (size_t)(tri_id * 3) * args->vs_out_stride))[args->psiz_slot].x;
+         if (!(size > 0.0f))
+            size = 1.0f;
+         if (size > CP_MAX_POINT_SIZE)
+            size = CP_MAX_POINT_SIZE;
+
+         float px0 = sx0 - size * 0.5f;
+         float py0 = sy0 - size * 0.5f;
+         *(float4 *)(fs_in + args->pntc_input * 16) =
+            make_float4((cx - px0) / size, (cy - py0) / size, 0.0f, 1.0f);
+      }
+      return true;
+   }
 
    for (uint32_t i = 0; i < args->num_fs_inputs && i < CP_MAX_FS_INPUTS; i++) {
       int32_t src = args->input_vs_slot[i];

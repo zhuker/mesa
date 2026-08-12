@@ -87,6 +87,13 @@ struct cp_rasterize_args {
    uint64_t resolved;       /* one byte per pixel, set once a pixel is written */
    uint32_t reject_layers;
    uint32_t reject_passes;  /* how many layers hold a triangle so far */
+   /*
+    * Point rasterization. A POINT_LIST draw is expanded on the host into one
+    * degenerate triangle per point — all three vertices the same — and the
+    * square it covers is built here from the vertex shader's gl_PointSize.
+    */
+   uint32_t point_mode;
+   int32_t psiz_slot;       /* VS output slot holding VARYING_SLOT_PSIZ, -1 if none */
 };
 
 /* Passes an alpha-tested draw gets to find a fragment that survives. Each one
@@ -188,6 +195,12 @@ struct cp_fs_interp_args {
    int32_t input_vs_slot[CP_MAX_FS_INPUTS];
    uint32_t quad_width;     /* Quads across the framebuffer */
    float vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y;
+   /* Point rasterization, matching cp_rasterize_args. pntc_input is the
+    * fragment shader input slot that gl_PointCoord feeds, which no vertex
+    * shader output drives, so the interpolator writes it directly. */
+   uint32_t point_mode;
+   int32_t psiz_slot;
+   int32_t pntc_input;
 };
 
 struct cp_fs_writeback_args {
@@ -407,6 +420,9 @@ struct cp_draw_params {
 #define CP_SMALL_THRESHOLD   999999
 #define CP_MEDIUM_THRESHOLD  4096
 #define CP_TILE_SIZE         64
+
+/* Bound on the per-point rasterization loop, and the point size clamp. */
+#define CP_MAX_POINT_SIZE    256.0f
 #define CP_MAX_NONTRIVIAL    1000000
 #define CP_MAX_HUGE_TILES    2000000
 

@@ -317,6 +317,21 @@ cp_lap(double *since)
    return elapsed;
 }
 
+/*
+ * Which shader I/O slot carries a given varying location, or -1 if none does.
+ * gl_PointSize and gl_PointCoord reach the kernels this way like any other
+ * varying, rather than through a dedicated path.
+ */
+static int32_t
+cp_slot_for_location(const unsigned *locations, unsigned count,
+                     unsigned location)
+{
+   for (unsigned i = 0; i < count && i < CP_MAX_IO_SLOTS; i++)
+      if (locations[i] == location)
+         return (int32_t)i;
+   return -1;
+}
+
 /* One assembled vertex: which vertex of the bound buffers it reads, and which
  * instance it belongs to. */
 struct cp_vertex_ref {
@@ -587,6 +602,15 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
       .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
    };
+
+   interp.point_mode = info->mode == MESA_PRIM_POINTS;
+   interp.psiz_slot = cp_slot_for_location(cp->vs_shader->out_location,
+                                           num_vs_outputs, VARYING_SLOT_PSIZ);
+   /* gl_PointCoord is a fragment shader input that no vertex shader output
+    * drives, so the match below leaves it at -1 and the interpolator fills it
+    * from the pixel's position within the point. */
+   interp.pntc_input = cp_slot_for_location(fs->in_location, num_fs_inputs,
+                                            VARYING_SLOT_PNTC);
 
    /* Match each fragment shader input to the vertex shader output carrying the
     * same varying location. */
@@ -904,8 +928,16 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
        * in front of it, which is what cost Sponza the leaves whose backs face
        * the camera.
        */
-      .cull_mode = cp_cull_mode(&cp->rasterizer),
+      .cull_mode = info->mode == MESA_PRIM_POINTS ? 0
+                 : cp_cull_mode(&cp->rasterizer),
       .front_face = cp->rasterizer.front_ccw,
+      /* Points have no winding to cull and no edges to test; the square comes
+       * from gl_PointSize, wherever the vertex shader put it. */
+      .point_mode = info->mode == MESA_PRIM_POINTS,
+      .psiz_slot = cp->vs_shader
+         ? cp_slot_for_location(cp->vs_shader->out_location,
+                                CP_MAX_IO_SLOTS, VARYING_SLOT_PSIZ)
+         : -1,
       .depthbuf = cp->depthbuf,
       .depth_test = cp->depth_stencil.depth_enabled,
       .depth_func = cp->depth_stencil.depth_func,

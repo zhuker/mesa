@@ -95,6 +95,9 @@ struct tri_setup {
    float inv_area;
    bool e0_top_left, e1_top_left, e2_top_left;
    int ix_min, iy_min, ix_max, iy_max;
+   /* A point covers this screen-space square instead of the edges above. */
+   bool is_point;
+   float pt_x0, pt_y0, pt_x1, pt_y1;
 };
 
 /*
@@ -243,6 +246,46 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
    float4 v2 = positions[(tri_id * 3 + 2) * pos_stride];
 
    float inv_w0 = 1.0f / v0.w;
+
+   /*
+    * A point is one vertex wearing a square. The host expands POINT_LIST into
+    * degenerate triangles, so there are no edges to test and no winding to
+    * cull — the square comes from gl_PointSize, which the vertex shader wrote
+    * into one of its output slots, and every pixel inside it takes the
+    * vertex's own depth and varyings.
+    */
+   if (args->point_mode) {
+      s->is_point = true;
+      s->ndc_z0 = s->ndc_z1 = s->ndc_z2 = v0.z * inv_w0;
+
+      float cx = v0.x * inv_w0 * args->vp_scale_x + args->vp_trans_x;
+      float cy = v0.y * inv_w0 * args->vp_scale_y + args->vp_trans_y;
+
+      float size = 1.0f;
+      if (args->psiz_slot >= 0)
+         size = positions[(tri_id * 3 + 0) * pos_stride + args->psiz_slot].x;
+
+      /* A zero or negative size draws nothing; NaN fails this too. */
+      if (!(size > 0.0f))
+         return false;
+      if (size > CP_MAX_POINT_SIZE)
+         size = CP_MAX_POINT_SIZE;
+
+      float half = size * 0.5f;
+      s->pt_x0 = cx - half; s->pt_x1 = cx + half;
+      s->pt_y0 = cy - half; s->pt_y1 = cy + half;
+      s->sx0 = cx; s->sy0 = cy;
+      s->inv_area = 1.0f;
+
+      s->ix_min = max((int)floorf(s->pt_x0), 0);
+      s->iy_min = max((int)floorf(s->pt_y0), 0);
+      s->ix_max = min((int)ceilf(s->pt_x1), (int)args->width - 1);
+      s->iy_max = min((int)ceilf(s->pt_y1), (int)args->height - 1);
+      return true;
+   }
+
+   s->is_point = false;
+
    float inv_w1 = 1.0f / v1.w;
    float inv_w2 = 1.0f / v2.w;
 
@@ -309,6 +352,65 @@ cp_tri_rejected(const struct cp_rasterize_args *args, uint32_t tri_id,
       if (rej[i] == tri_id)
          return true;
    return false;
+}
+
+/*
+ * Depth test one fragment and stake its claim on the pixel. Shared by the
+ * point path below; the triangle stages inline the same sequence because they
+ * carry the edge values along with them.
+ */
+static __device__ __forceinline__ void
+emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
+              int px, int py, float ndc_z)
+{
+   if (cp_tri_rejected(args, tri_id, px, py))
+      return;
+
+   uint32_t depth_uint = float_to_sortable_uint(ndc_z * 0.5f + 0.5f);
+
+   if (args->depth_test && args->depthbuf) {
+      uint32_t prev =
+         ((const uint32_t *)(uintptr_t)args->depthbuf)[py * args->width + px];
+      bool pass;
+      switch (args->depth_func) {
+      case CP_FUNC_NEVER:     pass = false; break;
+      case CP_FUNC_LESS:      pass = depth_uint <  prev; break;
+      case CP_FUNC_EQUAL:     pass = depth_uint == prev; break;
+      case CP_FUNC_LEQUAL:    pass = depth_uint <= prev; break;
+      case CP_FUNC_GREATER:   pass = depth_uint >  prev; break;
+      case CP_FUNC_NOTEQUAL:  pass = depth_uint != prev; break;
+      case CP_FUNC_GEQUAL:    pass = depth_uint >= prev; break;
+      default:                pass = true; break;
+      }
+      if (!pass)
+         return;
+   }
+
+   uint32_t key = args->depth_key_invert ? ~depth_uint : depth_uint;
+   uint64_t *visbuf = (uint64_t *)(uintptr_t)args->framebuffer;
+   atomicMin(&visbuf[py * args->width + px], PACK_VISBUF(key, tri_id));
+}
+
+/*
+ * Every pixel whose centre falls inside the point's square, at the vertex's
+ * own depth. Half-open on both axes so two points that abut do not both claim
+ * the shared row, the same reason the triangle path has a fill rule.
+ */
+static __device__ __forceinline__ void
+rasterize_point(struct cp_rasterize_args *args, struct tri_setup *s,
+                uint32_t tri_id)
+{
+   for (int py = s->iy_min; py <= s->iy_max; py++) {
+      float cy = (float)py + 0.5f;
+      if (cy < s->pt_y0 || cy >= s->pt_y1)
+         continue;
+      for (int px = s->ix_min; px <= s->ix_max; px++) {
+         float cx = (float)px + 0.5f;
+         if (cx < s->pt_x0 || cx >= s->pt_x1)
+            continue;
+         emit_fragment(args, tri_id, px, py, s->ndc_z0);
+      }
+   }
 }
 
 static __device__ __forceinline__ void
@@ -383,6 +485,13 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
    struct tri_setup s;
    if (!setup_triangle(&args, tri_id, &s))
       return;
+
+   /* Points never go to the later stages: their size is clamped, so the loop
+    * is bounded and one thread can always afford it. */
+   if (s.is_point) {
+      rasterize_point(&args, &s, tri_id);
+      return;
+   }
 
    int bb_w = s.ix_max - s.ix_min + 1;
    int bb_h = s.iy_max - s.iy_min + 1;
