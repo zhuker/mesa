@@ -455,22 +455,8 @@ cp_scratch_destroy(struct cp_context *cp)
    memset(&cp->dscratch, 0, sizeof(cp->dscratch));
 }
 
-/*
- * Per-stage timing for a draw, printed under CUDAPIPE_DEBUG_TIME.
- *
- * Every stage already synchronises, so wall clock around each one is an honest
- * measure of where a draw's time goes — which is worth knowing before
- * optimising anything.
- */
-struct cp_draw_timing {
-   double assemble_ms;
-   double vertex_ms;
-   double rasterize_ms;
-   double interpolate_ms;
-   double fragment_ms;
-   double writeback_ms;
-};
-
+/* Per-stage timing for a draw, printed under CUDAPIPE_DEBUG_TIME. See
+ * cp_stage_end() below for why it is measured with events and not a clock. */
 static bool
 cp_timing_enabled(void)
 {
@@ -480,25 +466,88 @@ cp_timing_enabled(void)
    return enabled;
 }
 
-static double
-cp_now_ms(void)
-{
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
-}
+/*
+ * Stage timing, on CUDA events rather than on the host clock.
+ *
+ * This used to bracket each stage with clock_gettime. That measures how long
+ * the host spent issuing the stage, which was already only loosely related to
+ * how long the device spent running it and is now not related at all: every
+ * launch goes on a stream and returns immediately. A stage whose kernel runs
+ * for a millisecond and whose launch takes two microseconds was being
+ * reported as two microseconds, and the one unlucky stage that happened to
+ * follow a full queue absorbed everyone else's time.
+ *
+ * Events are recorded on the same stream as the work, so the interval between
+ * two of them is device time between those two points. Reading them back
+ * needs the stream to have reached the last one, which is a synchronisation —
+ * hence only under CUDAPIPE_DEBUG_TIME, and hence a pool rather than one pair
+ * per stage, because a blended draw runs the shading stages hundreds of times
+ * and every interval has to be recorded before any of them can be read.
+ */
+enum cp_stage {
+   CP_STAGE_ASSEMBLE,
+   CP_STAGE_VERTEX,
+   CP_STAGE_RASTERIZE,
+   CP_STAGE_INTERPOLATE,
+   CP_STAGE_FRAGMENT,
+   CP_STAGE_WRITEBACK,
+   CP_NUM_STAGES,
+};
 
-/* Returns the elapsed time since *since and resets it, so stages can be timed
- * one after another without repeating the bookkeeping. */
-static double
-cp_lap(double *since)
+/* Record that `stage` has just finished. The first mark of a draw carries no
+ * stage and only starts the clock. */
+static void
+cp_stage_end(struct cp_context *cp, int stage)
 {
    if (!cp_timing_enabled())
-      return 0.0;
-   double now = cp_now_ms();
-   double elapsed = now - *since;
-   *since = now;
-   return elapsed;
+      return;
+
+   struct cp_stage_timer *t = &cp->timer;
+   if (t->num == t->cap) {
+      unsigned cap = t->cap ? t->cap * 2 : 64;
+      CUevent *ev = realloc(t->events, cap * sizeof(*ev));
+      int *st = realloc(t->stages, cap * sizeof(*st));
+      if (!ev || !st) {
+         free(ev ? ev : t->events);
+         free(st ? st : t->stages);
+         t->events = NULL; t->stages = NULL; t->cap = t->num = 0;
+         return;
+      }
+      t->events = ev;
+      t->stages = st;
+      /* Events are created once and re-recorded, since creating one costs
+       * more than recording it and a deep draw records thousands. */
+      for (unsigned i = t->cap; i < cap; i++)
+         if (cuEventCreate(&t->events[i], CU_EVENT_DEFAULT) != CUDA_SUCCESS)
+            return;
+      t->cap = cap;
+   }
+
+   t->stages[t->num] = stage;
+   cuEventRecord(t->events[t->num], cp->stream);
+   t->num++;
+}
+
+/* Resolve every interval recorded this draw into per-stage totals. Costs one
+ * synchronisation, which is why it is debug-only. */
+static void
+cp_stage_resolve(struct cp_context *cp, double *ms)
+{
+   struct cp_stage_timer *t = &cp->timer;
+   if (t->num < 2) {
+      t->num = 0;
+      return;
+   }
+
+   cuEventSynchronize(t->events[t->num - 1]);
+   for (unsigned i = 1; i < t->num; i++) {
+      float dt = 0.0f;
+      int stage = t->stages[i];
+      if (stage >= 0 && stage < CP_NUM_STAGES &&
+          cuEventElapsedTime(&dt, t->events[i - 1], t->events[i]) == CUDA_SUCCESS)
+         ms[stage] += dt;
+   }
+   t->num = 0;
 }
 
 /*
@@ -721,8 +770,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
                    float vp_scale_x, float vp_scale_y,
                    float vp_trans_x, float vp_trans_y,
                    CUdeviceptr reject, CUdeviceptr resolved,
-                   unsigned reject_pass,
-                   struct cp_draw_timing *timing)
+                   unsigned reject_pass)
 {
    struct cp_screen *screen = cp->screen;
    struct cp_shader_binary *fs = cp->fs_shader;
@@ -829,8 +877,6 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       }
    }
 
-   double mark = cp_timing_enabled() ? cp_now_ms() : 0.0;
-
    void *interp_params[] = { &interp };
    /* One thread per 2x2 quad, and the shader then runs four threads per quad
     * so it can difference across one. */
@@ -842,7 +888,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       fprintf(stderr, "cudapipe: fs_interpolate launch failed (%d)\n", interp_err);
       return;
    }
-   timing->interpolate_ms = cp_lap(&mark);
+   cp_stage_end(cp, CP_STAGE_INTERPOLATE);
 
    /* Launch FS and writeback over max_pixels — each kernel reads the actual
     * pixel count from the counter (device-visible managed memory) and exits
@@ -943,7 +989,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       fprintf(stderr, "cudapipe: fragment shader launch failed (%d)\n", fs_err);
       return;
    }
-   timing->fragment_ms = cp_lap(&mark);
+   cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
    const struct pipe_rt_blend_state *rt = &cp->blend_state.rt[0];
    struct cp_fs_writeback_args wb = {
@@ -988,7 +1034,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    cuLaunchKernel(screen->kernels.fs_writeback,
                   (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
                   0, cp->stream, wb_params, NULL);
-   timing->writeback_ms = cp_lap(&mark);
+   cp_stage_end(cp, CP_STAGE_WRITEBACK);
 
    if (getenv("CUDAPIPE_DEBUG_DISCARD")) {
       /* Both live in device-only memory now, so they have to be fetched
@@ -1235,8 +1281,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
           cp->depth_stencil.depth_func == PIPE_FUNC_GEQUAL),
    };
 
-   struct cp_draw_timing timing = {0};
-   double mark = cp_timing_enabled() ? cp_now_ms() : 0.0;
+   /* Marks the start of the draw; the interval it opens is
+    * attributed to nothing. */
+   cp_stage_end(cp, -1);
 
    /* Reclaim last draw's scratch and size the arena for this one. */
    cp_scratch_begin(cp);
@@ -1303,7 +1350,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          return;
       }
    }
-   timing.assemble_ms = cp_lap(&mark);
+   cp_stage_end(cp, CP_STAGE_ASSEMBLE);
 
    /* If we have a compiled VS, run it to transform vertices.
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
@@ -1601,7 +1648,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
          }
       }
    }
-   timing.vertex_ms = cp_lap(&mark);
+   cp_stage_end(cp, CP_STAGE_VERTEX);
 
    if (getenv("CUDAPIPE_DEBUG_DRAW")) {
       fprintf(stderr, "cudapipe: [samples=%u] draw %u tris (%u instances), fb=%ux%u, "
@@ -1781,7 +1828,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
       if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
          fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
-      timing.rasterize_ms += cp_lap(&mark);
+      cp_stage_end(cp, CP_STAGE_RASTERIZE);
 
       /* Shade every covered pixel by running the fragment shader on the GPU:
        * interpolate its inputs, launch it, then blend its output into the
@@ -1792,7 +1839,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
                             vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
                             retry ? cp->reject : 0,
                             retry ? cp->resolved : 0,
-                            pass, &timing);
+                            pass);
 
       if (peel) {
          /* Step past what this pass blended, and stop once the interval finds
@@ -1815,15 +1862,25 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    }
 
    if (cp_timing_enabled()) {
-      double total = timing.assemble_ms + timing.vertex_ms +
-                     timing.rasterize_ms + timing.interpolate_ms +
-                     timing.fragment_ms + timing.writeback_ms;
+      /* Device time between the events recorded above. This synchronises, so
+       * the numbers describe a draw that ran on its own — which is the point,
+       * but means a total here will not add up to a frame measured by the
+       * benchmark, where draws overlap the host. */
+      double ms[CP_NUM_STAGES] = {0};
+      cp_stage_resolve(cp, ms);
+      double total = 0.0;
+      for (int i = 0; i < CP_NUM_STAGES; i++)
+         total += ms[i];
       fprintf(stderr,
-              "cudapipe: %5u tris  assemble %6.2f  vertex %6.2f  raster %6.2f  "
-              "interp %6.2f  fragment %6.2f  writeback %6.2f  total %6.2f ms\n",
-              num_triangles, timing.assemble_ms, timing.vertex_ms,
-              timing.rasterize_ms, timing.interpolate_ms, timing.fragment_ms,
-              timing.writeback_ms, total);
+              "cudapipe: %5u tris  assemble %6.3f  vertex %6.3f  raster %6.3f  "
+              "interp %6.3f  fragment %6.3f  writeback %6.3f  total %6.3f ms\n",
+              num_triangles, ms[CP_STAGE_ASSEMBLE], ms[CP_STAGE_VERTEX],
+              ms[CP_STAGE_RASTERIZE], ms[CP_STAGE_INTERPOLATE],
+              ms[CP_STAGE_FRAGMENT], ms[CP_STAGE_WRITEBACK], total);
+   } else {
+      /* Nothing was recorded, but keep the pool empty either way so a later
+       * run with timing on does not resolve against a stale mark. */
+      cp->timer.num = 0;
    }
 
 

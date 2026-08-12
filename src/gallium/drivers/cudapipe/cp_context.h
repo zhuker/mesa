@@ -30,6 +30,18 @@ struct cp_context {
     */
    CUstream stream;
 
+   /*
+    * Per-stage draw timing under CUDAPIPE_DEBUG_TIME, on CUDA events recorded
+    * on the stream above. A growable pool because every interval of a draw has
+    * to be recorded before any can be read, and a blended draw runs the
+    * shading stages once per layer. Empty unless the variable is set.
+    */
+   struct cp_stage_timer {
+      CUevent  *events;
+      int      *stages;   /* which stage the interval ending here belongs to */
+      unsigned  num, cap;
+   } timer;
+
    struct pipe_framebuffer_state framebuffer;
    struct pipe_viewport_state viewport;
    struct pipe_scissor_state scissor;
