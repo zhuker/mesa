@@ -476,24 +476,52 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
  * Every pixel whose centre falls inside the point's square, at the vertex's
  * own depth. Half-open on both axes so two points that abut do not both claim
  * the shared row, the same reason the triangle path has a fill rule.
+ *
+ * The bounding box is walked flattened rather than as two nested loops so that
+ * a caller can hand it a lane and a stride: one thread covers a point with
+ * (0, 1) and a warp covers it with (lane_id, 32). gl_PointSize is clamped at
+ * CP_MAX_POINT_SIZE, which is 256, so a single point can be 65,536 pixels and
+ * is worth more than one thread.
  */
 static __device__ __forceinline__ void
 rasterize_point(struct cp_rasterize_args *args, struct tri_setup *s,
-                uint32_t tri_id)
+                uint32_t tri_id, uint32_t lane, uint32_t stride)
 {
-   for (int py = s->iy_min; py <= s->iy_max; py++) {
-      for (int px = s->ix_min; px <= s->ix_max; px++) {
-         for (int sm = 0; sm < (int)args->num_samples; sm++) {
-            float ox, oy;
-            cp_sample_pos(args->num_samples, sm, &ox, &oy);
-            float cx = (float)px + ox, cy = (float)py + oy;
-            if (cx < s->pt_x0 || cx >= s->pt_x1 ||
-                cy < s->pt_y0 || cy >= s->pt_y1)
-               continue;
-            emit_fragment(args, tri_id, px, py, sm, s->ndc_z0);
-         }
+   int bb_w = s->ix_max - s->ix_min + 1;
+   int area = bb_w * (s->iy_max - s->iy_min + 1);
+
+   for (int i = (int)lane; i < area; i += (int)stride) {
+      int px = s->ix_min + (i % bb_w);
+      int py = s->iy_min + (i / bb_w);
+
+      for (int sm = 0; sm < (int)args->num_samples; sm++) {
+         float ox, oy;
+         cp_sample_pos(args->num_samples, sm, &ox, &oy);
+         float cx = (float)px + ox, cy = (float)py + oy;
+         if (cx < s->pt_x0 || cx >= s->pt_x1 ||
+             cy < s->pt_y0 || cy >= s->pt_y1)
+            continue;
+         emit_fragment(args, tri_id, px, py, sm, s->ndc_z0);
       }
    }
+}
+
+/*
+ * Hand lane 0's setup to the rest of the warp.
+ *
+ * Word by word over the struct rather than field by field: the fields that
+ * matter depend on what was set up — a point carries a square where a triangle
+ * carries edges — and a broadcast that names them individually has to be
+ * extended every time one is added, which is how the point path came to be
+ * stuck in stage 1.
+ */
+static __device__ __forceinline__ void
+cp_broadcast_setup(struct tri_setup *s)
+{
+   uint32_t *w = (uint32_t *)s;
+#pragma unroll
+   for (int i = 0; i < (int)(sizeof(struct tri_setup) / sizeof(uint32_t)); i++)
+      w[i] = __shfl_sync(0xFFFFFFFF, w[i], 0);
 }
 
 /*
@@ -514,13 +542,6 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
    if (!setup_triangle(&args, tri_id, &s))
       return;
 
-   /* Points never go to the later stages: their size is clamped, so the loop
-    * is bounded and one thread can always afford it. */
-   if (s.is_point) {
-      rasterize_point(&args, &s, tri_id);
-      return;
-   }
-
    int bb_w = s.ix_max - s.ix_min + 1;
    int bb_h = s.iy_max - s.iy_min + 1;
    int bb_area = bb_w * bb_h;
@@ -528,6 +549,13 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
    if (bb_area <= 0)
       return;
 
+   /*
+    * Too big for one thread: queue it for a warp. Points go the same way as
+    * triangles here — a sprite is clamped to 256 pixels a side, which is
+    * 65,536 pixels and no more affordable on one lane than a triangle of the
+    * same size. Leaving them in this stage is what left particlesystem
+    * rasterizing its fire one thread at a time.
+    */
    if (bb_area > CP_SMALL_THRESHOLD) {
       uint32_t *counter = (uint32_t *)(uintptr_t)queues.nontrivial_count;
       uint32_t idx = atomicAdd(counter, 1u);
@@ -535,6 +563,11 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
          uint32_t *queue = (uint32_t *)(uintptr_t)queues.nontrivial;
          queue[idx] = tri_id;
       }
+      return;
+   }
+
+   if (s.is_point) {
+      rasterize_point(&args, &s, tri_id, 0, 1);
       return;
    }
 
@@ -610,64 +643,34 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
          continue;
 
       /* Lane 0 does triangle setup for the whole warp. */
-      float sx0, sy0, sx1, sy1, sx2, sy2;
-      float ndc_z0, ndc_z1, ndc_z2;
-      float inv_area;
-      int e0_tl, e1_tl, e2_tl;
-      int ix_min, iy_min, ix_max, iy_max;
+      struct tri_setup s;
       int valid = 0;
 
-      if (lane_id == 0) {
-         struct tri_setup s;
-         if (setup_triangle(&args, tri_id, &s)) {
-            sx0 = s.sx0; sy0 = s.sy0;
-            sx1 = s.sx1; sy1 = s.sy1;
-            sx2 = s.sx2; sy2 = s.sy2;
-            ndc_z0 = s.ndc_z0; ndc_z1 = s.ndc_z1; ndc_z2 = s.ndc_z2;
-            inv_area = s.inv_area;
-            e0_tl = s.e0_top_left;
-            e1_tl = s.e1_top_left;
-            e2_tl = s.e2_top_left;
-            ix_min = s.ix_min; iy_min = s.iy_min;
-            ix_max = s.ix_max; iy_max = s.iy_max;
-            valid = 1;
-         }
-      }
+      if (lane_id == 0)
+         valid = setup_triangle(&args, tri_id, &s) ? 1 : 0;
 
-      /* Broadcast setup from lane 0 to all lanes */
-      valid   = __shfl_sync(0xFFFFFFFF, valid, 0);
+      valid = __shfl_sync(0xFFFFFFFF, valid, 0);
       if (!valid)
          continue;
+      cp_broadcast_setup(&s);
 
-      sx0     = __shfl_sync(0xFFFFFFFF, sx0, 0);
-      sy0     = __shfl_sync(0xFFFFFFFF, sy0, 0);
-      sx1     = __shfl_sync(0xFFFFFFFF, sx1, 0);
-      sy1     = __shfl_sync(0xFFFFFFFF, sy1, 0);
-      sx2     = __shfl_sync(0xFFFFFFFF, sx2, 0);
-      sy2     = __shfl_sync(0xFFFFFFFF, sy2, 0);
-      ndc_z0  = __shfl_sync(0xFFFFFFFF, ndc_z0, 0);
-      ndc_z1  = __shfl_sync(0xFFFFFFFF, ndc_z1, 0);
-      ndc_z2  = __shfl_sync(0xFFFFFFFF, ndc_z2, 0);
-      inv_area = __shfl_sync(0xFFFFFFFF, inv_area, 0);
-      e0_tl   = __shfl_sync(0xFFFFFFFF, e0_tl, 0);
-      e1_tl   = __shfl_sync(0xFFFFFFFF, e1_tl, 0);
-      e2_tl   = __shfl_sync(0xFFFFFFFF, e2_tl, 0);
-      ix_min  = __shfl_sync(0xFFFFFFFF, ix_min, 0);
-      iy_min  = __shfl_sync(0xFFFFFFFF, iy_min, 0);
-      ix_max  = __shfl_sync(0xFFFFFFFF, ix_max, 0);
-      iy_max  = __shfl_sync(0xFFFFFFFF, iy_max, 0);
+      /* A point has a square rather than edges, and the warp strides it. */
+      if (s.is_point) {
+         rasterize_point(&args, &s, tri_id, lane_id, 32);
+         continue;
+      }
 
-      int bb_w = ix_max - ix_min + 1;
-      int bb_h = iy_max - iy_min + 1;
+      int bb_w = s.ix_max - s.ix_min + 1;
+      int bb_h = s.iy_max - s.iy_min + 1;
       int bb_area = bb_w * bb_h;
 
       /* Huge triangles: decompose into tiles and push to stage 3 */
       if (bb_area > CP_MEDIUM_THRESHOLD) {
          if (lane_id == 0) {
-            int tile_x_min = ix_min / CP_TILE_SIZE;
-            int tile_y_min = iy_min / CP_TILE_SIZE;
-            int tile_x_max = ix_max / CP_TILE_SIZE;
-            int tile_y_max = iy_max / CP_TILE_SIZE;
+            int tile_x_min = s.ix_min / CP_TILE_SIZE;
+            int tile_y_min = s.iy_min / CP_TILE_SIZE;
+            int tile_x_max = s.ix_max / CP_TILE_SIZE;
+            int tile_y_max = s.iy_max / CP_TILE_SIZE;
             int num_tiles = (tile_x_max - tile_x_min + 1) *
                             (tile_y_max - tile_y_min + 1);
 
@@ -694,28 +697,29 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
 
       /* Medium triangle: all 32 lanes iterate the bounding box with stride 32 */
       for (int i = (int)lane_id; i < bb_area; i += 32) {
-         int px = ix_min + (i % bb_w);
-         int py = iy_min + (i / bb_w);
+         int px = s.ix_min + (i % bb_w);
+         int py = s.iy_min + (i / bb_w);
 
          for (int sm = 0; sm < (int)args.num_samples; sm++) {
             float ox, oy;
             cp_sample_pos(args.num_samples, sm, &ox, &oy);
             float cx = (float)px + ox, cy = (float)py + oy;
 
-            float e0 = edge_function(sx1, sy1, sx2, sy2, cx, cy);
-            float e1 = edge_function(sx2, sy2, sx0, sy0, cx, cy);
-            float e2 = edge_function(sx0, sy0, sx1, sy1, cx, cy);
+            float e0 = edge_function(s.sx1, s.sy1, s.sx2, s.sy2, cx, cy);
+            float e1 = edge_function(s.sx2, s.sy2, s.sx0, s.sy0, cx, cy);
+            float e2 = edge_function(s.sx0, s.sy0, s.sx1, s.sy1, cx, cy);
 
-            if (!edge_inside(e0, e0_tl) ||
-                !edge_inside(e1, e1_tl) ||
-                !edge_inside(e2, e2_tl))
+            if (!edge_inside(e0, s.e0_top_left) ||
+                !edge_inside(e1, s.e1_top_left) ||
+                !edge_inside(e2, s.e2_top_left))
                continue;
 
-            float w0 = e0 * inv_area;
-            float w1 = e1 * inv_area;
+            float w0 = e0 * s.inv_area;
+            float w1 = e1 * s.inv_area;
 
             emit_fragment(&args, tri_id, px, py, sm,
-                          w0 * ndc_z0 + w1 * ndc_z1 + (1.0f - w0 - w1) * ndc_z2);
+                          w0 * s.ndc_z0 + w1 * s.ndc_z1 +
+                          (1.0f - w0 - w1) * s.ndc_z2);
          }
       }
    }
