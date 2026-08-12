@@ -1303,6 +1303,34 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    unsigned total_verts = num_triangles * 3;
 
+   /*
+    * Rewind the device-only scratch to the start of the draw.
+    *
+    * Every buffer taken from it — the vertex shader's output, the clipped
+    * positions, the pixel list, the shader's inputs and outputs, the fragment
+    * coordinates, the coverage and discard masks — is produced by one kernel
+    * of this draw and consumed by another. None of it outlives the draw, and
+    * nothing on the host ever touches it: cp_scratch_alloc_device() returns a
+    * device address rather than a pointer precisely so that dereferencing one
+    * does not compile.
+    *
+    * So the next draw may have the same memory, for the reason the pass loop
+    * below already rewinds on: kernels on one stream are serialized, and this
+    * draw's first kernel cannot start writing until the previous draw's last
+    * kernel has finished reading. The managed arena is a different matter and
+    * is deliberately not rewound here — the host writes into that one while
+    * the device is still reading the draw before.
+    *
+    * Without this the arena carries a whole frame of draws, and it is sized to
+    * the framebuffer rather than to coverage: max_pixels is twice the pixels
+    * in the framebuffer, so one draw's shading buffers run to hundreds of
+    * megabytes whatever the draw covers. instancing reached 5.1 GB in a frame
+    * and spent 62% of it with the GPU idle, because passing
+    * CP_SCRATCH_RECLAIM_BYTES makes cp_scratch_alloc() drain the device and
+    * free the overflow arenas — and it was passing it several times a frame.
+    */
+   cp->dscratch.used = 0;
+
    /* For TRIANGLE_LIST with a VS and single instance, the vertex fetch kernel
     * indexes the IB directly on GPU — no CPU-side topology expansion needed. */
    bool skip_refs = has_vs && info->mode == MESA_PRIM_TRIANGLES &&
