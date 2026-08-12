@@ -189,17 +189,24 @@ limits below were exactly such a change, and llvmpipe came out bit-identical.
 Sixty frames of each sample, the still scenes orbited, timed rather than stored
 — milliseconds per frame, the mean over the sixty (`cp_perf_run.sh ... 60 1`):
 
-| | nvidia | cudapipe | llvmpipe |
-|---|---|---|---|
-| particlesystem | 0.0 | **1364.5** | 15.9 |
-| bloom | 0.0 | 557.4 | 3.5 |
-| gltfscenerendering | 0.0 | 341.7 | 14.9 |
-| instancing | 0.1 | 241.9 | 82.4 |
-| multithreading | 0.3 | 155.4 | 97.0 |
-| pbribl | 0.1 | 135.4 | 2.6 |
-| **total, one frame of each** | **0.9** | **3789** | **242** |
+| | nvidia | cudapipe | llvmpipe | cudapipe before the perf pass |
+|---|---|---|---|---|
+| particlesystem | 0.1 | **55.2** | 15.7 | 1361.7 |
+| multithreading | 0.3 | **50.2** | 96.6 | 156.6 |
+| instancing | 0.1 | **27.2** | 74.3 | 241.7 |
+| dynamicuniformbuffer | 0.0 | **22.5** | 1.1 | 128.5 |
+| gltfscenerendering | 0.1 | **19.9** | 14.8 | 343.9 |
+| bloom | 0.0 | **12.4** | 3.5 | 558.0 |
+| pbribl | 0.0 | **3.8** | 2.6 | 135.4 |
+| **total, one frame of each** | **0.9** | **206.7** | **233.0** | **3792.2** |
 
-Peak GPU: 367 MiB and 51% for NVIDIA, 3.3 GiB and 100% for cudapipe.
+**cudapipe now finishes the sweep ahead of llvmpipe**, and ahead of it on seven
+of the seventeen samples individually. It was 16x behind. The whole of that
+change, what each step of it was worth, and what was *not* done to get it, is
+`src/gallium/drivers/cudapipe/PERFORMANCE_PROGRESS.md`; the short version is that
+96% of it was three defects rather than any optimization, the largest being that
+`CP_SMALL_THRESHOLD` was set above the size of the framebuffer and two of the
+rasterizer's three stages had therefore never executed.
 
 NVIDIA's column is not a rendering time. Offscreen benchmarking measures
 recording and submitting a frame, and nothing waits for the GPU until the pass
@@ -207,25 +214,29 @@ ends, so a driver that submits asynchronously is timed on its CPU side alone —
 `tests/TESTING.md` says which column to compare across drivers and why. It is
 the honest number for cudapipe, which blocks the host on every draw.
 
-Three things to take from it, none of them worked on yet:
+Things to take from it:
 
-**cudapipe is single threaded on the host.** Over the storing run, where both
-were measured, wall clock tracks CPU on every sample — 83.27 against 83.22 on
-particlesystem — so it is one core blocking on the GPU. llvmpipe's 33 s wall
-against 110 s CPU is it spreading across cores.
+**cudapipe is single threaded on the host**, and this has not been worked on.
+Over a storing run wall clock tracks CPU on every sample, so it is one core
+blocking on the GPU. llvmpipe spreading across cores is why it stays close
+despite shading on the CPU — and why the samples cudapipe now beats it on are
+the ones with the most geometry.
 
-**The two worst samples are both the peel loop.** particlesystem and bloom are
-the blended draws, at 4.0x and 1.6x gltfscenerendering, the worst draw that is
-not blended. Up to 256 passes per draw, each with a `cuStreamSynchronize` —
-gap 5, and the obvious first target.
+**The peel loop is still the worst thing in the driver.** particlesystem runs
+about 260 passes a frame, each re-rasterizing and re-shading the whole draw with
+a host sync between them, and it remains 3.5x slower than llvmpipe when nothing
+else in the set is. Phase 3 of the performance plan is what addresses it.
 
-**cudapipe does not win pbribl, and never did.** It was recorded here as the
-one sample it beat llvmpipe on, 14.2 s against 16.0 — but those were whole
-process times, and llvmpipe spends 16.6 s of pbribl before the first frame,
-precomputing the IBL textures. Per frame it renders at 2.6 ms against
-cudapipe's 135. Nothing in the set is faster than llvmpipe, which is what the
-timed pass exists to say; the wall clock of a run that also stores 60 images
-could not.
+**`dynamicuniformbuffer` is the other outlier**, 20x slower than llvmpipe, and
+it is launch-bound rather than kernel-bound: 625 twelve-triangle cubes a frame,
+nine kernels and five memsets each, 5,635 launches. Also structural.
+
+**cudapipe does not win pbribl, and never did** by the measure originally used.
+It was once recorded as the one sample it beat llvmpipe on, 14.2 s against 16.0
+— but those were whole process times, and llvmpipe spends 16.6 s of pbribl
+before its first frame precomputing IBL textures. Per frame it is 2.6 against
+3.8 ms. The lesson stands even though the totals have moved: a measure that
+contains start-up will eventually be read as if it did not.
 
 ## Architecture
 
