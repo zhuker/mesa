@@ -110,6 +110,52 @@ before that.
 Fourteen of eighteen are within a handful of pixels, from one before this work.
 Of the four that are not, two are unimplemented features rather than defects.
 
+### Calibrate against llvmpipe, not against zero
+
+The same sweep run through lavapipe/llvmpipe, which is the backend cudapipe's
+sampler and clipper were ported from, and which shares lavapipe as its frontend:
+
+| Sample | llvmpipe vs NVIDIA | cudapipe vs NVIDIA | cudapipe vs llvmpipe |
+|---|---|---|---|
+| gltfscenerendering | 26263 | **15697** | 5975 |
+| multisampling | **1454** | 23773 | 23145 |
+| particlesystem | **327** | 23106 | 22416 |
+| texturemipmapgen | **21070** | 32237 | 17921 |
+| instancing | 5829 | **3506** | 1869 |
+| texturecubemap | 5165 | **4144** | 3792 |
+| multithreading | **1954** | 2087 | 1831 |
+| texture | **426** | 589 | 320 |
+| pbribl | 73 | **28** | 96 |
+| vulkanscene | **11** | 25 | 20 |
+| everything else | ~0 | ~0 | ~0 |
+| **total** | **62574** | 105212 | 77405 |
+
+Two things follow, and both change how the status table above should be read.
+
+**A software rasterizer does not converge on NVIDIA.** llvmpipe is mature and
+still differs by 62574 pixels over the set. Most of that is the same
+anisotropic filtering difference cudapipe has: on texturemipmapgen llvmpipe's
+mean error runs to +12.7/255 in the top luminance band against cudapipe's
++20.5, the same sign and shape, about 60% of the size. So there is real
+headroom there, but the floor is llvmpipe's number, not zero.
+
+**Excluding the two unimplemented features, cudapipe is already at parity.**
+Take out multisampling and particlesystem, which are MSAA and POINT_LIST and
+nothing to do with fidelity, and it is 58333 for cudapipe against 60793 for
+llvmpipe. On gltfscenerendering cudapipe is closer to NVIDIA than llvmpipe is,
+by a factor of 1.7, and that holds region by region across the surfaces where
+the difference is most visible — the curtains, the pillars, the arches.
+
+Worth re-running whenever a sampler or rasterizer change looks like it is not
+paying off; llvmpipe is the honest target.
+
+Note also that all 18 samples run clean under llvmpipe, while renderheadless,
+gltfscenerendering and pbribl segfault during teardown under cudapipe after
+writing their images. Those are cudapipe bugs, not sample bugs.
+
+    VK_ICD_FILENAMES=build-cudapipe/src/gallium/targets/lavapipe/lvp_devenv_icd.x86_64.json \
+      VALIDATION=0 OUT=build/compare/llvmpipe ./run_offscreen.sh
+
 ## Architecture
 
 ```
