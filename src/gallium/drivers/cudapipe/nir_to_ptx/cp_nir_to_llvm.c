@@ -21,6 +21,9 @@
  * PTX ISA version in the target machine's feature string below. */
 #define CP_MAX_PTX_SM 86
 
+/* Argument slots per launch; the host fills this array — see cp_context.c. */
+#define CP_MAX_ARG_SLOTS 64
+
 struct ntl_context {
    LLVMContextRef llvm_ctx;
    LLVMModuleRef module;
@@ -36,6 +39,11 @@ struct ntl_context {
    LLVMValueRef *kernel_args;
    unsigned num_kernel_args;
 
+   /* One load per argument slot, in the entry block; see cp_arg_slot(). */
+   LLVMValueRef arg_slots[CP_MAX_ARG_SLOTS];
+   LLVMBasicBlockRef entry_block;
+   unsigned md_invariant_load;
+
    /* Set when the shader samples a texture, so the sampler PTX gets linked in. */
    bool uses_tex;
    bool needs_link;   /* pull in cp_sampler.cu for its device helpers */
@@ -47,6 +55,53 @@ struct ntl_context {
    int sm_major;
    int sm_minor;
 };
+
+/*
+ * The pointer in argument slot `index`, loaded once.
+ *
+ * Every stage reads its buffers out of a 64-entry array of pointers the host
+ * fills in before the launch, and each site that wanted one used to load it
+ * again. LLVM cannot merge those by itself: any store through any of the
+ * pointers might alias the array, so a vertex shader that reads an input and
+ * then writes an output reloaded the input pointer and the stride afterwards,
+ * and each reload is a dependent global load in front of the real work.
+ *
+ * Two things fix it. The load is marked invariant, which is true -- the block
+ * is written before the launch and nothing in the kernel writes it -- and it
+ * is emitted in the entry block and cached, so it dominates every use and one
+ * load serves them all.
+ */
+static LLVMValueRef
+cp_arg_slot(struct ntl_context *ctx, unsigned index)
+{
+   assert(index < CP_MAX_ARG_SLOTS);
+   if (ctx->arg_slots[index])
+      return ctx->arg_slots[index];
+
+   LLVMTypeRef i8 = LLVMInt8TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef ptr_type = LLVMPointerType(i8, 0);
+   LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+
+   /* Emit into the entry block so the value dominates wherever it is used. */
+   LLVMBasicBlockRef saved = LLVMGetInsertBlock(ctx->builder);
+   LLVMValueRef term = LLVMGetBasicBlockTerminator(ctx->entry_block);
+   if (term)
+      LLVMPositionBuilderBefore(ctx->builder, term);
+   else
+      LLVMPositionBuilderAtEnd(ctx->builder, ctx->entry_block);
+
+   LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, ctx->kernel_args[0],
+                                           LLVMPointerType(ptr_type, 0), "");
+   LLVMValueRef slot = LLVMBuildLoad2(ctx->builder, ptr_type,
+      LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
+         &(LLVMValueRef){LLVMConstInt(i64, index, false)}, 1, ""), "arg_slot");
+   LLVMSetMetadata(slot, ctx->md_invariant_load,
+                   LLVMMDNodeInContext(ctx->llvm_ctx, NULL, 0));
+
+   LLVMPositionBuilderAtEnd(ctx->builder, saved);
+   ctx->arg_slots[index] = slot;
+   return slot;
+}
 
 static LLVMTypeRef
 get_llvm_type(struct ntl_context *ctx, unsigned bit_size, unsigned num_components)
@@ -306,15 +361,7 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
    }
    case nir_intrinsic_load_num_workgroups: {
       /* arg_ptrs[0] = pointer to {gridX, gridY, gridZ} */
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMValueRef args = ctx->kernel_args[0];
-      LLVMValueRef args_as_ptrptr = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      /* Load arg_ptrs[0] which is the grid_size pointer */
-      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
-      LLVMValueRef zero64 = LLVMConstInt(i64, 0, false);
-      LLVMValueRef grid_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_as_ptrptr, &zero64, 1, ""), "grid_ptr");
+      LLVMValueRef grid_ptr = cp_arg_slot(ctx, 0);
       /* Cast to i32* and load x, y, z */
       LLVMTypeRef i32_ptr = LLVMPointerType(i32, 0);
       LLVMValueRef grid_i32 = LLVMBuildBitCast(ctx->builder, grid_ptr, i32_ptr, "");
@@ -362,14 +409,7 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef bs = LLVMConstInt(i32, 256, false);
       LLVMValueRef thread_id = LLVMBuildAdd(ctx->builder,
          LLVMBuildMul(ctx->builder, bid, bs, ""), tid, "");
-      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMValueRef args = ctx->kernel_args[0];
-      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      LLVMValueRef vid_arr_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
-            &(LLVMValueRef){LLVMConstInt(i64, 5, false)}, 1, ""), "vid_arr");
+      LLVMValueRef vid_arr_ptr = cp_arg_slot(ctx, 5);
       LLVMValueRef vid_ptr = LLVMBuildGEP2(ctx->builder, i32,
          LLVMBuildBitCast(ctx->builder, vid_arr_ptr, LLVMPointerType(i32, 0), ""),
          &thread_id, 1, "");
@@ -399,14 +439,7 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       unsigned field =
          instr->intrinsic == nir_intrinsic_load_base_instance ? 1 :
          instr->intrinsic == nir_intrinsic_load_draw_id ? 2 : 0;
-      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMValueRef args = ctx->kernel_args[0];
-      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      LLVMValueRef params = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
-            &(LLVMValueRef){LLVMConstInt(i64, 7, false)}, 1, ""), "draw_params");
+      LLVMValueRef params = cp_arg_slot(ctx, 7);
       LLVMValueRef slot = LLVMBuildGEP2(ctx->builder, i32,
          LLVMBuildBitCast(ctx->builder, params, LLVMPointerType(i32, 0), ""),
          &(LLVMValueRef){LLVMConstInt(i32, field, false)}, 1, "");
@@ -422,14 +455,7 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
       LLVMValueRef thread_id = LLVMBuildAdd(ctx->builder,
          LLVMBuildMul(ctx->builder, bid, LLVMConstInt(i32, 256, false), ""), tid, "");
-      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMValueRef args = ctx->kernel_args[0];
-      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      LLVMValueRef arr_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
-            &(LLVMValueRef){LLVMConstInt(i64, 6, false)}, 1, ""), "iid_arr");
+      LLVMValueRef arr_ptr = cp_arg_slot(ctx, 6);
       LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder, i32,
          LLVMBuildBitCast(ctx->builder, arr_ptr, LLVMPointerType(i32, 0), ""),
          &thread_id, 1, "");
@@ -447,14 +473,7 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef offset_val = get_src(ctx, &instr->src[0]);
 
       /* Input ptr is at args[2] (after grid_info at 0, reserved at 1) */
-      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMValueRef args = ctx->kernel_args[0];
-      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      LLVMValueRef input_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
-            &(LLVMValueRef){LLVMConstInt(i64, 2, false)}, 1, ""), "vs_input");
+      LLVMValueRef input_ptr = cp_arg_slot(ctx, 2);
 
       /* Compute byte offset: vertex_id * vertex_stride + base * 16 + comp * 4 + offset * 16 */
       LLVMValueRef bid2 = emit_workgroup_id(ctx, 0);
@@ -462,13 +481,13 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
          LLVMBuildMul(ctx->builder, bid2, LLVMConstInt(i32, 256, false), ""), tid2, "");
 
-      /* Read stride from args[3] */
+      /* Read stride from args[3]. Invariant for the same reason the slot it
+       * came from is: the host writes it before the launch. */
       LLVMTypeRef i32_ptr = LLVMPointerType(i32, 0);
-      LLVMValueRef stride_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
-            &(LLVMValueRef){LLVMConstInt(i64, 3, false)}, 1, ""), "stride_ptr");
       LLVMValueRef stride = LLVMBuildLoad2(ctx->builder, i32,
-         LLVMBuildBitCast(ctx->builder, stride_ptr, i32_ptr, ""), "stride");
+         LLVMBuildBitCast(ctx->builder, cp_arg_slot(ctx, 3), i32_ptr, ""), "stride");
+      LLVMSetMetadata(stride, ctx->md_invariant_load,
+                      LLVMMDNodeInContext(ctx->llvm_ctx, NULL, 0));
 
       LLVMValueRef byte_off = LLVMBuildAdd(ctx->builder,
          LLVMBuildAdd(ctx->builder,
@@ -498,14 +517,7 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMValueRef offset_val = get_src(ctx, &instr->src[1]);
 
       /* Output ptr is at args[4] */
-      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMValueRef args = ctx->kernel_args[0];
-      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      LLVMValueRef output_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
-            &(LLVMValueRef){LLVMConstInt(i64, 4, false)}, 1, ""), "vs_output");
+      LLVMValueRef output_ptr = cp_arg_slot(ctx, 4);
 
       /* vertex_id */
       LLVMValueRef bid2 = emit_workgroup_id(ctx, 0);
@@ -1995,6 +2007,13 @@ emit_function(struct ntl_context *ctx)
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "entry");
    LLVMPositionBuilderAtEnd(ctx->builder, entry);
 
+   /* Where cp_arg_slot() puts its loads, so that one dominates every use. */
+   ctx->entry_block = entry;
+   memset(ctx->arg_slots, 0, sizeof(ctx->arg_slots));
+   ctx->md_invariant_load =
+      LLVMGetMDKindIDInContext(ctx->llvm_ctx, "invariant.load",
+                               strlen("invariant.load"));
+
    /*
     * Bounds check: the count is on the device, so both grids are sized for the
     * worst case and each thread bounds itself against slot 0 — the vertex
@@ -2013,16 +2032,12 @@ emit_function(struct ntl_context *ctx)
    if (ctx->nir->info.stage == MESA_SHADER_VERTEX ||
        ctx->nir->info.stage == MESA_SHADER_FRAGMENT) {
       LLVMTypeRef i32_t = LLVMInt32TypeInContext(ctx->llvm_ctx);
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMTypeRef i64_t = LLVMInt64TypeInContext(ctx->llvm_ctx);
-      LLVMValueRef args = LLVMGetParam(ctx->function, 0);
-      LLVMValueRef args_pp = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      LLVMValueRef cnt_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_pp,
-            &(LLVMValueRef){LLVMConstInt(i64_t, 0, false)}, 1, ""), "cnt_ptr");
       LLVMValueRef count = LLVMBuildLoad2(ctx->builder, i32_t,
-         LLVMBuildBitCast(ctx->builder, cnt_ptr, LLVMPointerType(i32_t, 0), ""), "invoc_count");
+         LLVMBuildBitCast(ctx->builder, cp_arg_slot(ctx, 0),
+                          LLVMPointerType(i32_t, 0), ""), "invoc_count");
+      /* Written by the launch before this one, so constant throughout this. */
+      LLVMSetMetadata(count, ctx->md_invariant_load,
+                      LLVMMDNodeInContext(ctx->llvm_ctx, NULL, 0));
 
       LLVMValueRef bid = emit_workgroup_id(ctx, 0);
       LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
