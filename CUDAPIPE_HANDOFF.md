@@ -91,13 +91,12 @@ quad-derivative work, and far more before that.
 | Sample | Differing | Note |
 |---|---|---|
 | texturemipmapgen | 3.50% | anisotropic filter, accepted — see gap 3 |
-
 | gltfscenerendering | 1.70% | anisotropic filter, accepted — see gap 3 |
 | texturecubemap | 0.45% | reflection sharper than the reference at grazing angles |
 | instancing | 0.38% | mostly the procedural starfield, see below |
 | multithreading | 0.23% | speckle, no diagnosis, and the sample is nondeterministic |
-| particlesystem | 0.17% | |
 | multisampling | 0.19% | |
+| particlesystem | 0.17% | |
 | texture | 589 px | anisotropic taps on a slightly tilted quad |
 | pbribl | 28 px | |
 | vulkanscene | 25 px | |
@@ -122,17 +121,17 @@ sampler and clipper were ported from, and which shares lavapipe as its frontend:
 | Sample | llvmpipe vs NVIDIA | cudapipe vs NVIDIA | cudapipe vs llvmpipe |
 |---|---|---|---|
 | texturemipmapgen | **21070** | 32237 | 17921 |
-| multisampling | **1454** | 1757 | ~2000 |
-| gltfscenerendering | 26263 | **15698** | 5976 |
+| gltfscenerendering | 26263 | **15697** | 5975 |
 | texturecubemap | 5165 | **4144** | 3792 |
 | instancing | 5829 | **3506** | 1869 |
-| multithreading | **1954** | 2085 | 1831 |
+| multithreading | **1954** | 2086 | 1834 |
+| multisampling | **1454** | 1757 | 1023 |
 | particlesystem | **327** | 1533 | 818 |
 | texture | **426** | 589 | 320 |
 | pbribl | 73 | **28** | 96 |
 | vulkanscene | **11** | 25 | 20 |
 | everything else | ~0 | ~0 | ~0 |
-| **total** | 62574 | **61622** | ~55000 |
+| **total** | 62574 | **61622** | 55008 |
 
 Two things follow, and both change how the status table above should be read.
 
@@ -167,6 +166,12 @@ cp_gallery.py takes the third directory and lays the two renderers beside the
 same reference, with a panel of the two against each other that goes black
 wherever they agree.
 
+llvmpipe runs through the same lavapipe, so a change there moves both renderers
+and can invalidate the comparison set without touching cudapipe at all. After
+editing anything under `src/gallium/frontends/lavapipe`, re-render llvmpipe and
+`cmp` it against the stored set before trusting a comparison — the sample count
+limits below were exactly such a change, and llvmpipe came out bit-identical.
+
 ## Architecture
 
 ```
@@ -186,6 +191,8 @@ cudapipe Gallium driver
     │   7. cp_fs_writeback      (drop helpers, discard mask, blend, attachment)
     │   steps 4-7 repeat: up to CP_DISCARD_LAYERS times for an alpha-tested
     │   draw, up to CP_BLEND_LAYERS times for a blended one
+    ├── blit: cp_resolve_samples when a multisample source meets a
+    │   single-sample destination, a plain copy or format translate otherwise
     └── flush: cuCtxSynchronize + scratch reclaim
 ```
 
@@ -449,6 +456,24 @@ hundred pixels of every comparison until two identical runs were diffed against
 each other. Before attributing a small delta to a change, check the sample
 against itself.
 
+**A capability you advertise but clamp is worse than one you refuse.** lavapipe
+named a fixed set of sample counts regardless of the driver under it, so the
+multisampling sample asked for the largest, got eight, and cudapipe quietly
+rasterized four samples into an eight sample attachment. Nothing errored: the
+resolve simply averaged four samples it had written with four it never touched,
+and the result was a plausible, slightly wrong image. The limits now come from
+the screen's `is_format_supported`. When adding a feature that has a range,
+make the advertised range the implemented one, and check what the application
+actually ends up asking for rather than what you had in mind for it.
+
+**A second allocation path is a second place to get the size right.**
+`resource_create_unbacked` computed its layout but never multiplied by
+`nr_samples`, so a multisample attachment created that way reported one
+sample's worth of memory. It was invisible for as long as nothing wrote to the
+later planes, and would have become memory corruption the moment multisampling
+started working. When a resource property scales the allocation, grep for every
+site that returns a size.
+
 **A guard has to sit at every site, not the shared helper.** The alpha-test
 reject check was added to `rasterize_pixel` and changed nothing, because all
 three rasterizer stages have their own inlined pixel loops; there are four
@@ -517,6 +542,10 @@ retried.
 * `bind_rasterizer_state` carries the cull mode. Drawing what should have been
   culled is not just wasted work — a back face can win the depth test and hide
   the surface in front of it.
+* A multisample resource holds its samples plane after plane, `lpr.sample_stride`
+  apart, and the same layout is used for the driver's own visibility and depth
+  buffers as `sample * width * height + pixel`. Both resource creation paths
+  have to multiply the allocation by `nr_samples`.
 * LLVM's NVPTX backend only knows architectures that existed when it was
   released, so `CP_MAX_PTX_SM` in `cp_nir_to_llvm.c` caps the architecture and
   lets the driver JIT forward. Raise it together with the PTX ISA version.
