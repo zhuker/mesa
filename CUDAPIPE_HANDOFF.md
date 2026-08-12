@@ -73,6 +73,11 @@ percentage plus an ASCII map. `cp_gallery.py` builds an HTML page: summary table
 sorted worst-first, then reference / result / difference per sample, every panel
 full resolution and clickable, the result hover-flipping to the reference.
 
+There is a second, animated sweep — sixty frames per sample, with the still
+scenes orbited — which catches what a single frame cannot: two of the
+regressions in the set are invisible at frame 0. `tests/TESTING.md` describes
+both sweeps, every tool, and the traps.
+
 **Editing a sample's shader is the fastest way to bisect a difference.** The
 samples load `.spv` at runtime, so `glslangValidator -V shader.vert -o
 shader.vert.spv` and re-running both drivers takes seconds and needs no C++
