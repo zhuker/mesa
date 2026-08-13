@@ -49,6 +49,21 @@ OUT=$ROOT/$LABEL
 FRAMEROOT=$ROOT/_frames
 REF=$FRAMEROOT/nvidia
 
+# An iteration is a record, and reusing a label overwrites one. It is easy to
+# do: the labels that suggest themselves for a change are the same ones that
+# suggested themselves last time something touched the same code, and nothing
+# about the run says the directory was already there. It has happened once —
+# a second pass named an iteration `dscratch` over the first pass's `dscratch`,
+# and the earlier bench numbers and sixty frames a document still cites are
+# simply gone. Refuse rather than clobber; FORCE=1 to re-run a label on
+# purpose, which is the case where the old numbers are the ones being replaced.
+if [ -e "$OUT" ] && [ "${FORCE:-0}" != "1" ]; then
+    echo "iteration '$LABEL' already exists at $OUT" >&2
+    echo "  it holds $(cat "$OUT/_commit.txt" 2>/dev/null | head -1)" >&2
+    echo "  pick another label, or FORCE=1 to overwrite it" >&2
+    exit 1
+fi
+
 # A stale build silently measures the previous iteration, which is the single
 # most expensive mistake available here.
 export PATH=$HOME/vulkan-sdk/1.4.357.1/x86_64/bin:$PATH

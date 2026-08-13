@@ -273,7 +273,14 @@ $T/cp_profile.sh particlesystem mylabel 6     # where the frame goes
 ```
 
 Iterations live under `build/iter/<label>/`, frames under `build/iter/_frames/`,
-profiles under `build/prof/<label>/`. The three-driver HTML report for the
+profiles under `build/prof/<label>/`.
+
+**The `dscratch` iteration's raw data no longer exists.** The phase 1a pass ran
+an iteration under the same label and `cp_iterate.sh` overwrote it in place —
+its bench CSV and its sixty frames are gone, though the 223.4 ms in the table
+above is the number they produced and is unaffected. Regenerating it means
+checking the commit out and re-running. `cp_iterate.sh` now refuses an existing
+label unless `FORCE=1`. The three-driver HTML report for the
 current state is `build/iter/_report/perf60.html`, built with
 `cp_perf_report.py` over `_report/frames` and `_report/bench`.
 

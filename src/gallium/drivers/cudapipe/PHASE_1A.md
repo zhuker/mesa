@@ -91,7 +91,7 @@ phase that was ranked on a profile taken before the last three changes.
 | `noflush` | 193.33 | −0.7 | 1a.2 | **reverted** — removing the flush drain is a loss |
 | `streams` | 190.18 | 2.5 | **1a.1** | one non-blocking stream for the frame path |
 | `events` | 190.97 | ~0 | **1a.4** | CUDA-event stage timing (measurement only) |
-| `dscratch` | 168.80 | 22.2 | — | device scratch rewound per draw |
+| `drawrewind` | 168.80 | 22.2 | — | device scratch rewound per draw |
 
 **The largest win, 22 ms of the 38, is not a phase 1a item.** It was found by
 the measurement gate that phase 1a's exit criteria call for.
@@ -264,6 +264,15 @@ stages land in one row of `cuda_gpu_kern_sum` and the largest entry in every
 profile is uninterpretable. It also flags kernels whose duration does not vary
 with the draw, which is the shape of every defect found so far, and prints the
 union of GPU busy intervals against wall time.
+
+**`tests/cp_iterate.sh` refuses to overwrite an existing iteration.** This pass
+named an iteration `dscratch` on top of the first pass's `dscratch`, and the
+earlier bench numbers and sixty frames — cited as a step in
+`PERFORMANCE_PROGRESS.md` — were overwritten in place with no warning. The
+label that suggests itself for a change is the same one that suggested itself
+last time something touched the same code, which is exactly when the record
+being destroyed is the one worth keeping. `FORCE=1` to re-run a label on
+purpose. This pass's iteration is now `drawrewind`.
 
 **`tests/cp_iterate.sh` refuses to report a cost number if the correctness gate
 did not run.** It invoked the comparison with whatever `python3` was on PATH,
