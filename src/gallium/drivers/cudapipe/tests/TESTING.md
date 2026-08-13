@@ -579,17 +579,25 @@ not the one on `PATH`.
 Worth using for CLI syntax and for report queries. Three things to know before
 relying on it:
 
-**`search-docs` and `lookup-recipes` are broken out of the box.** The shipped
-`manifest.json` records content hashes computed against a different build, and
-all 496 disagree with the files beside them, so both commands fail with
-`content hash mismatch: SKILL.md`. `cp_nsys_skill_fix.py` diagnoses and repairs
-it; re-run after every Nsight Systems upgrade. Everything that talks to the
-installed `nsys` or to a report works without the fix. This matters more than
-it sounds: those two commands are the only sanctioned route to the reference
-corpus — `references/notes/llm-analysis-pitfalls.md`,
+**`search-docs` and `lookup-recipes` are broken out of the box**, and this
+install has been repaired so that they work. The shipped `manifest.json`
+records content hashes computed against a different build — all 496 disagree
+with the files beside them — so both commands fail with `content hash
+mismatch: SKILL.md` until `cp_nsys_skill_fix.py` rewrites the digests. **An
+Nsight Systems upgrade or reinstall puts the broken manifest back**, so run the
+script again then; it checks by default and exits 0 when clean, which is also
+how to find out whether a newer release fixed this upstream. Everything that
+talks to the installed `nsys` or to a report works without the fix.
+
+This matters more than two broken commands sounds: they are the only sanctioned
+route to the reference corpus — `references/notes/llm-analysis-pitfalls.md`,
 `references/notes/sql_query_tips.md`,
 `references/curated/investigation_methodology.md` — and SKILL.md forbids
 reading them by hand.
+
+Quote multi-word `--query` arguments; unquoted they split into extra
+positionals and the tool reports `unrecognized arguments`, which reads like a
+wrong command rather than a shell mistake.
 
 **Its per-kernel summary is wrong for this driver, and confidently so.**
 `report-fact --intent kernel_summary` returns one row named `main` with the

@@ -47,10 +47,18 @@ tool and removes the need to guess flags or table schemas, and its
 `report-query` runs bounded SQL against a report. Run its bootstrap first and
 use the Python it reports.
 
-**`search-docs` and `lookup-recipes` fail on a shipped-manifest bug**
-(`content hash mismatch`); `tests/cp_nsys_skill_fix.py` repairs it, and it
-needs re-running after each Nsight Systems upgrade. Everything that talks to
-`nsys` or to a report works regardless.
+**Every command works on this machine — but only because the pack was
+repaired here.** A fresh install has `search-docs` and `lookup-recipes` failing
+with `content hash mismatch`, because the shipped `manifest.json` records stale
+digests. `tests/cp_nsys_skill_fix.py` fixed this install; re-run it after any
+Nsight Systems upgrade or reinstall, since the package restores the broken
+manifest. It checks by default and exits 0 when there is nothing to do, so it
+is also the quickest way to tell whether a newer release fixed this upstream.
+Everything that talks to `nsys` or to a report was never affected.
+
+Quote multi-word `--query` arguments. Unquoted they split into extra
+positionals and the error reads `unrecognized arguments`, which looks like the
+command is wrong rather than the shell.
 
 **It is not authoritative on this driver.** Two project facts override it, and
 it has no way to know either:
