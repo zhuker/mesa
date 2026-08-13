@@ -469,6 +469,22 @@ visible in the API summary, invisible in the kernel summary, and explained by
 neither. When the kernel breakdown does not add up to the frame, read the
 `--- CUDA API ---` section of the profile before theorising.
 
+And when the kernel breakdown *does* add up but names something implausible,
+read the `--- memory ops ---` section. **A kernel that touches a managed page
+the host has just written stalls until the page arrives, and the stall is
+charged to the kernel.** So the cost lands on whichever kernel touches the page
+first, which need not be the one doing anything wrong. `instancing` reported
+`cp_vertex_fetch` at 58.7% of GPU time with a median launch of 2.48 ms —
+absurd for gathering three attributes, and entirely the four managed id arrays
+the host had built for it. The line that named it was 15,713 unified
+host-to-device migrations per ten frames, one table further down; the fix took
+the median launch to 93.6 µs without touching the gather at all. See
+`../INSTANCING.md`.
+
+The general form: **a kernel whose duration is absurd for the work it
+describes is reporting somebody else's page faults.** Ask what the host wrote
+just before it ran.
+
 ---
 
 ## Iterating on performance

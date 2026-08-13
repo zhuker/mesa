@@ -51,10 +51,10 @@ and compared to NVIDIA after every step; `tests/cp_iterate.sh` runs both passes
 and the comparison. No verdict against NVIDIA changed at any point, the two
 standing regressions (`gltfscenerendering`, `texture3d`) included.
 
-| | baseline | after the first pass | after phase 1a |  |
-|---|---|---|---|---|
-| **total over the sweep** | **3792.15 ms** | **205.3 / 206.7 ms** | **168.10 ms** | **~22.6x** |
-| llvmpipe, same sweep | 233.00 ms | 233.00 ms | 232.14 ms | — |
+| | baseline | after the first pass | after phase 1a | after instancing |  |
+|---|---|---|---|---|---|
+| **total over the sweep** | **3792.15 ms** | **205.3 / 206.7 ms** | **168.10 ms** | **149.83 ms** | **~25.3x** |
+| llvmpipe, same sweep | 233.00 ms | 233.00 ms | 232.14 ms | 232.14 ms | — |
 
 Two runs of the final build are quoted because they differ by 0.6%, which is
 about the run-to-run spread of the sweep and worth carrying so that a later
@@ -95,11 +95,16 @@ more of them before starting anything structural.
 
 ## What is left, biggest first
 
+**Superseded twice — see `PHASE_1A.md` and `INSTANCING.md`.** The table below is
+the state after the first pass; the current one is at the end of
+`INSTANCING.md`. The two structural items named underneath it are still open
+and are still the right two, which is why the section stays.
+
 | sample | ms | vs llvmpipe | why |
 |---|---|---|---|
 | particlesystem | 55.11 | 3.5x slower | 260 peel passes a frame; Phase 3 |
 | multithreading | 48.39 | **2x faster** | 343 draws each paying full-screen costs |
-| instancing | 27.62 | **2.7x faster** | |
+| instancing | 27.62 | **2.7x faster** | since 7.08; the id arrays, `INSTANCING.md` |
 | dynamicuniformbuffer | 22.42 | **20x slower** | launch-bound; see below |
 | gltfscenerendering | 19.79 | 1.3x slower | |
 | bloom | 12.44 | 3.5x slower | full-screen passes |
@@ -161,6 +166,13 @@ Two things there are worth carrying back into how this document is read:
 - **An ordering argument decays.** This section is the second one in this
   document to have been ranked correctly and then overtaken by a change
   elsewhere. Re-measure a phase before trusting where it sits.
+- **A kernel can be charged for somebody else's page faults.** The lead this
+  phase left — `instancing` at 38% busy with `cp_vertex_fetch` at 57% of GPU
+  time — was neither a slow kernel nor a slow host, but four managed buffers
+  the host wrote and that kernel happened to touch first. Written up in
+  `INSTANCING.md`: 27.02 → 7.08 ms. A kernel whose duration is absurd for the
+  work it describes is reporting a migration, and the memory-operations table
+  is where that shows.
 
 Line numbers below predate the changes since and are stale.
 

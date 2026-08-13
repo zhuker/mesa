@@ -82,7 +82,7 @@ the number that means anything:
 | multithreading | 85% |
 | dynamicuniformbuffer | 83% |
 | bloom | 81% |
-| **instancing** | **36%** |
+| **instancing** | **36%** — since 93%, see "what is left" |
 
 Measured over a 17-second steady window, which is the only way these mean
 anything. An earlier version of this table quoted figures taken across whole
@@ -261,6 +261,21 @@ draws a frame, `cp_vertex_fetch` at 57% of GPU time with a grid of 17,280
 blocks, and a median launch of 2.4 ms. Whatever is costing it is not the
 allocator and not the launch count.
 
+**Followed up, and it was the vertex and instance id arrays.** Written up in
+`INSTANCING.md`: 27.02 → 7.08 ms and 38% → 93% busy, the sweep 168.80 → 149.83.
+The fetch kernel could already index the index buffer itself but only for a
+single instance, so the 8,192-instance draw took the host path and built a
+4.4 million entry table — twice over, into managed memory. The 2.4 ms median
+launch was warps stalling on those pages, not gather work.
+
+Worth keeping from it: **the sample's own profile said `cp_vertex_fetch`, and
+`cp_vertex_fetch` was not the problem.** A kernel reading managed memory the
+host has just written is charged for the migration, so the cost appears on
+whichever kernel touches the page first. The two lines that named the real
+cause were in the memory-operations table — 15,713 unified migrations per ten
+frames — which is neither of the two questions the profile script was built to
+answer.
+
 **The llvmpipe calibration is now on the page.** Every difference chart carries
 llvmpipe against the same reference as a second line, because a residual is not
 readable on its own — at frame 47 of `gltfscenerendering` cudapipe differs by
@@ -375,6 +390,8 @@ Profiles are under `build/prof/<label>/`.
 sharing the card measure each other. `cp_iterate.sh` warns if something is
 already on it.
 
-**HEAD is what `drawrewind` measured** — no driver source has changed since,
-only tests and documentation — so the 168.10 ms in this document describes the
-current build rather than a build that once existed.
+**HEAD was what `drawrewind` measured** when this was written, and is not any
+more: the `idsondevice` iteration is on top of it and took the sweep to
+149.83 ms. The 168.10 ms here describes the build this pass ended on, which is
+what makes it the right baseline to compare the next change against — not what
+the driver costs today.
