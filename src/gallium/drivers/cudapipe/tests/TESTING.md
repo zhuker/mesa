@@ -33,6 +33,8 @@ run's images.
 
 | Tool | What it does |
 |---|---|
+| `cp_iterate.sh` | one optimisation iteration: build, time, render, compare, record |
+| `cp_iter_report.py` | an iteration's json record, and the pages over them |
 | `headless_streamer_samples.txt` | the sample set — one entry per capability the capture needs, with the mapping in comments |
 | `cp_perf_run.sh` | one driver's pass: frames, timing, GPU load |
 | `cp_compare.py` | two images, or the PPM/PNG reader the rest import |
@@ -326,3 +328,70 @@ sides.
 drivers over eighteen samples is a few minutes, and it is tempting to overlap
 them. Two passes sharing the card measure each other. The same goes for a sweep
 running while a build does — `nvidia-smi` during the pass is the check.
+
+---
+
+## Iterating on performance
+
+`cp_iterate.sh LABEL [COMPARE_LABEL]` is one iteration end to end: build, time
+sixty frames, render the same sixty, compare them to the stored NVIDIA
+reference, print the cost delta, and write the whole thing down.
+
+```bash
+DESC="what this tried" cp_iterate.sh mylabel previouslabel
+```
+
+Everything an iteration produced lands under `build/iter/LABEL`:
+
+```
+build/iter/
+    nvidia/<sample>/frame0000.ppm     the reference, rendered once
+    LABEL/
+        <sample>/frame0000.ppm        the frames this build rendered
+        bench/_bench.csv              the timed pass, and a csv per sample
+        _render/                      the storing pass's own gpu and timing csvs
+        verdict.txt  delta.txt  _commit.txt
+        iteration.json                all of it as one record
+    iterations.json                   every iteration.json, collected
+    iterations.html                   the summary, a row per iteration
+    perf.html                         one iteration in full, ?iter=LABEL
+```
+
+`build/iter` is therefore exactly the root `cp_compare_frames.py` wants — one
+directory per thing being compared — and an iteration is one directory that can
+be copied, kept or deleted whole.
+
+**Set `DESC`.** A label and a number stop meaning anything within a day of the
+run. What the iteration was *trying* is the part nobody can reconstruct
+afterwards, and it is what the summary page shows.
+
+### The pages
+
+```bash
+cp_iter_report.py page     # rewrites iterations.json; the html never changes
+```
+
+Both pages are static and fetch their data at load time, so they have to be
+served over HTTP rather than opened from a `file://` URL. `iterations.html` is
+the history — description, total, delta, and whether the correctness gate ran —
+and each row links to `perf.html?iter=LABEL`, which is that iteration in full:
+the cost and verdict table, frame time over the run, and differing pixels per
+frame against the reference.
+
+The per-frame charts are the reason to look. `texture3d` reads as 2 differing
+pixels at frame 0 and 3,090 at frame 24, and only one of those is visible in a
+table.
+
+### Two things the record exists to catch
+
+**A gate that did not run.** `cp_compare_frames.py` exits 1 both when a sample
+regressed and when the comparison never happened, so the status cannot tell
+them apart — and a cost delta prints underneath either way. `cp_iterate.sh`
+refuses to report a cost number without a verdict table, and `iteration.json`
+carries `correctness.gate_ran` so the summary page can say so on the row.
+
+**A label reused.** Reusing one overwrites an iteration in place, and the label
+that suggests itself for a change is the same one that suggested itself last
+time something touched that code — so the record most likely to be destroyed is
+the one most useful to compare against. `cp_iterate.sh` refuses an existing
+label; `FORCE=1` when replacing it is the intent.

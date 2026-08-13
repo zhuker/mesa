@@ -10,13 +10,17 @@ it cost, what it did to every sample against the iteration it was compared to,
 and what the correctness gate said. cp_iterate.sh calls it at the end of a run,
 so every iteration gets one without anyone remembering to.
 
-`page` collects every `iteration.json` under the root into
-`_report/iterations.json` — one file holding the whole history — and copies the
-viewer to `_report/iterations.html`. The viewer fetches that json at load time,
-so neither it nor the page has to be regenerated to look at a new iteration:
-re-running `page` rewrites only the data. It does mean the page has to be
-served over HTTP rather than opened from a file:// URL, which is what a browser
-allows.
+`page` writes three files at the root of build/iter:
+
+    iterations.json   every iteration.json collected into one history
+    iterations.html   the summary over them, a row per iteration
+    perf.html         one iteration in full, as perf.html?iter=LABEL
+
+Both pages are static and hold no data — they fetch it at load time — so
+neither has to be regenerated to look at a new iteration. Re-running `page`
+rewrites iterations.json and nothing else needs to happen. It does mean they
+have to be served over HTTP rather than opened from a file:// URL, which is
+what a browser allows.
 
 The point of all this is that a cost number is not a result on its own. What
 makes it one is knowing which build produced it, what was being tried, what it
@@ -36,6 +40,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VIEWER = os.path.join(HERE, "cp_iter_page.html")
+PERF   = os.path.join(HERE, "cp_iter_perf.html")
 
 # What counts as worth pointing at. Matches the <<< and !!! markers cp_iterate.sh
 # prints, so the two agree about what a result is.
@@ -105,6 +110,57 @@ def read_verdict(path):
             except ValueError:
                 continue
     return bool(rows), rows
+
+
+def read_frame_diffs(frameroot, label, ref, tol, cache):
+    """
+    {sample: [differing pixels per frame]} against the reference frames.
+
+    The same ffmpeg pass cp_perf_report.py uses, imported rather than
+    reimplemented so the two pages cannot disagree about what a differing pixel
+    is. Cached per iteration, because the frames it reads never change once the
+    iteration has been rendered.
+    """
+    if os.path.isfile(cache):
+        try:
+            return json.load(open(cache))
+        except json.JSONDecodeError:
+            pass
+
+    sys.path.insert(0, HERE)
+    try:
+        from cp_perf_report import frame_pattern, frame_size, frames_of, diff_series
+    except ImportError as e:
+        print("no per-frame differences (%s)" % e, file=sys.stderr)
+        return {}
+
+    test_dir = os.path.join(frameroot, label)
+    ref_dir = os.path.join(frameroot, ref)
+    if not os.path.isdir(test_dir) or not os.path.isdir(ref_dir):
+        return {}
+
+    out = {}
+    for sample in sorted(os.listdir(test_dir)):
+        if sample.startswith("_") or not os.path.isdir(os.path.join(test_dir, sample)):
+            continue
+        rp, rn = frame_pattern(ref_dir, sample)
+        tp, tn = frame_pattern(test_dir, sample)
+        if not rp or not tp:
+            continue
+        names = frames_of(test_dir, sample)
+        w, h = frame_size(os.path.join(test_dir, sample, names[0]))
+        if not w or not h:
+            continue
+        series = diff_series(rp, tp, tol, w * h)
+        if series:
+            # diff_series returns [[frame, pixels], ...]; only the pixels vary.
+            out[sample] = [p for _, p in series]
+    try:
+        with open(cache, "w") as f:
+            json.dump(out, f)
+    except OSError:
+        pass
+    return out
 
 
 def git_info(mesa, commit):
@@ -181,6 +237,17 @@ def cmd_record(args):
     if not desc and os.path.isfile(dpath):
         desc = open(dpath).read().strip()
 
+    # Per-frame differences, which is the one series that exists nowhere else:
+    # it takes an ffmpeg pass over the stored frames to produce. Per-frame
+    # *times* are deliberately not copied in here — cp_perf_run.sh already
+    # wrote them to bench/<sample>.csv and the detail page reads those
+    # directly, so there is one copy of them rather than two that can drift.
+    frame_diff = {}
+    if not args.no_diffs:
+        frame_diff = read_frame_diffs(
+            root, args.label, args.ref, args.tol,
+            os.path.join(out, "_frame_diffs.json"))
+
     rec = {
         "label": args.label,
         "description": desc,
@@ -201,6 +268,11 @@ def cmd_record(args):
                      if prev_total else None,
         "cost": cost,
         "delta": delta,
+        "tolerance": args.tol,
+        "reference": args.ref,
+        # sample -> [differing pixels per frame]. Frame times are not here; see
+        # above — the page reads bench/<sample>.csv for those.
+        "frame_diff": frame_diff,
         "wins": wins,
         "regressions": regressions,
         "correctness": {
@@ -222,7 +294,10 @@ def cmd_record(args):
 
 def cmd_page(args):
     root = args.root
-    out = args.out or os.path.join(root, "_report")
+    # The pages sit at the root of build/iter, beside the iterations they
+    # describe, so that perf.html?iter=LABEL can reach LABEL/ with a relative
+    # path and the whole tree can be served as-is.
+    out = args.out or root
     os.makedirs(out, exist_ok=True)
 
     iters = []
@@ -245,10 +320,11 @@ def cmd_page(args):
     with open(os.path.join(out, "iterations.json"), "w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
 
-    if os.path.isfile(VIEWER):
-        shutil.copyfile(VIEWER, os.path.join(out, "iterations.html"))
-    else:
-        print("warning: viewer missing at %s" % VIEWER, file=sys.stderr)
+    for src, name in ((VIEWER, "iterations.html"), (PERF, "perf.html")):
+        if os.path.isfile(src):
+            shutil.copyfile(src, os.path.join(out, name))
+        else:
+            print("warning: viewer missing at %s" % src, file=sys.stderr)
 
     print("%d iterations -> %s" % (len(iters), os.path.join(out, "iterations.html")))
     for r in iters:
@@ -272,6 +348,12 @@ def main():
     r.add_argument("--note", action="append")
     r.add_argument("--driver", default="cudapipe")
     r.add_argument("--frames", type=int, default=60)
+    r.add_argument("--ref", default="nvidia",
+                   help="frame directory the differences are taken against")
+    r.add_argument("--tol", type=int, default=8,
+                   help="per-channel tolerance, matching cp_compare_frames.py")
+    r.add_argument("--no-diffs", action="store_true",
+                   help="skip the ffmpeg pass over the stored frames")
     r.set_defaults(func=cmd_record)
 
     p = sub.add_parser("page")

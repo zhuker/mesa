@@ -5,26 +5,33 @@
 #
 #   DESC="what this tried" cp_iterate.sh LABEL [COMPARE_LABEL]
 #
-# Everything lands under $VULKAN/build/iter/LABEL:
+# Everything an iteration produced lands under $VULKAN/build/iter/LABEL:
 #
-#   bench/   the timed pass — _bench.csv, per-sample frame times, no images
-#   verdict.txt   cp_compare_frames.py against the stored nvidia reference
-#   delta.txt     ms/frame against COMPARE_LABEL, per sample and in total
+#   bench/          the timed pass — _bench.csv, per-sample frame times
+#   <sample>/       the stored frames, one directory of them per sample
+#   _render/        the storing pass's own timing and GPU csvs
+#   verdict.txt     cp_compare_frames.py against the stored nvidia reference
+#   delta.txt       ms/frame against COMPARE_LABEL, per sample and in total
 #   iteration.json  all of the above as one record, plus the commit, DESC, and
 #                   which samples moved past 5% either way
 #
+# build/iter is then exactly the root cp_compare_frames.py wants — one directory
+# per thing being compared — with the nvidia reference sitting beside the
+# iterations as build/iter/nvidia.
+#
+# _render/ carries its underscore for a reason: cp_compare_frames.py takes its
+# sample list from the reference directory and skips names starting with one,
+# and the reference has a _render/ of its own. bench/ needs no underscore
+# because only iterations have one, and the reference is what is enumerated.
+#
 # DESC is worth setting. A label and a number stop meaning anything within a
 # day or so of the run; what the iteration was trying is the part nobody can
-# reconstruct afterwards. It also ends up on the page that
-# cp_iter_report.py builds over every iteration's json.
-#
-# The stored frames go to build/iter/_frames/LABEL instead, beside the nvidia
-# reference at build/iter/_frames/nvidia, because cp_compare_frames.py takes one
-# root holding a directory per driver and compares them pairwise.
+# reconstruct afterwards. It also ends up on the pages cp_iter_report.py builds
+# over every iteration's json.
 #
 # The two passes render the same work; see TESTING.md. The reference frames are
-# rendered once into build/iter/_ref and reused, because NVIDIA's output does
-# not change when cudapipe does.
+# rendered once and reused, because NVIDIA's output does not change when
+# cudapipe does.
 #
 # Why a script rather than the commands: a performance claim is only worth
 # something if the run behind it can be repeated, and the flags that have to
@@ -53,8 +60,8 @@ esac
 
 ROOT=$VULKAN/build/iter
 OUT=$ROOT/$LABEL
-FRAMEROOT=$ROOT/_frames
-REF=$FRAMEROOT/nvidia
+FRAMEROOT=$ROOT
+REF=$ROOT/nvidia
 
 # An iteration is a record, and reusing a label overwrites one. It is easy to
 # do: the labels that suggest themselves for a change are the same ones that
@@ -98,9 +105,20 @@ if [ "${BENCH_ONLY:-0}" != "1" ]; then
     echo "=== [$LABEL] rendering the same $FRAMES frames ==="
     # Frames are never reused between iterations: a partial re-render leaves
     # one sample's old images beside another's new ones, which reads as a
-    # change in the sample that was not re-run.
-    rm -rf "${FRAMEROOT:?}/$LABEL"
-    "$T/cp_perf_run.sh" "$DRIVER" "$ICD" "$FRAMEROOT/$LABEL" "$FRAMES" || exit 1
+    # change in the sample that was not re-run. Only the sample directories go
+    # — bench/ holds the timed pass that already ran, and blowing the whole
+    # iteration directory away here would take it with them.
+    for d in "${OUT:?}"/*/; do
+        case $(basename "$d") in bench|_render|_logs) ;; *) rm -rf "$d" ;; esac
+    done
+    "$T/cp_perf_run.sh" "$DRIVER" "$ICD" "$OUT" "$FRAMES" || exit 1
+    # The storing pass writes its own _gpu.csv and _timing.csv beside the
+    # frames; keep them, but out of the way of the sample directories.
+    mkdir -p "$OUT/_render"
+    for f in "$OUT"/_gpu.csv "$OUT"/_gpu_procs.csv "$OUT"/_timing.csv \
+             "$OUT"/_summary.txt; do
+        [ -f "$f" ] && mv "$f" "$OUT/_render/"
+    done
 
     echo "=== [$LABEL] correctness against nvidia ==="
     "$MESA/venv/bin/python3" "$T/cp_compare_frames.py" \

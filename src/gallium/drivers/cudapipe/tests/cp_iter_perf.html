@@ -1,0 +1,304 @@
+<!doctype html>
+<!--
+  One iteration in full: perf.html?iter=LABEL
+
+  Static, and one copy of it for the whole tree. It sits at the root of
+  build/iter beside the iteration directories, takes the label from the query
+  string, and reads LABEL/iteration.json and LABEL/bench/<sample>.csv.
+
+  Two data sources on purpose. Per-frame times come straight from the csvs
+  cp_perf_run.sh wrote, so there is one copy of them rather than a second in
+  json that could drift. Per-frame differences come from iteration.json, because
+  producing them takes an ffmpeg pass over the stored frames and they exist
+  nowhere else.
+
+  Served over HTTP, not opened off disk.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iteration detail</title>
+<style>
+  :root {
+    --bg:#fff; --panel:#f6f7f9; --line:#dfe3e8; --fg:#14171a; --dim:#5b6570;
+    --win:#0b7a3b; --winbg:#e6f4ec; --reg:#b3261e; --regbg:#fbeae9;
+    --accent:#2a5db0; --warn:#8a5a00; --grid:#e8ebee; --now:#2a5db0; --prev:#9aa5b1;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg:#14171a; --panel:#1c2126; --line:#2c333a; --fg:#e6eaee; --dim:#97a3ae;
+    --win:#4ad07f; --winbg:#10291c; --reg:#ff7b72; --regbg:#2b1614;
+    --accent:#7aa7f0; --warn:#e0b050; --grid:#242b31; --now:#7aa7f0; --prev:#5d6874;
+  } }
+  :root[data-theme="dark"] {
+    --bg:#14171a; --panel:#1c2126; --line:#2c333a; --fg:#e6eaee; --dim:#97a3ae;
+    --win:#4ad07f; --winbg:#10291c; --reg:#ff7b72; --regbg:#2b1614;
+    --accent:#7aa7f0; --warn:#e0b050; --grid:#242b31; --now:#7aa7f0; --prev:#5d6874;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width:1180px; margin:0 auto; padding:24px 20px 80px; }
+  a { color:var(--accent); }
+  h1 { font-size:20px; margin:0 0 4px; letter-spacing:-.01em; }
+  h2 { font-size:15px; margin:30px 0 10px; }
+  .sub { color:var(--dim); font-size:13px; }
+  code,.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .back { font-size:13px; display:inline-block; margin-bottom:14px; }
+
+  .meta { color:var(--dim); font-size:12px; margin:10px 0 4px; }
+  .meta span { margin-right:16px; white-space:nowrap; }
+  .desc { font-size:14px; margin:6px 0 0; }
+  ul.notes { margin:10px 0 0; padding-left:18px; color:var(--dim); font-size:13px; }
+
+  .cards { display:flex; gap:12px; flex-wrap:wrap; margin:18px 0 4px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:12px 16px; min-width:150px; }
+  .card .k { color:var(--dim); font-size:11px; text-transform:uppercase;
+             letter-spacing:.05em; }
+  .card .v { font-size:21px; font-weight:600; margin-top:2px; }
+
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th,td { text-align:right; padding:5px 9px; border-bottom:1px solid var(--line); }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--dim); font-weight:600; font-size:12px; text-transform:uppercase;
+       letter-spacing:.04em; white-space:nowrap; }
+  .scroll { overflow-x:auto; }
+  .pct.win { color:var(--win); font-weight:600; }
+  .pct.reg { color:var(--reg); font-weight:600; }
+  .pct.flat { color:var(--dim); }
+  .noisy { opacity:.55; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:999px;
+           font-size:11px; font-weight:600; }
+  .badge.ok{background:var(--winbg);color:var(--win)}
+  .badge.bad{background:var(--regbg);color:var(--reg)}
+  .badge.warn{background:var(--regbg);color:var(--warn)}
+  .gate-bad { border-left:3px solid var(--reg); padding-left:12px; margin:14px 0; }
+
+  .charts { display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr));
+            gap:16px; }
+  .chart { border:1px solid var(--line); border-radius:10px; background:var(--panel);
+           padding:10px 12px 6px; }
+  .chart h3 { margin:0 0 2px; font-size:13px; font-weight:600; }
+  .chart .cap { color:var(--dim); font-size:11px; margin-bottom:4px; }
+  svg { display:block; width:100%; height:auto; overflow:visible; }
+  .empty { color:var(--dim); font-style:italic; font-size:13px; }
+  .key { font-size:11px; color:var(--dim); }
+  .key b { font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="iterations.html">&larr; all iterations</a>
+  <div id="root"><p class="sub">loading…</p></div>
+</div>
+
+<script>
+const esc = s => String(s==null?"":s).replace(/[&<>"]/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const f2 = n => n==null ? "" : n.toFixed(2);
+const fmtInt = n => n==null ? "" : n.toLocaleString();
+
+function pctSpan(p, noisy) {
+  if (p == null) return '<span class="pct flat">—</span>';
+  const c = p <= -5 ? "win" : p >= 5 ? "reg" : "flat";
+  return `<span class="pct ${c}${noisy?" noisy":""}">${p>0?"+":""}${p.toFixed(1)}%</span>`;
+}
+
+/* A line chart of one or two series. Drawn as inline SVG rather than with a
+   library so the page stays a single file with nothing to fetch. */
+function lineChart(series, opts) {
+  const W = 330, H = 120, L = 44, R = 6, T = 8, B = 18;
+  const all = series.flatMap(s => s.data).filter(v => v != null);
+  if (!all.length) return '<p class="empty">no data</p>';
+  const n = Math.max(...series.map(s => s.data.length));
+  let hi = Math.max(...all), lo = opts && opts.zero === false ? Math.min(...all) : 0;
+  if (hi === lo) hi = lo + 1;
+  const x = i => L + (n <= 1 ? 0 : (i / (n - 1)) * (W - L - R));
+  const y = v => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  const fmt = opts && opts.fmt ? opts.fmt : (v => v.toFixed(1));
+
+  let g = "";
+  for (let k = 0; k <= 2; k++) {
+    const v = lo + (hi - lo) * k / 2, yy = y(v);
+    g += `<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="var(--grid)"/>
+          <text x="${L-6}" y="${yy+3.5}" text-anchor="end" font-size="9"
+                fill="var(--dim)">${esc(fmt(v))}</text>`;
+  }
+  g += `<text x="${L}" y="${H-4}" font-size="9" fill="var(--dim)">0</text>
+        <text x="${W-R}" y="${H-4}" text-anchor="end" font-size="9"
+              fill="var(--dim)">${n-1}</text>`;
+
+  for (const s of series) {
+    if (!s.data.length) continue;
+    const d = s.data.map((v, i) => `${i?"L":"M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join("");
+    g += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.w||1.6}"
+             ${s.dash?'stroke-dasharray="3,3"':''} stroke-linejoin="round"/>`;
+  }
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${g}</svg>`;
+}
+
+/* bench/<sample>.csv: two header lines, then `frame,ms`, then the rows. */
+function parseFrameCsv(text) {
+  const out = [];
+  let started = false;
+  for (const line of text.split("\n")) {
+    if (line.startsWith("frame,")) { started = true; continue; }
+    if (!started) continue;
+    const p = line.trim().split(",");
+    if (p.length === 2) { const v = parseFloat(p[1]); if (!isNaN(v)) out.push(v); }
+  }
+  return out;
+}
+
+function costTable(r) {
+  const samples = Object.keys(r.cost || {}).sort(
+    (a,b) => (r.cost[b].ms_avg||0) - (r.cost[a].ms_avg||0));
+  const rows = samples.map(s => {
+    const c = r.cost[s], d = (r.delta||{})[s], v = ((r.correctness||{}).samples||{})[s]||{};
+    const vb = v.verdict === "ok" ? '<span class="badge ok">ok</span>'
+             : v.verdict === "REGRESSED" ? '<span class="badge bad">regressed</span>'
+             : v.verdict ? `<span class="badge warn">${esc(v.verdict)}</span>` : "";
+    return `<tr>
+      <td><code>${esc(s)}</code></td>
+      <td>${f2(c.ms_avg)}</td><td>${f2(c.ms_best)}</td><td>${f2(c.ms_worst)}</td>
+      <td>${d?f2(d.before):""}</td><td>${d?pctSpan(d.pct,d.noisy):"—"}</td>
+      <td>${v.frame0!=null?fmtInt(v.frame0):""}</td>
+      <td>${v.worst!=null?fmtInt(v.worst):""}</td>
+      <td>${v.at!=null?v.at:""}</td>
+      <td style="text-align:left">${vb}</td></tr>`;
+  }).join("");
+  return `<div class="scroll"><table><thead><tr>
+    <th>sample</th><th>ms</th><th>best</th><th>worst</th><th>before</th><th>change</th>
+    <th>frame 0</th><th>worst diff</th><th>at</th><th style="text-align:left">verdict</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function render(r, csvs) {
+  const c = r.correctness || {};
+  const samples = Object.keys(r.cost || {}).sort(
+    (a,b) => (r.cost[b].ms_avg||0) - (r.cost[a].ms_avg||0));
+
+  const gateWarn = c.gate_ran ? "" : `<div class="gate-bad"><b>The correctness gate
+    did not run for this iteration.</b> Its cost numbers are unguarded.</div>`;
+  const changed = c.changed_vs_against || [];
+  const changedHtml = changed.length ? `<div class="gate-bad"><b>Verdict changed
+    against ${esc(r.against)}:</b> ` + changed.map(x =>
+    `<code>${esc(x.sample)}</code> ${esc(x.was)} &rarr; ${esc(x.now)}`).join(", ")
+    + `</div>` : "";
+
+  // Frame time per frame, this iteration against the one it was compared to is
+  // not available per-frame (only the mean is), so this shows this run's shape
+  // with its own mean as the flat reference.
+  const timeCharts = samples.map(s => {
+    const d = csvs[s] || [];
+    if (!d.length) return "";
+    const mean = d.reduce((a,b)=>a+b,0)/d.length;
+    return `<div class="chart"><h3>${esc(s)}</h3>
+      <div class="cap">${f2(mean)} ms mean · ${d.length} frames</div>
+      ${lineChart([
+        {data:d, color:"var(--now)"},
+        {data:d.map(()=>mean), color:"var(--prev)", w:1, dash:true}
+      ], {fmt:v=>v.toFixed(1)})}
+      <div class="key"><b style="color:var(--now)">—</b> ms/frame
+        <b style="color:var(--prev)">- -</b> mean</div></div>`;
+  }).join("");
+
+  const fd = r.frame_diff || {};
+  const diffCharts = samples.filter(s => (fd[s]||[]).length).map(s => {
+    const d = fd[s];
+    const worst = Math.max(...d), at = d.indexOf(worst);
+    return `<div class="chart"><h3>${esc(s)}</h3>
+      <div class="cap">worst ${fmtInt(worst)} px at frame ${at} ·
+        frame 0 ${fmtInt(d[0])}</div>
+      ${lineChart([{data:d, color:"var(--reg)"}], {fmt:v=>
+        v>=1000 ? (v/1000).toFixed(0)+"k" : v.toFixed(0)})}
+      </div>`;
+  }).join("");
+
+  document.getElementById("root").innerHTML = `
+    <h1><code>${esc(r.label)}</code></h1>
+    <p class="desc">${esc(r.description || "no description recorded")}</p>
+    <div class="meta">
+      <span>commit <code>${esc((r.commit||"").slice(0,11)) || "—"}</code></span>
+      <span>${esc(r.driver||"")}, ${r.frames||"?"} frames</span>
+      <span>vs <code>${esc(r.against||"—")}</code></span>
+      <span>recorded ${esc(r.recorded||"")}</span>
+      ${(r.dirty||[]).length ? `<span style="color:var(--warn)">uncommitted: ${
+        r.dirty.map(esc).join(", ")}</span>`:""}
+    </div>
+    ${r.commit_subject ? `<div class="meta"><span>${esc(r.commit_subject)}</span></div>`:""}
+    ${(r.notes||[]).length ? "<ul class='notes'>"+r.notes.map(n=>"<li>"+esc(n)+"</li>").join("")+"</ul>":""}
+
+    <div class="cards">
+      <div class="card"><div class="k">total</div><div class="v">${f2(r.total_ms)} ms</div></div>
+      <div class="card"><div class="k">vs ${esc(r.against||"—")}</div>
+        <div class="v">${r.total_pct!=null?pctSpan(r.total_pct):"—"}</div></div>
+      <div class="card"><div class="k">wins / regressions</div>
+        <div class="v"><span class="pct win">${(r.wins||[]).length}</span>
+          / <span class="pct reg">${(r.regressions||[]).length}</span></div></div>
+      <div class="card"><div class="k">correctness</div><div class="v" style="font-size:15px">
+        ${c.gate_ran ? (changed.length
+          ? `<span class="badge bad">${changed.length} changed</span>`
+          : '<span class="badge ok">unchanged</span>')
+        : '<span class="badge warn">gate did not run</span>'}</div></div>
+    </div>
+    ${gateWarn}${changedHtml}
+
+    <h2>Cost and correctness by sample</h2>
+    ${costTable(r)}
+
+    <h2>Frame time over the run</h2>
+    <p class="sub">Every frame of the timed pass, in order. The mean is the
+      number in the table above; the shape is what it hides — a warm-up frame, a
+      periodic stall, or a sample that drifts.</p>
+    <div class="charts">${timeCharts || '<p class="empty">no per-frame csvs found</p>'}</div>
+
+    <h2>Differing pixels over the animation</h2>
+    <p class="sub">Against ${esc(r.reference||"nvidia")} at tolerance
+      ${r.tolerance||8}/255, every frame — not frame 0. Each chart is scaled to
+      itself, because a shared axis flattens every small one and the small ones
+      are where the signal is.</p>
+    <div class="charts">${diffCharts || `<p class="empty">no per-frame differences
+      recorded — re-run <code>cp_iter_report.py record</code> without
+      <code>--no-diffs</code></p>`}</div>`;
+}
+
+const LABEL = new URLSearchParams(location.search).get("iter") || "";
+document.title = LABEL ? LABEL + " — iteration" : "iteration";
+
+if (!LABEL) {
+  document.getElementById("root").innerHTML = `<div class="gate-bad">
+    <p><b>No iteration named.</b></p>
+    <p class="empty">This page takes one from the query string, as
+    <code>perf.html?iter=LABEL</code>. Pick one from
+    <a href="iterations.html">the summary</a>.</p></div>`;
+} else {
+  const dir = encodeURIComponent(LABEL);
+  fetch(`${dir}/iteration.json`, {cache:"no-store"})
+    .then(r => { if (!r.ok) throw new Error(r.status+" "+r.statusText); return r.json(); })
+    .then(async rec => {
+      // Per-frame times come from the csvs cp_perf_run.sh already wrote, so
+      // they are not duplicated into the json. One fetch per sample, parallel.
+      const names = Object.keys(rec.cost || {});
+      const csvs = {};
+      await Promise.all(names.map(s =>
+        fetch(`${dir}/bench/${encodeURIComponent(s)}.csv`, {cache:"no-store"})
+          .then(r => r.ok ? r.text() : "")
+          .then(t => { if (t) csvs[s] = parseFrameCsv(t); })
+          .catch(() => {})));
+      render(rec, csvs);
+    })
+    .catch(e => {
+      document.getElementById("root").innerHTML = `<div class="gate-bad">
+        <p><b>Could not load <code>${esc(LABEL)}/iteration.json</code></b> — ${
+          esc(e.message)}</p>
+        <p class="empty">Either there is no iteration by that name, or
+        <code>cp_iter_report.py record</code> has not run for it. This page also
+        reads its data at load time, so it has to be served over HTTP rather
+        than opened from a <code>file://</code> URL.</p></div>`;
+    });
+}
+</script>
+</body>
+</html>

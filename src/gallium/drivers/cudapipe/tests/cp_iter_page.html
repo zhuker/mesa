@@ -4,6 +4,7 @@
 
   Static: it holds no data and never needs regenerating. `cp_iter_report.py
   page` refreshes iterations.json beside it and this renders whatever is there.
+  Rows link through to perf.html?iter=LABEL for one iteration in full.
 
   Served over HTTP, not opened off disk. A browser will not fetch a sibling
   file from a file:// URL, so opening this directly shows the message below
@@ -114,7 +115,9 @@ function history() {
           : '<span class="badge ok">verdicts unchanged</span>')
       : '<span class="badge warn">gate did not run</span>';
     return `<tr data-i="${i}">
-      <td><code>${esc(r.label)}</code></td>
+      <td><a href="perf.html?iter=${encodeURIComponent(r.label)}"
+             title="frame times, per-frame differences and the full tables"
+             ><code>${esc(r.label)}</code></a></td>
       <td style="text-align:left;width:34%">${esc(r.description || "")}</td>
       <td>${f2(r.total_ms)}</td>
       ${pctCell(p)}
@@ -200,7 +203,9 @@ function detail(r) {
     <p class="sub" style="margin:10px 0 0">Correctness is every one of the
       ${r.frames || 60} frames of each sample against the stored NVIDIA
       reference at tolerance 8/255, not frame 0 — <code>worst</code> and
-      <code>at</code> are which frame was furthest off and where.</p>
+      <code>at</code> are which frame was furthest off and where.
+      <a href="perf.html?iter=${encodeURIComponent(r.label)}">Open
+      <code>${esc(r.label)}</code> in full</a> for the per-frame charts.</p>
   </div>`;
 }
 
