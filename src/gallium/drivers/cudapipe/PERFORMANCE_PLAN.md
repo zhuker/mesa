@@ -129,6 +129,43 @@ Two things stand out, and neither needs Phase 3:
   and could not help more, because the cost is the number of launches rather
   than their size.
 
+  **Every per-frame figure in that paragraph is five times too large, and the
+  conclusion drawn from them is wrong.** The sample's `OBJECT_INSTANCES` is
+  125, not 625 — a 5x5x5 grid — and a clean 120-frame profile measures 1,127
+  launches a frame, which is 125 draws times the nine launches each. 5,635 is
+  exactly 5x 1,127 and 625 is exactly 5x 125, because the profile behind them
+  divided by the frame count handed to `cp_profile.sh` while the trace also held
+  the warm-up frames nsys records but nobody asked for. `tests/TESTING.md`
+  documents the trap; the profiler no longer renders a warm-up, so `FRAMES` is
+  now the number of frames in the trace.
+
+  Corrected, the sample is **not launch-bound**. Of a 12.35 ms frame, roughly
+  7.8 ms is GPU kernel time and `cuLaunchKernel` accounts for 2.8 ms of traced
+  host time — traced, so an overstatement. What owns the frame is one kernel:
+
+  | kernel | ms/frame | share | grid |
+  |---|---|---|---|
+  | `cp_rasterize_stage2` | 3.09 | **25%** | **5 blocks** |
+  | `main` (VS and FS) | 1.31 | 11% | 1 and 7200 |
+  | `cp_fs_interpolate` | 1.24 | 10% | 900 |
+  | `cp_rasterize_stage3` | 0.80 | 6% | 2048 |
+  | `cp_vertex_fetch` | 0.53 | 4% | **1 block** |
+  | `cp_fs_writeback` | 0.48 | 4% | 7200 |
+  | `cp_rasterize_stage1` | 0.20 | 2% | **1 block** |
+  | `cp_clip_triangles` | 0.14 | 1% | **1 block** |
+
+  `cp_rasterize_stage2` is a quarter of the frame and runs on **five blocks** —
+  `CLAMP((36 + 7) / 8, 1, 512)` for a draw of twelve triangles — so it occupies
+  about 3% of a 170-SM card while every other SM idles, and it takes 22.9 us to
+  do it because a warp walks a whole triangle's bounding box alone. Four more
+  kernels run on a single block each.
+
+  So the diagnosis is not the launch count but the same warp starvation the
+  device counters report for the whole sweep: `SMs Active` 12%, `SM Issue` 2%.
+  Batching draws is still the answer, and now for the stated reason — a batched
+  draw gives stage 2 a grid worth launching — rather than because the launches
+  themselves dominate.
+
   Two ways out were named here, both structural: merge stages so a draw costs
   fewer kernels, on cuRE's argument for a persistent megakernel; or batch draws,
   which is Phase 3.
