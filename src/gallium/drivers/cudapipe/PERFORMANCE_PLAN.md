@@ -141,14 +141,17 @@ Two things stand out, and neither needs Phase 3:
   share a binning pass, per-draw cost stops scaling with draw count. Note that
   llvmpipe is 20x faster here for the structural reason that it has no per-draw
   launch at all.
-- **Per-draw full-screen work.** `cp_fs_interpolate` launches one thread per
-  quad of the whole framebuffer on every draw and every peel pass, and the
-  visibility buffer is memset whole (7.4 MB) just as often — both regardless of
-  what the draw covers. On multithreading that is 18 ms of 50. The visbuf clear
-  has an exact answer already available: `pixel_list` holds precisely the
-  entries a draw made non-empty, so clearing those rather than the buffer needs
-  no host-side count. The interpolator wants the draw's bounding box, which
-  stage 1 could accumulate on the device.
+- **Per-draw full-screen work — now Phase 4, and measured.** `cp_fs_interpolate`
+  launches one thread per quad of the whole framebuffer on every draw and every
+  peel pass, and the fragment shader and writeback launch over `max_pixels`
+  regardless of what the draw covers. Worth about 19% on `multithreading`,
+  `bloom` and `dynamicuniformbuffer` together.
+
+  Both remedies this section used to propose have since been tried and neither
+  is the answer: bounding the interpolator by a device-accumulated draw bounding
+  box is **neutral across the sweep** (§4.1), and the visibility-buffer clear is
+  already at peak memset bandwidth at 2.78 µs, so clearing less costs a launch
+  to save nothing (§4.3). The cost that remains is the fixed grids of §4.2.
 
 ---
 
@@ -883,6 +886,144 @@ edges by eight rows as any other. Do not sequence this ahead of that.
 
 ---
 
+# Phase 4 — the fragment stage's fixed costs
+
+**Numbered last and available first.** Nothing depends on this phase and it
+depends on nothing; the number is an identity, not a position. Phase 3 subsumes
+all of it, which is the argument for taking only the cheap parts until Phase 3
+is decided.
+
+This is the "per-draw full-screen work" item from "What is left" above, promoted
+to a phase because it is the largest measured item in the driver and had no
+number while §0.4 — measured as buying nothing on this sample set — had a full
+section. The document was organised by where ideas came from rather than by what
+they are worth.
+
+## What it actually is
+
+Three kernels, not one. Every one of them is launched at a fixed size per draw
+and per peel pass, and the coefficient of variation across thousands of launches
+says how little any of them depends on the draw. On `multithreading`:
+
+| kernel | share of GPU time | avg | CV | launched over |
+|---|---|---|---|---|
+| `cp_fs_interpolate` | 33.0% | 18,305 ns | 0.21 | every quad of the framebuffer |
+| `main` (fragment) | ~10% | 5,211 ns | — | `max_pixels` = 2·w·h |
+| `cp_fs_writeback` | 7.5% | 4,076 ns | **0.03** | `max_pixels` = 2·w·h |
+
+A CV of 0.03 is a kernel doing the same amount of work whatever it was asked to
+draw, which is the shape `cp_prof_kernels.py` exists to flag.
+
+**The prize is real and it is worth about 19%.** A probe that made
+`cp_fs_interpolate` return immediately took `multithreading` from 29.70 to
+24.12 ms, `bloom` from 12.01 to 10.06 and `dynamicuniformbuffer` from 12.31 to
+11.05. Note what that probe actually measured: with the interpolator inert the
+pixel counter stays zero, so the fragment shader and the writeback early-out
+too. It is the upper bound for **all three together**, not for the interpolator
+alone — which is the point. Bounding one of the three is not worth much, and
+that is what §4.1 found out the expensive way.
+
+## 4.1 Bound the interpolator by the draw's bounding box — tried, and it is neutral
+
+The interim answer this document proposed. **Implemented, measured across the
+sweep, and reverted.**
+
+Stage 1 accumulates the union of the primitive boxes `setup_triangle` already
+clamps to the clip rectangle — complete by construction, since every primitive
+passes through stage 1 whether it rasterizes there or is queued onward, and a
+point's box is its full sprite square. Four `uint32` as
+`[min_x, min_y, ~max_x, ~max_y]`, so all four are `atomicMin` and all four
+initialise from one `cuMemsetD32`; a shared-memory reduction makes it four
+atomics per block rather than four per primitive. The interpolator then drops
+any quad the box does not meet, which is **exactly output-neutral**: outside the
+box every visibility entry is still EMPTY, so the quad search would return
+`ntris == 0` after reading four cache lines to find out.
+
+It works, and it does not pay:
+
+| | baseline | with the box |
+|---|---|---|
+| multithreading | 29.70 | 29.67 |
+| dynamicuniformbuffer | 12.31 | 12.32 |
+| bloom | 12.01 | 12.00 |
+| particlesystem | 51.90 | 51.58 |
+| gltfscenerendering | 17.13 | 17.12 |
+| instancing | 7.01 | 7.09 |
+
+The kernel does get faster where the box is tight —
+`dynamicuniformbuffer`'s `cp_fs_interpolate` fell 12,295 → 8,645 ns, a 30% cut —
+and the frame did not move, because that sample is launch-bound and its GPU time
+is not what binds it. Where a sample *is* GPU-bound the box is not tight enough:
+`multithreading`'s interpolator fell only 18,305 → 16,940 ns with a median
+launch unchanged at 17,440.
+
+**The reason is the one this document should have caught before writing the
+item.** It justified a bounding-box fix with "a median draw covering 588
+pixels" — but coverage and bounding box are different quantities, and a draw
+that covers 588 pixels spread along an object's silhouette has a bounding box
+far larger than 588 pixels. Nothing in the sample set is both GPU-bound and
+spatially compact.
+
+Two probe failures on the way, both worth not repeating:
+
+- **A probe that hardcoded a tiny box measured nothing.** Overwriting the four
+  loaded values immediately after loading them made the loads dead, NVRTC
+  removed them, and the "tiny box" run was really the "no box at all" run. It
+  showed a 17% win that did not exist. A probe that changes what the compiler
+  can prove is not measuring the thing it names.
+- **A 13.7% regression on `gltfscenerendering` was an artefact of comparing to a
+  number from an earlier session.** Rebuilding the previous commit and measuring
+  it in the same session gave the same 17.1 ms. `TESTING.md` already says to run
+  a sample twice against itself before attributing a delta; it applies to
+  baselines carried between sessions just as much.
+
+Keep the idea recorded rather than repeated. If Phase 3 does not happen, the
+box becomes worth revisiting only together with §4.2, since neither is worth
+much alone.
+
+## 4.2 Size the fragment and writeback grids by the pixel count
+
+The floor §4.1 could not reach. Both kernels launch `max_pixels` = 2·w·h threads
+— 1.8 million at 1280x720 — and each thread reads the device-side counter and
+returns if it is past it. `cp_fs_writeback` costs 4 µs a launch at a CV of 0.03
+doing essentially nothing.
+
+The count is on the device, which is why it is launched this way: sizing the
+grid from it needs the host to know it, and reading it costs a sync. The ways
+out are a device-side launch, a CUDA graph whose launch dimensions are updated
+on the device, or the structural answer in §4.4. This is the item that actually
+holds the 19%.
+
+## 4.3 Bound the visibility-buffer clear — measured as not worth it
+
+The other half of the original item, and the cheaper-looking one. **It is not
+where the time is.** The clear is 7.4 MB once per draw and costs **2.78 µs**,
+which is peak memset bandwidth on this card; a kernel launch to clear less costs
+about the same as the memset it replaces. Measured across the set the visbuf
+clears are 0.85–4.0 ms a frame traced, and every alternative to them is a launch.
+
+For contrast, and this is where the memsets did pay: the largest memset cost in
+the driver was a **64-byte** blocking `cuMemsetD8` at 31 µs, eleven times the
+7.4 MB one. See the "zero small managed allocations on the host" commit — the
+count told the wrong story and the duration told the right one.
+
+## 4.4 Quad coverage masks — the end state
+
+Moved here from "Definite, but not next" below, because it is the answer to
+§4.1, §4.2 and §4.3 at once rather than a separate idea. cuRE paper §5.3: derive
+a quad mask from the pixel mask with a few bit operations, start four
+consecutive lanes per set bit, suppress helper-thread writes with the original
+pixel mask, take derivatives by `__shfl` between the four lanes. There is then
+no full-screen pass, no separate interpolate kernel, and no fixed grid to size —
+the work list is the coverage.
+
+It is still not next, for the reason given there: wiring it into a standalone
+interpolate kernel is plumbing that Phase 3 deletes. What has changed is that
+the interim answer this document offered instead has now been measured and does
+not work, so there is no cheap version to do first.
+
+---
+
 # cuRE — what to take, and what it settles
 
 Kenzel et al. 2018, read in full for this section. The checkout is `~/git/cuRE`:
@@ -974,10 +1115,14 @@ start four consecutive lanes per set bit, and suppress helper-thread writes usin
 the original pixel mask. Derivatives then come from `__shfl` between the four
 lanes, with no full-screen pass and no separate interpolate kernel.
 
-It is not next because the same 18 ms already has a cheaper interim answer in
-this document — the device-accumulated draw bounding box, and clearing visbuf
-from `pixel_list` — and because wiring quad masks into a standalone interpolate
-kernel is plumbing that Phase 3 then deletes. Right mechanism, wrong moment.
+It is not next because wiring quad masks into a standalone interpolate kernel is
+plumbing that Phase 3 then deletes. Right mechanism, wrong moment.
+
+**The "cheaper interim answer" this entry used to cite is gone.** It was the
+device-accumulated draw bounding box and clearing visbuf from `pixel_list`; both
+have since been measured, and §4.1 and §4.3 record why neither pays. So the
+choice is now between this and §4.2 rather than between this and something
+cheap — see Phase 4.
 
 **`BlockWorkAssignment`** (`work_assignment.cuh:20-82`). Every thread reports a
 work count, a block-wide prefix sum hands out exactly NUM_THREADS work items
