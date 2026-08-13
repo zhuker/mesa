@@ -242,6 +242,13 @@ draws a frame, `cp_vertex_fetch` at 57% of GPU time with a grid of 17,280
 blocks, and a median launch of 2.4 ms. Whatever is costing it is not the
 allocator and not the launch count.
 
+**The llvmpipe calibration is now on the page.** Every difference chart carries
+llvmpipe against the same reference as a second line, because a residual is not
+readable on its own — at frame 47 of `gltfscenerendering` cudapipe differs by
+59,939 pixels and llvmpipe by 91,091, so that is what software rasterization
+costs; `texture3d` peaks at 3,090 against llvmpipe's 0, so that one is a
+cudapipe defect and the clearest correctness lead in the set.
+
 **`cp_fs_interpolate` is still the one kernel near the top of every sample**,
 and it is a fixed full-framebuffer launch per draw and per peel pass —
 18.98 µs on multithreading with a coefficient of variation of 0.20, against a
@@ -281,3 +288,70 @@ run printed a one-line import error where the verdict table goes and a cost
 delta underneath as usual. Both "a sample regressed" and "the check never ran"
 exit 1, so the status could not tell them apart. That is how a regression
 ships.
+
+**`tests/cp_iter_report.py`** — an iteration records itself, and the pages over
+those records. An iteration used to be a directory of csvs whose meaning lived
+in whoever ran it; `record` writes `iteration.json` beside them with the commit
+and its subject, which files were uncommitted at the time, what the run was
+trying, the full per-sample cost, the delta against what it was compared to,
+the samples that moved past 5% split into wins and regressions, and the parsed
+verdict table with whether the gate ran at all. `page` collects them into
+`iterations.json` and renders two static pages that fetch it: `iterations.html`
+for the history and `perf.html?iter=LABEL` for one iteration in full — cost and
+verdict per sample, frame time over the run, differing pixels per frame, and a
+frame inspector showing the reference, this iteration and llvmpipe with each
+one's difference.
+
+Backfilling this pass's ten iterations is what showed it was worth having:
+three of them record that the correctness gate did not run, and the page says
+so on the row rather than leaving it in a file nobody opens. Two were
+`BENCH_ONLY` on purpose; the third is `noflush`, whose cost numbers are
+unguarded because of the numpy fault above.
+
+**Frames are stored as PNG.** The samples write PPM and the gate reads it, but
+a browser cannot display it, so the inspector needed frames it could show.
+Converting in place and dropping the PPM — rather than exporting a second copy
+the way the old report did — turned out to *save* disk rather than cost it: a
+1280x720 PPM is 2.7 MB whatever it holds against 150 KB to 2 MB as PNG, and the
+tree went from 57 GB to 16 GB. The pane then points at the very file the gate
+judged. The conversion was checked bit-exact before anything was deleted.
+
+Two bugs in that worth carrying, because both survived a first verification and
+were caught only by looking at output rather than at code. ffmpeg's image2
+muxer numbers its output from 1 whatever `-start_number` the input was given,
+so every frame was written one higher than it was read — pixel counts identical,
+verdicts unchanged, and the only sign was `particlesystem` claiming its worst
+frame was 60 of 0..59. And `#full { display:flex }` beats the browser's
+`[hidden] { display:none }`, so the full-size overlay sat over the page dimming
+everything, which was invisible in a DOM dump and obvious in a screenshot.
+
+---
+
+## Reproducing this
+
+```bash
+cd ~/git/Vulkan
+T=~/mesa/src/gallium/drivers/cudapipe/tests
+
+DESC="what this tried" $T/cp_iterate.sh mylabel drawrewind   # build, time, render, compare, record
+BENCH_ONLY=1 DESC="..." $T/cp_iterate.sh quick drawrewind    # cost only, no frames, no gate
+$T/cp_gpu_busy.sh instancing 120                             # the measurement gate, untraced
+$T/cp_profile.sh instancing mylabel 10                       # where the frame goes
+$MESA/venv/bin/python3 $T/cp_prof_kernels.py \
+    build/prof/mylabel/instancing.sqlite --frames 10         # by kernel and grid size
+$MESA/venv/bin/python3 $T/cp_iter_report.py page             # refresh the pages
+```
+
+Iterations live under `build/iter/<label>/` — frames, bench, verdict and
+`iteration.json` in one directory — with the nvidia reference and the llvmpipe
+calibration beside them as `build/iter/nvidia` and `build/iter/llvmpipe`, and
+the pages at `build/iter/iterations.html` and `build/iter/perf.html?iter=LABEL`.
+Profiles are under `build/prof/<label>/`.
+
+**Run timing passes one at a time with nothing else on the GPU.** Two passes
+sharing the card measure each other. `cp_iterate.sh` warns if something is
+already on it.
+
+**HEAD is what `drawrewind` measured** — no driver source has changed since,
+only tests and documentation — so the 168.10 ms in this document describes the
+current build rather than a build that once existed.
