@@ -188,23 +188,27 @@ limits below were exactly such a change, and llvmpipe came out bit-identical.
 
 ### What it costs
 
-Sixty frames of each sample, the still scenes orbited, timed rather than stored
-— milliseconds per frame, the mean over the sixty (`cp_perf_run.sh ... 60 1`):
+Six hundred frames of each sample, the still scenes orbited, timed rather than
+stored — milliseconds per frame, the mean over the run (`cp_perf_run.sh ... 600
+1`, which is what `cp_iterate.sh` runs). Sixty frames is what gets *stored* and
+compared, and is far too few to time: at sixty the render loop is a minority of
+the process. `tests/TESTING.md` has the measurement that settles it.
 
-| | nvidia | cudapipe | llvmpipe | before phase 1a | before any perf work |
-|---|---|---|---|---|---|
-| particlesystem | 0.1 | **50.1** | 15.7 | 55.2 | 1361.7 |
-| multithreading | 0.3 | **29.7** | 96.9 | 50.2 | 156.6 |
-| instancing | 0.1 | **27.1** | 73.0 | 27.2 | 241.7 |
-| dynamicuniformbuffer | 0.0 | **17.4** | 1.0 | 22.5 | 128.5 |
-| gltfscenerendering | 0.0 | **15.0** | 15.2 | 19.9 | 343.9 |
-| bloom | 0.0 | **12.1** | 3.6 | 12.4 | 558.0 |
-| pbribl | 0.0 | **1.7** | 2.7 | 3.8 | 135.4 |
-| **total, one frame of each** | **0.9** | **168.1** | **232.1** | **206.7** | **3792.2** |
+| | nvidia | cudapipe | llvmpipe | before batching | before phase 1a | before any perf work |
+|---|---|---|---|---|---|---|
+| particlesystem | 0.1 | **52.0** | 15.7 | 52.3 | 55.2 | 1361.7 |
+| gltfscenerendering | 0.1 | **15.3** | 15.2 | 15.3 | 19.9 | 343.9 |
+| bloom | 0.0 | **12.1** | 3.6 | 12.1 | 12.4 | 558.0 |
+| instancing | 0.1 | **7.1** | 73.0 | 7.1 | 27.2 | 241.7 |
+| multithreading | 0.3 | **6.0** | 96.9 | 29.8 | 50.2 | 156.6 |
+| pbribl | 0.0 | **1.6** | 2.7 | 1.7 | 3.8 | 135.4 |
+| dynamicuniformbuffer | 0.0 | **1.3** | 1.0 | 12.3 | 22.5 | 128.5 |
+| pushconstants | 0.0 | **0.8** | 3.4 | 2.3 | 2.4 | 5.7 |
+| **total, one frame of each** | **0.9** | **109.0** | **232.1** | **145.5** | **206.7** | **3792.2** |
 
-**cudapipe finishes the sweep 1.38x ahead of llvmpipe**, and ahead of it on ten
-of the seventeen samples individually. It was 16x behind. Two passes got it
-there and each has its own write-up:
+**cudapipe finishes the sweep 2.13x ahead of llvmpipe**, and ahead of it on nine
+of the seventeen samples individually, with `gltfscenerendering` level. It was
+16x behind. Four passes got it there and each has its own write-up:
 
 - `PERFORMANCE_PROGRESS.md` — the first pass, 3792 -> 207 ms. 96% of it was
   three defects rather than any optimization, the largest being that
@@ -216,6 +220,25 @@ there and each has its own write-up:
   the device scratch arena reached 5.1 GB inside one frame, because it carried
   every draw at once and each draw's shading buffers are sized to twice the
   framebuffer rather than to what the draw covers.
+- `INSTANCING.md` — 168 -> 150 ms, almost all of it one sample. `instancing`
+  was 38% GPU busy because one draw of 8,192 instances took a host path that
+  built a 4.4 million entry vertex/instance id table — twice, into managed
+  memory — for values that are arithmetic on the thread index. The fetch kernel
+  derives them now. 27.1 -> 7.1 ms, and the profile had been naming
+  `cp_vertex_fetch`, which was not the problem: a kernel touching a managed page
+  the host just wrote is charged for the migration.
+- `BATCHING.md` — 145 -> 109 ms. Consecutive draws that cannot depend on their
+  order are merged and rasterized as one, which needs none of Phase 3 because
+  with blending off the visibility buffer resolves by `atomicMin` and a minimum
+  is order-independent. `dynamicuniformbuffer` 12.3 -> 1.3, `multithreading`
+  29.8 -> 6.0, `pushconstants` 2.3 -> 0.8.
+
+Plus one step that belongs to no pass, 150 -> 145 ms: `cuMemsetD8` is the
+blocking variant, and `dynamicuniformbuffer` creates 764 transient 64-byte
+resources a frame, each cleared with one at 31.5 µs of device time. That put it
+ahead of `cuLaunchKernel` in host API time to move 64 bytes. Small managed
+allocations are zeroed by the host now; past 64 KB the clear becomes real
+bandwidth and the device keeps it.
 
 NVIDIA's column is not a rendering time. Offscreen benchmarking measures
 recording and submitting a frame, and nothing waits for the GPU until the pass
@@ -231,29 +254,42 @@ blocking on the GPU. llvmpipe spreading across cores is why it stays close
 despite shading on the CPU — and why the samples cudapipe now beats it on are
 the ones with the most geometry.
 
-**The peel loop is still the worst thing in the driver.** particlesystem runs
-about 260 passes a frame, each re-rasterizing and re-shading the whole draw. The
-host sync between them is now taken on a doubling interval rather than every
-layer, which is worth 7%, but the passes themselves remain and it is 3.2x
-slower than llvmpipe when nothing else in the set is. Phase 3 addresses it.
+**The peel loop is the worst thing in the driver, and it is now nearly half the
+sweep.** particlesystem is 52.0 ms of a 109.0 ms total. It runs about 260 passes
+a frame, each re-rasterizing and re-shading the whole draw. Phase 1a took the
+host sync between them on a doubling interval rather than every layer, and
+batching refuses blended draws by design, so nothing since has touched the
+passes themselves. It is 3.3x slower than llvmpipe, and `bloom` — full-screen
+passes, the same shape — is 3.4x. Phase 3 is what addresses both.
 
-**`instancing` is the clearest lead in the set.** 36% GPU busy over a
-seventeen-second window — nearly two thirds of its frame is the host — and it is the one sample the per-draw scratch rewind
-did not help. Its profile looks like nothing else: 15 draws a frame,
-`cp_vertex_fetch` at 57% of GPU time with a grid of 17,280 blocks and a median
-launch of 2.4 ms.
+**"94% GPU busy" never meant the GPU was working.** Device counters have
+particlesystem at 94% GR Active while issuing instructions on 5% of cycles,
+with a third of its SMs active and DRAM flat. That is what a long sequence of
+small passes looks like from outside, not an expensive kernel. Every
+"kernel-bound" verdict in these documents means only that a kernel was
+resident; `tests/TESTING.md` question 2 is how to ask the other half.
 
-**`dynamicuniformbuffer` is still an outlier**, 17x slower than llvmpipe and
-launch-bound rather than kernel-bound: 625 twelve-triangle cubes a frame, nine
-kernels each. Streams and the scratch rewind took it from 22.5 to 17.4 ms; the
-rest is structural.
+**`dynamicuniformbuffer` is no longer an outlier, and the reason it looked like
+one was wrong.** It was recorded here as launch-bound at 625 twelve-triangle
+cubes a frame and nine kernels each. `OBJECT_INSTANCES` is 125, and the profile
+behind those figures divided by the frame count handed to `cp_profile.sh` while
+the trace also held the warm-up frames nsys records and nobody asked for — so
+every per-frame number in it was 5x too large, and the sample was not
+launch-bound. Batching then took it 12.3 -> 1.3 ms, mostly by deleting
+*multiplicity* rather than by growing grids: the framebuffer-sized costs were
+being paid 125 times for one frame's output. It is now host-bound at 25% GPU
+busy, in lavapipe's per-draw descriptor allocation — about 125
+`cuMemAllocManaged`/`cuMemFree` pairs a frame through
+`pipe_screen::allocate_memory`.
 
-**cudapipe does not win pbribl, and never did** by the measure originally used.
-It was once recorded as the one sample it beat llvmpipe on, 14.2 s against 16.0
-— but those were whole process times, and llvmpipe spends 16.6 s of pbribl
-before its first frame precomputing IBL textures. Per frame it is 2.6 against
-3.8 ms. The lesson stands even though the totals have moved: a measure that
-contains start-up will eventually be read as if it did not.
+**`pbribl` is a lesson about the measure rather than a win.** It was once
+recorded as the one sample cudapipe beat llvmpipe on, 14.2 s against 16.0 — but
+those were whole process times, and llvmpipe spends 16.6 s of pbribl before its
+first frame precomputing IBL textures. Per frame at the time it was 3.8 against
+2.7, the other way round. It is 1.6 against 2.7 now, so cudapipe does win it —
+which is why the original claim is worth keeping rather than deleting: it was
+right by accident, for a reason that had nothing to do with rendering. A measure
+that contains start-up will eventually be read as if it did not.
 
 ## Architecture
 
@@ -457,6 +493,15 @@ smooth.
    intrinsics. Routing pow to the CUDA library version was tried and changed the
    image without moving it closer to the reference, so it was reverted. `fsin`
    and `fcos` do *not* — see below.
+12. **Batched draws break a depth tie the other way.** With `LEQUAL` and
+   coplanar geometry spanning two merged draws, the batch keeps the lowest
+   triangle index — the earliest draw — where drawing them in sequence keeps the
+   later one. No sample in the set shows it, and it is mitigated rather than
+   absent: the clipper compacts its output with `atomicAdd`, so triangle order
+   is already nondeterministic *within* a draw and the tie was never exact. It
+   is still a real difference in what the driver computes, and the first place
+   to look if a depth-fighting artefact appears. `CUDAPIPE_NO_BATCH=1`
+   distinguishes it from anything else in one run.
 
 ## Lessons that cost the most to learn
 
@@ -701,3 +746,16 @@ retried.
 * LLVM's NVPTX backend only knows architectures that existed when it was
   released, so `CP_MAX_PTX_SM` in `cp_nir_to_llvm.c` caps the architecture and
   lets the driver JIT forward. Raise it together with the PTX ISA version.
+* **Batching's correctness rests on deferral, not on merging, and the invariant
+  is not self-enforcing.** Holding a draw back means `cp_draw_execute()` runs
+  after the next draw's state has been bound, which rendered `vulkanscene` 12.9%
+  wrong with every batch of size *one*. Every state setter therefore flushes the
+  pending batch when the incoming value differs, and every path that observes
+  rendering flushes before it looks — 27 call sites. A state setter added later
+  that does not flush is silently wrong, and the sample sweep may not catch it:
+  this one did not, until a batch cap of one was tried deliberately. The same
+  holds for `reads_const_bufs`, which is sound only while
+  `emit_const_buf_base()` remains the only reader of `args[18..]`.
+  `CUDAPIPE_BATCH_MAX=1` must stay bit-identical to `CUDAPIPE_NO_BATCH=1`; that
+  check separates "deferral is sound" from "merging is sound", which fail
+  differently.
