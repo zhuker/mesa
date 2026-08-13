@@ -30,20 +30,25 @@ There are three sweeps, and they answer different questions.
 |---|---|---|
 | **single frame** | 1 | does the driver draw the scene |
 | **animated** | 60 | does it keep drawing it |
-| **benchmark** | 60 | what those same sixty frames cost |
+| **benchmark** | 600 | what that same work costs |
 
 The single frame sweep is the cheap one and catches most things. The animated
 one catches what a still image cannot: state that leaks between frames, a
 particle system settling, anything that only goes wrong once the camera moves.
 Two of the regressions in the set are invisible at frame 0.
 
-The benchmark sweep renders exactly what the animated one renders — same loop,
-same fixed frame time, same orbit — and stores none of it. That split is not a
+The benchmark sweep renders the same work as the animated one — same loop, same
+fixed frame time, same orbit — and stores none of it. That split is not a
 convenience: storing a 1280x720 frame takes about 10 ms, which is longer than
 several of these samples spend rendering one, so a pass that writes images
 cannot be timed. Correctness and cost therefore come from two runs of one
 workload, which is what lets a slow frame in the chart be looked at in the other
 run's images.
+
+It runs the orbit for more frames, because sixty is too few to time — the orbit
+is periodic, so that is the same path covered again rather than a different one.
+"The frame count is the one flag that may differ" below has the measurement that
+justifies it.
 
 ---
 
@@ -128,22 +133,21 @@ It writes about 8 GB of frames and 2.7 GB of report images.
 
 ### Benchmark
 
-The same command with `1` as a fifth argument times those sixty frames instead
-of storing them. Pass the same frame count — a different one measures a
-different workload, and the script refuses `0`:
+The same command with `1` as a fifth argument times the frames instead of
+storing them. The frame count is the one thing that may sensibly differ from
+the storing run — see below — and the script refuses `0`:
 
 ```bash
 B=$PWD/build/bench60
 
-$T/cp_perf_run.sh nvidia   ""                                          $B/nvidia   60 1
-$T/cp_perf_run.sh cudapipe $M/cudapipe/cudapipe_devenv_icd.x86_64.json $B/cuda     60 1
-$T/cp_perf_run.sh llvmpipe $M/lavapipe/lvp_devenv_icd.x86_64.json      $B/llvmpipe 60 1
+$T/cp_perf_run.sh nvidia   ""                                          $B/nvidia   600 1
+$T/cp_perf_run.sh cudapipe $M/cudapipe/cudapipe_devenv_icd.x86_64.json $B/cuda     600 1
+$T/cp_perf_run.sh llvmpipe $M/lavapipe/lvp_devenv_icd.x86_64.json      $B/llvmpipe 600 1
 ```
 
 It writes `_bench.csv` — `sample,frames,fps,ms_avg,ms_best,ms_worst,wall_s,exit`
-— and one csv of every frame's time per sample, and no images. Under a minute
-for cudapipe's pass, against the four and a half the same frames take when they
-are stored.
+— and one csv of every frame's time per sample, and no images. Two and a half
+minutes for cudapipe's pass at 600 frames.
 
 **The fps figure times recording and submitting a frame, not finishing it.**
 Nothing waits for the GPU until the pass ends, so a driver that submits
@@ -490,12 +494,19 @@ just before it ran.
 ## Iterating on performance
 
 `cp_iterate.sh LABEL [COMPARE_LABEL]` is one iteration end to end: build, time
-sixty frames, render the same sixty, compare them to the stored NVIDIA
-reference, print the cost delta, and write the whole thing down.
+the frames, render and store them, compare them to the stored NVIDIA reference,
+print the cost delta, and write the whole thing down.
 
 ```bash
 DESC="what this tried" cp_iterate.sh mylabel previouslabel
 ```
+
+**Nothing below is done by hand.** One command produces the whole directory —
+the frames, the timing, the verdict, the png conversion and the
+`iteration.json` record. There is no step where files are moved into place or a
+json is edited, and there should not be: the point of the record is that it
+describes the run that actually happened, and a hand-maintained one describes
+what someone remembered afterwards.
 
 It times `BENCH_FRAMES` (600 by default) and stores `FRAMES` (60) — see "the
 frame count is the one flag that may differ" above for why those are not the
@@ -525,6 +536,27 @@ be copied, kept or deleted whole.
 **Set `DESC`.** A label and a number stop meaning anything within a day of the
 run. What the iteration was *trying* is the part nobody can reconstruct
 afterwards, and it is what the summary page shows.
+
+### Reaching for the tool directly
+
+`cp_iterate.sh` calls `cp_iter_report.py record` itself, so the only reasons to
+run it by hand are these:
+
+```bash
+# refresh the pages after recording — the only one needed routinely
+cp_iter_report.py page
+
+# fix or add a description on an iteration already run, without re-running it
+cp_iter_report.py record LABEL --against PREV --desc "..." --note "..."
+
+# ppm -> png for an older tree, or one interrupted before it converted
+cp_iter_report.py convert [LABEL ...]
+```
+
+`record` is idempotent and re-reads everything from the iteration's own files,
+so re-running it never invents a number — it can only pick up a description, a
+note, or a series (the llvmpipe calibration) that was not computed the first
+time.
 
 ### The pages
 
