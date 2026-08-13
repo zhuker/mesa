@@ -235,8 +235,8 @@ host sync between them is now taken on a doubling interval rather than every
 layer, which is worth 7%, but the passes themselves remain and it is 3.2x
 slower than llvmpipe when nothing else in the set is. Phase 3 addresses it.
 
-**`instancing` is the clearest lead in the set.** 39% GPU busy — more than half
-its frame is the host — and it is the one sample the per-draw scratch rewind
+**`instancing` is the clearest lead in the set.** 36% GPU busy over a
+seventeen-second window — nearly two thirds of its frame is the host — and it is the one sample the per-draw scratch rewind
 did not help. Its profile looks like nothing else: 15 draws a frame,
 `cp_vertex_fetch` at 57% of GPU time with a grid of 17,280 blocks and a median
 launch of 2.4 ms.

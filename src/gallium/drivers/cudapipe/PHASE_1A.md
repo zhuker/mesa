@@ -75,14 +75,24 @@ tell.
 utilisation over a run with no profiler attached, which is the only version of
 the number that means anything:
 
-| sample | before 1a | after |
-|---|---|---|
-| dynamicuniformbuffer | 70% | 82% |
-| multithreading | 77% | 84% |
-| bloom | 80% | 81% |
-| particlesystem | 91% | 94% |
-| gltfscenerendering | — | 93% |
-| **instancing** | — | **39%** |
+| sample | after 1a, GPU busy |
+|---|---|
+| gltfscenerendering | 94% |
+| particlesystem | 94% |
+| multithreading | 85% |
+| dynamicuniformbuffer | 83% |
+| bloom | 81% |
+| **instancing** | **36%** |
+
+Measured over a 17-second steady window, which is the only way these mean
+anything. An earlier version of this table quoted figures taken across whole
+sixty-frame runs — 77% for multithreading, 66-70% for dynamicuniformbuffer —
+and those were biased low, because at sixty frames the render loop is a
+minority of the process and the average included several seconds of start-up
+and teardown idle. `cp_gpu_busy.sh` now takes a target duration rather than a
+frame count and refuses a window too short to average. The direction of the
+finding did not change; the numbers did, and instancing's spread went from
+p10 8 / p90 92 to p10 34 / p90 43.
 
 The lesson is the plan's own, applied to the plan: an ordering argument is a
 hypothesis about where time goes, and it decays. Re-measure before trusting a
