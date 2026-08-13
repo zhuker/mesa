@@ -649,6 +649,54 @@ hierarchical bin sizes is what actually fixes the underlying cause.
 
 Requires 1b. Enables the full value of Phase 3.
 
+## What it is worth, measured
+
+Everything is still pitch-linear: `cp_resource_layout` computes
+`row_stride = nblocksx * block_size` with no alignment, and every internal
+buffer indexes `y * width + x`.
+
+The ceiling was measured by pinning every texel fetch in `cp_fetch_texel` to
+(0, 0) — same filtering, same decode, same number of fetches, perfect cache
+behaviour — which is the most a layout change could ever buy and rather more
+than a swizzle actually delivers:
+
+| sample | baseline | perfect texture locality | |
+|---|---|---|---|
+| **gltfscenerendering** | 17.18 | **11.65** | **−32.2%** |
+| texturemipmapgen | 1.43 | 1.19 | −16.8% |
+| texturecubemap | 1.11 | 1.06 | −4.5% |
+| particlesystem | 51.90 | 50.76 | −2.2% |
+| bloom | 12.01 | 11.91 | −0.8% |
+| multithreading | 29.70 | 29.68 | 0.0% |
+
+So it is a **large win on one sample and nothing on most**, and at the ceiling
+it is about 4% of the sweep, because `gltfscenerendering` is 12% of the total
+and is the only textured scene in the set.
+
+**Do not read that 4% as the value of this phase.** The sample set is sixteen
+teaching demos and one Sponza; the workload this driver exists for is the
+capture, which lists 77 graphics pipelines. `gltfscenerendering` is the only
+sample that looks like it, and it is the one that moved 32%. The sweep
+understates this phase more than it understates anything else on the plan.
+
+**Two corrections to the framing above:**
+
+- **The internal buffers are not where this helps, and swizzling them would
+  hurt.** `cp_fs_interpolate` gives quad *q* to thread *q*, so a warp covers 64
+  pixels across two rows — two contiguous 512-byte runs of the visibility
+  buffer, which is already perfectly coalesced. Stage 1 walks a row per thread,
+  which linear also suits. This is analysis, not measurement, but it is the
+  reason the probe above moved the texture-heavy samples and nothing else.
+- **§2.1 may need much less of 1b than this header claims.** cudapipe's sampler
+  reads its own `cp_texture_info`, not `lp_jit_texture`, and Vulkan already
+  forbids `vkGetImageSubresourceLayout` on OPTIMAL images — so the layout of an
+  OPTIMAL texture is nobody's business but the driver's. The real coupling is
+  narrower: cudapipe advertises every memory type HOST_VISIBLE until 1b.2, so
+  an application may legally map an OPTIMAL image and write it expecting
+  linear. The samples all upload through staging and `vkCmdCopyBufferToImage`,
+  which cudapipe controls. That makes 2.1 attemptable before 1b with a known
+  risk, rather than blocked on it.
+
 ## 2.1 Swizzled layout for `VK_IMAGE_TILING_OPTIMAL`
 
 `cp_resource_layout` (`cp_resource.c:30-56`) computes
