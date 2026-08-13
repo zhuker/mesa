@@ -393,21 +393,31 @@ drivers over eighteen samples is a few minutes, and it is tempting to overlap
 them. Two passes sharing the card measure each other. The same goes for a sweep
 running while a build does — `nvidia-smi` during the pass is the check.
 
-**A baseline from another session is not a baseline. Re-measure it.**
-`gltfscenerendering` reads 15.10 ms inside a `cp_iterate.sh` sweep and 17.1 ms
-run on its own, on the same build, repeatably — 13%, an order of magnitude more
-than the 0.6-1.2% run-to-run spread quoted above, and enough to invent a
-regression that does not exist or hide one that does. A whole afternoon went
-into a 13.7% `gltfscenerendering` "regression" that disappeared the moment the
-previous commit was rebuilt and measured in the same sitting. **Before
-attributing any delta to a change, build the thing you are comparing against
-and measure it now**, next to the new number, on the same idle card. The stored
-`_bench.csv` is for the history page, not for A/B.
+**A number from `_bench.csv` is not comparable to a hand-run sample, because
+nine samples orbit and a hand-run one usually does not.** `cp_perf_run.sh`
+appends `--offscreenorbit` for `triangle`, `pushconstants`, `texture`,
+`negativeviewportheight`, `texturecubemap`, `computeshader`, `vulkanscene`,
+`pbribl` and `gltfscenerendering`. Run one of those by hand without the flag and
+it renders a different camera path — a different workload, not a slower one:
 
-Why the two differ is not established. A sample run seventeenth in a sweep
-meets a card whose clocks have been boosting for two minutes; run alone it
-meets an idle one. That would make every figure in a sweep a function of its
-position in the sweep, which is worth knowing before it is relied on again.
+| | by hand | `--offscreenorbit` | in the sweep |
+|---|---|---|---|
+| gltfscenerendering | 17.15 | **15.33** | 15.10 |
+| pbribl | 2.00 | **1.64** | 1.67 |
+
+An afternoon went into a 13.7% `gltfscenerendering` "regression" that was
+entirely this flag, and it survived being "confirmed" three times because every
+confirmation repeated the same mistake. It was then written up here as a 13%
+*clock and sweep-position* effect, which was invented to explain a gap that had
+a flag behind it — the wrong explanation is the part worth remembering, because
+a plausible mechanism is exactly what stops the boring cause being checked.
+
+The rule that does hold: **build the thing you are comparing against and
+measure it beside the new number, with the same flags, in the same sitting.**
+An A/B is only valid when both sides were run identically — which is what makes
+`cp_iterate.sh` the right tool and a hand-run pair the fragile one. `ORBIT=` on
+the command line disables orbiting for a whole pass if a hand comparison is
+what is wanted.
 
 **A probe that changes what the compiler can prove is not measuring the thing
 it names.** Probes — cutting a kernel to an early `return`, pinning an input to
