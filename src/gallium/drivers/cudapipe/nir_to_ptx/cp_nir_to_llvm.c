@@ -2217,8 +2217,31 @@ static CUresult
 link_shader_module(CUmodule *module, const char *shader_ptx,
                    const char *sampler_ptx)
 {
+   /*
+    * Cap the register count when asked.
+    *
+    * The JIT optimises for instruction-level parallelism and will spend as
+    * many registers as it likes doing it. On Sponza the fragment shader came
+    * out at 195 per thread, which fits one 256-thread block on an SM and caps
+    * theoretical occupancy at 16.7% — ncu measured 8.8% achieved, with SM
+    * throughput at 11.8% and DRAM at 1.8%, so the kernel was neither compute
+    * nor bandwidth bound but simply had too few warps resident to hide
+    * anything. Fewer registers means more warps and also more spilling, and
+    * which way that lands is a per-shader question, so it is a knob rather
+    * than a constant.
+    */
+   CUjit_option jit_opts[1];
+   void *jit_vals[1];
+   unsigned num_jit = 0;
+   const char *maxreg = getenv("CUDAPIPE_MAX_REGISTERS");
+   if (maxreg && atoi(maxreg) > 0) {
+      jit_opts[num_jit] = CU_JIT_MAX_REGISTERS;
+      jit_vals[num_jit] = (void *)(uintptr_t)atoi(maxreg);
+      num_jit++;
+   }
+
    CUlinkState link;
-   CUresult err = cuLinkCreate(0, NULL, NULL, &link);
+   CUresult err = cuLinkCreate(num_jit, jit_opts, jit_vals, &link);
    if (err != CUDA_SUCCESS)
       return err;
 

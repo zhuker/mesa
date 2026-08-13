@@ -649,16 +649,45 @@ hierarchical bin sizes is what actually fixes the underlying cause.
 
 Requires 1b. Enables the full value of Phase 3.
 
-## What it is worth, measured
+## What it is worth — the first measurement was wrong, and `ncu` says so
 
 Everything is still pitch-linear: `cp_resource_layout` computes
 `row_stride = nblocksx * block_size` with no alignment, and every internal
 buffer indexes `y * width + x`.
 
-The ceiling was measured by pinning every texel fetch in `cp_fetch_texel` to
-(0, 0) — same filtering, same decode, same number of fetches, perfect cache
-behaviour — which is the most a layout change could ever buy and rather more
-than a swizzle actually delivers:
+**The 32% figure below is not a measurement of layout and should not be used.**
+It came from pinning every texel fetch in `cp_fetch_texel` to (0, 0), which was
+meant to keep the filtering, the decode and the fetch *count* while giving
+perfect cache behaviour. It does not: with the coordinates constant, the four
+bilinear taps and the anisotropic loop all resolve to the same address, so the
+compiler folds them into one fetch. The probe measured **doing fewer fetches**,
+not **the same fetches with better locality** — the identical failure recorded
+in `tests/TESTING.md` under probes, committed twice in one session.
+
+**What the hardware counters say instead.** `ncu` on `gltfscenerendering`, the
+one textured scene, over its fragment shader:
+
+| | |
+|---|---|
+| **L1/TEX hit rate** | **94.7%** |
+| L2 hit rate | 56.4% |
+| Memory throughput | 19.4% |
+| DRAM throughput | 1.8% |
+| Compute (SM) throughput | 11.8% |
+| **Achieved occupancy** | **8.8%** |
+
+A 94.7% L1 hit rate is the cache already absorbing whatever 2D locality the
+linear layout costs, and 1.8% DRAM throughput is a kernel nowhere near
+bandwidth. **There is very little for a swizzle to recover here.** What the
+same column does say is that the shader has too few warps resident to hide any
+latency at all, and that is a register-pressure problem rather than a layout
+one — see "Fragment shader occupancy" below.
+
+This does not close Phase 2 — aligned strides still matter for coalescing, and
+the argument that the sample set is not representative of the capture still
+stands. It closes the claim that layout was measured to be worth 32%.
+
+The superseded measurement, kept so the mistake is legible:
 
 | sample | baseline | perfect texture locality | |
 |---|---|---|---|
@@ -669,17 +698,50 @@ than a swizzle actually delivers:
 | bloom | 12.01 | 11.91 | −0.8% |
 | multithreading | 29.70 | 29.68 | 0.0% |
 
-So it is a **large win on one sample and nothing on most**, and at the ceiling
-it is about 4% of the sweep, because `gltfscenerendering` is 12% of the total
-and is the only textured scene in the set.
+Read now as what it is: a probe that removed fetches, on the one sample with
+enough fetches for that to show. It says nothing about layout.
 
-**Do not read that 4% as the value of this phase.** The sample set is sixteen
+**The sample set is still not representative, and that argument survives.** The sample set is sixteen
 teaching demos and one Sponza; the workload this driver exists for is the
 capture, which lists 77 graphics pipelines. `gltfscenerendering` is the only
-sample that looks like it, and it is the one that moved 32%. The sweep
-understates this phase more than it understates anything else on the plan.
+sample that looks like it. The sweep understates this phase more than it
+understates anything else on the plan — but that is an argument for measuring it
+against a representative scene, not a number.
 
-**Two corrections to the framing above:**
+## Fragment shader occupancy — a real item, and not a layout one
+
+`ncu` puts the Sponza fragment shader at **195 registers per thread**, which
+fits one 256-thread block on an SM: theoretical occupancy 16.7%, achieved 8.8%,
+with the SM issuing on 11.8% of cycles and DRAM at 1.8%. Neither compute nor
+bandwidth bound — simply too few warps to hide anything behind.
+
+`link_shader_module()` passes no JIT options at all, so the JIT spends
+registers freely on instruction-level parallelism. `CUDAPIPE_MAX_REGISTERS`
+caps them, and it is a knob rather than a constant because the trade is
+per-shader — fewer registers buys warps and costs spills:
+
+| sample | off | 96 | 128 |
+|---|---|---|---|
+| **gltfscenerendering** | 17.15 | **15.19** | 15.39 |
+| instancing | 7.12 | **6.83** | 6.87 |
+| bloom | 12.05 | 12.43 | 12.22 |
+| particlesystem | 52.07 | 52.19 | 51.94 |
+| multithreading | 29.75 | 29.75 | 29.70 |
+| dynamicuniformbuffer | 12.31 | 12.28 | 12.32 |
+
+−11.4% on the sample that most resembles the capture, −4.1% on `instancing`,
+**+3.2% on `bloom`**, and flat elsewhere. So a fixed cap is wrong. The shape of
+the real fix is to compile, read `CU_FUNC_ATTRIBUTE_NUM_REGS` back, and cap only
+the shaders whose count is costing occupancy — or emit `__launch_bounds__` from
+the backend, which tells the JIT the block size it must fit rather than guessing
+a register count.
+
+Worth noting against Phase 4: `main` is the one kernel in the profile with a
+grid large enough to fill the device (42 waves per SM against 0.36-0.88 for the
+rasterizer stages), so it is the one place occupancy is the binding constraint
+rather than grid size.
+
+## Two corrections to the framing above
 
 - **The internal buffers are not where this helps, and swizzling them would
   hurt.** `cp_fs_interpolate` gives quad *q* to thread *q*, so a warp covers 64

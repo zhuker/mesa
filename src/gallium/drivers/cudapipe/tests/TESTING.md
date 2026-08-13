@@ -393,6 +393,36 @@ drivers over eighteen samples is a few minutes, and it is tempting to overlap
 them. Two passes sharing the card measure each other. The same goes for a sweep
 running while a build does — `nvidia-smi` during the pass is the check.
 
+**A baseline from another session is not a baseline. Re-measure it.**
+`gltfscenerendering` reads 15.10 ms inside a `cp_iterate.sh` sweep and 17.1 ms
+run on its own, on the same build, repeatably — 13%, an order of magnitude more
+than the 0.6-1.2% run-to-run spread quoted above, and enough to invent a
+regression that does not exist or hide one that does. A whole afternoon went
+into a 13.7% `gltfscenerendering` "regression" that disappeared the moment the
+previous commit was rebuilt and measured in the same sitting. **Before
+attributing any delta to a change, build the thing you are comparing against
+and measure it now**, next to the new number, on the same idle card. The stored
+`_bench.csv` is for the history page, not for A/B.
+
+Why the two differ is not established. A sample run seventeenth in a sweep
+meets a card whose clocks have been boosting for two minutes; run alone it
+meets an idle one. That would make every figure in a sweep a function of its
+position in the sweep, which is worth knowing before it is relied on again.
+
+**A probe that changes what the compiler can prove is not measuring the thing
+it names.** Probes — cutting a kernel to an early `return`, pinning an input to
+a constant — are how nearly every ceiling in this document was established, and
+they have one failure mode. A probe that hardcoded the rasterizer's bounding
+box wrote over the four values it had just loaded, so NVRTC saw the loads were
+dead and removed them: the run measured *no bounding box read at all* while
+claiming to measure *a small bounding box*, and reported a 17% win that did not
+exist. It sent a whole investigation down the wrong path.
+
+Write a probe so the work it is meant to keep is still observable — consume the
+loaded value, or `if (never_true) use(value);` behind something the compiler
+cannot fold. And when a probe result is surprisingly good, check the generated
+code before believing it.
+
 ---
 
 ## Finding where the time goes
@@ -473,6 +503,55 @@ question. Neither reading is proven by this tool.
 
 It names no kernel — that is question 3 — so a finding here is a hypothesis
 until the traced run or `ncu` attributes it to something.
+
+**The whole sweep, measured this way, and it is one shape.** Each sample sized
+to about 12 seconds of rendering, median of the active window:
+
+| sample | ms | GR | SMs | **issue** | warps | DRAMr | DRAMw |
+|---|---|---|---|---|---|---|---|
+| particlesystem | 51.98 | 94 | 40 | **6** | 9 | 0 | 1 |
+| multithreading | 29.74 | 86 | 21 | **2** | 7 | 0 | 1 |
+| gltfscenerendering | 15.10 | 97 | 27 | **3** | 5 | 1 | 1 |
+| dynamicuniformbuffer | 12.35 | 86 | 12 | **2** | 5 | 0 | 1 |
+| bloom | 12.06 | 83 | 11 | **2** | 5 | 1 | 1 |
+| **instancing** | 7.01 | **100** | **100** | **2** | **71** | **13** | **17** |
+| multisampling | 3.57 | 98 | 9 | **1** | 1 | 1 | 1 |
+| vulkanscene | 2.85 | 87 | 18 | **2** | 6 | 1 | 1 |
+| pushconstants | 2.30 | 84 | 22 | **1** | 5 | 0 | 1 |
+| pbribl | 1.67 | 77 | 23 | **3** | 6 | 1 | 1 |
+| texturemipmapgen | 1.43 | 67 | 19 | **2** | 6 | 1 | 3 |
+| texturecubemap | 1.10 | 4 | 2 | 1 | 1 | 1 | 3 |
+| computeshader | 0.87 | 1 | 0 | 0 | 0 | 0 | 2 |
+| negativeviewportheight | 0.86 | 1 | 0 | 0 | 0 | 0 | 5 |
+| texture | 0.74 | 1 | 0 | 0 | 0 | 0 | 2 |
+| texture3d | 0.71 | 1 | 0 | 0 | 0 | 0 | 3 |
+| triangle | 0.67 | 1 | 0 | 0 | 0 | 0 | 1 |
+
+Three things fall out of it, and none is visible from `GR Active` alone:
+
+- **The device issues on 1-6% of cycles on every sample that uses it at all.**
+  `GR Active` reads 83-100% for the eleven samples above `texturecubemap`, and
+  `cp_gpu_busy.sh` reports the same figure because it is the same quantity. So
+  **every "kernel-bound" verdict in this repository means only that a kernel was
+  resident**, and the pass records that read one as "the host is not the
+  problem, make the kernels faster" were reading it wrong. `SMs Active` at 9-40%
+  says most of the machine has no work at all: the grids are small because the
+  work is per draw, and stage 1 of a small draw is one or two blocks on a card
+  with 170 SMs.
+- **`instancing` is the one sample that fills the machine and the only one with
+  real DRAM traffic** — 100% SMs, 71 warps in flight, 13/17% bandwidth — and it
+  still issues on 2% of cycles. Full and stalled is a different problem from
+  empty and stalled, and it is the only sample in the set where `ncu` and
+  question 3 are the right next step rather than the launch structure.
+- **Six samples never occupy the GPU at all.** `triangle`, `texture`,
+  `texture3d`, `computeshader`, `negativeviewportheight` and `texturecubemap`
+  read 1-4% `GR Active` over a fifteen-second window that is almost entirely
+  render loop. Their cost is host-side in its entirety, and `triangle` at
+  0.67 ms a frame for one triangle is the driver's per-frame floor rather than
+  anything about drawing.
+
+Reading this table next to the sweep totals is what the two together are for:
+the samples worth the most time are the ones with the emptiest device.
 
 **Same seconds-not-frames trap as question 1, and it bites harder**, because
 the default is ten frames. Ten frames of `instancing` gave a median `GR Active`
