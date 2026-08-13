@@ -1036,6 +1036,17 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
                   0, cp->stream, wb_params, NULL);
    cp_stage_end(cp, CP_STAGE_WRITEBACK);
 
+   /* How much of the shading launch does any work. Syncs, so debug only, and
+    * read it on a deterministic sample. */
+   if (getenv("CUDAPIPE_DEBUG_WORK")) {
+      uint32_t shaded = 0;
+      cuStreamSynchronize(cp->stream);
+      cuMemcpyDtoH(&shaded, counter, sizeof(shaded));
+      fprintf(stderr, "work shaded=%u fs_threads=%u interp_threads=%u fb=%u\n",
+              MIN2(shaded, max_pixels), num_pixels,
+              ((w + 1) / 2) * ((h + 1) / 2), w * h);
+   }
+
    if (getenv("CUDAPIPE_DEBUG_DISCARD")) {
       /* Both live in device-only memory now, so they have to be fetched
        * rather than read through the pointer. This path already synchronises,
