@@ -7,6 +7,13 @@ from the plan was implemented.**
 
 Commits `1b944740fa1` through `6476255398e`, all on `cudapipe`.
 
+**This is the record of the first pass, and its forward-looking sections have
+been overtaken.** A second pass did phase 1a and took the sweep from 206.7 to
+168.10 ms; it is written up in `PHASE_1A.md`. The numbers below are what this
+pass measured and are left as they were — but "what is left" and "what was not
+done" describe the state in front of that pass, not the state now, and are
+annotated accordingly.
+
 ---
 
 ## The number
@@ -191,6 +198,12 @@ stage 2 in a single command.
 
 ## What is left, biggest first
 
+**Superseded by `PHASE_1A.md`.** The table below is the state at the end of this
+pass; multithreading has since gone 50.2 → 29.7 and dynamicuniformbuffer
+22.5 → 17.4. The two structural items — the peel loop and per-draw full-screen
+work — are still open, and `cp_fs_interpolate` is still the one kernel near the
+top of every sample.
+
 | sample | ms | vs llvmpipe | |
 |---|---|---|---|
 | particlesystem | 55.2 | 3.5x slower | 260 peel passes a frame |
@@ -242,10 +255,10 @@ Essentially the whole plan. Recorded precisely so nobody assumes otherwise:
 | item | status |
 |---|---|
 | Measurement gate | **done** — the only plan item executed as written |
-| 1a.1 streams | not done; still zero `cuStreamCreate`, every launch on the NULL stream |
-| 1a.2 delete syncs | not done; `cuCtxSynchronize` went 12 → 16 (two debug read-backs, one upload fallback) |
-| 1a.3 CPU paths to kernels | not started |
-| 1a.4 CUDA-event timing | not started — and it is the prerequisite for trusting `cp_lap()` the moment 1a.1 lands |
+| 1a.1 streams | not done then; **since done in part** — every launch and memset is on a non-blocking per-context stream, but five synchronous `cuMemcpyHtoD` calls in the sampler, texture and UBO paths are still on the NULL stream, which 1a.1 also asks for |
+| 1a.2 delete syncs | not done then; **since done at three of the six sites** — `cp_clear`, the compute dispatch, and the peel loop, which now checks on a doubling interval rather than every layer. The flush drain was removed, measured as a regression, and put back; the map-for-READ sync is one the plan says to keep; the copy and blit syncs go with 1a.3 |
+| 1a.3 CPU paths to kernels | not started, and **since measured as not worth starting** for this workload: only `texturemipmapgen` reaches the CPU blit path, nine times per process at load. It stays on the plan as robustness and as a prerequisite for Phase 2.3 |
+| 1a.4 CUDA-event timing | not started then; **since done** |
 | 0.1–0.4, 0.6 | none done |
 | 0.5 silent geometry drop | partial: overflow made safe, **not** counted or reported |
 | 1b.1 ABI leak, 1b.4 growable queues | not started |
@@ -272,17 +285,22 @@ BENCH_ONLY=1 $T/cp_iterate.sh quick s2final   # cost only, no frames
 $T/cp_profile.sh particlesystem mylabel 6     # where the frame goes
 ```
 
-Iterations live under `build/iter/<label>/`, frames under `build/iter/_frames/`,
-profiles under `build/prof/<label>/`.
+**The layout has changed since.** An iteration is now one directory holding
+everything it produced — frames, bench, verdict and an `iteration.json` record —
+with the nvidia reference and the llvmpipe calibration beside it as
+`build/iter/nvidia` and `build/iter/llvmpipe`, and pages at
+`build/iter/iterations.html` and `build/iter/perf.html?iter=LABEL`. Frames are
+PNG rather than PPM. `tests/TESTING.md` describes it; `build/iter/_frames/` no
+longer exists.
 
 **The `dscratch` iteration's raw data no longer exists.** The phase 1a pass ran
 an iteration under the same label and `cp_iterate.sh` overwrote it in place —
 its bench CSV and its sixty frames are gone, though the 223.4 ms in the table
 above is the number they produced and is unaffected. Regenerating it means
 checking the commit out and re-running. `cp_iterate.sh` now refuses an existing
-label unless `FORCE=1`. The three-driver HTML report for the
-current state is `build/iter/_report/perf60.html`, built with
-`cp_perf_report.py` over `_report/frames` and `_report/bench`.
+label unless `FORCE=1`. The three-driver HTML report for the state at the end of
+this pass is `build/iter/_report/perf60.html`, built with `cp_perf_report.py`
+over `_report/frames` and `_report/bench`.
 
 **Run timing passes one at a time with nothing else on the GPU.** Two passes
 sharing the card measure each other.

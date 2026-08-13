@@ -8,6 +8,15 @@ useful part.
 **The sweep went 206.65 → 168.10 ms, and the largest single win was not in the
 phase.**
 
+**The phase is not fully implemented, and its exit criterion is not met.** 1a.1
+is done for launches and memsets but not for the five synchronous
+`cuMemcpyHtoD` calls it also names; 1a.2 removed three of six syncs; 1a.3 was
+measured and skipped; 1a.4 is done. A frame still synchronises at the flush,
+at the scratch reclaim, and once per peel interval. Two of those are deliberate
+and measured — see "What was not done" — and the rest is where the phase ran
+out of measurable return rather than out of items. Do not read the number above
+as the phase being finished.
+
 ---
 
 ## The number
