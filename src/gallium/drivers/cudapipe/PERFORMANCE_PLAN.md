@@ -5,10 +5,19 @@ for the performance pass that follows, ordered by dependency rather than by
 size.
 
 Every item names the reference implementation it comes from. That is deliberate:
-each of these ideas exists in shipped code somewhere in this tree or in CuRast,
-and reading the original is faster than rediscovering the reasoning. Paths of
-the form `src/...` are relative to the Mesa checkout; CuRast paths are relative
-to `~/git/CuRast`.
+each of these ideas exists in shipped code somewhere in this tree, in CuRast, or
+in cuRE, and reading the original is faster than rediscovering the reasoning.
+
+Where the sources are on this machine:
+
+| reference | checkout | the part worth reading |
+|---|---|---|
+| Mesa (llvmpipe, panfrost) | this tree | paths of the form `src/...` |
+| CuRast | `~/git/CuRast` | `src/kernels/`, paper at `docs/CuRast_arxiv.pdf` |
+| cuRE | `~/git/cuRE` | `source/cure/pipeline/`, paper at `SIGGRAPH-2018_cuRE-authorversion.opt.pdf` |
+
+CuRast and cuRE are different codebases whose names differ by one letter; see the
+cuRE section for why the distinction matters.
 
 ## Ordering, and why — superseded by measurement
 
@@ -120,13 +129,18 @@ Two things stand out, and neither needs Phase 3:
   and could not help more, because the cost is the number of launches rather
   than their size.
 
-  Two ways out, both structural. Merge stages, so a draw costs fewer kernels —
-  cuRE's argument for a persistent megakernel (see References) is exactly this,
-  and it is the one reference in this document that argues against cudapipe's
-  present decomposition. Or batch draws, which is Phase 3: if primitives from
-  several draws can share a binning pass, per-draw cost stops scaling with draw
-  count. Note that llvmpipe is 20x faster here for the structural reason that it
-  has no per-draw launch at all.
+  Two ways out were named here, both structural: merge stages so a draw costs
+  fewer kernels, on cuRE's argument for a persistent megakernel; or batch draws,
+  which is Phase 3.
+
+  **The first has since been read and closed — see "cuRE" below.** cuRE's own
+  measurements have the multi-kernel sort-middle design it competes with
+  (CUDARaster, structurally what cudapipe is) faster than the megakernel on
+  nearly every scene. The megakernel buys bounded memory and consistency, not
+  speed. So batching is the live answer: if primitives from several draws can
+  share a binning pass, per-draw cost stops scaling with draw count. Note that
+  llvmpipe is 20x faster here for the structural reason that it has no per-draw
+  launch at all.
 - **Per-draw full-screen work.** `cp_fs_interpolate` launches one thread per
   quad of the whole framebuffer on every draw and every peel pass, and the
   visibility buffer is memset whole (7.4 MB) just as often — both regardless of
@@ -713,7 +727,8 @@ Phase 3 is building that.
 
 - Bin primitives into per-tile lists.
 - One block per tile. The tile's colour and depth live in **shared memory** for
-  the duration.
+  the duration. *(cuRE tried this and reversed it — see "Where cuRE contradicts
+  this document". Its reason may not apply here, but settle it by measurement.)*
 - Walk the tile's list in submission order, shading and blending inline.
 - Write the tile out once, coalesced.
 
@@ -765,6 +780,11 @@ The sort becomes exact — submission index has no per-pixel variation — so th
 stash disappears entirely, and the ordering is Vulkan-correct by construction.
 Take the machinery, not the semantics.
 
+The index field does not need 32 bits; see "Sort-key bit reduction" under cuRE.
+Note also that the harder half of primitive ordering — knowing that no earlier
+primitive can still arrive — does not exist here, because binning and
+rasterization are separated by a barrier. cuRE needs a whole mechanism for it.
+
 ## 3.4 Hierarchical bin sizes
 
 cudapipe (following CuRast) splits huge triangles at a **fixed** tile size, so
@@ -782,6 +802,12 @@ the level matching its bounding box:
 
 Choosing the split tile size from the bounding box turns 510 entries into a
 handful, and keeps entries-per-triangle roughly constant regardless of size.
+
+**There is a second answer to this, from cuRE** — one queue entry per (triangle,
+rasterizer) with the hit bins re-derived on the consuming side, which caps the
+same 510 entries at the rasterizer count without any hierarchy. It is written up
+under "Static bin ownership with per-rasterizer queue entries"; it costs a design
+decision Phase 3 has not taken, which is why both are recorded rather than one.
 
 Note the tiler itself is fixed-function hardware — there is no binning algorithm
 to port from panfrost or panvk, only the concept. `pan_tiler.c` is nonetheless
@@ -830,6 +856,16 @@ subpixel grid and iterate in integers, the way `src/gallium/drivers/llvmpipe/
 lp_setup_tri.c` does. That gives incremental stepping *and* exactness, which is
 what hardware does. It removes the per-pixel edge-function evaluation entirely.
 
+**Half of this may be superseded.** With cuRE's coverage masks there is no
+per-pixel edge evaluation to step: a tile's coverage comes from three edges by
+eight row intersections, and the inner loop iterates set bits. The *snapping* is
+still wanted, because the row intersections have to be exact for the mask to be
+the arbiter — but the *stepping* has nothing left to step. The conservative
+variant recorded under cuRE needs neither, and is the reason that item is not
+sequenced behind this one. Note that cuRE's own `snapVertex`
+(`PerWarpPatchGeometryStage.cuh:56`) is commented out at its only call site: they
+did not ship the snapping either.
+
 ## 3.7 Stage 3: consider ray-tracing
 
 **Reference:** `CuRast/src/kernels/triangles_visbuffer.cu:688-800`. Their stage 3
@@ -840,6 +876,186 @@ interpolation" while the ray-trace path computes exact depth from
 attribute interpolation still works.
 
 Worth evaluating for cudapipe's stage 3, where the same precision problem exists.
+
+**Likely to evaporate.** Under coverage masks a large triangle stops being a
+special case — it is one that hits many bins, and each bin costs the same three
+edges by eight rows as any other. Do not sequence this ahead of that.
+
+---
+
+# cuRE — what to take, and what it settles
+
+Kenzel et al. 2018, read in full for this section. The checkout is `~/git/cuRE`:
+
+- **`source/cure/pipeline/`** — the pipeline itself, and everything cited below.
+  Bare `.cuh` filenames in this section are relative to that directory.
+- **`SIGGRAPH-2018_cuRE-authorversion.opt.pdf`** at the repository root — the
+  paper. Section and figure numbers below refer to it.
+- `source/cure/shaders/`, `source/CUDARaster/`, `source/FreePipe/` — the shader
+  set, and plugin implementations of the two designs the paper compares against.
+- `source/cure/pipeline/config.h.template` and `gpu_configs.h` — the knobs, and
+  worth a look on their own: the pipeline is compiled per GPU launch
+  configuration, which is the part of the design least applicable here.
+
+**It is not CuRast.** The names differ by one letter and the two are independent
+codebases that reach different conclusions: CuRast (`~/git/CuRast`) is cudapipe's
+direct ancestor and the source of the three-stage design, cuRE is a persistent
+megakernel that argues against exactly that decomposition. A reference to one is
+not a reference to the other.
+
+## What it settles without any work
+
+The megakernel is not the answer to the launch-bound sample. Table 3 of the
+paper has CUDARaster — a multi-kernel sort-middle design, structurally what
+cudapipe already is — faster than cuRE by 1.5–4x on nearly every scene. cuRE's
+stated wins are **bounded memory** (Fig. 10: CUDARaster and Piko exhaust device
+memory on large scenes, cuRE does not), **consistency** (the only approach that
+completed every scene at every resolution), and primitive-order correctness. §3.1
+is explicit that the cost is provisioning every SM for the most expensive stage.
+
+That closes one of the two options offered for `dynamicuniformbuffer` above, and
+it is the second time in this document that an appealing structural argument did
+not survive contact with the numbers behind it.
+
+## Definite
+
+**Conservative coverage masks in stage 3.** `cp_rasterize.cu:834-869` walks every
+pixel of every tile evaluating three edge functions per pixel per sample,
+whether the tile is fully covered, barely covered, or clipped to a corner. cuRE
+builds the whole tile's coverage as a bitmask instead
+(`TileRasterizerMask.cuh:53-78`, paper §5.2 and Fig. 8): for
+each row of the tile, intersect each edge with that row and construct the row's
+bits by shifting an all-ones mask. Three edges by eight rows is 24 intersections
+for the tile, against 192 edge evaluations today — and in the partial case the
+uncovered pixels are never touched at all. The bin rasterizer
+(`BinRasterizer.cuh:66-95`) is the same construction one level up.
+
+**Take the rejection, not the arbitration.** cuRE's mask *is* the coverage
+decision, which is why it carries a `0.008f` fill-convention fudge
+(`TileRasterizerMask.cuh:66`) and is not watertight — the property
+`cp_rasterize.cu:511-521` exists to protect. Adopting that version gates the item
+on §3.6's fixed-point snapping. It does not have to: round the row intersections
+**outward** and use the mask only to reject, leaving the existing exact edge test
+as the arbiter for pixels that survive. Coverage is then bit-identical to today
+by construction, most of the saving remains, and the item lands against the
+current rasterizer with no prerequisite.
+
+**Vertex reuse in the geometry stage.** `cp_vertex_fetch.cu:13` runs one thread —
+and one vertex shader invocation — per *index*. For an indexed closed mesh
+indices are about 3T and unique vertices about T/2, so the shader runs up to six
+times per vertex. cuRE deduplicates inside a warp before shading
+(`PerWarpPatchGeometryStage.cuh:190-226`, paper §4): 32 lanes take a 96-index
+batch, a 32-iteration ballot loop reduces it to at most 32 distinct vertices, the
+shader runs once each, and triangles are reassembled with `__shfl`. Triangle
+order is preserved by construction (`:255`), so nothing downstream changes.
+
+Two scope limits to know before measuring: it does nothing for non-indexed draws,
+and nothing for the pre-expanded topology path (`args.vertex_ids` set — strips,
+fans, points). `gltfscenerendering` is where it should show. The redundancy is
+certain; whether removing it moves the frame depends on the vertex shader's
+current share of GPU time, which this document's own rule says to measure rather
+than argue about. One `tests/cp_profile.sh` run answers it.
+
+The one coupling is with the output layout, not with anything in Phase 3: the VS
+output array becomes indexed per distinct vertex rather than per assembled
+vertex, so the rasterizer's `num_varyings + 1` stride needs an indirection.
+
+**Sort-key bit reduction.** Small and certain, for whenever §3.3 happens. The
+proposed `tile_y(8) | tile_x(8) | submissionIndex(32)` key does not need 32 bits
+of index. cuRE remaps ids into the live window so the radix sort runs on about
+ten bits (`rasterization_stage.cuh:267` and `:301`). Fewer passes, same order.
+
+## Definite, but not next
+
+**Quad coverage masks and helper threads** (paper §5.3). The right end state for
+the per-draw full-screen work named above, and needed inside Phase 3's tile loop
+regardless: derive a quad mask from the pixel mask with a few bit operations,
+start four consecutive lanes per set bit, and suppress helper-thread writes using
+the original pixel mask. Derivatives then come from `__shfl` between the four
+lanes, with no full-screen pass and no separate interpolate kernel.
+
+It is not next because the same 18 ms already has a cheaper interim answer in
+this document — the device-accumulated draw bounding box, and clearing visbuf
+from `pixel_list` — and because wiring quad masks into a standalone interpolate
+kernel is plumbing that Phase 3 then deletes. Right mechanism, wrong moment.
+
+**`BlockWorkAssignment`** (`work_assignment.cuh:20-82`). Every thread reports a
+work count, a block-wide prefix sum hands out exactly NUM_THREADS work items
+across all of them, pull, repeat until drained. It replaces the
+`CP_SMALL_THRESHOLD` / `CP_MEDIUM_THRESHOLD` dispatch with one uniform loop, and
+it is a better answer than §3.5's atomic work claiming for two reasons: no
+atomics, and **a prefix sum is order-preserving**, so primitive order falls out
+of the mechanism instead of being reconstructed afterwards. Its companion is the
+*encode only, expand in next stage* rule (paper §5.1): a thread writes a
+fixed-size record saying how many threads the next stage needs, never the
+expansion itself — which is the structural fix for §0.5's silent drops and
+§1b.4's growable queues, since the expansion is never stored.
+
+Not next because its value is as the inside of Phase 3's tile loop. Retrofitting
+it onto the current three-kernel dispatch would be restructuring a stage that is
+no longer at the top of the profile.
+
+## Optional exploration
+
+**Static bin ownership with per-rasterizer queue entries.** The highest upside
+here and the least certain. cuRE assigns bins to blocks by a fixed pattern
+(`BinTileSpace.cuh:500-666`) and files **one queue entry per (triangle,
+rasterizer)** rather than per tile; the consuming block re-derives which of its
+own bins the triangle hits from the bounding box (`numHitBinsForMyRasterizer`,
+`getHitBinForMyRasterizer`), so `MAX_TRIANGLE_REFERENCES` is just the rasterizer
+count — 40 on their GTX 1080 configuration.
+
+That is a second answer to §3.4. The worked example there — a screen-covering
+triangle at 1080p producing 30x17 = 510 entries, `CP_MAX_HUGE_TILES` being the
+cap most likely to blow — becomes at most 40 entries, with no hierarchical bin
+sizes and no Mali-style multi-level tiler. Note cudapipe would not need a
+megakernel for this: a persistent rasterizer kernel with fixed bin ownership is
+an ordinary launch.
+
+It stays optional because it forks Phase 3 away from "one block per tile". The
+entry can name a rasterizer only if that rasterizer is guaranteed to process it,
+which dynamic per-tile assignment cannot promise. And the pattern arithmetic is
+~170 lines of dense index math that has to be ported and proven before it teaches
+anything. Prototype only once Phase 3's shape is otherwise settled.
+
+**In-block blend ordering without locks** (`StampShading.cuh:66-141`). Each
+fragment searches backwards for the nearest earlier fragment hitting the same
+tile with an overlapping mask, records that predecessor, and blends when the
+predecessor signals done; §5.4 notes that with no conflicts this completes
+without any serialization. Conditional on decisions not yet taken — it only pays
+if the load balancer above is adopted *and* blending happens inline.
+
+Worth recording that these two are coupled: `BlockWorkAssignment` fills the block
+from several primitives at once, which is the point of it, so two threads in one
+round can reach the same pixel from different primitives and in-block order has
+to be resolved explicitly. Taking the load balancer into a blending path means
+taking this as well. It does not bite depth-tested opaque draws, which still
+resolve by `atomicMin` — but the blend path is what Phase 3 exists to fix.
+
+## Read, do not port
+
+**The progress queue** (`progress_queue.cuh`, paper Fig. 6). A bitmask over
+primitives that have finished geometry processing, giving a watermark below which
+the input queue is known complete, so a rasterizer can tell "sorted" from "safe
+to consume". Genuinely clever and genuinely unnecessary here: it answers "can an
+earlier primitive still arrive", and cudapipe's barrier between binning and
+rasterization makes that unaskable. cudapipe gets the easy half of §3.3 for free.
+
+## Where cuRE contradicts this document
+
+§3.2 says the tile's colour and depth "live in **shared memory** for the
+duration". cuRE tried small tiles held in shared memory and backed out: §5.4
+reports that in a streaming pipeline work arrives gradually, so small tiles leave
+most rasterizers idle waiting for input, and they were forced to give each
+rasterizer many bins and blend **in global memory** — with blending then
+dominating their runtime.
+
+cudapipe is not fully streaming. The barrier between binning and rasterization
+means a tile's whole list is known before its block starts, which is exactly the
+condition cuRE lacked, so §3.2 may well be right. But this is the one place where
+a reference design tried what is planned here and reversed it, and that belongs
+next to the plan rather than being rediscovered later. It is a measurement, not a
+borrow.
 
 ---
 
@@ -901,7 +1117,14 @@ rasterization without sorting.
 **CUDARaster** — Laine & Karras, HPG 2011. Hierarchical software rasterization
 with persistent threads and queue-based work distribution.
 
-**cuRE** — Kenzel et al., SIGGRAPH 2018. A persistent megakernel that keeps data
-in registers across pipeline stages, arguing against the multi-kernel structure
-cudapipe currently has. Worth reading before committing to Phase 3's kernel
-decomposition.
+**cuRE** — Kenzel, Kerbl, Schmalstieg, Steinberger; *A High-Performance Software
+Graphics Pipeline Architecture for the GPU*, SIGGRAPH 2018. `~/git/cuRE`, paper
+at `SIGGRAPH-2018_cuRE-authorversion.opt.pdf`. A persistent megakernel that keeps
+data in registers across pipeline stages, arguing against the multi-kernel
+structure cudapipe has.
+
+**Read in full; see the "cuRE" section above.** The architectural argument does
+not survive the paper's own Table 3, but four mechanisms inside it do, and the
+coverage-mask rasterizer and the vertex-reuse scheme are the two most useful
+things found in any reference so far that cudapipe is not already doing. Do not
+confuse this with CuRast, which is a different codebase by an overlapping group.

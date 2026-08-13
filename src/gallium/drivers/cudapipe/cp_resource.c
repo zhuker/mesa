@@ -55,6 +55,39 @@ cp_resource_layout(struct cp_resource *res, const struct pipe_resource *tmpl)
    return offset;
 }
 
+/*
+ * Zero a freshly made managed allocation.
+ *
+ * `cuMemsetD8` is the blocking variant, and on a small buffer essentially all
+ * of what it costs is the host round trip rather than the write: 64 bytes
+ * measured at 31 us average, and 37 us at the call. `dynamicuniformbuffer`
+ * makes 764 transient resources a frame — a dynamic UBO slice per draw — and
+ * paid that for every one, which put `cuMemsetD8_v2` at **28.7% of all
+ * host-side CUDA API time**, ahead of `cuLaunchKernel`. It was the largest
+ * single memory-operation cost in the driver and none of it was bandwidth.
+ *
+ * The memory is managed and was allocated a moment ago, so its pages are
+ * host-resident and the host can simply write it. That is nanoseconds at these
+ * sizes, and it leaves the pages where the caller is about to write them
+ * anyway — a small resource is one the host fills.
+ *
+ * Past the threshold the trade reverses: a megabyte-scale clear is real
+ * bandwidth, the device does it an order of magnitude faster, and pulling the
+ * whole allocation to the host to zero it is exactly the migration the rest of
+ * this driver has spent two passes removing. So large allocations keep the
+ * device memset.
+ */
+#define CP_HOST_ZERO_MAX ((uint64_t)64 * 1024)
+
+static void
+cp_zero_managed(CUdeviceptr ptr, uint64_t size)
+{
+   if (size <= CP_HOST_ZERO_MAX)
+      memset((void *)(uintptr_t)ptr, 0, size);
+   else
+      cuMemsetD8(ptr, 0, size);
+}
+
 static struct pipe_resource *
 cp_resource_create(struct pipe_screen *screen,
                    const struct pipe_resource *tmpl)
@@ -87,7 +120,7 @@ cp_resource_create(struct pipe_screen *screen,
       res->lpr.tex_data = ptr;
       res->cuda_managed = true;
       res->owns_data = true;
-      cuMemsetD8(res->device_ptr, 0, size);
+      cp_zero_managed(res->device_ptr, size);
    }
 
    return &res->lpr.base;
@@ -738,7 +771,7 @@ cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
    if (cuMemAllocManaged(&dev, size, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
       return NULL;
 
-   cuMemsetD8(dev, 0, size);
+   cp_zero_managed(dev, size);
    return (struct pipe_memory_allocation *)(uintptr_t)dev;
 }
 
