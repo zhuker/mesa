@@ -649,6 +649,15 @@ hierarchical bin sizes is what actually fixes the underlying cause.
 
 Requires 1b. Enables the full value of Phase 3.
 
+**"Enables the full value of" is not "must precede", and it has been read as
+both.** Phase 3 does not depend on this phase; the one place it could —
+"write the tile out once, coalesced" — depends on the *tile width* rather than
+on the layout, and the condition is written down in §3.2 under "Tile width ≥ 32
+pixels, or swizzle first" so that whoever chooses the tile size meets it. The
+dependency the rest of this document states runs the other way: §3.2 lists
+swizzled layout among the things Phase 3 makes natural, because the tile becomes
+the unit of both storage and work.
+
 ## What it is worth — the first measurement was wrong, and `ncu` says so
 
 Everything is still pitch-linear: `cp_resource_layout` computes
@@ -853,9 +862,58 @@ What this subsumes:
 - Discard resolves inside the tile loop; the retry machinery disappears.
 - Framebuffer traffic becomes one store per tile instead of scattered atomics.
 - Swizzled layout (Phase 2) becomes natural, since the tile is the unit of both
-  storage and work.
+  storage and work — provided the tile is wide enough, which is the constraint
+  below.
 - Quad derivatives survive — a tile block has the 2×2 neighbourhood, which is
   the part that would be expected to block this and does not.
+
+### Tile width ≥ 32 pixels, or swizzle first
+
+**This is the constraint that decides whether Phase 2 has to come first, and it
+belongs to whoever picks the tile size.**
+
+"Write the tile out once, coalesced" is the one line in this phase that a
+pitch-linear framebuffer can invalidate. Linear means one store per tile *row*,
+not one per tile, so the tile's width decides whether those stores coalesce:
+
+| tile width | RGBA8 row | sectors | |
+|---|---|---|---|
+| 32 px | 128 B | 4 | one full warp transaction |
+| 16 px | 64 B | 2 | fully used, twice the transactions |
+| 8 px | 32 B | 1 | fully used, four times the transactions |
+
+Sectors are 32 bytes, so a narrow row wastes no bandwidth — it costs
+*transaction count*. At 32 pixels and above the store is exactly what a swizzled
+layout would give, and Phase 2 buys nothing for the framebuffer. Below it the
+gap grows, and at that point either widen the tile or do §2.1 first.
+
+**Measured on the pre-Phase-3 driver**, `ncu` over `gltfscenerendering`, where
+32 sectors per request is the signature of scattered access and 4 is a perfect
+32-lane 32-bit access:
+
+| kernel | ld sec/req | st sec/req | DRAM % |
+|---|---|---|---|
+| `cp_fs_writeback` | 1.39 | **1.95** | 10.0 |
+| `cp_rasterize_stage1` | 3.09 | 2.26 | 1.4 |
+| `cp_fs_interpolate` | 6.63 | 9.16 | 10.6 |
+| `main` | 4.77 | 8.50 | 1.8 |
+
+Nothing is near the scattered signature, the framebuffer store is already
+coalesced under linear, and DRAM throughput is 0.2-10.6% — only `instancing`,
+at 13-17%, uses real bandwidth. A layout change is a bandwidth optimisation and
+this driver is not bandwidth bound.
+
+**What that measurement does not cover**, and the reason this is a constraint
+rather than a dismissal: it describes the *current* access pattern. Phase 3
+replaces it. The claim that a ≥32-pixel tile row is one transaction is
+arithmetic rather than measurement, and cannot be checked until the tile loop
+exists — so check it then, and treat a narrow tile as a decision that pulls
+§2.1 in front of this phase.
+
+Two things stay true whichever tile size wins: §2.2's aligned strides are
+independent of swizzling, and the texture path is unaffected either way — its
+L1/TEX hit rate is already 94.7%, so the sampler is not what a swizzle would
+be for.
 
 ## 3.3 Sort key: submission order, not depth
 
