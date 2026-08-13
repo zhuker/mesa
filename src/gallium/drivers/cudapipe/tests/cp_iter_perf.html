@@ -83,6 +83,27 @@
   .chart .cap { color:var(--dim); font-size:11px; margin-bottom:4px; }
   svg { display:block; width:100%; height:auto; overflow:visible; }
   .empty { color:var(--dim); font-style:italic; font-size:13px; }
+
+  /* frame inspector */
+  .insp { border:1px solid var(--line); border-radius:10px; background:var(--panel);
+          padding:14px 16px; }
+  .ctl { display:flex; gap:16px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  .ctl label { font-size:12px; color:var(--dim); display:flex; gap:6px;
+               align-items:center; }
+  .ctl select, .ctl input[type=number] { background:var(--bg); color:var(--fg);
+    border:1px solid var(--line); border-radius:6px; padding:3px 6px; font:inherit;
+    font-size:13px; }
+  .ctl input[type=range] { width:200px; }
+  .panes { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+  @media (max-width:900px){ .panes{grid-template-columns:1fr;} }
+  .pane { min-width:0; }
+  .pane canvas, .pane img { width:100%; height:auto; display:block;
+                 border:1px solid var(--line); border-radius:6px; background:#000;
+                 cursor:crosshair; }
+  .pane .cap { font-size:11px; color:var(--dim); margin-top:4px; }
+  .pane .cap b { color:var(--fg); }
+  svg .cursor { stroke:var(--fg); stroke-width:1; opacity:.45; }
+  .chart { cursor:crosshair; }
   .key { font-size:11px; color:var(--dim); }
   .key b { font-weight:600; }
 </style>
@@ -127,7 +148,9 @@ function lineChart(series, opts) {
   }
   g += `<text x="${L}" y="${H-4}" font-size="9" fill="var(--dim)">0</text>
         <text x="${W-R}" y="${H-4}" text-anchor="end" font-size="9"
-              fill="var(--dim)">${n-1}</text>`;
+              fill="var(--dim)">${n-1}</text>
+        <line class="cursor" x1="0" y1="${T}" x2="0" y2="${H-B}"
+              visibility="hidden"/>`;
 
   for (const s of series) {
     if (!s.data.length) continue;
@@ -174,6 +197,184 @@ function costTable(r) {
     </tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
+/* --- frame inspector ------------------------------------------------------
+   The frames are PNG, converted in place from the PPM the sweep writes and
+   sitting in the sample directory the correctness gate reads — so the pane is
+   pointed at the very file that was judged, not at a second copy of it. Full
+   resolution and lossless on purpose: the page exists to say whether a pixel
+   is wrong, and neither a resample nor a JPEG artefact can be told from one.
+
+   The reference frames live under the reference's own directory and are shared
+   by every iteration, since NVIDIA's output does not change when cudapipe does.
+
+   The difference pane is drawn here rather than exported, so that the gain is
+   a live control rather than a decision taken at export time. */
+
+function framePath(r, sample, n, dirLabel) {
+  const m = (r.frames_meta || {})[sample];
+  if (!m) return null;
+  return `${encodeURIComponent(dirLabel)}/${encodeURIComponent(sample)}/` +
+         `${m.prefix}${String(n).padStart(m.digits, "0")}${m.ext}`;
+}
+
+const IMGCACHE = new Map();
+function loadImg(src) {
+  if (IMGCACHE.has(src)) return IMGCACHE.get(src);
+  const p = new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => res(im);
+    im.onerror = () => rej(new Error("missing " + src));
+    im.src = src;
+  });
+  IMGCACHE.set(src, p);
+  return p;
+}
+
+/* Pixels of an image, via an offscreen canvas. Same origin, so the canvas is
+   not tainted and getImageData is allowed. */
+const PIXCACHE = new Map();
+function pixels(im, src) {
+  if (PIXCACHE.has(src)) return PIXCACHE.get(src);
+  const c = document.createElement("canvas");
+  c.width = im.naturalWidth; c.height = im.naturalHeight;
+  const cx = c.getContext("2d", {willReadFrequently: true});
+  cx.drawImage(im, 0, 0);
+  const d = cx.getImageData(0, 0, c.width, c.height);
+  PIXCACHE.set(src, d);
+  return d;
+}
+
+/* |a - b| per channel, brightened. The old report did this with ffmpeg's
+   colorlevels, and warned that eq=contrast is not a gain because it pivots
+   around mid grey; a plain multiply is what was meant. */
+function drawDiff(cv, a, b, gain) {
+  cv.width = a.width; cv.height = a.height;
+  const out = cv.getContext("2d").createImageData(a.width, a.height);
+  const d = out.data, x = a.data, y = b.data;
+  for (let i = 0; i < d.length; i += 4) {
+    for (let c = 0; c < 3; c++) {
+      const v = Math.abs(x[i+c] - y[i+c]) * gain;
+      d[i+c] = v > 255 ? 255 : v;
+    }
+    d[i+3] = 255;
+  }
+  cv.getContext("2d").putImageData(out, 0, 0);
+}
+
+function inspector(r) {
+  const meta = r.frames_meta || {};
+  const samples = Object.keys(meta).sort();
+  if (!samples.length)
+    return `<p class="empty">no stored frames for this iteration — it was run
+      with BENCH_ONLY, or cp_iter_report.py record has not seen them</p>`;
+  const opts = samples.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+  return `<div class="insp">
+    <div class="ctl">
+      <label>sample <select id="i-sample">${opts}</select></label>
+      <label>frame <input type="range" id="i-frame" min="0" max="59" value="0">
+        <input type="number" id="i-frameno" min="0" max="59" value="0" style="width:64px"></label>
+      <label>difference gain <input type="range" id="i-gain" min="1" max="40" value="12">
+        <span id="i-gainv" class="mono">12x</span></label>
+    </div>
+    <div class="panes">
+      <div class="pane"><a id="i-refa" target="_blank"><img id="i-ref"></a>
+        <div class="cap"><b>${esc(r.reference || "nvidia")}</b> reference</div></div>
+      <div class="pane"><a id="i-testa" target="_blank"><img id="i-test"></a>
+        <div class="cap"><b>${esc(r.label)}</b> — hover to flip to the reference</div></div>
+      <div class="pane"><canvas id="i-diff"></canvas>
+        <div class="cap" id="i-diffcap">absolute difference</div></div>
+    </div></div>`;
+}
+
+function wireInspector(r) {
+  const meta = r.frames_meta || {};
+  const el = id => document.getElementById(id);
+  const selS = el("i-sample"), rng = el("i-frame"), num = el("i-frameno"),
+        gain = el("i-gain"), gainv = el("i-gainv");
+  if (!selS) return;
+  let cur = {sample: selS.value, frame: 0, ref: null, test: null};
+
+  function cursors() {
+    document.querySelectorAll(".chart").forEach(ch => {
+      const line = ch.querySelector(".cursor");
+      if (!line) return;
+      const n = +ch.dataset.n || 60;
+      if (ch.dataset.sample !== cur.sample) { line.setAttribute("visibility","hidden"); return; }
+      const L = 44, R = 6, W = 330;
+      const x = L + (n <= 1 ? 0 : (cur.frame / (n - 1)) * (W - L - R));
+      line.setAttribute("x1", x); line.setAttribute("x2", x);
+      line.setAttribute("visibility", "visible");
+    });
+  }
+
+  async function show() {
+    const s = cur.sample, n = cur.frame, m = meta[s];
+    if (!m) return;
+    rng.max = num.max = Math.max(0, (m.count || 60) - 1);
+    const rp = framePath(r, s, n, r.reference || "nvidia");
+    const tp = framePath(r, s, n, r.label);
+    el("i-ref").src = rp;  el("i-refa").href = rp;
+    el("i-test").src = tp; el("i-testa").href = tp;
+    cur.refSrc = rp; cur.testSrc = tp;
+    try {
+      const [ri, ti] = await Promise.all([loadImg(rp), loadImg(tp)]);
+      if (cur.sample !== s || cur.frame !== n) return;   /* superseded */
+      cur.ref = pixels(ri, rp); cur.test = pixels(ti, tp);
+      drawDiff(el("i-diff"), cur.ref, cur.test, +gain.value);
+      const d = (r.frame_diff || {})[s];
+      el("i-diffcap").innerHTML = `absolute difference &times;${gain.value}` +
+        (d && d[n] != null ? ` · <b>${fmtInt(d[n])}</b> pixels over tolerance
+          ${r.tolerance || 8}` : "");
+    } catch (e) {
+      el("i-diffcap").textContent = "could not load frame — has "
+        + "cp_iter_report.py record exported the png? (" + e.message + ")";
+    }
+  }
+
+  function set(sample, frame) {
+    if (sample) { cur.sample = sample; selS.value = sample; }
+    const m = meta[cur.sample];
+    const max = Math.max(0, ((m && m.count) || 60) - 1);
+    cur.frame = Math.max(0, Math.min(max, frame|0));
+    rng.value = num.value = cur.frame;
+    cursors(); show();
+  }
+
+  selS.onchange = () => set(selS.value, 0);
+  rng.oninput = () => set(null, +rng.value);
+  num.oninput = () => set(null, +num.value);
+  gain.oninput = () => { gainv.textContent = gain.value + "x";
+    if (cur.ref && cur.test) drawDiff(el("i-diff"), cur.ref, cur.test, +gain.value); };
+
+  /* Hover the test pane to flip it to the reference, as the old report did:
+     the eye is far better at spotting a change between two images in the same
+     place than at comparing two images side by side. */
+  const tc = el("i-test");
+  tc.onmouseenter = () => { if (cur.refSrc) tc.src = cur.refSrc; };
+  tc.onmouseleave = () => { if (cur.testSrc) tc.src = cur.testSrc; };
+
+  /* Click a chart to send the panes there. */
+  document.querySelectorAll(".chart[data-sample]").forEach(ch => {
+    ch.addEventListener("click", e => {
+      const svg = ch.querySelector("svg");
+      if (!svg) return;
+      const b = svg.getBoundingClientRect();
+      const L = 44, R = 6, W = 330;
+      const x = (e.clientX - b.left) / b.width * W;
+      const n = +ch.dataset.n || 60;
+      const f = Math.round((x - L) / (W - L - R) * (n - 1));
+      set(ch.dataset.sample, f);
+      document.querySelector(".insp").scrollIntoView({behavior:"smooth", block:"center"});
+    });
+  });
+
+  /* A frame is worth linking to. ?sample=&frame= opens the inspector straight
+     on one, which is how a finding gets pointed at rather than described. */
+  const q = new URLSearchParams(location.search);
+  const qs = q.get("sample"), qf = +(q.get("frame") || 0);
+  set(qs && meta[qs] ? qs : selS.value, qf || 0);
+}
+
 function render(r, csvs) {
   const c = r.correctness || {};
   const samples = Object.keys(r.cost || {}).sort(
@@ -194,7 +395,8 @@ function render(r, csvs) {
     const d = csvs[s] || [];
     if (!d.length) return "";
     const mean = d.reduce((a,b)=>a+b,0)/d.length;
-    return `<div class="chart"><h3>${esc(s)}</h3>
+    return `<div class="chart" data-sample="${esc(s)}" data-n="${d.length}">
+      <h3>${esc(s)}</h3>
       <div class="cap">${f2(mean)} ms mean · ${d.length} frames</div>
       ${lineChart([
         {data:d, color:"var(--now)"},
@@ -208,7 +410,8 @@ function render(r, csvs) {
   const diffCharts = samples.filter(s => (fd[s]||[]).length).map(s => {
     const d = fd[s];
     const worst = Math.max(...d), at = d.indexOf(worst);
-    return `<div class="chart"><h3>${esc(s)}</h3>
+    return `<div class="chart" data-sample="${esc(s)}" data-n="${d.length}">
+      <h3>${esc(s)}</h3>
       <div class="cap">worst ${fmtInt(worst)} px at frame ${at} ·
         frame 0 ${fmtInt(d[0])}</div>
       ${lineChart([{data:d, color:"var(--reg)"}], {fmt:v=>
@@ -261,7 +464,16 @@ function render(r, csvs) {
       are where the signal is.</p>
     <div class="charts">${diffCharts || `<p class="empty">no per-frame differences
       recorded — re-run <code>cp_iter_report.py record</code> without
-      <code>--no-diffs</code></p>`}</div>`;
+      <code>--no-diffs</code></p>`}</div>
+
+    <h2>Frame inspector</h2>
+    <p class="sub">Click any chart above to bring that sample and frame here, or
+      link to one directly with
+      <code>?iter=${esc(r.label)}&amp;sample=NAME&amp;frame=N</code>.
+      Hover this iteration's frame to flip it to the reference. The frames are
+      the full-resolution frames the correctness gate judged. Click a pane to
+      open that frame on its own.</p>
+    ${inspector(r)}`;
 }
 
 const LABEL = new URLSearchParams(location.search).get("iter") || "";
@@ -288,6 +500,7 @@ if (!LABEL) {
           .then(t => { if (t) csvs[s] = parseFrameCsv(t); })
           .catch(() => {})));
       render(rec, csvs);
+      wireInspector(rec);
     })
     .catch(e => {
       document.getElementById("root").innerHTML = `<div class="gate-bad">

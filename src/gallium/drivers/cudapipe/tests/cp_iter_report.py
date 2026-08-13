@@ -4,6 +4,7 @@ Make an iteration describe itself, and collect the descriptions into a page.
 
     cp_iter_report.py record LABEL [--desc TEXT] [--against LABEL] [--note ...]
     cp_iter_report.py page [--root DIR] [--out DIR]
+    cp_iter_report.py convert [LABEL ...]
 
 `record` writes `build/iter/LABEL/iteration.json`: what the iteration was, what
 it cost, what it did to every sample against the iteration it was compared to,
@@ -114,7 +115,7 @@ def read_verdict(path):
 
 def read_frame_diffs(frameroot, label, ref, tol, cache):
     """
-    {sample: [differing pixels per frame]} against the reference frames.
+    ({sample: [differing pixels per frame]}, {sample: how to address a frame}).
 
     The same ffmpeg pass cp_perf_report.py uses, imported rather than
     reimplemented so the two pages cannot disagree about what a differing pixel
@@ -123,7 +124,9 @@ def read_frame_diffs(frameroot, label, ref, tol, cache):
     """
     if os.path.isfile(cache):
         try:
-            return json.load(open(cache))
+            c = json.load(open(cache))
+            if isinstance(c, dict) and "diffs" in c:
+                return c["diffs"], c.get("frames", {})
         except json.JSONDecodeError:
             pass
 
@@ -132,14 +135,14 @@ def read_frame_diffs(frameroot, label, ref, tol, cache):
         from cp_perf_report import frame_pattern, frame_size, frames_of, diff_series
     except ImportError as e:
         print("no per-frame differences (%s)" % e, file=sys.stderr)
-        return {}
+        return {}, {}
 
     test_dir = os.path.join(frameroot, label)
     ref_dir = os.path.join(frameroot, ref)
     if not os.path.isdir(test_dir) or not os.path.isdir(ref_dir):
-        return {}
+        return {}, {}
 
-    out = {}
+    out, meta = {}, {}
     for sample in sorted(os.listdir(test_dir)):
         if sample.startswith("_") or not os.path.isdir(os.path.join(test_dir, sample)):
             continue
@@ -155,12 +158,128 @@ def read_frame_diffs(frameroot, label, ref, tol, cache):
         if series:
             # diff_series returns [[frame, pixels], ...]; only the pixels vary.
             out[sample] = [p for _, p in series]
+        # How the page addresses one frame. Recorded rather than derived in the
+        # browser so there is one implementation of the naming, here, next to
+        # the one that reads it.
+        m = re.match(r"(.*?)(\d+)(\.(?:ppm|png))$", names[0])
+        if m:
+            meta[sample] = {
+                "prefix": m.group(1), "digits": len(m.group(2)),
+                "ext": m.group(3), "count": min(len(names), rn or len(names)),
+                "width": w, "height": h,
+            }
     try:
         with open(cache, "w") as f:
-            json.dump(out, f)
+            json.dump({"diffs": out, "frames": meta}, f)
     except OSError:
         pass
-    return out
+    return out, meta
+
+
+def convert_frames_to_png(root, label, meta):
+    """
+    Convert an iteration's stored frames from PPM to PNG, in place, and drop
+    the PPM.
+
+    The samples write PPM and cp_compare_frames.py reads it, but a browser
+    cannot display it, so the inspector needs PNG. Converting in place rather
+    than exporting a second copy means there is still one set of frames: the
+    comparator reads PNG perfectly well (cp_compare.read_image goes through
+    Pillow), the ffmpeg difference pass takes either, and the page can point an
+    <img> straight at the file the gate just judged.
+
+    It also costs less rather than more. A 1280x720 PPM is 2.7 MB whatever it
+    holds; the same frame as PNG is 150 KB to 2 MB depending on the content, so
+    a sweep shrinks by roughly four times.
+
+    PNG because nothing here may be lossy — the page exists to judge whether a
+    pixel is wrong, and a JPEG artefact cannot be told apart from one. That the
+    conversion is bit-exact was checked rather than assumed, by decoding both
+    forms and comparing the pixels.
+
+    Frames keep their names, so frame_pattern() still derives the same
+    sequence. The PPM is removed only after its PNG exists and is non-empty.
+    """
+    src_root = os.path.join(root, label)
+    if not os.path.isdir(src_root) or not shutil.which("ffmpeg"):
+        if not shutil.which("ffmpeg"):
+            print("no ffmpeg; leaving frames as ppm", file=sys.stderr)
+        return 0, 0
+
+    converted = removed = 0
+    for sample, m in sorted(meta.items()):
+        if m.get("ext") != ".ppm":
+            continue
+        d = os.path.join(src_root, sample)
+        pat = os.path.join(d, "%s%%0%dd.ppm" % (m["prefix"], m["digits"]))
+        r = subprocess.run(
+            # -start_number on the output as well as the input. The image2
+            # muxer numbers its output from 1 whatever the input started at, so
+            # without this every frame is written one higher than it was read:
+            # the pixels are right and every frame index is off by one, which
+            # shows up as a sample reporting its worst frame at 60 of 0..59.
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-start_number", "0", "-i", pat, "-start_number", "0",
+             os.path.join(d, "%s%%0%dd.png" % (m["prefix"], m["digits"]))],
+            capture_output=True, timeout=3600)
+        if r.returncode != 0:
+            print("png conversion failed for %s/%s: %s"
+                  % (label, sample, r.stderr.decode()[:200]), file=sys.stderr)
+            continue
+        converted += 1
+        for f in sorted(os.listdir(d)):
+            if not f.endswith(".ppm"):
+                continue
+            png = os.path.join(d, f[:-4] + ".png")
+            if os.path.isfile(png) and os.path.getsize(png) > 0:
+                os.remove(os.path.join(d, f))
+                removed += 1
+    return converted, removed
+
+
+def scan_frames(root, label):
+    """
+    {sample: how to address a frame} by looking at what is on disk.
+
+    `record` gets this from the pass that computes the differences; this is for
+    a directory that has frames and nothing else — an iteration from before the
+    json existed, or a reference — so that it can still be converted.
+    """
+    d = os.path.join(root, label)
+    if not os.path.isdir(d):
+        return {}
+    meta = {}
+    for sample in sorted(os.listdir(d)):
+        sd = os.path.join(d, sample)
+        if sample.startswith("_") or not os.path.isdir(sd):
+            continue
+        names = sorted(f for f in os.listdir(sd) if f.endswith((".ppm", ".png")))
+        if not names:
+            continue
+        m = re.match(r"(.*?)(\d+)(\.(?:ppm|png))$", names[0])
+        if m:
+            meta[sample] = {"prefix": m.group(1), "digits": len(m.group(2)),
+                            "ext": m.group(3), "count": len(names)}
+    return meta
+
+
+def cmd_convert(args):
+    """Convert stored frames to png, in place, for one label or for all."""
+    root = args.root
+    labels = args.labels or sorted(
+        d for d in os.listdir(root)
+        if os.path.isdir(os.path.join(root, d)) and not d.startswith("_"))
+    tot_c = tot_r = 0
+    for label in labels:
+        meta = scan_frames(root, label)
+        if not meta:
+            continue
+        c, rm = convert_frames_to_png(root, label, meta)
+        tot_c += c
+        tot_r += rm
+        if c:
+            print("%-14s %2d sample(s) converted, %4d ppm removed" % (label, c, rm))
+    print("%d sample directories converted, %d ppm removed" % (tot_c, tot_r))
 
 
 def git_info(mesa, commit):
@@ -242,11 +361,25 @@ def cmd_record(args):
     # *times* are deliberately not copied in here — cp_perf_run.sh already
     # wrote them to bench/<sample>.csv and the detail page reads those
     # directly, so there is one copy of them rather than two that can drift.
-    frame_diff = {}
+    frame_diff, frame_meta = {}, {}
     if not args.no_diffs:
-        frame_diff = read_frame_diffs(
+        frame_diff, frame_meta = read_frame_diffs(
             root, args.label, args.ref, args.tol,
             os.path.join(out, "_frame_diffs.json"))
+
+    # Frames to PNG so a browser can show them, in place, dropping the PPM.
+    # The reference is converted too, once — it is shared by every iteration,
+    # since NVIDIA's output does not change when cudapipe does.
+    if frame_meta and not args.no_png:
+        for who in (args.label, args.ref):
+            c, rm = convert_frames_to_png(root, who, frame_meta)
+            if c:
+                print("converted %d sample(s) of %s to png, removed %d ppm"
+                      % (c, who, rm))
+        # The recorded extension is now stale for anything just converted.
+        for m in frame_meta.values():
+            if m.get("ext") == ".ppm":
+                m["ext"] = ".png"
 
     rec = {
         "label": args.label,
@@ -273,6 +406,9 @@ def cmd_record(args):
         # sample -> [differing pixels per frame]. Frame times are not here; see
         # above — the page reads bench/<sample>.csv for those.
         "frame_diff": frame_diff,
+        # sample -> how to build the path of frame n, so the inspector can fetch
+        # a stored .ppm directly and decode it rather than needing an export.
+        "frames_meta": frame_meta,
         "wins": wins,
         "regressions": regressions,
         "correctness": {
@@ -354,11 +490,19 @@ def main():
                    help="per-channel tolerance, matching cp_compare_frames.py")
     r.add_argument("--no-diffs", action="store_true",
                    help="skip the ffmpeg pass over the stored frames")
+    r.add_argument("--no-png", action="store_true",
+                   help="leave frames as ppm instead of converting them to png")
     r.set_defaults(func=cmd_record)
 
     p = sub.add_parser("page")
     p.add_argument("--out", default="")
     p.set_defaults(func=cmd_page)
+
+    c = sub.add_parser("convert",
+                       help="ppm -> png in place for stored frames, dropping the ppm")
+    c.add_argument("labels", nargs="*",
+                   help="iteration labels; default every directory under the root")
+    c.set_defaults(func=cmd_convert)
 
     args = ap.parse_args()
     args.func(args)
