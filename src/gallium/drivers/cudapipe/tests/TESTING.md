@@ -590,6 +590,30 @@ the frame, what the host is spending its time in, and what the memory traffic
 is. It keeps the `.nsys-rep` so a later profile can be diffed against an
 earlier one rather than re-argued.
 
+**`FRAMES` is the number of frames in the trace, and it did not used to be.**
+The profile rendered `--benchwarmup 1` as well, so that what it traced would be
+steady state — but nsys traces the whole process, so the effect was to put about
+seventy-seven frames of a *static* scene (warm-up renders frame 0 repeatedly
+without advancing it) in front of the ones asked for. `FRAMES` then described
+about a twentieth of the trace, and per-frame arithmetic off it was wrong by
+that factor: a four-frame profile of `dynamicuniformbuffer` reported 2,531 draws
+a frame where the sample makes 125.
+
+Dropping the warm-up costs nothing it was supposed to buy. With and without it
+kernel shares agree to a percent and the per-launch averages are identical to
+the nanosecond, because the fixed-cost kernels this driver is full of do not
+care which frame they are in.
+
+**What it did buy, by accident, was frames to dilute the context.** Creating and
+destroying the CUDA context is a one-off cost inside every trace, and a short
+one does not spread it: ten frames of `dynamicuniformbuffer` puts `cuCtxCreate`
+and `cuCtxDestroy` at 61% of host API time with the frame's own work a rounding
+error underneath. So the summary now warns when they exceed 20% and says to
+raise `FRAMES` before reading that section. **The kernel summary is unaffected**
+— only the API section is — which is why it warns rather than refuses.
+`WARMUP=1` restores the old behaviour for a trace that has to match an older
+one.
+
 `cp_prof_kernels.py` is what makes the result readable, and is not optional:
 **every shader cudapipe compiles is a CUDA kernel named `main`**, so the vertex
 and fragment stages land in one row of `nsys`'s own summary and the largest

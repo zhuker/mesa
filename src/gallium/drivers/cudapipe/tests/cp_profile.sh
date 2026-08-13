@@ -12,13 +12,30 @@
 #               means the number above is stall time wearing a kernel's name
 #   occupancy   GPU busy time against wall time; the gap is the pipeline bubble
 #
-# Output lands in $VULKAN/build/prof/LABEL/SAMPLE.{nsys-rep,kernels.txt,
-# api.txt,summary.txt}. The report files are kept so a later run can be
+# Output lands in $VULKAN/build/prof/LABEL/SAMPLE.{nsys-rep,sqlite,stats.txt,
+# summary.txt} — stats.txt is every nsys report, summary.txt the three that
+# matter. The report files are kept so a later run can be
 # diffed against an earlier one rather than re-argued.
 #
 # Ten frames by default, not sixty: the trace is per-launch and a sixty frame
-# particlesystem run writes gigabytes. The warm up is still rendered, so what
-# is traced is a steady-state frame either way.
+# particlesystem run writes gigabytes.
+#
+# **No warm-up, so FRAMES is the number of frames in the trace.** It used to
+# render --benchwarmup 1 as well, so that the traced frames would be steady
+# state. nsys traces the whole process, so what that actually did was put about
+# seventy-seven extra frames of a *static* scene in front of the ones asked for
+# — warm-up renders frame 0 repeatedly without advancing it — leaving FRAMES
+# describing about a twentieth of the trace and any per-frame arithmetic wrong
+# by that factor. Measured, it bought nothing it was meant to: kernel shares
+# agree to a percent with and without it, and the per-launch averages are
+# identical to the nanosecond, because the fixed-cost kernels this driver is
+# full of do not care which frame they are in.
+#
+# What it did buy, by accident, was diluting the one-off cost of creating and
+# destroying the CUDA context. Without it a ten-frame trace has cuCtxCreate and
+# cuCtxDestroy at 63% of host API time. That is what the warning under the API
+# section is for: raise FRAMES until it stops firing before reading that
+# section. WARMUP=1 restores the old behaviour.
 #
 # CUDAPIPE_DEBUG_TIME=1 in the environment additionally captures the driver's
 # own per-stage lines into stages.txt, which attributes time to pipeline stage
@@ -73,7 +90,8 @@ BIN=build/bin/$SAMPLE
 # describes a static scene the timed run never rendered.
 ORBIT=${ORBIT-triangle pushconstants texture negativeviewportheight \
 texturecubemap computeshader vulkanscene pbribl gltfscenerendering}
-args=(--offscreen --benchmark --offscreenframes "$FRAMES" --benchwarmup 1)
+args=(--offscreen --benchmark --offscreenframes "$FRAMES" \
+      --benchwarmup "${WARMUP:-0}")
 case " $ORBIT " in *" all "*|*" $SAMPLE "*) args+=(--offscreenorbit) ;; esac
 
 export VK_ICD_FILENAMES=$ICD
@@ -232,6 +250,18 @@ section() {
     section "CUDA GPU Kernel Summary" 22
     echo "--- CUDA API, by total time (host side) ---"
     section "CUDA API Summary" 16
+    # Creating and destroying the context is a fixed cost paid once, and a short
+    # trace does not dilute it — at ten frames of dynamicuniformbuffer it is 63%
+    # of host API time and the frame's own work is a rounding error underneath.
+    # The kernel summary is unaffected, so warn rather than refuse, and warn
+    # only about the section it invalidates.
+    ctx=$(awk '$NF ~ /^cuCtx(Create|Destroy)/ { s += $1 } END { printf "%d", s+0 }' \
+          "$OUT/$SAMPLE.stats.txt" 2>/dev/null)
+    if [ -n "${ctx:-}" ] && [ "${ctx:-0}" -ge 20 ] 2>/dev/null; then
+        echo "!! context create/destroy is ${ctx}% of host API time: this trace is"
+        echo "!! too short to read the section above. Raise FRAMES (now $FRAMES)"
+        echo "!! until it falls away. The kernel summary is unaffected."
+    fi
     echo "--- memory ops ---"
     section "CUDA GPU MemOps Summary (by Time)" 12
 } > "$OUT/$SAMPLE.summary.txt"
