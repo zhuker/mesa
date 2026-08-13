@@ -254,6 +254,19 @@ an interval.
 | gltfscenerendering | 15.01 | comparable | |
 | bloom | 12.09 | 3.4x slower | full-screen passes |
 
+**"kernel-bound at 94%" is since measured and does not mean what that row
+implies.** GPU counter sampling was not available when this was written and is
+now — `METRICS=1 cp_profile.sh particlesystem <label> 100`, see
+`tests/TESTING.md` question 2. Over 100 frames `particlesystem` runs at 94% GR
+Active, matching this row, while issuing instructions on 5% of cycles with a
+third of the SMs active and eight warps a cycle in flight; DRAM and PCIe are
+flat. The GPU is occupied rather than working, which is the shape of 260 small
+passes rather than of a stage kernel that needs optimising. **Read this row as
+"the host is not the constraint", which is all `cp_gpu_busy.sh` could establish
+at the time — not as "stages 2 and 3 are the work to do".** The counters name
+no kernel, so the pass-structure reading is a hypothesis too; `NCU=1` on stage 3
+is what would settle it.
+
 **`instancing` is the next thing to look at.** It is the one sample the
 per-draw rewind did not help (−2.1%) and it is still 39% GPU busy, so more than
 half its frame is the host. Its profile is unlike anything else in the set: 15

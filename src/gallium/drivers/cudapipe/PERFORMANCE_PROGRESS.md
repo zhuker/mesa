@@ -183,11 +183,25 @@ frame, what the host is doing, and what the memory traffic is. Keeps the
 export is worth querying directly for per-launch grid sizes and unified-memory
 migration counts, which is how several of the findings above were pinned down.
 
-`NCU=1` runs Nsight Compute instead, **but it does not work on this machine**:
-`ERR_NVGPUCTRPERM`, because reading GPU performance counters needs a root-level
-`NVreg_RestrictProfilingToAdminUsers=0` modprobe option and a reboot. No
-occupancy or warp-stall counters until someone sets that. nsys needs no such
-permission and answered every question here.
+`NCU=1` runs Nsight Compute instead, **but it did not work on this machine
+during this pass**: `ERR_NVGPUCTRPERM`, because reading GPU performance
+counters needs a root-level `NVreg_RestrictProfilingToAdminUsers=0` modprobe
+option and a reboot. No occupancy or warp-stall counters until someone sets
+that. nsys needs no such permission and answered every question here.
+
+**Since fixed — the option is set and `ncu` works.** So does
+`nsys --gpu-metrics-devices`, which is the same permission and was failing for
+the same reason while reporting it as the GPU being unsupported. Nothing in
+this document was measured with either, and none of its conclusions rest on
+one; the note stands only so that the absence of counter data from this pass is
+not read as counter data having been unavailable ever since. `tests/TESTING.md`
+is the current instructions.
+
+The upgrade that came with it is worth knowing about when reading old traces:
+Nsight Systems 2024.6.2, which is what CUDA 12.8 bundles and what every profile
+in this document was taken with, predates this GPU and could not identify it.
+2026.1.3 is installed alongside and `cp_profile.sh` now prefers it. Host-side
+times are not comparable across the two.
 
 **Rasterizer thresholds are now NVRTC `-D` overrides** —
 `CUDAPIPE_SMALL_THRESHOLD` and `CUDAPIPE_MEDIUM_THRESHOLD`. NVRTC compiles at run

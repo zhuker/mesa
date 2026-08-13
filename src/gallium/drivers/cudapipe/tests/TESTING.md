@@ -65,7 +65,7 @@ justifies it.
 | `cp_gallery.py` | HTML for the single frame sweep, two or three drivers |
 | `cp_perf_report.py` | HTML for the animated sweep: cost, GPU, per-frame differences, frame inspector |
 | `cp_gpu_busy.sh` | is the GPU actually busy — the measurement gate, untraced |
-| `cp_profile.sh` | Nsight Systems over one sample, reduced to three questions |
+| `cp_profile.sh` | one sample under a profiler, in three modes: `METRICS=1` device counters, default CUDA trace, `NCU=1` per-kernel counters |
 | `cp_prof_kernels.py` | a trace split by kernel *and grid size*, with the fixed-cost kernels flagged |
 
 **Run these with the repo venv's interpreter**, `$MESA/venv/bin/python3`
@@ -397,7 +397,7 @@ running while a build does — `nvidia-smi` during the pass is the check.
 
 ## Finding where the time goes
 
-Three questions, in this order. Answering the first with the wrong tool is the
+Four questions, in this order. Answering the first with the wrong tool is the
 mistake this section exists to prevent.
 
 ### 1. Is the frame kernel-bound or host-bound?
@@ -431,7 +431,62 @@ a window with fewer than sixty samples rather than reporting one.
 The measurement still carries a couple of points of run-to-run spread —
 `instancing` gives 35-40% across runs — so read it as a band, not a figure.
 
-### 2. Which kernel owns the frame?
+### 2. Is the GPU full, or merely occupied?
+
+```bash
+METRICS=1 cp_profile.sh particlesystem mylabel 100
+```
+
+On-die counter sampling with the CUDA API left uninstrumented. Because nothing
+intercepts `cuLaunchKernel`, this is the one profile of this driver that its own
+launch count does not distort — which is why it can be trusted where question 1
+says a profiler cannot be. Needs GPU counter permission; if the GPU is not
+listed, check `/proc/driver/nvidia/params` before suspecting the tool.
+
+**The pair that matters is `SMs Active` against `SM Issue`.** `particlesystem`,
+100 frames:
+
+```
+                                                   med     p90     max
+GR Active [Throughput %]                            94      99     100
+SMs Active [Throughput %]                           36      53     100
+SM Issue [Throughput %]                              5      11      19
+Compute Warps in Flight [Avg Warps per Cycle]        8      13      94
+DRAM Read Bandwidth [Throughput %]                   0       1       1
+PCIe RX Throughput [Throughput %]                    1       1      21
+```
+
+`GR Active` 94% is the same figure `cp_gpu_busy.sh` gets by polling
+`nvidia-smi` — two unrelated mechanisms agreeing, which is what licenses
+reading the rest of the column. And the rest says the machine is nearly empty
+while it is occupied: a third of the SMs active, eight warps a cycle in flight,
+DRAM and PCIe flat. That is not an expensive kernel. It is a long sequence of
+small ones that never fill the device, which is what 260 peel passes a frame
+look like from outside.
+
+**So "94% busy" never meant the GPU was working — only that a kernel was
+resident.** Question 1 says the host is not holding the device up; this one says
+whether the device is doing anything with the time it has. `PHASE_1A.md` reads
+`particlesystem` as "kernel-bound at 94%" and concludes stages 2 and 3 must get
+faster; these counters point instead at the pass structure, which is a phase 3
+question. Neither reading is proven by this tool.
+
+It names no kernel — that is question 3 — so a finding here is a hypothesis
+until the traced run or `ncu` attributes it to something.
+
+**Same seconds-not-frames trap as question 1, and it bites harder**, because
+the default is ten frames. Ten frames of `instancing` gave a median `GR Active`
+of 1%: its render loop is a sliver of a process that spends its time compiling
+shaders and tearing down, so the window averaged mostly idle and every row read
+low. The summary prints a warning below 50% busy — raise `FRAMES` until it
+stops firing before reading anything under it.
+
+`METRICS_HZ` sets the sampling rate (default 10000), `METRICS_SET` the metric
+set (default is auto-selected; `gb20x` on this machine, `gb20x-top` is
+lighter), `METRICS_DEV` the device. The report is kept beside the traced one as
+`SAMPLE.metrics.nsys-rep`, so both can exist for the same label.
+
+### 3. Which kernel owns the frame?
 
 ```bash
 cp_profile.sh instancing mylabel 10
@@ -461,13 +516,31 @@ Remember that tracing inflates short kernels much more than long ones, so read
 shares rather than absolute times, and never compare a traced total to an
 untraced one.
 
-`NCU=1` runs Nsight Compute instead, **but it does not work on this machine**:
-`ERR_NVGPUCTRPERM`, because reading GPU performance counters needs a root-level
-`NVreg_RestrictProfilingToAdminUsers=0` modprobe option and a reboot. No
-occupancy or warp-stall counters until someone sets that. `nsys` needs no such
-permission and has answered every question asked of it so far.
+`NCU=1` runs Nsight Compute instead, for the counters `nsys` cannot give:
+occupancy, memory throughput and warp stall reasons. It used to fail here with
+`ERR_NVGPUCTRPERM` — reading GPU performance counters needs a root-level
+modprobe option — and that is now set:
 
-### 3. Is the cost in the kernels at all?
+```bash
+cat /etc/modprobe.d/nvidia-profiling.conf   # NVreg_RestrictProfilingToAdminUsers=0
+grep RmProfilingAdminOnly /proc/driver/nvidia/params   # must read 0
+```
+
+If a fresh kernel or driver install ever drops that file, `ncu` starts failing
+with `ERR_NVGPUCTRPERM` again and `nsys --gpu-metrics-devices` stops listing
+the GPU. Both are the same permission; check `/proc/driver/nvidia/params`
+before concluding anything about the tools.
+
+**Reach for it only once a sample is known to be kernel-bound**, which
+`cp_gpu_busy.sh` is what establishes. Every win in this driver so far came from
+finding work that should not have been done at all, and that is a question
+about launch counts and grid sizes rather than about warp stalls — `ncu` is for
+after the profile already names one kernel and the question has become why
+*that kernel* is slow. It replays every launch several times to gather the
+counter set, so it is perhaps fifty times slower, and its totals are
+meaningless for comparing anything.
+
+### 4. Is the cost in the kernels at all?
 
 Not everything shows up as kernel time. The largest single win of the phase 1a
 pass was 5.3 ms of a 27.6 ms frame sitting in `cuMemAlloc` and `cuMemFree` —
@@ -492,6 +565,57 @@ describes is reporting somebody else's page faults.** Ask what the host wrote
 just before it ran.
 
 ---
+
+### The Nsight Systems agent skill pack
+
+Nsight Systems 2026.4 ships a skill pack for AI agents at
+`/opt/nvidia/nsight-systems/2026.4.1/skills/nsight-systems/SKILL.md`. It is a
+gated evidence CLI: `doctor`, `inspect-cli` (exact flag syntax for the
+installed version), `report-context`, `report-fact`, `report-query` (bounded
+SQL over a report), `report-doctor`, plus recipes. Run its bootstrap first —
+`sh scripts/determine_local_unix_platform.sh` — and use the Python it reports,
+not the one on `PATH`.
+
+Worth using for CLI syntax and for report queries. Three things to know before
+relying on it:
+
+**`search-docs` and `lookup-recipes` are broken out of the box.** The shipped
+`manifest.json` records content hashes computed against a different build, and
+all 496 disagree with the files beside them, so both commands fail with
+`content hash mismatch: SKILL.md`. `cp_nsys_skill_fix.py` diagnoses and repairs
+it; re-run after every Nsight Systems upgrade. Everything that talks to the
+installed `nsys` or to a report works without the fix. This matters more than
+it sounds: those two commands are the only sanctioned route to the reference
+corpus — `references/notes/llm-analysis-pitfalls.md`,
+`references/notes/sql_query_tips.md`,
+`references/curated/investigation_methodology.md` — and SKILL.md forbids
+reading them by hand.
+
+**Its per-kernel summary is wrong for this driver, and confidently so.**
+`report-fact --intent kernel_summary` returns one row named `main` with the
+vertex and fragment stages summed, for the reason described above. Use
+`report-query` with `GROUP BY gridX`, or `cp_prof_kernels.py`.
+
+**It cannot know that traced evidence misleads here.** It reasons from what
+nsys recorded, and question 1 above is the standing exception. Where the skill
+and `cp_gpu_busy.sh` disagree about whether a frame is host-bound, the untraced
+measurement wins.
+
+Much of the corpus is graphics, stutter and Windows scheduling material that a
+CUDA-compute rasterizer never touches, so the useful fraction is smaller than
+497 files suggests.
+
+### Versions
+
+Three versions of Nsight Systems are installed and `$CUDA/bin/nsys` is a
+wrapper pinned to the oldest, so `cp_profile.sh` resolves the newest under
+`/opt/nvidia/nsight-systems` itself and records which it used in the summary.
+`NSYS=/opt/nvidia/nsight-systems/2024.6.2/target-linux-x64/nsys` names an older
+one, which is what a stored `.nsys-rep` has to be re-read against. **Do not
+compare host-side time between traces taken with different versions**: CUPTI's
+per-launch cost differs between them and this driver issues thousands of
+launches a frame. The GPU-busy question still belongs to `cp_gpu_busy.sh`,
+which attaches no profiler at all.
 
 ## Iterating on performance
 
