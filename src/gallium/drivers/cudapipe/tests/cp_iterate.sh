@@ -199,6 +199,16 @@ print(f"{'TOTAL':<24}{to:>12.2f}{tn:>12.2f}"
 PY
 fi
 
+# Device counters per sample, when asked. Off by default because it renders
+# every sample for another twelve seconds — about five minutes on top of a pass
+# that already takes ten. Worth it for a change whose point is to fill the
+# device, because `issue` and `sms` move before ms/frame does.
+if [ "${METRICS:-0}" = "1" ]; then
+    echo "=== [$LABEL] device counters ==="
+    "$T/cp_metrics_sweep.sh" "$LABEL" "${METRICS_SECONDS:-12}" || \
+        echo "warning: metrics sweep failed; the record will say so by omitting it" >&2
+fi
+
 # Record the iteration as one json: the commit, what it was trying, the cost,
 # the delta against what it was compared to, which samples moved past 5% either
 # way, and what the correctness gate said. Written every time so that no

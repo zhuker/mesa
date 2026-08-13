@@ -68,6 +68,7 @@ justifies it.
 | `cp_profile.sh` | one sample under a profiler, in three modes: `METRICS=1` device counters, default CUDA trace, `NCU=1` per-kernel counters |
 | `cp_prof_kernels.py` | a trace split by kernel *and grid size*, with the fixed-cost kernels flagged |
 | `cp_prof_nvtx.py` | the same trace split by *pipeline stage*, from the driver's NVTX ranges |
+| `cp_metrics_sweep.sh` | device counters for every sample, into the iteration's record |
 
 **Run these with the repo venv's interpreter**, `$MESA/venv/bin/python3`
 (`pip install numpy pillow` beyond what the build needs), which is what
@@ -791,6 +792,37 @@ build/iter/
 `build/iter` is therefore exactly the root `cp_compare_frames.py` wants — one
 directory per thing being compared — and an iteration is one directory that can
 be copied, kept or deleted whole.
+
+### Recording what the device was doing, not just what it cost
+
+```bash
+METRICS=1 DESC="..." cp_iterate.sh mylabel previouslabel
+```
+
+`ms/frame` cannot tell a kernel that got faster from one that stopped being
+launched, and for a change whose point is to fill the device — batching draws,
+growing a grid, raising occupancy — `issue` and `sms` move before the frame time
+does. `METRICS=1` runs `cp_metrics_sweep.sh` after the timed pass and puts a
+row per sample into `metrics.csv` and into `iteration.json`:
+
+```
+sample         ms    gr  sms  issue  warps  dram_r  dram_w
+multithreading 29.74 86  21   2      7      0       1
+instancing      7.01 100 100  2      71     13      17
+```
+
+It costs about five minutes on top of a pass that already takes ten, which is
+why it is opt-in. `METRICS_SECONDS` sets the per-sample window (12 by default);
+the seconds-not-frames trap from question 1 applies here identically.
+
+An iteration without it records **no** metrics rather than zeroes — a row of
+zeroes reads as "the device was idle" instead of "nobody measured", which is
+the same distinction `correctness.gate_ran` exists for.
+
+Run by hand it refuses a label whose `_commit.txt` does not match `HEAD`, since
+it measures whatever is built now and files it under that label; `FORCE=1`
+overrides. `cp_iterate.sh` calls it straight after its own build, where the two
+always agree.
 
 **Set `DESC`.** A label and a number stop meaning anything within a day of the
 run. What the iteration was *trying* is the part nobody can reconstruct

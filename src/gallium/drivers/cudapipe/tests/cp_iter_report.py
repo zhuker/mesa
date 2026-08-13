@@ -301,6 +301,39 @@ def git_info(mesa, commit):
     return subject
 
 
+def read_metrics(out):
+    """`metrics.csv` from cp_metrics_sweep.sh, if that was run for this label.
+
+    Absent for most iterations, because the sweep costs about five minutes and
+    cp_iterate.sh only runs it when asked. Present it as missing rather than as
+    zero: a row of zeroes reads as "the device was idle" instead of "nobody
+    measured", and that distinction is the whole reason the correctness gate
+    carries `gate_ran`.
+    """
+    path = os.path.join(out, "metrics.csv")
+    if not os.path.isfile(path):
+        return {}
+    rows = {}
+    with open(path) as f:
+        for line in f.read().splitlines()[1:]:
+            c = line.split(",")
+            if len(c) < 10 or not c[0]:
+                continue
+
+            def num(x):
+                try:
+                    return float(x)
+                except ValueError:
+                    return None
+
+            rows[c[0]] = {
+                "gr": num(c[2]), "sms": num(c[3]), "issue": num(c[4]),
+                "warps": num(c[5]), "dram_r": num(c[6]), "dram_w": num(c[7]),
+                "window_s": num(c[8]), "samples": num(c[9]),
+            }
+    return rows
+
+
 def cmd_record(args):
     root = args.root
     out = os.path.join(root, args.label)
@@ -446,6 +479,11 @@ def cmd_record(args):
         "calib_diff": calib_diff,
         "wins": wins,
         "regressions": regressions,
+        # Device counters per sample, when cp_metrics_sweep.sh was run for this
+        # label. `issue` is the one that says whether the machine is working;
+        # ms/frame alone cannot distinguish a kernel that got faster from one
+        # that stopped being launched.
+        "metrics": read_metrics(out),
         "correctness": {
             "gate_ran": gate_ran,
             "samples": verdict,
