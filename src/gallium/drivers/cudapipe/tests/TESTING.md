@@ -140,13 +140,50 @@ drive their own frames — so they have nothing to time and get no row.
 mode or not; the script deletes it so that a timed pass really does leave
 nothing behind.
 
-**The flags have to mirror the storing run exactly**, which is the whole point
-and is easy to get wrong, because offscreen benchmarking quietly ignores the
-options a windowed benchmark uses:
+**The frame count is the one flag that may differ, and only because it was
+measured.** Everything else has to mirror the storing run. Sixty frames is
+right for storing — it is the animation the samples were set up to render, and
+every frame is kept — and far too few for timing. A sample's process spends a
+couple of seconds on start-up, shader compilation, the warm-up second and
+teardown, all of it with the GPU idle, so at sixty frames the render loop is a
+*minority* of the process:
+
+| sample | ms/frame | 60 frames render for | of a process lasting |
+|---|---|---|---|
+| instancing | 27.0 | 1.62 s | 4.3 s |
+| dynamicuniformbuffer | 17.0 | 1.02 s | 3.7 s |
+| bloom | 12.1 | 0.73 s | 3.5 s |
+| triangle | 0.7 | 0.04 s | 2.8 s |
+
+A mean taken over one and a half seconds is dominated by the sweep's own
+run-to-run spread, which is why two runs of one build differed by 0.6-1.2%
+during the phase 1a pass — the same size as several of the changes being looked
+for. `cp_iterate.sh` therefore times `BENCH_FRAMES` (600) and stores `FRAMES`
+(60), which puts every sample above ten seconds of rendering.
+
+That is allowed to differ only because the two still render the same work: the
+orbit is periodic, so a longer run covers the same camera path again rather
+than a different one. Checked rather than assumed, 60 against 600 over the
+whole sweep:
+
+| | total | multithreading | dynamicuniformbuffer | instancing | bloom |
+|---|---|---|---|---|---|
+| 60 frames | 168.80 | 29.70 | 16.95 | 27.02 | 12.13 |
+| 600 frames | 170.14 | 29.70 | 16.99 | 27.30 | 12.09 |
+| | +0.8% | 0.0% | +0.2% | +1.0% | −0.3% |
+
+The two samples that move more than that, `gltfscenerendering` (−5.4%) and
+`particlesystem` (+4.0%), are both on the nondeterministic list below. A
+600-frame pass takes about two and a half minutes; 6000 takes twenty-five and
+is for a final confirmation.
+
+**The rest of the flags have to mirror the storing run exactly**, which is easy
+to get wrong, because offscreen benchmarking quietly ignores the options a
+windowed benchmark uses:
 
 | | storing | timing |
 |---|---|---|
-| count | `--offscreenframes 60` | `--offscreenframes 60`, **not** `--benchruntime` |
+| count | `--offscreenframes 60` | `--offscreenframes 600`, **not** `--benchruntime` — see above |
 | motion | `--offscreenorbit` per the ORBIT list | the same list, or the still samples benchmark a static scene |
 | output | `--offscreenfilename` | none — nothing is stored |
 
@@ -340,6 +377,10 @@ reference, print the cost delta, and write the whole thing down.
 ```bash
 DESC="what this tried" cp_iterate.sh mylabel previouslabel
 ```
+
+It times `BENCH_FRAMES` (600 by default) and stores `FRAMES` (60) — see "the
+frame count is the one flag that may differ" above for why those are not the
+same number.
 
 Everything an iteration produced lands under `build/iter/LABEL`:
 

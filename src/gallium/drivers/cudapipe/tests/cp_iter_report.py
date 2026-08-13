@@ -208,9 +208,16 @@ def convert_frames_to_png(root, label, meta):
 
     converted = removed = 0
     for sample, m in sorted(meta.items()):
-        if m.get("ext") != ".ppm":
-            continue
         d = os.path.join(src_root, sample)
+        if not os.path.isdir(d):
+            continue
+        # What is actually on disk, not what the caller's metadata says. The
+        # reference is converted once and then passed this same metadata by
+        # every later iteration, so without this it retries a conversion that
+        # has already happened and ffmpeg complains once per sample about a
+        # pattern matching no files.
+        if not any(f.endswith(".ppm") for f in os.listdir(d)):
+            continue
         pat = os.path.join(d, "%s%%0%dd.ppm" % (m["prefix"], m["digits"]))
         r = subprocess.run(
             # -start_number on the output as well as the input. The image2
@@ -407,7 +414,10 @@ def cmd_record(args):
         "description": desc,
         "notes": args.note or [],
         "driver": args.driver,
+        # Two counts: what was stored and compared, and what was timed. They
+        # differ on purpose — see cp_iterate.sh.
         "frames": args.frames,
+        "bench_frames": args.bench_frames,
         "recorded": datetime.datetime.now().isoformat(timespec="seconds"),
         "mtime": os.path.getmtime(os.path.join(out, "bench", "_bench.csv"))
                  if os.path.isfile(os.path.join(out, "bench", "_bench.csv")) else 0,
@@ -508,7 +518,10 @@ def main():
     r.add_argument("--against", default="")
     r.add_argument("--note", action="append")
     r.add_argument("--driver", default="cudapipe")
-    r.add_argument("--frames", type=int, default=60)
+    r.add_argument("--frames", type=int, default=60,
+                   help="frames stored and compared by the correctness gate")
+    r.add_argument("--bench-frames", type=int, default=600,
+                   help="frames timed by the benchmark pass")
     r.add_argument("--ref", default="nvidia",
                    help="frame directory the differences are taken against")
     r.add_argument("--tol", type=int, default=8,

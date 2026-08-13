@@ -38,6 +38,10 @@
 # match between the timed and the stored pass are exactly the ones that are
 # easy to get wrong by hand.
 #
+# FRAMES (60) is the stored pass; BENCH_FRAMES (600) is the timed one. Raise
+# BENCH_FRAMES for a final confirmation — 6000 takes about twenty-five minutes
+# and puts the spread below a tenth of a percent.
+#
 # BENCH_ONLY=1 skips the frame pass when only the cost is in question.
 # DRIVER=llvmpipe times lavapipe instead, for the calibration in TESTING.md.
 set -u
@@ -49,7 +53,27 @@ MESA=${MESA:-$HOME/mesa}
 VULKAN=${VULKAN:-$HOME/git/Vulkan}
 T=$MESA/src/gallium/drivers/cudapipe/tests
 M=$MESA/build-cudapipe/src/gallium/targets
+# Two frame counts, because the two passes answer different questions.
+#
+# The stored pass is the correctness gate and the report: sixty frames is the
+# animation the samples were set up to render, and every one of them is kept as
+# a png, so the count is bounded by what is worth storing and looking at.
+#
+# The timed pass measures cost, where sixty frames is far too few. A sample's
+# process spends a couple of seconds on start-up, shader compilation, the warm
+# up second and teardown, so at sixty frames the render loop is a minority of
+# it — instancing renders for 1.6 s of 4.3 s — and the mean is taken over a
+# window short enough that run-to-run spread swamps the changes being looked
+# for. Six hundred frames puts every sample above ten seconds of rendering.
+#
+# The two therefore no longer render the same number of frames, and TESTING.md
+# is otherwise emphatic that they must render the same work. They still do: the
+# orbit is periodic, so a longer run covers the same path again rather than a
+# different one, and the totals agree to 0.8% — inside the sweep's own spread —
+# with the largest samples agreeing to within 1%. That was measured before this
+# split was made; see TESTING.md.
 FRAMES=${FRAMES:-60}
+BENCH_FRAMES=${BENCH_FRAMES:-600}
 
 case ${DRIVER:=cudapipe} in
     cudapipe) ICD=$M/cudapipe/cudapipe_devenv_icd.x86_64.json ;;
@@ -93,8 +117,8 @@ git -C "$MESA" diff --stat >> "$OUT/_commit.txt" 2>/dev/null
 busy=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l)
 [ "$busy" -gt 0 ] && echo "warning: $busy process(es) already on the GPU" >&2
 
-echo "=== [$LABEL] timing $FRAMES frames ($DRIVER) ==="
-"$T/cp_perf_run.sh" "$DRIVER" "$ICD" "$OUT/bench" "$FRAMES" 1 || exit 1
+echo "=== [$LABEL] timing $BENCH_FRAMES frames ($DRIVER) ==="
+"$T/cp_perf_run.sh" "$DRIVER" "$ICD" "$OUT/bench" "$BENCH_FRAMES" 1 || exit 1
 
 if [ "${BENCH_ONLY:-0}" != "1" ]; then
     if [ ! -d "$REF" ]; then
@@ -182,6 +206,6 @@ fi
 # and collected into a page by `cp_iter_report.py page`.
 "$MESA/venv/bin/python3" "$T/cp_iter_report.py" --root "$ROOT" --mesa "$MESA" \
     record "$LABEL" --against "$AGAINST" --driver "$DRIVER" --frames "$FRAMES" \
-    --desc "${DESC:-}"
+    --bench-frames "$BENCH_FRAMES" --desc "${DESC:-}"
 
 echo "=== [$LABEL] done -> $OUT ==="
