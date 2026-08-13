@@ -39,8 +39,10 @@
 # --offscreenorbit, which walks the camera around the subject. ORBIT names them;
 # ORBIT=all orbits everything, ORBIT= orbits nothing.
 #
-# Both GPU samplers run for the whole pass, so a sample's slice is found by
-# timestamp against _timing.csv rather than by a per-sample capture.
+# Both GPU samplers run for the whole pass rather than per sample, so a
+# sample's slice is cut out of them afterwards by the process names in
+# _gpu_procs.csv — _timing.csv says how long each sample took but not when it
+# ran. perf.html does exactly that to put load and memory beside each sample.
 #
 # Example, all three drivers at 60 frames:
 #

@@ -4,13 +4,14 @@
 
   Static, and one copy of it for the whole tree. It sits at the root of
   build/iter beside the iteration directories, takes the label from the query
-  string, and reads LABEL/iteration.json and LABEL/bench/<sample>.csv.
+  string, and reads LABEL/iteration.json and the csvs under LABEL/bench/ —
+  <sample>.csv, _gpu.csv and _gpu_procs.csv.
 
-  Two data sources on purpose. Per-frame times come straight from the csvs
-  cp_perf_run.sh wrote, so there is one copy of them rather than a second in
-  json that could drift. Per-frame differences come from iteration.json, because
-  producing them takes an ffmpeg pass over the stored frames and they exist
-  nowhere else.
+  Two data sources on purpose. Per-frame times, GPU load and GPU memory come
+  straight from the csvs cp_perf_run.sh wrote, so there is one copy of them
+  rather than a second in json that could drift. Per-frame differences come from
+  iteration.json, because producing them takes an ffmpeg pass over the stored
+  frames and they exist nowhere else.
 
   Served over HTTP, not opened off disk.
 -->
@@ -196,6 +197,130 @@ function parseFrameCsv(text) {
     if (p.length === 2) { const v = parseFloat(p[1]); if (!isNaN(v)) out.push(v); }
   }
   return out;
+}
+
+/* --- GPU load and memory --------------------------------------------------
+   Both samplers in cp_perf_run.sh run for the whole pass rather than per
+   sample, because several samples finish in well under a second and a
+   per-sample capture would get a single poll. So a sample's slice has to be cut
+   out by time, and _gpu_procs.csv is what makes that possible: it names the
+   process behind each poll, and the sample name is the binary's name.
+
+   Only the timed pass is read. Utilisation over a storing pass is mostly the
+   10 ms an image write costs. */
+
+/* bench/_gpu.csv: nvidia-smi's own csv, no header and units in the fields —
+   timestamp, utilization.gpu, utilization.memory, memory.used, memory.total,
+   power.draw, at 2 Hz. */
+function parseGpuCsv(text) {
+  const out = [];
+  for (const line of text.split("\n")) {
+    const p = line.split(",");
+    if (p.length < 5) continue;
+    const m = p[0].trim().match(/^(\d{4})\/(\d\d)\/(\d\d) (\d\d):(\d\d):(\d\d)\.(\d+)/);
+    if (!m) continue;
+    const t = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6],
+                       +m[7].slice(0, 3)).getTime() / 1000;
+    const util = parseFloat(p[1]), mem = parseFloat(p[3]);
+    if (isNaN(util) || isNaN(mem)) continue;
+    out.push({t, util, mem});
+  }
+  return out;
+}
+
+/* bench/_gpu_procs.csv: epoch, pid, process name, used memory — one line per
+   process per poll, and no line at all while nothing is on the card. */
+function parseProcCsv(text) {
+  const out = {};
+  for (const line of text.split("\n")) {
+    const p = line.split(",");
+    if (p.length < 4) continue;
+    const t = parseFloat(p[0]), mem = parseFloat(p[3]);
+    const name = p[2].trim().replace(/^.*\//, "");
+    if (isNaN(t) || !name) continue;
+    const e = out[name] || (out[name] = {t0: t, t1: t, mem: 0});
+    if (t < e.t0) e.t0 = t;
+    if (t > e.t1) e.t1 = t;
+    if (!isNaN(mem) && mem > e.mem) e.mem = mem;
+  }
+  return out;
+}
+
+/* The two files keep different clocks: nvidia-smi prints the machine's local
+   wall clock, the process sampler prints epoch seconds. Parsed here they agree,
+   because the page is served from the machine that ran the pass — but a browser
+   in another timezone reads the first one hours off, no window overlaps
+   anything, and every sample would silently report no data. A disagreement far
+   larger than the half second between the two samplers starting is that, and is
+   corrected; anything smaller is real skew and is left alone. */
+function clockOffset(gpu, procs) {
+  const starts = Object.values(procs).map(w => w.t0);
+  if (!gpu.length || !starts.length) return 0;
+  const d = Math.min(...starts) - gpu[0].t;
+  return Math.abs(d) < 120 ? 0 : Math.round(d / 900) * 900;
+}
+
+/* Per sample: mean and peak load over its slice of the pass, and the most GPU
+   memory in use while it ran.
+
+   The load figures trim the window the way cp_gpu_busy.sh does — the polls
+   before the first and after the last with the GPU doing anything are start-up,
+   shader compilation and teardown, and then a tenth is dropped off each end for
+   the ramp. The memory figures do not: a sample that allocates up front and
+   never touches it again is still holding it, and that is the number wanted.
+
+   At 2 Hz a short sample yields a handful of polls, so the poll count is
+   reported beside the mean rather than left for the reader to assume. */
+function gpuStats(gpu, procs) {
+  const off = clockOffset(gpu, procs), out = {};
+  for (const [name, w] of Object.entries(procs)) {
+    const win = gpu.filter(g => g.t + off >= w.t0 && g.t + off <= w.t1);
+    if (!win.length) { out[name] = {secs: w.t1 - w.t0, ownMb: w.mem, polls: 0}; continue; }
+    let lo = 0, hi = win.length - 1;
+    while (lo <= hi && !win[lo].util) lo++;
+    while (hi >= lo && !win[hi].util) hi--;
+    const live = win.slice(lo, hi + 1);
+    const trim = Math.floor(live.length * 0.1);
+    const core = trim && live.length - 2 * trim >= 10
+               ? live.slice(trim, live.length - trim) : live;
+    out[name] = {
+      secs: w.t1 - w.t0,
+      polls: core.length,
+      mean: core.length ? core.reduce((a, g) => a + g.util, 0) / core.length : null,
+      peak: core.length ? Math.max(...core.map(g => g.util)) : null,
+      memMb: Math.max(...win.map(g => g.mem)),
+      ownMb: w.mem,
+    };
+  }
+  return out;
+}
+
+function gpuTable(r, stats, order) {
+  const names = order.filter(s => stats[s])
+    .concat(Object.keys(stats).filter(s => !order.includes(s)).sort());
+  if (!names.length) return "";
+  const rows = names.map(s => {
+    /* cp_gpu_busy.sh refuses to report a window under six seconds of steady
+       state; this sampler is half its rate, so that is twelve polls. Greyed
+       rather than withheld, because this run happened anyway and a thin figure
+       still says which end of the scale a sample is at. */
+    const g = stats[s], thin = g.polls < 12;
+    return `<tr class="${thin ? "noisy" : ""}">
+      <td><code>${esc(s)}</code></td>
+      <td>${g.mean != null ? g.mean.toFixed(0) + "%" : "—"}</td>
+      <td>${g.peak != null ? g.peak.toFixed(0) + "%" : "—"}</td>
+      <td>${g.memMb != null ? fmtInt(Math.round(g.memMb)) : "—"}</td>
+      <td>${g.ownMb ? fmtInt(Math.round(g.ownMb)) : "—"}</td>
+      <td>${g.secs.toFixed(1)}</td>
+      <td>${g.polls}</td></tr>`;
+  }).join("");
+  return `<div class="scroll"><table><thead><tr>
+    <th>sample</th><th title="mean utilization.gpu over the trimmed window">load</th>
+    <th>peak</th><th title="memory.used, the whole card">gpu ram MiB</th>
+    <th title="this process's own GPU memory, from _gpu_procs.csv">its own</th>
+    <th title="how long the sample held a context on the card">window s</th>
+    <th title="polls of the 2 Hz sampler the load figures average">polls</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function costTable(r) {
@@ -466,7 +591,7 @@ function closeFull() {
 }
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeFull(); });
 
-function render(r, csvs) {
+function render(r, csvs, gstats) {
   const c = r.correctness || {};
   const samples = Object.keys(r.cost || {}).sort(
     (a,b) => (r.cost[b].ms_avg||0) - (r.cost[a].ms_avg||0));
@@ -547,6 +672,26 @@ function render(r, csvs) {
     <h2>Cost and correctness by sample</h2>
     ${costTable(r)}
 
+    <h2>GPU load and memory by sample</h2>
+    <p class="sub">From the timed pass's own samplers at 2 Hz, cut to each
+      sample's slice of the run by the process names in
+      <code>bench/_gpu_procs.csv</code>. <b>Load</b> is the mean fraction of the
+      interval a kernel was resident, over the window trimmed the way
+      <code>cp_gpu_busy.sh</code> trims it — the idle ends dropped, then a tenth
+      off each end for the ramp — so it is the render loop rather than the
+      process. <b>Gpu ram</b> is the whole card's <code>memory.used</code> while
+      the sample ran and <b>its own</b> is that process's share, untrimmed,
+      because memory held is held whether it is touched or not. Rows greyed out
+      average fewer than twelve polls — under the six seconds of steady state
+      <code>cp_gpu_busy.sh</code> refuses to report below — and say which end of
+      the scale a sample is at rather than a figure;
+      <code>cp_gpu_busy.sh SAMPLE 20</code> is how one of those gets an
+      answer.</p>
+    ${gpuTable(r, gstats, samples) || `<p class="empty">no GPU samples for this
+      iteration — <code>bench/_gpu.csv</code> or
+      <code>bench/_gpu_procs.csv</code> is missing or empty, which is also what a
+      pass on a driver that never touches the card looks like</p>`}
+
     <h2>Frame time over the run</h2>
     <p class="sub">Every frame of the timed pass, in order. The mean is the
       number in the table above; the shape is what it hides — a warm-up frame, a
@@ -591,16 +736,19 @@ if (!LABEL) {
   fetch(`${dir}/iteration.json`, {cache:"no-store"})
     .then(r => { if (!r.ok) throw new Error(r.status+" "+r.statusText); return r.json(); })
     .then(async rec => {
-      // Per-frame times come from the csvs cp_perf_run.sh already wrote, so
-      // they are not duplicated into the json. One fetch per sample, parallel.
+      // Per-frame times, GPU load and GPU memory come from the csvs
+      // cp_perf_run.sh already wrote, so they are not duplicated into the json.
+      // One fetch per sample plus the two pass-wide ones, all parallel.
       const names = Object.keys(rec.cost || {});
       const csvs = {};
-      await Promise.all(names.map(s =>
-        fetch(`${dir}/bench/${encodeURIComponent(s)}.csv`, {cache:"no-store"})
-          .then(r => r.ok ? r.text() : "")
-          .then(t => { if (t) csvs[s] = parseFrameCsv(t); })
-          .catch(() => {})));
-      render(rec, csvs);
+      const text = p => fetch(`${dir}/bench/${p}`, {cache:"no-store"})
+        .then(r => r.ok ? r.text() : "").catch(() => "");
+      const [gpuText, procText] = await Promise.all([
+        text("_gpu.csv"), text("_gpu_procs.csv"),
+        ...names.map(s => text(`${encodeURIComponent(s)}.csv`)
+          .then(t => { if (t) csvs[s] = parseFrameCsv(t); })),
+      ]);
+      render(rec, csvs, gpuStats(parseGpuCsv(gpuText), parseProcCsv(procText)));
       wireInspector(rec);
     })
     .catch(e => {

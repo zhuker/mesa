@@ -239,7 +239,9 @@ per-frame times, described above.
 
 The GPU samplers cover the pass rather than each sample deliberately. Several
 samples finish in well under a second, so a per-sample capture would get a
-single poll; a sample's slice is found by timestamp against `_timing.csv`.
+single poll; a sample's slice is cut out afterwards by the process names in
+`_gpu_procs.csv`, which is what `perf.html` does. `_timing.csv` cannot do it —
+it records how long each sample took but not when it ran.
 **Utilisation figures are only meaningful in benchmark mode**, where each sample
 runs for seconds rather than milliseconds.
 
@@ -568,8 +570,29 @@ Both pages are static and fetch their data at load time, so they have to be
 served over HTTP rather than opened from a `file://` URL. `iterations.html` is
 the history — description, total, delta, and whether the correctness gate ran —
 and each row links to `perf.html?iter=LABEL`, which is that iteration in full:
-the cost and verdict table, frame time over the run, and differing pixels per
-frame against the reference.
+the cost and verdict table, GPU load and memory per sample, frame time over the
+run, and differing pixels per frame against the reference.
+
+**The GPU table is cut out of the pass-wide samplers by process name.** Both
+samplers run for the whole timed pass rather than per sample, so the page reads
+`bench/_gpu_procs.csv` — which names the process behind every poll, and the
+process is the sample's binary — to find each sample's slice, and averages
+`bench/_gpu.csv` over it. The load figure trims that slice the way
+`cp_gpu_busy.sh` does, dropping the idle ends and then a tenth of what is left
+at each end, so it is the render loop and not the several seconds of start-up
+and shader compilation around it; `multithreading` reads 84% there, which is
+what the untraced measurement above gives. Memory is not trimmed, because
+memory held is held whether it is touched or not, and both the card's
+`memory.used` and the sample's own share are shown — on an otherwise idle card
+those differ by the ~170 MiB of context the driver keeps.
+
+**Read the poll count before the percentage.** At 2 Hz a sample that runs for
+three seconds contributes four polls, and a mean of four polls is not a
+utilisation figure. Rows under twelve — the six seconds of steady state
+`cp_gpu_busy.sh` refuses to report below — are greyed for that reason, and say
+which end of the scale a sample is at and nothing finer. `cp_gpu_busy.sh SAMPLE
+20` is how one of those gets an answer. This is a by-product of a pass that ran
+anyway, not a substitute for the measurement gate.
 
 The per-frame charts are the reason to look. `texture3d` reads as 2 differing
 pixels at frame 0 and 3,090 at frame 24, and only one of those is visible in a
