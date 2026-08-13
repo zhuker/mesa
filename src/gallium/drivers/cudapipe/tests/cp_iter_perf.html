@@ -24,16 +24,19 @@
     --bg:#fff; --panel:#f6f7f9; --line:#dfe3e8; --fg:#14171a; --dim:#5b6570;
     --win:#0b7a3b; --winbg:#e6f4ec; --reg:#b3261e; --regbg:#fbeae9;
     --accent:#2a5db0; --warn:#8a5a00; --grid:#e8ebee; --now:#2a5db0; --prev:#9aa5b1;
+    --calib:#8a5a00;
   }
   @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
     --bg:#14171a; --panel:#1c2126; --line:#2c333a; --fg:#e6eaee; --dim:#97a3ae;
     --win:#4ad07f; --winbg:#10291c; --reg:#ff7b72; --regbg:#2b1614;
     --accent:#7aa7f0; --warn:#e0b050; --grid:#242b31; --now:#7aa7f0; --prev:#5d6874;
+    --calib:#e0b050;
   } }
   :root[data-theme="dark"] {
     --bg:#14171a; --panel:#1c2126; --line:#2c333a; --fg:#e6eaee; --dim:#97a3ae;
     --win:#4ad07f; --winbg:#10291c; --reg:#ff7b72; --regbg:#2b1614;
     --accent:#7aa7f0; --warn:#e0b050; --grid:#242b31; --now:#7aa7f0; --prev:#5d6874;
+    --calib:#e0b050;
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
@@ -103,6 +106,21 @@
   .pane .cap { font-size:11px; color:var(--dim); margin-top:4px; }
   .pane .cap b { color:var(--fg); }
   svg .cursor { stroke:var(--fg); stroke-width:1; opacity:.45; }
+
+  /* full-size overlay */
+  /* display:flex would otherwise beat the browser's [hidden]{display:none},
+     leaving the overlay permanently over the page dimming everything. */
+  #full[hidden] { display:none; }
+  #full { position:fixed; inset:0; background:rgba(0,0,0,.92); z-index:50;
+          display:flex; flex-direction:column; }
+  #full-bar { display:flex; justify-content:space-between; align-items:center;
+              gap:16px; padding:10px 16px; color:#e6eaee; font-size:13px;
+              background:rgba(0,0,0,.6); flex:0 0 auto; }
+  #full-bar button { background:transparent; border:1px solid #667; color:#e6eaee;
+              border-radius:6px; padding:3px 10px; font:inherit; cursor:pointer; }
+  #full-scroll { flex:1 1 auto; overflow:auto; display:flex;
+                 align-items:flex-start; justify-content:center; padding:12px; }
+  #full-img { max-width:none; image-rendering:pixelated; cursor:zoom-out; }
   .chart { cursor:crosshair; }
   .key { font-size:11px; color:var(--dim); }
   .key b { font-weight:600; }
@@ -112,6 +130,12 @@
 <div class="wrap">
   <a class="back" href="iterations.html">&larr; all iterations</a>
   <div id="root"><p class="sub">loading…</p></div>
+</div>
+
+<div id="full" hidden onclick="if(event.target.id!=='full-img')closeFull()">
+  <div id="full-bar"><span id="full-cap"></span>
+    <button onclick="closeFull()">close (esc)</button></div>
+  <div id="full-scroll"><img id="full-img"></div>
 </div>
 
 <script>
@@ -263,6 +287,7 @@ function drawDiff(cv, a, b, gain) {
 
 function inspector(r) {
   const meta = r.frames_meta || {};
+  const ref = r.reference || "nvidia", calib = r.calibration || "";
   const samples = Object.keys(meta).sort();
   if (!samples.length)
     return `<p class="empty">no stored frames for this iteration — it was run
@@ -277,12 +302,18 @@ function inspector(r) {
         <span id="i-gainv" class="mono">12x</span></label>
     </div>
     <div class="panes">
-      <div class="pane"><a id="i-refa" target="_blank"><img id="i-ref"></a>
-        <div class="cap"><b>${esc(r.reference || "nvidia")}</b> reference</div></div>
-      <div class="pane"><a id="i-testa" target="_blank"><img id="i-test"></a>
-        <div class="cap"><b>${esc(r.label)}</b> — hover to flip to the reference</div></div>
+      <div class="pane"><img id="i-ref" data-full="">
+        <div class="cap"><b>${esc(ref)}</b> reference</div></div>
+      <div class="pane"><img id="i-test" data-full="">
+        <div class="cap"><b>${esc(r.label)}</b> — hover to flip to ${esc(ref)}</div></div>
+      ${calib ? `<div class="pane"><img id="i-calib" data-full="">
+        <div class="cap"><b>${esc(calib)}</b> — hover to flip to ${esc(ref)}</div></div>` : ""}
+      <div class="pane" style="grid-column:1"><div class="cap" style="margin:0">
+        Click any frame for it at full size, where the same hover works.</div></div>
       <div class="pane"><canvas id="i-diff"></canvas>
-        <div class="cap" id="i-diffcap">absolute difference</div></div>
+        <div class="cap" id="i-diffcap">difference</div></div>
+      ${calib ? `<div class="pane"><canvas id="i-cdiff"></canvas>
+        <div class="cap" id="i-cdiffcap">difference</div></div>` : ""}
     </div></div>`;
 }
 
@@ -311,23 +342,36 @@ function wireInspector(r) {
     const s = cur.sample, n = cur.frame, m = meta[s];
     if (!m) return;
     rng.max = num.max = Math.max(0, (m.count || 60) - 1);
-    const rp = framePath(r, s, n, r.reference || "nvidia");
-    const tp = framePath(r, s, n, r.label);
-    el("i-ref").src = rp;  el("i-refa").href = rp;
-    el("i-test").src = tp; el("i-testa").href = tp;
-    cur.refSrc = rp; cur.testSrc = tp;
+    const REF = r.reference || "nvidia", CAL = r.calibration || "";
+    const rp = framePath(r, s, n, REF), tp = framePath(r, s, n, r.label);
+    const cp = CAL ? framePath(r, s, n, CAL) : null;
+    el("i-ref").src = rp;   el("i-ref").dataset.full = rp;
+    el("i-test").src = tp;  el("i-test").dataset.full = tp;
+    if (cp && el("i-calib")) { el("i-calib").src = cp; el("i-calib").dataset.full = cp; }
+    cur.refSrc = rp; cur.testSrc = tp; cur.calibSrc = cp;
     try {
-      const [ri, ti] = await Promise.all([loadImg(rp), loadImg(tp)]);
+      const imgs = await Promise.all(
+        [loadImg(rp), loadImg(tp)].concat(cp ? [loadImg(cp)] : []));
       if (cur.sample !== s || cur.frame !== n) return;   /* superseded */
-      cur.ref = pixels(ri, rp); cur.test = pixels(ti, tp);
+      cur.ref = pixels(imgs[0], rp); cur.test = pixels(imgs[1], tp);
       drawDiff(el("i-diff"), cur.ref, cur.test, +gain.value);
       const d = (r.frame_diff || {})[s];
-      el("i-diffcap").innerHTML = `absolute difference &times;${gain.value}` +
-        (d && d[n] != null ? ` · <b>${fmtInt(d[n])}</b> pixels over tolerance
+      el("i-diffcap").innerHTML = `<b>${esc(r.label)}</b> &minus; ${esc(REF)},
+        &times;${gain.value}` +
+        (d && d[n] != null ? ` · <b>${fmtInt(d[n])}</b> px over tol
           ${r.tolerance || 8}` : "");
+      if (cp && el("i-cdiff")) {
+        cur.calib = pixels(imgs[2], cp);
+        drawDiff(el("i-cdiff"), cur.ref, cur.calib, +gain.value);
+        const c = (r.calib_diff || {})[s];
+        el("i-cdiffcap").innerHTML = `<b>${esc(CAL)}</b> &minus; ${esc(REF)},
+          &times;${gain.value}` +
+          (c && c[n] != null ? ` · <b>${fmtInt(c[n])}</b> px over tol
+            ${r.tolerance || 8}` : "");
+      }
     } catch (e) {
       el("i-diffcap").textContent = "could not load frame — has "
-        + "cp_iter_report.py record exported the png? (" + e.message + ")";
+        + "cp_iter_report.py record run for it? (" + e.message + ")";
     }
   }
 
@@ -344,14 +388,33 @@ function wireInspector(r) {
   rng.oninput = () => set(null, +rng.value);
   num.oninput = () => set(null, +num.value);
   gain.oninput = () => { gainv.textContent = gain.value + "x";
-    if (cur.ref && cur.test) drawDiff(el("i-diff"), cur.ref, cur.test, +gain.value); };
+    if (cur.ref && cur.test) drawDiff(el("i-diff"), cur.ref, cur.test, +gain.value);
+    if (cur.ref && cur.calib && el("i-cdiff"))
+      drawDiff(el("i-cdiff"), cur.ref, cur.calib, +gain.value); };
 
   /* Hover the test pane to flip it to the reference, as the old report did:
      the eye is far better at spotting a change between two images in the same
      place than at comparing two images side by side. */
-  const tc = el("i-test");
-  tc.onmouseenter = () => { if (cur.refSrc) tc.src = cur.refSrc; };
-  tc.onmouseleave = () => { if (cur.testSrc) tc.src = cur.testSrc; };
+  /* Hover a renderer's frame to flip it to the reference, as the old report
+     did: the eye is far better at spotting a change between two images in the
+     same place than at comparing two side by side. */
+  for (const [id, key] of [["i-test","testSrc"], ["i-calib","calibSrc"]]) {
+    const im = el(id);
+    if (!im) continue;
+    im.onmouseenter = () => { if (cur.refSrc) im.src = cur.refSrc; };
+    im.onmouseleave = () => { if (cur[key]) im.src = cur[key]; };
+  }
+
+  /* Full size, where the same hover works. A pane is a third of the page wide,
+     which is a sixth of the frame — enough to see that something moved and not
+     enough to see what. */
+  document.querySelectorAll(".pane img").forEach(im => {
+    im.onclick = () => openFull(im.dataset.full, cur.refSrc,
+      im.id === "i-ref" ? "" : (im.id === "i-calib" ? cur.calibSrc : cur.testSrc),
+      `${cur.sample} frame ${cur.frame} — ` +
+      (im.id === "i-ref" ? (r.reference || "nvidia")
+       : im.id === "i-calib" ? (r.calibration || "") : r.label));
+  });
 
   /* Click a chart to send the panes there. */
   document.querySelectorAll(".chart[data-sample]").forEach(ch => {
@@ -373,7 +436,35 @@ function wireInspector(r) {
   const q = new URLSearchParams(location.search);
   const qs = q.get("sample"), qf = +(q.get("frame") || 0);
   set(qs && meta[qs] ? qs : selS.value, qf || 0);
+
+  /* &full=test|calib|ref opens that pane at full size straight away, so a
+     finding can be linked at the resolution it has to be judged at. */
+  const qfull = q.get("full");
+  if (qfull) {
+    const im = el(qfull === "ref" ? "i-ref"
+              : qfull === "calib" ? "i-calib" : "i-test");
+    if (im) setTimeout(() => im.click(), 0);
+  }
 }
+
+/* Full-size overlay. Natural resolution, scrollable, and hovering still flips
+   to the reference for anything that is not the reference. */
+function openFull(src, refSrc, ownSrc, caption) {
+  const ov = document.getElementById("full");
+  const im = document.getElementById("full-img");
+  document.getElementById("full-cap").textContent = caption +
+    (ownSrc ? " · hover to flip to the reference" : "");
+  im.src = src;
+  im.onmouseenter = () => { if (ownSrc && refSrc) im.src = refSrc; };
+  im.onmouseleave = () => { if (ownSrc) im.src = ownSrc; };
+  ov.hidden = false;
+  document.body.style.overflow = "hidden";
+}
+function closeFull() {
+  document.getElementById("full").hidden = true;
+  document.body.style.overflow = "";
+}
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeFull(); });
 
 function render(r, csvs) {
   const c = r.correctness || {};
@@ -406,16 +497,21 @@ function render(r, csvs) {
         <b style="color:var(--prev)">- -</b> mean</div></div>`;
   }).join("");
 
-  const fd = r.frame_diff || {};
+  const fd = r.frame_diff || {}, cd = r.calib_diff || {}, calib = r.calibration;
   const diffCharts = samples.filter(s => (fd[s]||[]).length).map(s => {
-    const d = fd[s];
+    const d = fd[s], c = cd[s] || [];
     const worst = Math.max(...d), at = d.indexOf(worst);
+    const cw = c.length ? Math.max(...c) : null;
+    const series = [{data:d, color:"var(--reg)"}];
+    if (c.length) series.push({data:c, color:"var(--calib)", w:1.3, dash:true});
     return `<div class="chart" data-sample="${esc(s)}" data-n="${d.length}">
       <h3>${esc(s)}</h3>
-      <div class="cap">worst ${fmtInt(worst)} px at frame ${at} ·
-        frame 0 ${fmtInt(d[0])}</div>
-      ${lineChart([{data:d, color:"var(--reg)"}], {fmt:v=>
+      <div class="cap">worst ${fmtInt(worst)} px at frame ${at}${
+        cw != null ? ` · ${esc(calib)} ${fmtInt(cw)}` : ""}</div>
+      ${lineChart(series, {fmt:v=>
         v>=1000 ? (v/1000).toFixed(0)+"k" : v.toFixed(0)})}
+      ${c.length ? `<div class="key"><b style="color:var(--reg)">—</b> ${
+        esc(r.label)} <b style="color:var(--calib)">- -</b> ${esc(calib)}</div>` : ""}
       </div>`;
   }).join("");
 
@@ -461,7 +557,11 @@ function render(r, csvs) {
     <p class="sub">Against ${esc(r.reference||"nvidia")} at tolerance
       ${r.tolerance||8}/255, every frame — not frame 0. Each chart is scaled to
       itself, because a shared axis flattens every small one and the small ones
-      are where the signal is.</p>
+      are where the signal is.${r.calibration ? ` The dashed line is
+      <b>${esc(r.calibration)}</b> against the same reference: a residual both
+      software renderers have is what software rasterization costs, and one only
+      this driver has is a defect. Judge against that line, not against zero.`
+      : ""}</p>
     <div class="charts">${diffCharts || `<p class="empty">no per-frame differences
       recorded — re-run <code>cp_iter_report.py record</code> without
       <code>--no-diffs</code></p>`}</div>
@@ -469,7 +569,8 @@ function render(r, csvs) {
     <h2>Frame inspector</h2>
     <p class="sub">Click any chart above to bring that sample and frame here, or
       link to one directly with
-      <code>?iter=${esc(r.label)}&amp;sample=NAME&amp;frame=N</code>.
+      <code>?iter=${esc(r.label)}&amp;sample=NAME&amp;frame=N</code>, adding
+      <code>&amp;full=test</code> to open it at full size.
       Hover this iteration's frame to flip it to the reference. The frames are
       the full-resolution frames the correctness gate judged. Click a pane to
       open that frame on its own.</p>

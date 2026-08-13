@@ -362,10 +362,31 @@ def cmd_record(args):
     # wrote them to bench/<sample>.csv and the detail page reads those
     # directly, so there is one copy of them rather than two that can drift.
     frame_diff, frame_meta = {}, {}
+    calib_diff = {}
     if not args.no_diffs:
         frame_diff, frame_meta = read_frame_diffs(
             root, args.label, args.ref, args.tol,
             os.path.join(out, "_frame_diffs.json"))
+
+        # The same series for llvmpipe, against the same reference.
+        #
+        # TESTING.md is emphatic about why: llvmpipe is mature, shares lavapipe
+        # as its frontend, and still differs from NVIDIA by tens of thousands of
+        # pixels across the set. A residual both software renderers have is what
+        # software rasterization costs; a residual only cudapipe has is a
+        # defect. Without the second line on the chart there is no way to tell
+        # which of the two a number is, and several questions have been settled
+        # by exactly that distinction — gltfscenerendering grows fourfold over
+        # its orbit, and llvmpipe grows further on the same frames.
+        #
+        # It is cached in the calibration driver's own directory, because it
+        # does not depend on the iteration and would otherwise be recomputed for
+        # every one of them.
+        if args.calibrate and os.path.isdir(os.path.join(root, args.calibrate)):
+            calib_diff, _ = read_frame_diffs(
+                root, args.calibrate, args.ref, args.tol,
+                os.path.join(root, args.calibrate,
+                             "_frame_diffs_vs_%s.json" % args.ref))
 
     # Frames to PNG so a browser can show them, in place, dropping the PPM.
     # The reference is converted too, once — it is shared by every iteration,
@@ -406,9 +427,13 @@ def cmd_record(args):
         # sample -> [differing pixels per frame]. Frame times are not here; see
         # above — the page reads bench/<sample>.csv for those.
         "frame_diff": frame_diff,
-        # sample -> how to build the path of frame n, so the inspector can fetch
-        # a stored .ppm directly and decode it rather than needing an export.
+        # sample -> how to build the path of frame n, so the inspector can point
+        # an <img> at the same file the correctness gate read.
         "frames_meta": frame_meta,
+        # The calibration renderer and its differences against the same
+        # reference. What makes a residual readable as cost or as defect.
+        "calibration": args.calibrate if calib_diff else "",
+        "calib_diff": calib_diff,
         "wins": wins,
         "regressions": regressions,
         "correctness": {
@@ -490,6 +515,9 @@ def main():
                    help="per-channel tolerance, matching cp_compare_frames.py")
     r.add_argument("--no-diffs", action="store_true",
                    help="skip the ffmpeg pass over the stored frames")
+    r.add_argument("--calibrate", default="llvmpipe",
+                   help="second renderer to difference against the same "
+                        "reference, for calibration; '' to skip")
     r.add_argument("--no-png", action="store_true",
                    help="leave frames as ppm instead of converting them to png")
     r.set_defaults(func=cmd_record)

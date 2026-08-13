@@ -345,9 +345,10 @@ Everything an iteration produced lands under `build/iter/LABEL`:
 
 ```
 build/iter/
-    nvidia/<sample>/frame0000.ppm     the reference, rendered once
+    nvidia/<sample>/frame0000.png     the reference, rendered once
+    llvmpipe/<sample>/frame0000.png   the calibration renderer
     LABEL/
-        <sample>/frame0000.ppm        the frames this build rendered
+        <sample>/frame0000.png        the frames this build rendered
         bench/_bench.csv              the timed pass, and a csv per sample
         _render/                      the storing pass's own gpu and timing csvs
         verdict.txt  delta.txt  _commit.txt
@@ -381,6 +382,26 @@ frame against the reference.
 The per-frame charts are the reason to look. `texture3d` reads as 2 differing
 pixels at frame 0 and 3,090 at frame 24, and only one of those is visible in a
 table.
+
+Each difference chart carries a second, dashed line: **llvmpipe against the same
+reference**. That is what makes a residual readable, and it is the calibration
+this document argues for below. At frame 47 of `gltfscenerendering` cudapipe
+differs by 59,939 pixels and llvmpipe by 91,091, so that residual is what
+software rasterization costs; `texture3d` peaks at 3,090 against llvmpipe's 0,
+so that one is a cudapipe defect.
+
+Under the charts is the frame inspector: the reference, this iteration and
+llvmpipe side by side, with each one's difference beneath it. Hovering a
+renderer's frame flips it to the reference, and clicking opens it at full
+resolution where the same hover works. A frame is linkable —
+`perf.html?iter=LABEL&sample=NAME&frame=N`, plus `&full=test` to open it large —
+so a finding can be pointed at rather than described.
+
+**Frames are stored as PNG.** The samples write PPM, and `cp_iterate.sh`
+converts in place and drops the PPM once the gate has read it: a browser cannot
+display PPM, and a 1280x720 PPM is 2.7 MB whatever it holds against 150 KB to
+2 MB as PNG. The conversion is bit-exact, and `cp_compare.read_image` reads
+either. `cp_iter_report.py convert [LABEL ...]` does it for an older tree.
 
 ### Two things the record exists to catch
 
