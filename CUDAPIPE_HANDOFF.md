@@ -75,8 +75,10 @@ full resolution and clickable, the result hover-flipping to the reference.
 
 There is a second, animated sweep — sixty frames per sample, with the still
 scenes orbited — which catches what a single frame cannot: two of the
-regressions in the set are invisible at frame 0. `tests/TESTING.md` describes
-both sweeps, every tool, and the traps.
+regressions in the set are invisible at frame 0. `tests/TESTING.md` is the methodology for both
+halves of this — how correctness is checked, how cost is measured reliably
+enough to compare, and how to find where the time actually goes. Read it before
+trusting a number from either.
 
 **Editing a sample's shader is the fastest way to bisect a difference.** The
 samples load `.spv` at runtime, so `glslangValidator -V shader.vert -o

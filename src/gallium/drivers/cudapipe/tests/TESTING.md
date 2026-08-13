@@ -1,4 +1,22 @@
-# The sample sweep: running it, checking it, reading it
+# Methodology: how this driver is checked and how it is measured
+
+Both halves are here, because they use the same runs and the same tools and
+because neither is worth much alone — a change that is faster and wrong is not
+a result, and the second-largest source of wasted effort on this driver has
+been measuring the wrong thing confidently.
+
+| | where |
+|---|---|
+| **correctness** — is it drawing the right pixels | the sweeps below, "calibrate against llvmpipe", "traps" |
+| **cost** — what a frame costs, reliably enough to compare | "benchmark", "traps", "iterating on performance" |
+| **diagnosis** — where the time actually goes | "finding where the time goes" |
+
+The pass records — `../PERFORMANCE_PROGRESS.md` and `../PHASE_1A.md` — are what
+was done and what it was worth, not how to do it. This is how to do it.
+
+---
+
+## The sample sweep: running it, checking it, reading it
 
 cudapipe is checked differentially. The Sascha Willems samples at `~/git/Vulkan`
 render offscreen and reproducibly, so the same binary is run against the NVIDIA
@@ -41,6 +59,9 @@ run's images.
 | `cp_compare_frames.py` | every frame of every sample against a reference, with a pass/fail verdict |
 | `cp_gallery.py` | HTML for the single frame sweep, two or three drivers |
 | `cp_perf_report.py` | HTML for the animated sweep: cost, GPU, per-frame differences, frame inspector |
+| `cp_gpu_busy.sh` | is the GPU actually busy — the measurement gate, untraced |
+| `cp_profile.sh` | Nsight Systems over one sample, reduced to three questions |
+| `cp_prof_kernels.py` | a trace split by kernel *and grid size*, with the fixed-cost kernels flagged |
 
 **Run these with the repo venv's interpreter**, `$MESA/venv/bin/python3`
 (`pip install numpy pillow` beyond what the build needs), which is what
@@ -365,6 +386,88 @@ sides.
 drivers over eighteen samples is a few minutes, and it is tempting to overlap
 them. Two passes sharing the card measure each other. The same goes for a sweep
 running while a build does — `nvidia-smi` during the pass is the check.
+
+---
+
+## Finding where the time goes
+
+Three questions, in this order. Answering the first with the wrong tool is the
+mistake this section exists to prevent.
+
+### 1. Is the frame kernel-bound or host-bound?
+
+```bash
+cp_gpu_busy.sh instancing 20        # SAMPLE, then seconds of rendering
+```
+
+`>90%` busy means the host is already ahead of the device and there is nothing
+to win by submitting faster. Below that, the device is waiting on the host for
+the remainder, and that gap is what work on submission and synchronisation is
+worth.
+
+**A profiler cannot answer this.** CUPTI adds host-side cost to every
+`cuLaunchKernel`, and cudapipe issues thousands of them a frame, so a traced
+run manufactures exactly the host-side gap the question is about. A trace of
+`multithreading` reported the GPU 66% busy and simultaneously reported more GPU
+kernel time per frame than the untraced frame takes end to end, which is the
+tell. `cp_gpu_busy.sh` asks `nvidia-smi` over a run with nothing attached.
+
+**It takes seconds, not frames, and that matters.** A sample's process spends a
+couple of seconds on start-up, shader compilation, the warm-up second and
+teardown with the GPU idle. Sampling across all of it averages the render loop
+together with that idle and reports a number far below the truth. Measured
+across a sixty-frame run `multithreading` reads as 77% busy and
+`dynamicuniformbuffer` as 66%; over seventeen seconds of steady state both read
+as 84-85%. The script computes the frame count from the sample's recorded cost,
+trims the ramp at each end, prints the window it actually measured, and refuses
+a window with fewer than sixty samples rather than reporting one.
+
+The measurement still carries a couple of points of run-to-run spread —
+`instancing` gives 35-40% across runs — so read it as a band, not a figure.
+
+### 2. Which kernel owns the frame?
+
+```bash
+cp_profile.sh instancing mylabel 10
+$MESA/venv/bin/python3 cp_prof_kernels.py \
+    build/prof/mylabel/instancing.sqlite --frames 10
+```
+
+`cp_profile.sh` runs Nsight Systems and reduces the trace to which kernel owns
+the frame, what the host is spending its time in, and what the memory traffic
+is. It keeps the `.nsys-rep` so a later profile can be diffed against an
+earlier one rather than re-argued.
+
+`cp_prof_kernels.py` is what makes the result readable, and is not optional:
+**every shader cudapipe compiles is a CUDA kernel named `main`**, so the vertex
+and fragment stages land in one row of `nsys`'s own summary and the largest
+entry in every profile is uninterpretable. Splitting by grid size separates
+them — the vertex shader is launched over the vertex count and the fragment
+shader over a fixed worst case.
+
+It also flags **kernels whose duration does not vary with the draw**. That is
+the shape of nearly every defect found in this driver so far: work sized to the
+worst case the host can compute rather than to what the draw does. A kernel
+with a coefficient of variation near zero across thousands of launches is doing
+the same amount of work whatever it was asked to draw.
+
+Remember that tracing inflates short kernels much more than long ones, so read
+shares rather than absolute times, and never compare a traced total to an
+untraced one.
+
+`NCU=1` runs Nsight Compute instead, **but it does not work on this machine**:
+`ERR_NVGPUCTRPERM`, because reading GPU performance counters needs a root-level
+`NVreg_RestrictProfilingToAdminUsers=0` modprobe option and a reboot. No
+occupancy or warp-stall counters until someone sets that. `nsys` needs no such
+permission and has answered every question asked of it so far.
+
+### 3. Is the cost in the kernels at all?
+
+Not everything shows up as kernel time. The largest single win of the phase 1a
+pass was 5.3 ms of a 27.6 ms frame sitting in `cuMemAlloc` and `cuMemFree` —
+visible in the API summary, invisible in the kernel summary, and explained by
+neither. When the kernel breakdown does not add up to the frame, read the
+`--- CUDA API ---` section of the profile before theorising.
 
 ---
 

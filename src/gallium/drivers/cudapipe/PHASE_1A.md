@@ -279,6 +279,10 @@ device, and the interpolator can skip the quads outside it.
 
 ## Tooling added
 
+The durable form of all of this — how to run it, and which tool answers which
+question — is `tests/TESTING.md`. What follows is why each piece exists, which
+is a fact about this pass rather than about the method.
+
 **`tests/cp_gpu_busy.sh SAMPLE [FRAMES] [DRIVER]`** — the measurement gate,
 asked without a profiler attached, for the reason above. Reports median GPU
 busy and says what it implies for phase 1a.
