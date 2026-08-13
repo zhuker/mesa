@@ -1331,10 +1331,23 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
     */
    cp->dscratch.used = 0;
 
-   /* For TRIANGLE_LIST with a VS and single instance, the vertex fetch kernel
-    * indexes the IB directly on GPU — no CPU-side topology expansion needed. */
+   /*
+    * For TRIANGLE_LIST with a VS, the vertex fetch kernel indexes the IB
+    * directly on the GPU — no CPU-side topology expansion needed.
+    *
+    * Instancing is included, and used not to be. An instanced draw replays one
+    * index range once per instance, so the vertex and instance ids of every
+    * assembled vertex follow from its position: vertex v is index v % vpi of
+    * instance v / vpi. That is arithmetic the kernel can do per thread, and
+    * building it on the host meant a 4.4 million entry table for one draw of
+    * `instancing` — walked five times, written twice into managed memory the
+    * device then had to fault back, and sized to the whole draw rather than to
+    * anything about it. The device idled 62% of that frame.
+    */
    bool skip_refs = has_vs && info->mode == MESA_PRIM_TRIANGLES &&
-                    instance_count == 1 && num_draws == 1;
+                    num_draws == 1;
+   /* Assembled vertices per instance, which is what the kernel divides by. */
+   unsigned verts_per_instance = total_triangles / instance_count * 3;
    struct cp_vertex_ref *refs = NULL;
    if (!skip_refs) {
       refs = cp_build_vertex_refs(info, draws, num_draws,
@@ -1414,10 +1427,29 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             return;
          }
 
-         /* Upload vertex_id and instance_id arrays for topology-expanded draws */
+         /*
+          * Vertex and instance ids: one uint32 per assembled vertex, read by
+          * the shader as gl_VertexIndex and gl_InstanceIndex and by the fetch
+          * kernel to resolve a divisored attribute.
+          *
+          * There are two ways to get them, and which applies is exactly
+          * whether the host had to expand the topology. A strip, a fan, a
+          * point list or several draws in one call leave the answer only in
+          * `refs`, so it is uploaded. A triangle list does not: the ids follow
+          * from the thread index, and the fetch kernel derives them.
+          *
+          * That second case used to build the arrays on the host as well, and
+          * build them *twice* — once for the fetch kernel and once for the
+          * shader, from the same refs, into two pairs of managed buffers. One
+          * draw of `instancing` assembles 4.4 million vertices, so that was
+          * four arrays of 17.7 MB a frame, each walked on the host and written
+          * into memory the device then had to fault back page by page. It cost
+          * a 35 MB refs table, five host passes over 4.4 million entries, and
+          * enough managed traffic to trip the scratch reclaim several times a
+          * frame. None of it was information: every byte is a function of v.
+          */
          CUdeviceptr vfetch_vid = 0, vfetch_iid = 0;
-         bool need_refs_on_gpu = (info->mode != MESA_PRIM_TRIANGLES) || instance_count > 1;
-         if (need_refs_on_gpu) {
+         if (refs) {
             vfetch_vid = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, total_verts * 4);
             vfetch_iid = (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, total_verts * 4);
             if (!vfetch_vid || !vfetch_iid) { FREE(refs); return; }
@@ -1434,16 +1466,52 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             free(iid_host);
          }
 
+         /*
+          * What the shader will be handed. With the ids already materialised
+          * the shader reads the same arrays; otherwise the fetch kernel
+          * publishes them, and only the ones the shader actually reads are
+          * given anywhere to write.
+          *
+          * A 32-bit index buffer is already the vertex id array and can be
+          * pointed at rather than copied — but only while every assembled
+          * vertex reads a distinct entry of it, which instancing ends.
+          */
+         CUdeviceptr vid_buf = vfetch_vid, iid_buf = vfetch_iid;
+         CUdeviceptr out_vid = 0, out_iid = 0;
+
+         if (!refs) {
+            if (indexed && ib_base && info->index_size == 4 &&
+                instance_count == 1) {
+               vid_buf = (CUdeviceptr)(uintptr_t)ib_base +
+                         (size_t)draws[0].start * 4;
+            } else if (cp->vs_shader->reads_vertex_id) {
+               out_vid = cp_scratch_alloc_device(cp, (size_t)total_verts * 4);
+               if (!out_vid) { FREE(refs); return; }
+               vid_buf = out_vid;
+            }
+
+            if (cp->vs_shader->reads_instance_id) {
+               out_iid = cp_scratch_alloc_device(cp, (size_t)total_verts * 4);
+               if (!out_iid) { FREE(refs); return; }
+               iid_buf = out_iid;
+            } else {
+               iid_buf = 0;
+            }
+         }
+
          struct cp_vertex_fetch_args vf_args = {
             .output = vs_input_buf,
             .num_elements = cp->num_vertex_elements,
             .num_verts = total_verts,
             .vs_in_stride = vs_in_stride,
-            .index_size = need_refs_on_gpu ? 0 : info->index_size,
+            .index_size = refs ? 0 : info->index_size,
             .first_vertex = indexed ? (unsigned)draws[0].index_bias : draws[0].start,
             .start_instance = info->start_instance,
             .vertex_ids = vfetch_vid,
             .instance_ids = vfetch_iid,
+            .verts_per_instance = refs ? 0 : verts_per_instance,
+            .out_vertex_ids = out_vid,
+            .out_instance_ids = out_iid,
          };
 
          /* Set up index buffer for direct GPU indexing (triangle list only).
@@ -1451,7 +1519,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
           * draw's first index has to be folded into the pointer — a glTF model
           * draws every primitive out of one shared buffer this way, and
           * ignoring it draws the first primitive over and over. */
-         if (!need_refs_on_gpu && indexed && ib_base)
+         if (!refs && indexed && ib_base)
             vf_args.index_buffer = (uint64_t)(uintptr_t)ib_base +
                                    (uint64_t)draws[0].start * info->index_size;
 
@@ -1474,9 +1542,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             vf_args.elem_instance_divisor[e] = elem->instance_divisor;
          }
 
-         /* Nothing to gather when the shader declares no inputs. */
-         if (vs_input_buf) {
-            cuMemsetD8Async(vs_input_buf, 0, (size_t)total_verts * vs_in_stride, cp->stream);
+         /* Nothing to gather when the shader declares no inputs — but it still
+          * runs if the ids are wanted, since deriving those is now its job
+          * too and a shader with no inputs may still read gl_VertexIndex. */
+         if (vs_input_buf || out_vid || out_iid) {
+            if (vs_input_buf)
+               cuMemsetD8Async(vs_input_buf, 0, (size_t)total_verts * vs_in_stride, cp->stream);
             void *vf_params[] = { &vf_args };
             cuLaunchKernel(screen->kernels.vertex_fetch,
                (total_verts + 255) / 256, 1, 1, 256, 1, 1,
@@ -1513,62 +1584,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             free(in);
          }
 
-         CUdeviceptr vid_buf = 0, iid_buf = 0;
-
-         if (skip_refs) {
-            /* TRIANGLE_LIST fast path: VS reads vertex IDs from the index buffer
-             * directly (or sequentially for non-indexed). No CPU loop needed. */
-            if (indexed && ib_base) {
-               /* Point vid at the IB data — VS reads IB[thread_id] as vertex_id.
-                * Note: this only works for 32-bit indices. For 16-bit we still
-                * need a conversion (the VS expects uint32 per vertex). */
-               if (info->index_size == 4) {
-                  vid_buf = (CUdeviceptr)(uintptr_t)ib_base +
-                            (size_t)draws[0].start * 4;
-               } else {
-                  /* 16-bit IB: allocate and let the vertex_fetch kernel handle it */
-                  /* The fetch kernel widens the indices into this. */
-                  vid_buf = cp_scratch_alloc_device(cp, total_verts * 4);
-               }
-            } else if (cp->vs_shader->reads_vertex_id) {
-               /* Non-indexed: vertex_id is just thread_id + first, but the
-                * shader reads it out of this array rather than computing it,
-                * so it has to exist. Only materialised for the shaders that
-                * ask — a fullscreen pass building its corners from
-                * gl_VertexIndex is the usual one. */
-               vid_buf = (CUdeviceptr)(uintptr_t)
-                  cp_scratch_alloc(cp, (size_t)total_verts * 4);
-               if (vid_buf) {
-                  uint32_t *ids = (uint32_t *)(uintptr_t)vid_buf;
-                  for (unsigned v = 0; v < total_verts; v++)
-                     ids[v] = draws[0].start + v;
-               }
-            } else {
-               vid_buf = 0;
-            }
-            /* instance_id = 0 for all vertices (single instance) */
-            iid_buf = 0;
-         } else {
-            vid_buf = (CUdeviceptr)(uintptr_t)
-               cp_scratch_alloc(cp, (size_t)total_verts * 4);
-            iid_buf = (CUdeviceptr)(uintptr_t)
-               cp_scratch_alloc(cp, (size_t)total_verts * 4);
-            if (!vid_buf || !iid_buf) { FREE(refs); return; }
-
-            uint32_t *vid_host = malloc((size_t)total_verts * 4);
-            uint32_t *iid_host = malloc((size_t)total_verts * 4);
-            if (!vid_host || !iid_host) {
-               free(vid_host); free(iid_host); FREE(refs); return;
-            }
-            for (unsigned v = 0; v < total_verts; v++) {
-               vid_host[v] = refs[v].vertex;
-               iid_host[v] = refs[v].instance;
-            }
-            memcpy((void*)(uintptr_t)vid_buf, vid_host, (size_t)total_verts * 4);
-            memcpy((void*)(uintptr_t)iid_buf, iid_host, (size_t)total_verts * 4);
-            free(vid_host);
-            free(iid_host);
-         }
+         /* vid_buf and iid_buf were decided above, alongside the fetch kernel
+          * that fills them. */
 
          /*
           * The scalars the shader dereferences, in one block and so in one

@@ -549,6 +549,21 @@ struct cp_vertex_fetch_args {
    uint32_t start_instance;
    uint64_t vertex_ids;
    uint64_t instance_ids;
+   /*
+    * Assembled vertices in one instance, when the ids are derived here rather
+    * than read from `vertex_ids`. An instanced draw replays the same index
+    * range once per instance, so vertex v of the draw is vertex v % this of
+    * instance v / this — which is the whole of what the host used to compute
+    * and upload per vertex. Zero means the caller supplied the arrays.
+    */
+   uint32_t verts_per_instance;
+   /*
+    * Where to publish the ids for the vertex shader, which reads gl_VertexIndex
+    * and gl_InstanceIndex out of arrays indexed by thread. Either may be zero
+    * when the shader does not read that one.
+    */
+   uint64_t out_vertex_ids;
+   uint64_t out_instance_ids;
 };
 
 #endif /* CP_RAST_TYPES_H */

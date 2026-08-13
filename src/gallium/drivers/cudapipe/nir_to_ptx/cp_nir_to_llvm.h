@@ -24,6 +24,11 @@ struct cp_shader_binary {
     * draw have to materialise the vertex id array the shader reads from. */
    bool reads_vertex_id;
 
+   /* Whether the shader reads gl_InstanceIndex. Same bargain: the array is one
+    * uint32 per assembled vertex, which is megabytes for an instanced draw,
+    * and a shader that ignores the id does not need it written at all. */
+   bool reads_instance_id;
+
    /* Whether the shader can discard. An alpha-tested draw needs several passes
     * because visibility is resolved before shading. */
    bool uses_discard;

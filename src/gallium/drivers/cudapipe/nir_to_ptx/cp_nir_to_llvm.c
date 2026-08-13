@@ -2338,6 +2338,9 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
             case nir_intrinsic_load_vertex_id_zero_base:
                bin->reads_vertex_id = true;
                break;
+            case nir_intrinsic_load_instance_id:
+               bin->reads_instance_id = true;
+               break;
             case nir_intrinsic_terminate:
             case nir_intrinsic_terminate_if:
                bin->uses_discard = true;

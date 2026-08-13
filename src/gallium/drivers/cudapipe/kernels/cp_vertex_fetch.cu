@@ -23,18 +23,39 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
       vertex_id = ((const uint32_t *)(uintptr_t)args.vertex_ids)[v];
       instance_id = ((const uint32_t *)(uintptr_t)args.instance_ids)[v];
    } else {
-      /* TRIANGLE_LIST with index buffer: direct indexing */
+      /*
+       * TRIANGLE_LIST: the ids follow from the thread index alone. Every
+       * instance replays the same index range, so the vertex within the
+       * instance is v modulo the instance's vertex count and the instance is
+       * the quotient. verts_per_instance is num_verts for a single-instance
+       * draw, which leaves this the plain v it was before.
+       */
+      uint32_t local = v;
+      instance_id = 0;
+      if (args.verts_per_instance) {
+         local = v % args.verts_per_instance;
+         instance_id = v / args.verts_per_instance;
+      }
+
       if (args.index_buffer && args.index_size > 0) {
          const char *ib = (const char *)(uintptr_t)args.index_buffer;
          if (args.index_size == 2)
-            vertex_id = (uint32_t)((const unsigned short *)ib)[v] + args.first_vertex;
+            vertex_id = (uint32_t)((const unsigned short *)ib)[local] + args.first_vertex;
          else
-            vertex_id = ((const uint32_t *)ib)[v] + args.first_vertex;
+            vertex_id = ((const uint32_t *)ib)[local] + args.first_vertex;
       } else {
-         vertex_id = v + args.first_vertex;
+         vertex_id = local + args.first_vertex;
       }
-      instance_id = 0;
    }
+
+   /* Hand the ids to the vertex shader, which reads them per thread. Doing it
+    * here rather than on the host is the point of the block above: the arrays
+    * are megabytes for an instanced draw and every byte of them is derivable
+    * from v. */
+   if (args.out_vertex_ids)
+      ((uint32_t *)(uintptr_t)args.out_vertex_ids)[v] = vertex_id;
+   if (args.out_instance_ids)
+      ((uint32_t *)(uintptr_t)args.out_instance_ids)[v] = instance_id;
 
    /* Gather all attributes for this vertex into the packed output */
    char *out = (char *)(uintptr_t)args.output + (uint64_t)v * args.vs_in_stride;
