@@ -202,10 +202,20 @@ fi
 # Record the iteration as one json: the commit, what it was trying, the cost,
 # the delta against what it was compared to, which samples moved past 5% either
 # way, and what the correctness gate said. Written every time so that no
-# iteration depends on someone having remembered to describe it afterwards,
-# and collected into a page by `cp_iter_report.py page`.
+# iteration depends on someone having remembered to describe it afterwards.
 "$MESA/venv/bin/python3" "$T/cp_iter_report.py" --root "$ROOT" --mesa "$MESA" \
     record "$LABEL" --against "$AGAINST" --driver "$DRIVER" --frames "$FRAMES" \
     --bench-frames "$BENCH_FRAMES" --desc "${DESC:-}"
+
+# And collect it, for the same reason the record is written unconditionally.
+# `iterations.json` is what both pages fetch, and it is rebuilt from the
+# per-iteration records rather than appended to — so an iteration that ran, was
+# recorded and passed the gate stayed invisible in the history until someone
+# remembered a second command, which is the same failure this script already
+# refuses a reused label and an unrun gate to prevent. Rebuilding is a re-read
+# of the records on disk and costs a fraction of a second against a pass of
+# several minutes.
+"$MESA/venv/bin/python3" "$T/cp_iter_report.py" --root "$ROOT" --mesa "$MESA" \
+    page >/dev/null || echo "warning: could not rebuild iterations.json" >&2
 
 echo "=== [$LABEL] done -> $OUT ==="

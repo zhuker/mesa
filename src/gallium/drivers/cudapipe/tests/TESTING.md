@@ -566,6 +566,14 @@ time.
 cp_iter_report.py page     # rewrites iterations.json; the html never changes
 ```
 
+**`cp_iterate.sh` runs this itself**, so an iteration appears in the history
+without anyone remembering to. Run it by hand only after editing a record or
+adding one from elsewhere. It used to be a separate step, and the consequence
+was the one this script guards against everywhere else: an iteration that ran,
+recorded itself and passed the gate was simply absent from the page, because
+`iterations.json` is rebuilt from the per-iteration records rather than
+appended to.
+
 Both pages are static and fetch their data at load time, so they have to be
 served over HTTP rather than opened from a `file://` URL. `iterations.html` is
 the history — description, total, delta, and whether the correctness gate ran —
