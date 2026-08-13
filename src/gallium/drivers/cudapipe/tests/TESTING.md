@@ -11,8 +11,9 @@ been measuring the wrong thing confidently.
 | **cost** — what a frame costs, reliably enough to compare | "benchmark", "traps", "iterating on performance" |
 | **diagnosis** — where the time actually goes | "finding where the time goes" |
 
-The pass records — `../PERFORMANCE_PROGRESS.md` and `../PHASE_1A.md` — are what
-was done and what it was worth, not how to do it. This is how to do it.
+The pass records — `../PERFORMANCE_PROGRESS.md`, `../PHASE_1A.md`,
+`../INSTANCING.md` and `../BATCHING.md` — are what was done and what it was
+worth, not how to do it. This is how to do it.
 
 ---
 

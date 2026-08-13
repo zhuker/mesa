@@ -60,10 +60,12 @@ and compared to NVIDIA after every step; `tests/cp_iterate.sh` runs both passes
 and the comparison. No verdict against NVIDIA changed at any point, the two
 standing regressions (`gltfscenerendering`, `texture3d`) included.
 
-| | baseline | after the first pass | after phase 1a | after instancing |  |
-|---|---|---|---|---|---|
-| **total over the sweep** | **3792.15 ms** | **205.3 / 206.7 ms** | **168.10 ms** | **149.83 ms** | **~25.3x** |
-| llvmpipe, same sweep | 233.00 ms | 233.00 ms | 232.14 ms | 232.14 ms | — |
+| | baseline | first pass | phase 1a | instancing | batching |  |
+|---|---|---|---|---|---|---|
+| **total over the sweep** | **3792.15 ms** | **205.3 / 206.7 ms** | **168.10 ms** | **149.83 ms** | **108.98 ms** | **~34.8x** |
+| llvmpipe, same sweep | 233.00 ms | 233.00 ms | 232.14 ms | 232.14 ms | 232.14 ms | — |
+
+cudapipe is now **2.13x faster than llvmpipe** over the set.
 
 Two runs of the final build are quoted because they differ by 0.6%, which is
 about the run-to-run spread of the sweep and worth carrying so that a later
@@ -165,6 +167,17 @@ Two things stand out, and neither needs Phase 3:
   Batching draws is still the answer, and now for the stated reason — a batched
   draw gives stage 2 a grid worth launching — rather than because the launches
   themselves dominate.
+
+  **Done, in a narrow form that needs none of Phase 3 — `BATCHING.md`.**
+  12.34 → 1.29 ms. Consecutive draws that cannot depend on their order are
+  merged, which is safe because the visibility buffer resolves by `atomicMin`
+  and a minimum is order-independent; no sort key, no binning, no tile loop.
+  Stage 2's grid went 5 → 512 blocks. But the prediction above was only half
+  right: launches fell 1,127 → 11 and GPU kernel time 7.8 → 0.23 ms a frame,
+  and most of that was **multiplicity rather than grid size** — the
+  framebuffer-sized costs were being paid 125 times for one frame's output.
+  The sample is now host-bound at 25% GPU busy, in lavapipe's per-draw
+  descriptor allocation.
 
   Two ways out were named here, both structural: merge stages so a draw costs
   fewer kernels, on cuRE's argument for a persistent megakernel; or batch draws,
@@ -855,6 +868,20 @@ point already run on the device.
 # Phase 3 — tiled rasterization
 
 The largest change, and the one every reference design agrees on.
+
+**Part of what this phase was for has been taken without it.** Draw batching —
+named here as Phase 3's payoff, since per-draw cost stops scaling with draw
+count once several draws share a pass — turns out not to need binning, sorting
+or a tile loop for the *order-independent* case: with blending off the
+visibility buffer resolves by `atomicMin`, so draws whose result cannot depend
+on their order merge safely as they are. That is written up in `BATCHING.md` and
+took the sweep 145.53 → 108.98 ms.
+
+What is left for this phase is the part that argument does not reach: **blended
+draws**, where order is the whole problem and §3.3's submission-order sort key
+is the answer, and draws with **differing geometry**, which need per-draw index
+ranges rather than tiles. `particlesystem` at 52 ms is the standing case for the
+first and is untouched by anything so far.
 
 ## 3.1 Why this is the convergent answer
 

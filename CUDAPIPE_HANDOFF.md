@@ -264,7 +264,11 @@ lavapipe frontend (reused as-is)
     ↓ pipe_context calls (on submit thread)
 cudapipe Gallium driver
     ├── State changes write into persistent cp_gpu_state (managed memory)
-    ├── draw_vbo:
+    ├── draw_vbo: batches consecutive draws that cannot depend on their
+    │   order (blending off, so the visibility buffer's atomicMin resolve is
+    │   order-independent) and runs the pipeline below once for the batch.
+    │   See BATCHING.md. A batch of one is the unbatched path, bit-identical.
+    ├── the pipeline, per batch:
     │   1. cp_vertex_fetch      (GPU gathers attributes)
     │   2. Vertex shader kernel (NIR → PTX)
     │   3. cp_clip_triangles    (near plane and w > 0)
@@ -646,6 +650,12 @@ retried.
 | `CUDAPIPE_DEBUG_VFETCH` | dump what the GPU vertex fetch gathered (syncs) |
 | `CUDAPIPE_DEBUG_DISCARD` | covered and discarded pixels per alpha-test pass (syncs) |
 | `CUDAPIPE_DEBUG_SHADER` | warn on unhandled NIR intrinsics |
+| `CUDAPIPE_DEBUG_BATCH` | why each draw batch ended |
+| `CUDAPIPE_NO_BATCH` | disable draw batching; reproduces the unbatched frame byte for byte |
+| `CUDAPIPE_BATCH_MAX` | cap the batch size; `1` is the bit-identical check |
+| `CUDAPIPE_DEBUG_WORK` | shaded pixels against threads launched, per shading pass (syncs) |
+| `CUDAPIPE_NVTX` | NVTX timeline ranges per draw and stage; read with `tests/cp_prof_nvtx.py` |
+| `CUDAPIPE_MAX_REGISTERS` | cap shader registers via `CU_JIT_MAX_REGISTERS` |
 | `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
 
 ```bash

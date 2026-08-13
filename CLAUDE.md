@@ -13,8 +13,9 @@ being worked on here.
   time actually goes. Read it before trusting a number from either half.
 
 `CUDAPIPE_PLAN.md` and `src/gallium/drivers/cudapipe/{PERFORMANCE_PLAN,
-PERFORMANCE_PROGRESS,PHASE_1A,INSTANCING}.md` are records of past passes. Their
-forward-looking sections have been overtaken and say so where they have.
+PERFORMANCE_PROGRESS,PHASE_1A,INSTANCING,BATCHING}.md` are records of past
+passes. Their forward-looking sections have been overtaken and say so where
+they have.
 
 ## Profiling
 
