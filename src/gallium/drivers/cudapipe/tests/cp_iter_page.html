@@ -3,11 +3,11 @@
   Viewer for cp_iter_report.py's iterations.json.
 
   Static: it holds no data and never needs regenerating. `cp_iter_report.py
-  page` refreshes iterations.js beside it and this renders whatever is there.
-  The data is loaded from the .js rather than fetched from the .json because a
-  browser opening this from a file:// URL will not fetch a sibling file but
-  will run one via <script src>. iterations.json holds the same content and is
-  the one to read from another tool.
+  page` refreshes iterations.json beside it and this renders whatever is there.
+
+  Served over HTTP, not opened off disk. A browser will not fetch a sibling
+  file from a file:// URL, so opening this directly shows the message below
+  rather than the report.
 -->
 <html lang="en">
 <head>
@@ -89,10 +89,8 @@
   <div id="root"></div>
 </div>
 
-<script src="iterations.js"></script>
 <script>
-const D = (window.CP_ITERATIONS || {iterations: []});
-const IT = D.iterations || [];
+let D = {iterations: []}, IT = [];
 
 const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -212,11 +210,13 @@ function select(i) {
   document.getElementById("detail").innerHTML = detail(IT[i]);
 }
 
-if (!IT.length) {
-  document.getElementById("root").innerHTML =
-    `<p class="empty">No iterations found. Run
-     <code>cp_iter_report.py page</code> after an iteration has been recorded.</p>`;
-} else {
+function render() {
+  if (!IT.length) {
+    document.getElementById("root").innerHTML =
+      `<p class="empty">No iterations found. Run
+       <code>cp_iter_report.py page</code> after an iteration has been recorded.</p>`;
+    return;
+  }
   document.getElementById("sub").textContent =
     `${IT.length} iterations · generated ${D.generated || ""} · click a row`;
   document.getElementById("root").innerHTML = history();
@@ -226,6 +226,23 @@ if (!IT.length) {
   });
   select(IT.length - 1);
 }
+
+fetch("iterations.json", {cache: "no-store"})
+  .then(r => {
+    if (!r.ok) throw new Error(r.status + " " + r.statusText);
+    return r.json();
+  })
+  .then(d => { D = d; IT = d.iterations || []; render(); })
+  .catch(e => {
+    // Almost always one of two things: the page was opened off disk, where a
+    // browser refuses to fetch a sibling file, or `page` has not been run yet.
+    document.getElementById("root").innerHTML = `<div class="gate-bad">
+      <p><b>Could not load <code>iterations.json</code></b> — ${esc(e.message)}</p>
+      <p class="empty">This page reads its data at load time, so it has to be
+      served over HTTP rather than opened from a <code>file://</code> URL. If
+      the file is simply missing, run <code>cp_iter_report.py page</code>.</p>
+      </div>`;
+  });
 </script>
 </body>
 </html>

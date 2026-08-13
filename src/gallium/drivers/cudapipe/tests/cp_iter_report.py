@@ -11,15 +11,12 @@ and what the correctness gate said. cp_iterate.sh calls it at the end of a run,
 so every iteration gets one without anyone remembering to.
 
 `page` collects every `iteration.json` under the root into
-`_report/iterations.json` — one file holding the whole history — plus the same
-data as `iterations.js`, and copies the viewer to `_report/iterations.html`.
-
-Why two files with the same content: a browser opening the page from a `file://`
-URL refuses `fetch()` of a sibling `.json`, but will load a sibling `.js` with a
-`<script src>` tag. The `.json` is the one to read from another tool; the `.js`
-is what makes the page work without a web server. Neither the page nor the
-viewer has to be regenerated to look at a new iteration — re-running `page`
-rewrites only the data.
+`_report/iterations.json` — one file holding the whole history — and copies the
+viewer to `_report/iterations.html`. The viewer fetches that json at load time,
+so neither it nor the page has to be regenerated to look at a new iteration:
+re-running `page` rewrites only the data. It does mean the page has to be
+served over HTTP rather than opened from a file:// URL, which is what a browser
+allows.
 
 The point of all this is that a cost number is not a result on its own. What
 makes it one is knowing which build produced it, what was being tried, what it
@@ -247,10 +244,6 @@ def cmd_page(args):
     }
     with open(os.path.join(out, "iterations.json"), "w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
-    with open(os.path.join(out, "iterations.js"), "w") as f:
-        f.write("window.CP_ITERATIONS = ")
-        json.dump(payload, f, sort_keys=True)
-        f.write(";\n")
 
     if os.path.isfile(VIEWER):
         shutil.copyfile(VIEWER, os.path.join(out, "iterations.html"))
