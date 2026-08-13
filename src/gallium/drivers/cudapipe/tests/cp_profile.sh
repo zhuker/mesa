@@ -194,8 +194,15 @@ fi
 
 echo "=== [$LABEL] nsys $SAMPLE, $FRAMES frames ($NSYS_VER) ==="
 rm -f "$OUT/$SAMPLE.nsys-rep" "$OUT/$SAMPLE.sqlite"
-"$NSYS" profile \
-    --trace=cuda --sample=none --cpuctxsw=none \
+# NVTX as well as CUDA, and the driver's ranges turned on to fill it. Every
+# compiled shader is a kernel named `main`, so without the ranges the timeline
+# cannot say which draw or which stage a row belongs to; with them the trace
+# names itself. NVTX=0 leaves the driver silent for a trace that has to match
+# an older one, since the ranges cost a few percent when enabled.
+CUDAPIPE_NVTX_ENV=()
+[ "${NVTX:-1}" = "1" ] && CUDAPIPE_NVTX_ENV=(env CUDAPIPE_NVTX=1)
+"${CUDAPIPE_NVTX_ENV[@]}" "$NSYS" profile \
+    --trace=cuda,nvtx --sample=none --cpuctxsw=none \
     --force-overwrite true -o "$OUT/$SAMPLE" \
     "$BIN" "${args[@]}" > "$OUT/$SAMPLE.run.txt" 2>&1
 rc=$?

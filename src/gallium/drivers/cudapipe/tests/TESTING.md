@@ -67,6 +67,7 @@ justifies it.
 | `cp_gpu_busy.sh` | is the GPU actually busy — the measurement gate, untraced |
 | `cp_profile.sh` | one sample under a profiler, in three modes: `METRICS=1` device counters, default CUDA trace, `NCU=1` per-kernel counters |
 | `cp_prof_kernels.py` | a trace split by kernel *and grid size*, with the fixed-cost kernels flagged |
+| `cp_prof_nvtx.py` | the same trace split by *pipeline stage*, from the driver's NVTX ranges |
 
 **Run these with the repo venv's interpreter**, `$MESA/venv/bin/python3`
 (`pip install numpy pillow` beyond what the build needs), which is what
@@ -604,6 +605,41 @@ the same amount of work whatever it was asked to draw.
 Remember that tracing inflates short kernels much more than long ones, so read
 shares rather than absolute times, and never compare a traced total to an
 untraced one.
+
+#### The driver names its own timeline
+
+`cp_profile.sh` traces `--trace=cuda,nvtx` and runs the sample with
+`CUDAPIPE_NVTX=1`, so the driver pushes an NVTX range around each draw and each
+stage — `vertex`, `raster`, `interp`, `fs`, `writeback`, one per `pass`, and a
+`flush` mark per frame. `cp_prof_nvtx.py` aggregates them:
+
+```
+stage                    count    ms/frame    avg us  % of draw
+draw (all)               10125      105.37     41.63     100.0%
+pass 0                   10125       59.20     23.39      56.2%
+vertex                   10125       45.16     17.84      42.9%
+raster                   10125       20.21      7.99      19.2%
+```
+
+That is `dynamicuniformbuffer`, and it says the host spends 43% of its per-draw
+time issuing the vertex stage — a fact no kernel summary contains, because the
+cost is in submitting the work rather than in running it.
+
+**These are issue times, not device times.** A range closes when the launches
+are queued, not when the GPU finishes them. That is the useful reading for a
+launch-bound frame and the wrong one for anything else; `CUDAPIPE_DEBUG_TIME`
+and its CUDA events are the device measure. Read the two together — a stage
+costing far more to issue than to run is exactly what launch-bound looks like
+from the host side.
+
+The ranges cost about 4% on `multithreading` when enabled and nothing when not,
+so they are off unless `CUDAPIPE_NVTX` is set. `NVTX=0 cp_profile.sh ...` turns
+them off for a trace that has to be compared against an older one.
+
+This is also the structural fix for the `main` problem: `cp_prof_kernels.py`
+splits kernels by grid size because every compiled shader is named `main`, which
+works from outside. A range says which stage issued a launch, so the trace names
+itself.
 
 `NCU=1` runs Nsight Compute instead, for the counters `nsys` cannot give:
 occupancy, memory throughput and warp stall reasons. It used to fail here with

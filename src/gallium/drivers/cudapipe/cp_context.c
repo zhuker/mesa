@@ -1,5 +1,6 @@
 #include "cp_context.h"
 #include "cp_screen.h"
+#include "cp_nvtx.h"
 #include "cp_resource.h"
 #include "nir_to_ptx/cp_nir_to_llvm.h"
 #include "compiler/nir/nir.h"
@@ -878,15 +879,20 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    }
 
    void *interp_params[] = { &interp };
-   /* One thread per 2x2 quad, and the shader then runs four threads per quad
-    * so it can difference across one. */
-   unsigned num_quads = ((w + 1) / 2) * ((h + 1) / 2);
-   CUresult interp_err = cuLaunchKernel(screen->kernels.fs_interpolate,
-                                        (num_quads + 255) / 256, 1, 1, 256, 1, 1,
-                                        0, cp->stream, interp_params, NULL);
-   if (interp_err != CUDA_SUCCESS) {
-      fprintf(stderr, "cudapipe: fs_interpolate launch failed (%d)\n", interp_err);
-      return;
+   {
+      /* Scoped rather than pushed and popped, because the launch check below
+       * returns out of the middle of it. */
+      CP_NVTX_SCOPE("interp");
+      /* One thread per 2x2 quad, and the shader then runs four threads per
+       * quad so it can difference across one. */
+      unsigned num_quads = ((w + 1) / 2) * ((h + 1) / 2);
+      CUresult interp_err = cuLaunchKernel(screen->kernels.fs_interpolate,
+                                           (num_quads + 255) / 256, 1, 1, 256, 1, 1,
+                                           0, cp->stream, interp_params, NULL);
+      if (interp_err != CUDA_SUCCESS) {
+         fprintf(stderr, "cudapipe: fs_interpolate launch failed (%d)\n", interp_err);
+         return;
+      }
    }
    cp_stage_end(cp, CP_STAGE_INTERPOLATE);
 
@@ -983,11 +989,15 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 
    void *fs_arg_ptr = (void *)(uintptr_t)fs_args_dev;
    void *fs_params[] = { &fs_arg_ptr };
-   CUresult fs_err = cuLaunchKernel(fs->kernel, (num_pixels + 255) / 256, 1, 1,
-                                    256, 1, 1, 0, cp->stream, fs_params, NULL);
-   if (fs_err != CUDA_SUCCESS) {
-      fprintf(stderr, "cudapipe: fragment shader launch failed (%d)\n", fs_err);
-      return;
+   {
+      /* Scoped: the launch check returns out of the middle. */
+      CP_NVTX_SCOPE("fs");
+      CUresult fs_err = cuLaunchKernel(fs->kernel, (num_pixels + 255) / 256, 1, 1,
+                                       256, 1, 1, 0, cp->stream, fs_params, NULL);
+      if (fs_err != CUDA_SUCCESS) {
+         fprintf(stderr, "cudapipe: fragment shader launch failed (%d)\n", fs_err);
+         return;
+      }
    }
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
@@ -1031,9 +1041,11 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    };
 
    void *wb_params[] = { &wb };
+   cp_nvtx_push("writeback");
    cuLaunchKernel(screen->kernels.fs_writeback,
                   (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
                   0, cp->stream, wb_params, NULL);
+   cp_nvtx_pop();   /* writeback */
    cp_stage_end(cp, CP_STAGE_WRITEBACK);
 
    /* How much of the shading launch does any work. Syncs, so debug only, and
@@ -1292,6 +1304,11 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
           cp->depth_stencil.depth_func == PIPE_FUNC_GEQUAL),
    };
 
+   /* Names this draw on the timeline for the rest of the function, however it
+    * leaves — see CP_NVTX_SCOPE. */
+   CP_NVTX_SCOPEF("draw %u tris%s", num_triangles,
+                  instance_count > 1 ? " inst" : "");
+
    /* Marks the start of the draw; the interval it opens is
     * attributed to nothing. */
    cp_stage_end(cp, -1);
@@ -1409,6 +1426,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
     * The output replaces packed_positions for the rasterizer. */
    /* VS execution */
    if (cp->vs_shader && cp->vs_shader->kernel) {
+      CP_NVTX_SCOPE("vertex");
       void *vb_data2 = NULL;
       if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
          struct cp_resource *vb_res2 =
@@ -1828,6 +1846,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    unsigned interval_start = 0;
 
    for (unsigned pass = 0; pass < passes; pass++) {
+      CP_NVTX_SCOPEF("pass %u", pass);
       cp->scratch.used = shade_mark;
       cp->dscratch.used = shade_dmark;
       if (pass) {
@@ -1845,6 +1864,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
 
       /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
+      cp_nvtx_push("raster");
       void *s1_params[] = { &rast_args, &rast_queues };
       CUresult rast_err = cuLaunchKernel(screen->kernels.rasterize_stage1,
          (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
@@ -1884,6 +1904,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
       if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
          fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
+      cp_nvtx_pop();   /* raster */
       cp_stage_end(cp, CP_STAGE_RASTERIZE);
 
       /* Shade every covered pixel by running the fragment shader on the GPU:
@@ -2094,6 +2115,7 @@ cp_flush(struct pipe_context *ctx, struct pipe_fence_handle **fence,
     */
    cuCtxSynchronize();
    cp_scratch_reset(cp);
+   cp_nvtx_mark("flush");
 }
 
 /* Stub state functions - store state for use at draw time */

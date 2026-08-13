@@ -35,11 +35,21 @@ endif
 dep_nvrtc = meson.get_compiler('c').find_library('nvrtc', required : false)
 dep_nvjitlink = meson.get_compiler('c').find_library('nvJitLink', required : false)
 
+# NVTX is header-only in its v3 form — the headers load the injection library
+# themselves when a profiler is attached, so there is nothing to link and
+# nothing to pay for when there is no profiler. Optional so that a CUDA install
+# without the headers still builds; the ranges compile out.
+cp_nvtx_args = []
+if meson.get_compiler('c').has_header('nvtx3/nvToolsExt.h')
+  cp_nvtx_args += '-DCP_HAVE_NVTX'
+endif
+
 libcudapipe = static_library(
   'cudapipe',
   [files_cudapipe, cudapipe_kernel_incs],
   include_directories : [inc_include, inc_src, inc_util, inc_gallium, inc_gallium_aux, inc_cudapipe],
   dependencies : [idep_nir, idep_mesautil, dep_cuda, dep_nvrtc, dep_nvjitlink, dep_llvm],
+  c_args : cp_nvtx_args,
   gnu_symbol_visibility : 'hidden',
 )
 
