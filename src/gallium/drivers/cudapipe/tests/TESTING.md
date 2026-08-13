@@ -615,16 +615,25 @@ stage — `vertex`, `raster`, `interp`, `fs`, `writeback`, one per `pass`, and a
 `flush` mark per frame. `cp_prof_nvtx.py` aggregates them:
 
 ```
-stage                    count    ms/frame    avg us  % of draw
-draw (all)               10125      105.37     41.63     100.0%
-pass 0                   10125       59.20     23.39      56.2%
-vertex                   10125       45.16     17.84      42.9%
-raster                   10125       20.21      7.99      19.2%
+stage                    count   ms total   us/draw  % of draw
+draw (all)               10125      421.5     41.63     100.0%
+pass 0                   10125      236.8     23.39      56.2%
+vertex                   10125      180.6     17.84      42.9%
+raster                   10125       80.9      7.99      19.2%
 ```
 
 That is `dynamicuniformbuffer`, and it says the host spends 43% of its per-draw
-time issuing the vertex stage — a fact no kernel summary contains, because the
-cost is in submitting the work rather than in running it.
+issue time on the vertex stage — a fact no kernel summary contains, because the
+cost is in submitting the work rather than in running it. The vertex block makes
+about seven of the sixteen CUDA calls a draw makes, and that ratio is what the
+share is measuring.
+
+**Per draw, not per frame.** The trace covers the whole process and
+`cp_profile.sh` renders `--benchwarmup 1` before the frames it was asked for, so
+a four-frame profile of a 12 ms sample holds about eighty-four frames. Dividing
+by the number given to `cp_profile.sh` overstates every per-frame figure by
+twenty times, which is exactly what happened the first time this table was
+printed. Draws are counted in the trace itself, so they are the denominator.
 
 **These are issue times, not device times.** A range closes when the launches
 are queued, not when the GPU finishes them. That is the useful reading for a

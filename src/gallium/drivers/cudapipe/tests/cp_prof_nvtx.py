@@ -18,6 +18,14 @@ the shape of a launch-bound frame.
 
 Tracing inflates per-launch host cost, so compare shares between stages rather
 than absolute times, and never against an untraced frame.
+
+**Per draw and % of draw are the honest columns; per frame is a trap.** The
+trace covers the whole process, and cp_profile.sh runs the sample with
+`--benchwarmup 1` — a second of warm-up frames rendered before the ones it was
+asked to time. A four-frame profile of a 12 ms sample therefore contains about
+eighty-four frames, so dividing by the number given to cp_profile.sh overstates
+every per-frame figure by twenty times. Draws are counted in the trace itself,
+which is why they are the default denominator and frames are not.
 """
 import argparse
 import os
@@ -29,7 +37,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("sqlite")
     ap.add_argument("--frames", type=int, default=0,
-                    help="divide totals by this many frames")
+                    help="divide totals by this many frames — and see the "
+                         "warning below, because it is NOT the frame count "
+                         "passed to cp_profile.sh")
     args = ap.parse_args()
 
     if not os.path.exists(args.sqlite):
@@ -63,27 +73,30 @@ def main():
     draw_total = sum(t for n, c, t, a in rows if n.startswith("draw "))
     draw_count = sum(c for n, c, t, a in rows if n.startswith("draw "))
 
-    per = args.frames if args.frames > 0 else 1
-    unit = "ms/frame" if args.frames > 0 else "ms total"
-
-    print(f"{'stage':<20}{'count':>10}{unit:>12}{'avg us':>10}{'% of draw':>11}")
-    print("-" * 63)
+    print(f"{'stage':<20}{'count':>10}{'ms total':>11}{'us/draw':>10}{'% of draw':>11}")
+    print("-" * 62)
     if draw_count:
-        print(f"{'draw (all)':<20}{draw_count:>10}"
-              f"{draw_total/1e6/per:>12.2f}{draw_total/draw_count/1e3:>10.2f}"
-              f"{100.0:>10.1f}%")
+        print(f"{'draw (all)':<20}{draw_count:>10}{draw_total/1e6:>11.1f}"
+              f"{draw_total/draw_count/1e3:>10.2f}{100.0:>10.1f}%")
     for name, count, total, avg in rows:
         if name.startswith("draw "):
             continue
         share = 100.0 * total / draw_total if draw_total else 0.0
-        print(f"{name[:19]:<20}{count:>10}{total/1e6/per:>12.2f}"
-              f"{avg/1e3:>10.2f}{share:>10.1f}%")
+        per_draw = total / draw_count / 1e3 if draw_count else 0.0
+        print(f"{name[:19]:<20}{count:>10}{total/1e6:>11.1f}"
+              f"{per_draw:>10.2f}{share:>10.1f}%")
 
-    if draw_count and args.frames > 0:
-        print("-" * 63)
-        print(f"{draw_count/args.frames:.0f} draws per frame")
     for name, count in marks:
         print(f"mark {name}: {count}")
+
+    if args.frames > 0:
+        print("-" * 62)
+        print(f"per frame at --frames {args.frames}: "
+              f"{draw_count/args.frames:.0f} draws, "
+              f"{draw_total/1e6/args.frames:.2f} ms of draw")
+        print("  ^ only if that is the number of frames the *process* rendered.")
+        print("    cp_profile.sh adds a second of warm-up that is traced too, so")
+        print("    a 4-frame profile of a 12 ms sample holds about 84 of them.")
 
     print()
     print("Issue time, not device time — every launch is asynchronous. Read")
