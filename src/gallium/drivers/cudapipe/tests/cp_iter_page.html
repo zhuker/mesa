@@ -1,0 +1,231 @@
+<!doctype html>
+<!--
+  Viewer for cp_iter_report.py's iterations.json.
+
+  Static: it holds no data and never needs regenerating. `cp_iter_report.py
+  page` refreshes iterations.js beside it and this renders whatever is there.
+  The data is loaded from the .js rather than fetched from the .json because a
+  browser opening this from a file:// URL will not fetch a sibling file but
+  will run one via <script src>. iterations.json holds the same content and is
+  the one to read from another tool.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cudapipe iterations</title>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #f6f7f9; --line: #dfe3e8; --fg: #14171a;
+    --dim: #5b6570; --win: #0b7a3b; --winbg: #e6f4ec;
+    --reg: #b3261e; --regbg: #fbeae9; --accent: #2a5db0; --warn: #8a5a00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14171a; --panel: #1c2126; --line: #2c333a; --fg: #e6eaee;
+      --dim: #97a3ae; --win: #4ad07f; --winbg: #10291c;
+      --reg: #ff7b72; --regbg: #2b1614; --accent: #7aa7f0; --warn: #e0b050;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14171a; --panel: #1c2126; --line: #2c333a; --fg: #e6eaee;
+    --dim: #97a3ae; --win: #4ad07f; --winbg: #10291c;
+    --reg: #ff7b72; --regbg: #2b1614; --accent: #7aa7f0; --warn: #e0b050;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 80px; }
+  h1 { font-size: 21px; margin: 0 0 2px; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 30px 0 10px; letter-spacing: -0.01em; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 22px; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  /* history */
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: right; padding: 6px 9px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--dim); font-weight: 600; font-size: 12px;
+       text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--panel); }
+  tr.sel { background: var(--panel); box-shadow: inset 3px 0 0 var(--accent); }
+  .scroll { overflow-x: auto; }
+
+  .pct.win { color: var(--win); font-weight: 600; }
+  .pct.reg { color: var(--reg); font-weight: 600; }
+  .pct.flat { color: var(--dim); }
+  .noisy { opacity: .55; }
+
+  .bar { height: 4px; background: var(--accent); border-radius: 2px; display: block; }
+
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px;
+           font-size: 11px; font-weight: 600; white-space: nowrap; }
+  .badge.ok  { background: var(--winbg); color: var(--win); }
+  .badge.bad { background: var(--regbg); color: var(--reg); }
+  .badge.warn{ background: var(--regbg); color: var(--warn); }
+
+  .detail { margin-top: 8px; border: 1px solid var(--line); border-radius: 10px;
+            background: var(--panel); padding: 18px 20px; }
+  .desc { font-size: 14px; margin: 0 0 12px; }
+  .meta { color: var(--dim); font-size: 12px; margin-bottom: 14px; }
+  .meta span { margin-right: 16px; white-space: nowrap; }
+  ul.notes { margin: 0 0 14px; padding-left: 18px; color: var(--dim); font-size: 13px; }
+
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  @media (max-width: 780px) { .cols { grid-template-columns: 1fr; } }
+  .movers li { margin-bottom: 3px; font-size: 13px; list-style: none; }
+  .movers ul { padding: 0; margin: 0; }
+  .empty { color: var(--dim); font-style: italic; font-size: 13px; }
+  .gate-bad { border-left: 3px solid var(--reg); padding-left: 12px; margin: 12px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>cudapipe iterations</h1>
+  <div class="sub" id="sub"></div>
+  <div id="root"></div>
+</div>
+
+<script src="iterations.js"></script>
+<script>
+const D = (window.CP_ITERATIONS || {iterations: []});
+const IT = D.iterations || [];
+
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const f2 = n => (n == null ? "" : n.toFixed(2));
+
+function pctCell(p, noisy) {
+  if (p == null) return '<td class="pct flat">—</td>';
+  const cls = p <= -5 ? "win" : p >= 5 ? "reg" : "flat";
+  return `<td class="pct ${cls}${noisy ? " noisy" : ""}">${p > 0 ? "+" : ""}${p.toFixed(1)}%</td>`;
+}
+
+function history() {
+  const max = Math.max(...IT.map(r => r.total_ms || 0), 1);
+  const rows = IT.map((r, i) => {
+    const p = r.total_pct;
+    const gate = r.correctness && r.correctness.gate_ran;
+    const changed = (r.correctness && r.correctness.changed_vs_against) || [];
+    let badge = gate
+      ? (changed.length
+          ? `<span class="badge bad">${changed.length} verdict changed</span>`
+          : '<span class="badge ok">verdicts unchanged</span>')
+      : '<span class="badge warn">gate did not run</span>';
+    return `<tr data-i="${i}">
+      <td><code>${esc(r.label)}</code></td>
+      <td style="text-align:left;width:34%">${esc(r.description || "")}</td>
+      <td>${f2(r.total_ms)}</td>
+      ${pctCell(p)}
+      <td style="width:110px"><span class="bar" style="width:${
+        Math.max(2, 100 * (r.total_ms || 0) / max)}%"></span></td>
+      <td style="text-align:left">${badge}</td>
+    </tr>`;
+  }).join("");
+  return `<h2>History</h2><div class="scroll"><table>
+    <thead><tr><th>iteration</th><th style="text-align:left">what changed</th>
+    <th>total ms</th><th>vs prev</th><th></th>
+    <th style="text-align:left">correctness</th></tr></thead>
+    <tbody id="hist">${rows}</tbody></table></div>
+    <div id="detail"></div>`;
+}
+
+function movers(list, kind) {
+  if (!list || !list.length)
+    return `<p class="empty">none past ±5%</p>`;
+  return '<ul>' + list.map(m => `<li class="${m.noisy ? "noisy" : ""}">
+      <span class="pct ${kind}">${m.pct > 0 ? "+" : ""}${m.pct.toFixed(1)}%</span>
+      &nbsp;<code>${esc(m.sample)}</code>
+      <span style="color:var(--dim)">${f2(m.before)} → ${f2(m.after)} ms${
+        m.noisy ? " · under the noise floor" : ""}</span></li>`).join("") + '</ul>';
+}
+
+function detail(r) {
+  const c = r.correctness || {};
+  const samples = Object.keys(r.cost || {}).sort(
+    (a, b) => (r.cost[b].ms_avg || 0) - (r.cost[a].ms_avg || 0));
+
+  const rows = samples.map(s => {
+    const co = r.cost[s], d = (r.delta || {})[s];
+    const v = (c.samples || {})[s] || {};
+    const vb = v.verdict === "ok" ? '<span class="badge ok">ok</span>'
+             : v.verdict === "REGRESSED" ? '<span class="badge bad">regressed</span>'
+             : v.verdict ? `<span class="badge warn">${esc(v.verdict)}</span>` : "";
+    return `<tr><td><code>${esc(s)}</code></td>
+      <td>${f2(co.ms_avg)}</td>
+      <td>${d ? f2(d.before) : ""}</td>
+      ${d ? pctCell(d.pct, d.noisy) : '<td class="pct flat">—</td>'}
+      <td>${v.frame0 != null ? v.frame0 : ""}</td>
+      <td>${v.worst != null ? v.worst : ""}</td>
+      <td>${v.at != null ? v.at : ""}</td>
+      <td style="text-align:left">${vb}</td>
+      <td>${co.exit === 0 ? "" : '<span class="badge bad">exit ' + co.exit + "</span>"}</td>
+    </tr>`;
+  }).join("");
+
+  const gateWarn = c.gate_ran ? "" : `<div class="gate-bad"><b>The correctness gate
+    did not run for this iteration.</b> Its cost numbers are unguarded — a
+    sample regressing and the check never running both exit 1, so the status
+    alone does not tell them apart.</div>`;
+
+  const changed = (c.changed_vs_against || []);
+  const changedHtml = changed.length ? `<div class="gate-bad"><b>Verdict changed
+    against ${esc(r.against)}:</b> ` + changed.map(x =>
+    `<code>${esc(x.sample)}</code> ${esc(x.was)} → ${esc(x.now)}`).join(", ")
+    + "</div>" : "";
+
+  return `<div class="detail">
+    <p class="desc"><b><code>${esc(r.label)}</code></b> — ${esc(r.description || "no description recorded")}</p>
+    <div class="meta">
+      <span>commit <code>${esc((r.commit || "").slice(0, 11)) || "—"}</code></span>
+      <span>${esc(r.driver || "")}, ${r.frames || "?"} frames</span>
+      <span>vs <code>${esc(r.against || "—")}</code></span>
+      ${r.dirty && r.dirty.length ? `<span style="color:var(--warn)">uncommitted: ${
+        r.dirty.map(esc).join(", ")}</span>` : ""}
+    </div>
+    ${r.commit_subject ? `<div class="meta"><span>${esc(r.commit_subject)}</span></div>` : ""}
+    ${(r.notes || []).length ? "<ul class='notes'>" +
+       r.notes.map(n => "<li>" + esc(n) + "</li>").join("") + "</ul>" : ""}
+    ${gateWarn}${changedHtml}
+    <div class="cols movers">
+      <div><h2 style="margin-top:4px">Wins</h2>${movers(r.wins, "win")}</div>
+      <div><h2 style="margin-top:4px">Regressions</h2>${movers(r.regressions, "reg")}</div>
+    </div>
+    <h2>Per sample</h2><div class="scroll"><table>
+      <thead><tr><th>sample</th><th>ms</th><th>before</th><th>change</th>
+      <th>frame 0</th><th>worst</th><th>at</th>
+      <th style="text-align:left">verdict</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <p class="sub" style="margin:10px 0 0">Correctness is every one of the
+      ${r.frames || 60} frames of each sample against the stored NVIDIA
+      reference at tolerance 8/255, not frame 0 — <code>worst</code> and
+      <code>at</code> are which frame was furthest off and where.</p>
+  </div>`;
+}
+
+function select(i) {
+  document.querySelectorAll("#hist tr").forEach(
+    (tr, j) => tr.classList.toggle("sel", i === j));
+  document.getElementById("detail").innerHTML = detail(IT[i]);
+}
+
+if (!IT.length) {
+  document.getElementById("root").innerHTML =
+    `<p class="empty">No iterations found. Run
+     <code>cp_iter_report.py page</code> after an iteration has been recorded.</p>`;
+} else {
+  document.getElementById("sub").textContent =
+    `${IT.length} iterations · generated ${D.generated || ""} · click a row`;
+  document.getElementById("root").innerHTML = history();
+  document.getElementById("hist").addEventListener("click", e => {
+    const tr = e.target.closest("tr");
+    if (tr) select(+tr.dataset.i);
+  });
+  select(IT.length - 1);
+}
+</script>
+</body>
+</html>

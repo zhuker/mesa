@@ -3,13 +3,20 @@
 # One optimisation iteration: build, time the sixty frames, render them, and
 # say what changed against another iteration.
 #
-#   cp_iterate.sh LABEL [COMPARE_LABEL]
+#   DESC="what this tried" cp_iterate.sh LABEL [COMPARE_LABEL]
 #
 # Everything lands under $VULKAN/build/iter/LABEL:
 #
 #   bench/   the timed pass — _bench.csv, per-sample frame times, no images
 #   verdict.txt   cp_compare_frames.py against the stored nvidia reference
 #   delta.txt     ms/frame against COMPARE_LABEL, per sample and in total
+#   iteration.json  all of the above as one record, plus the commit, DESC, and
+#                   which samples moved past 5% either way
+#
+# DESC is worth setting. A label and a number stop meaning anything within a
+# day or so of the run; what the iteration was trying is the part nobody can
+# reconstruct afterwards. It also ends up on the page that
+# cp_iter_report.py builds over every iteration's json.
 #
 # The stored frames go to build/iter/_frames/LABEL instead, beside the nvidia
 # reference at build/iter/_frames/nvidia, because cp_compare_frames.py takes one
@@ -149,5 +156,14 @@ print(f"{'TOTAL':<24}{to:>12.2f}{tn:>12.2f}"
       f"{(tn-to)/to*100 if to else 0:>9.1f}%")
 PY
 fi
+
+# Record the iteration as one json: the commit, what it was trying, the cost,
+# the delta against what it was compared to, which samples moved past 5% either
+# way, and what the correctness gate said. Written every time so that no
+# iteration depends on someone having remembered to describe it afterwards,
+# and collected into a page by `cp_iter_report.py page`.
+"$MESA/venv/bin/python3" "$T/cp_iter_report.py" --root "$ROOT" --mesa "$MESA" \
+    record "$LABEL" --against "$AGAINST" --driver "$DRIVER" --frames "$FRAMES" \
+    --desc "${DESC:-}"
 
 echo "=== [$LABEL] done -> $OUT ==="
