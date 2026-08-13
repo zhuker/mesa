@@ -31,10 +31,21 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
        * draw, which leaves this the plain v it was before.
        */
       uint32_t local = v;
+
+      /*
+       * A batch replays one draw's index range once per draw, so the vertex
+       * within the draw is v modulo the draw's vertex count. The gather is
+       * then identical for every draw of the batch — what differs is the
+       * uniform block the vertex shader reads, which it picks from the same
+       * quotient. Zero for an unbatched draw, which leaves this untouched.
+       */
+      if (args.verts_per_draw)
+         local = v % args.verts_per_draw;
+
       instance_id = 0;
       if (args.verts_per_instance) {
-         local = v % args.verts_per_instance;
-         instance_id = v / args.verts_per_instance;
+         instance_id = local / args.verts_per_instance;
+         local = local % args.verts_per_instance;
       }
 
       if (args.index_buffer && args.index_size > 0) {

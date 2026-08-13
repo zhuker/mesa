@@ -179,6 +179,11 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
    if (!transfer)
       return NULL;
 
+   /* A map is where the host looks at what the GPU drew, so any draws still
+    * being held back for merging have to be submitted before the sync below
+    * — otherwise the readback waits for a queue they were never put on. */
+   cp_batch_flush(cp);
+
    /* If reading GPU-written data, ensure all kernels have finished. */
    if (!(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) &&
        !(usage & PIPE_MAP_DISCARD_RANGE)) {
@@ -229,6 +234,7 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
    struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *src_res = cp_resource(src);
    struct cp_resource *dst_res = cp_resource(dst);
+   cp_batch_flush(cp);
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
 
@@ -280,6 +286,7 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *src_res = cp_resource(info->src.resource);
    struct cp_resource *dst_res = cp_resource(info->dst.resource);
+   cp_batch_flush(cp);
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
    if (getenv("CUDAPIPE_DEBUG_DRAW"))
@@ -527,6 +534,7 @@ cp_clear_buffer(struct pipe_context *ctx, struct pipe_resource *res,
 {
    struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *cp_res = cp_resource(res);
+   cp_batch_flush(cp);
    void *data = cp_resource_data(cp_res);
    if (!data)
       return;
@@ -559,6 +567,7 @@ cp_clear_render_target(struct pipe_context *ctx, struct pipe_surface *dst,
    if (!dst || !dst->texture)
       return;
    struct cp_context *cp = (struct cp_context *)ctx;
+   cp_batch_flush(cp);
    struct cp_resource *res = cp_resource(dst->texture);
    void *data = cp_resource_data(res);
    if (!data)
@@ -590,6 +599,7 @@ cp_clear_depth_stencil(struct pipe_context *ctx, struct pipe_surface *dst,
                        unsigned width, unsigned height,
                        bool render_condition_enabled)
 {
+   cp_batch_flush((struct cp_context *)ctx);
    if (!dst || !dst->texture)
       return;
    struct cp_resource *res = cp_resource(dst->texture);
@@ -622,6 +632,7 @@ cp_clear_texture(struct pipe_context *ctx, struct pipe_resource *res,
                  unsigned level, const struct pipe_box *box, const void *data)
 {
    struct cp_resource *cp_res = cp_resource(res);
+   cp_batch_flush((struct cp_context *)ctx);
    void *tex_data = cp_resource_data(cp_res);
    if (!tex_data)
       return;
@@ -652,6 +663,9 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
    struct pipe_framebuffer_state *fb = &cp_ctx->framebuffer;
 
    cuCtxSetCurrent(screen->cuda_ctx);
+
+   /* A clear overwrites what the held-back draws were going to draw into. */
+   cp_batch_flush(cp_ctx);
 
    if (getenv("CUDAPIPE_DEBUG_DRAW"))
       fprintf(stderr, "cudapipe: clear buffers=0x%x color=[%.2f,%.2f,%.2f,%.2f]\n",

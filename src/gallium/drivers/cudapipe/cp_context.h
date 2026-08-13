@@ -12,10 +12,105 @@ struct cp_shader_binary;
 #define CP_MAX_CONST_BUFFERS  16
 #define CP_MAX_SAMPLERS       256
 
+/*
+ * Draw batching.
+ *
+ * Consecutive draws that would produce the same pixels in any order are held
+ * back and submitted as one. What makes that safe is the visibility buffer:
+ * with blending off it resolves the nearest fragment per pixel by atomicMin,
+ * which does not care in what order the fragments arrived, so a batch needs no
+ * submission-order sort key. See cp_batch_eligible() and struct cp_batch_key for the
+ * whole list of conditions, all of which have to hold.
+ *
+ * The point is grid size. dynamicuniformbuffer draws 125 twelve-triangle cubes
+ * a frame, and every stage is sized to one of them: cp_rasterize_stage2 runs on
+ * five blocks of a 170-SM card and owns a quarter of the frame. A batch gives
+ * the same kernels a grid worth launching, and pays the framebuffer-sized fixed
+ * costs — the visibility clear, the interpolator, the fragment grid — once for
+ * the batch instead of once per draw.
+ *
+ * The cap is on draws and on triangles both, because the buffers a draw sizes
+ * from its triangle count (the near-plane clipper's output, three per input
+ * triangle) scale with the batch and the arena has a hard limit.
+ */
+#define CP_MAX_BATCH_DRAWS 128
+#define CP_MAX_BATCH_TRIS  (256 * 1024)
+
+/*
+ * Everything that has to be the same for two consecutive draws to be merged.
+ *
+ * Built by cp_batch_build_key() and compared with memcmp, so that adding a
+ * piece of state to the driver and forgetting it here is the one mistake this
+ * cannot make quietly: the key is filled from a zeroed struct by a single
+ * function, and anything it does not copy is simply not a merge condition.
+ * What is deliberately *absent* is the vertex stage's uniform bindings — those
+ * are what a batch is allowed to differ in, and what the table in the shader's
+ * argument block exists to carry.
+ */
+struct cp_batch_key {
+   const void *vs, *fs;
+
+   /* Framebuffer and the driver's own per-pass buffers. */
+   const void *cbuf_texture, *zs_texture, *color_data;
+   uint64_t visbuf, depthbuf;
+   uint32_t fb_w, fb_h, fb_nr_cbufs, fb_samples, cbuf_format;
+
+   /* The draw itself. Batched draws replay one index range, so the range is
+    * part of the key rather than something the batch varies. */
+   uint32_t mode, index_size, instance_count, start_instance, drawid_offset;
+   const void *index_resource;
+   uint32_t draw_start, draw_count;
+   int32_t draw_index_bias;
+
+   /* Pipeline state, whole structs: a field added upstream is then covered
+    * without anything here having to name it. */
+   struct pipe_viewport_state viewport;
+   struct pipe_scissor_state scissor;
+   struct pipe_rasterizer_state rasterizer;
+   struct pipe_depth_stencil_alpha_state depth_stencil;
+   struct pipe_blend_state blend_state;
+   uint32_t blend_enabled;
+
+   /* Vertex input. */
+   struct pipe_vertex_element vertex_elements[16];
+   uint32_t num_vertex_elements, vertex_stride, num_vertex_buffers;
+   struct {
+      const void *resource;
+      uint32_t offset;
+   } vertex_buffers[16];
+
+   /* Fragment bindings, which a batch may *not* vary — see cp_rast_types.h.
+    * The vertex count is here too, since the table's rows are that wide. */
+   uint32_t num_fs_ubos, num_vs_ubos;
+   const void *fs_ubos[CP_MAX_CONST_BUFFERS];
+   uint32_t fs_ubo_sizes[CP_MAX_CONST_BUFFERS];
+   uint64_t sampler_table;
+   uint32_t num_samplers;
+};
+
 struct cp_context {
    struct pipe_context base;
 
    struct cp_screen *screen;
+
+   /*
+    * Draws held back for merging. `pending` means one or more draws have been
+    * accepted and nothing has run yet, so every path that observes rendering —
+    * a flush, a readback, a clear, a blit, a dispatch — has to call
+    * cp_batch_flush() before it looks.
+    */
+   struct {
+      bool pending;
+      unsigned ndraws;
+      unsigned tris_per_draw;
+      struct cp_batch_key key;
+      struct pipe_draw_info info;
+      struct pipe_draw_start_count_bias draw;
+      unsigned drawid_offset;
+      /* One row of vertex-stage uniform pointers per draw, in the layout the
+       * shader indexes: row * CP_ARG_UBO_STRIDE + binding. */
+      uint64_t vs_ubos[CP_MAX_BATCH_DRAWS * CP_MAX_CONST_BUFFERS];
+   } batch;
 
    /*
     * The stream every launch, memset and copy in the frame path goes on.
@@ -114,6 +209,7 @@ struct cp_context {
       unsigned buffer_size;
       CUdeviceptr managed_copy; /* Device buffer for user_buffer data */
       unsigned managed_size;
+      bool user_copy;
    } compute_ubos[CP_MAX_CONST_BUFFERS];
    unsigned num_compute_ubos;
 
@@ -122,6 +218,14 @@ struct cp_context {
       unsigned buffer_size;
       CUdeviceptr managed_copy;
       unsigned managed_size;
+      /*
+       * The binding came from a user pointer and was copied into
+       * `managed_copy`, which is reused for every update. Two draws then see
+       * the same device address with different contents, so a batch that
+       * deferred either of them would shade both with whichever value landed
+       * last. cp_batch_eligible() refuses such a draw outright.
+       */
+      bool user_copy;
    } fs_ubos[CP_MAX_CONST_BUFFERS];
    unsigned num_fs_ubos;
 
@@ -130,6 +234,7 @@ struct cp_context {
       unsigned buffer_size;
       CUdeviceptr managed_copy;
       unsigned managed_size;
+      bool user_copy;
    } vs_ubos[CP_MAX_CONST_BUFFERS];
    unsigned num_vs_ubos;
 
@@ -198,6 +303,23 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags);
 
 uint32_t cp_depth_to_sortable(float depth);
 void cp_clear_depthbuf(struct cp_context *cp, float depth);
+
+/*
+ * Submit whatever draws are being held back for merging, if any.
+ *
+ * Anything that observes the framebuffer — a flush, a map, a clear, a blit, a
+ * copy, a dispatch — has to call this first, or it looks at a frame with draws
+ * missing from it. Cheap and idempotent when nothing is pending.
+ */
+void cp_batch_flush(struct cp_context *cp);
+
+/*
+ * The same, naming what ended the batch. Every state change that a batch
+ * cannot survive goes through this, and CUDAPIPE_DEBUG_BATCH prints the
+ * reason — which is the only practical way to find out why a sample that
+ * looks batchable is producing batches of one.
+ */
+void cp_batch_flush_why(struct cp_context *cp, const char *why);
 
 /*
  * How the sampler and the fragment writeback decode and encode a format, or

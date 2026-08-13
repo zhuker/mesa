@@ -33,6 +33,17 @@ struct cp_shader_binary {
     * because visibility is resolved before shading. */
    bool uses_discard;
 
+   /*
+    * Whether the shader reads any constant buffer — a uniform block, a push
+    * constant range, or the descriptor behind a sampler, all of which reach it
+    * through the same argument slots. False means what is bound in those slots
+    * cannot change what the shader computes, which is what lets consecutive
+    * draws be batched across a binding the fragment stage never looks at. It
+    * is recorded by the one code generator function that reads those slots, so
+    * it cannot drift from what the PTX actually does.
+    */
+   bool reads_const_bufs;
+
    /* Which VARYING_SLOT_* each I/O slot carries, so a fragment shader's inputs
     * can be matched to the vertex shader's outputs by location rather than by
     * position. Slots with no variable are VARYING_SLOT_MAX. */

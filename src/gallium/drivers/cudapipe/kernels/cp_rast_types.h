@@ -149,6 +149,31 @@ struct cp_clip_args {
  * the uniform/descriptor buffers; the gap in between is free. */
 #define CP_ARG_SLOT_DISCARD 8
 
+/*
+ * Draw batching. Several consecutive draws that differ in nothing but their
+ * vertex-stage uniform bindings are submitted as one, so that the grids are
+ * sized to the batch rather than to a draw of a dozen triangles. The vertex
+ * shader then has to pick its own draw's bindings out of a table:
+ *
+ *   draw  = thread_id / *(uint32_t *)args[CP_ARG_SLOT_BATCH_DIV]
+ *   base  = ((void **)args[CP_ARG_SLOT_UBO_TABLE])[draw * CP_ARG_UBO_STRIDE + i]
+ *
+ * Both slots are always filled, so the generated code has no branch and no
+ * batched/unbatched variant. A single draw sets the table to `&args[18]` and
+ * the divisor to 0xFFFFFFFF, which makes the expression above compute exactly
+ * the args[18 + i] the shader used to load.
+ *
+ * Only the vertex stage reads them. Draws whose *fragment* bindings differ are
+ * not merged at all, so the fragment shader keeps loading args[18 + i] and its
+ * generated code is untouched.
+ */
+#define CP_ARG_SLOT_UBO_TABLE 9
+#define CP_ARG_SLOT_BATCH_DIV 10
+/* Entries per draw in the table at CP_ARG_SLOT_UBO_TABLE; matches
+ * CP_MAX_CONST_BUFFERS and the 18.. layout it stands in for. */
+#define CP_ARG_UBO_STRIDE 16
+#define CP_ARG_UBO_BASE 18
+
 /* enum pipe_compare_func */
 enum cp_compare_func {
    CP_FUNC_NEVER = 0,
@@ -564,6 +589,15 @@ struct cp_vertex_fetch_args {
     */
    uint64_t out_vertex_ids;
    uint64_t out_instance_ids;
+   /*
+    * Assembled vertices in one draw of a batch. Batched draws share their
+    * geometry entirely — same index range, same buffers — and differ only in
+    * their vertex-stage uniforms, so vertex v of the launch is vertex
+    * v % this of draw v / this and gathers exactly what the draw before it
+    * did. Zero means this is not a batch, which is the single-draw path
+    * unchanged.
+    */
+   uint32_t verts_per_draw;
 };
 
 #endif /* CP_RAST_TYPES_H */

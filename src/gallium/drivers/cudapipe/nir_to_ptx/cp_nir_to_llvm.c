@@ -46,6 +46,15 @@ struct ntl_context {
 
    /* Set when the shader samples a texture, so the sampler PTX gets linked in. */
    bool uses_tex;
+   /*
+    * Set the first time emit_const_buf_base() runs. That function is the only
+    * place the generated code touches args[18..], so a shader it was never
+    * called for cannot read a constant buffer at all — descriptors, samplers
+    * and push constants included, since every one of them arrives through it.
+    * Draw batching uses that to stop caring what is bound where the shader
+    * does not look.
+    */
+   bool reads_const_bufs;
    bool needs_link;   /* pull in cp_sampler.cu for its device helpers */
 
    LLVMBasicBlockRef break_block;
@@ -226,6 +235,67 @@ emit_local_invocation_id(struct ntl_context *ctx, unsigned component)
 }
 
 /*
+ * The base pointer of the stage's constant buffer number `slot`.
+ *
+ * Every read of args[18..] in the generated code goes through here — the index
+ * form of load_ubo/load_ssbo below, and nir_intrinsic_load_const_buf_base_addr_lvp,
+ * which is how a lavapipe-lowered shader actually reaches a uniform block. That
+ * is what makes it one function rather than a line in each of them, and what
+ * makes `reads_const_bufs` trustworthy.
+ *
+ * The vertex stage reads through the batch table, so that consecutive draws
+ * differing only in their vertex uniforms can share one launch; see
+ * CP_ARG_SLOT_UBO_TABLE. A single draw points the table at args[18] and sets
+ * the divisor to 0xFFFFFFFF, so the row index is zero and this computes the
+ * very address the plain form does — there is no second variant of the shader
+ * and no branch. Only the vertex stage: a batch is refused unless every draw
+ * in it has the same fragment bindings, so the fragment shader's generated
+ * code is untouched.
+ */
+static LLVMValueRef
+emit_const_buf_base(struct ntl_context *ctx, LLVMValueRef slot)
+{
+   LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+   LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
+
+   ctx->reads_const_bufs = true;
+
+   if (ctx->nir->info.stage == MESA_SHADER_VERTEX) {
+      LLVMValueRef table = LLVMBuildBitCast(ctx->builder,
+         cp_arg_slot(ctx, CP_ARG_SLOT_UBO_TABLE), ptr_ptr_type, "ubo_table");
+      LLVMValueRef div = LLVMBuildLoad2(ctx->builder, i32,
+         LLVMBuildBitCast(ctx->builder, cp_arg_slot(ctx, CP_ARG_SLOT_BATCH_DIV),
+                          LLVMPointerType(i32, 0), ""), "batch_div");
+      LLVMSetMetadata(div, ctx->md_invariant_load,
+                      LLVMMDNodeInContext(ctx->llvm_ctx, NULL, 0));
+
+      LLVMValueRef tid = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, emit_workgroup_id(ctx, 0),
+                      LLVMConstInt(i32, 256, false), ""),
+         emit_local_invocation_id(ctx, 0), "");
+      LLVMValueRef row = LLVMBuildUDiv(ctx->builder, tid, div, "batch_draw");
+
+      LLVMValueRef off = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, row,
+                      LLVMConstInt(i32, CP_ARG_UBO_STRIDE, false), ""),
+         slot, "");
+      off = LLVMBuildZExt(ctx->builder, off, i64, "");
+      return LLVMBuildLoad2(ctx->builder, ptr_type,
+         LLVMBuildGEP2(ctx->builder, ptr_type, table, &off, 1, ""), "buf_base");
+   }
+
+   LLVMValueRef args = LLVMBuildBitCast(ctx->builder, ctx->kernel_args[0],
+                                        ptr_ptr_type, "");
+   LLVMValueRef idx = LLVMBuildAdd(ctx->builder, slot,
+                                   LLVMConstInt(i32, CP_ARG_UBO_BASE, false), "");
+   idx = LLVMBuildZExt(ctx->builder, idx, i64, "");
+   return LLVMBuildLoad2(ctx->builder, ptr_type,
+      LLVMBuildGEP2(ctx->builder, ptr_type, args, &idx, 1, ""), "buf_base");
+}
+
+/*
  * The base pointer of the buffer a load_ubo/load_ssbo addresses.
  *
  * Two forms reach us, distinguished by the width of the source — the same
@@ -233,9 +303,7 @@ emit_local_invocation_id(struct ntl_context *ctx, unsigned component)
  *
  *   64 bit: the address of an lp_jit_buffer descriptor, whose first member is
  *           the base pointer. One dereference.
- *   32 bit: an index into the stage's constant buffer array. Our kernel arg
- *           table already holds base pointers, so args[18 + index] *is* the
- *           base and must not be dereferenced.
+ *   32 bit: an index into the stage's constant buffer array, resolved above.
  *
  * Push constants arrive as the index form with index 0, which is why missing
  * this case faulted every shader that used them.
@@ -243,7 +311,6 @@ emit_local_invocation_id(struct ntl_context *ctx, unsigned component)
 static LLVMValueRef
 emit_buffer_base(struct ntl_context *ctx, nir_src *src)
 {
-   LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
    LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
    LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
    LLVMValueRef val = get_src(ctx, src);
@@ -253,14 +320,7 @@ emit_buffer_base(struct ntl_context *ctx, nir_src *src)
       return LLVMBuildLoad2(ctx->builder, ptr_type, desc_ptr, "buf_base");
    }
 
-   LLVMValueRef args = LLVMBuildBitCast(ctx->builder, ctx->kernel_args[0],
-                                        ptr_ptr_type, "");
-   LLVMValueRef idx = LLVMBuildAdd(ctx->builder, val,
-                                   LLVMConstInt(LLVMInt32TypeInContext(ctx->llvm_ctx),
-                                                18, false), "");
-   idx = LLVMBuildZExt(ctx->builder, idx, i64, "");
-   return LLVMBuildLoad2(ctx->builder, ptr_type,
-      LLVMBuildGEP2(ctx->builder, ptr_type, args, &idx, 1, ""), "buf_base");
+   return emit_const_buf_base(ctx, val);
 }
 
 /*
@@ -565,24 +625,16 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       break;
    }
    case nir_intrinsic_load_const_buf_base_addr_lvp: {
-      /* Returns the 64-bit base address of constant buffer `src[0]`
-       * In our layout: kernel arg is a ptr to array of ptrs.
-       * UBO pointers start at index 18 in the arg array.
-       * The slot index from src[0] maps to arg_ptrs[18 + slot].
+      /*
+       * The 64-bit base address of constant buffer `src[0]`. This is how a
+       * lavapipe-lowered shader reaches a uniform block: the address lands
+       * here, and the load_ubo that follows dereferences the descriptor at it.
+       * emit_const_buf_base() owns the layout, including the per-draw table
+       * the vertex stage reads through when draws are batched.
        */
-      LLVMValueRef slot = get_src(ctx, &instr->src[0]);
-      LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
-      LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
-      LLVMTypeRef ptr_ptr_type = LLVMPointerType(ptr_type, 0);
-      LLVMValueRef args = ctx->kernel_args[0];
-      LLVMValueRef args_as_ptrptr = LLVMBuildBitCast(ctx->builder, args, ptr_ptr_type, "");
-      LLVMValueRef ubo_idx = LLVMBuildAdd(ctx->builder, slot, LLVMConstInt(i32, 18, false), "");
-      ubo_idx = LLVMBuildZExt(ctx->builder, ubo_idx, i64, "");
-      LLVMValueRef ubo_ptr = LLVMBuildLoad2(ctx->builder, ptr_type,
-         LLVMBuildGEP2(ctx->builder, ptr_type, args_as_ptrptr,
-            &ubo_idx, 1, ""), "ubo_base");
-      /* Convert pointer to i64 (device address) */
-      LLVMValueRef addr = LLVMBuildPtrToInt(ctx->builder, ubo_ptr, i64, "");
+      LLVMValueRef base = emit_const_buf_base(ctx, get_src(ctx, &instr->src[0]));
+      LLVMValueRef addr = LLVMBuildPtrToInt(ctx->builder, base,
+         LLVMInt64TypeInContext(ctx->llvm_ctx), "");
       set_ssa_def(ctx, &instr->def, addr);
       break;
    }
@@ -2350,6 +2402,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    bin->shared_size = nir->info.shared_size;
    bin->nir_num_outputs = nir->num_outputs;
    bin->nir_num_inputs = nir->num_inputs;
+   bin->reads_const_bufs = ctx.reads_const_bufs;
 
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
