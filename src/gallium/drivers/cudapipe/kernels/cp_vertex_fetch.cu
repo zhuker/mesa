@@ -31,16 +31,37 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
        * draw, which leaves this the plain v it was before.
        */
       uint32_t local = v;
+      uint32_t first_vertex = args.first_vertex;
+      const char *ib = (const char *)(uintptr_t)args.index_buffer;
 
       /*
-       * A batch replays one draw's index range once per draw, so the vertex
-       * within the draw is v modulo the draw's vertex count. The gather is
-       * then identical for every draw of the batch — what differs is the
-       * uniform block the vertex shader reads, which it picks from the same
-       * quotient. Zero for an unbatched draw, which leaves this untouched.
+       * A batch concatenates the draws it merged, and they need not share an
+       * index range: this thread's draw is the last one that starts at or
+       * before it. Binary search, over a table bounded by the batch cap and so
+       * a few hundred bytes at most. Nothing here runs for an unbatched draw —
+       * num_draw_slices is zero and every value above stands.
        */
-      if (args.verts_per_draw)
-         local = v % args.verts_per_draw;
+      uint32_t row = 0;
+      if (args.num_draw_slices) {
+         const struct cp_draw_slice *sl =
+            (const struct cp_draw_slice *)(uintptr_t)args.draw_slices;
+         uint32_t lo = 0, hi = args.num_draw_slices - 1;
+         while (lo < hi) {
+            uint32_t mid = (lo + hi + 1) >> 1;
+            if (sl[mid].vert_begin <= v)
+               lo = mid;
+            else
+               hi = mid - 1;
+         }
+         row = lo;
+         local = v - sl[row].vert_begin;
+         first_vertex = sl[row].first_vertex;
+         ib += sl[row].index_bytes;
+      }
+
+      /* The vertex shader picks its own draw's uniform bindings out of this. */
+      if (args.out_batch_rows)
+         ((uint32_t *)(uintptr_t)args.out_batch_rows)[v] = row;
 
       instance_id = 0;
       if (args.verts_per_instance) {
@@ -49,13 +70,12 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
       }
 
       if (args.index_buffer && args.index_size > 0) {
-         const char *ib = (const char *)(uintptr_t)args.index_buffer;
          if (args.index_size == 2)
-            vertex_id = (uint32_t)((const unsigned short *)ib)[local] + args.first_vertex;
+            vertex_id = (uint32_t)((const unsigned short *)ib)[local] + first_vertex;
          else
-            vertex_id = ((const uint32_t *)ib)[local] + args.first_vertex;
+            vertex_id = ((const uint32_t *)ib)[local] + first_vertex;
       } else {
-         vertex_id = local + args.first_vertex;
+         vertex_id = local + first_vertex;
       }
    }
 

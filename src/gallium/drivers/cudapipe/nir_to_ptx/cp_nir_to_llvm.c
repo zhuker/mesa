@@ -245,12 +245,12 @@ emit_local_invocation_id(struct ntl_context *ctx, unsigned component)
  *
  * The vertex stage reads through the batch table, so that consecutive draws
  * differing only in their vertex uniforms can share one launch; see
- * CP_ARG_SLOT_UBO_TABLE. A single draw points the table at args[18] and sets
- * the divisor to 0xFFFFFFFF, so the row index is zero and this computes the
- * very address the plain form does — there is no second variant of the shader
- * and no branch. Only the vertex stage: a batch is refused unless every draw
- * in it has the same fragment bindings, so the fragment shader's generated
- * code is untouched.
+ * CP_ARG_SLOT_UBO_TABLE. A single draw points the table at args[18], the mask
+ * at a zero and the row array at one word holding zero, so the row index is
+ * zero and this computes the very address the plain form does — there is no
+ * second variant of the shader and no branch. Only the vertex stage: a batch
+ * is refused unless every draw in it has the same fragment bindings, so the
+ * fragment shader's generated code is untouched.
  */
 static LLVMValueRef
 emit_const_buf_base(struct ntl_context *ctx, LLVMValueRef slot)
@@ -265,17 +265,29 @@ emit_const_buf_base(struct ntl_context *ctx, LLVMValueRef slot)
    if (ctx->nir->info.stage == MESA_SHADER_VERTEX) {
       LLVMValueRef table = LLVMBuildBitCast(ctx->builder,
          cp_arg_slot(ctx, CP_ARG_SLOT_UBO_TABLE), ptr_ptr_type, "ubo_table");
-      LLVMValueRef div = LLVMBuildLoad2(ctx->builder, i32,
-         LLVMBuildBitCast(ctx->builder, cp_arg_slot(ctx, CP_ARG_SLOT_BATCH_DIV),
-                          LLVMPointerType(i32, 0), ""), "batch_div");
-      LLVMSetMetadata(div, ctx->md_invariant_load,
+      LLVMValueRef mask = LLVMBuildLoad2(ctx->builder, i32,
+         LLVMBuildBitCast(ctx->builder, cp_arg_slot(ctx, CP_ARG_SLOT_BATCH_MASK),
+                          LLVMPointerType(i32, 0), ""), "batch_mask");
+      LLVMSetMetadata(mask, ctx->md_invariant_load,
                       LLVMMDNodeInContext(ctx->llvm_ctx, NULL, 0));
 
       LLVMValueRef tid = LLVMBuildAdd(ctx->builder,
          LLVMBuildMul(ctx->builder, emit_workgroup_id(ctx, 0),
                       LLVMConstInt(i32, 256, false), ""),
          emit_local_invocation_id(ctx, 0), "");
-      LLVMValueRef row = LLVMBuildUDiv(ctx->builder, tid, div, "batch_draw");
+
+      /* Which draw of the batch this vertex came from, decided by
+       * cp_vertex_fetch and read back rather than recomputed. Masked to zero
+       * for a single draw, which is the one-word array below it. */
+      LLVMValueRef rows = LLVMBuildBitCast(ctx->builder,
+         cp_arg_slot(ctx, CP_ARG_SLOT_BATCH_ROWS), LLVMPointerType(i32, 0),
+         "batch_rows");
+      LLVMValueRef ridx = LLVMBuildZExt(ctx->builder,
+         LLVMBuildAnd(ctx->builder, tid, mask, ""), i64, "");
+      LLVMValueRef row = LLVMBuildLoad2(ctx->builder, i32,
+         LLVMBuildGEP2(ctx->builder, i32, rows, &ridx, 1, ""), "batch_draw");
+      LLVMSetMetadata(row, ctx->md_invariant_load,
+                      LLVMMDNodeInContext(ctx->llvm_ctx, NULL, 0));
 
       LLVMValueRef off = LLVMBuildAdd(ctx->builder,
          LLVMBuildMul(ctx->builder, row,
@@ -2420,6 +2432,12 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
             case nir_intrinsic_terminate:
             case nir_intrinsic_terminate_if:
                bin->uses_discard = true;
+               break;
+            case nir_intrinsic_load_base_instance:
+            case nir_intrinsic_load_first_vertex:
+            case nir_intrinsic_load_base_vertex:
+            case nir_intrinsic_load_draw_id:
+               bin->reads_draw_params = true;
                break;
             default:
                break;

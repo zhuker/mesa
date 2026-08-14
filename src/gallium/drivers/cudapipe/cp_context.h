@@ -43,9 +43,12 @@ struct cp_shader_binary;
  * piece of state to the driver and forgetting it here is the one mistake this
  * cannot make quietly: the key is filled from a zeroed struct by a single
  * function, and anything it does not copy is simply not a merge condition.
- * What is deliberately *absent* is the vertex stage's uniform bindings — those
- * are what a batch is allowed to differ in, and what the table in the shader's
- * argument block exists to carry.
+ * What is deliberately *absent* is the vertex stage's uniform bindings and the
+ * index range — those are what a batch is allowed to differ in, and what the
+ * tables behind the shader's argument block exist to carry.
+ *
+ * CUDAPIPE_DEBUG_BATCHDIFF names the fields two draws disagree on, which is
+ * the only way to tell which of them is worth attacking next.
  */
 struct cp_batch_key {
    const void *vs, *fs;
@@ -55,8 +58,11 @@ struct cp_batch_key {
    uint64_t visbuf, depthbuf;
    uint32_t fb_w, fb_h, fb_nr_cbufs, fb_samples, cbuf_format;
 
-   /* The draw itself. Batched draws replay one index range, so the range is
-    * part of the key rather than something the batch varies. */
+   /* The draw itself. The index *range* is not here: a batch carries a table
+    * of them and cp_vertex_fetch searches it, which is what lets a scene of
+    * different meshes out of one buffer merge at all. The range comes back
+    * only for a shader that reads gl_BaseVertex or gl_DrawID, which a batch
+    * has one copy of. */
    uint32_t mode, index_size, instance_count, start_instance, drawid_offset;
    const void *index_resource;
    uint32_t draw_start, draw_count;
@@ -102,10 +108,14 @@ struct cp_context {
    struct {
       bool pending;
       unsigned ndraws;
-      unsigned tris_per_draw;
+      /* Triangles over the whole batch, which is what the clipper's output
+       * buffer is sized from and so what CP_MAX_BATCH_TRIS caps. */
+      unsigned tris;
       struct cp_batch_key key;
       struct pipe_draw_info info;
-      struct pipe_draw_start_count_bias draw;
+      /* One index range per merged draw; cp_draw_execute() turns these into
+       * the slice table cp_vertex_fetch searches. */
+      struct pipe_draw_start_count_bias draws[CP_MAX_BATCH_DRAWS];
       unsigned drawid_offset;
       /* One row of vertex-stage uniform pointers per draw, in the layout the
        * shader indexes: row * CP_ARG_UBO_STRIDE + binding. */

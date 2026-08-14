@@ -34,6 +34,14 @@ struct cp_shader_binary {
    bool uses_discard;
 
    /*
+    * Whether the shader reads gl_BaseVertex, gl_BaseInstance or gl_DrawID.
+    * Those come from one triple at args[7], which a batch has only one of, so
+    * a shader that reads them may only be merged with draws that would give
+    * it the same answer — see cp_batch_build_key().
+    */
+   bool reads_draw_params;
+
+   /*
     * Whether the shader reads any constant buffer — a uniform block, a push
     * constant range, or the descriptor behind a sampler, all of which reach it
     * through the same argument slots. False means what is bound in those slots

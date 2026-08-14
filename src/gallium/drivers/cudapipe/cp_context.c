@@ -2652,10 +2652,21 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       total_triangles += cp_triangles_for_draw(info->mode, draws[d].count);
    total_triangles *= instance_count;
 
-   /* A batch replays the same range once per merged draw. That is the whole of
-    * what makes the grids below bigger. */
+   /* What one draw of the batch contributes, which is what the instance
+    * arithmetic below divides by. A batch is never instanced, so this is the
+    * unbatched draw's own count and nothing else reads it. */
    unsigned tris_per_draw = total_triangles;
-   total_triangles *= batch_draws;
+
+   /*
+    * A batch concatenates its merged draws, and they need not be the same
+    * size: `draws` holds one range per merged draw. That is the whole of what
+    * makes the grids below bigger.
+    */
+   if (batch_draws > 1) {
+      total_triangles = 0;
+      for (unsigned d = 0; d < batch_draws; d++)
+         total_triangles += cp_triangles_for_draw(info->mode, draws[d].count);
+   }
 
    if (total_triangles == 0)
       do { if (getenv("CUDAPIPE_DEBUG_DRAW"))
@@ -2848,12 +2859,12 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     */
    bool skip_refs = has_vs && info->mode == MESA_PRIM_TRIANGLES &&
                     num_draws == 1;
-   /* Assembled vertices per instance, which is what the kernel divides by, and
-    * per merged draw, which it divides by first. Both are taken from the
-    * single draw's triangle count, so an unbatched draw sees exactly the
-    * numbers it saw before batching existed. */
+   /* Assembled vertices per instance, which is what the kernel divides by.
+    * Taken from the single draw's triangle count, so an unbatched draw sees
+    * exactly the number it saw before batching existed; a batch is never
+    * instanced and passes zero instead, having already resolved the vertex
+    * out of its slice table. */
    unsigned verts_per_instance = tris_per_draw / instance_count * 3;
-   unsigned verts_per_draw = tris_per_draw * 3;
    struct cp_vertex_ref *refs = NULL;
    if (!skip_refs) {
       refs = cp_build_vertex_refs(info, draws, num_draws,
@@ -2987,8 +2998,11 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          CUdeviceptr out_vid = 0, out_iid = 0;
 
          if (!refs) {
+            /* A batch's assembled vertices span several ranges of the index
+             * buffer, so the buffer is no longer the id array for them — the
+             * fetch kernel has to publish one. */
             if (indexed && ib_base && info->index_size == 4 &&
-                instance_count == 1) {
+                instance_count == 1 && batch_draws == 1) {
                vid_buf = (CUdeviceptr)(uintptr_t)ib_base +
                          (size_t)draws[0].start * 4;
             } else if (cp->vs_shader->reads_vertex_id) {
@@ -3006,6 +3020,45 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
             }
          }
 
+         /*
+          * The batch's slice table: where each merged draw's vertices begin in
+          * the concatenated stream, and which part of the index buffer they
+          * come from. This is what lets draws of different sizes merge — the
+          * fetch kernel searches it per thread rather than dividing by a
+          * single vertex count.
+          *
+          * Built only for a real batch. An unbatched draw leaves it null, and
+          * every field the kernel would otherwise take from a slice keeps the
+          * value it has always had, which is what makes CUDAPIPE_BATCH_MAX=1
+          * bit-identical rather than merely close.
+          */
+         CUdeviceptr slices_dev = 0;
+         CUdeviceptr batch_rows = 0;
+         if (batch_draws > 1) {
+            struct cp_draw_slice slices[CP_MAX_BATCH_DRAWS];
+            uint32_t vbegin = 0;
+            for (unsigned d = 0; d < batch_draws; d++) {
+               slices[d].vert_begin = vbegin;
+               slices[d].index_bytes =
+                  indexed ? (uint32_t)draws[d].start * info->index_size : 0;
+               slices[d].first_vertex =
+                  indexed ? (uint32_t)draws[d].index_bias : draws[d].start;
+               slices[d].pad = 0;
+               vbegin += cp_triangles_for_draw(info->mode, draws[d].count) * 3;
+            }
+            slices_dev = cp_upload(cp, slices,
+                                   (size_t)batch_draws * sizeof(slices[0]));
+            if (!slices_dev) { FREE(refs); return; }
+
+            /* One row per assembled vertex, for the shader to pick its
+             * uniform bindings with. Only a shader that reads a constant
+             * buffer at all has any use for it. */
+            if (cp->vs_shader->reads_const_bufs) {
+               batch_rows = cp_scratch_alloc_device(cp, (size_t)total_verts * 4);
+               if (!batch_rows) { FREE(refs); return; }
+            }
+         }
+
          struct cp_vertex_fetch_args vf_args = {
             .output = vs_input_buf,
             .num_elements = cp->num_vertex_elements,
@@ -3016,20 +3069,24 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
             .start_instance = info->start_instance,
             .vertex_ids = vfetch_vid,
             .instance_ids = vfetch_iid,
-            .verts_per_instance = refs ? 0 : verts_per_instance,
+            .verts_per_instance = (refs || batch_draws > 1) ? 0 : verts_per_instance,
             .out_vertex_ids = out_vid,
             .out_instance_ids = out_iid,
-            .verts_per_draw = batch_draws > 1 ? verts_per_draw : 0,
+            .draw_slices = slices_dev,
+            .num_draw_slices = slices_dev ? batch_draws : 0,
+            .out_batch_rows = batch_rows,
          };
 
          /* Set up index buffer for direct GPU indexing (triangle list only).
           * The fetch kernel indexes from the start of what it is given, so the
           * draw's first index has to be folded into the pointer — a glTF model
           * draws every primitive out of one shared buffer this way, and
-          * ignoring it draws the first primitive over and over. */
+          * ignoring it draws the first primitive over and over. A batch has
+          * one such offset per merged draw, so it carries them in the slice
+          * table and is handed the buffer's own base. */
          if (!refs && indexed && ib_base)
             vf_args.index_buffer = (uint64_t)(uintptr_t)ib_base +
-                                   (uint64_t)draws[0].start * info->index_size;
+               (slices_dev ? 0 : (uint64_t)draws[0].start * info->index_size);
 
          for (unsigned e = 0; e < cp->num_vertex_elements && e < 16; e++) {
             const struct pipe_vertex_element *elem = &cp->vertex_elements[e];
@@ -3053,7 +3110,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          /* Nothing to gather when the shader declares no inputs — but it still
           * runs if the ids are wanted, since deriving those is now its job
           * too and a shader with no inputs may still read gl_VertexIndex. */
-         if (vs_input_buf || out_vid || out_iid) {
+         if (vs_input_buf || out_vid || out_iid || batch_rows) {
             if (vs_input_buf)
                cuMemsetD8Async(vs_input_buf, 0, (size_t)total_verts * vs_in_stride, cp->stream);
             void *vf_params[] = { &vf_args };
@@ -3128,13 +3185,14 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
           * is chosen. See CP_ARG_SLOT_UBO_TABLE.
           *
           * A single draw still gets a table: one row, pointed at by args[9],
-          * with the divisor at args[10] set so that every thread reads row
-          * zero. That is the same pointer the shader used to read out of
-          * args[18 + i], so there is no batched and unbatched form of the
-          * generated code and nothing to get out of step.
+          * with the mask at args[11] zero so that every thread indexes the
+          * one-word row array at args[10], which holds zero. That is the same
+          * pointer the shader used to read out of args[18 + i], so there is no
+          * batched and unbatched form of the generated code and nothing to get
+          * out of step.
           */
          const size_t vs_args_bytes = 64 * sizeof(void *);
-         const size_t vs_div_off = vs_args_bytes;
+         const size_t vs_scal_off = vs_args_bytes;   /* row 0, then the mask */
          const size_t vs_tbl_off = vs_args_bytes + 16;
          size_t vs_blk_bytes = vs_tbl_off +
             (size_t)batch_draws * CP_ARG_UBO_STRIDE * sizeof(uint64_t);
@@ -3158,13 +3216,23 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          vs_args_host[7] = (void*)(uintptr_t)(meta_dev + offsetof(struct cp_vs_meta, draw_params));
          vs_args_host[CP_ARG_SLOT_UBO_TABLE] =
             (void*)(uintptr_t)(vs_args_dev + vs_tbl_off);
-         vs_args_host[CP_ARG_SLOT_BATCH_DIV] =
-            (void*)(uintptr_t)(vs_args_dev + vs_div_off);
+         /*
+          * row = rows[tid & mask]. A batch points rows at what cp_vertex_fetch
+          * wrote — one draw index per assembled vertex, resolved by the same
+          * search that decided what to gather — and masks nothing off. A
+          * single draw points rows at the zero word sitting in this block and
+          * masks the index to zero, so every thread reads row zero without a
+          * branch or a second shader variant.
+          */
+         vs_args_host[CP_ARG_SLOT_BATCH_ROWS] = batch_rows
+            ? (void*)(uintptr_t)batch_rows
+            : (void*)(uintptr_t)(vs_args_dev + vs_scal_off);
+         vs_args_host[CP_ARG_SLOT_BATCH_MASK] =
+            (void*)(uintptr_t)(vs_args_dev + vs_scal_off + 4);
 
-         /* Dividing a thread id by this gives the row. A single draw wants row
-          * zero for every thread, and no vertex count reaches 2^32 - 1. */
-         *(uint32_t *)((char *)vs_blk + vs_div_off) =
-            batch_draws > 1 ? verts_per_draw : 0xFFFFFFFFu;
+         ((uint32_t *)((char *)vs_blk + vs_scal_off))[0] = 0;
+         ((uint32_t *)((char *)vs_blk + vs_scal_off))[1] =
+            batch_rows ? 0xFFFFFFFFu : 0u;
 
          uint64_t *vs_tbl = (uint64_t *)((char *)vs_blk + vs_tbl_off);
          for (unsigned d = 0; d < batch_draws; d++) {
@@ -4093,10 +4161,23 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
  *  - A shader that discards is refused, because a discarded fragment has
  *    already displaced the one behind it and the retry machinery is per draw.
  *
- * What a batch is then allowed to vary is the vertex stage's uniform
- * bindings — the same buffer at a different dynamic offset, which is what
- * dynamicuniformbuffer's 125 cubes a frame differ in and nothing else. The
- * vertex shader picks its row out of a table; see CP_ARG_SLOT_UBO_TABLE.
+ * What a batch is then allowed to vary is two things, and both are carried as
+ * a table with one row per merged draw:
+ *
+ *  - The vertex stage's uniform bindings — the same buffer at a different
+ *    dynamic offset, which is what dynamicuniformbuffer's 125 cubes a frame
+ *    differ in. The vertex shader picks its row out of the table at
+ *    CP_ARG_SLOT_UBO_TABLE.
+ *  - The index range. Draws of different sizes out of one buffer concatenate,
+ *    and cp_vertex_fetch searches a table of slices to find which draw a
+ *    thread's vertex came from — see struct cp_draw_slice. Without that,
+ *    bloom's 154 draws a frame and vulkanscene's 19 merge none of themselves,
+ *    because no two of them replay the same range.
+ *
+ * The *fragment* stage's bindings are still a merge condition, so a scene
+ * whose meshes carry a texture each still batches nothing. That would need a
+ * per-triangle draw index threaded through the clipper, which is the next
+ * increment and a larger one.
  */
 
 /* Fill in everything two draws must agree on. See struct cp_batch_key. */
@@ -4131,9 +4212,18 @@ cp_batch_build_key(struct cp_context *cp, const struct pipe_draw_info *info,
    key->start_instance = info->start_instance;
    key->drawid_offset = drawid_offset;
    key->index_resource = info->index_size ? info->index.resource : NULL;
-   key->draw_start = draws[0].start;
-   key->draw_count = draws[0].count;
-   key->draw_index_bias = draws[0].index_bias;
+   /*
+    * The range is normally not a merge condition — a batch carries one slice
+    * per draw and the fetch kernel resolves which is which. It becomes one
+    * again for a shader that reads gl_BaseVertex, gl_BaseInstance or
+    * gl_DrawID: those come from a single triple in the argument block, so two
+    * draws that would be told different things cannot share a launch.
+    */
+   if (cp->vs_shader && cp->vs_shader->reads_draw_params) {
+      key->draw_start = draws[0].start;
+      key->draw_count = draws[0].count;
+      key->draw_index_bias = draws[0].index_bias;
+   }
 
    key->viewport = cp->viewport;
    key->scissor = cp->scissor;
@@ -4170,6 +4260,51 @@ cp_batch_build_key(struct cp_context *cp, const struct pipe_draw_info *info,
    }
    key->sampler_table = cp->sampler_table;
    key->num_samplers = cp->num_samplers;
+}
+
+/*
+ * Which fields of the key two draws disagree on.
+ *
+ * memcmp gives one lumped verdict — "state or geometry" — which is exactly the
+ * wrong granularity when the question is what stops a sample batching. Under
+ * CUDAPIPE_DEBUG_BATCHDIFF the mismatch is reported field by field, so the
+ * answer can be counted rather than guessed at. Off by default and never on the
+ * fast path: the caller still decides with memcmp.
+ */
+static void
+cp_batch_key_report_diff(const struct cp_batch_key *a,
+                         const struct cp_batch_key *b)
+{
+#define F(name) { #name, offsetof(struct cp_batch_key, name), \
+                  sizeof(((struct cp_batch_key *)0)->name) }
+   static const struct { const char *name; size_t off, size; } fields[] = {
+      F(vs), F(fs),
+      F(cbuf_texture), F(zs_texture), F(color_data), F(visbuf), F(depthbuf),
+      F(fb_w), F(fb_h), F(fb_nr_cbufs), F(fb_samples), F(cbuf_format),
+      F(mode), F(index_size), F(instance_count), F(start_instance),
+      F(drawid_offset), F(index_resource),
+      F(draw_start), F(draw_count), F(draw_index_bias),
+      F(viewport), F(scissor), F(rasterizer), F(depth_stencil),
+      F(blend_state), F(blend_enabled),
+      F(vertex_elements), F(num_vertex_elements), F(vertex_stride),
+      F(num_vertex_buffers), F(vertex_buffers),
+      F(num_fs_ubos), F(num_vs_ubos), F(fs_ubos), F(fs_ubo_sizes),
+      F(sampler_table), F(num_samplers),
+   };
+#undef F
+   char line[512];
+   size_t n = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(fields); i++) {
+      if (!memcmp((const char *)a + fields[i].off,
+                  (const char *)b + fields[i].off, fields[i].size))
+         continue;
+      int w = snprintf(line + n, sizeof(line) - n, "%s%s",
+                       n ? "," : "", fields[i].name);
+      if (w < 0 || (size_t)w >= sizeof(line) - n)
+         break;
+      n += w;
+   }
+   fprintf(stderr, "cudapipe: batchdiff %s\n", n ? line : "(none)");
 }
 
 /*
@@ -4255,15 +4390,19 @@ cp_batch_eligible(struct cp_context *cp, const struct pipe_draw_info *info,
    return true;
 }
 
-/* Snapshot this draw's vertex-stage bindings as the next row of the table. */
+/* Snapshot this draw's index range and vertex-stage bindings as the next row
+ * of the batch's tables. */
 static void
-cp_batch_record(struct cp_context *cp)
+cp_batch_record(struct cp_context *cp,
+                const struct pipe_draw_start_count_bias *draw, unsigned tris)
 {
    uint64_t *row = cp->batch.vs_ubos +
       (size_t)cp->batch.ndraws * CP_ARG_UBO_STRIDE;
    memset(row, 0, CP_ARG_UBO_STRIDE * sizeof(*row));
    for (unsigned i = 0; i < cp->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
       row[i] = (uint64_t)(uintptr_t)cp->vs_ubos[i].buffer;
+   cp->batch.draws[cp->batch.ndraws] = *draw;
+   cp->batch.tris += tris;
    cp->batch.ndraws++;
 }
 
@@ -4294,6 +4433,7 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
     * code and nothing in it may see a batch that is already on its way. */
    cp->batch.pending = false;
    cp->batch.ndraws = 0;
+   cp->batch.tris = 0;
 
    if (debug & 2) {
       fprintf(stderr, "cudapipe: batch of %u draws\n", ndraws);
@@ -4307,7 +4447,7 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
    }
 
    cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
-                   &cp->batch.draw, 1, ndraws, cp->batch.vs_ubos);
+                   cp->batch.draws, 1, ndraws, cp->batch.vs_ubos);
 }
 
 static void
@@ -4345,16 +4485,21 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
       if (cp->batch.pending) {
          const char *why = NULL;
-         if (memcmp(&key, &cp->batch.key, sizeof(key)))
+         if (memcmp(&key, &cp->batch.key, sizeof(key))) {
             why = "the next draw differs in state or geometry";
+            static int diffdbg = -1;
+            if (diffdbg < 0)
+               diffdbg = getenv("CUDAPIPE_DEBUG_BATCHDIFF") ? 1 : 0;
+            if (diffdbg)
+               cp_batch_key_report_diff(&key, &cp->batch.key);
+         }
          else if (cp->batch.ndraws >= (unsigned)cap)
             why = "the draw cap";
-         else if ((cp->batch.ndraws + 1) * cp->batch.tris_per_draw >
-                  CP_MAX_BATCH_TRIS)
+         else if (cp->batch.tris + tris > CP_MAX_BATCH_TRIS)
             why = "the triangle cap";
 
          if (!why) {
-            cp_batch_record(cp);
+            cp_batch_record(cp, &draws[0], tris);
             return;
          }
          cp_batch_flush_why(cp, why);
@@ -4363,11 +4508,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       /* Whatever was pending has gone; this draw opens the next batch. */
       cp->batch.key = key;
       cp->batch.info = *info;
-      cp->batch.draw = draws[0];
       cp->batch.drawid_offset = drawid_offset;
-      cp->batch.tris_per_draw = tris;
       cp->batch.pending = true;
-      cp_batch_record(cp);
+      cp_batch_record(cp, &draws[0], tris);
       return;
    }
 
@@ -4798,8 +4941,20 @@ static void
 cp_bind_vs_state(struct pipe_context *ctx, void *state)
 {
    struct cp_context *cp = (struct cp_context *)ctx;
-   if (cp->vs_shader != (struct cp_shader_binary *)state)
+   if (cp->vs_shader != (struct cp_shader_binary *)state) {
+      /* Resolved once: this runs on every draw of every sample. A scene that
+       * builds one pipeline per material — gltfscenerendering — rebinds a
+       * distinct binary here between every draw, which ends the batch before
+       * the key is ever consulted, and that is invisible from the key's own
+       * diagnostics. */
+      static int diffdbg = -1;
+      if (diffdbg < 0)
+         diffdbg = getenv("CUDAPIPE_DEBUG_BATCHDIFF") ? 1 : 0;
+      if (diffdbg)
+         fprintf(stderr, "cudapipe: batchdiff vs bind %p -> %p\n",
+                 (void *)cp->vs_shader, state);
       cp_batch_flush_why(cp, "vertex shader");
+   }
    cp->vs_shader = (struct cp_shader_binary *)state;
 }
 

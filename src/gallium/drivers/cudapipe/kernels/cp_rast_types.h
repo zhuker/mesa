@@ -240,25 +240,48 @@ struct cp_clip_args {
 #define CP_ARG_SLOT_DISCARD 8
 
 /*
- * Draw batching. Several consecutive draws that differ in nothing but their
- * vertex-stage uniform bindings are submitted as one, so that the grids are
- * sized to the batch rather than to a draw of a dozen triangles. The vertex
- * shader then has to pick its own draw's bindings out of a table:
+ * Draw batching. Several consecutive draws that differ in nothing the result
+ * can depend on are submitted as one, so that the grids are sized to the batch
+ * rather than to a draw of a dozen triangles. The vertex shader then has to
+ * pick its own draw's bindings out of a table:
  *
- *   draw  = thread_id / *(uint32_t *)args[CP_ARG_SLOT_BATCH_DIV]
- *   base  = ((void **)args[CP_ARG_SLOT_UBO_TABLE])[draw * CP_ARG_UBO_STRIDE + i]
+ *   row  = ((const uint32_t *)args[CP_ARG_SLOT_BATCH_ROWS])
+ *             [thread_id & *(uint32_t *)args[CP_ARG_SLOT_BATCH_MASK]]
+ *   base = ((void **)args[CP_ARG_SLOT_UBO_TABLE])[row * CP_ARG_UBO_STRIDE + i]
  *
- * Both slots are always filled, so the generated code has no branch and no
- * batched/unbatched variant. A single draw sets the table to `&args[18]` and
- * the divisor to 0xFFFFFFFF, which makes the expression above compute exactly
- * the args[18 + i] the shader used to load.
+ * All three slots are always filled, so the generated code has no branch and
+ * no batched/unbatched variant. A single draw sets the table to `&args[18]`,
+ * the mask to zero and the row array to one word holding zero, which makes the
+ * expression above compute exactly the args[18 + i] the shader used to load.
+ *
+ * The row is a lookup rather than arithmetic on the thread id because a batch
+ * no longer has to replay one index range: draws of different vertex counts
+ * merge, so which draw a thread belongs to is a search over the batch's
+ * offsets. cp_vertex_fetch does that search already to know what to gather,
+ * and writes the answer here instead of the shader repeating it.
  *
  * Only the vertex stage reads them. Draws whose *fragment* bindings differ are
  * not merged at all, so the fragment shader keeps loading args[18 + i] and its
  * generated code is untouched.
  */
-#define CP_ARG_SLOT_UBO_TABLE 9
-#define CP_ARG_SLOT_BATCH_DIV 10
+#define CP_ARG_SLOT_UBO_TABLE  9
+#define CP_ARG_SLOT_BATCH_ROWS 10
+#define CP_ARG_SLOT_BATCH_MASK 11
+
+/*
+ * One merged draw's slice of the assembled vertex stream.
+ *
+ * A batch concatenates its draws, so vertex v of the launch belongs to the
+ * last draw whose vert_begin is not past it, and gathers from that draw's
+ * index range. The table is bounded by CP_MAX_BATCH_DRAWS, so the search is a
+ * handful of steps over something entirely in cache.
+ */
+struct cp_draw_slice {
+   uint32_t vert_begin;    /* first assembled vertex of this draw */
+   uint32_t index_bytes;   /* byte offset of its first index into the IB */
+   uint32_t first_vertex;  /* index_bias when indexed, draw start when not */
+   uint32_t pad;
+};
 /* Entries per draw in the table at CP_ARG_SLOT_UBO_TABLE; matches
  * CP_MAX_CONST_BUFFERS and the 18.. layout it stands in for. */
 #define CP_ARG_UBO_STRIDE 16
@@ -825,14 +848,20 @@ struct cp_vertex_fetch_args {
    uint64_t out_vertex_ids;
    uint64_t out_instance_ids;
    /*
-    * Assembled vertices in one draw of a batch. Batched draws share their
-    * geometry entirely — same index range, same buffers — and differ only in
-    * their vertex-stage uniforms, so vertex v of the launch is vertex
-    * v % this of draw v / this and gathers exactly what the draw before it
-    * did. Zero means this is not a batch, which is the single-draw path
-    * unchanged.
+    * The batch's draws, one slice each, and how many there are. Zero means
+    * this is not a batch and every line above reads exactly as it did before
+    * batching existed — which is what makes CUDAPIPE_BATCH_MAX=1 a real
+    * check rather than a different code path that happens to agree.
     */
-   uint32_t verts_per_draw;
+   uint64_t draw_slices;   /* const struct cp_draw_slice * */
+   uint32_t num_draw_slices;
+   /*
+    * Where to publish each assembled vertex's row in the batch's per-draw
+    * tables, for the vertex shader to pick its uniform bindings out of. The
+    * search below already knows the answer, so the shader does not repeat it.
+    * Zero when the shader has no use for it.
+    */
+   uint64_t out_batch_rows;
 };
 
 #endif /* CP_RAST_TYPES_H */
