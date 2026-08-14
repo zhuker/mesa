@@ -194,21 +194,22 @@ stored — milliseconds per frame, the mean over the run (`cp_perf_run.sh ... 60
 compared, and is far too few to time: at sixty the render loop is a minority of
 the process. `tests/TESTING.md` has the measurement that settles it.
 
-| | nvidia | cudapipe | llvmpipe | before batching | before phase 1a | before any perf work |
+| | nvidia | cudapipe | llvmpipe | before the peel pass | before batching | before any perf work |
 |---|---|---|---|---|---|---|
-| particlesystem | 0.1 | **52.0** | 15.7 | 52.3 | 55.2 | 1361.7 |
-| gltfscenerendering | 0.1 | **15.3** | 15.2 | 15.3 | 19.9 | 343.9 |
-| bloom | 0.0 | **12.1** | 3.6 | 12.1 | 12.4 | 558.0 |
-| instancing | 0.1 | **7.1** | 73.0 | 7.1 | 27.2 | 241.7 |
-| multithreading | 0.3 | **6.0** | 96.9 | 29.8 | 50.2 | 156.6 |
-| pbribl | 0.0 | **1.6** | 2.7 | 1.7 | 3.8 | 135.4 |
-| dynamicuniformbuffer | 0.0 | **1.3** | 1.0 | 12.3 | 22.5 | 128.5 |
-| pushconstants | 0.0 | **0.8** | 3.4 | 2.3 | 2.4 | 5.7 |
-| **total, one frame of each** | **0.9** | **109.0** | **232.1** | **145.5** | **206.7** | **3792.2** |
+| particlesystem | 0.1 | **35.1** | 15.7 | 52.0 | 52.3 | 1361.7 |
+| gltfscenerendering | 0.1 | **15.1** | 15.2 | 15.3 | 15.3 | 343.9 |
+| bloom | 0.0 | **12.1** | 3.6 | 12.1 | 12.1 | 558.0 |
+| instancing | 0.1 | **7.1** | 73.0 | 7.1 | 7.1 | 241.7 |
+| multithreading | 0.3 | **6.0** | 96.9 | 6.0 | 29.8 | 156.6 |
+| multisampling | 0.0 | **3.4** | 5.3 | 3.5 | 3.6 | 41.1 |
+| pbribl | 0.0 | **1.7** | 2.7 | 1.6 | 1.7 | 135.4 |
+| dynamicuniformbuffer | 0.0 | **1.3** | 1.0 | 1.3 | 12.3 | 128.5 |
+| pushconstants | 0.0 | **0.8** | 3.4 | 0.8 | 2.3 | 5.7 |
+| **total, one frame of each** | **0.9** | **91.8** | **232.1** | **109.0** | **145.5** | **3792.2** |
 
-**cudapipe finishes the sweep 2.13x ahead of llvmpipe**, and ahead of it on nine
-of the seventeen samples individually, with `gltfscenerendering` level. It was
-16x behind. Four passes got it there and each has its own write-up:
+**cudapipe finishes the sweep 2.53x ahead of llvmpipe**, and ahead of it on ten
+of the seventeen samples individually. It was 16x behind. Five passes got it
+there; the first four have their own write-up:
 
 - `PERFORMANCE_PROGRESS.md` — the first pass, 3792 -> 207 ms. 96% of it was
   three defects rather than any optimization, the largest being that
@@ -240,6 +241,15 @@ ahead of `cuLaunchKernel` in host API time to move 64 bytes. Small managed
 allocations are zeroed by the host now; past 64 KB the clear becomes real
 bandwidth and the device keeps it.
 
+The fifth pass has no write-up of its own; it is one commit, "stop the peel loop
+paying for work it already did", 109 -> 92 ms and particlesystem 52.0 -> 35.1.
+Three changes to the peel loop: the binning queues are built once per draw
+rather than rebuilt on all 256 passes; points take their own medium threshold,
+so a sprite between 128 and 4096 pixels stops getting one warp however much it
+covers; and stage 3 walks only the part of a tile the primitive's bounding box
+reaches. The second is nearly all of it, at -27.6%. Two of the three predictions
+behind them were wrong in instructive ways — see "the peel loop" below.
+
 NVIDIA's column is not a rendering time. Offscreen benchmarking measures
 recording and submitting a frame, and nothing waits for the GPU until the pass
 ends, so a driver that submits asynchronously is timed on its CPU side alone —
@@ -254,13 +264,38 @@ blocking on the GPU. llvmpipe spreading across cores is why it stays close
 despite shading on the CPU — and why the samples cudapipe now beats it on are
 the ones with the most geometry.
 
-**The peel loop is the worst thing in the driver, and it is now nearly half the
-sweep.** particlesystem is 52.0 ms of a 109.0 ms total. It runs about 260 passes
-a frame, each re-rasterizing and re-shading the whole draw. Phase 1a took the
-host sync between them on a doubling interval rather than every layer, and
-batching refuses blended draws by design, so nothing since has touched the
-passes themselves. It is 3.3x slower than llvmpipe, and `bloom` — full-screen
-passes, the same shape — is 3.4x. Phase 3 is what addresses both.
+**The peel loop is still the worst thing in the driver.** particlesystem is
+35.1 ms of a 91.8 ms total, 2.2x slower than llvmpipe where nothing else in the
+set is off by more than `bloom`'s 3.4x. It runs about 260 passes a frame, each
+re-rasterizing and re-shading the whole draw, and the fifth pass above made each
+repeat cheaper without removing a single repetition.
+
+Where its time now goes, profiled at 30 frames: **`cp_rasterize_stage3` 56.7%**,
+the framebuffer-sized kernels (`cp_fs_interpolate`, `cp_fs_writeback`,
+`cp_peel_advance`) 21.8% between them, the fragment shader 16.1%, and everything
+else under 3%. Two things worth carrying out of that pass:
+
+- **Stage 3's cost is the `atomicMin` per covered sample, not the coverage test
+  on rejected ones.** Bounding the tile walk cut its trip count by the predicted
+  factor and its duration by 11%. Stage 3 takes one block per (primitive, tile)
+  pair, so a tile in the fire's core has hundreds of blocks contending on the
+  same few thousand addresses — 260 times over, with identical addresses and
+  identical values every time. That is what Phase 3's one-block-per-tile form
+  removes, by resolving in shared memory, and it is the strongest evidence so
+  far for that form over a per-pixel fragment list.
+- **Half the passes cannot be seen.** Rendering at 128 layers instead of 256
+  leaves red and green bit-identical across the whole frame and moves 641 pixels
+  of blue. The fire's core saturates long before the cap. That is not a licence
+  to lower `CP_BLEND_LAYERS` — the change is visible in the brightest pixels, a
+  tolerance-8 count over the frame reads it as 0.06% and hides it, and the value
+  would be tuned to this scene. It says the work is there to be removed by
+  something that knows when a pixel can no longer change.
+
+  An exact early-out is harder than it looks here: the blend is
+  `src + dst * (1 - a)`, so a saturated pixel can go back *down* and saturation
+  is not an absorbing state. Only pure additive blending gives that, and this
+  pipeline is premultiplied `over` — it merely behaves additively because the
+  texture's alpha is near zero, which is data the driver cannot see.
 
 **"94% GPU busy" never meant the GPU was working.** Device counters have
 particlesystem at 94% GR Active while issuing instructions on 5% of cycles,
@@ -346,8 +381,13 @@ lanes and dropped by the writeback.
 
 **A point is one vertex wearing a square.** POINT_LIST arrives as one
 degenerate triangle per point; `setup_triangle` turns that into a
-screen-aligned square from `gl_PointSize` and stage 1 walks it with a half-open
-box test, so stages 2 and 3 never see one. Every input takes the vertex's own
+screen-aligned square from `gl_PointSize`, and every stage resolves it with the
+same half-open box test rather than with edge functions. A point under
+`CP_SMALL_THRESHOLD` is walked by one thread in stage 1; above it, it goes
+straight to stage 3 and gets a block per tile, because `CP_POINT_THRESHOLD`
+defaults to the small threshold — a sprite is all bounding box, so the one-warp
+middle path stage 2 offers a triangle is the worst of both for it. Raising
+`CUDAPIPE_POINT_THRESHOLD` puts the middle path back. Every input takes the vertex's own
 value, since there is nothing to interpolate between. `gl_PointCoord` is the
 one thing that varies and no vertex shader output drives it, so the
 interpolator writes it from the pixel's position inside the square; helper
@@ -493,7 +533,20 @@ smooth.
    intrinsics. Routing pow to the CUDA library version was tried and changed the
    image without moving it closer to the reference, so it was reverted. `fsin`
    and `fcos` do *not* — see below.
-12. **Batched draws break a depth tie the other way.** With `LEQUAL` and
+12. **Stage 2 and stage 3 do not interpolate depth to the same bits.** Both
+   evaluate the same edge functions with the same fill rule, but the
+   barycentric-to-depth arithmetic is written out separately in each, and NVRTC
+   is free to contract the products into FMAs differently. The visibility
+   buffer resolves by `atomicMin`, so a one-ulp difference flips a tie and a
+   different triangle wins the pixel. Moving triangles across the stage 2/3
+   boundary — by lowering `CUDAPIPE_MEDIUM_THRESHOLD` — changes two pixels of
+   `gltfscenerendering` for this reason. It is why `CP_POINT_THRESHOLD` is a
+   separate constant rather than the medium threshold simply being lowered, and
+   any change to the size thresholds or to Phase 3's tiling will keep meeting
+   it. The fix is one interpolation routine both stages call, the way
+   `emit_fragment()` already unified the four `atomicMin` sites. Points are
+   unaffected: they carry a single depth and both stages pass it through.
+13. **Batched draws break a depth tie the other way.** With `LEQUAL` and
    coplanar geometry spanning two merged draws, the batch keeps the lowest
    triangle index — the earliest draw — where drawing them in sequence keeps the
    later one. No sample in the set shows it, and it is mitigated rather than
@@ -700,6 +753,9 @@ retried.
 | `CUDAPIPE_BATCH_MAX` | cap the batch size; `1` is the bit-identical check |
 | `CUDAPIPE_DEBUG_WORK` | shaded pixels against threads launched, per shading pass (syncs) |
 | `CUDAPIPE_NVTX` | NVTX timeline ranges per draw and stage; read with `tests/cp_prof_nvtx.py` |
+| `CUDAPIPE_NO_BINCACHE` | rebuild the binning queues on every peel pass, as before |
+| `CUDAPIPE_SMALL_THRESHOLD` / `MEDIUM_THRESHOLD` / `POINT_THRESHOLD` | rasterizer stage boundaries, `-D` at NVRTC time — sweep without rebuilding |
+| `CUDAPIPE_TILE_BOUND` | `0` puts stage 3 back to walking the whole tile |
 | `CUDAPIPE_MAX_REGISTERS` | cap shader registers via `CU_JIT_MAX_REGISTERS` |
 | `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
 
