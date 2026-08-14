@@ -120,6 +120,96 @@ struct cp_rasterize_args {
    /* Samples per pixel, 1 or CP_MAX_SAMPLES. Coverage and depth are resolved
     * per sample; shading stays per pixel. */
    uint32_t num_samples;
+   /*
+    * TEMPORARY INSTRUMENTATION (CUDAPIPE_FRAG_CENSUS). Both are uint32 per
+    * pixel, sample planes folded together, and both are zero unless the census
+    * is on. `census` counts every fragment emit_fragment is called with, i.e.
+    * raw coverage before any visibility resolution; `census_depth` counts the
+    * subset that survives the depth test against earlier draws. Nothing reads
+    * them on the device, so a set pointer cannot change what is rendered.
+    */
+   uint64_t census;
+   uint64_t census_depth;
+   /*
+    * TEMPORARY (CUDAPIPE_ABUFFER). A counted per-pixel fragment list, built by
+    * two extra rasterization passes over the same geometry the peel loop is
+    * about to re-rasterize CP_BLEND_LAYERS times. Nothing downstream reads it:
+    * the draw is still rendered by the peel loop, and this exists only to be
+    * checked against what that loop composites.
+    *
+    * abuf_mode selects which pass this launch is. In either the fragment is
+    * counted or recorded *after* the depth test and *instead of* the
+    * visibility buffer, so a counting or filling launch writes nothing the
+    * renderer reads.
+    */
+   uint64_t abuf_counts;    /* uint32 per pixel: depth-passing fragments */
+   uint64_t abuf_offsets;   /* uint32 per pixel: exclusive scan of the above */
+   uint64_t abuf_cursor;    /* uint32 per pixel: fill position within the run */
+   uint64_t abuf_frags;     /* uint32 per fragment: primitive id */
+   uint64_t abuf_overflow;  /* uint32: fragments the fill could not place */
+   uint32_t abuf_capacity;  /* entries in abuf_frags */
+   uint32_t abuf_mode;      /* CP_ABUF_* below */
+};
+
+#define CP_ABUF_OFF     0u
+#define CP_ABUF_COUNT   1u
+#define CP_ABUF_FILL    2u
+
+/*
+ * Whether the device code above is compiled at all.
+ *
+ * The fields stay in the struct unconditionally — the host writes them and the
+ * two sides have to agree on the layout — but the branches that read them sit
+ * in emit_fragment, which runs about 960 million times a frame on
+ * particlesystem. Three branches on a pointer that is uniformly null still
+ * cost 1.6% there, and that is a tax on every future A/B of a tree carrying
+ * this instrumentation. NVRTC compiles at run time, so the host defines this
+ * to 1 only when CUDAPIPE_ABUFFER or CUDAPIPE_FRAG_CENSUS is set, exactly the
+ * way CP_SMALL_THRESHOLD and friends are handed over; see cp_kernels.c.
+ */
+#ifndef CP_ABUF_INSTRUMENT
+#define CP_ABUF_INSTRUMENT 0
+#endif
+
+/* Elements one block of the prefix sum scans. One thread per element, two
+ * shared buffers, so the shared cost is 2 * this * 4 bytes. */
+#define CP_ABUF_SCAN_BLOCK 512
+
+/* Longest per-pixel run the sort handles in shared memory. Measured maximum
+ * depth on particlesystem is 406-411; anything above this falls back to a
+ * single-threaded insertion sort in global memory, which is correct and slow
+ * rather than wrong. */
+#define CP_ABUF_SORT_MAX 1024
+
+/* Peel layers the verification log records for every pixel. */
+#define CP_ABUF_LOG_LAYERS 32
+
+/*
+ * Counters the quad merge and the instrumented interpolator share, in one
+ * allocation so a single copy back reads all of them.
+ */
+#define CP_ABUF_DBG_PEEL_QUADS  0  /* quads cp_fs_interpolate emitted, all passes */
+#define CP_ABUF_DBG_NOT_FOUND   1  /* ... whose (block, primitive) is not in the merge */
+#define CP_ABUF_DBG_DEGENERATE  2  /* ... whose interpolation refused a covered pixel */
+#define CP_ABUF_DBG_FULL        3  /* ... dropped because the fragment buffer filled */
+#define CP_ABUF_DBG_SLOT_BAD    4  /* shaded fragments whose A-buffer slot was out of range */
+#define CP_ABUF_DBG_COUNTERS    5
+
+/*
+ * Everything the blend equation is, in the form both the peel path's writeback
+ * and the A-buffer's composite read it.
+ *
+ * One struct rather than two sets of flat fields, because the two kernels
+ * evaluate the same equation on the same draw and a second copy of it is a
+ * second thing that can be right about a draw the first one is wrong about —
+ * which is the failure mode gap 12 in CUDAPIPE_HANDOFF.md already is.
+ */
+struct cp_blend_desc {
+   uint32_t enable;
+   /* pipe_blend_state factors/functions for the colour and alpha channels. */
+   uint32_t rgb_src_factor, rgb_dst_factor, rgb_func;
+   uint32_t alpha_src_factor, alpha_dst_factor, alpha_func;
+   uint32_t colormask;
 };
 
 /* Passes an alpha-tested draw gets to find a fragment that survives. Each one
@@ -253,6 +343,45 @@ struct cp_fs_interp_args {
    int32_t psiz_slot;
    int32_t pntc_input;
    uint32_t num_samples;
+   /*
+    * TEMPORARY (CUDAPIPE_ABUFFER). What this interpolation emitted, folded
+    * into the merged quad array so the peel path and the A-buffer path can be
+    * compared without keeping a record per pass.
+    *
+    * A quad is a (2x2 block, primitive, 4-bit coverage mask) triple, and the
+    * merge already holds every such triple the A-buffer implies, one per
+    * distinct primitive per block, ascending. So the interpolator looks its
+    * own triple up in that array and ORs its mask into dbg_peel_mask; over the
+    * peel loop's passes the accumulated mask is what the merged mask has to
+    * equal. A triple the merge does not contain is counted rather than
+    * written, which is the mismatch this exists to find.
+    *
+    * All five are zero for every draw but the one being verified, and the code
+    * that reads them compiles out entirely unless CP_ABUF_INSTRUMENT.
+    */
+   uint64_t dbg_blk_offsets;  /* uint32 per block: first quad of the block */
+   uint64_t dbg_blk_counts;   /* uint32 per block: quads in the block */
+   uint64_t dbg_quad_prim;    /* uint32 per quad: primitive id, ascending */
+   uint64_t dbg_peel_mask;    /* uint32 per quad: OR of the masks emitted */
+   uint64_t dbg_counters;     /* uint32[CP_ABUF_DBG_COUNTERS] */
+   /*
+    * TEMPORARY (CUDAPIPE_ABUFFER), step 3b. The quad stream as the *source* of
+    * an interpolation rather than something to check one against, and the map
+    * from a shaded slot back to the A-buffer slot it belongs to.
+    *
+    * cp_abuf_interpolate reads the first four and fills the same four output
+    * arrays cp_fs_interpolate does, through the same cp_interp_pixel; the
+    * A-buffer lists are read by both, to turn a (pixel, primitive) into the
+    * one slot where both paths deposit their shaded colour.
+    */
+   uint64_t abuf_quad_prim;   /* uint32 per quad: primitive */
+   uint64_t abuf_quad_mask;   /* uint8 per quad: 4-bit pixel coverage */
+   uint64_t abuf_quad_block;  /* uint32 per quad: 2x2 block index */
+   uint64_t abuf_frags;       /* uint32 per A-buffer slot: primitive, sorted */
+   uint64_t abuf_offsets;     /* uint32 per pixel: first slot of its run */
+   uint64_t abuf_counts;      /* uint32 per pixel: length of its run */
+   uint64_t dbg_slot;         /* Out: uint32 per shaded slot, ~0 for no slot */
+   uint32_t abuf_num_quads;
 };
 
 struct cp_fs_writeback_args {
@@ -274,16 +403,46 @@ struct cp_fs_writeback_args {
    uint32_t fs_out_stride;
    uint32_t num_pixels;
    uint32_t color_encoding; /* enum cp_color_encoding */
-   uint32_t blend_enable;
-   /* pipe_blend_state factors/functions for the colour and alpha channels. */
-   uint32_t rgb_src_factor, rgb_dst_factor, rgb_func;
-   uint32_t alpha_src_factor, alpha_dst_factor, alpha_func;
-   uint32_t colormask;
+   struct cp_blend_desc blend;
    /* Samples per pixel, and the distance between one sample's plane of the
     * colour attachment and the next, in bytes. */
    uint32_t num_samples;
    uint32_t sample_stride;   /* bytes between colour sample planes */
    uint32_t height;          /* with width, the stride between visbuf planes */
+};
+
+/*
+ * Composite a whole A-buffer into the colour attachment (CUDAPIPE_ABUFFER).
+ *
+ * One thread per covered pixel. The pixel's run of fragments is already sorted
+ * ascending by primitive, which is the order the peel loop composites in, so
+ * the thread reads the attachment once, blends the run in place and writes it
+ * back once. Reading and writing the attachment once per pixel rather than
+ * once per layer is most of what this replaces the peel loop to get.
+ *
+ * `shade_slot` is the map the merge left behind: for A-buffer slot s, which of
+ * the quad stream's shading slots holds that fragment. 0xFFFFFFFF for a slot
+ * the merge could not place, which is skipped rather than read.
+ */
+struct cp_abuf_composite_args {
+   uint64_t offsets;        /* uint32 per pixel: first A-buffer slot */
+   uint64_t counts;         /* uint32 per pixel: length of the run */
+   uint64_t shade_slot;     /* uint32 per A-buffer slot: shading slot */
+   uint64_t fs_out;         /* Fragment shader colour output, per shading slot */
+   uint64_t coverage;       /* uint8 per shading slot; helper lanes are zero */
+   uint64_t discard_mask;   /* uint8 per shading slot, set by `discard` (0 = none) */
+   uint64_t color_out;
+   uint64_t list;           /* uint32 per covered pixel */
+   uint64_t list_count;     /* uint32: entries in `list` */
+   uint32_t fs_out_stride;
+   uint32_t num_slots;      /* bound on a shading slot index */
+   uint32_t capacity;       /* bound on an A-buffer slot index */
+   uint32_t color_encoding; /* enum cp_color_encoding */
+   /* Layers to composite, 0 for all of them. Only for reproducing the peel
+    * loop's own CP_BLEND_LAYERS truncation when something needs comparing
+    * against it; the point of this path is that it has no such cap. */
+   uint32_t max_layers;
+   struct cp_blend_desc blend;
 };
 
 /*

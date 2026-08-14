@@ -26,6 +26,20 @@ struct cp_kernels {
    CUfunction resolve_samples;
    CUfunction resolve_visbuf;
 
+   /* TEMPORARY: A-buffer build and its verification log (CUDAPIPE_ABUFFER). */
+   CUfunction abuf_scan_block;
+   CUfunction abuf_scan_add;
+   CUfunction abuf_worklist;
+   CUfunction abuf_sort;
+   CUfunction abuf_peel_log;
+   CUfunction abuf_peel_log_list;
+   CUfunction abuf_block_worklist;
+   CUfunction abuf_quad_count;
+   CUfunction abuf_quad_fill;
+   CUfunction abuf_interpolate;
+   CUfunction abuf_scatter_colors;
+   CUfunction abuf_composite;
+
    /* Fragment stage kernels bracketing the compiled fragment shader */
    CUfunction fs_interpolate;
    CUfunction fs_writeback;
@@ -40,6 +54,10 @@ struct cp_kernels {
 
    bool initialized;
 };
+
+/* TEMPORARY: whether the kernels were compiled with the A-buffer
+ * instrumentation. See cp_kernels.c. */
+bool cp_kernels_instrumented(void);
 
 bool cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen);
 void cp_kernels_destroy(struct cp_kernels *k);

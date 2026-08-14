@@ -423,6 +423,15 @@ static __device__ __forceinline__ void
 emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
               int px, int py, int sample, float ndc_z)
 {
+#if CP_ABUF_INSTRUMENT
+   /* TEMPORARY: raw coverage census. Counted first so it is one entry per
+    * (primitive, pixel, sample) the rasterizer produced, before rejection,
+    * before the depth test and before the visibility buffer. */
+   if (args->census)
+      atomicAdd((unsigned int *)(uintptr_t)args->census +
+                (uint32_t)py * args->width + (uint32_t)px, 1u);
+#endif
+
    if (cp_tri_rejected(args, tri_id, px, py))
       return;
 
@@ -447,6 +456,39 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
       if (!pass)
          return;
    }
+
+#if CP_ABUF_INSTRUMENT
+   /* TEMPORARY: same census, restricted to what survives the depth test. */
+   if (args->census_depth)
+      atomicAdd((unsigned int *)(uintptr_t)args->census_depth +
+                (uint32_t)py * args->width + (uint32_t)px, 1u);
+
+   /*
+    * TEMPORARY: A-buffer build. This is the depth-passing population — the
+    * same set the peel loop composites, because peeling also selects among
+    * fragments that got this far. Both modes return before the visibility
+    * buffer, so neither launch can change what is rendered.
+    */
+   if (args->abuf_mode != CP_ABUF_OFF) {
+      uint32_t p = (uint32_t)py * args->width + (uint32_t)px;
+      if (args->abuf_mode == CP_ABUF_COUNT) {
+         atomicAdd((unsigned int *)(uintptr_t)args->abuf_counts + p, 1u);
+      } else {
+         uint32_t slot = atomicAdd((unsigned int *)(uintptr_t)args->abuf_cursor
+                                   + p, 1u);
+         uint32_t n = ((const uint32_t *)(uintptr_t)args->abuf_counts)[p];
+         uint32_t base = ((const uint32_t *)(uintptr_t)args->abuf_offsets)[p];
+         /* Bounded by the pixel's own run as well as by the array, so that a
+          * fill that disagrees with the count is reported rather than allowed
+          * to write over the next pixel's fragments. */
+         if (slot < n && base + slot < args->abuf_capacity)
+            ((uint32_t *)(uintptr_t)args->abuf_frags)[base + slot] = tri_id;
+         else
+            atomicAdd((unsigned int *)(uintptr_t)args->abuf_overflow, 1u);
+      }
+      return;
+   }
+#endif /* CP_ABUF_INSTRUMENT */
 
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args->framebuffer;
 
@@ -961,6 +1003,399 @@ cp_peel_advance(uint64_t *visbuf, uint32_t *peel_next,
    if (entry != VISBUF_EMPTY)
       peel_next[y * width + x] = VISBUF_TRIID(entry) + 1u;
 }
+
+#if CP_ABUF_INSTRUMENT
+/*
+ * ---------------------------------------------------------------------------
+ * TEMPORARY: A-buffer support kernels (CUDAPIPE_ABUFFER)
+ * ---------------------------------------------------------------------------
+ *
+ * Nothing here is on the rendering path. Between them these turn the per-pixel
+ * fragment counts the rasterizer produced into a per-pixel run of primitive
+ * ids, sorted ascending, plus the log the peel loop is checked against.
+ */
+
+/*
+ * One block's exclusive prefix sum, Hillis-Steele in shared memory, with the
+ * block's total left in `sums` for the level above. Double-buffered so a step
+ * reads one buffer and writes the other, which is what removes the second
+ * barrier per step.
+ */
+extern "C" __global__ void
+cp_abuf_scan_block(const uint32_t *in, uint32_t *out, uint32_t *sums,
+                   uint32_t n)
+{
+   __shared__ uint32_t buf[2][CP_ABUF_SCAN_BLOCK];
+   uint32_t tid = threadIdx.x;
+   uint32_t i = blockIdx.x * CP_ABUF_SCAN_BLOCK + tid;
+   uint32_t v = i < n ? in[i] : 0u;
+
+   int pin = 0;
+   buf[pin][tid] = v;
+   __syncthreads();
+   for (uint32_t off = 1; off < CP_ABUF_SCAN_BLOCK; off <<= 1) {
+      uint32_t x = buf[pin][tid];
+      if (tid >= off)
+         x += buf[pin][tid - off];
+      pin ^= 1;
+      buf[pin][tid] = x;
+      __syncthreads();
+   }
+
+   uint32_t incl = buf[pin][tid];
+   if (i < n)
+      out[i] = incl - v;
+   if (tid == CP_ABUF_SCAN_BLOCK - 1 && sums)
+      sums[blockIdx.x] = incl;
+}
+
+/* Add each block's scanned base back into its elements. Must be launched with
+ * CP_ABUF_SCAN_BLOCK threads, which is what makes blockIdx the block index the
+ * level above scanned. */
+extern "C" __global__ void
+cp_abuf_scan_add(uint32_t *data, const uint32_t *sums, uint32_t n)
+{
+   uint32_t i = blockIdx.x * CP_ABUF_SCAN_BLOCK + threadIdx.x;
+   if (i < n)
+      data[i] += sums[blockIdx.x];
+}
+
+/*
+ * Pixels with at least `min_count` fragments. Only 4.6% of the framebuffer is
+ * covered at all, so this turns a grid over every pixel into a grid over the
+ * ~40,000 that have anything in them.
+ *
+ * The sort asks for 2, since a run of 0 or 1 is already sorted. The composite
+ * asks for 1, since a run of 1 still has to be blended.
+ */
+extern "C" __global__ void
+cp_abuf_worklist(const uint32_t *counts, uint32_t n, uint32_t min_count,
+                 uint32_t *list, uint32_t *list_count)
+{
+   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i < n && counts[i] >= min_count) {
+      uint32_t at = atomicAdd(list_count, 1u);
+      list[at] = i;
+   }
+}
+
+/*
+ * Sort each pixel's run ascending: one block per pixel, grid-strided over the
+ * worklist. A run is padded up to a power of two with 0xFFFFFFFF and sorted
+ * bitonically in shared memory, so the padding lands past the end and only the
+ * first `n` entries are written back. Runs longer than CP_ABUF_SORT_MAX get an
+ * insertion sort from thread 0 instead — correct, slow, and not expected to
+ * happen at a measured maximum depth of 411.
+ */
+extern "C" __global__ void
+cp_abuf_sort(uint32_t *frags, const uint32_t *offsets, const uint32_t *counts,
+             const uint32_t *list, const uint32_t *list_count,
+             uint32_t *long_runs)
+{
+   __shared__ uint32_t key[CP_ABUF_SORT_MAX];
+   uint32_t work = *list_count;
+
+   for (uint32_t wi = blockIdx.x; wi < work; wi += gridDim.x) {
+      uint32_t p = list[wi];
+      uint32_t n = counts[p];
+      uint32_t *run = frags + offsets[p];
+
+      if (n > CP_ABUF_SORT_MAX) {
+         if (threadIdx.x == 0) {
+            atomicAdd(long_runs, 1u);
+            for (uint32_t i = 1; i < n; i++) {
+               uint32_t v = run[i];
+               int32_t j = (int32_t)i - 1;
+               while (j >= 0 && run[j] > v) {
+                  run[j + 1] = run[j];
+                  j--;
+               }
+               run[j + 1] = v;
+            }
+         }
+         __syncthreads();
+         continue;
+      }
+
+      uint32_t m = 1;
+      while (m < n)
+         m <<= 1;
+
+      for (uint32_t i = threadIdx.x; i < m; i += blockDim.x)
+         key[i] = i < n ? run[i] : 0xFFFFFFFFu;
+      __syncthreads();
+
+      for (uint32_t k = 2; k <= m; k <<= 1) {
+         for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+            /* Each pair is touched once, by the thread holding the lower
+             * index, so a strided loop needs no further exclusion. */
+            for (uint32_t i = threadIdx.x; i < m; i += blockDim.x) {
+               uint32_t ixj = i ^ j;
+               if (ixj > i) {
+                  bool up = (i & k) == 0;
+                  uint32_t a = key[i], b = key[ixj];
+                  if ((a > b) == up) {
+                     key[i] = b;
+                     key[ixj] = a;
+                  }
+               }
+            }
+            __syncthreads();
+         }
+      }
+
+      for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+         run[i] = key[i];
+      __syncthreads();
+   }
+}
+
+/*
+ * What the peel loop selected at every pixel on this pass. VISBUF_TRIID of an
+ * empty entry is 0, which is a valid primitive, so the empty case is written
+ * out explicitly.
+ */
+extern "C" __global__ void
+cp_abuf_peel_log(const uint64_t *visbuf, uint32_t *log, uint32_t layers,
+                 uint32_t pass, uint32_t n)
+{
+   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= n || pass >= layers)
+      return;
+   uint64_t entry = visbuf[i];
+   log[(size_t)i * layers + pass] =
+      entry == VISBUF_EMPTY ? 0xFFFFFFFFu : VISBUF_TRIID(entry);
+}
+
+/* The same, for a short list of pixels and to full depth, so that the deep
+ * tail is compared rather than only its first CP_ABUF_LOG_LAYERS entries. */
+extern "C" __global__ void
+cp_abuf_peel_log_list(const uint64_t *visbuf, const uint32_t *list,
+                      uint32_t *log, uint32_t layers, uint32_t pass,
+                      uint32_t n)
+{
+   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= n || pass >= layers)
+      return;
+   uint64_t entry = visbuf[list[i]];
+   log[(size_t)i * layers + pass] =
+      entry == VISBUF_EMPTY ? 0xFFFFFFFFu : VISBUF_TRIID(entry);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * TEMPORARY: per-pixel lists -> quad stream (CUDAPIPE_ABUFFER)
+ * ---------------------------------------------------------------------------
+ *
+ * The fragment shader is fed quads, not pixels: four lanes in a 2x2 block, so
+ * the sampler can take a screen-space derivative by shuffling between them. A
+ * derivative is only meaningful across one surface, so a quad has to belong to
+ * a single primitive — which is why cp_fs_interpolate emits one quad per
+ * distinct primitive it finds in a block and shades the pixels that primitive
+ * missed as helper lanes.
+ *
+ * These build the same thing from the A-buffer, for every layer at once. Each
+ * block's four pixels hold a sorted list of the primitives covering them, so
+ * the distinct primitives of the block are their 4-way merge, and the pixels
+ * one primitive covers are the lists it was found in — a 4-bit mask, which is
+ * exactly what the interpolator writes into `coverage`.
+ */
+
+/*
+ * Blocks worth visiting. 4.6% of the framebuffer is covered on
+ * particlesystem, which is order 8,000-10,000 blocks against 230,400, and a
+ * grid over all of them would spend its time finding nothing.
+ */
+extern "C" __global__ void
+cp_abuf_block_worklist(const uint32_t *counts, uint32_t width, uint32_t height,
+                       uint32_t quad_width, uint32_t nblocks, uint32_t *list,
+                       uint32_t *list_count)
+{
+   uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+   if (b >= nblocks)
+      return;
+
+   uint32_t qx = (b % quad_width) * 2;
+   uint32_t qy = (b / quad_width) * 2;
+   uint32_t any = 0;
+   for (int i = 0; i < 4; i++) {
+      uint32_t x = qx + (i & 1), y = qy + (i >> 1);
+      /* A block on the edge of an odd-sized framebuffer has corners outside
+       * it. cp_fs_interpolate ignores those when it looks for triangles — it
+       * only clamps their addresses so the quad stays whole — so they cannot
+       * contribute coverage here either. */
+      if (x < width && y < height)
+         any |= counts[(size_t)y * width + x];
+   }
+
+   if (any) {
+      uint32_t at = atomicAdd(list_count, 1u);
+      list[at] = b;
+   }
+}
+
+/*
+ * One block's merge, shared by the counting and the filling pass so that the
+ * two cannot disagree about what a block contains.
+ *
+ * Returns the number of distinct primitives. With `out_prim` non-null it also
+ * writes them, ascending, from `out_base`, each with the mask of the block's
+ * four pixels whose list held it.
+ *
+ * `out_shade_slot`, when given, is filled the other way round: for every
+ * A-buffer slot this merge consumed, which of the quad stream's shading slots
+ * will hold that fragment's colour. The composite walks a pixel's run and
+ * needs its shaded colours in that order, and the merge is the one place that
+ * knows both indices at once — so recording it here is what spares the
+ * composite a binary search per layer.
+ */
+static __device__ __forceinline__ uint32_t
+cp_abuf_merge_block(const uint32_t *frags, const uint32_t *offsets,
+                    const uint32_t *counts, uint32_t width, uint32_t height,
+                    uint32_t quad_width, uint32_t b,
+                    uint32_t *out_prim, unsigned char *out_mask,
+                    uint32_t *out_peel_mask, uint32_t *out_block,
+                    uint32_t *out_shade_slot,
+                    uint32_t out_base, uint32_t capacity, uint32_t *overflow)
+{
+   const uint32_t *run[4];
+   uint32_t n[4], cur[4], head[4], off[4];
+
+   uint32_t qx = (b % quad_width) * 2;
+   uint32_t qy = (b / quad_width) * 2;
+   for (int i = 0; i < 4; i++) {
+      uint32_t x = qx + (i & 1), y = qy + (i >> 1);
+      run[i] = NULL;
+      n[i] = 0;
+      cur[i] = 0;
+      head[i] = 0;
+      off[i] = 0;
+      if (x < width && y < height) {
+         uint32_t p = (uint32_t)y * width + x;
+         off[i] = offsets[p];
+         run[i] = frags + off[i];
+         n[i] = counts[p];
+         if (n[i])
+            head[i] = run[i][0];
+      }
+   }
+
+   uint32_t emitted = 0;
+   for (;;) {
+      /* The smallest primitive still unconsumed in any of the four lists.
+       * Heads are kept in registers: reloading all four every time round is
+       * four global loads per quad produced, where only the lists that
+       * advanced can have changed. Tracked with a flag rather than a sentinel
+       * value, because every 32-bit primitive id is a legal one. */
+      bool have = false;
+      uint32_t best = 0;
+      for (int i = 0; i < 4; i++) {
+         if (cur[i] < n[i] && (!have || head[i] < best)) {
+            best = head[i];
+            have = true;
+         }
+      }
+      if (!have)
+         break;
+
+      /* Consume it from every list holding it. The step-2 check established
+       * that a run is strictly increasing, so `while` can only ever run once —
+       * it is here so that a run that ever stops being would produce one quad
+       * rather than an endless loop. */
+      uint32_t mask = 0;
+      uint32_t took[4] = { 0, 0, 0, 0 };
+      for (int i = 0; i < 4; i++) {
+         while (cur[i] < n[i] && head[i] == best) {
+            mask |= 1u << i;
+            /* Which entry of this pixel's run was consumed, so the slot it
+             * occupies can be pointed at the shading slot below. */
+            took[i] = cur[i] + 1;
+            if (++cur[i] < n[i])
+               head[i] = run[i][cur[i]];
+         }
+      }
+
+      if (out_prim) {
+         uint32_t at = out_base + emitted;
+         if (at < capacity) {
+            out_prim[at] = best;
+            out_mask[at] = (unsigned char)mask;
+            /*
+             * cp_abuf_interpolate gives quad q the four shading slots 4q..4q+3,
+             * lane i being the block's pixel i. So the fragment this quad
+             * carries for pixel i is shaded at 4*at + i, and it lives in
+             * A-buffer slot off[i] + (the entry just consumed).
+             */
+            if (out_shade_slot) {
+               for (int i = 0; i < 4; i++) {
+                  if (mask & (1u << i))
+                     out_shade_slot[off[i] + took[i] - 1] = at * 4u + (uint32_t)i;
+               }
+            }
+            /* Which block the quad came from. The array is grouped by block
+             * and the offsets say where each block's group starts, but a
+             * consumer walking quads rather than blocks would have to invert
+             * that; one word per quad is cheaper than a search per quad. */
+            if (out_block)
+               out_block[at] = b;
+            /* Cleared here rather than by a memset over the whole capacity:
+             * the peel loop ORs into it from the next launch onwards. */
+            if (out_peel_mask)
+               out_peel_mask[at] = 0;
+         } else if (overflow) {
+            atomicAdd(overflow, 1u);
+         }
+      }
+      emitted++;
+   }
+
+   return emitted;
+}
+
+/*
+ * Quads per block, into a dense array for the prefix sum. Grid-strided over
+ * the worklist, whose length lives on the device — the host never learns it,
+ * so nothing here costs a drain.
+ */
+extern "C" __global__ void
+cp_abuf_quad_count(const uint32_t *frags, const uint32_t *offsets,
+                   const uint32_t *counts, uint32_t width, uint32_t height,
+                   uint32_t quad_width, const uint32_t *list,
+                   const uint32_t *list_count, uint32_t *blk_counts)
+{
+   uint32_t work = *list_count;
+   uint32_t stride = gridDim.x * blockDim.x;
+   for (uint32_t wi = blockIdx.x * blockDim.x + threadIdx.x; wi < work;
+        wi += stride) {
+      uint32_t b = list[wi];
+      blk_counts[b] = cp_abuf_merge_block(frags, offsets, counts, width, height,
+                                          quad_width, b, NULL, NULL, NULL, NULL,
+                                          NULL, 0, 0, NULL);
+   }
+}
+
+/* The same merge again, this time writing the quads at the scanned offsets. */
+extern "C" __global__ void
+cp_abuf_quad_fill(const uint32_t *frags, const uint32_t *offsets,
+                  const uint32_t *counts, uint32_t width, uint32_t height,
+                  uint32_t quad_width, const uint32_t *list,
+                  const uint32_t *list_count, const uint32_t *blk_offsets,
+                  uint32_t *quad_prim, unsigned char *quad_mask,
+                  uint32_t *quad_peel_mask, uint32_t *quad_block,
+                  uint32_t *shade_slot,
+                  uint32_t capacity, uint32_t *overflow)
+{
+   uint32_t work = *list_count;
+   uint32_t stride = gridDim.x * blockDim.x;
+   for (uint32_t wi = blockIdx.x * blockDim.x + threadIdx.x; wi < work;
+        wi += stride) {
+      uint32_t b = list[wi];
+      cp_abuf_merge_block(frags, offsets, counts, width, height, quad_width, b,
+                          quad_prim, quad_mask, quad_peel_mask, quad_block,
+                          shade_slot, blk_offsets[b], capacity, overflow);
+   }
+}
+#endif /* CP_ABUF_INSTRUMENT */
 
 /*
  * Clear visibility buffer to "empty" (max depth, invalid triID)

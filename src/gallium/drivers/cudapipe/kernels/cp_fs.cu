@@ -176,6 +176,133 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
    return true;
 }
 
+#if CP_ABUF_INSTRUMENT
+/*
+ * TEMPORARY (CUDAPIPE_ABUFFER). Which A-buffer slot holds (pixel, primitive).
+ *
+ * The A-buffer is one sorted run of primitive ids per pixel, so a fragment's
+ * slot is a binary search away — and every fragment either path shades has
+ * exactly one, which is what lets the two paths' colours be compared without
+ * either of them agreeing on an order. Returns ~0 if the primitive is not in
+ * the pixel's run, which is a mismatch rather than a normal outcome.
+ */
+static __device__ __forceinline__ uint32_t
+cp_abuf_slot_for(const struct cp_fs_interp_args *args, uint32_t pixel,
+                 uint32_t prim)
+{
+   const uint32_t *frags = (const uint32_t *)(uintptr_t)args->abuf_frags;
+   const uint32_t *offsets = (const uint32_t *)(uintptr_t)args->abuf_offsets;
+   const uint32_t *counts = (const uint32_t *)(uintptr_t)args->abuf_counts;
+   if (!frags || !offsets || !counts)
+      return 0xFFFFFFFFu;
+
+   uint32_t base = offsets[pixel];
+   uint32_t lo = 0, hi = counts[pixel];
+   while (lo < hi) {
+      uint32_t mid = lo + (hi - lo) / 2;
+      uint32_t v = frags[base + mid];
+      if (v == prim)
+         return base + mid;
+      if (v < prim)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   return 0xFFFFFFFFu;
+}
+
+/*
+ * TEMPORARY (CUDAPIPE_ABUFFER), step 3b: the same interpolation, driven by the
+ * merged quad stream instead of by the visibility buffer.
+ *
+ * One thread per quad, and a quad's four slots are 4q..4q+3 — the peel path
+ * has to take them from an atomic because it does not know how many quads a
+ * block will produce until it has looked, and here the merge has already said.
+ * Slots stay four-aligned either way, which is what the shader's cross-lane
+ * derivatives require.
+ *
+ * Everything a slot holds comes from cp_interp_pixel, the function the peel
+ * interpolator calls, so the two cannot drift: a helper lane is a lane the
+ * quad's mask does not name, and it is interpolated exactly like a covered one
+ * — outside the triangle, with negative barycentrics.
+ */
+extern "C" __global__ void
+cp_abuf_interpolate(struct cp_fs_interp_args args)
+{
+   uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+   if (q >= args.abuf_num_quads)
+      return;
+
+   uint32_t b = ((const uint32_t *)(uintptr_t)args.abuf_quad_block)[q];
+   uint32_t prim = ((const uint32_t *)(uintptr_t)args.abuf_quad_prim)[q];
+   uint32_t mask = ((const unsigned char *)(uintptr_t)args.abuf_quad_mask)[q];
+
+   uint32_t qx = (b % args.quad_width) * 2;
+   uint32_t qy = (b / args.quad_width) * 2;
+   uint32_t base = q * 4u;
+
+   unsigned char *coverage = (unsigned char *)(uintptr_t)args.coverage;
+   uint32_t *dbg_slot = (uint32_t *)(uintptr_t)args.dbg_slot;
+
+   for (int i = 0; i < 4; i++) {
+      uint32_t x = qx + (i & 1);
+      uint32_t y = qy + (i >> 1);
+      bool in_fb = x < args.width && y < args.height;
+      /* Clamped the way cp_fs_interpolate clamps, so an odd-sized framebuffer
+       * still shades a whole quad and the two agree on which pixel a corner
+       * outside it borrows. */
+      uint32_t pixel = (y < args.height ? y : args.height - 1) * args.width +
+                       (x < args.width ? x : args.width - 1);
+      bool covered = in_fb && (mask & (1u << i));
+
+      bool ok = cp_interp_pixel(&args, prim, pixel, base + i);
+      /* Single-sampled only, so a covered pixel wins sample 0 and nothing
+       * else; the host refuses this path for anything else. */
+      if (coverage)
+         coverage[base + i] = (covered && ok) ? 1u : 0u;
+      if (dbg_slot)
+         dbg_slot[base + i] = (covered && ok)
+            ? cp_abuf_slot_for(&args, pixel, prim) : 0xFFFFFFFFu;
+   }
+}
+
+/*
+ * TEMPORARY (CUDAPIPE_ABUFFER). Deposit each shaded fragment's colour in the
+ * A-buffer slot for its (pixel, primitive), so that the peel path and the
+ * quad-stream path — which shade in completely different orders — can be
+ * compared element by element.
+ *
+ * Helper lanes carry ~0 and are skipped: both paths shade them and both drop
+ * them. `writes` counts rather than flags, so a slot claimed twice is visible
+ * instead of looking like agreement.
+ */
+extern "C" __global__ void
+cp_abuf_scatter_colors(uint64_t fs_out, uint32_t fs_out_stride,
+                       const uint32_t *dbg_slot, const uint32_t *counter,
+                       uint32_t max_slots, uint32_t capacity,
+                       float4 *colors, uint32_t *writes, uint32_t *dbg)
+{
+   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t limit = counter ? *counter : max_slots;
+   if (limit > max_slots)
+      limit = max_slots;
+   if (i >= limit)
+      return;
+
+   uint32_t slot = dbg_slot[i];
+   if (slot == 0xFFFFFFFFu)
+      return;
+   if (slot >= capacity) {
+      atomicAdd(dbg + CP_ABUF_DBG_SLOT_BAD, 1u);
+      return;
+   }
+
+   colors[slot] = *(const float4 *)((const char *)(uintptr_t)fs_out +
+                                    (size_t)i * fs_out_stride);
+   atomicAdd(writes + slot, 1u);
+}
+#endif /* CP_ABUF_INSTRUMENT */
+
 extern "C" __global__ void
 cp_fs_interpolate(struct cp_fs_interp_args args)
 {
@@ -240,8 +367,22 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
 
    for (int t = 0; t < ntris; t++) {
       uint32_t base = atomicAdd((unsigned int *)(uintptr_t)args.counter, 4u);
-      if (base + 4 > args.max_pixels)
+      if (base + 4 > args.max_pixels) {
+#if CP_ABUF_INSTRUMENT
+         /* TEMPORARY: quads lost here are quads the comparison would report as
+          * missing from the peel side, so say so rather than let it look like
+          * a merge that invented them. */
+         if (args.dbg_counters)
+            atomicAdd((unsigned int *)(uintptr_t)args.dbg_counters +
+                      CP_ABUF_DBG_FULL, (unsigned int)(ntris - t));
+#endif
          return;
+      }
+
+      /* TEMPORARY: the quad's coverage as one 4-bit mask, which is the form
+       * the A-buffer merge produces. Costs nothing when compiled out. */
+      uint32_t quad_mask = 0;
+      bool degenerate = false;
 
       for (int i = 0; i < 4; i++) {
          /* Which of this pixel's samples this triangle actually won. Zero
@@ -259,7 +400,57 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
          bool ok = cp_interp_pixel(&args, tris[t], pix[i], base + i);
          if (coverage)
             coverage[base + i] = ok ? (unsigned char)mask : 0;
+         if (mask && !ok)
+            degenerate = true;
+         if (mask && ok)
+            quad_mask |= 1u << i;
+#if CP_ABUF_INSTRUMENT
+         /* TEMPORARY: where this fragment's shaded colour is to be deposited,
+          * so the A-buffer path's colour for the same (pixel, primitive) can
+          * be compared against it. A helper lane has no slot. */
+         if (args.dbg_slot)
+            ((uint32_t *)(uintptr_t)args.dbg_slot)[base + i] =
+               (mask && ok) ? cp_abuf_slot_for(&args, pix[i], tris[t])
+                            : 0xFFFFFFFFu;
+#endif
       }
+
+#if CP_ABUF_INSTRUMENT
+      /*
+       * TEMPORARY: record the triple this quad is, against the merged quad
+       * array. The merge holds one entry per distinct primitive per block,
+       * ascending, so the entry for this one is a binary search away; ORing
+       * into it accumulates the mask over the passes, because one primitive
+       * can win different pixels of a block on different passes.
+       */
+      if (args.dbg_quad_prim) {
+         atomicAdd((unsigned int *)(uintptr_t)args.dbg_counters +
+                   CP_ABUF_DBG_PEEL_QUADS, 1u);
+         if (degenerate)
+            atomicAdd((unsigned int *)(uintptr_t)args.dbg_counters +
+                      CP_ABUF_DBG_DEGENERATE, 1u);
+
+         uint32_t lo = ((const uint32_t *)(uintptr_t)args.dbg_blk_offsets)[quad];
+         uint32_t cnt = ((const uint32_t *)(uintptr_t)args.dbg_blk_counts)[quad];
+         const uint32_t *prims = (const uint32_t *)(uintptr_t)args.dbg_quad_prim;
+         uint32_t a = 0, bnd = cnt, found = 0xFFFFFFFFu;
+         while (a < bnd) {
+            uint32_t mid = a + (bnd - a) / 2;
+            uint32_t v = prims[lo + mid];
+            if (v == tris[t]) { found = mid; break; }
+            if (v < tris[t]) a = mid + 1; else bnd = mid;
+         }
+         if (found != 0xFFFFFFFFu)
+            atomicOr((unsigned int *)(uintptr_t)args.dbg_peel_mask + lo + found,
+                     quad_mask);
+         else
+            atomicAdd((unsigned int *)(uintptr_t)args.dbg_counters +
+                      CP_ABUF_DBG_NOT_FOUND, 1u);
+      }
+#else
+      (void)quad_mask;
+      (void)degenerate;
+#endif
    }
 }
 
@@ -365,6 +556,43 @@ cp_half_to_float_wb(unsigned short h)
    else
       bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
    return __int_as_float((int)bits);
+}
+
+/*
+ * The blend equation, once.
+ *
+ * Both cp_fs_writeback and cp_abuf_composite call this, on the same
+ * struct cp_blend_desc the host filled from the draw's pipe_rt_blend_state.
+ * Neither of them may hold its own copy of the arithmetic: this driver already
+ * carries one pair of routines that drifted apart (CUDAPIPE_HANDOFF.md gap 12)
+ * and the whole point of the A-buffer path is that it composites what the peel
+ * path composited.
+ *
+ * `dst` is the attachment's decoded value; `out` may alias neither.
+ */
+static __device__ __forceinline__ void
+cp_blend_resolve(const struct cp_blend_desc *b, const float *src,
+                 const float *dst, float *out)
+{
+   if (b->enable) {
+      for (int c = 0; c < 3; c++) {
+         float sf = cp_blend_factor(b->rgb_src_factor, src[c], src[3], dst[c], dst[3]);
+         float df = cp_blend_factor(b->rgb_dst_factor, src[c], src[3], dst[c], dst[3]);
+         out[c] = cp_blend_combine(b->rgb_func, src[c] * sf, dst[c] * df);
+      }
+      float sfa = cp_blend_factor(b->alpha_src_factor, src[3], src[3], dst[3], dst[3]);
+      float dfa = cp_blend_factor(b->alpha_dst_factor, src[3], src[3], dst[3], dst[3]);
+      out[3] = cp_blend_combine(b->alpha_func, src[3] * sfa, dst[3] * dfa);
+
+      /* Channels masked out keep the destination value. */
+      for (int c = 0; c < 4; c++) {
+         if (!(b->colormask & (1u << c)))
+            out[c] = dst[c];
+      }
+   } else {
+      for (int c = 0; c < 4; c++)
+         out[c] = (b->colormask & (1u << c)) ? src[c] : dst[c];
+   }
 }
 
 static __device__ void
@@ -617,29 +845,12 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
       (size_t)sm * args.sample_stride + (size_t)pixel * bpp;
 
    float out[4];
-   if (args.blend_enable) {
+   /* The destination is only read when the equation needs it — an unblended,
+    * unmasked write does not, and that is the common case. */
+   if (args.blend.enable || args.blend.colormask != 0xF) {
       float dst[4];
       cp_load_dst(dst_ptr, args.color_encoding, dst);
-
-      for (int c = 0; c < 3; c++) {
-         float sf = cp_blend_factor(args.rgb_src_factor, src[c], src[3], dst[c], dst[3]);
-         float df = cp_blend_factor(args.rgb_dst_factor, src[c], src[3], dst[c], dst[3]);
-         out[c] = cp_blend_combine(args.rgb_func, src[c] * sf, dst[c] * df);
-      }
-      float sfa = cp_blend_factor(args.alpha_src_factor, src[3], src[3], dst[3], dst[3]);
-      float dfa = cp_blend_factor(args.alpha_dst_factor, src[3], src[3], dst[3], dst[3]);
-      out[3] = cp_blend_combine(args.alpha_func, src[3] * sfa, dst[3] * dfa);
-
-      /* Channels masked out keep the destination value. */
-      for (int c = 0; c < 4; c++) {
-         if (!(args.colormask & (1u << c)))
-            out[c] = dst[c];
-      }
-   } else if (args.colormask != 0xF) {
-      float dst[4];
-      cp_load_dst(dst_ptr, args.color_encoding, dst);
-      for (int c = 0; c < 4; c++)
-         out[c] = (args.colormask & (1u << c)) ? src[c] : dst[c];
+      cp_blend_resolve(&args.blend, src, dst, out);
    } else {
       for (int c = 0; c < 4; c++)
          out[c] = src[c];
@@ -648,6 +859,95 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
    cp_store_dst(dst_ptr, args.color_encoding, out);
    }
 }
+
+#if CP_ABUF_INSTRUMENT
+/*
+ * Composite an A-buffer into the colour attachment (CUDAPIPE_ABUFFER).
+ *
+ * The peel loop reads and writes the attachment once per layer, because a pass
+ * only knows about its own layer. Here the pixel's whole run is in hand, so
+ * the attachment is touched twice for the pixel rather than twice for each of
+ * its ~400 fragments.
+ *
+ * The blend is nevertheless carried through the attachment's own encoding at
+ * every layer, and that is not an oversight. The peel loop stores each layer
+ * and reloads it, so on an 8-bit attachment each layer is quantised before the
+ * next one blends against it; carrying full float across the run would give a
+ * *different* — arguably better — answer, and the claim this path is verified
+ * against is that it produces the peel loop's image bit for bit. The round
+ * trip is through the same cp_store_dst/cp_load_dst pair, into 16 bytes of
+ * stack, so it costs arithmetic rather than memory traffic.
+ */
+extern "C" __global__ void
+cp_abuf_composite(struct cp_abuf_composite_args args)
+{
+   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= *(const uint32_t *)(uintptr_t)args.list_count)
+      return;
+   uint32_t pixel = ((const uint32_t *)(uintptr_t)args.list)[i];
+
+   uint32_t n = ((const uint32_t *)(uintptr_t)args.counts)[pixel];
+   uint32_t base = ((const uint32_t *)(uintptr_t)args.offsets)[pixel];
+   if (!n)
+      return;
+   if (args.max_layers && n > args.max_layers)
+      n = args.max_layers;
+
+   const uint32_t *shade_slot = (const uint32_t *)(uintptr_t)args.shade_slot;
+   const unsigned char *coverage =
+      (const unsigned char *)(uintptr_t)args.coverage;
+   const unsigned char *discard_mask =
+      (const unsigned char *)(uintptr_t)args.discard_mask;
+
+   uint32_t bpp = cp_bytes_per_pixel(args.color_encoding);
+   void *dst_ptr = (char *)(uintptr_t)args.color_out + (size_t)pixel * bpp;
+
+   /* Single-sampled only — the host refuses this path for anything else — so
+    * there is one plane and no per-sample coverage to fold in. */
+   float dst[4];
+   cp_load_dst(dst_ptr, args.color_encoding, dst);
+
+   bool wrote = false;
+   for (uint32_t k = 0; k < n; k++) {
+      uint32_t s = base + k;
+      if (s >= args.capacity)
+         break;
+      uint32_t slot = shade_slot[s];
+      /* A slot the merge could not place. It cannot be read, and dropping the
+       * rest of the run with it would compose the layers out of order. */
+      if (slot == 0xFFFFFFFFu || slot >= args.num_slots)
+         continue;
+      /* What cp_fs_writeback drops before blending: a lane the interpolation
+       * refused, and a fragment the shader discarded. Neither contributes
+       * colour, and on this path neither contributes depth either, since a
+       * draw that writes depth is not eligible. */
+      if (coverage && !coverage[slot])
+         continue;
+      if (discard_mask && discard_mask[slot])
+         continue;
+
+      const float4 *fs_out =
+         (const float4 *)((const char *)(uintptr_t)args.fs_out +
+                          (size_t)slot * args.fs_out_stride);
+      float src[4] = { fs_out->x, fs_out->y, fs_out->z, fs_out->w };
+
+      float out[4];
+      cp_blend_resolve(&args.blend, src, dst, out);
+
+      /* Quantise exactly where the peel loop quantises: through the
+       * attachment's encoding, into 16 bytes of stack rather than into the
+       * attachment itself. The union is float4-headed so that the widest
+       * encoding's 16-byte store lands on something aligned for it. */
+      union { float4 align; unsigned char b[16]; } tmp;
+      cp_store_dst(tmp.b, args.color_encoding, out);
+      cp_load_dst(tmp.b, args.color_encoding, dst);
+      wrote = true;
+   }
+
+   if (wrote)
+      cp_store_dst(dst_ptr, args.color_encoding, dst);
+}
+#endif /* CP_ABUF_INSTRUMENT */
 
 /*
  * Resolve a multisample attachment: the average of its sample planes.
