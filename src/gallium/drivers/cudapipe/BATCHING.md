@@ -181,6 +181,24 @@ table of offsets plus a prefix search in `cp_vertex_fetch`, and per-triangle
 draw indices threaded through the clipper for the fragment stage, which this
 pass avoided by making identical fragment bindings a merge condition.
 
+**Done for the vertex half — `bloom` 12.07 → 2.16 ms, `vulkanscene` 2.81 → 1.53,
+`particlesystem` 5.07 → 4.54, the sweep 61.82 → 49.99.** `cp_vertex_fetch`
+binary-searches a per-draw slice table and the range leaves the key. The
+per-triangle draw index was **not** needed: instrumenting the key's `memcmp` to
+name the differing field says `bloom`'s 298 batch breaks are all `draw_start`
+and `draw_count` and nothing else — no state, no fragment binding, no shader.
+`bloom` goes from 151 batches a frame to 2, and stage 1's grid from 1–9 blocks
+to 193.
+
+**The paragraph above is wrong about `gltfscenerendering`, and the shape of the
+error is worth keeping.** It does not fail on geometry; it never reaches the key
+at all. All 42 of its batch breaks are the vertex shader, because the sample
+creates one pipeline per material and binds 25 distinct VS binaries a frame.
+Per-draw index ranges cannot help it and neither can per-draw fragment bindings
+alone — it needs shader dedup by compiled content, per-draw cull mode, per-draw
+bindings, and its `MASK` materials discard, which the batcher refuses outright.
+It is untouched at 15.32 ms and is now the largest sample in the sweep.
+
 `multithreading` batches 44 of its 342 draws before hitting `CP_MAX_BATCH_TRIS`,
 which is bounded by the clipper's output buffer being sized at 3x the input
 triangle count. Raising the cap from 64K to 256K was worth 6.47 → 6.04 ms;
@@ -190,6 +208,20 @@ further and is independent of everything else here.
 Blending, discard, instancing and depth-only passes are refused by design, so
 `particlesystem`, `bloom` and `instancing` are untouched. Blended draws are what
 Phase 3's tile loop is for, and this pass does not bring it closer.
+
+**Two of those three moved once the ranges came out of the key**, which this
+paragraph did not anticipate: each has a handful of *opaque* draws with
+different ranges that merge fine. `vulkanscene` −45.6%, `particlesystem` −10.5%.
+Only `instancing` is genuinely refused by design.
+
+**And the known deviation below is now reachable.** `bloom` was bit-identical
+against itself over 60 frames and differs on 4 of them at 1–2 pixels once its
+draws merge; `vulkanscene` goes 1/60 to 5/60. It needs `CUDAPIPE_BATCH_MAX` at 8
+to appear and not 2 — enough merged draws for two to collide at equal depth. The
+underlying defect is the clipper's output order rather than batching: `atomicAdd`
+compaction means primitive order is not stable, which breaks Vulkan's guarantee
+independently of any of this. A stable compaction is the fix, and it is worth
+its own pass rather than being paid for by merging less.
 
 ---
 

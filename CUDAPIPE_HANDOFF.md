@@ -194,22 +194,24 @@ stored — milliseconds per frame, the mean over the run (`cp_perf_run.sh ... 60
 compared, and is far too few to time: at sixty the render loop is a minority of
 the process. `tests/TESTING.md` has the measurement that settles it.
 
-| | nvidia | cudapipe | llvmpipe | before the A-buffer | before the peel pass | before any perf work |
+| | nvidia | cudapipe | llvmpipe | before draw ranges | before the A-buffer | before any perf work |
 |---|---|---|---|---|---|---|
-| gltfscenerendering | 0.1 | **15.3** | 15.2 | 15.1 | 15.3 | 343.9 |
-| bloom | 0.0 | **12.1** | 3.6 | 12.1 | 12.1 | 558.0 |
-| instancing | 0.1 | **7.1** | 73.0 | 7.1 | 7.1 | 241.7 |
+| gltfscenerendering | 0.1 | **15.3** | 15.2 | 15.3 | 15.1 | 343.9 |
+| instancing | 0.1 | **7.0** | 73.0 | 7.1 | 7.1 | 241.7 |
 | multithreading | 0.3 | **6.0** | 96.9 | 6.0 | 6.0 | 156.6 |
-| **particlesystem** | 0.1 | **5.1** | 15.7 | 35.1 | 52.0 | 1361.7 |
-| multisampling | 0.0 | **3.4** | 5.3 | 3.4 | 3.5 | 41.1 |
-| pbribl | 0.0 | **1.6** | 2.7 | 1.7 | 1.6 | 135.4 |
+| particlesystem | 0.1 | **4.5** | 15.7 | 5.1 | 35.1 | 1361.7 |
+| multisampling | 0.0 | **3.4** | 5.3 | 3.4 | 3.4 | 41.1 |
+| **bloom** | 0.0 | **2.2** | 3.6 | 12.1 | 12.1 | 558.0 |
+| pbribl | 0.0 | **1.6** | 2.7 | 1.6 | 1.7 | 135.4 |
+| **vulkanscene** | 0.0 | **1.5** | 9.4 | 2.8 | 2.8 | 183.1 |
 | dynamicuniformbuffer | 0.0 | **1.3** | 1.0 | 1.3 | 1.3 | 128.5 |
-| pushconstants | 0.0 | **0.8** | 3.4 | 0.8 | 0.8 | 5.7 |
-| **total, one frame of each** | **0.9** | **61.8** | **232.1** | **91.8** | **109.0** | **3792.2** |
+| **total, one frame of each** | **0.9** | **50.0** | **232.1** | **61.8** | **91.8** | **3792.2** |
 
-**cudapipe finishes the sweep 3.76x ahead of llvmpipe**, and ahead of it on ten
-of the seventeen samples individually, with `gltfscenerendering` level. It was
-16x behind. Six passes got it there; five have their own write-up:
+**cudapipe finishes the sweep 4.64x ahead of llvmpipe**, and **every sample
+above 1.3 ms is at or ahead of it** — what remains behind are the sub-millisecond
+samples like `triangle` and `texture3d`, which measure the driver's per-frame
+floor rather than anything about drawing. It was 16x behind. Seven passes got it
+there; five have their own write-up:
 
 - `PERFORMANCE_PROGRESS.md` — the first pass, 3792 -> 207 ms. 96% of it was
   three defects rather than any optimization, the largest being that
@@ -257,6 +259,13 @@ behind them were wrong in instructive ways.
   composite 2.28M fragments — 99.76% of the calls rejected for being below their
   pixel's `peel_next` — and that ratio is the whole case. Verified stepwise
   against the peel loop, and the checks are still runnable.
+- `BATCHING.md`, second half — the seventh pass, 62 -> 50 ms. Draws that replay
+  *different* index ranges now merge: `cp_vertex_fetch` binary-searches a
+  per-draw slice table and the range leaves the batch key. `bloom` 12.1 -> 2.2,
+  151 batches a frame to 2; `vulkanscene` -45.6% and `particlesystem` -10.5%,
+  neither predicted. The per-triangle draw index that pass expected to need
+  turned out not to be needed at all — `bloom`'s draws differ in nothing but the
+  range.
 
 NVIDIA's column is not a rendering time. Offscreen benchmarking measures
 recording and submitting a frame, and nothing waits for the GPU until the pass
@@ -272,10 +281,13 @@ blocking on the GPU. llvmpipe spreading across cores is why it stays close
 despite shading on the CPU — and why the samples cudapipe now beats it on are
 the ones with the most geometry.
 
-**The peel loop is no longer the default, and `bloom` is now the worst sample in
-the set.** particlesystem was 3.3x slower than llvmpipe at the start of the
-sixth pass and is 3.1x *faster* than it now; `bloom` at 12.1 against 3.6 is the
-largest remaining gap, and nothing in the six passes has touched it.
+**The peel loop is no longer the default, and `gltfscenerendering` is now the
+largest sample in the set.** particlesystem was 3.3x slower than llvmpipe and is
+3.5x *faster* now; `bloom` was the largest remaining gap and the seventh pass
+took it 12.1 → 2.2. `gltfscenerendering` at 15.3 is untouched by all seven, and
+is the one sample that cannot batch for a structural reason — it creates one
+pipeline per material and binds 25 distinct vertex shaders a frame, so it never
+reaches the batch key at all.
 
 The peel loop is still there, still correct, and still what runs for any blended
 draw the A-buffer refuses — multisample, depth-writing, more than one colour
@@ -572,7 +584,17 @@ smooth.
    A-buffer is bit-exact across twenty frames while peeling wanders by 1,496
    pixels. No sample in the set uses these equations, which is why it went
    unnoticed; `ABUFFER.md` has the matrix.
-15. **Batched draws break a depth tie the other way.** With `LEQUAL` and
+15. **`cp_clip_triangles` compacts its output with `atomicAdd`, so post-clip
+   primitive order is not stable run to run.** Vulkan defines rasterization
+   order by primitive order, so this breaks the guarantee independently of
+   anything else — it was simply invisible while batches were small and ties
+   were rare. Merging draws that replay different index ranges made it
+   reachable: `bloom` was bit-identical against itself over 60 frames and now
+   differs on 4 of them at 1–2 pixels, `vulkanscene` 1/60 → 5/60, appearing at
+   `CUDAPIPE_BATCH_MAX=8` and not at 2. A stable compaction is the fix and it is
+   worth its own pass; narrowing what merges would only hide it again. Gap 16
+   is the same defect seen from the other side.
+16. **Batched draws break a depth tie the other way.** With `LEQUAL` and
    coplanar geometry spanning two merged draws, the batch keeps the lowest
    triangle index — the earliest draw — where drawing them in sequence keeps the
    later one. No sample in the set shows it, and it is mitigated rather than
@@ -775,6 +797,7 @@ retried.
 | `CUDAPIPE_DEBUG_DISCARD` | covered and discarded pixels per alpha-test pass (syncs) |
 | `CUDAPIPE_DEBUG_SHADER` | warn on unhandled NIR intrinsics |
 | `CUDAPIPE_DEBUG_BATCH` | why each draw batch ended |
+| `CUDAPIPE_DEBUG_BATCHDIFF` | which field of the batch key differed — "state or geometry" is one `memcmp` and this is what names it |
 | `CUDAPIPE_NO_BATCH` | disable draw batching; reproduces the unbatched frame byte for byte |
 | `CUDAPIPE_BATCH_MAX` | cap the batch size; `1` is the bit-identical check |
 | `CUDAPIPE_DEBUG_WORK` | shaded pixels against threads launched, per shading pass (syncs) |

@@ -120,6 +120,15 @@ and are still the right two, which is why the section stays.
 | gltfscenerendering | 19.79 | 1.3x slower | |
 | bloom | 12.44 | 3.5x slower | full-screen passes |
 
+**"full-screen passes" is wrong, and it was quoted three times before anyone
+profiled it.** `bloom` makes **154 draws a frame**, batches none of them, and
+runs its geometry stages on one to nine blocks of a 170-SM card; half its draws
+render at 256x256, not full screen. What it shared with `dynamicuniformbuffer`
+was the launch count — ~1,270 a frame — and the same fix worked: once draws with
+differing index ranges could merge it went to 2 batches a frame, 53 launches,
+and **12.07 → 2.16 ms**. See `BATCHING.md`. The lesson is the document's own:
+a characterisation nobody measured survived four passes as an explanation.
+
 Two things stand out, and neither needs Phase 3:
 
 - **`dynamicuniformbuffer` is 20x slower than llvmpipe**, and nothing else in
