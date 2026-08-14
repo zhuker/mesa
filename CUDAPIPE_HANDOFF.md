@@ -264,11 +264,22 @@ blocking on the GPU. llvmpipe spreading across cores is why it stays close
 despite shading on the CPU — and why the samples cudapipe now beats it on are
 the ones with the most geometry.
 
-**The peel loop is still the worst thing in the driver.** particlesystem is
-35.1 ms of a 91.8 ms total, 2.2x slower than llvmpipe where nothing else in the
-set is off by more than `bloom`'s 3.4x. It runs about 260 passes a frame, each
+**The peel loop is the worst thing in the driver on the default path, and there
+is now an opt-in replacement for it.** particlesystem is 35.1 ms of a 91.8 ms
+total, 2.2x slower than llvmpipe. It runs about 260 passes a frame, each
 re-rasterizing and re-shading the whole draw, and the fifth pass above made each
 repeat cheaper without removing a single repetition.
+
+`CUDAPIPE_ABUFFER=1` removes the repetition: one rasterization into per-pixel
+fragment lists, sorted by submission index, shaded once and composited once.
+**particlesystem 34.96 → 5.13 ms and the sweep 91.81 → 62.00**, verified
+stepwise against the peel loop and byte-identical where the sample is stable.
+`ABUFFER.md` is the record, including why it is not the default yet: one blend
+equation has ever run through it, draws that never use it still pay 3.5% on
+`multisampling`, and the fragment array peaks at 87% of a capacity sized from
+the first draw seen.
+
+The numbers in this section are the default path, which is unchanged.
 
 Where its time now goes, profiled at 30 frames: **`cp_rasterize_stage3` 56.7%**,
 the framebuffer-sized kernels (`cp_fs_interpolate`, `cp_fs_writeback`,
@@ -753,6 +764,8 @@ retried.
 | `CUDAPIPE_BATCH_MAX` | cap the batch size; `1` is the bit-identical check |
 | `CUDAPIPE_DEBUG_WORK` | shaded pixels against threads launched, per shading pass (syncs) |
 | `CUDAPIPE_NVTX` | NVTX timeline ranges per draw and stage; read with `tests/cp_prof_nvtx.py` |
+| `CUDAPIPE_ABUFFER` | composite a blended draw in one pass instead of peeling — see `ABUFFER.md`. Opt-in |
+| `CUDAPIPE_ABUFFER_COMPOSITE=0` / `_VERIFY=1` / `_LAYERS=N` / `_TIMING=0` | build the lists beside the peel loop; the stepwise checks; cap the composite; drop the timing drain |
 | `CUDAPIPE_NO_BINCACHE` | rebuild the binning queues on every peel pass, as before |
 | `CUDAPIPE_SMALL_THRESHOLD` / `MEDIUM_THRESHOLD` / `POINT_THRESHOLD` | rasterizer stage boundaries, `-D` at NVRTC time — sweep without rebuilding |
 | `CUDAPIPE_TILE_BOUND` | `0` puts stage 3 back to walking the whole tile |

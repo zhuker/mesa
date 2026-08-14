@@ -877,11 +877,26 @@ visibility buffer resolves by `atomicMin`, so draws whose result cannot depend
 on their order merge safely as they are. That is written up in `BATCHING.md` and
 took the sweep 145.53 → 108.98 ms.
 
-What is left for this phase is the part that argument does not reach: **blended
-draws**, where order is the whole problem and §3.3's submission-order sort key
-is the answer, and draws with **differing geometry**, which need per-draw index
-ranges rather than tiles. `particlesystem` at 52 ms is the standing case for the
-first and is untouched by anything so far.
+**And the other part has since been taken in a different shape — see
+`ABUFFER.md`.** Blended draws were the piece batching could not reach, and they
+are done for the narrow case: a single-pass per-pixel A-buffer, sorted by
+submission index exactly as §3.3 prescribes, replacing the 256-pass peel loop.
+`particlesystem` 34.96 → 5.13 ms and the sweep 91.81 → 62.00, opt-in behind
+`CUDAPIPE_ABUFFER=1`.
+
+It is deliberately **not** §3.2's shape. "One block per tile, shading and
+blending inline" needs the fragment shader callable from inside the tile kernel,
+and cudapipe's shaders are separately compiled `__global__` kernels — which
+`CUDAPIPE_HANDOFF.md` already names as why llvmpipe's structure was not ported.
+The A-buffer keeps the shader machinery and pays two extra rasterization passes
+for it, 0.15 ms against the 256 it removes. Whether the per-tile form would beat
+it is open and now has a baseline to beat.
+
+So what is left for this phase is **draws with differing geometry**, which need
+per-draw index ranges rather than tiles, and generalising the A-buffer past the
+one blend equation and one sample count it currently accepts. §3.4's
+hierarchical bin sizes, §3.5's persistent blocks and §3.6's fixed-point stepping
+are untouched and unmeasured against the new baseline.
 
 ## 3.1 Why this is the convergent answer
 
