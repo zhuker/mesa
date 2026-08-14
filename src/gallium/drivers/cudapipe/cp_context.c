@@ -49,6 +49,7 @@ static_assert(offsetof(struct lp_sampler_descriptor, sampler_index) ==
               "lp_sampler_descriptor sampler_index offset changed");
 
 static void cp_scratch_destroy(struct cp_context *cp);
+static void cp_abuf_report(void);
 static void cp_scratch_reset(struct cp_context *cp);
 
 static void
@@ -56,6 +57,7 @@ cp_destroy_context(struct pipe_context *ctx)
 {
    struct cp_context *cp = (struct cp_context *)ctx;
    cp_batch_flush(cp);
+   cp_abuf_report();
    if (cp->visbuf)
       cuMemFree(cp->visbuf);
    if (cp->depthbuf)
@@ -1462,6 +1464,34 @@ cp_census_dump(const char *what, unsigned draw_seq, unsigned peel_seq,
 /* Pixels whose whole run is compared against the peel loop, deepest first. */
 #define CP_ABUF_DEEP_PIXELS 1000
 
+/*
+ * How the fragment array is sized, and when it is resized.
+ *
+ * The array used to be sized once from the first draw ever seen, at 25% over
+ * its count, and never grown — which over 600 frames of particlesystem left
+ * the population at 87.1% of capacity. That is a scene whose animation happens
+ * not to grow much; one that did would quietly stop being eligible and cost
+ * seven times as much, because an overrun falls back to the peel loop.
+ *
+ * So: allocate at twice the first count, and grow when a *later* count comes
+ * within CP_ABUF_GROW_AT of capacity. The growth is deliberately not a
+ * doubling of the array — it is twice the population that triggered it — so
+ * that a scene which grew once does not keep paying for the growth rate it had
+ * at the time.
+ *
+ * **The growth happens between draws, never inside the peel loop or the merge,
+ * and at most once per draw.** `CUDAPIPE_HANDOFF.md` records this driver
+ * invoking the OOM killer with an allocator that grew inside a loop. It is
+ * additionally bounded three ways: by CP_ABUF_MAX_FRAGS, by
+ * CP_ABUF_MAX_GROWTHS over the process, and by the fact that every growth is
+ * announced on stderr. A refused growth is not an error — the draw falls back
+ * to the peel loop, which is correct and slow.
+ */
+#define CP_ABUF_HEADROOM     2u      /* times the count that sized it */
+#define CP_ABUF_SLACK        65536u  /* plus this, so a tiny first draw is not tiny */
+#define CP_ABUF_GROW_AT      0.75    /* fraction of capacity that triggers a grow */
+#define CP_ABUF_MAX_GROWTHS  8u
+
 struct cp_abuf {
    int enabled;             /* -1 unknown, 0 off, 1 on */
    int verify;
@@ -1469,6 +1499,7 @@ struct cp_abuf {
     * loop, rather than merely having its lists built and checked beside it. */
    int composite;
    int timing;              /* print the per-draw event breakdown */
+   int debug;               /* explain on stderr why a draw is not eligible */
    /* Layers the composite stops after, 0 for all of them. Only for asking what
     * the peel loop's own CP_BLEND_LAYERS truncation was worth; the path has no
     * such cap and is not meant to acquire one. */
@@ -1491,12 +1522,15 @@ struct cp_abuf {
     * it was measured to cost. */
    CUdeviceptr clist, clist_count;
 
-   /* The fragment array itself: allocated once, from the first frame's count,
-    * and never grown. See "a bump allocator that is only reset between draws"
-    * in the handoff — an allocation that can grow inside a loop is how this
-    * driver has invoked the OOM killer before. */
+   /* The fragment array itself: sized from the first draw's count with
+    * CP_ABUF_HEADROOM to spare, and grown between draws when a later count
+    * comes within CP_ABUF_GROW_AT of it. See the constants above for why the
+    * growth is bounded the way it is. */
    CUdeviceptr frags;
    unsigned capacity;
+   unsigned growths;        /* times it has been grown this process */
+   unsigned peak;           /* largest population any draw has counted */
+   bool grow_capped;        /* a growth was refused; do not ask again */
 
    /* What the peel loop selected: CP_ABUF_LOG_LAYERS for every pixel, and the
     * full CP_BLEND_LAYERS for the deepest CP_ABUF_DEEP_PIXELS. */
@@ -1550,7 +1584,11 @@ static bool
 cp_abuf_enabled(void)
 {
    if (cp_abuf.enabled < 0) {
-      cp_abuf.enabled = getenv("CUDAPIPE_ABUFFER") ? 1 : 0;
+      /* On by default, off with CUDAPIPE_NO_ABUFFER=1 — the same shape as
+       * CUDAPIPE_NO_BATCH and CUDAPIPE_NO_BINCACHE. CUDAPIPE_ABUFFER=1 still
+       * means what it always did and is now a no-op, so a command line or a
+       * script written against the opt-in version still does what it says. */
+      cp_abuf.enabled = getenv("CUDAPIPE_NO_ABUFFER") ? 0 : 1;
 
       /*
        * Compositing and verifying are exclusive, because the verification is
@@ -1573,9 +1611,15 @@ cp_abuf_enabled(void)
       const char *n = getenv("CUDAPIPE_ABUFFER_VERIFY_DRAWS");
       cp_abuf.verify_max = n ? (unsigned)atoi(n) : 8;
       /* The per-draw event breakdown costs a drain and a line of stderr per
-       * draw, which a 600 frame timing pass does not want. */
+       * draw, which nothing on the default path wants — it was on by default
+       * while the path was opt-in and something being examined, and is off by
+       * default now that it is how blended draws are rendered. */
       const char *t = getenv("CUDAPIPE_ABUFFER_TIMING");
-      cp_abuf.timing = t ? atoi(t) != 0 : 1;
+      cp_abuf.timing = t ? atoi(t) != 0 : 0;
+      /* Likewise the running commentary on which draws are eligible: useful
+       * when the question is why a draw peeled, noise on every other run. */
+      const char *d = getenv("CUDAPIPE_ABUFFER_DEBUG");
+      cp_abuf.debug = d ? atoi(d) != 0 : 0;
       const char *l = getenv("CUDAPIPE_ABUFFER_LAYERS");
       cp_abuf.max_layers = l && *l ? (unsigned)atoi(l) : 0;
    }
@@ -1720,6 +1764,196 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
    ab->w = w;
    ab->h = h;
    ab->ready = true;
+   return true;
+}
+
+/*
+ * What the fragment array ended up holding, against what it was sized for.
+ *
+ * The one number that says whether the headroom is right: an allocation sized
+ * from the first draw and never checked again is how the opt-in version came
+ * to be running at 87.1% of capacity without anybody knowing. Printed once, at
+ * teardown, and only when asked — CUDAPIPE_ABUFFER_TIMING, which is the switch
+ * for "tell me what this path did".
+ */
+static void
+cp_abuf_report(void)
+{
+   struct cp_abuf *ab = &cp_abuf;
+   if (!cp_abuf.timing || !ab->peak)
+      return;
+   fprintf(stderr, "abuffer: peak population %u fragments against a capacity "
+           "of %u (%.1f%%), %u growth%s\n", ab->peak, ab->capacity,
+           ab->capacity ? 100.0 * ab->peak / ab->capacity : 0.0,
+           ab->growths, ab->growths == 1 ? "" : "s");
+}
+
+static void
+cp_abuf_free(CUdeviceptr *p)
+{
+   if (*p)
+      cuMemFree(*p);
+   *p = 0;
+}
+
+/*
+ * Make the per-fragment arrays big enough for a draw of `total` fragments, and
+ * big enough that the next few draws will not have to ask again.
+ *
+ * Called once per eligible draw, after the count pass and before the fill —
+ * which is the only moment the host knows the population and nothing has been
+ * written into the arrays yet. Never called from inside the peel loop or the
+ * merge. Returns false only when there are no usable arrays at all; a growth
+ * that is refused leaves the existing ones in place and says so, and the
+ * caller then decides whether this particular draw still fits.
+ */
+static bool
+cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
+{
+   bool grow = ab->frags &&
+      (double)total > (double)ab->capacity * CP_ABUF_GROW_AT;
+
+   if (ab->frags && !grow)
+      return true;
+   if (grow && (ab->grow_capped || ab->growths >= CP_ABUF_MAX_GROWTHS))
+      return true;
+
+   size_t want = (size_t)total * CP_ABUF_HEADROOM + CP_ABUF_SLACK;
+   if (want > CP_ABUF_MAX_FRAGS) {
+      if (ab->frags) {
+         /* Keep what is there. Draws that fit still take the path; draws that
+          * do not fall back, which is what the cap is for. */
+         if (!ab->grow_capped)
+            fprintf(stderr, "abuffer: %u fragments would want %zu entries, "
+                    "over the %u cap — keeping %u and letting oversized draws "
+                    "peel\n", total, want, CP_ABUF_MAX_FRAGS, ab->capacity);
+         ab->grow_capped = true;
+         return true;
+      }
+      fprintf(stderr, "abuffer: %u fragments needs %zu entries, over the %u "
+              "cap — falling back to the peel path and not allocating\n",
+              total, want, CP_ABUF_MAX_FRAGS);
+      ab->disabled = true;
+      return false;
+   }
+
+   unsigned was = ab->capacity;
+
+   /* Freed before the new ones are asked for, so a grow needs the new size on
+    * the card rather than the old and the new at once. Nothing in them is
+    * live: the count pass writes only the per-pixel counters. */
+   cp_abuf_free(&ab->frags);
+   cp_abuf_free(&ab->quad_prim);
+   cp_abuf_free(&ab->quad_mask);
+   cp_abuf_free(&ab->quad_block);
+   cp_abuf_free(&ab->shade_slot);
+   cp_abuf_free(&ab->peel_mask);
+   cp_abuf_free(&ab->colors_abuf);
+   cp_abuf_free(&ab->writes_abuf);
+   cp_abuf_free(&ab->colors_peel);
+   cp_abuf_free(&ab->writes_peel);
+   ab->capacity = ab->quad_capacity = 0;
+   ab->colors_ready = false;
+
+   if (!cp_abuf_alloc(ab, &ab->frags, want * sizeof(uint32_t), "fragments"))
+      return false;
+   ab->capacity = (unsigned)want;
+
+   /*
+    * The quad arrays, sized from the same number. A quad needs at least one
+    * covering fragment, so there can never be more quads than fragments —
+    * which is what lets these be allocated from a count the host already has,
+    * instead of draining the device again to ask how many the merge produced.
+    */
+   if (!cp_abuf_alloc(ab, &ab->quad_prim, want * sizeof(uint32_t),
+                      "quad primitives") ||
+       !cp_abuf_alloc(ab, &ab->quad_mask, want, "quad masks") ||
+       !cp_abuf_alloc(ab, &ab->quad_block, want * sizeof(uint32_t),
+                      "quad blocks") ||
+       /* Only the composite reads this one, and only the comparison against
+        * the peel loop reads the other. */
+       (cp_abuf.composite &&
+        !cp_abuf_alloc(ab, &ab->shade_slot, want * sizeof(uint32_t),
+                       "shading slots")) ||
+       (cp_abuf.verify &&
+        !cp_abuf_alloc(ab, &ab->peel_mask, want * sizeof(uint32_t),
+                       "peel masks")))
+      return false;
+   ab->quad_capacity = (unsigned)want;
+
+   /* Thirteen bytes an entry for the quads either way: primitive, mask and
+    * block are common, and the fourth word is the shading slot when
+    * compositing and the peel mask when checking. */
+   if (grow) {
+      ab->growths++;
+      fprintf(stderr, "abuffer: grew the fragment array %u -> %u entries "
+              "(%.1f MB, %.1f MB of quads) — a draw counted %u, which is "
+              "%.0f%% of what it had; growth %u of %u\n",
+              was, ab->capacity, want * 4.0 / (1024.0 * 1024.0),
+              want * 13.0 / (1024.0 * 1024.0), total,
+              was ? 100.0 * total / was : 0.0, ab->growths,
+              CP_ABUF_MAX_GROWTHS);
+   } else {
+      fprintf(stderr, "abuffer: fragment array %u entries (%.1f MB, %.1f MB "
+              "of quads) from a first count of %u\n", ab->capacity,
+              want * 4.0 / (1024.0 * 1024.0), want * 13.0 / (1024.0 * 1024.0),
+              total);
+   }
+
+   if (cp_abuf.verify) {
+      free(ab->h_frags);
+      free(ab->h_quad_prim);
+      free(ab->h_quad_mask);
+      free(ab->h_peel_mask);
+      ab->h_frags = malloc(want * sizeof(uint32_t));
+      ab->h_quad_prim = malloc(want * sizeof(uint32_t));
+      ab->h_quad_mask = malloc(want);
+      ab->h_peel_mask = malloc(want * sizeof(uint32_t));
+      if (!ab->h_frags || !ab->h_quad_prim || !ab->h_quad_mask ||
+          !ab->h_peel_mask) {
+         fprintf(stderr, "abuffer: host mirrors failed; disabled\n");
+         ab->disabled = true;
+         return false;
+      }
+
+      /*
+       * One float4 and one write count per A-buffer slot, for each of the two
+       * paths. Sized by the same capacity because a slot is what both paths
+       * address, and refused rather than allocated past a cap — 40 bytes a
+       * slot is 130 MB at the measured population and grows with it.
+       */
+      size_t cb = want * 16, wb = want * sizeof(uint32_t);
+      if (2 * (cb + wb) > CP_ABUF_MAX_COLOR_BYTES) {
+         fprintf(stderr, "abuffer: colour comparison would need %.1f MB, over "
+                 "the %.0f MB cap — the quad stream is still shaded and timed, "
+                 "but not checked\n", 2.0 * (cb + wb) / (1024.0 * 1024.0),
+                 CP_ABUF_MAX_COLOR_BYTES / (1024.0 * 1024.0));
+         return true;
+      }
+      if (!cp_abuf_alloc(ab, &ab->colors_abuf, cb, "colours (abuf)") ||
+          !cp_abuf_alloc(ab, &ab->writes_abuf, wb, "writes (abuf)") ||
+          !cp_abuf_alloc(ab, &ab->colors_peel, cb, "colours (peel)") ||
+          !cp_abuf_alloc(ab, &ab->writes_peel, wb, "writes (peel)"))
+         return false;
+      free(ab->h_colors_abuf);
+      free(ab->h_colors_peel);
+      free(ab->h_writes_abuf);
+      free(ab->h_writes_peel);
+      ab->h_colors_abuf = malloc(cb);
+      ab->h_colors_peel = malloc(cb);
+      ab->h_writes_abuf = malloc(wb);
+      ab->h_writes_peel = malloc(wb);
+      if (!ab->h_colors_abuf || !ab->h_colors_peel || !ab->h_writes_abuf ||
+          !ab->h_writes_peel) {
+         fprintf(stderr, "abuffer: colour mirrors failed; disabled\n");
+         ab->disabled = true;
+         return false;
+      }
+      ab->colors_ready = true;
+      fprintf(stderr, "abuffer: colour comparison on — %.1f MB on the device, "
+              "%.1f MB on the host\n", 2.0 * (cb + wb) / (1024.0 * 1024.0),
+              2.0 * (cb + wb) / (1024.0 * 1024.0));
+   }
    return true;
 }
 
@@ -3199,9 +3433,27 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
    bool abuf_prod = false;
    uint32_t abuf_quads = 0, abuf_covered = 0;
    if (cp_abuf_enabled() && peel && w && h && !ab->disabled) {
+      /* Why a draw is not eligible is a question about one run, and this is a
+       * path every blended draw now reaches — so it is said once, and only
+       * when CUDAPIPE_ABUFFER_DEBUG asked. */
       static int said = 0;
+      if (!cp_abuf.debug)
+         said = 1;
+      /*
+       * Asking for the comparison against the peel loop without the
+       * instrumentation to make it is not a state to render in: the log the
+       * comparison reads is written by kernels CUDAPIPE_ABUF_COMPILE=0
+       * refused, so every pixel reads as a mismatch. Say so once and render
+       * the ordinary way rather than print a thousand false ones.
+       */
+      if (cp_abuf.verify && !screen->kernels.abuf_peel_log) {
+         fprintf(stderr, "abuffer: CUDAPIPE_ABUFFER_VERIFY needs the "
+                 "instrumentation CUDAPIPE_ABUF_COMPILE=0 refused — "
+                 "not verifying\n");
+         cp_abuf.verify = 0;
+         cp_abuf.composite = 1;
+      }
       if (!screen->kernels.abuf_quad_fill) {
-         /* CUDAPIPE_ABUF_COMPILE=0 refused the kernels this needs. */
          if (!said++)
             fprintf(stderr, "abuffer: kernels not compiled in — skipped\n");
          ab->disabled = true;
@@ -3254,13 +3506,16 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       rast_queues.mode = CP_QUEUE_FILL;
       cuEventRecord(ab->ev[0], cp->stream);
       void *ap[] = { &aa, &rast_queues };
-      cuLaunchKernel(screen->kernels.rasterize_stage1,
+      /* The _abuf specialisations: same rasterizer, compiled with the count
+       * and fill branch live. Every other launch in this file uses the plain
+       * ones, which have no A-buffer code in them at all. */
+      cuLaunchKernel(screen->kernels.rasterize_stage1_abuf,
                      (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
                      0, cp->stream, ap, NULL);
-      cuLaunchKernel(screen->kernels.rasterize_stage2,
+      cuLaunchKernel(screen->kernels.rasterize_stage2_abuf,
                      CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                      256, 1, 1, 0, cp->stream, ap, NULL);
-      cuLaunchKernel(screen->kernels.rasterize_stage3, 2048, 1, 1, 64, 1, 1,
+      cuLaunchKernel(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
                      0, cp->stream, ap, NULL);
       cuEventRecord(ab->ev[1], cp->stream);
 
@@ -3273,119 +3528,21 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       cuStreamSynchronize(cp->stream);
       cuMemcpyDtoH(&abuf_total, ab->sum3, sizeof(uint32_t));
 
-      if (!ab->frags) {
-         size_t want = (size_t)abuf_total + abuf_total / 4 + 65536;
-         if (want > CP_ABUF_MAX_FRAGS) {
-            fprintf(stderr, "abuffer: %u fragments needs %zu entries, over the "
-                    "%u cap — falling back to the peel path and not "
-                    "allocating\n", abuf_total, want, CP_ABUF_MAX_FRAGS);
-            ab->disabled = true;
-            abuf = false;
-         } else if (!cp_abuf_alloc(ab, &ab->frags, want * sizeof(uint32_t),
-                                   "fragments")) {
-            abuf = false;
-         } else {
-            ab->capacity = (unsigned)want;
-            if (cp_abuf.verify) {
-               ab->h_frags = malloc(want * sizeof(uint32_t));
-               if (!ab->h_frags) {
-                  ab->disabled = true;
-                  abuf = false;
-               }
-            }
-            fprintf(stderr, "abuffer: fragment array %u entries (%.1f MB) "
-                    "from a first count of %u\n", ab->capacity,
-                    want * 4.0 / (1024.0 * 1024.0), abuf_total);
-
-            /*
-             * The quad arrays, sized from the same number. A quad needs at
-             * least one covering fragment, so there can never be more quads
-             * than fragments — which is what lets these be allocated here,
-             * once, from a count the host already has, instead of draining the
-             * device again to ask how many the merge produced.
-             */
-            if (abuf) {
-               if (!cp_abuf_alloc(ab, &ab->quad_prim, want * sizeof(uint32_t),
-                                  "quad primitives") ||
-                   !cp_abuf_alloc(ab, &ab->quad_mask, want, "quad masks") ||
-                   !cp_abuf_alloc(ab, &ab->quad_block, want * sizeof(uint32_t),
-                                  "quad blocks") ||
-                   /* Only the composite reads this one, and only the
-                    * comparison against the peel loop reads the other. */
-                   (cp_abuf.composite &&
-                    !cp_abuf_alloc(ab, &ab->shade_slot, want * sizeof(uint32_t),
-                                   "shading slots")) ||
-                   (cp_abuf.verify &&
-                    !cp_abuf_alloc(ab, &ab->peel_mask, want * sizeof(uint32_t),
-                                   "peel masks"))) {
-                  abuf = false;
-               } else {
-                  ab->quad_capacity = (unsigned)want;
-                  if (cp_abuf.verify) {
-                     ab->h_quad_prim = malloc(want * sizeof(uint32_t));
-                     ab->h_quad_mask = malloc(want);
-                     ab->h_peel_mask = malloc(want * sizeof(uint32_t));
-                     if (!ab->h_quad_prim || !ab->h_quad_mask ||
-                         !ab->h_peel_mask) {
-                        fprintf(stderr, "abuffer: quad mirrors failed; "
-                                "disabled\n");
-                        ab->disabled = true;
-                        abuf = false;
-                     }
-                  }
-                  /* Thirteen bytes an entry either way: primitive, mask and
-                   * block are common, and the fourth word is the shading slot
-                   * when compositing and the peel mask when checking. */
-                  fprintf(stderr, "abuffer: quad array %u entries (%.1f MB)\n",
-                          ab->quad_capacity, want * 13.0 / (1024.0 * 1024.0));
-               }
-            }
-
-            /*
-             * Step 3b: one float4 and one write count per A-buffer slot, for
-             * each of the two paths. Sized by the same capacity because a slot
-             * is what both paths address, and refused rather than allocated
-             * past a cap — 40 bytes a slot is 130 MB at the measured
-             * population and grows with it.
-             */
-            if (abuf && cp_abuf.verify) {
-               size_t cb = want * 16, wb = want * sizeof(uint32_t);
-               if (2 * (cb + wb) > CP_ABUF_MAX_COLOR_BYTES) {
-                  fprintf(stderr, "abuffer: colour comparison would need "
-                          "%.1f MB, over the %.0f MB cap — the quad stream is "
-                          "still shaded and timed, but not checked\n",
-                          2.0 * (cb + wb) / (1024.0 * 1024.0),
-                          CP_ABUF_MAX_COLOR_BYTES / (1024.0 * 1024.0));
-               } else if (!cp_abuf_alloc(ab, &ab->colors_abuf, cb, "colours (abuf)") ||
-                          !cp_abuf_alloc(ab, &ab->writes_abuf, wb, "writes (abuf)") ||
-                          !cp_abuf_alloc(ab, &ab->colors_peel, cb, "colours (peel)") ||
-                          !cp_abuf_alloc(ab, &ab->writes_peel, wb, "writes (peel)")) {
-                  abuf = false;
-               } else {
-                  ab->h_colors_abuf = malloc(cb);
-                  ab->h_colors_peel = malloc(cb);
-                  ab->h_writes_abuf = malloc(wb);
-                  ab->h_writes_peel = malloc(wb);
-                  if (!ab->h_colors_abuf || !ab->h_colors_peel ||
-                      !ab->h_writes_abuf || !ab->h_writes_peel) {
-                     fprintf(stderr, "abuffer: colour mirrors failed; "
-                             "disabled\n");
-                     ab->disabled = true;
-                     abuf = false;
-                  } else {
-                     ab->colors_ready = true;
-                     fprintf(stderr, "abuffer: colour comparison on — "
-                             "%.1f MB on the device, %.1f MB on the host\n",
-                             2.0 * (cb + wb) / (1024.0 * 1024.0),
-                             2.0 * (cb + wb) / (1024.0 * 1024.0));
-                  }
-               }
-            }
-         }
-      } else if (abuf_total > ab->capacity) {
-         fprintf(stderr, "abuffer: %u fragments exceeds the %u already "
-                 "allocated; this draw falls back to the peel path\n",
-                 abuf_total, ab->capacity);
+      /* Whether the arrays are big enough for this draw, and whether they
+       * should be made bigger before the next one. Both live in one place; see
+       * cp_abuf_size_arrays(). */
+      if (abuf_total > ab->peak)
+         ab->peak = abuf_total;
+      if (!cp_abuf_size_arrays(ab, abuf_total))
+         abuf = false;
+      else if (abuf_total > ab->capacity) {
+         /* The growth was capped or refused and the draw outran what is there.
+          * Correct and slow rather than wrong: the peel loop renders it. */
+         static int said_over = 0;
+         if (!said_over++)
+            fprintf(stderr, "abuffer: %u fragments exceeds the %u allocated; "
+                    "this draw falls back to the peel path\n",
+                    abuf_total, ab->capacity);
          abuf = false;
       }
    }
@@ -3436,13 +3593,13 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       rast_queues.mode = CP_QUEUE_FILL;
       cuEventRecord(ab->ev[3], cp->stream);
       void *ap[] = { &aa, &rast_queues };
-      cuLaunchKernel(screen->kernels.rasterize_stage1,
+      cuLaunchKernel(screen->kernels.rasterize_stage1_abuf,
                      (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
                      0, cp->stream, ap, NULL);
-      cuLaunchKernel(screen->kernels.rasterize_stage2,
+      cuLaunchKernel(screen->kernels.rasterize_stage2_abuf,
                      CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                      256, 1, 1, 0, cp->stream, ap, NULL);
-      cuLaunchKernel(screen->kernels.rasterize_stage3, 2048, 1, 1, 64, 1, 1,
+      cuLaunchKernel(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
                      0, cp->stream, ap, NULL);
       cuEventRecord(ab->ev[4], cp->stream);
 

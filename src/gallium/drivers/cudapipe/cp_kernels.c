@@ -36,16 +36,16 @@ static const char cp_rast_types_src[] =
 ;
 
 /*
- * TEMPORARY: whether the A-buffer instrumentation is compiled into the
- * kernels at all.
+ * Whether the debug instrumentation is compiled into the kernels at all.
  *
- * Its reads sit in emit_fragment, which particlesystem calls about 960 million
- * times a frame, so three branches on pointers that are uniformly null still
- * cost 1.6% of the frame — a tax on every A/B run against a tree that carries
- * this. NVRTC compiles at run time, so the branches can simply not exist
- * unless something is going to use them, the same way CP_SMALL_THRESHOLD and
- * friends are handed over below. Nothing but the two debug variables turns it
- * on, and with it off the driver compiles to what HEAD compiles to.
+ * This is the fragment census and the machinery that compares the A-buffer
+ * against the peel loop — not the A-buffer itself, which is now always built
+ * and is selected by launching a different kernel rather than by a branch.
+ * What is left here is what genuinely has to sit inside emit_fragment and
+ * cp_fs_interpolate, both of which run hundreds of millions of times a frame,
+ * so it must not exist unless something is going to read it. NVRTC compiles at
+ * run time, so it simply does not, the same way CP_SMALL_THRESHOLD and friends
+ * are handed over below.
  */
 bool
 cp_kernels_instrumented(void)
@@ -53,14 +53,14 @@ cp_kernels_instrumented(void)
    static int on = -1;
    if (on < 0) {
       /* CUDAPIPE_ABUF_COMPILE=1 compiles the branches in without turning any
-       * feature on, which is the state this switch exists to remove and the
-       * only way to measure what it was costing. =0 refuses them outright. */
+       * feature on, which is the only way to measure what they cost; =0
+       * refuses them outright. */
       const char *force = getenv("CUDAPIPE_ABUF_COMPILE");
       if (force && *force)
          on = atoi(force) != 0;
       else
-         on = (getenv("CUDAPIPE_ABUFFER") || getenv("CUDAPIPE_FRAG_CENSUS"))
-            ? 1 : 0;
+         on = (getenv("CUDAPIPE_ABUFFER_VERIFY") ||
+               getenv("CUDAPIPE_FRAG_CENSUS")) ? 1 : 0;
    }
    return on == 1;
 }
@@ -202,20 +202,34 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
    cuModuleGetFunction(&k->clear_visbuf, k->module, "cp_clear_visbuf");
    cuModuleGetFunction(&k->peel_advance, k->module, "cp_peel_advance");
    cuModuleGetFunction(&k->resolve_visbuf, k->module, "cp_resolve_visbuf");
+
+   /*
+    * The A-buffer's own specialisation of the three rasterizer stages. Same
+    * source, compiled a second time with the count-and-fill branch live, so
+    * that the branch is chosen by which kernel the host launches rather than
+    * tested on the device once per coverage event. See emit_fragment().
+    */
+   cuModuleGetFunction(&k->rasterize_stage1_abuf, k->module,
+                       "cp_rasterize_stage1_abuf");
+   cuModuleGetFunction(&k->rasterize_stage2_abuf, k->module,
+                       "cp_rasterize_stage2_abuf");
+   cuModuleGetFunction(&k->rasterize_stage3_abuf, k->module,
+                       "cp_rasterize_stage3_abuf");
+
+   cuModuleGetFunction(&k->abuf_scan_block, k->module, "cp_abuf_scan_block");
+   cuModuleGetFunction(&k->abuf_scan_add, k->module, "cp_abuf_scan_add");
+   cuModuleGetFunction(&k->abuf_worklist, k->module, "cp_abuf_worklist");
+   cuModuleGetFunction(&k->abuf_sort, k->module, "cp_abuf_sort");
+   cuModuleGetFunction(&k->abuf_block_worklist, k->module,
+                       "cp_abuf_block_worklist");
+   cuModuleGetFunction(&k->abuf_quad_count, k->module, "cp_abuf_quad_count");
+   cuModuleGetFunction(&k->abuf_quad_fill, k->module, "cp_abuf_quad_fill");
    /* Only present when the instrumentation was compiled in, so only looked
     * up then; the draw path checks the pointers before launching. */
    if (cp_kernels_instrumented()) {
-      cuModuleGetFunction(&k->abuf_scan_block, k->module, "cp_abuf_scan_block");
-      cuModuleGetFunction(&k->abuf_scan_add, k->module, "cp_abuf_scan_add");
-      cuModuleGetFunction(&k->abuf_worklist, k->module, "cp_abuf_worklist");
-      cuModuleGetFunction(&k->abuf_sort, k->module, "cp_abuf_sort");
       cuModuleGetFunction(&k->abuf_peel_log, k->module, "cp_abuf_peel_log");
       cuModuleGetFunction(&k->abuf_peel_log_list, k->module,
                           "cp_abuf_peel_log_list");
-      cuModuleGetFunction(&k->abuf_block_worklist, k->module,
-                          "cp_abuf_block_worklist");
-      cuModuleGetFunction(&k->abuf_quad_count, k->module, "cp_abuf_quad_count");
-      cuModuleGetFunction(&k->abuf_quad_fill, k->module, "cp_abuf_quad_fill");
    }
 
    if (!build_module(&k->fs_module, cp_fs_src, "cp_fs.cu", screen))
@@ -223,16 +237,14 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
    cuModuleGetFunction(&k->fs_interpolate, k->fs_module, "cp_fs_interpolate");
    cuModuleGetFunction(&k->fs_writeback, k->fs_module, "cp_fs_writeback");
    cuModuleGetFunction(&k->resolve_samples, k->fs_module, "cp_resolve_samples");
-   /* TEMPORARY: the quad-stream interpolator lives beside the peel one so both
-    * call the same cp_interp_pixel; see cp_fs.cu. */
-   if (cp_kernels_instrumented()) {
-      cuModuleGetFunction(&k->abuf_interpolate, k->fs_module,
-                          "cp_abuf_interpolate");
+   /* The quad-stream interpolator lives beside the peel one so both call the
+    * same cp_interp_pixel; see cp_fs.cu. */
+   cuModuleGetFunction(&k->abuf_interpolate, k->fs_module,
+                       "cp_abuf_interpolate");
+   cuModuleGetFunction(&k->abuf_composite, k->fs_module, "cp_abuf_composite");
+   if (cp_kernels_instrumented())
       cuModuleGetFunction(&k->abuf_scatter_colors, k->fs_module,
                           "cp_abuf_scatter_colors");
-      cuModuleGetFunction(&k->abuf_composite, k->fs_module,
-                          "cp_abuf_composite");
-   }
 
    if (!build_module(&k->vfetch_module, cp_vertex_fetch_src, "cp_vertex_fetch.cu", screen))
       goto fail;

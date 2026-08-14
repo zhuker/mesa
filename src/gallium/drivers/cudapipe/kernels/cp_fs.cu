@@ -178,7 +178,8 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
 
 #if CP_ABUF_INSTRUMENT
 /*
- * TEMPORARY (CUDAPIPE_ABUFFER). Which A-buffer slot holds (pixel, primitive).
+ * Verification only (CUDAPIPE_ABUFFER_VERIFY). Which A-buffer slot holds
+ * (pixel, primitive).
  *
  * The A-buffer is one sorted run of primitive ids per pixel, so a fragment's
  * slot is a binary search away — and every fragment either path shades has
@@ -210,10 +211,11 @@ cp_abuf_slot_for(const struct cp_fs_interp_args *args, uint32_t pixel,
    }
    return 0xFFFFFFFFu;
 }
+#endif /* CP_ABUF_INSTRUMENT */
 
 /*
- * TEMPORARY (CUDAPIPE_ABUFFER), step 3b: the same interpolation, driven by the
- * merged quad stream instead of by the visibility buffer.
+ * Step 3b: the same interpolation, driven by the merged quad stream instead of
+ * by the visibility buffer.
  *
  * One thread per quad, and a quad's four slots are 4q..4q+3 — the peel path
  * has to take them from an atomic because it does not know how many quads a
@@ -242,7 +244,9 @@ cp_abuf_interpolate(struct cp_fs_interp_args args)
    uint32_t base = q * 4u;
 
    unsigned char *coverage = (unsigned char *)(uintptr_t)args.coverage;
+#if CP_ABUF_INSTRUMENT
    uint32_t *dbg_slot = (uint32_t *)(uintptr_t)args.dbg_slot;
+#endif
 
    for (int i = 0; i < 4; i++) {
       uint32_t x = qx + (i & 1);
@@ -260,15 +264,19 @@ cp_abuf_interpolate(struct cp_fs_interp_args args)
        * else; the host refuses this path for anything else. */
       if (coverage)
          coverage[base + i] = (covered && ok) ? 1u : 0u;
+#if CP_ABUF_INSTRUMENT
       if (dbg_slot)
          dbg_slot[base + i] = (covered && ok)
             ? cp_abuf_slot_for(&args, pixel, prim) : 0xFFFFFFFFu;
+#endif
    }
 }
 
+#if CP_ABUF_INSTRUMENT
 /*
- * TEMPORARY (CUDAPIPE_ABUFFER). Deposit each shaded fragment's colour in the
- * A-buffer slot for its (pixel, primitive), so that the peel path and the
+ * Verification only (CUDAPIPE_ABUFFER_VERIFY). Deposit each shaded fragment's
+ * colour in the A-buffer slot for its (pixel, primitive), so that the peel path
+ * and the
  * quad-stream path — which shade in completely different orders — can be
  * compared element by element.
  *
@@ -860,9 +868,8 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
    }
 }
 
-#if CP_ABUF_INSTRUMENT
 /*
- * Composite an A-buffer into the colour attachment (CUDAPIPE_ABUFFER).
+ * Composite an A-buffer into the colour attachment.
  *
  * The peel loop reads and writes the attachment once per layer, because a pass
  * only knows about its own layer. Here the pixel's whole run is in hand, so
@@ -947,7 +954,6 @@ cp_abuf_composite(struct cp_abuf_composite_args args)
    if (wrote)
       cp_store_dst(dst_ptr, args.color_encoding, dst);
 }
-#endif /* CP_ABUF_INSTRUMENT */
 
 /*
  * Resolve a multisample attachment: the average of its sample planes.

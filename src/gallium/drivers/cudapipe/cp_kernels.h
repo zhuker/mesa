@@ -20,13 +20,18 @@ struct cp_kernels {
    CUfunction rasterize_stage1;
    CUfunction rasterize_stage2;
    CUfunction rasterize_stage3;
+   /* The same three with the A-buffer's count/fill branch compiled in. Only
+    * the count and fill passes launch these; see emit_fragment(). */
+   CUfunction rasterize_stage1_abuf;
+   CUfunction rasterize_stage2_abuf;
+   CUfunction rasterize_stage3_abuf;
    CUfunction clip_triangles;
    CUfunction clear_visbuf;
    CUfunction peel_advance;
    CUfunction resolve_samples;
    CUfunction resolve_visbuf;
 
-   /* TEMPORARY: A-buffer build and its verification log (CUDAPIPE_ABUFFER). */
+   /* A-buffer build, and the peel-loop log its verification compares against. */
    CUfunction abuf_scan_block;
    CUfunction abuf_scan_add;
    CUfunction abuf_worklist;
@@ -55,7 +60,7 @@ struct cp_kernels {
    bool initialized;
 };
 
-/* TEMPORARY: whether the kernels were compiled with the A-buffer
+/* Whether the kernels were compiled with the census and A-buffer verification
  * instrumentation. See cp_kernels.c. */
 bool cp_kernels_instrumented(void);
 

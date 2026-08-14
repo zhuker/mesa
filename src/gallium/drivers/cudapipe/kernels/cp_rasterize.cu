@@ -418,7 +418,19 @@ cp_tri_rejected(const struct cp_rasterize_args *args, uint32_t tri_id,
  * Depth test one fragment and stake its claim on the pixel. Shared by the
  * point path below; the triangle stages inline the same sequence because they
  * carry the edge values along with them.
+ *
+ * ABUF — whether this is one of the A-buffer's count and fill passes — is a
+ * compile-time parameter rather than a test on args->abuf_mode. This function
+ * runs about 960 million times a frame on a peeled draw, and those passes are
+ * their own launches, so the question can be settled by which kernel the host
+ * launched instead of by a load and a compare per coverage event. Measured: a
+ * runtime test costs multisampling 3.4% for branches it never takes.
+ * PERFORMANCE_PLAN.md §0.1 quotes CuRast making the same choice for the same
+ * reason. Both specialisations are instantiated below as separate entry
+ * points, so <false> compiles to what a build without the A-buffer compiles
+ * to.
  */
+template <bool ABUF>
 static __device__ __forceinline__ void
 emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
               int px, int py, int sample, float ndc_z)
@@ -462,14 +474,15 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
    if (args->census_depth)
       atomicAdd((unsigned int *)(uintptr_t)args->census_depth +
                 (uint32_t)py * args->width + (uint32_t)px, 1u);
+#endif
 
    /*
-    * TEMPORARY: A-buffer build. This is the depth-passing population — the
-    * same set the peel loop composites, because peeling also selects among
-    * fragments that got this far. Both modes return before the visibility
-    * buffer, so neither launch can change what is rendered.
+    * A-buffer build. This is the depth-passing population — the same set the
+    * peel loop composites, because peeling also selects among fragments that
+    * got this far. Both modes return before the visibility buffer, so neither
+    * launch can change what is rendered.
     */
-   if (args->abuf_mode != CP_ABUF_OFF) {
+   if (ABUF) {
       uint32_t p = (uint32_t)py * args->width + (uint32_t)px;
       if (args->abuf_mode == CP_ABUF_COUNT) {
          atomicAdd((unsigned int *)(uintptr_t)args->abuf_counts + p, 1u);
@@ -488,7 +501,6 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
       }
       return;
    }
-#endif /* CP_ABUF_INSTRUMENT */
 
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args->framebuffer;
 
@@ -525,6 +537,7 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
  * CP_MAX_POINT_SIZE, which is 256, so a single point can be 65,536 pixels and
  * is worth more than one thread.
  */
+template <bool ABUF>
 static __device__ __forceinline__ void
 rasterize_point(struct cp_rasterize_args *args, struct tri_setup *s,
                 uint32_t tri_id, uint32_t lane, uint32_t stride)
@@ -543,7 +556,7 @@ rasterize_point(struct cp_rasterize_args *args, struct tri_setup *s,
          if (cx < s->pt_x0 || cx >= s->pt_x1 ||
              cy < s->pt_y0 || cy >= s->pt_y1)
             continue;
-         emit_fragment(args, tri_id, px, py, sm, s->ndc_z0);
+         emit_fragment<ABUF>(args, tri_id, px, py, sm, s->ndc_z0);
       }
    }
 }
@@ -571,8 +584,9 @@ cp_broadcast_setup(struct tri_setup *s)
  * Small triangles are rasterized with incremental edge stepping.
  * Large triangles are pushed to the nontrivial queue for stage 2.
  */
-extern "C" __global__ void
-cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
+template <bool ABUF>
+static __device__ __forceinline__ void
+cp_rasterize_stage1_body(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
    uint32_t tri_id = blockIdx.x * blockDim.x + threadIdx.x;
    /* After clipping the count lives on the device, so the grid is sized for
@@ -615,7 +629,7 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
    }
 
    if (s.is_point) {
-      rasterize_point(&args, &s, tri_id, 0, 1);
+      rasterize_point<ABUF>(&args, &s, tri_id, 0, 1);
       return;
    }
 
@@ -649,8 +663,9 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
                float w1 = e1 * s.inv_area;
                float w2 = 1.0f - w0 - w1;
 
-               emit_fragment(&args, tri_id, px, py, sm,
-                             w0 * s.ndc_z0 + w1 * s.ndc_z1 + w2 * s.ndc_z2);
+               emit_fragment<ABUF>(&args, tri_id, px, py, sm,
+                                   w0 * s.ndc_z0 + w1 * s.ndc_z1 +
+                                   w2 * s.ndc_z2);
             }
          }
       }
@@ -662,8 +677,9 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
  * Medium triangles are rasterized cooperatively. Huge triangles are decomposed
  * into tiles and pushed to the huge queue.
  */
-extern "C" __global__ void
-cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
+template <bool ABUF>
+static __device__ __forceinline__ void
+cp_rasterize_stage2_body(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
    uint32_t lane_id = threadIdx.x % 32;
    uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
@@ -770,7 +786,7 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
       /* A point of this size has a square rather than edges; the warp strides
        * it the same way it would a bounding box. */
       if (s.is_point) {
-         rasterize_point(&args, &s, tri_id, lane_id, 32);
+         rasterize_point<ABUF>(&args, &s, tri_id, lane_id, 32);
          continue;
       }
 
@@ -796,9 +812,9 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
             float w0 = e0 * s.inv_area;
             float w1 = e1 * s.inv_area;
 
-            emit_fragment(&args, tri_id, px, py, sm,
-                          w0 * s.ndc_z0 + w1 * s.ndc_z1 +
-                          (1.0f - w0 - w1) * s.ndc_z2);
+            emit_fragment<ABUF>(&args, tri_id, px, py, sm,
+                                w0 * s.ndc_z0 + w1 * s.ndc_z1 +
+                                (1.0f - w0 - w1) * s.ndc_z2);
          }
       }
    }
@@ -809,8 +825,9 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
  * Evaluates edge functions at tile corners for trivial accept/reject,
  * then rasterizes the tile with per-pixel tests only where needed.
  */
-extern "C" __global__ void
-cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
+template <bool ABUF>
+static __device__ __forceinline__ void
+cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
    uint32_t *huge_counter = (uint32_t *)(uintptr_t)queues.huge_count;
    uint32_t num_tiles = cp_queue_used(*huge_counter, CP_MAX_HUGE_TILES);
@@ -963,7 +980,7 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
                if (sh_s.is_point) {
                   if (sx >= sh_s.pt_x0 && sx < sh_s.pt_x1 &&
                       sy >= sh_s.pt_y0 && sy < sh_s.pt_y1)
-                     emit_fragment(&args, tri_id, px, py, sm, sh_s.ndc_z0);
+                     emit_fragment<ABUF>(&args, tri_id, px, py, sm, sh_s.ndc_z0);
                   continue;
                }
 
@@ -977,14 +994,62 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
                   float w0 = e0 * sh_s.inv_area;
                   float w1 = e1 * sh_s.inv_area;
 
-                  emit_fragment(&args, tri_id, px, py, sm,
-                                w0 * sh_s.ndc_z0 + w1 * sh_s.ndc_z1 +
-                                (1.0f - w0 - w1) * sh_s.ndc_z2);
+                  emit_fragment<ABUF>(&args, tri_id, px, py, sm,
+                                      w0 * sh_s.ndc_z0 + w1 * sh_s.ndc_z1 +
+                                      (1.0f - w0 - w1) * sh_s.ndc_z2);
                }
             }
          }
       }
    }
+}
+
+/*
+ * The two specialisations of each stage, as separate entry points.
+ *
+ * The rendering ones are what every draw launches and compile to code with no
+ * mention of the A-buffer in it at all; the `_abuf` ones are launched only by
+ * the count and fill passes, which never reach the visibility buffer. Naming
+ * them apart is what lets the choice be made by the host once per pass rather
+ * than by the device once per coverage event.
+ */
+extern "C" __global__ void
+cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
+{
+   cp_rasterize_stage1_body<false>(args, queues);
+}
+
+extern "C" __global__ void
+cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
+{
+   cp_rasterize_stage2_body<false>(args, queues);
+}
+
+extern "C" __global__ void
+cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
+{
+   cp_rasterize_stage3_body<false>(args, queues);
+}
+
+extern "C" __global__ void
+cp_rasterize_stage1_abuf(struct cp_rasterize_args args,
+                         struct cp_rast_queues queues)
+{
+   cp_rasterize_stage1_body<true>(args, queues);
+}
+
+extern "C" __global__ void
+cp_rasterize_stage2_abuf(struct cp_rasterize_args args,
+                         struct cp_rast_queues queues)
+{
+   cp_rasterize_stage2_body<true>(args, queues);
+}
+
+extern "C" __global__ void
+cp_rasterize_stage3_abuf(struct cp_rasterize_args args,
+                         struct cp_rast_queues queues)
+{
+   cp_rasterize_stage3_body<true>(args, queues);
 }
 
 /*
@@ -1004,15 +1069,16 @@ cp_peel_advance(uint64_t *visbuf, uint32_t *peel_next,
       peel_next[y * width + x] = VISBUF_TRIID(entry) + 1u;
 }
 
-#if CP_ABUF_INSTRUMENT
 /*
  * ---------------------------------------------------------------------------
- * TEMPORARY: A-buffer support kernels (CUDAPIPE_ABUFFER)
+ * A-buffer support kernels
  * ---------------------------------------------------------------------------
  *
- * Nothing here is on the rendering path. Between them these turn the per-pixel
- * fragment counts the rasterizer produced into a per-pixel run of primitive
- * ids, sorted ascending, plus the log the peel loop is checked against.
+ * None of these runs for a draw that is not taking the A-buffer path, so they
+ * cost a compile rather than a branch and are built unconditionally. Between
+ * them they turn the per-pixel fragment counts the rasterizer produced into a
+ * per-pixel run of primitive ids, sorted ascending, and merge those into the
+ * quad stream the fragment stage consumes.
  */
 
 /*
@@ -1150,10 +1216,15 @@ cp_abuf_sort(uint32_t *frags, const uint32_t *offsets, const uint32_t *counts,
    }
 }
 
+#if CP_ABUF_INSTRUMENT
 /*
  * What the peel loop selected at every pixel on this pass. VISBUF_TRIID of an
  * empty entry is 0, which is a valid primitive, so the empty case is written
  * out explicitly.
+ *
+ * Verification only (CUDAPIPE_ABUFFER_VERIFY): the A-buffer path does not run
+ * the peel loop, so there is nothing for this to log unless the two are being
+ * compared.
  */
 extern "C" __global__ void
 cp_abuf_peel_log(const uint64_t *visbuf, uint32_t *log, uint32_t layers,
@@ -1181,10 +1252,11 @@ cp_abuf_peel_log_list(const uint64_t *visbuf, const uint32_t *list,
    log[(size_t)i * layers + pass] =
       entry == VISBUF_EMPTY ? 0xFFFFFFFFu : VISBUF_TRIID(entry);
 }
+#endif /* CP_ABUF_INSTRUMENT */
 
 /*
  * ---------------------------------------------------------------------------
- * TEMPORARY: per-pixel lists -> quad stream (CUDAPIPE_ABUFFER)
+ * Per-pixel lists -> quad stream
  * ---------------------------------------------------------------------------
  *
  * The fragment shader is fed quads, not pixels: four lanes in a 2x2 block, so
@@ -1395,7 +1467,6 @@ cp_abuf_quad_fill(const uint32_t *frags, const uint32_t *offsets,
                           shade_slot, blk_offsets[b], capacity, overflow);
    }
 }
-#endif /* CP_ABUF_INSTRUMENT */
 
 /*
  * Clear visibility buffer to "empty" (max depth, invalid triID)
