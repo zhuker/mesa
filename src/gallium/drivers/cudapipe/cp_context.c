@@ -1840,6 +1840,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       .nontrivial_count = cp->rast_nontrivial_count,
       .huge_tiles = cp->rast_huge_tiles,
       .huge_count = cp->rast_huge_count,
+      .mode = CP_QUEUE_FILL,
    };
 
    /*
@@ -1941,6 +1942,22 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
    unsigned check_interval = 1;
    unsigned interval_start = 0;
 
+   /*
+    * Which primitive goes to which stage is decided from the geometry and the
+    * clip rectangle alone, and a peeled draw changes neither between passes —
+    * peel_next is consumed inside emit_fragment, long after coverage. So the
+    * 256 passes of particlesystem's fire were each rebuilding queues identical
+    * to the ones the pass before had just thrown away.
+    *
+    * The queues are context-lifetime cuMemAlloc buffers, not scratch, so
+    * nothing the loop rewinds below can touch them: the first pass builds
+    * them, the rest reuse them, and the counters are simply not reset.
+    */
+   static int bincache = -1;
+   if (bincache < 0)
+      bincache = getenv("CUDAPIPE_NO_BINCACHE") ? 0 : 1;
+   bool cache_queues = peel && bincache;
+
    for (unsigned pass = 0; pass < passes; pass++) {
       CP_NVTX_SCOPEF("pass %u", pass);
       cp->scratch.used = shade_mark;
@@ -1954,10 +1971,16 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
        * asked below is whether any pass since the last check composited. */
       if (peel && pass == interval_start)
          *(volatile uint32_t *)(uintptr_t)cp->peel_any = 0;
+      rast_queues.mode = !cache_queues ? CP_QUEUE_FILL
+                       : pass ? CP_QUEUE_REUSE : CP_QUEUE_BUILD;
+
       /* Both counters in one call; they are adjacent for this reason. The
        * memset is enqueued on the default stream, so it serializes properly
-       * with the preceding pass's kernels. */
-      cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
+       * with the preceding pass's kernels. A reusing pass keeps the counts
+       * the first pass arrived at — clearing them would leave stages 2 and 3
+       * reading an empty queue. */
+      if (rast_queues.mode != CP_QUEUE_REUSE)
+         cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
 
       /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
       cp_nvtx_push("raster");

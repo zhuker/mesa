@@ -557,11 +557,17 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
     * rasterizing its fire one thread at a time.
     */
    if (bb_area > CP_SMALL_THRESHOLD) {
-      uint32_t *counter = (uint32_t *)(uintptr_t)queues.nontrivial_count;
-      uint32_t idx = atomicAdd(counter, 1u);
-      if (idx < CP_MAX_NONTRIVIAL) {
-         uint32_t *queue = (uint32_t *)(uintptr_t)queues.nontrivial;
-         queue[idx] = tri_id;
+      /* A reusing pass already has this id in the queue from the first pass,
+       * at the same index and behind the same counter. The classification is
+       * still done — it is what decides this thread does not rasterize — but
+       * the append is not. */
+      if (queues.mode != CP_QUEUE_REUSE) {
+         uint32_t *counter = (uint32_t *)(uintptr_t)queues.nontrivial_count;
+         uint32_t idx = atomicAdd(counter, 1u);
+         if (idx < CP_MAX_NONTRIVIAL) {
+            uint32_t *queue = (uint32_t *)(uintptr_t)queues.nontrivial;
+            queue[idx] = tri_id;
+         }
       }
       return;
    }
@@ -638,7 +644,20 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
     * non-trivial triangle.
     */
    for (uint32_t q = warp_id; q < num_nontrivial; q += num_warps) {
-      uint32_t tri_id = nt_queue[q];
+      uint32_t entry = nt_queue[q];
+
+      /*
+       * A marked entry was decomposed into tiles by an earlier pass of this
+       * same draw, and those tiles are still in the huge queue. Skipping it
+       * here is what makes the reuse worth anything: the alternative is to
+       * redo the setup on every pass purely to rediscover that the primitive
+       * is too large for this stage. Nothing marks an entry unless the host
+       * asked for CP_QUEUE_BUILD, so this test is inert everywhere else.
+       */
+      if (entry & CP_NT_HUGE)
+         continue;
+
+      uint32_t tri_id = entry;
       if (tri_id >= num_triangles)
          continue;
 
@@ -666,8 +685,18 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
        * latency, not arithmetic, and the way to hide it is more threads.
        * Stage 3 gives the same sprite a block per tile.
        */
-      if (bb_area > CP_MEDIUM_THRESHOLD) {
-         if (lane_id == 0) {
+      if (bb_area > (s.is_point ? CP_POINT_THRESHOLD : CP_MEDIUM_THRESHOLD)) {
+         /* Reaching here on a reusing pass would mean an entry that is huge
+          * and unmarked, which the pass that built the queue cannot leave
+          * behind; appending its tiles again to a counter that is no longer
+          * reset would duplicate them, so the mode is checked rather than
+          * assumed. */
+         if (lane_id == 0 && queues.mode != CP_QUEUE_REUSE) {
+            /* Tell the passes after this one that this entry's tiles are
+             * already queued, so they can skip it before the setup above. */
+            if (queues.mode == CP_QUEUE_BUILD)
+               nt_queue[q] = tri_id | CP_NT_HUGE;
+
             int tile_x_min = s.ix_min / CP_TILE_SIZE;
             int tile_y_min = s.iy_min / CP_TILE_SIZE;
             int tile_x_max = s.ix_max / CP_TILE_SIZE;
@@ -823,6 +852,50 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
       }
       __syncthreads();
 
+      if (!sh_valid)
+         continue;
+
+#if CP_TILE_BOUND
+      /*
+       * Only the part of the tile the primitive's bounding box reaches.
+       *
+       * The tiles were enumerated from that box, so the last tile of each row
+       * and column is partly covered — and a sprite two tiles across covers a
+       * quarter of each of its four tiles on average. The box is a superset of
+       * coverage by construction, so the pixels this skips are exactly ones
+       * the per-pixel test below would have rejected; that test is unchanged
+       * and remains the coverage decision.
+       *
+       * Flattened rather than a column each: bounding the columns alone saves
+       * nothing, since the 64 threads run in parallel and an idle column costs
+       * no time, and the block's duration is set by the rows each active
+       * thread walks. Striding w*h positions instead is what stops threads
+       * idling — the same shape stage 2's medium path uses.
+       *
+       * The order fragments are emitted in changes with it. That is safe: the
+       * visibility buffer resolves by atomicMin, and a minimum does not depend
+       * on the order its inputs arrive in.
+       *
+       * No clip test here, unlike the full-tile walk below, and for the reason
+       * the other two stages do not have one either — setup_triangle() clamps
+       * the box to the clip rectangle, so [x0, x1] x [y0, y1] is inside it by
+       * construction. It was the tile that ran past the clip rectangle, and
+       * the tile is no longer what is being walked.
+       */
+      int x0 = max(tile_x, sh_s.ix_min);
+      int y0 = max(tile_y, sh_s.iy_min);
+      int x1 = min(tile_x + CP_TILE_SIZE - 1, sh_s.ix_max);
+      int y1 = min(tile_y + CP_TILE_SIZE - 1, sh_s.iy_max);
+      int bw = x1 - x0 + 1;
+      int bh = y1 - y0 + 1;
+      if (bw <= 0 || bh <= 0)
+         continue;
+
+      for (int i = (int)threadIdx.x; i < bw * bh; i += (int)blockDim.x) {
+         int px = x0 + (i % bw);
+         int py = y0 + (i / bw);
+         {
+#else
       /*
        * A tile is enumerated from the bounding box but covers whole tiles, so
        * its edges run past it — the clip rectangle has to be applied here
@@ -831,14 +904,14 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
       int col = (int)threadIdx.x;
       int px = tile_x + col;
 
-      if (sh_valid && col < CP_TILE_SIZE &&
-          px >= args.clip_x0 && px <= args.clip_x1) {
+      if (col < CP_TILE_SIZE && px >= args.clip_x0 && px <= args.clip_x1) {
          for (int row = 0; row < CP_TILE_SIZE; row++) {
             int py = tile_y + row;
             if (py > args.clip_y1)
                break;
             if (py < args.clip_y0)
                continue;
+#endif
 
             for (int sm = 0; sm < (int)args.num_samples; sm++) {
                float ox, oy;

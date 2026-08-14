@@ -4,6 +4,7 @@
 #include "util/macros.h"
 
 #include <nvrtc.h>
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -69,8 +70,8 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
     * a sweep of them repeatable rather than a series of builds nobody can
     * reproduce. Unset means the header's default.
     */
-   char small_opt[64], medium_opt[64];
-   const char *opts[5];
+   char small_opt[64], medium_opt[64], point_opt[64], tilebound_opt[64];
+   const char *opts[7];
    unsigned num_opts = 0;
    opts[num_opts++] = arch_opt;
    opts[num_opts++] = "--std=c++14";
@@ -89,7 +90,24 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
                atoi(medium_env));
       opts[num_opts++] = medium_opt;
    }
+   const char *point_env = getenv("CUDAPIPE_POINT_THRESHOLD");
+   if (point_env && *point_env) {
+      snprintf(point_opt, sizeof(point_opt), "-DCP_POINT_THRESHOLD=%d",
+               atoi(point_env));
+      opts[num_opts++] = point_opt;
+   }
+   /* Not a threshold but the same kind of knob: whether stage 3 walks the
+    * whole tile or only the part of it the primitive's bounding box reaches.
+    * CUDAPIPE_TILE_BOUND=0 compiles the full-tile walk back, so the two can be
+    * compared without a rebuild. */
+   const char *tilebound_env = getenv("CUDAPIPE_TILE_BOUND");
+   if (tilebound_env && *tilebound_env) {
+      snprintf(tilebound_opt, sizeof(tilebound_opt), "-DCP_TILE_BOUND=%d",
+               atoi(tilebound_env));
+      opts[num_opts++] = tilebound_opt;
+   }
 
+   assert(num_opts <= ARRAY_SIZE(opts));
    res = nvrtcCompileProgram(prog, num_opts, opts);
    if (res != NVRTC_SUCCESS) {
       size_t log_size;

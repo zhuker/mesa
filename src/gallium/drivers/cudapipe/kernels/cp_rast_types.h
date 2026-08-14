@@ -494,7 +494,57 @@ struct cp_draw_params {
 #ifndef CP_MEDIUM_THRESHOLD
 #define CP_MEDIUM_THRESHOLD  4096
 #endif
+
+/*
+ * Points take a lower medium threshold than triangles, and the reason is a
+ * measurement rather than a preference.
+ *
+ * A sprite between the two thresholds gets one warp in stage 2 however many
+ * pixels it covers, which is the defect the large-point path already fixed
+ * above CP_MEDIUM_THRESHOLD. particlesystem's fire spends most of its frames
+ * with about thirty sprites sitting in that gap, and they cost ~60 us a peel
+ * pass while the other 1500 warps of stage 2's grid have nothing to do, since
+ * a kernel retires with its slowest warp. Sending them to stage 3 instead is
+ * worth 28% of the sample.
+ *
+ * Why points and not triangles: a point is resolved by the same four-comparison
+ * square test in both stages and carries a single depth, so which stage takes
+ * it cannot change a pixel. A triangle's depth goes through the interpolation
+ * each stage writes separately, and the two are not bit-identical -- moving
+ * triangles across the same boundary flips two pixels of gltfscenerendering,
+ * where an atomicMin tie resolves the other way. That difference is worth
+ * fixing on its own, but it is not this knob's to carry.
+ *
+ * At CP_SMALL_THRESHOLD every point reaching stage 2 goes on to stage 3, which
+ * is where the sweep flattens; it is a separate constant so the gap can be
+ * reopened without touching the triangle path.
+ */
+#ifndef CP_POINT_THRESHOLD
+#define CP_POINT_THRESHOLD   CP_SMALL_THRESHOLD
+#endif
 #define CP_TILE_SIZE         64
+
+/*
+ * Whether stage 3 walks the whole tile or only the part of it the primitive's
+ * bounding box reaches.
+ *
+ * A stage 3 block is a (primitive, tile) pair, and the tiles were enumerated
+ * from the primitive's bounding box — so the last tile of each row and column
+ * is usually only partly covered, and a sprite two tiles across covers a
+ * quarter of each of its four tiles on average. Walking all 64x64 of them
+ * tests coverage on pixels the box already excludes.
+ *
+ * The bounding box in struct tri_setup is a superset of coverage by
+ * construction and is already clamped to the clip rectangle, for points and
+ * triangles alike, so intersecting it with the tile costs no new arithmetic
+ * and cannot drop a covered sample. Defined as a switch rather than assumed so
+ * that one binary can be A/B'd: CUDAPIPE_TILE_BOUND=0 in the environment
+ * compiles the full-tile walk back, the same way the thresholds above are
+ * swept. See cp_kernels.c.
+ */
+#ifndef CP_TILE_BOUND
+#define CP_TILE_BOUND        1
+#endif
 
 /* Bound on the per-point rasterization loop, and the point size clamp. */
 #define CP_MAX_POINT_SIZE    256.0f
@@ -541,11 +591,37 @@ struct cp_tile_pair {
    uint16_t tile_y;
 };
 
+/*
+ * What a pass is allowed to assume about the queues below.
+ *
+ * Which primitives land in which queue is a pure function of the geometry and
+ * the clip rectangle, and a peeled draw changes neither between its passes —
+ * only peel_next, which is read inside emit_fragment after coverage is already
+ * decided. So a draw that runs the full CP_BLEND_LAYERS passes rebuilds
+ * byte-identical queues 256 times.
+ *
+ * The first pass of such a draw therefore builds them and marks each queue
+ * entry it hands to stage 3, and every later pass reuses what is there: the
+ * counters are not reset, stage 1 stops appending, and stage 2 skips a marked
+ * entry without even doing its setup. CP_QUEUE_FILL is the unmarked build the
+ * kill switch and every non-peeled draw still take.
+ */
+#define CP_QUEUE_FILL    0u   /* build the queues, mark nothing */
+#define CP_QUEUE_BUILD   1u   /* build them and mark the stage 3 entries */
+#define CP_QUEUE_REUSE   2u   /* already valid; skip everything that fills them */
+
+/* Set on a nontrivial-queue entry that stage 2 decomposed into tiles, so that
+ * a reusing pass can skip it. Triangle ids are indices into a draw's clipped
+ * primitive list, so the top bit is free. */
+#define CP_NT_HUGE       0x80000000u
+
 struct cp_rast_queues {
    uint64_t nontrivial;        /* Device ptr to uint32_t[CP_MAX_NONTRIVIAL] */
    uint64_t nontrivial_count;  /* Device ptr to atomic uint32_t */
    uint64_t huge_tiles;        /* Device ptr to cp_tile_pair[CP_MAX_HUGE_TILES] */
    uint64_t huge_count;        /* Device ptr to atomic uint32_t */
+   uint32_t mode;              /* CP_QUEUE_* above */
+   uint32_t pad;
 };
 
 #define CP_MAX_VERTEX_ELEMENTS_VF 16
