@@ -7,9 +7,13 @@ shape than the plan proposes, and what it was worth.
 
 **`particlesystem` 34.96 → 5.13 ms, and the sweep 91.81 → 62.00.**
 
-It is **opt-in**, behind `CUDAPIPE_ABUFFER=1`. With the variable unset the
-driver peels exactly as before and benchmarks within 0.05% of the build without
-it. Making it the default is a separate decision and the reasons are at the end.
+**It is now the default.** `CUDAPIPE_NO_ABUFFER=1` goes back to the peel loop.
+It landed opt-in first and was defaulted in a second pass that removed the two
+things making that a bad idea — see "Making it the default" below, which also
+records the twenty blend configurations it was tested against and a pre-existing
+defect they turned up in the peel loop.
+
+With the default flip the sweep is **61.82 ms** and particlesystem **5.07**.
 
 ---
 
@@ -191,29 +195,80 @@ separately written code and disagree by an ulp.
 
 ---
 
-## What is not done, and why it is not the default
+## Making it the default
 
-- **One blend equation has ever run through the composite.** particlesystem is
-  the only sample that reaches it. Vulkan has ~19 factors x 5 operations with
-  separate RGB and alpha. The shared function means the arithmetic cannot
-  drift; it is not evidence that the path generalises, and nothing here tests a
-  second factor combination, a colour write mask, or an sRGB attachment.
-- **Draws that never use it still pay.** `CUDAPIPE_ABUFFER=1` compiles the count
-  and fill branches into `emit_fragment` for every draw, and `multisampling`
-  costs **+3.5%** for it, reproducibly — it runs them four times per pixel.
-  Those branches are load-bearing now, not instrumentation.
-- **The allocation headroom is 13 points, not 27.** The fragment array is sized
-  from the first draw seen; over 600 frames the population peaks at **87.1% of
-  capacity**. Overrun falls back to the peel loop rather than corrupting
-  anything, which is the right failure, but a scene that grew more over its
-  animation would silently drop to 35 ms.
-- **The path amplifies the sample's own nondeterminism and nobody knows why.**
-  particlesystem's documented one-pixel/one-LSB instability fires on 11 of 30
-  frames here against 2 of 30 while peeling. The variant images are the same
-  ones the peel path produces, and runs of both paths land in the same groups,
-  so it reads as an existing race being reached more often rather than a new
-  one. It is unexplained.
-- **+324 MiB** of device memory, flat across 600 frames.
+Three of the five reasons it landed opt-in were removed; two were accepted.
+
+**Draws that never use it were paying for it.** The opt-in version compiled the
+count and fill branches into `emit_fragment()` for every draw, and
+`multisampling` cost 3.35–3.45% for branches it never takes, running them four
+times per pixel. `emit_fragment()`, `rasterize_point()` and the three stage
+bodies are now `template <bool ABUF>` and one compile emits six entry points:
+the `<false>` set every draw launches, with no A-buffer code in them at all, and
+the `<true>` set the count and fill passes launch.
+
+That is §0.1's CuRast reference arriving from the other direction — *"branching
+at runtime may increase rendering duration by a couple of percent"* — and it is
+exactly what this was. A second module was measured rather than argued against:
+over `triangle` at one frame, nearly all start-up, templating costs +0.21 s of
+process wall where a second NVRTC compile and `cuModuleLoadData` cost +0.75 s
+and leave a second module resident. Neither lands in `ms/frame`.
+
+`multisampling`, 600 frames, interleaved: **3.406** compiled out, **3.520** as
+the opt-in version would have defaulted, **3.375** now — below the build with
+the feature compiled out, and the same whether the A-buffer runs or not.
+
+**The allocation is now 2x headroom with growth at 75% occupancy**, once per
+draw between the count and the fill, bounded by a cap and a growth count,
+announced on stderr, falling back to the peel loop if refused. Peak over 600
+frames is **54.9% of capacity with no growths**, against 87.1%. The growth path
+was exercised deliberately with a throwaway build at 1x headroom: eight growths,
+the cap, a clean fallback.
+
+**The nondeterminism has an explanation, and it is not this path.** See below.
+
+Accepted rather than fixed: **+358 MiB** of device memory, and
+`VK_BLEND_FACTOR_CONSTANT_COLOR`/`CONSTANT_ALPHA`, which are in the driver's
+enum and unimplemented — `cp_blend_factor` silently returns 1.0 — on **both**
+paths. Inherited rather than introduced, and more visible now this is the
+default.
+
+## Blend coverage, and what it found in the peel loop
+
+Twenty configurations, driven from the environment through one rebuild of the
+sample so there is no edit-without-rebuild window; both edited files restored,
+the binary verified md5-identical to the pre-edit one, and the baseline
+reproduced afterwards. Floor established by running each path against itself:
+**≤2 differing pixels at 1 LSB per frame.**
+
+**Twelve are at or inside the floor and eight are byte-identical on all twenty
+frames** — including `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA`, `SRC_ALPHA`/`ONE`,
+`SRC_ALPHA_SATURATE`, `REVERSE_SUBTRACT`, `MIN`, separate RGB and alpha
+equations, and an sRGB attachment.
+
+**Seven are not, and the peel loop is the one that cannot reproduce itself.**
+Under equations nonlinear in the destination — `SUBTRACT`, `MAX`,
+`ONE`/`INV_DST_COLOR`, `DST_ALPHA`/`INV_SRC_COLOR` — two runs of the *peel
+path* differ by thousands of pixels, on the pre-change driver with the A-buffer
+unset. Under `MAX`, which is order-independent and idempotent, the A-buffer is
+**bit-deterministic across twenty frames while peeling wanders by 1,496
+pixels**. Against NVIDIA the A-buffer sits inside the peel path's own
+run-to-run spread on every one of the seven.
+
+The fragment population is bit-identical run to run and the pass count is a
+constant 256, so the variable is per-fragment shaded colour: particlesystem's
+documented one-LSB instability, amplified by the equation's conditioning rather
+than by the path. **So "the A-buffer amplifies the sample's nondeterminism" was
+the wrong reading — the amplifier is the arithmetic, and the peel loop has it
+worse.** A driver that is nondeterministic under `SUBTRACT` and `MAX` is worth
+its own pass.
+
+Two caveats on the matrix itself: `particle.frag` writes alpha 0 for flame
+particles, so the `SRC_ALPHA`-source rows under-test the composite — the
+dst-dependent rows are the ones exercising ordering and per-layer quantisation.
+And one anomaly recorded without explanation: `CUDAPIPE_ABUFFER_LAYERS=256`
+makes the A-buffer nondeterministic under `MAX` where uncapped it is bit-exact.
+Capping is a bisecting tool, not the default path.
 
 ## Where the next win is
 
@@ -241,7 +296,7 @@ DESC="..." $T/cp_iterate.sh mylabel abufw0
 
 | variable | effect |
 |---|---|
-| `CUDAPIPE_ABUFFER` | build the A-buffer and composite from it |
+| `CUDAPIPE_NO_ABUFFER` | back to the peel loop |
 | `CUDAPIPE_ABUFFER_COMPOSITE=0` | build the lists beside the peel loop, still peel |
 | `CUDAPIPE_ABUFFER_VERIFY=1` | the step-by-step checks above; ~240 MB of comparison buffers |
 | `CUDAPIPE_ABUFFER_TIMING=0` | drop the per-draw drain the CUDA-event timings need |

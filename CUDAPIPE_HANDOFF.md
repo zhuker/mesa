@@ -194,22 +194,22 @@ stored — milliseconds per frame, the mean over the run (`cp_perf_run.sh ... 60
 compared, and is far too few to time: at sixty the render loop is a minority of
 the process. `tests/TESTING.md` has the measurement that settles it.
 
-| | nvidia | cudapipe | llvmpipe | before the peel pass | before batching | before any perf work |
+| | nvidia | cudapipe | llvmpipe | before the A-buffer | before the peel pass | before any perf work |
 |---|---|---|---|---|---|---|
-| particlesystem | 0.1 | **35.1** | 15.7 | 52.0 | 52.3 | 1361.7 |
-| gltfscenerendering | 0.1 | **15.1** | 15.2 | 15.3 | 15.3 | 343.9 |
+| gltfscenerendering | 0.1 | **15.3** | 15.2 | 15.1 | 15.3 | 343.9 |
 | bloom | 0.0 | **12.1** | 3.6 | 12.1 | 12.1 | 558.0 |
 | instancing | 0.1 | **7.1** | 73.0 | 7.1 | 7.1 | 241.7 |
-| multithreading | 0.3 | **6.0** | 96.9 | 6.0 | 29.8 | 156.6 |
-| multisampling | 0.0 | **3.4** | 5.3 | 3.5 | 3.6 | 41.1 |
-| pbribl | 0.0 | **1.7** | 2.7 | 1.6 | 1.7 | 135.4 |
-| dynamicuniformbuffer | 0.0 | **1.3** | 1.0 | 1.3 | 12.3 | 128.5 |
-| pushconstants | 0.0 | **0.8** | 3.4 | 0.8 | 2.3 | 5.7 |
-| **total, one frame of each** | **0.9** | **91.8** | **232.1** | **109.0** | **145.5** | **3792.2** |
+| multithreading | 0.3 | **6.0** | 96.9 | 6.0 | 6.0 | 156.6 |
+| **particlesystem** | 0.1 | **5.1** | 15.7 | 35.1 | 52.0 | 1361.7 |
+| multisampling | 0.0 | **3.4** | 5.3 | 3.4 | 3.5 | 41.1 |
+| pbribl | 0.0 | **1.6** | 2.7 | 1.7 | 1.6 | 135.4 |
+| dynamicuniformbuffer | 0.0 | **1.3** | 1.0 | 1.3 | 1.3 | 128.5 |
+| pushconstants | 0.0 | **0.8** | 3.4 | 0.8 | 0.8 | 5.7 |
+| **total, one frame of each** | **0.9** | **61.8** | **232.1** | **91.8** | **109.0** | **3792.2** |
 
-**cudapipe finishes the sweep 2.53x ahead of llvmpipe**, and ahead of it on ten
-of the seventeen samples individually. It was 16x behind. Five passes got it
-there; the first four have their own write-up:
+**cudapipe finishes the sweep 3.76x ahead of llvmpipe**, and ahead of it on ten
+of the seventeen samples individually, with `gltfscenerendering` level. It was
+16x behind. Six passes got it there; five have their own write-up:
 
 - `PERFORMANCE_PROGRESS.md` — the first pass, 3792 -> 207 ms. 96% of it was
   three defects rather than any optimization, the largest being that
@@ -248,7 +248,15 @@ rather than rebuilt on all 256 passes; points take their own medium threshold,
 so a sprite between 128 and 4096 pixels stops getting one warp however much it
 covers; and stage 3 walks only the part of a tile the primitive's bounding box
 reaches. The second is nearly all of it, at -27.6%. Two of the three predictions
-behind them were wrong in instructive ways — see "the peel loop" below.
+behind them were wrong in instructive ways.
+
+- `ABUFFER.md` — the sixth pass, 92 -> 62 ms, and particlesystem 35.1 -> 5.1.
+  The peel loop is gone for eligible blended draws: one rasterization into
+  per-pixel fragment lists sorted by submission index, shaded once, composited
+  once. `emit_fragment()` was being called about 960 million times a frame to
+  composite 2.28M fragments — 99.76% of the calls rejected for being below their
+  pixel's `peel_next` — and that ratio is the whole case. Verified stepwise
+  against the peel loop, and the checks are still runnable.
 
 NVIDIA's column is not a rendering time. Offscreen benchmarking measures
 recording and submitting a frame, and nothing waits for the GPU until the pass
@@ -264,36 +272,27 @@ blocking on the GPU. llvmpipe spreading across cores is why it stays close
 despite shading on the CPU — and why the samples cudapipe now beats it on are
 the ones with the most geometry.
 
-**The peel loop is the worst thing in the driver on the default path, and there
-is now an opt-in replacement for it.** particlesystem is 35.1 ms of a 91.8 ms
-total, 2.2x slower than llvmpipe. It runs about 260 passes a frame, each
-re-rasterizing and re-shading the whole draw, and the fifth pass above made each
-repeat cheaper without removing a single repetition.
+**The peel loop is no longer the default, and `bloom` is now the worst sample in
+the set.** particlesystem was 3.3x slower than llvmpipe at the start of the
+sixth pass and is 3.1x *faster* than it now; `bloom` at 12.1 against 3.6 is the
+largest remaining gap, and nothing in the six passes has touched it.
 
-`CUDAPIPE_ABUFFER=1` removes the repetition: one rasterization into per-pixel
-fragment lists, sorted by submission index, shaded once and composited once.
-**particlesystem 34.96 → 5.13 ms and the sweep 91.81 → 62.00**, verified
-stepwise against the peel loop and byte-identical where the sample is stable.
-`ABUFFER.md` is the record, including why it is not the default yet: one blend
-equation has ever run through it, draws that never use it still pay 3.5% on
-`multisampling`, and the fragment array peaks at 87% of a capacity sized from
-the first draw seen.
+The peel loop is still there, still correct, and still what runs for any blended
+draw the A-buffer refuses — multisample, depth-writing, more than one colour
+attachment. `CUDAPIPE_NO_ABUFFER=1` puts everything back on it. Its structure is
+worth understanding before touching the blend path: about 260 passes a frame,
+each re-rasterizing and re-shading the whole draw, with `emit_fragment()` called
+960 million times to composite 2.28M fragments.
 
-The numbers in this section are the default path, which is unchanged.
-
-Where its time now goes, profiled at 30 frames: **`cp_rasterize_stage3` 56.7%**,
-the framebuffer-sized kernels (`cp_fs_interpolate`, `cp_fs_writeback`,
-`cp_peel_advance`) 21.8% between them, the fragment shader 16.1%, and everything
-else under 3%. Two things worth carrying out of that pass:
+Two findings from the passes that got it there, both still live:
 
 - **Stage 3's cost is the `atomicMin` per covered sample, not the coverage test
   on rejected ones.** Bounding the tile walk cut its trip count by the predicted
   factor and its duration by 11%. Stage 3 takes one block per (primitive, tile)
-  pair, so a tile in the fire's core has hundreds of blocks contending on the
-  same few thousand addresses — 260 times over, with identical addresses and
-  identical values every time. That is what Phase 3's one-block-per-tile form
-  removes, by resolving in shared memory, and it is the strongest evidence so
-  far for that form over a per-pixel fragment list.
+  pair, so a tile in the fire's core had hundreds of blocks contending on the
+  same few thousand addresses, 260 times over with identical values. The
+  A-buffer removes the repetition rather than the contention; whether Phase
+  3's one-block-per-tile form would beat it is open, and now has a baseline.
 - **Half the passes cannot be seen.** Rendering at 128 layers instead of 256
   leaves red and green bit-identical across the whole frame and moves 641 pixels
   of blue. The fire's core saturates long before the cap. That is not a licence
@@ -557,7 +556,23 @@ smooth.
    it. The fix is one interpolation routine both stages call, the way
    `emit_fragment()` already unified the four `atomicMin` sites. Points are
    unaffected: they carry a single depth and both stages pass it through.
-13. **Batched draws break a depth tie the other way.** With `LEQUAL` and
+13. **`VK_BLEND_FACTOR_CONSTANT_COLOR` and `CONSTANT_ALPHA` are enumerated and
+   unimplemented.** `cp_blend_factor` falls through and returns 1.0 for both,
+   silently, on the A-buffer path and the peel path alike. Nothing in the sample
+   set uses them. It predates the A-buffer and is more exposed now that path is
+   the default.
+14. **The peel loop is nondeterministic under blend equations that are nonlinear
+   in the destination.** Two runs of one build differ by thousands of pixels
+   under `SUBTRACT`, `MAX`, `ONE`/`ONE_MINUS_DST_COLOR` and
+   `DST_ALPHA`/`ONE_MINUS_SRC_COLOR` — measured on the driver before the
+   A-buffer existed, so it is not that path's doing. The fragment population is
+   bit-identical run to run, so the variable is per-fragment shaded colour:
+   particlesystem's documented one-LSB instability, amplified by the equation's
+   conditioning. Under `MAX`, which is order-independent and idempotent, the
+   A-buffer is bit-exact across twenty frames while peeling wanders by 1,496
+   pixels. No sample in the set uses these equations, which is why it went
+   unnoticed; `ABUFFER.md` has the matrix.
+15. **Batched draws break a depth tie the other way.** With `LEQUAL` and
    coplanar geometry spanning two merged draws, the batch keeps the lowest
    triangle index — the earliest draw — where drawing them in sequence keeps the
    later one. No sample in the set shows it, and it is mitigated rather than
@@ -764,7 +779,7 @@ retried.
 | `CUDAPIPE_BATCH_MAX` | cap the batch size; `1` is the bit-identical check |
 | `CUDAPIPE_DEBUG_WORK` | shaded pixels against threads launched, per shading pass (syncs) |
 | `CUDAPIPE_NVTX` | NVTX timeline ranges per draw and stage; read with `tests/cp_prof_nvtx.py` |
-| `CUDAPIPE_ABUFFER` | composite a blended draw in one pass instead of peeling — see `ABUFFER.md`. Opt-in |
+| `CUDAPIPE_NO_ABUFFER` | back to the peel loop for blended draws — see `ABUFFER.md`. The A-buffer is the default |
 | `CUDAPIPE_ABUFFER_COMPOSITE=0` / `_VERIFY=1` / `_LAYERS=N` / `_TIMING=0` | build the lists beside the peel loop; the stepwise checks; cap the composite; drop the timing drain |
 | `CUDAPIPE_NO_BINCACHE` | rebuild the binning queues on every peel pass, as before |
 | `CUDAPIPE_SMALL_THRESHOLD` / `MEDIUM_THRESHOLD` / `POINT_THRESHOLD` | rasterizer stage boundaries, `-D` at NVRTC time — sweep without rebuilding |
