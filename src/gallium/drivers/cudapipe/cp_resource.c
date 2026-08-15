@@ -13,11 +13,15 @@
 #include "util/u_surface.h"
 #include "util/format/u_format.h"
 #include "util/format/u_format_pack.h"
+#include "util/simple_mtx.h"
+#include "util/u_atomic.h"
 
 #include <cuda.h>
 #include <math.h>
 #include <string.h>
 #include <stddef.h>
+#include <inttypes.h>
+#include <stdlib.h>
 
 
 /*
@@ -907,9 +911,406 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
 }
 
 /*
+ * A slab allocator for small VkDeviceMemory, and why the driver needs one.
+ *
+ * lavapipe backs every VkDescriptorSet with its own VkDeviceMemory —
+ * `lvp_descriptor_set_create()` calls `allocate_memory()` for a block whose
+ * floor is 64 bytes — and frees it when the set dies. A gfxrecon replay of a
+ * real frame does that about a thousand times per frame: 638,608 of the
+ * 701,468 managed allocations in a 199-frame window were 64, 96, 192 or 768
+ * bytes, and every one of them was freed from `lvp_descriptor_set_destroy()`.
+ *
+ * `cuMemAllocManaged` hands each of those a fresh mapping, and because they
+ * are freed as fast as they are made, CUDA recycles the same ~1 MB of virtual
+ * address space over and over. Managed memory migrates at page granularity,
+ * so the 64 bytes are irrelevant: the host writes a descriptor, the whole
+ * 64 KB page around it moves to the host, and then every vertex and fragment
+ * launch that reads a descriptor faults it back. Measured on that replay:
+ * 31,081 GPU page faults per frame with 99% of them landing in fourteen
+ * distinct pages, 17.5 MB/frame of migration to serve 0.9 MB of hot data, and
+ * 22.4 ms/frame — 34% of all kernel time — spent in fault service.
+ *
+ * The fix is to stop the ping-pong rather than to speed it up, and there are
+ * two independent things wrong. Both were measured separately, because the
+ * cheap one might have been the whole story and it was not:
+ *
+ *  - the *churn*: a thousand cuMemAllocManaged/cuMemFree pairs a frame, each
+ *    a driver call, none of which buys anything. A slab with per-size-class
+ *    free lists serves them from memory that is mapped once at startup. Worth
+ *    12% of the replay on its own, and — measured on `particlesystem`, which
+ *    is kernel-bound and gains nothing from it — it costs exactly nothing.
+ *  - the *residency*: memory the host writes and the device reads has to live
+ *    somewhere, and under UVM "somewhere" oscillates. Settling it on the host
+ *    lets the host write at full speed and the device read over PCIe with no
+ *    fault and no migration, and is worth another 17%. This is the half that
+ *    can go wrong: a remote read is only cheap for memory a grid reads once,
+ *    and a uniform buffer that every thread reads is exactly the case where
+ *    it is not. Hence the ceiling below, which is what keeps the two apart.
+ *
+ * `pinned` (cuMemAllocHost) and `advise` (managed, told to prefer the host and
+ * stay mapped to the device) reach the same place by different roads and
+ * measured identical — 131.7 s against 131.4 s on the replay, 484 against 508
+ * faults a frame. `advise` is the default because it is the one that degrades
+ * safely: SET_PREFERRED_LOCATION is a hint, so UVM may still migrate a page
+ * when it has to — for a device-side atomic, say — where pinned host memory
+ * cannot move and the atomic has nowhere correct to go.
+ *
+ * The ceiling is 128 bytes, and it is not arbitrary. lavapipe's descriptor
+ * sets in this replay are 64 and 96 bytes; `particlesystem`'s hot uniform
+ * buffers are 140 and 208. Measured across that boundary: a 128-byte ceiling
+ * is worth 29.3% of the replay and costs `particlesystem` 0.4%, while a 1 KB
+ * ceiling is worth the same 28.8% and costs it 2.5%. Everything the fault
+ * data pointed at is 96 bytes or under; everything above that was giving away
+ * device locality for no measured return. CUDAPIPE_SMALL_ALLOC_MAX raises it
+ * again up to CP_ARENA_MAX_SIZE for anyone re-testing that boundary.
+ *
+ * A ceiling alone is not enough, though, and `gltfscenerendering` is why: see
+ * CP_ARENA_DEFAULT_WARMUP below.
+ *
+ * The 64-byte minimum class matches the alignment lavapipe reports for buffers
+ * and images (lvp_device.c:2398, lvp_image.c:55); the only larger alignment it
+ * ever asks for is 64 KB for sparse images, far above this ceiling.
+ *
+ * CUDAPIPE_SMALL_ALLOC selects the backing: `advise` (default), `pinned`,
+ * `managed` (slab over ordinary managed memory — the control that isolates the
+ * churn win from the residency win), `blocksonly` (open and advise the blocks
+ * but serve nothing out of them — the control that isolates the cost of the
+ * mapping from the cost of what is put in it), and `off` (per-allocation
+ * cuMemAllocManaged, what the driver did before).
+ *
+ * CUDAPIPE_SMALL_ALLOC_STATS prints the allocation mix and the arena's hit
+ * rates at exit, whether or not the arena ever opened.
+ */
+#define CP_ARENA_MIN_SHIFT   6
+#define CP_ARENA_CLASSES     5
+#define CP_ARENA_MAX_SIZE    ((uint64_t)1 << (CP_ARENA_MIN_SHIFT + CP_ARENA_CLASSES - 1))
+#define CP_ARENA_DEFAULT_MAX ((uint64_t)128)
+#define CP_ARENA_BLOCK_SIZE  ((size_t)2 * 1024 * 1024)
+#define CP_ARENA_MAX_BLOCKS  64
+
+enum cp_arena_mode {
+   CP_ARENA_OFF = 0,
+   CP_ARENA_PINNED,
+   CP_ARENA_MANAGED,
+   CP_ARENA_ADVISE,
+   /* Diagnostic: open the blocks and advise them exactly as `advise` does, but
+    * serve nothing out of them, so that "the blocks exist" and "the small
+    * allocations moved into them" can be told apart by measurement. */
+   CP_ARENA_BLOCKSONLY,
+};
+
+struct cp_arena_block {
+   char *base;
+   char *end;
+   int cls;
+};
+
+static struct {
+   simple_mtx_t lock;
+   /* Every screen calls cuCtxCreate for itself (cp_screen.c:409), and pinned
+    * host memory is only mapped into the context that allocated it, so the
+    * arena belongs to whichever screen opened it and a second screen in the
+    * same process falls back to the per-allocation path. Freeing stays
+    * screen-agnostic: it is decided by which block the pointer lands in. */
+   struct cp_screen *owner;
+   struct cp_arena_block blocks[CP_ARENA_MAX_BLOCKS];
+   unsigned nblocks;
+   void *free_list[CP_ARENA_CLASSES];
+   char *bump[CP_ARENA_CLASSES];
+   char *bump_end[CP_ARENA_CLASSES];
+} cp_arena = { .lock = SIMPLE_MTX_INITIALIZER };
+
+static enum cp_arena_mode
+cp_arena_mode(void)
+{
+   static int mode = -1;
+
+   if (mode < 0) {
+      const char *v = getenv("CUDAPIPE_SMALL_ALLOC");
+      if (!v || !strcmp(v, "advise"))
+         mode = CP_ARENA_ADVISE;
+      else if (!strcmp(v, "pinned"))
+         mode = CP_ARENA_PINNED;
+      else if (!strcmp(v, "managed"))
+         mode = CP_ARENA_MANAGED;
+      else if (!strcmp(v, "blocksonly"))
+         mode = CP_ARENA_BLOCKSONLY;
+      else
+         mode = CP_ARENA_OFF;
+   }
+   return (enum cp_arena_mode)mode;
+}
+
+/*
+ * The ceiling is tunable because it is the whole trade: everything under it
+ * moves to host residency, which is free for memory the device reads once per
+ * launch and a remote PCIe read for memory it reads hard.
+ */
+static uint64_t
+cp_arena_max_size(void)
+{
+   static uint64_t max = 0;
+
+   if (max == 0) {
+      const char *v = getenv("CUDAPIPE_SMALL_ALLOC_MAX");
+      max = v ? strtoull(v, NULL, 0) : CP_ARENA_DEFAULT_MAX;
+      if (max > CP_ARENA_MAX_SIZE)
+         max = CP_ARENA_MAX_SIZE;
+   }
+   return max;
+}
+
+/* Instrumentation. Plain counters, no getenv on the path; dumped at exit only
+ * when CUDAPIPE_SMALL_ALLOC_STATS is set, which is read once, there. */
+static struct {
+   int armed;
+   uint64_t n_alloc, n_free_hit, n_free_miss, n_reuse, n_grow;
+   uint64_t by_size[CP_ARENA_MAX_SIZE + 1];
+} cp_arena_stats;
+
+static void
+cp_arena_stats_dump(void)
+{
+   if (!getenv("CUDAPIPE_SMALL_ALLOC_STATS"))
+      return;
+   fprintf(stderr, "cudapipe arena: alloc %" PRIu64 " reuse %" PRIu64
+           " grow %" PRIu64 " free_hit %" PRIu64 " free_miss %" PRIu64 "\n",
+           cp_arena_stats.n_alloc, cp_arena_stats.n_reuse,
+           cp_arena_stats.n_grow, cp_arena_stats.n_free_hit,
+           cp_arena_stats.n_free_miss);
+   for (uint64_t s = 0; s <= CP_ARENA_MAX_SIZE; s++)
+      if (cp_arena_stats.by_size[s])
+         fprintf(stderr, "cudapipe arena: size %4" PRIu64 " x %" PRIu64 "\n",
+                 s, cp_arena_stats.by_size[s]);
+}
+
+/*
+ * How many small allocations the driver has to see before the arena opens.
+ *
+ * The arena is not free for a workload that does not churn, and the size
+ * ceiling above cannot tell the two apart. `gltfscenerendering` makes exactly
+ * four small allocations — 64, 64, 84, 128 bytes — in a 600-frame pass, and
+ * paid 9.2% for them: 15.27 ms a frame against 13.97 with the arena off,
+ * monotone over three alternating reps. The capture makes 1,461,069 of the
+ * same sizes and saves 29%. Nothing about a 64-byte request separates them.
+ *
+ * What went wrong there is what the ceiling exists to prevent, one level down.
+ * lavapipe backs a descriptor set with VkDeviceMemory and binds it as a
+ * constant buffer, so the kernel dereferences it (cp_context.c:5971) — every
+ * thread of every launch reads it. A set that is allocated, read once and
+ * freed a thousand times a frame belongs on the host. A set that is allocated
+ * at startup and then read by every thread for the rest of the run belongs on
+ * the device, and moving it into a host-preferred block is a remote read per
+ * thread forever after. Measured: `CUDAPIPE_SMALL_ALLOC=blocksonly`, which
+ * opens and advises the same blocks but serves nothing out of them, costs
+ * `gltfscenerendering` 0.1% — so it is not the mapping, the advice or the
+ * allocator, it is the four allocations that went into it. `managed`, which
+ * packs them with no advice at all, still costs 8.7%: pack a device-hot
+ * allocation into a shared 2 MB managed block and it stops being device-local
+ * whether or not it is told to.
+ *
+ * Counting the allocations separates them, because churn is the thing the
+ * arena exists to absorb. Measured over the whole suite: gltfscenerendering 4,
+ * texturemipmapgen 3, pushconstants 5, particlesystem 6, texture 6,
+ * instancing 10, multisampling 10, computeshader 11, texturecubemap 17,
+ * pbribl 21, vulkanscene 21, multithreading 46 — for whole runs — against
+ * dynamicuniformbuffer at 226,379 and the capture at 1,461,069. So a static
+ * workload never opens a block, and a churning one crosses inside its first
+ * frame and pays for it once: the capture keeps 29.0% of the 29.4% it had
+ * ungated (131.7 s against 131.0, from 185.5 s off) and dynamicuniformbuffer
+ * keeps all of its 35%.
+ *
+ * The gap is not as clean as it first looked, and the count is not really
+ * churn. `bloom` makes 168 small allocations and reuses two, so it crosses
+ * this gate on volume without churning, opens two blocks, and gets the
+ * residency it would have got ungated. That is the failure mode this threshold
+ * is supposed to prevent, and it costs bloom -0.9% — four of five alternating
+ * pairs negative, i.e. marginally faster. So the shape is reachable and, where
+ * it has been reached, harmless: bloom's allocations are evidently not the
+ * long-lived device-hot kind gltfscenerendering's four are.
+ *
+ * A gate that counted frees instead would separate the two exactly, at the
+ * cost of tracking which pointers are small during warm-up. Worth doing if
+ * something ever crosses on volume AND pays for it; nothing measured yet does.
+ *
+ * This also subsumes the ceiling's remaining casualty. `computeshader`'s small
+ * allocations are 112 and 128 bytes and it paid 11.6% for them; lowering
+ * CUDAPIPE_SMALL_ALLOC_MAX to 64 was the only way to give that back, at the
+ * cost of the 65-128 byte band everywhere. It makes eleven allocations in a
+ * run, so the gate returns it to parity with the ceiling left at 128.
+ *
+ * CUDAPIPE_SMALL_ALLOC_WARMUP overrides it; 0 is the ungated behaviour.
+ */
+#define CP_ARENA_DEFAULT_WARMUP 64
+
+static uint64_t cp_arena_seen;
+
+static uint64_t
+cp_arena_warmup(void)
+{
+   static uint64_t warmup = UINT64_MAX;
+
+   if (warmup == UINT64_MAX) {
+      const char *v = getenv("CUDAPIPE_SMALL_ALLOC_WARMUP");
+      warmup = v ? strtoull(v, NULL, 0) : CP_ARENA_DEFAULT_WARMUP;
+   }
+   return warmup;
+}
+
+/* -1 for anything the arena does not serve. */
+static int
+cp_arena_class(uint64_t size)
+{
+   if (size == 0 || size > cp_arena_max_size())
+      return -1;
+
+   /* Armed on the first small allocation rather than on the first block, so
+    * that a run whose arena never opens still says how few there were — which
+    * is the whole answer for a sample the gate below keeps out. */
+   if (!cp_arena_stats.armed &&
+       p_atomic_cmpxchg(&cp_arena_stats.armed, 0, 1) == 0)
+      atexit(cp_arena_stats_dump);
+
+   cp_arena_stats.n_alloc++;
+   cp_arena_stats.by_size[size]++;
+
+   int cls = 0;
+   uint64_t chunk = (uint64_t)1 << CP_ARENA_MIN_SHIFT;
+   while (chunk < size) {
+      chunk <<= 1;
+      cls++;
+   }
+   return cls;
+}
+
+/* Caller holds cp_arena.lock. */
+static bool
+cp_arena_grow(struct cp_screen *cp, int cls, enum cp_arena_mode mode)
+{
+   void *host = NULL;
+
+   if (cp_arena.nblocks >= CP_ARENA_MAX_BLOCKS)
+      return false;
+
+   if (mode == CP_ARENA_BLOCKSONLY)
+      mode = CP_ARENA_ADVISE;
+
+   if (mode == CP_ARENA_PINNED) {
+      CUresult err = cuMemAllocHost(&host, CP_ARENA_BLOCK_SIZE);
+      if (err != CUDA_SUCCESS) {
+         CP_CU_WARN(err, "cuMemAllocHost for the small-allocation arena");
+         return false;
+      }
+   } else {
+      CUdeviceptr dev = 0;
+      CUresult err = cuMemAllocManaged(&dev, CP_ARENA_BLOCK_SIZE,
+                                       CU_MEM_ATTACH_GLOBAL);
+      if (err != CUDA_SUCCESS) {
+         CP_CU_WARN(err, "cuMemAllocManaged for the small-allocation arena");
+         return false;
+      }
+      host = (void *)(uintptr_t)dev;
+
+      if (mode == CP_ARENA_ADVISE) {
+         /* Keep the pages on the host and keep them mapped to the device, so
+          * a device read is a remote read rather than a fault and a move. */
+         cuMemAdvise(dev, CP_ARENA_BLOCK_SIZE,
+                     CU_MEM_ADVISE_SET_PREFERRED_LOCATION, CU_DEVICE_CPU);
+         cuMemAdvise(dev, CP_ARENA_BLOCK_SIZE,
+                     CU_MEM_ADVISE_SET_ACCESSED_BY, cp->cuda_device);
+      }
+   }
+
+   cp_arena.blocks[cp_arena.nblocks].base = (char *)host;
+   cp_arena.blocks[cp_arena.nblocks].end = (char *)host + CP_ARENA_BLOCK_SIZE;
+   cp_arena.blocks[cp_arena.nblocks].cls = cls;
+   cp_arena.nblocks++;
+   cp_arena_stats.n_grow++;
+
+   cp_arena.bump[cls] = (char *)host;
+   cp_arena.bump_end[cls] = (char *)host + CP_ARENA_BLOCK_SIZE;
+   return true;
+}
+
+static void *
+cp_arena_alloc(struct cp_screen *cp, int cls, enum cp_arena_mode mode)
+{
+   size_t chunk = (size_t)1 << (CP_ARENA_MIN_SHIFT + cls);
+   void *p;
+
+   simple_mtx_lock(&cp_arena.lock);
+
+   if (!cp_arena.owner)
+      cp_arena.owner = cp;
+   if (cp_arena.owner != cp) {
+      simple_mtx_unlock(&cp_arena.lock);
+      return NULL;
+   }
+
+   if (mode == CP_ARENA_BLOCKSONLY) {
+      /* Open the block and advise it, then hand back nothing, so that the cost
+       * of the mapping can be measured apart from the cost of moving the
+       * allocations into it. */
+      if (!cp_arena.bump_end[cls])
+         cp_arena_grow(cp, cls, mode);
+      simple_mtx_unlock(&cp_arena.lock);
+      return NULL;
+   }
+
+   if (cp_arena.free_list[cls]) {
+      cp_arena_stats.n_reuse++;
+      p = cp_arena.free_list[cls];
+      /* The free list is threaded through the free chunks themselves; they
+       * are at least 64 bytes, so the link always fits. */
+      cp_arena.free_list[cls] = *(void **)p;
+   } else {
+      if ((size_t)(cp_arena.bump_end[cls] - cp_arena.bump[cls]) < chunk &&
+          !cp_arena_grow(cp, cls, mode)) {
+         simple_mtx_unlock(&cp_arena.lock);
+         return NULL;
+      }
+      p = cp_arena.bump[cls];
+      cp_arena.bump[cls] += chunk;
+   }
+
+   simple_mtx_unlock(&cp_arena.lock);
+   return p;
+}
+
+/* True if the pointer came out of the arena, in which case it is now free. */
+static bool
+cp_arena_free(void *p)
+{
+   simple_mtx_lock(&cp_arena.lock);
+
+   for (unsigned i = 0; i < cp_arena.nblocks; i++) {
+      if ((char *)p < cp_arena.blocks[i].base ||
+          (char *)p >= cp_arena.blocks[i].end)
+         continue;
+
+      /* Every block serves exactly one size class for its whole life, so the
+       * block the pointer falls in names the free list it belongs on — which
+       * stays true after the class has moved its cursor to a newer block. */
+      int cls = cp_arena.blocks[i].cls;
+      *(void **)p = cp_arena.free_list[cls];
+      cp_arena.free_list[cls] = p;
+      cp_arena_stats.n_free_hit++;
+
+      simple_mtx_unlock(&cp_arena.lock);
+      return true;
+   }
+
+   cp_arena_stats.n_free_miss++;
+   simple_mtx_unlock(&cp_arena.lock);
+   return false;
+}
+
+/*
  * Backing for VkDeviceMemory. This has to be memory the GPU can read: the
  * vertex fetch and shader kernels dereference application buffers directly,
  * so host-only memory here faults the kernel with CUDA_ERROR_ILLEGAL_ADDRESS.
+ * Pinned host memory qualifies — under unified addressing the GPU can follow a
+ * cuMemAllocHost pointer directly — which is what lets the arena above use it.
  *
  * lavapipe allocates from its submit thread, which has no current context of
  * its own, hence the cuCtxSetCurrent. A context may be current on several
@@ -919,9 +1320,24 @@ static struct pipe_memory_allocation *
 cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
 {
    struct cp_screen *cp = (struct cp_screen *)screen;
+   enum cp_arena_mode mode = cp_arena_mode();
    CUdeviceptr dev = 0;
+   int cls;
 
    cuCtxSetCurrent(cp->cuda_ctx);
+
+   if (mode != CP_ARENA_OFF && (cls = cp_arena_class(size)) >= 0 &&
+       p_atomic_inc_return(&cp_arena_seen) > cp_arena_warmup()) {
+      void *p = cp_arena_alloc(cp, cls, mode);
+      if (p) {
+         /* A plain store rather than cp_zero_managed: in the two host-resident
+          * modes the pages are where the host already is, and in the managed
+          * control mode this is the same host memset that path took anyway. */
+         memset(p, 0, size);
+         return (struct pipe_memory_allocation *)p;
+      }
+      /* Out of arena; fall through to the allocator that was always here. */
+   }
 
    /*
     * Nobody up the stack checks this. lavapipe takes the result straight to
@@ -946,6 +1362,9 @@ cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
    struct cp_screen *cp = (struct cp_screen *)screen;
 
    if (!mem)
+      return;
+
+   if (cp_arena_free((void *)mem))
       return;
 
    cuCtxSetCurrent(cp->cuda_ctx);
