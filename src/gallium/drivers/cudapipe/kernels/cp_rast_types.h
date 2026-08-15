@@ -230,7 +230,20 @@ struct cp_clip_args {
    uint32_t num_triangles;
    uint32_t num_slots;      /* Position plus varyings, i.e. num_varyings + 1 */
    uint32_t max_triangles;  /* Capacity of `out`, in triangles */
-   uint32_t pad;
+   /*
+    * Lay the output out by input triangle rather than compacting it: input
+    * triangle t owns slots 4t..4t+3, and the ones it does not fill are marked
+    * degenerate. A batch's primitive index is then monotone in submission
+    * order, which is what the A-buffer sorts on and so what makes merging
+    * blended draws into one episode legal at all. Compaction with atomicAdd
+    * cannot promise that — its output order is whichever thread got there
+    * first, so a later draw's fragment can sort before an earlier draw's.
+    *
+    * Costs nothing in the rasterizer's grid, which is already sized for the
+    * 4x worst case; the threads that would have exited on the count now exit
+    * on a zero area instead.
+    */
+   uint32_t stable;
 };
 
 #define CP_MAX_CLIP_SLOTS 16
@@ -405,6 +418,28 @@ struct cp_fs_interp_args {
    uint64_t abuf_counts;      /* uint32 per pixel: length of its run */
    uint64_t dbg_slot;         /* Out: uint32 per shaded slot, ~0 for no slot */
    uint32_t abuf_num_quads;
+   /*
+    * Which merged draw each shaded slot belongs to, for a batch whose draws
+    * differ in their *fragment* uniform bindings.
+    *
+    * The vertex stage answers this from the vertex id, which is what
+    * cp_vertex_fetch's slice search does. The fragment stage cannot: a shaded
+    * slot is a pixel, and which draw covered it is a property of the primitive
+    * that won it. So the interpolator — the one kernel that knows both the
+    * slot and the primitive — writes the row here, and the shader reads it at
+    * CP_ARG_SLOT_BATCH_ROWS exactly as the vertex shader does.
+    *
+    * The primitive index is a *stable* clipper output (see cp_clip_args), so
+    * `prim >> 2` is the input triangle and `3 * (prim >> 2)` the assembled
+    * vertex the slice table is keyed on. Null for a draw that is not a batch,
+    * where the mask at CP_ARG_SLOT_BATCH_MASK sends every thread to row zero.
+    */
+   uint64_t draw_slices;      /* struct cp_draw_slice[num_draw_slices] */
+   uint32_t num_draw_slices;
+   /* log2 of the clipper's output slots per input triangle: 2 when it ran in
+    * stable mode, 0 when it did not run at all. */
+   uint32_t prim_shift;
+   uint64_t out_batch_rows;   /* Out: uint32 per shaded slot */
 };
 
 struct cp_fs_writeback_args {

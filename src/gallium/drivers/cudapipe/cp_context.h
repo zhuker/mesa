@@ -120,7 +120,36 @@ struct cp_context {
       /* One row of vertex-stage uniform pointers per draw, in the layout the
        * shader indexes: row * CP_ARG_UBO_STRIDE + binding. */
       uint64_t vs_ubos[CP_MAX_BATCH_DRAWS * CP_MAX_CONST_BUFFERS];
+      /*
+       * The same for the fragment stage, and only a blended batch fills it.
+       * A blended draw is rendered by the A-buffer, which sorts on the
+       * primitive index — so merging several of them is legal where merging
+       * opaque draws with different fragment bindings still is not, because
+       * an opaque batch has no ordering to carry and nothing to hang a
+       * per-primitive row off. See cp_batch_abuf_ok().
+       */
+      bool blended;
+      uint64_t fs_ubos[CP_MAX_BATCH_DRAWS * CP_MAX_CONST_BUFFERS];
    } batch;
+
+   /*
+    * What the fragment shader launches of the draw now running should hand to
+    * CP_ARG_SLOT_UBO_TABLE. Set once at the top of cp_draw_execute() so that
+    * it cannot carry from one draw to the next, and read by
+    * cp_fs_launch_shader() — which both shading paths go through, and which is
+    * three call frames below where the batch is known.
+    */
+   struct {
+      const uint64_t *ubos;   /* rows of CP_ARG_UBO_STRIDE, or NULL */
+      unsigned ndraws;
+      /* Where the interpolator looks a primitive's draw up; the same table
+       * cp_vertex_fetch searches, uploaded once per draw. */
+      CUdeviceptr slices;
+      /* How to get from a primitive index back to an input triangle: 2 when
+       * the clipper laid its output out stably, 0 when it did not run. Taken
+       * from what was launched, not from what was intended. */
+      unsigned prim_shift;
+   } fs_batch;
 
    /*
     * The stream every launch, memset and copy in the frame path goes on.

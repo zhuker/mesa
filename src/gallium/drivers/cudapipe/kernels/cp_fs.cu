@@ -227,7 +227,51 @@ cp_abuf_slot_for(const struct cp_fs_interp_args *args, uint32_t pixel,
  * interpolator calls, so the two cannot drift: a helper lane is a lane the
  * quad's mask does not name, and it is interpolated exactly like a covered one
  * — outside the triangle, with negative barycentrics.
+ *
+ * (The helper below is inserted between this comment and the kernel it
+ * describes only because both belong here; cp_abuf_interpolate follows it.)
  */
+/*
+ * Which merged draw a primitive came from, and the four slots that carry the
+ * answer to the fragment shader. See cp_fs_interp_args::out_batch_rows.
+ *
+ * The search is the one cp_vertex_fetch does, over the same table: the last
+ * slice whose first assembled vertex is not past this primitive's.
+ * `prim >> prim_shift` undoes the clipper's stable layout, which reserves four
+ * output slots per input triangle; the shift is zero for a draw that did not
+ * clip at all, where the primitive index is the input triangle already. The
+ * host sets it from what it actually launched rather than from what it meant
+ * to, so a clip that was skipped cannot silently shift every primitive into
+ * the wrong draw's material.
+ */
+static __device__ __forceinline__ void
+cp_write_batch_rows(const struct cp_fs_interp_args *args, uint32_t prim,
+                    uint32_t base)
+{
+   uint32_t *rows = (uint32_t *)(uintptr_t)args->out_batch_rows;
+   if (!rows)
+      return;
+
+   uint32_t row = 0;
+   if (args->num_draw_slices > 1) {
+      const struct cp_draw_slice *s =
+         (const struct cp_draw_slice *)(uintptr_t)args->draw_slices;
+      uint32_t vert = (prim >> args->prim_shift) * 3u;
+      uint32_t lo = 0, hi = args->num_draw_slices - 1;
+      while (lo < hi) {
+         uint32_t mid = (lo + hi + 1u) >> 1;
+         if (s[mid].vert_begin <= vert)
+            lo = mid;
+         else
+            hi = mid - 1;
+      }
+      row = lo;
+   }
+
+   for (int i = 0; i < 4; i++)
+      rows[base + i] = row;
+}
+
 extern "C" __global__ void
 cp_abuf_interpolate(struct cp_fs_interp_args args)
 {
@@ -242,6 +286,8 @@ cp_abuf_interpolate(struct cp_fs_interp_args args)
    uint32_t qx = (b % args.quad_width) * 2;
    uint32_t qy = (b / args.quad_width) * 2;
    uint32_t base = q * 4u;
+
+   cp_write_batch_rows(&args, prim, base);
 
    unsigned char *coverage = (unsigned char *)(uintptr_t)args.coverage;
 #if CP_ABUF_INSTRUMENT
@@ -386,6 +432,8 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
 #endif
          return;
       }
+
+      cp_write_batch_rows(&args, tris[t], base);
 
       /* TEMPORARY: the quad's coverage as one 4-bit mask, which is the form
        * the A-buffer merge produces. Costs nothing when compiled out. */

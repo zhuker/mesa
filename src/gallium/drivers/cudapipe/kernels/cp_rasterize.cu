@@ -153,6 +153,9 @@ struct tri_setup {
  */
 #define CP_CLIP_NUM_PLANES 3
 #define CP_CLIP_MAX_VERTS 6   /* a triangle gains at most one vertex per plane */
+/* The fan over a hexagon, which is what the host sizes the output buffer for
+ * and what stable mode reserves per input triangle. */
+#define CP_CLIP_MAX_OUT 4
 
 static __device__ __forceinline__ float
 clip_dist(const float4 *v, int plane)
@@ -208,12 +211,39 @@ clip_poly(float4 *dst, const float4 *src, int n, uint32_t slots, int plane)
 }
 
 static __device__ __forceinline__ float4 *
-clip_emit(struct cp_clip_args *args, float4 *out, uint32_t slots)
+clip_emit(struct cp_clip_args *args, float4 *out, uint32_t slots,
+          uint32_t tri, uint32_t k)
 {
-   uint32_t o = atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
+   /* Stable mode owns slot 4*tri + k outright, so there is no counter to
+    * contend on and no order to lose; see cp_clip_args::stable. */
+   uint32_t o = args->stable
+      ? tri * CP_CLIP_MAX_OUT + k
+      : atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
    if (o >= args->max_triangles)
       return NULL;
    return out + (size_t)o * 3 * slots;
+}
+
+/*
+ * Retire this input triangle's unused slots.
+ *
+ * setup_triangle() rejects a zero area, so three identical vertices are a
+ * primitive the rasterizer never walks. w = 1 rather than 0, so that nothing
+ * on the way there divides by zero and produces a NaN the area test would let
+ * through.
+ */
+static __device__ __forceinline__ void
+clip_retire(struct cp_clip_args *args, float4 *out, uint32_t slots,
+            uint32_t tri, uint32_t k)
+{
+   for (uint32_t i = k; i < CP_CLIP_MAX_OUT; i++) {
+      uint32_t o = tri * CP_CLIP_MAX_OUT + i;
+      if (o >= args->max_triangles)
+         return;
+      float4 *dst = out + (size_t)o * 3 * slots;
+      dst[0] = dst[slots] = dst[2 * (size_t)slots] =
+         make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+   }
 }
 
 extern "C" __global__ void
@@ -245,9 +275,11 @@ cp_clip_triangles(struct cp_clip_args args)
    }
 
    if (inside == 3) {
-      float4 *dst = clip_emit(&args, out, slots);
+      float4 *dst = clip_emit(&args, out, slots, tri, 0);
       if (dst)
          clip_copy(dst, v, 3 * slots);
+      if (args.stable)
+         clip_retire(&args, out, slots, tri, 1);
       return;
    }
 
@@ -260,20 +292,27 @@ cp_clip_triangles(struct cp_clip_args args)
    for (int p = 0; p < CP_CLIP_NUM_PLANES; p++) {
       float4 *dst = (p & 1) ? poly_b : poly_a;
       n = clip_poly(dst, src, n, slots, p);
-      if (n < 3)
+      if (n < 3) {
+         if (args.stable)
+            clip_retire(&args, out, slots, tri, 0);
          return;
+      }
       src = dst;
    }
 
    /* Fan-triangulate the clipped polygon, which keeps the original winding. */
+   int k = 0;
    for (int i = 1; i + 1 < n; i++) {
-      float4 *dst = clip_emit(&args, out, slots);
+      float4 *dst = clip_emit(&args, out, slots, tri, (uint32_t)k);
       if (!dst)
-         return;
+         break;
+      k++;
       clip_copy(dst, src, slots);
       clip_copy(dst + slots, src + (size_t)i * slots, slots);
       clip_copy(dst + 2 * slots, src + (size_t)(i + 1) * slots, slots);
    }
+   if (args.stable)
+      clip_retire(&args, out, slots, tri, (uint32_t)k);
 }
 
 /*

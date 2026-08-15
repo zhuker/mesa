@@ -1192,7 +1192,8 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
                     CUdeviceptr counter, CUdeviceptr fs_in,
                     unsigned fs_in_stride, CUdeviceptr fs_out,
                     CUdeviceptr frag_coord, CUdeviceptr discard_mask,
-                    unsigned num_threads, CUevent ev_before)
+                    unsigned num_threads, CUevent ev_before,
+                    CUdeviceptr batch_rows)
 {
    /* Both blocks go to the device by DMA rather than through managed memory
     * the host has just dirtied — see cp_upload(). */
@@ -1202,19 +1203,64 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
    if (!stride_dev)
       return false;
 
-   void *fs_args_host[64] = {0};
+   /*
+    * The argument block, and behind it the per-draw uniform table the shader
+    * indexes into — one upload, because the block holds the table's device
+    * address. The shape is the vertex stage's, for the same reason and with
+    * the same single-draw degeneracy: one row, a zero mask and a one-word row
+    * array holding zero, so a draw that is not a batch computes exactly the
+    * args[18 + i] it always did. See CP_ARG_SLOT_UBO_TABLE.
+    */
+   const uint64_t *tbl_src = cp->fs_batch.ubos;
+   unsigned rows = tbl_src ? MAX2(cp->fs_batch.ndraws, 1u) : 1;
+   const size_t fs_args_bytes = 64 * sizeof(void *);
+   const size_t fs_scal_off = fs_args_bytes;   /* row 0, then the mask */
+   const size_t fs_tbl_off = fs_args_bytes + 16;
+   size_t fs_blk_bytes = fs_tbl_off +
+      (size_t)rows * CP_ARG_UBO_STRIDE * sizeof(uint64_t);
+
+   void *fs_blk = NULL;
+   CUdeviceptr fs_args_dev = cp_upload_begin(cp, fs_blk_bytes, &fs_blk);
+   if (!fs_args_dev)
+      return false;
+   memset(fs_blk, 0, fs_blk_bytes);
+
+   void **fs_args_host = (void **)fs_blk;
    fs_args_host[0] = (void *)(uintptr_t)counter;
    fs_args_host[2] = (void *)(uintptr_t)fs_in;
    fs_args_host[3] = (void *)(uintptr_t)stride_dev;
    fs_args_host[4] = (void *)(uintptr_t)fs_out;
    fs_args_host[6] = (void *)(uintptr_t)frag_coord;
    fs_args_host[CP_ARG_SLOT_DISCARD] = (void *)(uintptr_t)discard_mask;
-   for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
-      fs_args_host[18 + i] = cp->fs_ubos[i].buffer;
+   fs_args_host[CP_ARG_SLOT_UBO_TABLE] =
+      (void *)(uintptr_t)(fs_args_dev + fs_tbl_off);
+   fs_args_host[CP_ARG_SLOT_BATCH_ROWS] = batch_rows
+      ? (void *)(uintptr_t)batch_rows
+      : (void *)(uintptr_t)(fs_args_dev + fs_scal_off);
+   fs_args_host[CP_ARG_SLOT_BATCH_MASK] =
+      (void *)(uintptr_t)(fs_args_dev + fs_scal_off + 4);
 
-   CUdeviceptr fs_args_dev = cp_upload(cp, fs_args_host, sizeof(fs_args_host));
-   if (!fs_args_dev)
-      return false;
+   ((uint32_t *)((char *)fs_blk + fs_scal_off))[0] = 0;
+   ((uint32_t *)((char *)fs_blk + fs_scal_off))[1] =
+      batch_rows ? 0xFFFFFFFFu : 0u;
+
+   uint64_t *fs_tbl = (uint64_t *)((char *)fs_blk + fs_tbl_off);
+   for (unsigned d = 0; d < rows; d++) {
+      const uint64_t *row = tbl_src ? tbl_src + (size_t)d * CP_ARG_UBO_STRIDE
+                                    : NULL;
+      for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
+         fs_tbl[d * CP_ARG_UBO_STRIDE + i] =
+            row ? row[i] : (uint64_t)(uintptr_t)cp->fs_ubos[i].buffer;
+   }
+
+   /* Still written, so that the block reads the same whichever form a stage
+    * takes its bindings from — row zero, not the live binding, since a
+    * deferred draw's is no longer what is bound. */
+   for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
+      fs_args_host[18 + i] =
+         (void *)(uintptr_t)fs_tbl[i];
+
+   cp_upload_end(cp, fs_args_dev, fs_blk, fs_blk_bytes);
 
    if (getenv("CUDAPIPE_DEBUG_TEX")) {
       fprintf(stderr, "cudapipe: sampler table %p (%u entries) for FS module\n",
@@ -1408,6 +1454,25 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 
    cp_fs_interp_setup(cp, info, fs, num_fs_inputs, num_vs_outputs, &interp);
 
+   /* See the same block in cp_abuf_shade(). A blended batch reaches this path
+    * only when its A-buffer merge was refused and the peel loop renders it
+    * instead, which is rare and still has to be right. */
+   CUdeviceptr batch_rows = 0;
+   if (cp->fs_batch.ndraws > 1 && fs->reads_const_bufs) {
+      if (!cp->fs_batch.slices) {
+         fprintf(stderr, "cudapipe: a batch of %u has no slice table; refusing "
+                 "to shade it\n", cp->fs_batch.ndraws);
+         return;
+      }
+      batch_rows = cp_scratch_alloc_device(cp, (size_t)max_pixels * 4);
+      if (!batch_rows)
+         return;
+      interp.out_batch_rows = batch_rows;
+      interp.draw_slices = cp->fs_batch.slices;
+      interp.num_draw_slices = cp->fs_batch.ndraws;
+      interp.prim_shift = cp->fs_batch.prim_shift;
+   }
+
    /*
     * TEMPORARY (CUDAPIPE_ABUFFER): where this pass's shaded colours are to be
     * deposited for the comparison, one slot per (pixel, primitive). Allocated
@@ -1449,7 +1514,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    unsigned num_pixels = max_pixels;
 
    if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
-                            frag_coord, discard_mask, num_pixels, 0))
+                            frag_coord, discard_mask, num_pixels, 0, batch_rows))
       return;
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
@@ -1964,6 +2029,27 @@ cp_abuf_enabled(void)
       cp_abuf.max_layers = l && *l ? (unsigned)atoi(l) : 0;
    }
    return cp_abuf.enabled == 1;
+}
+
+/*
+ * Whether consecutive blended draws may share one A-buffer episode.
+ *
+ * The drain that decides whether the merged lists are complete is one
+ * cuStreamSynchronize per eligible draw — 482 of them a frame on the capture,
+ * and the largest single line in it. A batch pays one for all of them: the
+ * capture's 727,372 drains become 316,413, and it replays in 185 s where it
+ * took 333.
+ *
+ * On by default, off with CUDAPIPE_NO_ABUF_BATCH=1, which is the shape
+ * CUDAPIPE_NO_BATCH and CUDAPIPE_NO_ABUFFER already have.
+ */
+static bool
+cp_abuf_batch_enabled(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("CUDAPIPE_NO_ABUF_BATCH") ? 0 : 1;
+   return on == 1;
 }
 
 static void
@@ -2850,6 +2936,27 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
    };
    cp_fs_interp_setup(cp, info, fs, num_fs_inputs, num_vs_outputs, &interp);
 
+   /* Which merged draw's fragment bindings each shaded slot is to use. Only a
+    * batch has more than one answer, and only a shader that reads a constant
+    * buffer can tell. */
+   CUdeviceptr batch_rows = 0;
+   if (cp->fs_batch.ndraws > 1 && fs->reads_const_bufs) {
+      /* A batch the interpolator cannot resolve would shade every draw of it
+       * with the first one's material. Say so rather than render it. */
+      if (!cp->fs_batch.slices) {
+         fprintf(stderr, "abuffer: a batch of %u has no slice table; refusing "
+                 "to shade it\n", cp->fs_batch.ndraws);
+         return false;
+      }
+      batch_rows = cp_scratch_alloc_device(cp, (size_t)num_slots * 4);
+      if (!batch_rows)
+         return false;
+      interp.out_batch_rows = batch_rows;
+      interp.draw_slices = cp->fs_batch.slices;
+      interp.num_draw_slices = cp->fs_batch.ndraws;
+      interp.prim_shift = cp->fs_batch.prim_shift;
+   }
+
    void *ip[] = { &interp };
    cp_abuf_mark(ab->ev[11], cp->stream);
    CUresult e = cuLaunchKernel(screen->kernels.abuf_interpolate,
@@ -2862,7 +2969,8 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
    }
 
    if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
-                            frag_coord, discard_mask, num_slots, cp_abuf.timing ? ab->ev[13] : 0))
+                            frag_coord, discard_mask, num_slots,
+                            cp_abuf.timing ? ab->ev[13] : 0, batch_rows))
       return false;
    cp_abuf_mark(ab->ev[14], cp->stream);
 
@@ -3046,10 +3154,30 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                 unsigned drawid_offset,
                 const struct pipe_draw_start_count_bias *draws,
                 unsigned num_draws, unsigned batch_draws,
-                const uint64_t *vs_ubo_table)
+                const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table)
 {
    struct cp_screen *screen = cp->screen;
    struct pipe_framebuffer_state *fb = &cp->framebuffer;
+
+   /*
+    * The fragment stage's per-draw uniform bindings.
+    *
+    * Set here rather than where the slice table is built, because a *deferred*
+    * draw needs them even when it is a batch of one: it runs after the next
+    * draw's bindings have been bound over the live ones, so reading
+    * cp->fs_ubos at launch time shades it with the wrong material. That was
+    * worth 57% of the pixels of a frame, on batches of one, with no merging
+    * involved at all — BATCHING.md's "the hazard is deferral, not merging",
+    * arrived at a second time.
+    *
+    * Rewritten unconditionally so nothing about the last draw survives into
+    * this one. `slices` stays null until the batch actually has more than one
+    * draw to tell apart; with one draw every fragment takes row zero.
+    */
+   cp->fs_batch.ubos = fs_ubo_table;
+   cp->fs_batch.ndraws = fs_ubo_table ? batch_draws : 0;
+   cp->fs_batch.slices = 0;
+   cp->fs_batch.prim_shift = 0;
 
    if (!screen->kernels.initialized || !screen->kernels.rasterize_triangles)
       return;
@@ -3477,6 +3605,11 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                batch_rows = cp_scratch_alloc_device(cp, (size_t)total_verts * 4);
                if (!batch_rows) { FREE(refs); return; }
             }
+
+            /* The fragment stage searches the same table, from the primitive
+             * rather than from the vertex; see cp_fs_interp_args. */
+            if (fs_ubo_table)
+               cp->fs_batch.slices = slices_dev;
          }
 
          struct cp_vertex_fetch_args vf_args = {
@@ -3708,7 +3841,22 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                CUdeviceptr clip_count = cp_scratch_alloc_device(cp, 4);
 
                if (clipped && clip_count) {
-                  cuMemsetD32Async(clip_count, 0, 1, cp->stream);
+                  /*
+                   * A batch of blended draws is composited in primitive
+                   * order, so its primitives have to *be* in submission order
+                   * — which compaction by atomicAdd does not promise. Stable
+                   * mode gives every input triangle four slots of its own and
+                   * retires the ones it does not fill, so the count is the
+                   * whole array and the rasterizer skips the holes on their
+                   * zero area. Only for a batch: a single draw keeps the
+                   * compacting path, so CUDAPIPE_BATCH_MAX=1 stays
+                   * bit-identical to a build without any of this.
+                   */
+                  bool stable_clip = batch_draws > 1 && cp->blend_enabled;
+
+                  cuMemsetD32Async(clip_count,
+                                   stable_clip ? max_clipped : 0, 1,
+                                   cp->stream);
 
                   struct cp_clip_args clip = {
                      .vs_out = vs_output_buf,
@@ -3717,6 +3865,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                      .num_triangles = num_triangles,
                      .num_slots = num_vs_outputs,
                      .max_triangles = max_clipped,
+                     .stable = stable_clip,
                   };
                   void *clip_params[] = { &clip };
                   CUresult clip_err = cuLaunchKernel(
@@ -3729,6 +3878,8 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                      rast_args.positions = clipped;
                      rast_args.tri_count = clip_count;
                      rast_num_triangles = max_clipped;
+                     if (stable_clip)
+                        cp->fs_batch.prim_shift = 2;
                   } else {
                      fprintf(stderr, "cudapipe: clip launch failed (%d)\n",
                              clip_err);
@@ -4719,7 +4870,7 @@ static void
 cp_batch_build_key(struct cp_context *cp, const struct pipe_draw_info *info,
                    unsigned drawid_offset,
                    const struct pipe_draw_start_count_bias *draws,
-                   struct cp_batch_key *key)
+                   struct cp_batch_key *key, bool blended)
 {
    struct pipe_framebuffer_state *fb = &cp->framebuffer;
 
@@ -4785,7 +4936,13 @@ cp_batch_build_key(struct cp_context *cp, const struct pipe_draw_info *info,
     * Keying on bindings the shader never loads would break every batch in that
     * sample for no reason.
     */
-   if (cp->fs_shader && cp->fs_shader->reads_const_bufs) {
+   /*
+    * A *blended* batch carries these per draw instead, in the table behind the
+    * fragment shader's argument block — which is what makes 482 blended draws
+    * a frame merge at all, and is why they are absent from the key here rather
+    * than compared. See cp_batch_abuf_ok() and cp_fs_launch_shader().
+    */
+   if (cp->fs_shader && cp->fs_shader->reads_const_bufs && !blended) {
       key->num_fs_ubos = cp->num_fs_ubos;
       for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++) {
          key->fs_ubos[i] = cp->fs_ubos[i].buffer;
@@ -4841,6 +4998,7 @@ cp_batch_key_report_diff(const struct cp_batch_key *a,
    fprintf(stderr, "cudapipe: batchdiff %s\n", n ? line : "(none)");
 }
 
+
 /*
  * Whether this draw may be held back at all.
  *
@@ -4849,17 +5007,11 @@ cp_batch_key_report_diff(const struct cp_batch_key *a,
  * above then decides which batch.
  */
 static bool
-cp_batch_eligible(struct cp_context *cp, const struct pipe_draw_info *info,
-                  const struct pipe_draw_indirect_info *indirect,
-                  const struct pipe_draw_start_count_bias *draws,
-                  unsigned num_draws)
+cp_batch_structural(struct cp_context *cp, const struct pipe_draw_info *info,
+                    const struct pipe_draw_indirect_info *indirect,
+                    const struct pipe_draw_start_count_bias *draws,
+                    unsigned num_draws)
 {
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = getenv("CUDAPIPE_NO_BATCH") ? 0 : 1;
-   if (!enabled)
-      return false;
-
    /* The pipeline the batched path takes: a compiled vertex shader over a
     * triangle list, with the topology resolved on the device. Anything the
     * host has to expand into a refs table is left alone. */
@@ -4880,21 +5032,6 @@ cp_batch_eligible(struct cp_context *cp, const struct pipe_draw_info *info,
     * the single-draw path. */
    if (!cp->num_vertex_buffers || !cp->vertex_buffers[0].buffer.resource)
       return false;
-
-   /* Order-dependent results. See the note above. */
-   if (cp->blend_enabled || cp->fs_shader->uses_discard)
-      return false;
-   if (!cp->depth_stencil.depth_enabled || !cp->depth_stencil.depth_writemask)
-      return false;
-   switch (cp->depth_stencil.depth_func) {
-   case PIPE_FUNC_LESS:
-   case PIPE_FUNC_LEQUAL:
-   case PIPE_FUNC_GREATER:
-   case PIPE_FUNC_GEQUAL:
-      break;
-   default:
-      return false;
-   }
 
    /* Framebuffer and the buffers the stages need. */
    if (!cp->framebuffer.nr_cbufs || !cp->framebuffer.cbufs[0].texture ||
@@ -4924,6 +5061,107 @@ cp_batch_eligible(struct cp_context *cp, const struct pipe_draw_info *info,
    return true;
 }
 
+/*
+ * The opaque merge condition: a result that cannot depend on the order the
+ * draws arrived in, because the visibility buffer resolves it with atomicMin.
+ */
+static bool
+cp_batch_order_free(struct cp_context *cp)
+{
+   if (cp->blend_enabled || cp->fs_shader->uses_discard)
+      return false;
+   if (!cp->depth_stencil.depth_enabled || !cp->depth_stencil.depth_writemask)
+      return false;
+   switch (cp->depth_stencil.depth_func) {
+   case PIPE_FUNC_LESS:
+   case PIPE_FUNC_LEQUAL:
+   case PIPE_FUNC_GREATER:
+   case PIPE_FUNC_GEQUAL:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/*
+ * The blended merge condition: a draw the A-buffer renders.
+ *
+ * Order here is not free — it is *carried*, by the primitive index the
+ * A-buffer sorts on. Merging is legal only because the clipper lays a batch's
+ * triangles out in submission order (see cp_clip_triangles' stable mode), so a
+ * later draw's primitives sort after an earlier draw's exactly as they would
+ * have if the draws had run one at a time.
+ *
+ * The conditions are the A-buffer's own, restated: this has to agree with the
+ * test in cp_draw_execute, because a batch that ends up on the peel loop
+ * instead composites its merged draws in the same primitive order and is
+ * equally correct — but a batch that ends up anywhere else is not.
+ */
+static bool
+cp_batch_abuf_ok(struct cp_context *cp)
+{
+   struct cp_screen *screen = cp->screen;
+   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+
+   if (!cp_abuf_enabled() || cp_abuf.disabled)
+      return false;
+   if (!screen->kernels.abuf_quad_fill || !screen->kernels.clip_triangles ||
+       !screen->kernels.peel_advance)
+      return false;
+
+   /* What makes the draw peel at all — cp_draw_execute's `peel`. A discarding
+    * shader takes the retry path instead, and its fragments are not the
+    * A-buffer's population. */
+   if (!cp->blend_enabled || cp->fs_shader->uses_discard || !cp->peel_next)
+      return false;
+
+   /* The A-buffer's own gate. */
+   if (MAX2(cp->fb_samples, 1u) != 1 || cp->depth_stencil.depth_writemask)
+      return false;
+   if (fb->nr_cbufs != 1 || !fb->cbufs[0].texture ||
+       cp_color_encoding_from_format(fb->cbufs[0].format) < 0)
+      return false;
+
+   /*
+    * The vertex shader's outputs have to fit the clipper, because the stable
+    * layout the ordering rests on is the clipper's. A draw wide enough to skip
+    * clipping keeps the compacting path, where a batch's primitive indices
+    * would still be in submission order — but it is one condition rather than
+    * two, so it is refused here and left on the single-draw path.
+    */
+   unsigned nout = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
+   if (nout > CP_MAX_CLIP_SLOTS)
+      return false;
+
+   return true;
+}
+
+static bool
+cp_batch_eligible(struct cp_context *cp, const struct pipe_draw_info *info,
+                  const struct pipe_draw_indirect_info *indirect,
+                  const struct pipe_draw_start_count_bias *draws,
+                  unsigned num_draws, bool *blended)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = getenv("CUDAPIPE_NO_BATCH") ? 0 : 1;
+   if (!enabled)
+      return false;
+
+   if (!cp_batch_structural(cp, info, indirect, draws, num_draws))
+      return false;
+
+   if (cp_batch_order_free(cp)) {
+      *blended = false;
+      return true;
+   }
+   if (cp_abuf_batch_enabled() && cp_batch_abuf_ok(cp)) {
+      *blended = true;
+      return true;
+   }
+   return false;
+}
+
 /* Snapshot this draw's index range and vertex-stage bindings as the next row
  * of the batch's tables. */
 static void
@@ -4935,6 +5173,18 @@ cp_batch_record(struct cp_context *cp,
    memset(row, 0, CP_ARG_UBO_STRIDE * sizeof(*row));
    for (unsigned i = 0; i < cp->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
       row[i] = (uint64_t)(uintptr_t)cp->vs_ubos[i].buffer;
+
+   /* The fragment stage's, for a blended batch — the bindings the key stopped
+    * comparing. Recorded now, because by the time the batch runs the next
+    * draw's have been bound over them. */
+   if (cp->batch.blended) {
+      uint64_t *frow = cp->batch.fs_ubos +
+         (size_t)cp->batch.ndraws * CP_ARG_UBO_STRIDE;
+      memset(frow, 0, CP_ARG_UBO_STRIDE * sizeof(*frow));
+      for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
+         frow[i] = (uint64_t)(uintptr_t)cp->fs_ubos[i].buffer;
+   }
+
    cp->batch.draws[cp->batch.ndraws] = *draw;
    cp->batch.tris += tris;
    cp->batch.ndraws++;
@@ -4963,11 +5213,13 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
       fprintf(stderr, "cudapipe: batch of %u ends: %s\n", cp->batch.ndraws, why);
 
    unsigned ndraws = cp->batch.ndraws;
+   bool blended = cp->batch.blended;
    /* Cleared first: cp_draw_execute() runs a whole frame's worth of driver
     * code and nothing in it may see a batch that is already on its way. */
    cp->batch.pending = false;
    cp->batch.ndraws = 0;
    cp->batch.tris = 0;
+   cp->batch.blended = false;
 
    if (debug & 2) {
       fprintf(stderr, "cudapipe: batch of %u draws\n", ndraws);
@@ -4981,7 +5233,8 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
    }
 
    cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
-                   cp->batch.draws, 1, ndraws, cp->batch.vs_ubos);
+                   cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
+                   blended ? cp->batch.fs_ubos : NULL);
 }
 
 static void
@@ -5001,9 +5254,10 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    cuCtxSetCurrent(screen->cuda_ctx);
 
-   if (cp_batch_eligible(cp, info, indirect, draws, num_draws)) {
+   bool blended = false;
+   if (cp_batch_eligible(cp, info, indirect, draws, num_draws, &blended)) {
       struct cp_batch_key key;
-      cp_batch_build_key(cp, info, drawid_offset, draws, &key);
+      cp_batch_build_key(cp, info, drawid_offset, draws, &key, blended);
 
       unsigned tris = cp_triangles_for_draw(info->mode, draws[0].count);
 
@@ -5044,12 +5298,15 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       cp->batch.info = *info;
       cp->batch.drawid_offset = drawid_offset;
       cp->batch.pending = true;
+      /* Set before the first row is recorded: cp_batch_record() reads it to
+       * decide whether the fragment bindings have to be snapshotted too. */
+      cp->batch.blended = blended;
       cp_batch_record(cp, &draws[0], tris);
       return;
    }
 
    cp_batch_flush_why(cp, "the next draw cannot be batched");
-   cp_draw_execute(cp, info, drawid_offset, draws, num_draws, 1, NULL);
+   cp_draw_execute(cp, info, drawid_offset, draws, num_draws, 1, NULL, NULL);
 }
 
 static void
@@ -5721,9 +5978,12 @@ cp_set_constant_buffer(struct pipe_context *ctx, mesa_shader_stage shader,
     * table exists to carry, and a compute one, which no draw reads. A fragment
     * binding it will read when it finally runs, so changing one has to submit
     * what is held back first — unless the fragment shader reads no constant
-    * buffer at all, in which case what is bound there cannot reach it.
+    * buffer at all, in which case what is bound there cannot reach it, or the
+    * batch is a blended one, which carries a per-draw table of these too and
+    * has already snapshotted the row this would overwrite.
     */
    if (shader == MESA_SHADER_FRAGMENT && cp->batch.pending &&
+       !cp->batch.blended &&
        cp->fs_shader && cp->fs_shader->reads_const_bufs) {
       if (cp->fs_ubos[index].buffer != buf_ptr ||
           cp->fs_ubos[index].buffer_size != buf_size || needs_managed_copy)

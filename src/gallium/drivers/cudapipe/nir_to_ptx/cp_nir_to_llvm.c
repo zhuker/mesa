@@ -243,14 +243,19 @@ emit_local_invocation_id(struct ntl_context *ctx, unsigned component)
  * is what makes it one function rather than a line in each of them, and what
  * makes `reads_const_bufs` trustworthy.
  *
- * The vertex stage reads through the batch table, so that consecutive draws
- * differing only in their vertex uniforms can share one launch; see
+ * Both drawing stages read through the batch table, so that consecutive draws
+ * differing only in their uniforms can share one launch; see
  * CP_ARG_SLOT_UBO_TABLE. A single draw points the table at args[18], the mask
  * at a zero and the row array at one word holding zero, so the row index is
  * zero and this computes the very address the plain form does — there is no
- * second variant of the shader and no branch. Only the vertex stage: a batch
- * is refused unless every draw in it has the same fragment bindings, so the
- * fragment shader's generated code is untouched.
+ * second variant of the shader and no branch.
+ *
+ * The two stages differ only in who fills the row array. The vertex stage's is
+ * written by cp_vertex_fetch, which searches the batch's slices to know what
+ * to gather and writes the answer down rather than have the shader repeat it.
+ * The fragment stage's is written by the interpolator, which is where a shaded
+ * slot and the primitive that won it are both in hand — a pixel has no draw of
+ * its own. Compute reads args[18 + i] directly; it has no batch.
  */
 static LLVMValueRef
 emit_const_buf_base(struct ntl_context *ctx, LLVMValueRef slot)
@@ -262,7 +267,8 @@ emit_const_buf_base(struct ntl_context *ctx, LLVMValueRef slot)
 
    ctx->reads_const_bufs = true;
 
-   if (ctx->nir->info.stage == MESA_SHADER_VERTEX) {
+   if (ctx->nir->info.stage == MESA_SHADER_VERTEX ||
+       ctx->nir->info.stage == MESA_SHADER_FRAGMENT) {
       LLVMValueRef table = LLVMBuildBitCast(ctx->builder,
          cp_arg_slot(ctx, CP_ARG_SLOT_UBO_TABLE), ptr_ptr_type, "ubo_table");
       LLVMValueRef mask = LLVMBuildLoad2(ctx->builder, i32,
