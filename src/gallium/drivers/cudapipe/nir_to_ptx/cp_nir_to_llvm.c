@@ -509,6 +509,34 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
                   LLVMConstNull(get_llvm_type(ctx, instr->def.bit_size,
                                               instr->def.num_components)));
       break;
+   case nir_intrinsic_load_front_face: {
+      /*
+       * gl_FrontFacing. A byte per shaded slot at CP_ARG_SLOT_FRONT_FACE,
+       * written by cp_interp_pixel from the sign of the primitive's
+       * screen-space area — which is the only place the primitive that won a
+       * slot is still known. Indexed by the thread id, the way every other
+       * per-slot array here is.
+       *
+       * Undef until this existed, which is not a value a shader survives:
+       * the surface shaders flip their normal by it, so an undefined facing
+       * costs the whole direct-light term and swaps which hemisphere of the
+       * ambient probe is read.
+       */
+      LLVMValueRef bid = emit_workgroup_id(ctx, 0);
+      LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
+      LLVMValueRef thread_id = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, bid, LLVMConstInt(i32, 256, false), ""), tid, "");
+      LLVMTypeRef i8 = LLVMInt8TypeInContext(ctx->llvm_ctx);
+      LLVMValueRef arr = LLVMBuildBitCast(ctx->builder,
+         cp_arg_slot(ctx, CP_ARG_SLOT_FRONT_FACE), LLVMPointerType(i8, 0), "");
+      LLVMValueRef elem = LLVMBuildGEP2(ctx->builder, i8, arr, &thread_id, 1, "");
+      LLVMValueRef face = LLVMBuildLoad2(ctx->builder, i8, elem, "front_face");
+      LLVMSetAlignment(face, 1);
+      set_ssa_def(ctx, &instr->def,
+                  LLVMBuildICmp(ctx->builder, LLVMIntNE, face,
+                                LLVMConstInt(i8, 0, false), ""));
+      break;
+   }
    case nir_intrinsic_load_base_instance:
    case nir_intrinsic_load_first_vertex:
    case nir_intrinsic_load_base_vertex:
@@ -2764,6 +2792,9 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
             case nir_intrinsic_terminate:
             case nir_intrinsic_terminate_if:
                bin->uses_discard = true;
+               break;
+            case nir_intrinsic_load_front_face:
+               bin->reads_front_face = true;
                break;
             case nir_intrinsic_load_base_instance:
             case nir_intrinsic_load_first_vertex:

@@ -112,6 +112,14 @@ struct cp_shader_binary {
    bool uses_discard;
 
    /*
+    * Whether the fragment shader reads gl_FrontFacing. Only then does the
+    * interpolator write the per-slot facing byte the shader reads, which is
+    * one byte per shaded pixel and so worth not writing for the shaders — the
+    * large majority — that never ask.
+    */
+   bool reads_front_face;
+
+   /*
     * Whether the shader reads gl_BaseVertex, gl_BaseInstance or gl_DrawID.
     * Those come from one triple at args[7], which a batch has only one of, so
     * a shader that reads them may only be merged with draws that would give

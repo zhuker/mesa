@@ -83,6 +83,18 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
    if (area == 0.0f)
       return false;
 
+   /*
+    * gl_FrontFacing. The sign of the area before the flip above is the
+    * winding; which winding is the front is rasterizer state. A point has no
+    * winding, and Vulkan calls it front-facing.
+    */
+   if (args->front_face) {
+      /* vidx[1] is still 1 exactly when the area came out positive. */
+      bool front = args->point_mode
+         ? true : ((vidx[1] == 1) == (args->front_ccw != 0));
+      ((unsigned char *)(uintptr_t)args->front_face)[slot] = front ? 1 : 0;
+   }
+
    float inv_area = 1.0f / area;
    float cx = (float)(pixel % args->width) + 0.5f;
    float cy = (float)(pixel / args->width) + 0.5f;

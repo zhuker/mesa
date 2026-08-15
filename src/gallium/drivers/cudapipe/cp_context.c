@@ -1192,6 +1192,7 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
                     CUdeviceptr counter, CUdeviceptr fs_in,
                     unsigned fs_in_stride, CUdeviceptr fs_out,
                     CUdeviceptr frag_coord, CUdeviceptr discard_mask,
+                    CUdeviceptr front_face,
                     unsigned num_threads, CUevent ev_before,
                     CUdeviceptr batch_rows)
 {
@@ -1232,6 +1233,7 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
    fs_args_host[4] = (void *)(uintptr_t)fs_out;
    fs_args_host[6] = (void *)(uintptr_t)frag_coord;
    fs_args_host[CP_ARG_SLOT_DISCARD] = (void *)(uintptr_t)discard_mask;
+   fs_args_host[CP_ARG_SLOT_FRONT_FACE] = (void *)(uintptr_t)front_face;
    fs_args_host[CP_ARG_SLOT_UBO_TABLE] =
       (void *)(uintptr_t)(fs_args_dev + fs_tbl_off);
    fs_args_host[CP_ARG_SLOT_BATCH_ROWS] = batch_rows
@@ -1410,9 +1412,13 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
     */
    CUdeviceptr discard_mask = fs->uses_discard
       ? cp_scratch_alloc_device(cp, max_pixels) : 0;
+   /* gl_FrontFacing, on the same bargain as the discard mask above. */
+   CUdeviceptr front_face = fs->reads_front_face
+      ? cp_scratch_alloc_device(cp, max_pixels) : 0;
 
    if (!pixel_list || !counter || !fs_in || !fs_out || !coverage || !frag_coord ||
-       (fs->uses_discard && !discard_mask))
+       (fs->uses_discard && !discard_mask) ||
+       (fs->reads_front_face && !front_face))
       return;
 
    /*
@@ -1436,6 +1442,8 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .fs_in = fs_in,
       .frag_coord = frag_coord,
       .coverage = coverage,
+      .front_face = front_face,
+      .front_ccw = cp->rasterizer.front_ccw,
       .width = w, .height = h,
       .vs_out_stride = num_vs_outputs * 16,
       .fs_in_stride = fs_in_stride,
@@ -1514,7 +1522,8 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    unsigned num_pixels = max_pixels;
 
    if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
-                            frag_coord, discard_mask, num_pixels, 0, batch_rows))
+                            frag_coord, discard_mask, front_face, num_pixels, 0,
+                            batch_rows))
       return;
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
@@ -2892,11 +2901,14 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
    CUdeviceptr frag_coord = cp_scratch_alloc_device(cp, (size_t)num_slots * 16);
    CUdeviceptr discard_mask = fs->uses_discard
       ? cp_scratch_alloc_device(cp, num_slots) : 0;
+   CUdeviceptr front_face = fs->reads_front_face
+      ? cp_scratch_alloc_device(cp, num_slots) : 0;
    CUdeviceptr dbg_slot = record_colors
       ? cp_scratch_alloc_device(cp, (size_t)num_slots * 4) : 0;
 
    if (!pixel_list || !counter || !fs_in || !fs_out || !coverage ||
        !frag_coord || (fs->uses_discard && !discard_mask) ||
+       (fs->reads_front_face && !front_face) ||
        (record_colors && !dbg_slot)) {
       fprintf(stderr, "abuffer: shading buffers for %u slots refused; this "
               "draw's quad stream is not shaded\n", num_slots);
@@ -2917,6 +2929,8 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
       .fs_in = fs_in,
       .frag_coord = frag_coord,
       .coverage = coverage,
+      .front_face = front_face,
+      .front_ccw = cp->rasterizer.front_ccw,
       .width = w, .height = h,
       .vs_out_stride = num_vs_outputs * 16,
       .fs_in_stride = fs_in_stride,
@@ -2969,7 +2983,7 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
    }
 
    if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
-                            frag_coord, discard_mask, num_slots,
+                            frag_coord, discard_mask, front_face, num_slots,
                             cp_abuf.timing ? ab->ev[13] : 0, batch_rows))
       return false;
    cp_abuf_mark(ab->ev[14], cp->stream);

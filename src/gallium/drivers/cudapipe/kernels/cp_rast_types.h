@@ -282,6 +282,13 @@ struct cp_clip_args {
 #define CP_ARG_SLOT_BATCH_MASK 11
 
 /*
+ * gl_FrontFacing: one byte per shaded slot, written by the interpolator, read
+ * by the fragment stage at its own thread id. Fragment stage only; the slot is
+ * null everywhere else and no other stage emits load_front_face.
+ */
+#define CP_ARG_SLOT_FRONT_FACE 12
+
+/*
  * One merged draw's slice of the assembled vertex stream.
  *
  * A batch concatenates its draws, so vertex v of the launch belongs to the
@@ -362,6 +369,16 @@ struct cp_fs_interp_args {
     * not reach the framebuffer.
     */
    uint64_t coverage;
+   /*
+    * Out: one byte per slot, non-zero when the primitive that won the slot
+    * faces the viewer. gl_FrontFacing is not a varying — it is a property of
+    * the primitive — and this is the only place both the primitive and the
+    * slot it shades are in hand. front_ccw is the rasterizer state that turns
+    * a signed screen-space area into a facing, and has to be carried here
+    * because setup_triangle discards the sign.
+    */
+   uint64_t front_face;
+   uint32_t front_ccw;
    uint32_t width, height;
    uint32_t vs_out_stride;  /* Bytes per vertex in vs_out */
    uint32_t fs_in_stride;   /* Bytes per pixel in fs_in */
