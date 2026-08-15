@@ -133,6 +133,93 @@ Two things matter, both of them learned by hitting them:
 A warning that the replay device differs from the capture device is expected and
 harmless — that is the whole point.
 
+## 4. Getting frames out of a capture that never presents
+
+An offscreen application has no swapchain, so GFXR counts zero frames and
+`--screenshots` — which hooks `vkQueuePresentKHR` — never fires. `gfxrecon-info`
+says so directly:
+
+```
+Application exe name: ./HeadlessStreamer
+Total frames: 0
+```
+
+`GFXRECON_CAPTURE_FRAMES` counts presents too, so a capture like this cannot be
+trimmed by frame range either. The whole file is one "frame" to every tool that
+asks.
+
+What such an application does have is a readback: it renders into an image and
+copies it to a host-visible buffer to encode. `gfxrecon-replay --dump-resources`
+can dump the destination of that copy, which is exactly the bytes the
+application itself consumed. `cp_gfxr_frames.py` drives the whole path:
+
+```sh
+cp_gfxr_frames.py index  capture.gfxr                  # -> blocks.tsv (7.6 s for 2.4 GB)
+cp_gfxr_frames.py frames blocks.tsv                    # what readbacks exist
+cp_gfxr_frames.py plan   blocks.tsv --frames 0,100,-1  # -> dump.json
+cp_gfxr_frames.py replay capture.gfxr dump.json --icd <icd> --out DIR
+cp_gfxr_frames.py png    DIR                           # .bin -> .png
+```
+
+`--frames` takes `0,5,-1`, `0-9`, `::100` or `all`. On the HeadlessStreamer
+capture `frames` reports:
+
+```
+1510 readbacks, from 2 image(s):
+  image 14        1509 frames  1280x720  VK_FORMAT_B8G8R8A8_UNORM   <- frame output
+  image 240448       1 frames   640x360  VK_FORMAT_B8G8R8A8_UNORM
+```
+
+Three things about this are worth knowing before trusting the output:
+
+* **`--dump-resources` addresses commands by block index**, the counter GFXR
+  gives every call in the file, and a transfer dump needs three: the copy, the
+  `vkBeginCommandBuffer` it records into, and the `vkQueueSubmit` that submits
+  that command buffer. `index` recovers all three by matching command-buffer
+  ids. It deliberately drops draw calls, which is why its output is a hundred
+  times smaller than the capture's command count.
+* **Transfer dumps are always raw binary.** GFXR writes image files only for
+  image targets; a buffer comes out as `.bin` with no header, hence the `png`
+  step. Dumping *draw calls* instead — a `"Draw"` array plus the enclosing
+  `RenderPass` indices — makes GFXR write PNGs itself and honour
+  `DumpBeforeCommand` and `DumpDepth`, which is the better tool for finding
+  which draw first diverges.
+* **The manifest suffix is misdocumented.** `vulkan_dump_resources.md` says
+  replay writes `<name>_rd.json`; it writes `<name>_dr.json`.
+
+The replay itself needs two flags beyond section 3's: `--remove-unsupported`,
+because the application asks for extensions a software driver does not expose
+(`VK_KHR_video_maintenance1` here) and `vkCreateDevice` fails outright without
+it, and `--log-file`, because gfxrecon's stdout is block-buffered and a driver
+that segfaults takes the last few KB of the log with it.
+
+There is no way to stop replay early at a block index, so dumping frame 0 still
+streams the whole file. When iterating, kill the replay once the dump lands —
+that turns a several-minute run into seconds, since an early frame sits a tiny
+fraction of the way into the block stream.
+
+### Why this is worth more than the sample sweep
+
+The sweep covers eighteen samples that were chosen to be small. A real
+application exercises paths none of them reach, and it exercises them at a
+volume that changes which costs matter. Everything in this list came from the
+capture and none of it from the sweep:
+
+* vertex formats narrower than 32 bits per component were never expanded, so
+  packed attributes arrived garbled — a hard fault where the value indexed an
+  array, silently wrong pixels everywhere else;
+* block-compressed copies were measured in pixels rather than blocks, a 16x
+  overrun;
+* the clipper never clipped `z <= w`, which is the near plane under reversed-Z;
+* the A-buffer disabled itself permanently on the first framebuffer resize,
+  which no single-resolution sample can trigger;
+* consecutive blended draws shared no state at all, because the fragment
+  uniform bindings changed every draw — which is what made batching them worth
+  44% and is not visible in any sample.
+
+It is also a better cost oracle than the sweep for anything that shows up at
+scale, with the caveat in `TESTING.md` about pairing runs under 10%.
+
 ## Troubleshooting
 
 | Symptom | Cause |

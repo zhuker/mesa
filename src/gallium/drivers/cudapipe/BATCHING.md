@@ -237,3 +237,56 @@ CUDAPIPE_BATCH_MAX=1 ...                           # must be bit-identical to NO
 ```
 
 **HEAD is what `batchtest` measured.**
+
+---
+
+## Blended draws, later, on a real application
+
+The eligibility list above refuses blended draws outright, and `ABUFFER.md`
+took them instead. Both are now merged: consecutive A-buffer-eligible draws
+batch into one episode, which is worth 44% of a captured application's frame
+and nothing at all on this sweep.
+
+Two things had to be true first, and the first one is the reason to read this
+section.
+
+**The key had to change, and the reason is not the one this document
+predicts.** §3.3 spends its length on the sort key and the per-triangle draw
+index, and concludes the index was not needed. For blended draws it is: the
+clipper compacted its output with an `atomicAdd`, so post-clip primitive
+indices did not respect draw order, and the A-buffer sorts on exactly that
+index. The clipper now has a stable mode — input triangle *t* owns output
+slots *4t..4t+3*, unfilled slots retired as zero-area triangles that
+`setup_triangle` already rejects — which costs nothing, because stage 1 was
+always sized for four times the input.
+
+**And the key would have merged nothing anyway.** Measured over 280,000
+eligible draws of the capture, the mean run length under the key as it stood
+is **1.00** — consecutive blended draws share *nothing*. `fs_ubos` breaks 97%
+of the runs. The fragment shader binds a 64 and a 96 byte uniform block and
+rebinds them every draw, and hashing the contents rather than comparing the
+addresses gives the same answer, so it is not pointer churn.
+
+That is the `gltfscenerendering` lesson in §3.3 again, in a harder form. There
+the ranges were in the key and had to come out. Here the *fragment bindings*
+were in the key and had to come out, which meant giving the fragment stage the
+per-draw binding table the vertex stage already had. With that, the achieved
+batch length is 2.30 and the capture goes from 333 s to 185 s.
+
+The sweep does not move, because no sample rebinds fragment uniforms per draw
+often enough to matter — which is precisely why a real application was needed
+to find it.
+
+**One live bug this turned up, of the kind §3.3 warns about.** Deferral, not
+merging: a held-back draw launched with whatever fragment bindings were
+current at flush time, which by then belonged to the *next* draw. With
+`CUDAPIPE_BATCH_MAX=1` — the configuration this document requires to be
+bit-identical to `NO_BATCH` — 57% of the image was wrong. `cp->fs_batch.ubos`
+is now set for every draw rather than only for real batches.
+
+Opaque batches still require identical fragment bindings; extending the table
+to them is small now, and is this document's `gltfscenerendering` item.
+
+| variable | effect |
+|---|---|
+| `CUDAPIPE_NO_ABUF_BATCH=1` | blended draws take the A-buffer one at a time |

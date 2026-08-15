@@ -205,6 +205,50 @@ The two samples that move more than that, `gltfscenerendering` (−5.4%) and
 600-frame pass takes about two and a half minutes; 6000 takes twenty-five and
 is for a final confirmation.
 
+### 600 frames is not enough to call a regression on `gltfscenerendering`
+
+It is enough for the other sixteen. That one has been seen to spread **6.9%
+across three runs of an identical build** — 13.87, 14.83, 13.88 — which is
+larger than the ±5% the gate flags at, so a single sweep can manufacture a
+regression out of nothing and can equally hide a real one.
+
+It has done both. One pass reported it +7.1% and the number vanished under a
+controlled comparison, the baseline build reproducing the "regressed" figure on
+its own. A later pass reported +7.1% again and that one was real, reproducing
+at +0.99 ms across five interleaved pairs. The two are indistinguishable from
+the sweep alone.
+
+So a >5% move on a >3 ms sample is a **question, not a finding**. Answer it by
+building both trees and alternating:
+
+```sh
+git worktree add /tmp/base <baseline-commit>     # build it there
+for r in 1 2 3; do
+  for v in old new; do
+    SAMPLES=gltfscenerendering tests/cp_perf_run.sh $v $ICD_$v $OUT/$v$r 600 1
+  done
+done
+```
+
+Report the per-pair deltas and their median, not the two means. Within an arm
+the spread is about 0.1 ms, so pairing resolves a 1% move that the sweep cannot
+see at all.
+
+The suspected mechanism is the driver's own: `cp_tune_before` times register-cap
+candidates at runtime and keeps whichever build wins, so two runs of one binary
+can settle into different states. That makes it a property of the driver rather
+than of the machine, and it will not go away by asking the sweep more politely.
+
+The same caution applies to the **capture replay** described in
+`GFXRECONSTRUCT.md`, which is otherwise a far finer instrument than the sweep —
+four consecutive pairs of it agreed to 0.07%, and then a later pair disagreed by
+3.9%. Treat anything under about 10% there as needing a paired A/B too: build
+two `.so` files, write one ICD json each pointing at its `library_path`, and
+alternate. A change worth under 3% may simply not be resolvable in wall time,
+and is better argued from a direct count — an `LD_PRELOAD` shim over the CUDA
+driver API costs 0.1% and gives exact per-call-site totals, where CUPTI would
+distort this driver badly.
+
 **The rest of the flags have to mirror the storing run exactly**, which is easy
 to get wrong, because offscreen benchmarking quietly ignores the options a
 windowed benchmark uses:

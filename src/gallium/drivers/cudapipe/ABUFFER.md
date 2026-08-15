@@ -15,6 +15,39 @@ defect they turned up in the peel loop.
 
 With the default flip the sweep is **61.82 ms** and particlesystem **5.07**.
 
+> **Later, on a real application.** Two things below were true of every sample
+> and false of the first captured application this was run against, and both
+> cost more than everything this document measures. They are recorded here
+> because the shape of the mistake is the same in each: a decision taken once,
+> correct for a workload that renders one size and rebinds nothing.
+>
+> **The A-buffer switched itself off and nobody noticed.** `cp_abuf_setup` had
+> no realloc path, so the first framebuffer size change set `ab->disabled` for
+> the life of the context. A sample renders one size, so it never fired. The
+> capture runs fifteen render passes a frame at 1280x720 and 160x90, so it
+> fired at about frame five and the remaining fifteen hundred frames all peeled.
+> Fixing it — grow-only capacity, per-size values recomputed — was worth 19% of
+> the whole replay, and the peel loop's convergence drain, which was 61.5% of
+> the frame, fell to 1.3% as a side effect. See commit "let the A-buffer survive
+> a framebuffer resize".
+>
+> **Batching blended draws is worth 44%, and the batch key had to change first.**
+> The batching section below is right that this is the next increment. What it
+> could not know is that under the key as it stood, consecutive blended draws
+> share *nothing*: mean run length 1.00 over 280,000 eligible draws, with
+> `fs_ubos` breaking 97% of them, confirmed by hashing the contents rather than
+> comparing pointers. The fragment shader rebinds a 64 and a 96 byte uniform
+> block every draw and the constants genuinely differ. Per-draw fragment
+> bindings, plus a stable clipper so the primitive index stays monotone across
+> merged draws, took the capture from 333 to 185 seconds. Both are in commit
+> "batch blended draws, once their bindings allow it".
+>
+> The numbers in this document are otherwise unchanged, and `particlesystem`
+> still does not batch — the sweep is flat across both commits. But **5.07 ms
+> is stale as a baseline**: the current tree runs it at 4.06, and a spot check
+> against that figure was briefly mistaken for a 19% win that a controlled
+> comparison then put at −0.5%.
+
 ---
 
 ## The number
