@@ -881,6 +881,217 @@ cp_fs_interp_setup(struct cp_context *cp, const struct pipe_draw_info *info,
 }
 
 /*
+ * Deciding, per fragment shader, whether capping its registers pays.
+ *
+ * The compiler marks a shader as a candidate when its own register count is
+ * what holds its occupancy below two blocks an SM — see
+ * load_shader_module_tuned(). It cannot do more than mark it, because the
+ * register count of every textured fragment shader in this driver is the same
+ * 195: that is the linked sampler's allocation and not the shader's, so it
+ * says nothing about the shader it belongs to. Measured, the same 195 -> 126
+ * cap is worth −9.0% on gltfscenerendering and +3.2% on bloom, and inside
+ * bloom one capped shader gets 4% faster while the one that owns the frame
+ * gets 11% slower. Nothing available before the shader runs separates those.
+ *
+ * What separates them is running it. A candidate is timed on the device for
+ * CP_TUNE_SAMPLES launches as built and CP_TUNE_SAMPLES launches capped, and
+ * the faster build is kept for the rest of the process. The comparison is
+ * per shader and on this application's own draws, which is the only place the
+ * answer exists.
+ *
+ * Four things keep it honest and cheap:
+ *
+ * - **The trial is the shader's, not the driver's.** Every candidate carries
+ *   its own events and its own phase, so twenty-five materials settle over the
+ *   same few frames instead of queueing behind one another. Nothing is shared
+ *   between them, and a launch is bracketed by its own two events on one
+ *   stream, so what is timed is that kernel and nothing else.
+ * - **Nothing waits.** The events of a finished phase are read when the device
+ *   has got to them — cuEventQuery on the last one, at whatever launch comes
+ *   next — and never waited for. Draining the stream at the two phase
+ *   boundaries instead, which is the obvious way to write this, cost
+ *   gltfscenerendering 0.9 ms of frame across a 600-frame run: the host runs
+ *   well ahead of the device here, so each of the fifty drains gives up a
+ *   whole pipeline's depth. It is the single largest thing measured in this
+ *   pass, and it is entirely the measurement's own cost.
+ * - **The first launches of a phase are thrown away.** The launches after a
+ *   build is switched in pay for cold instruction caches and the driver's
+ *   first-launch work on it, which is not what is being compared.
+ * - **The median is compared, not the mean.** A fragment shader's launches
+ *   vary by two orders of magnitude across draws in this set, and the capped
+ *   phase is a different set of draws from the uncapped one.
+ *
+ * **The trial is a veto, not an election.** The cap is taken unless the capped
+ * build is CP_TUNE_VETO worse, rather than only when it is measurably better,
+ * and the asymmetry is what the measurements are shaped like: across the sweep
+ * a capped shader either swings by 12-40% or sits within a few percent of
+ * where it started, and nothing lands in between. A 40% swing is a fact about
+ * the shader; a 2% one is a fact about the twenty-four draws that happened to
+ * be timed, and reruns of the same shader move it by that much on their own. The trial runs in the samples' warm-up, which renders frame 0 over
+ * and over, so it sees one camera position of a scene the run then orbits
+ * around. Requiring the cap to prove itself there leaves nine of Sponza's
+ * twenty-five materials as built and measures 0.1-0.9 ms/frame worse than
+ * capping them; requiring the veto to prove itself keeps them, and still
+ * throws out the shader that owns bloom's frame, which is 12% worse capped.
+ *
+ * The whole cost is 48 event records per candidate shader, in the first
+ * frames it is used in — inside the warm-up second for the sweep. Nothing is
+ * timed, rebuilt or waited for after that, and a shader the compiler did not
+ * mark is never touched at all.
+ *
+ * CUDAPIPE_TUNE_VETO overrides the threshold, and it is the knob to reach for
+ * if a sample regresses: it trades what the marginal shaders are worth on the
+ * samples that gain against what they cost on the samples that do not.
+ * CUDAPIPE_NO_REGCAP turns the whole thing off.
+ */
+#define CP_TUNE_VETO 1.05   /* how much worse capped has to be to be refused */
+
+static int
+cp_tune_cmp_float(const void *a, const void *b)
+{
+   float x = *(const float *)a, y = *(const float *)b;
+   return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* Median of one phase's samples, in microseconds. */
+static double
+cp_tune_median(struct cp_shader_tune *t, int phase)
+{
+   float v[CP_TUNE_SAMPLES];
+   memcpy(v, t->us[phase], sizeof(v));
+   qsort(v, CP_TUNE_SAMPLES, sizeof(v[0]), cp_tune_cmp_float);
+   return 0.5 * (v[CP_TUNE_SAMPLES / 2] + v[(CP_TUNE_SAMPLES - 1) / 2]);
+}
+
+static void
+cp_tune_release(struct cp_shader_binary *fs)
+{
+   struct cp_shader_tune *t = &fs->tune;
+   if (t->events_made) {
+      for (unsigned i = 0; i < CP_TUNE_SAMPLES; i++) {
+         cuEventDestroy(t->start[i]);
+         cuEventDestroy(t->stop[i]);
+      }
+      t->events_made = false;
+   }
+   fs->tune_done = true;
+}
+
+/* Read a finished phase's events back, if the last of them has completed.
+ * Nothing waits: a phase that is not ready yet is read at the next launch. */
+static bool
+cp_tune_harvest(struct cp_shader_tune *t)
+{
+   if (cuEventQuery(t->stop[CP_TUNE_SAMPLES - 1]) != CUDA_SUCCESS)
+      return false;
+   for (unsigned i = 0; i < CP_TUNE_SAMPLES; i++) {
+      float ms = 0;
+      cuEventElapsedTime(&ms, t->start[i], t->stop[i]);
+      t->us[t->phase][i] = ms * 1000.0f;
+   }
+   return true;
+}
+
+/* Called just before a fragment shader launch. Returns true if this launch is
+ * being timed. cp_tune_after() is called after every launch either way, and
+ * is where a change of build takes effect. */
+static bool
+cp_tune_before(struct cp_context *cp, struct cp_shader_binary *fs)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = getenv("CUDAPIPE_NO_REGCAP") ? 0 : 1;
+   if (!enabled || !fs->tune_cap || fs->tune_done)
+      return false;
+
+   struct cp_shader_tune *t = &fs->tune;
+
+   /* A phase whose events are still in flight. Keep launching what is bound
+    * — a few extra launches of either build cost nothing — and read them when
+    * the device has got to them. */
+   if (t->reading) {
+      if (!cp_tune_harvest(t))
+         return false;
+      t->reading = false;
+
+      if (t->phase == 0) {
+         /* Back to the build the JIT chose, which is already loaded. */
+         t->regs_capped = fs->num_regs;
+         t->swap_pending = true;
+         t->phase = 1;
+         /* Not zero: the swap is already scheduled, and seen == 0 is what
+          * schedules one. Counting from one skips CP_TUNE_SKIP launches of
+          * the build being switched to, exactly as phase 0 did. */
+         t->seen = 1;
+         t->timed = 0;
+         return false;
+      }
+
+      double capped = cp_tune_median(t, 0), as_built = cp_tune_median(t, 1);
+      const char *v = getenv("CUDAPIPE_TUNE_VETO");
+      bool keep = capped < as_built * (v ? atof(v) : CP_TUNE_VETO);
+      if (keep)
+         t->swap_pending = true;   /* back to capped, on the next launch */
+
+      if (getenv("CUDAPIPE_SHADER_STATS"))
+         fprintf(stderr, "cudapipe: shader trial regs %3d -> %3d (cap %d): "
+                 "%.1f us -> %.1f us median of %d, %s\n",
+                 fs->num_regs, t->regs_capped, fs->tune_cap, as_built, capped,
+                 CP_TUNE_SAMPLES, keep ? "CAPPED" : "left as built");
+
+      /* The events go now; a swap still pending is applied by the launch this
+       * call is about to let through, which no longer times anything. */
+      cp_tune_release(fs);
+      return false;
+   }
+
+   if (t->seen++ == 0) {
+      /* The capped build goes first, so that the two phases are the same
+       * shape: each starts with a switch of build and then skips launches.
+       * Swapping here rather than before this launch keeps the sampler
+       * globals with the module they were written to — the swap takes effect
+       * on the next launch, which is one of the skipped ones. */
+      t->swap_pending = true;
+      return false;
+   }
+   if (t->seen <= CP_TUNE_SKIP)
+      return false;
+
+   if (!t->events_made) {
+      for (unsigned i = 0; i < CP_TUNE_SAMPLES; i++) {
+         if (cuEventCreate(&t->start[i], CU_EVENT_DEFAULT) != CUDA_SUCCESS ||
+             cuEventCreate(&t->stop[i], CU_EVENT_DEFAULT) != CUDA_SUCCESS) {
+            fs->tune_done = true;
+            return false;
+         }
+      }
+      t->events_made = true;
+   }
+
+   cuEventRecord(t->start[t->timed], cp->stream);
+   return true;
+}
+
+/* Called after every fragment shader launch: applies a pending change of
+ * build, and closes a timed launch's event pair. */
+static void
+cp_tune_after(struct cp_context *cp, struct cp_shader_binary *fs, bool timed)
+{
+   struct cp_shader_tune *t = &fs->tune;
+
+   if (t->swap_pending) {
+      cp_shader_swap_build(fs);
+      t->swap_pending = false;
+   }
+   if (!timed)
+      return;
+
+   cuEventRecord(t->stop[t->timed], cp->stream);
+   if (++t->timed >= CP_TUNE_SAMPLES)
+      t->reading = true;
+}
+
+/*
  * Launch the compiled fragment shader over a prepared input buffer.
  *
  * The shader reads its arguments through the same pointer-array ABI the
@@ -991,6 +1202,9 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
        * above, which are the ABI rather than the shading. */
       if (ev_before)
          cuEventRecord(ev_before, cp->stream);
+      /* A shader the compiler marked as a register-cap candidate is timed
+       * here, both as built and capped, and the faster build kept. */
+      bool timed = cp_tune_before(cp, fs);
       CUresult fs_err = cuLaunchKernel(fs->kernel, (num_threads + 255) / 256,
                                        1, 1, 256, 1, 1, 0, cp->stream,
                                        fs_params, NULL);
@@ -999,6 +1213,7 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
                  fs_err);
          return false;
       }
+      cp_tune_after(cp, fs, timed);
    }
    return true;
 }

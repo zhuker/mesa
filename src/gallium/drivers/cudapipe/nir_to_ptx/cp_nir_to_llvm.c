@@ -2276,33 +2276,59 @@ capture_io_locations(struct nir_shader *nir, struct cp_shader_binary *bin)
    }
 }
 
-/* Link the sampler's relocatable PTX with the shader's, producing a cubin. */
+/*
+ * The block size every compiled shader is launched with. Both stages use it:
+ * the vertex shader over (vertices + 255) / 256 blocks and the fragment shader
+ * over a fixed worst case, cp_context.c:994 and :3256. It is a constant of the
+ * driver rather than something the JIT can be left to guess at, which is what
+ * makes the occupancy arithmetic below exact rather than a heuristic.
+ */
+#define CP_SHADER_BLOCK_THREADS 256
+
+/*
+ * How many of those blocks the register policy tries to fit on an SM.
+ *
+ * Occupancy at a fixed block size is a step function of the register count —
+ * blocks per SM is floor(registers_per_sm / (threads * regs_per_thread)) — so
+ * the only caps worth applying are the ones that land on a step. Measured on
+ * gltfscenerendering, whose fragment shader is 195 registers and one block,
+ * 300 frames on the sweep's orbit:
+ *
+ *   cap    off     96     112     128     144     160     176
+ *   ms   15.06  13.49   13.54   13.57   15.52   14.63   15.08
+ *
+ * The three caps that reach two blocks are worth 10% and are indistinguishable
+ * from each other; the three that leave it at one are indistinguishable from
+ * no cap at all. So what is being bought is the step, not the register count,
+ * and the cap worth applying is the largest one that reaches the step —
+ * cutting further only spills more for no more warps.
+ */
+#define CP_SHADER_TARGET_BLOCKS 2
+
+/* Load a shader module, optionally capping the register count.
+ *
+ * `sampler_ptx` non-NULL links the sampler's relocatable PTX in first; the
+ * rest load their own PTX directly. Both paths take the same JIT options,
+ * which the direct one did not before — CUDAPIPE_MAX_REGISTERS reached the
+ * linked shaders only, so a vertex shader that samples no texture was never
+ * capped whatever it was set to.
+ */
 static CUresult
-link_shader_module(CUmodule *module, const char *shader_ptx,
-                   const char *sampler_ptx)
+load_shader_module(CUmodule *module, const char *shader_ptx,
+                   const char *sampler_ptx, int max_regs)
 {
-   /*
-    * Cap the register count when asked.
-    *
-    * The JIT optimises for instruction-level parallelism and will spend as
-    * many registers as it likes doing it. On Sponza the fragment shader came
-    * out at 195 per thread, which fits one 256-thread block on an SM and caps
-    * theoretical occupancy at 16.7% — ncu measured 8.8% achieved, with SM
-    * throughput at 11.8% and DRAM at 1.8%, so the kernel was neither compute
-    * nor bandwidth bound but simply had too few warps resident to hide
-    * anything. Fewer registers means more warps and also more spilling, and
-    * which way that lands is a per-shader question, so it is a knob rather
-    * than a constant.
-    */
    CUjit_option jit_opts[1];
    void *jit_vals[1];
    unsigned num_jit = 0;
-   const char *maxreg = getenv("CUDAPIPE_MAX_REGISTERS");
-   if (maxreg && atoi(maxreg) > 0) {
+   if (max_regs > 0) {
       jit_opts[num_jit] = CU_JIT_MAX_REGISTERS;
-      jit_vals[num_jit] = (void *)(uintptr_t)atoi(maxreg);
+      jit_vals[num_jit] = (void *)(uintptr_t)max_regs;
       num_jit++;
    }
+
+   if (!sampler_ptx)
+      return cuModuleLoadDataEx(module, shader_ptx, num_jit, jit_opts,
+                                jit_vals);
 
    CUlinkState link;
    CUresult err = cuLinkCreate(num_jit, jit_opts, jit_vals, &link);
@@ -2324,6 +2350,266 @@ link_shader_module(CUmodule *module, const char *shader_ptx,
 
    cuLinkDestroy(link);
    return err;
+}
+
+/* What one built module costs in resources, and what that buys in warps. */
+struct cp_shader_cost {
+   int regs;         /* registers per thread */
+   int spill;        /* bytes of local memory per thread — 0 is no spilling */
+   int blocks;       /* 256-thread blocks resident per SM, from the driver */
+};
+
+static void
+measure_shader_cost(CUfunction fn, struct cp_shader_cost *cost)
+{
+   cost->regs = cost->spill = cost->blocks = 0;
+   cuFuncGetAttribute(&cost->regs, CU_FUNC_ATTRIBUTE_NUM_REGS, fn);
+   cuFuncGetAttribute(&cost->spill, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fn);
+   /* Ask the driver rather than dividing by hand: it knows the allocation
+    * granularity, the warp and block limits and the shared memory this
+    * function reserves, and none of those are the same on every device. */
+   cuOccupancyMaxActiveBlocksPerMultiprocessor(&cost->blocks, fn,
+                                               CP_SHADER_BLOCK_THREADS, 0);
+}
+
+/* Rebuild an already-loaded shader with a different register cap, in place.
+ *
+ * This is the compile-time shape of the policy — CUDAPIPE_REGCAP_STATIC — and
+ * the reason the PTX and the sampler it was built from are kept on the binary.
+ * The default policy does not use it: it loads both builds and switches
+ * between them, because a rebuild between two draws is a JIT link on a hot
+ * path. The caller must have drained the stream if anything of the module
+ * being replaced may still be in flight.
+ *
+ * Returns false and leaves the shader exactly as it was if anything fails,
+ * including the JIT declining the cap.
+ */
+bool
+cp_shader_set_reg_cap(struct cp_shader_binary *bin, int max_regs)
+{
+   if (!bin || !bin->ptx_text || bin->reg_cap == max_regs)
+      return false;
+
+   CUmodule mod = NULL;
+   CUfunction fn = NULL;
+   if (load_shader_module(&mod, bin->ptx_text, bin->sampler_ptx,
+                          max_regs) != CUDA_SUCCESS)
+      return false;
+   if (cuModuleGetFunction(&fn, mod, "main") != CUDA_SUCCESS) {
+      cuModuleUnload(mod);
+      return false;
+   }
+
+   struct cp_shader_cost cost;
+   measure_shader_cost(fn, &cost);
+
+   cuModuleUnload(bin->module);
+   bin->module = mod;
+   bin->kernel = fn;
+   bin->num_regs = cost.regs;
+   bin->spill_bytes = cost.spill;
+   bin->blocks_per_sm = cost.blocks;
+   bin->reg_cap = max_regs;
+
+   /* The sampler reads its table and its quad-derivative flag through globals
+    * of the module, so both addresses and both cached values belong to the
+    * module that has just been thrown away. */
+   bin->globals_resolved = false;
+   bin->sym_sampler_table = 0;
+   bin->sym_quad_derivs = 0;
+
+   return true;
+}
+
+/*
+ * Load the shader, and work out whether capping its registers is even a
+ * question worth asking about it.
+ *
+ * The JIT optimises for instruction-level parallelism and spends registers
+ * freely doing it. On Sponza the fragment shader comes out at 195 per thread,
+ * which fits one 256-thread block on an SM and caps theoretical occupancy at
+ * 16.7%; ncu measures it there with SM and memory throughput both under 8%,
+ * no spilling at all, and warps stalled on long_scoreboard and wait — global
+ * load latency and fixed-latency dependencies, both of which are hidden by
+ * having more warps and by nothing else. Capping it to 128 buys the second
+ * block and is worth 10% of that sample's frame.
+ *
+ * A fixed cap is still wrong, and the reason is sharper than "the trade is
+ * per-shader". **The register count of every textured fragment shader in this
+ * driver is 195**, whatever the shader does: it is the linked sampler's
+ * allocation, not the shader's, and it comes out identical for Sponza's PBR
+ * material and for bloom's blur. So `CU_FUNC_ATTRIBUTE_NUM_REGS` — the signal
+ * the performance plan proposed deciding on — carries no per-shader
+ * information here at all. Capping on it alone is a fixed cap wearing a
+ * measurement's clothes, and it costs bloom 3.2% while paying 9% on Sponza.
+ *
+ * What it does tell you is which shaders the question is *about*: this
+ * function loads the shader as the JIT built it, and marks it for the runtime
+ * trial in cp_context.c if, and only if, its own register count is what is
+ * holding its occupancy below the target. Everything else is loaded once,
+ * never rebuilt, and never timed.
+ *
+ * Only fragment shaders are candidates. The vertex stage runs over the vertex
+ * count, which is one or two blocks on a 170-SM card for most draws in this
+ * set, so its occupancy is bounded by the grid long before it is bounded by
+ * registers — and measured, none of the sweep's vertex shaders reaches the
+ * threshold anyway (22-90 registers, two blocks or better).
+ *
+ * CUDAPIPE_MAX_REGISTERS overrides everything with a fixed cap on every
+ * shader, which is what it always did and is how a regression gets bisected.
+ * CUDAPIPE_REGCAP_STATIC=1 applies the cap at compile time without the trial,
+ * which is the shape the plan proposed and is kept so it can be measured.
+ * CUDAPIPE_NO_REGCAP disables all of it.
+ */
+static CUresult
+load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
+                         const char *sampler_ptx, bool is_fragment,
+                         const char *stage)
+{
+   static int forced = -1, disabled, use_static;
+   if (forced < 0) {
+      const char *env = getenv("CUDAPIPE_MAX_REGISTERS");
+      forced = env && atoi(env) > 0 ? atoi(env) : 0;
+      disabled = getenv("CUDAPIPE_NO_REGCAP") ? 1 : 0;
+      use_static = getenv("CUDAPIPE_REGCAP_STATIC") ? 1 : 0;
+   }
+   bool stats = getenv("CUDAPIPE_SHADER_STATS") != NULL;
+
+   bin->sampler_ptx = sampler_ptx;
+
+   CUresult err = load_shader_module(&bin->module, ptx, sampler_ptx, forced);
+   if (err != CUDA_SUCCESS)
+      return err;
+   err = cuModuleGetFunction(&bin->kernel, bin->module, "main");
+   if (err != CUDA_SUCCESS)
+      return err;
+
+   struct cp_shader_cost cost;
+   measure_shader_cost(bin->kernel, &cost);
+   bin->num_regs = cost.regs;
+   bin->spill_bytes = cost.spill;
+   bin->blocks_per_sm = cost.blocks;
+   bin->reg_cap = forced;
+
+   const char *why = NULL;
+   if (forced)
+      why = "capped by CUDAPIPE_MAX_REGISTERS";
+   else if (disabled)
+      why = "policy off";
+   else if (!is_fragment)
+      why = "kept (not a fragment shader)";
+   else if (cost.blocks < 1 || cost.blocks >= CP_SHADER_TARGET_BLOCKS)
+      why = "kept (already at the target)";
+
+   int cap = 0;
+   if (!why) {
+      /* The largest cap that fits the target, straight out of the device: on
+       * a 64K-register SM at 256 threads and two blocks that is 128. */
+      CUdevice dev;
+      int regs_per_sm = 0;
+      if (cuCtxGetDevice(&dev) == CUDA_SUCCESS)
+         cuDeviceGetAttribute(&regs_per_sm,
+                              CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR,
+                              dev);
+      cap = regs_per_sm / (CP_SHADER_TARGET_BLOCKS * CP_SHADER_BLOCK_THREADS);
+      if (cap <= 0)
+         why = "kept (device has no register count)";
+      else if (cap >= cost.regs)
+         /* Shared memory or a block limit is holding it down, and no register
+          * cap can move either. */
+         why = "kept (not register bound)";
+   }
+
+   if (why) {
+      if (stats)
+         fprintf(stderr, "cudapipe: shader %-21s regs %3d spill %4d "
+                 "blocks/sm %d  %s\n", stage, cost.regs, cost.spill,
+                 cost.blocks, why);
+      return CUDA_SUCCESS;
+   }
+
+   if (use_static) {
+      bool ok = cp_shader_set_reg_cap(bin, cap);
+      if (stats)
+         fprintf(stderr, "cudapipe: shader %-21s regs %3d spill %4d "
+                 "blocks/sm %d  static cap %d -> regs %3d spill %4d "
+                 "blocks/sm %d\n", stage, cost.regs, cost.spill, cost.blocks,
+                 cap, bin->num_regs, bin->spill_bytes, bin->blocks_per_sm);
+      (void)ok;
+      return CUDA_SUCCESS;
+   }
+
+   /*
+    * A candidate: build the capped variant now, beside the one the JIT chose,
+    * and let the driver time both against real draws before picking. Both are
+    * built here, where pipeline creation already expects to pay for a JIT
+    * link, rather than one of them in the middle of the run where it would be
+    * a JIT link and a stream drain between two draws.
+    */
+   CUmodule alt = NULL;
+   CUfunction alt_fn = NULL;
+   struct cp_shader_cost alt_cost = {0};
+   if (load_shader_module(&alt, ptx, sampler_ptx, cap) == CUDA_SUCCESS &&
+       cuModuleGetFunction(&alt_fn, alt, "main") == CUDA_SUCCESS) {
+      measure_shader_cost(alt_fn, &alt_cost);
+   } else if (alt) {
+      cuModuleUnload(alt);
+      alt = NULL;
+   }
+
+   /* Only worth trying if the JIT actually met the cap and it bought a block.
+    * Otherwise the shader is left exactly as it was and never timed. */
+   if (!alt_fn || alt_cost.blocks <= cost.blocks) {
+      if (alt)
+         cuModuleUnload(alt);
+      if (stats)
+         fprintf(stderr, "cudapipe: shader %-21s regs %3d spill %4d "
+                 "blocks/sm %d  kept (cap %d buys nothing)\n", stage,
+                 cost.regs, cost.spill, cost.blocks, cap);
+      return CUDA_SUCCESS;
+   }
+
+   bin->tune_cap = cap;
+   bin->alt_module = alt;
+   bin->alt_kernel = alt_fn;
+   bin->alt_regs = alt_cost.regs;
+   bin->alt_spill_bytes = alt_cost.spill;
+   bin->alt_blocks_per_sm = alt_cost.blocks;
+   bin->alt_reg_cap = cap;
+   bin->alt_last_sampler_table = ~(uint64_t)0;
+   bin->alt_last_quad_derivs = -1;
+
+   if (stats)
+      fprintf(stderr, "cudapipe: shader %-21s regs %3d spill %4d blocks/sm %d "
+              "-> cap %d: regs %3d spill %4d blocks/sm %d  on trial\n",
+              stage, cost.regs, cost.spill, cost.blocks, cap, alt_cost.regs,
+              alt_cost.spill, alt_cost.blocks);
+
+   return CUDA_SUCCESS;
+}
+
+void
+cp_shader_swap_build(struct cp_shader_binary *bin)
+{
+   if (!bin->alt_module)
+      return;
+
+#define CP_SWAP(type, a, b) do { type tmp = (a); (a) = (b); (b) = tmp; } while (0)
+   CP_SWAP(CUmodule, bin->module, bin->alt_module);
+   CP_SWAP(CUfunction, bin->kernel, bin->alt_kernel);
+   CP_SWAP(int, bin->num_regs, bin->alt_regs);
+   CP_SWAP(int, bin->spill_bytes, bin->alt_spill_bytes);
+   CP_SWAP(int, bin->blocks_per_sm, bin->alt_blocks_per_sm);
+   CP_SWAP(int, bin->reg_cap, bin->alt_reg_cap);
+   /* The sampler's table and quad-derivative flag are globals of a module, so
+    * the resolved addresses and the last values written to them belong to the
+    * build that was launched, not to the shader. */
+   CP_SWAP(bool, bin->globals_resolved, bin->alt_globals_resolved);
+   CP_SWAP(CUdeviceptr, bin->sym_sampler_table, bin->alt_sym_sampler_table);
+   CP_SWAP(CUdeviceptr, bin->sym_quad_derivs, bin->alt_sym_quad_derivs);
+   CP_SWAP(uint64_t, bin->last_sampler_table, bin->alt_last_sampler_table);
+   CP_SWAP(int, bin->last_quad_derivs, bin->alt_last_quad_derivs);
+#undef CP_SWAP
 }
 
 struct cp_shader_binary *
@@ -2363,6 +2649,46 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    };
    LLVMValueRef md_node = LLVMMDNodeInContext(ctx.llvm_ctx, md_vals, 3);
    LLVMAddNamedMetadataOperand(ctx.module, "nvvm.annotations", md_node);
+
+   /*
+    * The other shape the performance plan named — emit `__launch_bounds__`
+    * and let ptxas work the register count out from the block size — behind
+    * an environment variable because measuring it is the only way to see that
+    * it does not work here. `CUDAPIPE_LAUNCH_BOUNDS=N` emits `.maxntid 256`
+    * and `.minnctapersm N`. Measured on this driver:
+    *
+    * - `.maxntid 256` alone is not binding. A 256-thread block only requires
+    *   256 registers a thread, the shaders are under that, and nothing
+    *   changes. The occupancy-forcing half is `.minnctapersm`, which is the
+    *   same guess as a register cap in different units.
+    * - With `.minnctapersm 2` **every shader that links the sampler fails to
+    *   load**: cuModuleLoadData returns 300, `device kernel image is invalid`.
+    *   Those are exactly the shaders the item is about. `.minnctapersm 1`
+    *   loads and does nothing.
+    * - On the shaders that do not link it, the annotation *raises* the
+    *   register count rather than lowering it — 56 to 72 on texture's vertex
+    *   shader, 66 to 95 on bloom's — because it is a permission to spend up
+    *   to the bound and ptxas takes it.
+    *
+    * So it is left off, and the driver caps registers directly instead.
+    */
+   const char *lb = getenv("CUDAPIPE_LAUNCH_BOUNDS");
+   if (lb && atoi(lb) > 0) {
+      LLVMValueRef ntid[] = {
+         ctx.function,
+         LLVMMDStringInContext(ctx.llvm_ctx, "maxntidx", 8),
+         LLVMConstInt(i32, CP_SHADER_BLOCK_THREADS, false),
+      };
+      LLVMAddNamedMetadataOperand(ctx.module, "nvvm.annotations",
+                                  LLVMMDNodeInContext(ctx.llvm_ctx, ntid, 3));
+      LLVMValueRef ctasm[] = {
+         ctx.function,
+         LLVMMDStringInContext(ctx.llvm_ctx, "minctasm", 8),
+         LLVMConstInt(i32, atoi(lb), false),
+      };
+      LLVMAddNamedMetadataOperand(ctx.module, "nvvm.annotations",
+                                  LLVMMDNodeInContext(ctx.llvm_ctx, ctasm, 3));
+   }
 
    LLVMValueRef arg0 = LLVMGetParam(ctx.function, 0);
    ctx.kernel_args = &arg0;
@@ -2449,11 +2775,11 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
 
    /* Shaders that sample textures, or that call one of the module's device
     * helpers, need it linked in; the rest load their PTX directly. */
-   CUresult err;
-   if ((ctx.uses_tex || ctx.needs_link) && sampler_ptx)
-      err = link_shader_module(&bin->module, ptx, sampler_ptx);
-   else
-      err = cuModuleLoadData(&bin->module, ptx);
+   bool needs_sampler = (ctx.uses_tex || ctx.needs_link) && sampler_ptx;
+   CUresult err = load_shader_module_tuned(bin, ptx,
+                                           needs_sampler ? sampler_ptx : NULL,
+                                           nir->info.stage == MESA_SHADER_FRAGMENT,
+                                           mesa_shader_stage_name(nir->info.stage));
 
    if (err != CUDA_SUCCESS) {
       const char *err_str = NULL;
@@ -2461,8 +2787,6 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
       fprintf(stderr, "cudapipe: loading shader module failed (%d: %s)\n",
               err, err_str ? err_str : "?");
       /* Keep the PTX for debugging even if load fails */
-   } else {
-      cuModuleGetFunction(&bin->kernel, bin->module, "main");
    }
 
    return bin;
@@ -2475,6 +2799,8 @@ cp_shader_binary_destroy(struct cp_shader_binary *bin)
       return;
    if (bin->module)
       cuModuleUnload(bin->module);
+   if (bin->alt_module)
+      cuModuleUnload(bin->alt_module);
    free(bin->ptx_text);
    FREE(bin);
 }

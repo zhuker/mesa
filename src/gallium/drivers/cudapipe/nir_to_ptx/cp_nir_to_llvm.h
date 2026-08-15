@@ -9,6 +9,30 @@ struct nir_shader;
 
 #define CP_MAX_IO_SLOTS 32
 
+/* Launches timed per phase of a shader's register-cap trial, and how many are
+ * thrown away at the start of one. See cp_tune_before() in cp_context.c. */
+#define CP_TUNE_SAMPLES 24
+#define CP_TUNE_SKIP    16
+
+/*
+ * A fragment shader's register-cap trial: the driver runs the shader as the
+ * JIT built it and then capped, times both on the device, and keeps the
+ * faster. Lives on the shader because trials overlap — one per shader, all
+ * running against the same frames — and because the decision is the shader's.
+ */
+struct cp_shader_tune {
+   int phase;              /* 0 capped, 1 as the JIT built it */
+   unsigned seen;          /* launches this phase */
+   unsigned timed;         /* of those, ones with events on them */
+   int regs_capped;
+   bool swap_pending;      /* switch builds after the launch in flight */
+   bool reading;           /* a phase's events are recorded, not yet read */
+   bool events_made;
+   CUevent start[CP_TUNE_SAMPLES];
+   CUevent stop[CP_TUNE_SAMPLES];
+   float us[2][CP_TUNE_SAMPLES];
+};
+
 struct cp_shader_binary {
    char *ptx_text;
    size_t ptx_size;
@@ -19,6 +43,60 @@ struct cp_shader_binary {
    unsigned shared_size;
    unsigned nir_num_outputs;
    unsigned nir_num_inputs;
+
+   /*
+    * What the built kernel cost in registers, what it spills, and how many
+    * 256-thread blocks of it fit on an SM — read back from the driver after
+    * the module is loaded, which is the only place the number exists: the JIT
+    * decides it and nothing upstream of it can be asked. `reg_cap` is the cap
+    * that was applied, or 0 for a shader left as the JIT built it.
+    */
+   int num_regs;
+   int spill_bytes;
+   int blocks_per_sm;
+   int reg_cap;
+
+   /*
+    * The register cap this shader is a candidate for, or 0 for one that is
+    * not. Non-zero means the shader is a fragment shader whose own register
+    * count is holding its occupancy below the target, so capping it *might*
+    * pay — which of the two builds is actually faster is settled by timing
+    * both on this workload, in cp_context.c. `tune_done` is set once that has
+    * happened, so it happens once per shader.
+    */
+   int tune_cap;
+   bool tune_done;
+   struct cp_shader_tune tune;
+
+   /*
+    * The other build of a candidate shader: the same PTX with the cap on, or
+    * off, whichever the fields above are not currently using. Both are built
+    * when the pipeline is created and both stay loaded, and switching between
+    * them is a pointer swap.
+    *
+    * Both are built up front so that the choice, when the driver makes it,
+    * costs nothing on a hot path: building the second one during the run
+    * would put a JIT link and the drain it needs between two draws, and the
+    * cost of that would land on whichever build happened to be rebuilt —
+    * which is the one thing a comparison between them cannot afford.
+    */
+   CUmodule alt_module;
+   CUfunction alt_kernel;
+   int alt_regs;
+   int alt_spill_bytes;
+   int alt_blocks_per_sm;
+   int alt_reg_cap;
+   bool alt_globals_resolved;
+   CUdeviceptr alt_sym_sampler_table;
+   CUdeviceptr alt_sym_quad_derivs;
+   uint64_t alt_last_sampler_table;
+   int alt_last_quad_derivs;
+
+   /* Borrowed from the screen, which owns it for the life of the driver: the
+    * sampler PTX this shader was linked against, kept so the shader can be
+    * rebuilt with a different cap after the fact. NULL for a shader that
+    * links nothing. */
+   const char *sampler_ptx;
 
    /* Whether the shader reads gl_VertexIndex. Only then does a non-indexed
     * draw have to materialise the vertex id array the shader reads from. */
@@ -86,5 +164,15 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
 
 void
 cp_shader_binary_destroy(struct cp_shader_binary *bin);
+
+/* Rebuild a loaded shader with a register cap (0 for none), in place. The
+ * caller must have drained the stream first. False leaves it untouched. */
+bool
+cp_shader_set_reg_cap(struct cp_shader_binary *bin, int max_regs);
+
+/* Swap the shader's two builds over, so the one that was inactive is the one
+ * launched. Costs nothing on the device: both are already loaded. */
+void
+cp_shader_swap_build(struct cp_shader_binary *bin);
 
 #endif
