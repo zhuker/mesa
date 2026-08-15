@@ -1255,13 +1255,44 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       LLVMBuildCall2(ctx->builder, fn_type, fn, NULL, 0, "");
       break;
    }
-   default:
-      /* Unhandled intrinsic. The undef below propagates through everything it
-       * feeds, so a missing intrinsic usually shows up as a shader that
-       * silently computes nothing — say so when debugging. */
-      if (getenv("CUDAPIPE_DEBUG_SHADER"))
-         fprintf(stderr, "cudapipe: unhandled intrinsic '%s' -> undef\n",
-                 nir_intrinsic_infos[instr->intrinsic].name);
+   default: {
+      /*
+       * Unhandled intrinsic. The undef below propagates through everything it
+       * feeds, so a missing intrinsic shows up as a shader that silently
+       * computes nothing — and this used to say so only under
+       * CUDAPIPE_DEBUG_SHADER, which nobody sets until they already suspect
+       * the shader.
+       *
+       * That cost real time. load_front_face was missing, so gl_FrontFacing
+       * was undef, so the tangent frame was flipped by an undefined sign, so
+       * every surface in a captured application lost its direct lighting. The
+       * frames looked plausible — dim and slightly green — and the driver knew
+       * the whole time. Finding it took bisecting a frame to a single draw and
+       * dumping every descriptor of it from two drivers.
+       *
+       * So say it once per intrinsic, always. This is compile time, not draw
+       * time: a handful of lines for a shader that will render wrong, against
+       * however long it takes to work that out from the picture.
+       */
+      static const char *said[32];
+      static unsigned num_said;
+      const char *name = nir_intrinsic_infos[instr->intrinsic].name;
+      bool seen = false;
+
+      for (unsigned i = 0; i < num_said; i++)
+         if (said[i] == name) {
+            seen = true;
+            break;
+         }
+
+      if (!seen) {
+         if (num_said < ARRAY_SIZE(said))
+            said[num_said++] = name;
+         fprintf(stderr, "cudapipe: intrinsic '%s' is not implemented — the "
+                 "shader reading it computes on undef and will render "
+                 "wrong.\n", name);
+      }
+
       if (nir_intrinsic_infos[instr->intrinsic].has_dest) {
          unsigned num_comp = instr->def.num_components;
          unsigned bit_size = instr->def.bit_size;
@@ -1269,6 +1300,7 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
                      LLVMGetUndef(get_llvm_type(ctx, bit_size, num_comp)));
       }
       break;
+   }
    }
 }
 

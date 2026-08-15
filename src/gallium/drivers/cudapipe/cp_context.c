@@ -1533,7 +1533,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       void *p[] = { &fs_out, &fs_out_stride, &dbg_slot, &counter, &num_pixels,
                     &cp_abuf_dbg.capacity, &cp_abuf_dbg.colors,
                     &cp_abuf_dbg.writes, &cp_abuf_dbg.counters };
-      cuLaunchKernel(screen->kernels.abuf_scatter_colors,
+      CP_LAUNCH(screen->kernels.abuf_scatter_colors,
                      (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
                      0, cp->stream, p, NULL);
    }
@@ -1572,7 +1572,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 
    void *wb_params[] = { &wb };
    cp_nvtx_push("writeback");
-   cuLaunchKernel(screen->kernels.fs_writeback,
+   CP_LAUNCH(screen->kernels.fs_writeback,
                   (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
                   0, cp->stream, wb_params, NULL);
    cp_nvtx_pop();   /* writeback */
@@ -2488,7 +2488,7 @@ cp_abuf_scan_n(struct cp_context *cp, struct cp_screen *screen,
    };
    for (int i = 0; i < 3; i++) {
       void *p[] = { &lvl[i].in, &lvl[i].out, &lvl[i].sums, &lvl[i].n };
-      cuLaunchKernel(screen->kernels.abuf_scan_block, lvl[i].grid, 1, 1,
+      CP_LAUNCH(screen->kernels.abuf_scan_block, lvl[i].grid, 1, 1,
                      CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, p, NULL);
    }
    /* Add each level's scanned bases back down. */
@@ -2498,7 +2498,7 @@ cp_abuf_scan_n(struct cp_context *cp, struct cp_screen *screen,
       unsigned cnt = i ? nb1 : n;
       unsigned grid = i ? nb2 : nb1;
       void *p[] = { &data, &sums, &cnt };
-      cuLaunchKernel(screen->kernels.abuf_scan_add, grid, 1, 1,
+      CP_LAUNCH(screen->kernels.abuf_scan_add, grid, 1, 1,
                      CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, p, NULL);
    }
 }
@@ -2992,7 +2992,7 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
       void *p[] = { &fs_out, &fs_out_stride, &dbg_slot, &counter, &num_slots,
                     &ab->capacity, &ab->colors_abuf, &ab->writes_abuf,
                     &ab->dbg };
-      cuLaunchKernel(screen->kernels.abuf_scatter_colors,
+      CP_LAUNCH(screen->kernels.abuf_scatter_colors,
                      (num_slots + 255) / 256, 1, 1, 256, 1, 1,
                      0, cp->stream, p, NULL);
    }
@@ -3690,7 +3690,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
             if (vs_input_buf)
                cuMemsetD8Async(vs_input_buf, 0, (size_t)total_verts * vs_in_stride, cp->stream);
             void *vf_params[] = { &vf_args };
-            cuLaunchKernel(screen->kernels.vertex_fetch,
+            CP_LAUNCH(screen->kernels.vertex_fetch,
                (total_verts + 255) / 256, 1, 1, 256, 1, 1,
                0, cp->stream, vf_params, NULL);
          }
@@ -3853,6 +3853,25 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                CUdeviceptr clipped = cp_scratch_alloc_device(
                   cp, (size_t)max_clipped * 3 * out_stride);
                CUdeviceptr clip_count = cp_scratch_alloc_device(cp, 4);
+
+               /*
+                * Falling through here does not draw nothing, it draws wrong:
+                * unclipped geometry crossing a depth plane divides to
+                * coordinates far off screen, and if the pass writes depth
+                * those triangles then occlude what is behind them. The
+                * allocator says why it failed; this says what the failure
+                * costs, because a silent skip looks exactly like a rasterizer
+                * bug from the outside.
+                */
+               if (!clipped || !clip_count) {
+                  static bool said;
+                  if (!said) {
+                     said = true;
+                     fprintf(stderr, "cudapipe: no scratch for clipping %u "
+                             "triangles — this draw is rasterized unclipped "
+                             "and may be visibly wrong.\n", num_triangles);
+                  }
+               }
 
                if (clipped && clip_count) {
                   /*
@@ -4192,13 +4211,13 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       /* The _abuf specialisations: same rasterizer, compiled with the count
        * and fill branch live. Every other launch in this file uses the plain
        * ones, which have no A-buffer code in them at all. */
-      cuLaunchKernel(screen->kernels.rasterize_stage1_abuf,
+      CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
                      (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
                      0, cp->stream, ap, NULL);
-      cuLaunchKernel(screen->kernels.rasterize_stage2_abuf,
+      CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
                      CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                      256, 1, 1, 0, cp->stream, ap, NULL);
-      cuLaunchKernel(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
+      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
                      0, cp->stream, ap, NULL);
       cp_abuf_mark(ab->ev[1], cp->stream);
 
@@ -4255,7 +4274,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          unsigned nn = (unsigned)n;
          void *p[] = { &ab->counts, &ab->offsets, &ab->sum3, &nn,
                        &ab->capacity, &ab->overflow };
-         cuLaunchKernel(screen->kernels.abuf_clamp_runs, 1024, 1, 1, 256, 1, 1,
+         CP_LAUNCH(screen->kernels.abuf_clamp_runs, 1024, 1, 1, 256, 1, 1,
                         0, cp->stream, p, NULL);
       } else {
          cuStreamSynchronize(cp->stream);
@@ -4328,13 +4347,13 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       rast_queues.mode = CP_QUEUE_FILL;
       cp_abuf_mark(ab->ev[3], cp->stream);
       void *ap[] = { &aa, &rast_queues };
-      cuLaunchKernel(screen->kernels.rasterize_stage1_abuf,
+      CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
                      (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
                      0, cp->stream, ap, NULL);
-      cuLaunchKernel(screen->kernels.rasterize_stage2_abuf,
+      CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
                      CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                      256, 1, 1, 0, cp->stream, ap, NULL);
-      cuLaunchKernel(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
+      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
                      0, cp->stream, ap, NULL);
       cp_abuf_mark(ab->ev[4], cp->stream);
 
@@ -4344,11 +4363,11 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          unsigned nn = (unsigned)n, min2 = 2;
          cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
          void *wp[] = { &ab->counts, &nn, &min2, &ab->list, &ab->list_count };
-         cuLaunchKernel(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
+         CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
                         256, 1, 1, 0, cp->stream, wp, NULL);
          void *sp[] = { &ab->frags, &ab->offsets, &ab->counts, &ab->list,
                         &ab->list_count, &ab->long_runs };
-         cuLaunchKernel(screen->kernels.abuf_sort, 4096, 1, 1, 256, 1, 1,
+         CP_LAUNCH(screen->kernels.abuf_sort, 4096, 1, 1, 256, 1, 1,
                         0, cp->stream, sp, NULL);
       }
       cp_abuf_mark(ab->ev[5], cp->stream);
@@ -4360,7 +4379,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          unsigned nn = (unsigned)n, min1 = 1;
          cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
          void *wp[] = { &ab->counts, &nn, &min1, &ab->clist, &ab->clist_count };
-         cuLaunchKernel(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
+         CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
                         256, 1, 1, 0, cp->stream, wp, NULL);
       }
 
@@ -4378,7 +4397,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       {
          void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_list,
                        &ab->blk_list_count };
-         cuLaunchKernel(screen->kernels.abuf_block_worklist,
+         CP_LAUNCH(screen->kernels.abuf_block_worklist,
                         (nblocks + 255) / 256, 1, 1, 256, 1, 1,
                         0, cp->stream, p, NULL);
       }
@@ -4396,7 +4415,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          /* 32 threads a block, not 256: there are only ~8,100 covered blocks,
           * and a wide thread block packs them into a few dozen CUDA blocks
           * that occupy a fraction of the SMs. */
-         cuLaunchKernel(screen->kernels.abuf_quad_count, 1024, 1, 1, 32, 1, 1,
+         CP_LAUNCH(screen->kernels.abuf_quad_count, 1024, 1, 1, 32, 1, 1,
                         0, cp->stream, p, NULL);
       }
       cp_abuf_mark(ab->ev[9], cp->stream);
@@ -4411,7 +4430,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
           * length of that run is now only on the device. */
          if (ab->shade_slot && screen->kernels.abuf_clear_slots) {
             void *p[] = { &ab->shade_slot, &ab->sum3, &ab->capacity };
-            cuLaunchKernel(screen->kernels.abuf_clear_slots, 1024, 1, 1,
+            CP_LAUNCH(screen->kernels.abuf_clear_slots, 1024, 1, 1,
                            256, 1, 1, 0, cp->stream, p, NULL);
          } else if (ab->shade_slot) {
             /* Without it, the whole array: clearing more than the draw uses is
@@ -4426,7 +4445,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                        &ab->quad_prim, &ab->quad_mask, &ab->peel_mask,
                        &ab->quad_block, &ab->shade_slot, &ab->quad_capacity,
                        &ab->quad_overflow };
-         cuLaunchKernel(screen->kernels.abuf_quad_fill, 1024, 1, 1, 32, 1, 1,
+         CP_LAUNCH(screen->kernels.abuf_quad_fill, 1024, 1, 1, 32, 1, 1,
                         0, cp->stream, p, NULL);
       }
       cp_abuf_mark(ab->ev[10], cp->stream);
@@ -4576,13 +4595,13 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
 
       /* Stage 2: warp-cooperative, grid-strided over the nontrivial queue */
       void *s2_params[] = { &rast_args, &rast_queues };
-      cuLaunchKernel(screen->kernels.rasterize_stage2,
+      CP_LAUNCH(screen->kernels.rasterize_stage2,
          s2_blocks, 1, 1, 256, 1, 1,
          0, cp->stream, s2_params, NULL);
 
       /* Stage 3: block per tile, grid-strided over the huge-tile queue */
       void *s3_params[] = { &rast_args, &rast_queues };
-      cuLaunchKernel(screen->kernels.rasterize_stage3,
+      CP_LAUNCH(screen->kernels.rasterize_stage3,
          s3_blocks, 1, 1, 64, 1, 1,
          0, cp->stream, s3_params, NULL);
 
@@ -4619,14 +4638,14 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          unsigned layers = CP_ABUF_LOG_LAYERS;
          if (pass < layers) {
             void *p[] = { &visbuf, &ab->log, &layers, &pass, &nn };
-            cuLaunchKernel(screen->kernels.abuf_peel_log, (nn + 255) / 256,
+            CP_LAUNCH(screen->kernels.abuf_peel_log, (nn + 255) / 256,
                            1, 1, 256, 1, 1, 0, cp->stream, p, NULL);
          }
          unsigned dlayers = CP_BLEND_LAYERS;
          if (abuf_deep_n && pass < dlayers) {
             void *p[] = { &visbuf, &ab->deep_list, &ab->deep_log, &dlayers,
                           &pass, &abuf_deep_n };
-            cuLaunchKernel(screen->kernels.abuf_peel_log_list,
+            CP_LAUNCH(screen->kernels.abuf_peel_log_list,
                            (abuf_deep_n + 255) / 256, 1, 1, 256, 1, 1,
                            0, cp->stream, p, NULL);
          }
@@ -4648,7 +4667,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
           * nothing left to composite — which is the common case at pass 2,
           * since most blended draws do not overlap themselves. */
          void *pa_params[] = { &visbuf, &cp->peel_next, &w, &h };
-         cuLaunchKernel(screen->kernels.peel_advance,
+         CP_LAUNCH(screen->kernels.peel_advance,
                         (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
                         0, cp->stream, pa_params, NULL);
 

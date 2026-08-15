@@ -798,8 +798,19 @@ cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
    CUdeviceptr dev = 0;
 
    cuCtxSetCurrent(cp->cuda_ctx);
-   if (cuMemAllocManaged(&dev, size, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+
+   /*
+    * Nobody up the stack checks this. lavapipe takes the result straight to
+    * memset() in lvp_descriptor_set_create(), so a failure here arrives as a
+    * segfault in libc with the driver nowhere in the backtrace — which is
+    * exactly how a sticky CUDA_ERROR_ILLEGAL_ADDRESS from some earlier kernel
+    * presented, three frames removed from the kernel that caused it.
+    */
+   CUresult err = cuMemAllocManaged(&dev, size, CU_MEM_ATTACH_GLOBAL);
+   if (err != CUDA_SUCCESS) {
+      CP_CU_WARN(err, "cuMemAllocManaged for VkDeviceMemory");
       return NULL;
+   }
 
    cp_zero_managed(dev, size);
    return (struct pipe_memory_allocation *)(uintptr_t)dev;
