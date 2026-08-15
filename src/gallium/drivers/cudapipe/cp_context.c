@@ -3582,8 +3582,9 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
              */
             if (screen->kernels.clip_triangles &&
                 num_vs_outputs <= CP_MAX_CLIP_SLOTS) {
-               /* Two planes turn one triangle into at most three. */
-               unsigned max_clipped = num_triangles * 3;
+               /* Three planes turn one triangle into a hexagon at worst, and
+                * the fan over that is four triangles. */
+               unsigned max_clipped = num_triangles * 4;
                CUdeviceptr clipped = cp_scratch_alloc_device(
                   cp, (size_t)max_clipped * 3 * out_stride);
                CUdeviceptr clip_count = cp_scratch_alloc_device(cp, 4);

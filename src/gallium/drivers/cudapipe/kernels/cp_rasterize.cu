@@ -126,30 +126,40 @@ struct tri_setup {
 };
 
 /*
- * Clipping against the two planes that make the perspective divide meaningful,
+ * Clipping against the planes that make the perspective divide meaningful,
  * one thread per input triangle.
  *
- * Vulkan's view volume is 0 <= z <= w. Two of its planes matter here:
+ * Vulkan's view volume is 0 <= z <= w. Three planes matter here:
  *
- *   z >= 0      the near plane. A ground plane running to the horizon crosses
- *               it, and the part behind the eye must be cut or it reappears
- *               mirrored in front.
+ *   z >= 0      one of the depth planes. Under the conventional projection it
+ *               is the near plane, and a ground plane running to the horizon
+ *               crosses it.
+ *   z <= w      the other one. Under a reversed-Z projection — depth cleared
+ *               to 0 and tested GREATER_OR_EQUAL, which is what the real
+ *               application uses — this is the near plane instead, and the two
+ *               swap roles. Whichever it is, the part outside must be cut or
+ *               it reappears mirrored in front: a vertex closer than the near
+ *               plane still has w > 0 and z > 0, so neither of the other two
+ *               tests rejects it, and it divides to a coordinate millions of
+ *               pixels off screen.
  *   w >  0      not a clip plane of its own but implied by z <= w. A vertex
  *               with w <= 0 divides to a garbage position however small its z,
  *               so it has to go before setup_triangle() touches it.
  *
- * Clipping on either plane alone is not enough: samples exist that only the
- * first fixes and samples that only the second fixes.
+ * No one plane is enough: samples exist that only one of them fixes.
  *
  * Interpolation happens in clip space, before the divide, which is what makes
  * the split exact for both position and varyings.
  */
-#define CP_CLIP_MAX_VERTS 5   /* a triangle cut by two planes */
+#define CP_CLIP_NUM_PLANES 3
+#define CP_CLIP_MAX_VERTS 6   /* a triangle gains at most one vertex per plane */
 
 static __device__ __forceinline__ float
 clip_dist(const float4 *v, int plane)
 {
-   return plane == 0 ? v[0].z : v[0].w - 1e-6f;
+   return plane == 0 ? v[0].z
+        : plane == 1 ? v[0].w - 1e-6f
+                     : v[0].w - v[0].z;
 }
 
 static __device__ __forceinline__ void
@@ -227,7 +237,10 @@ cp_clip_triangles(struct cp_clip_args args)
    int inside = 0;
    for (int i = 0; i < 3; i++) {
       const float4 *vi = v + (size_t)i * slots;
-      if (clip_dist(vi, 0) >= 0.0f && clip_dist(vi, 1) >= 0.0f)
+      bool in = true;
+      for (int p = 0; p < CP_CLIP_NUM_PLANES; p++)
+         in = in && clip_dist(vi, p) >= 0.0f;
+      if (in)
          inside++;
    }
 
@@ -241,21 +254,25 @@ cp_clip_triangles(struct cp_clip_args args)
    float4 poly_a[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
    float4 poly_b[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
 
-   int n = clip_poly(poly_a, v, 3, slots, 0);
-   if (n < 3)
-      return;
-   n = clip_poly(poly_b, poly_a, n, slots, 1);
-   if (n < 3)
-      return;
+   /* Ping-pong between the two buffers, one plane at a time. */
+   const float4 *src = v;
+   int n = 3;
+   for (int p = 0; p < CP_CLIP_NUM_PLANES; p++) {
+      float4 *dst = (p & 1) ? poly_b : poly_a;
+      n = clip_poly(dst, src, n, slots, p);
+      if (n < 3)
+         return;
+      src = dst;
+   }
 
    /* Fan-triangulate the clipped polygon, which keeps the original winding. */
    for (int i = 1; i + 1 < n; i++) {
       float4 *dst = clip_emit(&args, out, slots);
       if (!dst)
          return;
-      clip_copy(dst, poly_b, slots);
-      clip_copy(dst + slots, poly_b + (size_t)i * slots, slots);
-      clip_copy(dst + 2 * slots, poly_b + (size_t)(i + 1) * slots, slots);
+      clip_copy(dst, src, slots);
+      clip_copy(dst + slots, src + (size_t)i * slots, slots);
+      clip_copy(dst + 2 * slots, src + (size_t)(i + 1) * slots, slots);
    }
 }
 

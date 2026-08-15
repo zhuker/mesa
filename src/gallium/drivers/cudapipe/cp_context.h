@@ -30,8 +30,8 @@ struct cp_shader_binary;
  * the batch instead of once per draw.
  *
  * The cap is on draws and on triangles both, because the buffers a draw sizes
- * from its triangle count (the near-plane clipper's output, three per input
- * triangle) scale with the batch and the arena has a hard limit.
+ * from its triangle count (the clipper's output, four per input triangle)
+ * scale with the batch and the arena has a hard limit.
  */
 #define CP_MAX_BATCH_DRAWS 128
 #define CP_MAX_BATCH_TRIS  (256 * 1024)
