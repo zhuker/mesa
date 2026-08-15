@@ -1163,6 +1163,46 @@ cp_abuf_worklist(const uint32_t *counts, uint32_t n, uint32_t min_count,
 }
 
 /*
+ * Cut every pixel's run down to what the fragment array can hold.
+ *
+ * The host used to drain after the scan, see that the count was larger than
+ * the array, and send the draw to the peel loop before anything indexed it.
+ * It no longer looks, so the guard has to be here: the offsets are a prefix
+ * sum of the counts, so a total past the end of the array leaves later pixels
+ * with runs that start or end outside it — and the sort and the merge index
+ * `frags + offsets[p]` with no bound of their own.
+ *
+ * What is clamped is reported as overflow, which is the same counter the fill
+ * bumps and the same one the eligibility check reads, so a draw this touches
+ * at all is a draw the peel loop renders. It is the truncation being made
+ * harmless, not accepted.
+ *
+ * The common case is one cached load and a return: the arrays are sized with
+ * headroom and no draw on the traced workloads reaches this at all.
+ */
+extern "C" __global__ void
+cp_abuf_clamp_runs(uint32_t *counts, const uint32_t *offsets,
+                   const uint32_t *total, uint32_t n, uint32_t capacity,
+                   uint32_t *overflow)
+{
+   if (*total <= capacity)
+      return;
+
+   uint32_t stride = gridDim.x * blockDim.x;
+   for (uint32_t p = blockIdx.x * blockDim.x + threadIdx.x; p < n; p += stride) {
+      uint32_t c = counts[p];
+      if (!c)
+         continue;
+      uint32_t off = offsets[p];
+      uint32_t room = off < capacity ? capacity - off : 0;
+      if (c > room) {
+         counts[p] = room;
+         atomicAdd(overflow, c - room);
+      }
+   }
+}
+
+/*
  * Sort each pixel's run ascending: one block per pixel, grid-strided over the
  * worklist. A run is padded up to a power of two with 0xFFFFFFFF and sorted
  * bitonically in shared memory, so the padding lands past the end and only the
@@ -1461,6 +1501,27 @@ cp_abuf_quad_count(const uint32_t *frags, const uint32_t *offsets,
                                           quad_width, b, NULL, NULL, NULL, NULL,
                                           NULL, 0, 0, NULL);
    }
+}
+
+/*
+ * Clear the merge's slot map over the run this draw actually uses.
+ *
+ * The length of that run is the count pass's total, and since the drain
+ * between the count and the fill was removed the host does not have it — so
+ * the bound is read on the device instead. Clamped to the capacity because a
+ * count larger than the array is exactly the case the fill reports and the
+ * eligibility check refuses, and this must not write past the array while that
+ * is being found out.
+ */
+extern "C" __global__ void
+cp_abuf_clear_slots(uint32_t *slots, const uint32_t *total, uint32_t capacity)
+{
+   uint32_t n = *total;
+   if (n > capacity)
+      n = capacity;
+   uint32_t stride = gridDim.x * blockDim.x;
+   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
+      slots[i] = 0xFFFFFFFFu;
 }
 
 /* The same merge again, this time writing the quads at the scanned offsets. */

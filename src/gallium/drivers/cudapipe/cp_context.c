@@ -1809,6 +1809,17 @@ struct cp_abuf {
    bool ready;              /* per-pixel buffers allocated for w x h */
    bool disabled;           /* something refused it; do not try again */
    unsigned w, h;
+   /*
+    * What the framebuffer-sized allocations actually hold, as against what the
+    * current framebuffer needs. Grow-only: a render pass at a smaller size
+    * reuses the larger arrays and only recomputes the derived counts below.
+    * See cp_abuf_setup() for why it is not a realloc on every change.
+    */
+   size_t cap_pixels;       /* pixels the per-pixel arrays are sized for */
+   unsigned cap_blocks;     /* 2x2 blocks the per-block arrays are sized for */
+   size_t cap_log_pixels;   /* pixels the verification's peel log is sized for */
+   unsigned resizes;        /* times the arrays have been grown */
+   bool events_ready;       /* the CUevents are created once, not per size */
 
    /* Per-pixel, and the scan's per-level partial sums. */
    CUdeviceptr counts, offsets, cursor;
@@ -1833,6 +1844,16 @@ struct cp_abuf {
    unsigned growths;        /* times it has been grown this process */
    unsigned peak;           /* largest population any draw has counted */
    bool grow_capped;        /* a growth was refused; do not ask again */
+   /*
+    * A population that wants the arrays bigger, recorded by the draw that
+    * counted it and acted on by the next eligible draw. The count is no longer
+    * read on the host until after the fill has been issued — see the drain
+    * that used to be between them — so by the time a growth is known to be
+    * wanted, this draw's own kernels are already reading the arrays it would
+    * free. The next draw's count pass reads none of them, and is where the
+    * resize is safe.
+    */
+   uint32_t grow_to;
 
    /* What the peel loop selected: CP_ABUF_LOG_LAYERS for every pixel, and the
     * full CP_BLEND_LAYERS for the deepest CP_ABUF_DEEP_PIXELS. */
@@ -1882,6 +1903,23 @@ struct cp_abuf {
 
 static struct cp_abuf cp_abuf = { .enabled = -1 };
 
+/*
+ * Record an A-buffer stage boundary, but only when someone is going to read
+ * it. cuEventElapsedTime is called only under CUDAPIPE_ABUFFER_TIMING, which
+ * is off by default, and sixteen records per eligible draw is nothing beside
+ * the kernels they bracket when the numbers are wanted.
+ *
+ * When they are not, it is 11.8M calls and 3% of the frame on a capture that
+ * takes the A-buffer path 482 times per frame — which only became visible
+ * once the A-buffer stopped disabling itself and started running.
+ */
+static inline void
+cp_abuf_mark(CUevent ev, CUstream stream)
+{
+   if (cp_abuf.timing)
+      cuEventRecord(ev, stream);
+}
+
 static bool
 cp_abuf_enabled(void)
 {
@@ -1928,6 +1966,14 @@ cp_abuf_enabled(void)
    return cp_abuf.enabled == 1;
 }
 
+static void
+cp_abuf_free(CUdeviceptr *p)
+{
+   if (*p)
+      cuMemFree(*p);
+   *p = 0;
+}
+
 static bool
 cp_abuf_alloc(struct cp_abuf *ab, CUdeviceptr *p, size_t bytes,
               const char *what)
@@ -1942,8 +1988,33 @@ cp_abuf_alloc(struct cp_abuf *ab, CUdeviceptr *p, size_t bytes,
    return true;
 }
 
-/* Allocate everything that is sized by the framebuffer. The fragment array is
- * not here: its size comes from the first frame's measured count. */
+/*
+ * Allocate everything that is sized by the framebuffer. The fragment array is
+ * not here: its size comes from the first frame's measured count, and nothing
+ * about it depends on the framebuffer — a quad array bounded by the fragment
+ * population is bounded by it at any resolution.
+ *
+ * **Grow-only, because the size alternates within a frame.** This used to
+ * allocate once and disable itself the first time the framebuffer changed,
+ * which cost nothing while the only sample taking the path rendered at one
+ * size. A capture with a bloom pyramid changes size fifteen times a frame —
+ * 1280x720 for the scene and 160x90 and smaller for the pyramid — so the
+ * disable fired in the first second and every blended draw for the rest of the
+ * run went back to the peel loop.
+ *
+ * Free-and-reallocate on every change is the other wrong answer: it would be
+ * thirty cuMemFree/cuMemAlloc storms a frame, each of them a device-wide
+ * synchronising operation. So the arrays are sized to the largest w*h and the
+ * largest 2x2-block count seen so far and never shrink. Everything here is
+ * indexed by pixel or by block and bounded by a count the caller passes in, so
+ * an array sized for 921,600 pixels serves a 14,400-pixel pass exactly as well;
+ * the kernels never read past the current n. What has to be recomputed on every
+ * change is arithmetic: w, h, the three scan-level block counts on each of the
+ * two ladders, and the block geometry.
+ *
+ * A size that does not fit the three-level scan is refused for that size alone
+ * rather than disabling the path, since the next render pass is likely smaller.
+ */
 static bool
 cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
 {
@@ -1951,113 +2022,160 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
       return false;
    if (ab->ready && ab->w == w && ab->h == h)
       return true;
-   if (ab->ready) {
-      fprintf(stderr, "abuffer: framebuffer changed %ux%u -> %ux%u; disabled\n",
-              ab->w, ab->h, w, h);
-      ab->disabled = true;
-      return false;
-   }
 
    size_t n = (size_t)w * h;
-   size_t nb = n * sizeof(uint32_t);
-   ab->nb1 = (unsigned)((n + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK);
-   ab->nb2 = (ab->nb1 + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK;
-   ab->nb3 = (ab->nb2 + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK;
-   if (ab->nb3 != 1) {
-      fprintf(stderr, "abuffer: %zu pixels needs more than three scan levels; "
-              "disabled\n", n);
-      ab->disabled = true;
+   unsigned nb1 = (unsigned)((n + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK);
+   unsigned nb2 = (nb1 + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK;
+   unsigned nb3 = (nb2 + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK;
+   unsigned quad_width = (w + 1) / 2;
+   unsigned nblocks = quad_width * ((h + 1) / 2);
+   unsigned bnb1 = (nblocks + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK;
+   unsigned bnb2 = (bnb1 + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK;
+   unsigned bnb3 = (bnb2 + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK;
+   if (nb3 != 1 || bnb3 != 1) {
+      static int said_levels = 0;
+      if (!said_levels++)
+         fprintf(stderr, "abuffer: %ux%u needs more than three scan levels; "
+                 "draws at that size peel\n", w, h);
       return false;
    }
 
-   if (!cp_abuf_alloc(ab, &ab->counts, nb, "counts") ||
-       !cp_abuf_alloc(ab, &ab->offsets, nb, "offsets") ||
-       !cp_abuf_alloc(ab, &ab->cursor, nb, "cursor") ||
-       !cp_abuf_alloc(ab, &ab->list, nb, "list") ||
-       !cp_abuf_alloc(ab, &ab->sum1, ab->nb1 * 4, "sum1") ||
-       !cp_abuf_alloc(ab, &ab->sum1x, ab->nb1 * 4, "sum1x") ||
-       !cp_abuf_alloc(ab, &ab->sum2, ab->nb2 * 4, "sum2") ||
-       !cp_abuf_alloc(ab, &ab->sum2x, ab->nb2 * 4, "sum2x") ||
-       !cp_abuf_alloc(ab, &ab->sum3, 4 * 3, "sum3+counters"))
-      return false;
-   /* Three words in one allocation: the scan total, the fill's overflow
-    * counter and the sort's long-run counter. */
-   ab->overflow = ab->sum3 + 4;
-   ab->long_runs = ab->sum3 + 8;
-   if (!cp_abuf_alloc(ab, &ab->list_count, 4, "list_count"))
-      return false;
-   if (cp_abuf.composite &&
-       (!cp_abuf_alloc(ab, &ab->clist, nb, "composite worklist") ||
-        !cp_abuf_alloc(ab, &ab->clist_count, 4, "composite worklist count")))
-      return false;
-
-   /* Per 2x2 block: 640x360 of them for a 1280x720 framebuffer, so the same
-    * three scan levels are ample. */
-   ab->quad_width = (w + 1) / 2;
-   ab->nblocks = ab->quad_width * ((h + 1) / 2);
-   ab->bnb1 = (ab->nblocks + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK;
-   ab->bnb2 = (ab->bnb1 + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK;
-   ab->bnb3 = (ab->bnb2 + CP_ABUF_SCAN_BLOCK - 1) / CP_ABUF_SCAN_BLOCK;
-   if (ab->bnb3 != 1) {
-      fprintf(stderr, "abuffer: %u blocks needs more than three scan levels; "
-              "disabled\n", ab->nblocks);
-      ab->disabled = true;
-      return false;
+   /* The fixed-size counters and the events, once per process. */
+   if (!ab->sum3) {
+      if (!cp_abuf_alloc(ab, &ab->sum3, 4 * 3, "sum3+counters") ||
+          !cp_abuf_alloc(ab, &ab->list_count, 4, "list_count") ||
+          !cp_abuf_alloc(ab, &ab->blk_list_count, 4, "block worklist count") ||
+          !cp_abuf_alloc(ab, &ab->bsum3, 4 * 2, "block sum3+overflow") ||
+          !cp_abuf_alloc(ab, &ab->dbg, CP_ABUF_DBG_COUNTERS * 4,
+                         "debug counters"))
+         return false;
+      /* Three words in one allocation: the scan total, the fill's overflow
+       * counter and the sort's long-run counter. */
+      ab->overflow = ab->sum3 + 4;
+      ab->long_runs = ab->sum3 + 8;
+      ab->quad_overflow = ab->bsum3 + 4;
    }
-   size_t bb = (size_t)ab->nblocks * sizeof(uint32_t);
-   if (!cp_abuf_alloc(ab, &ab->blk_counts, bb, "block counts") ||
-       !cp_abuf_alloc(ab, &ab->blk_offsets, bb, "block offsets") ||
-       !cp_abuf_alloc(ab, &ab->blk_list, bb, "block worklist") ||
-       !cp_abuf_alloc(ab, &ab->blk_list_count, 4, "block worklist count") ||
-       !cp_abuf_alloc(ab, &ab->bsum1, ab->bnb1 * 4, "block sum1") ||
-       !cp_abuf_alloc(ab, &ab->bsum1x, ab->bnb1 * 4, "block sum1x") ||
-       !cp_abuf_alloc(ab, &ab->bsum2, ab->bnb2 * 4, "block sum2") ||
-       !cp_abuf_alloc(ab, &ab->bsum2x, ab->bnb2 * 4, "block sum2x") ||
-       !cp_abuf_alloc(ab, &ab->bsum3, 4 * 2, "block sum3+overflow") ||
-       !cp_abuf_alloc(ab, &ab->dbg, CP_ABUF_DBG_COUNTERS * 4, "debug counters"))
-      return false;
-   ab->quad_overflow = ab->bsum3 + 4;
-   ab->h_blk_counts = malloc(bb);
-   ab->h_blk_offsets = malloc(bb);
-   if (!ab->h_blk_counts || !ab->h_blk_offsets) {
-      fprintf(stderr, "abuffer: block mirrors failed; disabled\n");
-      ab->disabled = true;
-      return false;
+   if (!ab->events_ready) {
+      for (int i = 0; i < (int)ARRAY_SIZE(ab->ev); i++) {
+         if (cuEventCreate(&ab->ev[i], CU_EVENT_DEFAULT) != CUDA_SUCCESS) {
+            fprintf(stderr, "abuffer: cuEventCreate failed; disabled\n");
+            ab->disabled = true;
+            return false;
+         }
+      }
+      ab->events_ready = true;
    }
 
-   for (int i = 0; i < (int)ARRAY_SIZE(ab->ev); i++) {
-      if (cuEventCreate(&ab->ev[i], CU_EVENT_DEFAULT) != CUDA_SUCCESS) {
-         fprintf(stderr, "abuffer: cuEventCreate failed; disabled\n");
+   /* The per-pixel ladder. */
+   if (n > ab->cap_pixels) {
+      size_t nb = n * sizeof(uint32_t);
+      ab->ready = false;
+      ab->cap_pixels = 0;
+      cp_abuf_free(&ab->counts);
+      cp_abuf_free(&ab->offsets);
+      cp_abuf_free(&ab->cursor);
+      cp_abuf_free(&ab->list);
+      cp_abuf_free(&ab->clist);
+      cp_abuf_free(&ab->sum1);
+      cp_abuf_free(&ab->sum1x);
+      cp_abuf_free(&ab->sum2);
+      cp_abuf_free(&ab->sum2x);
+      if (!cp_abuf_alloc(ab, &ab->counts, nb, "counts") ||
+          !cp_abuf_alloc(ab, &ab->offsets, nb, "offsets") ||
+          !cp_abuf_alloc(ab, &ab->cursor, nb, "cursor") ||
+          !cp_abuf_alloc(ab, &ab->list, nb, "list") ||
+          !cp_abuf_alloc(ab, &ab->sum1, nb1 * 4, "sum1") ||
+          !cp_abuf_alloc(ab, &ab->sum1x, nb1 * 4, "sum1x") ||
+          !cp_abuf_alloc(ab, &ab->sum2, nb2 * 4, "sum2") ||
+          !cp_abuf_alloc(ab, &ab->sum2x, nb2 * 4, "sum2x"))
+         return false;
+
+      free(ab->h_counts);
+      free(ab->h_offsets);
+      free(ab->h_cursor);
+      ab->h_counts = malloc(nb);
+      ab->h_offsets = malloc(nb);
+      ab->h_cursor = malloc(nb);
+      if (!ab->h_counts || !ab->h_offsets || !ab->h_cursor) {
+         fprintf(stderr, "abuffer: host mirrors failed; disabled\n");
          ab->disabled = true;
          return false;
       }
+      ab->cap_pixels = n;
+      if (ab->resizes++)
+         fprintf(stderr, "abuffer: grew the per-pixel arrays to %ux%u\n", w, h);
    }
 
-   ab->h_counts = malloc(nb);
-   ab->h_offsets = malloc(nb);
-   ab->h_cursor = malloc(nb);
-   if (!ab->h_counts || !ab->h_offsets || !ab->h_cursor) {
-      fprintf(stderr, "abuffer: host mirrors failed; disabled\n");
-      ab->disabled = true;
-      return false;
+   /* The per-2x2-block ladder. 640x360 blocks for a 1280x720 framebuffer, so
+    * the same three scan levels are ample. */
+   if (nblocks > ab->cap_blocks) {
+      size_t bb = (size_t)nblocks * sizeof(uint32_t);
+      ab->ready = false;
+      ab->cap_blocks = 0;
+      cp_abuf_free(&ab->blk_counts);
+      cp_abuf_free(&ab->blk_offsets);
+      cp_abuf_free(&ab->blk_list);
+      cp_abuf_free(&ab->bsum1);
+      cp_abuf_free(&ab->bsum1x);
+      cp_abuf_free(&ab->bsum2);
+      cp_abuf_free(&ab->bsum2x);
+      if (!cp_abuf_alloc(ab, &ab->blk_counts, bb, "block counts") ||
+          !cp_abuf_alloc(ab, &ab->blk_offsets, bb, "block offsets") ||
+          !cp_abuf_alloc(ab, &ab->blk_list, bb, "block worklist") ||
+          !cp_abuf_alloc(ab, &ab->bsum1, bnb1 * 4, "block sum1") ||
+          !cp_abuf_alloc(ab, &ab->bsum1x, bnb1 * 4, "block sum1x") ||
+          !cp_abuf_alloc(ab, &ab->bsum2, bnb2 * 4, "block sum2") ||
+          !cp_abuf_alloc(ab, &ab->bsum2x, bnb2 * 4, "block sum2x"))
+         return false;
+      free(ab->h_blk_counts);
+      free(ab->h_blk_offsets);
+      ab->h_blk_counts = malloc(bb);
+      ab->h_blk_offsets = malloc(bb);
+      if (!ab->h_blk_counts || !ab->h_blk_offsets) {
+         fprintf(stderr, "abuffer: block mirrors failed; disabled\n");
+         ab->disabled = true;
+         return false;
+      }
+      ab->cap_blocks = nblocks;
    }
 
-   if (cp_abuf.verify) {
+   /* The composite's worklist. Outside the growth block because the flag can be
+    * turned on after the first setup — asking to verify without the kernels to
+    * verify with falls back to compositing — and then this has to appear. */
+   if (cp_abuf.composite) {
+      if (!ab->clist &&
+          !cp_abuf_alloc(ab, &ab->clist, ab->cap_pixels * sizeof(uint32_t),
+                         "composite worklist"))
+         return false;
+      if (!ab->clist_count &&
+          !cp_abuf_alloc(ab, &ab->clist_count, 4, "composite worklist count"))
+         return false;
+   }
+
+   if (cp_abuf.verify && n > ab->cap_log_pixels) {
       size_t logb = n * CP_ABUF_LOG_LAYERS * sizeof(uint32_t);
       size_t deepb = CP_ABUF_DEEP_PIXELS * CP_BLEND_LAYERS * sizeof(uint32_t);
-      if (!cp_abuf_alloc(ab, &ab->log, logb, "peel log") ||
-          !cp_abuf_alloc(ab, &ab->deep_list,
-                         CP_ABUF_DEEP_PIXELS * 4, "deep list") ||
-          !cp_abuf_alloc(ab, &ab->deep_log, deepb, "deep peel log"))
+      ab->cap_log_pixels = 0;
+      cp_abuf_free(&ab->log);
+      if (!cp_abuf_alloc(ab, &ab->log, logb, "peel log"))
          return false;
+      if (!ab->deep_log &&
+          (!cp_abuf_alloc(ab, &ab->deep_list,
+                          CP_ABUF_DEEP_PIXELS * 4, "deep list") ||
+           !cp_abuf_alloc(ab, &ab->deep_log, deepb, "deep peel log")))
+         return false;
+      free(ab->h_log);
       ab->h_log = malloc(logb);
-      ab->h_deep_log = malloc(deepb);
-      ab->h_deep_list = malloc(CP_ABUF_DEEP_PIXELS * 4);
+      if (!ab->h_deep_log) {
+         ab->h_deep_log = malloc(deepb);
+         ab->h_deep_list = malloc(CP_ABUF_DEEP_PIXELS * 4);
+      }
       if (!ab->h_log || !ab->h_deep_log || !ab->h_deep_list) {
          fprintf(stderr, "abuffer: host log mirrors failed; disabled\n");
          ab->disabled = true;
          return false;
       }
+      ab->cap_log_pixels = n;
       fprintf(stderr, "abuffer: verification on — peel log %.1f MB, "
               "deep log %.1f MB\n", logb / (1024.0 * 1024.0),
               deepb / (1024.0 * 1024.0));
@@ -2065,6 +2183,14 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
 
    ab->w = w;
    ab->h = h;
+   ab->nb1 = nb1;
+   ab->nb2 = nb2;
+   ab->nb3 = nb3;
+   ab->quad_width = quad_width;
+   ab->nblocks = nblocks;
+   ab->bnb1 = bnb1;
+   ab->bnb2 = bnb2;
+   ab->bnb3 = bnb3;
    ab->ready = true;
    return true;
 }
@@ -2088,14 +2214,6 @@ cp_abuf_report(void)
            "of %u (%.1f%%), %u growth%s\n", ab->peak, ab->capacity,
            ab->capacity ? 100.0 * ab->peak / ab->capacity : 0.0,
            ab->growths, ab->growths == 1 ? "" : "s");
-}
-
-static void
-cp_abuf_free(CUdeviceptr *p)
-{
-   if (*p)
-      cuMemFree(*p);
-   *p = 0;
 }
 
 /*
@@ -2733,20 +2851,20 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
    cp_fs_interp_setup(cp, info, fs, num_fs_inputs, num_vs_outputs, &interp);
 
    void *ip[] = { &interp };
-   cuEventRecord(ab->ev[11], cp->stream);
+   cp_abuf_mark(ab->ev[11], cp->stream);
    CUresult e = cuLaunchKernel(screen->kernels.abuf_interpolate,
                                (num_quads + 255) / 256, 1, 1, 256, 1, 1,
                                0, cp->stream, ip, NULL);
-   cuEventRecord(ab->ev[12], cp->stream);
+   cp_abuf_mark(ab->ev[12], cp->stream);
    if (e != CUDA_SUCCESS) {
       fprintf(stderr, "abuffer: cp_abuf_interpolate launch failed (%d)\n", e);
       return false;
    }
 
    if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
-                            frag_coord, discard_mask, num_slots, ab->ev[13]))
+                            frag_coord, discard_mask, num_slots, cp_abuf.timing ? ab->ev[13] : 0))
       return false;
-   cuEventRecord(ab->ev[14], cp->stream);
+   cp_abuf_mark(ab->ev[14], cp->stream);
 
    if (record_colors && screen->kernels.abuf_scatter_colors) {
       void *p[] = { &fs_out, &fs_out_stride, &dbg_slot, &counter, &num_slots,
@@ -2792,11 +2910,11 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
        * anything depends on. */
       unsigned nwork = num_covered ? num_covered : w * h;
       cp_nvtx_push("composite");
-      cuEventRecord(ab->ev[15], cp->stream);
+      cp_abuf_mark(ab->ev[15], cp->stream);
       CUresult ce = cuLaunchKernel(screen->kernels.abuf_composite,
                                    (nwork + 255) / 256, 1, 1, 256, 1, 1,
                                    0, cp->stream, p, NULL);
-      cuEventRecord(ab->ev[16], cp->stream);
+      cp_abuf_mark(ab->ev[16], cp->stream);
       cp_nvtx_pop();   /* composite */
       if (ce != CUDA_SUCCESS) {
          fprintf(stderr, "abuffer: cp_abuf_composite launch failed (%d)\n", ce);
@@ -3870,6 +3988,26 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       }
    }
 
+   /*
+    * A growth an earlier draw asked for. It happens here, before this draw
+    * touches anything, because the draw that asked for it was still reading
+    * the arrays it frees — its merge and its composite were issued after the
+    * count it asked on. The count pass below reads none of them.
+    *
+    * Rare by construction: the arrays are sized with headroom and this is
+    * asked at three quarters of it. No draw on the traced workloads asks at
+    * all after the first.
+    */
+   if (abuf && ab->grow_to) {
+      uint32_t want = ab->grow_to;
+      ab->grow_to = 0;
+      /* cuMemFree already blocks until the device has finished; the drain is
+       * written out so that this does not rest on that. */
+      cuStreamSynchronize(cp->stream);
+      if (!cp_abuf_size_arrays(ab, want))
+         abuf = false;
+   }
+
    if (abuf) {
       size_t n = (size_t)w * h;
       struct cp_rasterize_args aa = rast_args;
@@ -3884,7 +4022,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
       aa.abuf_mode = CP_ABUF_COUNT;
       rast_queues.mode = CP_QUEUE_FILL;
-      cuEventRecord(ab->ev[0], cp->stream);
+      cp_abuf_mark(ab->ev[0], cp->stream);
       void *ap[] = { &aa, &rast_queues };
       /* The _abuf specialisations: same rasterizer, compiled with the count
        * and fill branch live. Every other launch in this file uses the plain
@@ -3897,33 +4035,85 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                      256, 1, 1, 0, cp->stream, ap, NULL);
       cuLaunchKernel(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
                      0, cp->stream, ap, NULL);
-      cuEventRecord(ab->ev[1], cp->stream);
+      cp_abuf_mark(ab->ev[1], cp->stream);
 
       /* --- step 2: prefix sum --- */
       cp_abuf_scan(cp, screen, ab, (unsigned)n);
-      cuEventRecord(ab->ev[2], cp->stream);
+      cp_abuf_mark(ab->ev[2], cp->stream);
 
-      /* The host needs the total before it can size or refuse the fragment
-       * array, and this is a debug path, so it drains here. */
-      cuStreamSynchronize(cp->stream);
-      cuMemcpyDtoH(&abuf_total, ab->sum3, sizeof(uint32_t));
+      /*
+       * The count stays on the device.
+       *
+       * The host used to drain here for the total, and wanted it for three
+       * things: to size the fragment array, to refuse a draw that outran it,
+       * and to record the peak. None of the three has to be answered at this
+       * point in the draw, and answering it here is the most expensive
+       * synchronisation in the frame — 482 blended draws a frame on the
+       * headless_streamer capture each stop the host until the device has
+       * caught up, to re-derive a number whose answer never changes.
+       *
+       * What replaces it is machinery that was already there:
+       *
+       *  - The fill is bounded on the device by ab->capacity and counts every
+       *    fragment it could not place into ab->overflow. It cannot write past
+       *    the array whatever the count turns out to be.
+       *  - The drain after the merge, which this path pays anyway to decide
+       *    whether the peel loop runs, already reads that counter and refuses
+       *    the draw when it is not zero — see the eligibility check below.
+       *
+       * So a draw that outruns the array is caught one step later by the test
+       * that was always making the final decision, having spent a fill and a
+       * merge and nothing else. Nothing has been written that the peel loop
+       * reads: both A-buffer rasterization passes return before the visibility
+       * buffer, and the composite has not been issued. The peel loop renders
+       * that draw exactly as it did before this change.
+       *
+       * Two paths still need the total here and still drain for it: the first
+       * eligible draw, which has no array to fill and no size to give the
+       * fill, and every mode that does not composite — the verification reads
+       * the per-pixel counts on the host before the fill, and there is no
+       * later drain in those modes to read the total in.
+       */
+      bool drain_for_count = !ab->frags || !cp_abuf.composite ||
+                             !screen->kernels.abuf_clamp_runs;
 
-      /* Whether the arrays are big enough for this draw, and whether they
-       * should be made bigger before the next one. Both live in one place; see
-       * cp_abuf_size_arrays(). */
-      if (abuf_total > ab->peak)
-         ab->peak = abuf_total;
-      if (!cp_abuf_size_arrays(ab, abuf_total))
-         abuf = false;
-      else if (abuf_total > ab->capacity) {
-         /* The growth was capped or refused and the draw outran what is there.
-          * Correct and slow rather than wrong: the peel loop renders it. */
-         static int said_over = 0;
-         if (!said_over++)
-            fprintf(stderr, "abuffer: %u fragments exceeds the %u allocated; "
-                    "this draw falls back to the peel path\n",
-                    abuf_total, ab->capacity);
-         abuf = false;
+      if (!drain_for_count) {
+         /*
+          * Since nobody looks, nothing may index the array outside it. The
+          * offsets are a prefix sum, so a count larger than the array leaves
+          * later pixels with runs beginning or ending past its end, and the
+          * sort and the merge index frags + offsets[p] with no bound of their
+          * own. See cp_abuf_clamp_runs — which also records what it cut as
+          * overflow, so the draw this happens to is refused below and rendered
+          * by the peel loop rather than composited short.
+          */
+         unsigned nn = (unsigned)n;
+         void *p[] = { &ab->counts, &ab->offsets, &ab->sum3, &nn,
+                       &ab->capacity, &ab->overflow };
+         cuLaunchKernel(screen->kernels.abuf_clamp_runs, 1024, 1, 1, 256, 1, 1,
+                        0, cp->stream, p, NULL);
+      } else {
+         cuStreamSynchronize(cp->stream);
+         cuMemcpyDtoH(&abuf_total, ab->sum3, sizeof(uint32_t));
+
+         /* Whether the arrays are big enough for this draw, and whether they
+          * should be made bigger before the next one. Both live in one place;
+          * see cp_abuf_size_arrays(). */
+         if (abuf_total > ab->peak)
+            ab->peak = abuf_total;
+         if (!cp_abuf_size_arrays(ab, abuf_total))
+            abuf = false;
+         else if (abuf_total > ab->capacity) {
+            /* The growth was capped or refused and the draw outran what is
+             * there. Correct and slow rather than wrong: the peel loop renders
+             * it. */
+            static int said_over = 0;
+            if (!said_over++)
+               fprintf(stderr, "abuffer: %u fragments exceeds the %u allocated; "
+                       "this draw falls back to the peel path\n",
+                       abuf_total, ab->capacity);
+            abuf = false;
+         }
       }
    }
 
@@ -3971,7 +4161,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
       aa.abuf_mode = CP_ABUF_FILL;
       rast_queues.mode = CP_QUEUE_FILL;
-      cuEventRecord(ab->ev[3], cp->stream);
+      cp_abuf_mark(ab->ev[3], cp->stream);
       void *ap[] = { &aa, &rast_queues };
       cuLaunchKernel(screen->kernels.rasterize_stage1_abuf,
                      (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
@@ -3981,7 +4171,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                      256, 1, 1, 0, cp->stream, ap, NULL);
       cuLaunchKernel(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
                      0, cp->stream, ap, NULL);
-      cuEventRecord(ab->ev[4], cp->stream);
+      cp_abuf_mark(ab->ev[4], cp->stream);
 
       /* --- step 4: sort. The worklist build is inside this measurement: it
        * is a prerequisite of the sort as written, not a separate step. --- */
@@ -3996,7 +4186,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          cuLaunchKernel(screen->kernels.abuf_sort, 4096, 1, 1, 256, 1, 1,
                         0, cp->stream, sp, NULL);
       }
-      cuEventRecord(ab->ev[5], cp->stream);
+      cp_abuf_mark(ab->ev[5], cp->stream);
 
       /* The composite's worklist — every pixel with anything in it, not just
        * the ones worth sorting. Built here so it rides alongside the sort
@@ -4019,7 +4209,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
        */
       unsigned nblocks = ab->nblocks, qw = ab->quad_width;
       cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
-      cuEventRecord(ab->ev[6], cp->stream);
+      cp_abuf_mark(ab->ev[6], cp->stream);
       {
          void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_list,
                        &ab->blk_list_count };
@@ -4027,7 +4217,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                         (nblocks + 255) / 256, 1, 1, 256, 1, 1,
                         0, cp->stream, p, NULL);
       }
-      cuEventRecord(ab->ev[7], cp->stream);
+      cp_abuf_mark(ab->ev[7], cp->stream);
 
       /* Counting pass, prefix sum, filling pass — the same shape as the
        * fragment lists themselves, and for the same reason: the merge has to
@@ -4044,7 +4234,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          cuLaunchKernel(screen->kernels.abuf_quad_count, 1024, 1, 1, 32, 1, 1,
                         0, cp->stream, p, NULL);
       }
-      cuEventRecord(ab->ev[9], cp->stream);
+      cp_abuf_mark(ab->ev[9], cp->stream);
       cp_abuf_scan_n(cp, screen, ab->blk_counts, ab->blk_offsets, ab->bsum1,
                      ab->bsum1x, ab->bsum2, ab->bsum2x, ab->bsum3, nblocks,
                      ab->bnb1, ab->bnb2, ab->bnb3);
@@ -4052,10 +4242,20 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          /* Slots the merge cannot place stay 0xFFFFFFFF and are skipped by the
           * composite, so a fill that fell short loses a layer rather than
           * reading whatever the last draw left there. Only the run actually in
-          * use is cleared. */
-         if (ab->shade_slot)
-            cuMemsetD32Async(ab->shade_slot, 0xFFFFFFFF, abuf_total,
+          * use is cleared — by a kernel rather than a memset, because the
+          * length of that run is now only on the device. */
+         if (ab->shade_slot && screen->kernels.abuf_clear_slots) {
+            void *p[] = { &ab->shade_slot, &ab->sum3, &ab->capacity };
+            cuLaunchKernel(screen->kernels.abuf_clear_slots, 1024, 1, 1,
+                           256, 1, 1, 0, cp->stream, p, NULL);
+         } else if (ab->shade_slot) {
+            /* Without it, the whole array: clearing more than the draw uses is
+             * only slower, and clearing less would let the composite read a
+             * slot map the last draw wrote. */
+            cuMemsetD32Async(ab->shade_slot, 0xFFFFFFFF,
+                             abuf_total ? abuf_total : ab->capacity,
                              cp->stream);
+         }
          void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
                        &ab->blk_list, &ab->blk_list_count, &ab->blk_offsets,
                        &ab->quad_prim, &ab->quad_mask, &ab->peel_mask,
@@ -4064,8 +4264,8 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          cuLaunchKernel(screen->kernels.abuf_quad_fill, 1024, 1, 1, 32, 1, 1,
                         0, cp->stream, p, NULL);
       }
-      cuEventRecord(ab->ev[10], cp->stream);
-      cuEventRecord(ab->ev[8], cp->stream);
+      cp_abuf_mark(ab->ev[10], cp->stream);
+      cp_abuf_mark(ab->ev[8], cp->stream);
 
       /*
        * Whether this draw is rendered by the A-buffer rather than merely
@@ -4098,6 +4298,22 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                        "fragment-overflow=%u — this draw falls back to the "
                        "peel loop\n", q[0], q[1], c3[1]);
          }
+
+         /*
+          * The population, arriving one drain later than it used to, and the
+          * only place it is read now. The peak is exact; the growth it asks
+          * for is served by the next eligible draw, because this one's merge
+          * and composite are still reading the arrays it would free. A draw
+          * that outran the array does not wait for a bigger one — the check
+          * above has already sent it to the peel loop.
+          */
+         abuf_total = c3[0];
+         if (abuf_total > ab->peak)
+            ab->peak = abuf_total;
+         if (ab->frags && !ab->grow_capped &&
+             ab->growths < CP_ABUF_MAX_GROWTHS &&
+             (double)abuf_total > (double)ab->capacity * CP_ABUF_GROW_AT)
+            ab->grow_to = MAX2(ab->grow_to, abuf_total);
       }
 
       /* Hand the quad array to the interpolator, so that the peel loop about
@@ -4311,7 +4527,13 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
        */
       float t_qinterp = 0, t_qshade = 0, t_composite = 0;
       bool shaded = false;
-      if (qcounters[0] && !qcounters[1]) {
+      /*
+       * Shading a quad stream nothing will composite is work for nobody: a
+       * draw the check above refused is rendered by the peel loop, which
+       * shades it itself. The comparison modes still want it, because what
+       * they compare is the shading.
+       */
+      if (qcounters[0] && !qcounters[1] && (abuf_prod || !cp_abuf.composite)) {
          cp->scratch.used = shade_mark;
          cp->dscratch.used = shade_dmark;
          shaded = cp_abuf_shade(cp, info, ab, rast_args.positions,

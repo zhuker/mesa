@@ -40,6 +40,8 @@ struct cp_kernels {
    CUfunction abuf_peel_log_list;
    CUfunction abuf_block_worklist;
    CUfunction abuf_quad_count;
+   CUfunction abuf_clamp_runs;
+   CUfunction abuf_clear_slots;
    CUfunction abuf_quad_fill;
    CUfunction abuf_interpolate;
    CUfunction abuf_scatter_colors;
