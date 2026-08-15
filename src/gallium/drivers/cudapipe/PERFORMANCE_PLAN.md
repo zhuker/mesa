@@ -347,6 +347,19 @@ Pure cudapipe, local edits to `kernels/cp_rasterize.cu`. Every item here comes
 from CuRast (`~/git/CuRast`), which is the direct ancestor of cudapipe's
 three-stage design and has already paid for these lessons.
 
+**Measure the issue rate before taking any of these, and the reason is now
+tested rather than argued.** Every item below is a constant-factor instruction
+reduction. The first direct test of that class on this driver removed **half the
+instructions** from a fragment shader — 2168 → 1088 SASS, by emitting
+approximate divide and square root instead of the IEEE forms — on
+`gltfscenerendering`, which is 93% GPU busy, kernel-bound, and spends 51% of its
+frame in that kernel. The kernel's median launch moved **136.88 → 136.46 µs,
+−0.3%**, and the sweep did not move at all. `tests/TESTING.md`'s counters have
+that sample issuing on **3% of cycles**: these kernels are stalled, not
+instruction-limited, and deleting instructions from them buys nothing. It also
+cost a precision change on `texturecubemap` that the sample's zero
+nondeterminism floor could not absorb. Written up in `SM120.md`.
+
 **None of the items below has been done, and the rasterizer is nonetheless off
 the top of the profile.** What it needed was not a faster inner loop but for the
 loop to run on more than one thread: `CP_SMALL_THRESHOLD` at 999999 meant every
