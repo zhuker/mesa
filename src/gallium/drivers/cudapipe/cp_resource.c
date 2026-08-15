@@ -584,6 +584,74 @@ cp_clear_buffer(struct pipe_context *ctx, struct pipe_resource *res,
    }
 }
 
+/*
+ * Fill one rectangle of a managed surface with an already-packed value, as a
+ * kernel on cp->stream.
+ *
+ * The point of the kernel is not that it is faster than the host loop it
+ * replaces — it is that it is *ordered*. Every caller here flushes the batch
+ * first, but cp_batch_flush() only submits the held-back draws: it launches on
+ * cp->stream and returns without synchronising. A host store into the same
+ * managed pages is therefore a write-after-write race against kernels that may
+ * still be running, with no edge in either direction. Launching on cp->stream
+ * supplies the edge, because stream order serialises this against everything
+ * already enqueued there, including the batch just flushed.
+ *
+ * `value` is taken already packed: cp_clear_texture is handed a value that
+ * util_pack_color_union has packed for it, so packing here as well would
+ * silently produce a different colour.
+ *
+ * Returns false when the caller has to keep the host loop: the kernel has no
+ * arm for the pixel size and would write nothing at all, or the resource is
+ * not managed memory.
+ */
+static bool
+cp_clear_rect_kernel(struct cp_context *cp, struct cp_resource *res,
+                     uint64_t offset, unsigned width, unsigned height,
+                     unsigned stride, unsigned pixel_size,
+                     const uint32_t value[4], bool depth)
+{
+   struct cp_screen *screen = cp->screen;
+   CUfunction fn = depth ? screen->kernels.clear_depth_kernel
+                         : screen->kernels.clear_kernel;
+   void *data = cp_resource_data(res);
+
+   if (!fn || !data || !res->cuda_managed)
+      return false;
+
+   /* Both kernels index on the pixel size with no else arm, so a size they do
+    * not name writes nothing rather than something wrong — which is the worse
+    * failure of the two, because nothing looks like "the clear did not run".
+    * Depth is Z16/Z32F/Z24X8 only (cp_screen.c), colour excludes the
+    * three-component formats R8G8B8, R16G16B16 and R32G32B32. */
+   if (depth) {
+      if (pixel_size != 2 && pixel_size != 4)
+         return false;
+   } else if (pixel_size != 1 && pixel_size != 2 && pixel_size != 4 &&
+              pixel_size != 8 && pixel_size != 16) {
+      return false;
+   }
+
+   if (!width || !height)
+      return true;
+
+   struct cp_clear_args args = {
+      .target = (uint64_t)(uintptr_t)data + offset,
+      .width = width, .height = height,
+      .stride = stride,
+      .pixel_size = pixel_size,
+   };
+   memcpy(args.clear_value, value, sizeof(args.clear_value));
+
+   cuCtxSetCurrent(screen->cuda_ctx);
+   void *params[] = { &args };
+   cuLaunchKernel(fn,
+      (width + 15) / 16, (height + 15) / 16, 1,
+      16, 16, 1,
+      0, cp->stream, params, NULL);
+   return true;
+}
+
 static void
 cp_clear_render_target(struct pipe_context *ctx, struct pipe_surface *dst,
                        const union pipe_color_union *color,
@@ -603,20 +671,25 @@ cp_clear_render_target(struct pipe_context *ctx, struct pipe_surface *dst,
    unsigned pixel_size = util_format_get_blocksize(dst->format);
    unsigned stride = res->lpr.row_stride[dst->level];
 
-   struct cp_clear_args args = {
-      .target = (uint64_t)(uintptr_t)data,
-      .width = width, .height = height,
-      .stride = stride,
-      .pixel_size = pixel_size,
-   };
-   util_format_pack_rgba(dst->format, args.clear_value, color, 1);
+   uint32_t value[4] = { 0 };
+   util_format_pack_rgba(dst->format, value, color, 1);
 
-   cuCtxSetCurrent(cp->screen->cuda_ctx);
-   void *params[] = { &args };
-   cuLaunchKernel(cp->screen->kernels.clear_kernel,
-      (width + 15) / 16, (height + 15) / 16, 1,
-      16, 16, 1,
-      0, cp->stream, params, NULL);
+   /* Level and layer are deliberately not biased in: the draw path renders to
+    * level 0 of layer 0 with no bias of its own, so a clear that honoured them
+    * would land somewhere the draws never look. dstx/dsty are a different
+    * matter — they are within the one surface both agree on, and were being
+    * dropped, which put a partial vkCmdClearAttachments in the corner. */
+   uint64_t offset = (uint64_t)dsty * stride + (uint64_t)dstx * pixel_size;
+
+   if (cp_clear_rect_kernel(cp, res, offset, width, height, stride,
+                            pixel_size, value, false))
+      return;
+
+   for (unsigned y = 0; y < height; y++) {
+      char *row = (char *)data + offset + (uint64_t)y * stride;
+      for (unsigned x = 0; x < width; x++)
+         memcpy(row + (size_t)x * pixel_size, value, pixel_size);
+   }
 }
 
 static void
@@ -626,7 +699,8 @@ cp_clear_depth_stencil(struct pipe_context *ctx, struct pipe_surface *dst,
                        unsigned width, unsigned height,
                        bool render_condition_enabled)
 {
-   cp_batch_flush((struct cp_context *)ctx);
+   struct cp_context *cp = (struct cp_context *)ctx;
+   cp_batch_flush(cp);
    if (!dst || !dst->texture)
       return;
    struct cp_resource *res = cp_resource(dst->texture);
@@ -634,23 +708,37 @@ cp_clear_depth_stencil(struct pipe_context *ctx, struct pipe_surface *dst,
    if (!data)
       return;
 
+   /* There is no stencil buffer and no stencil test in this driver
+    * (cp_screen.c takes only Z16, Z32F and Z24X8), so a stencil-only clear has
+    * nothing to write. It used to run the loop anyway with clear_val left at
+    * zero, which zeroed the whole depth buffer — a clear of an aspect that
+    * does not exist destroying the one that does. */
+   if (!(clear_flags & PIPE_CLEAR_DEPTH))
+      return;
+
    unsigned pixel_size = util_format_get_blocksize(dst->format);
    unsigned stride = res->lpr.row_stride[dst->level];
 
-   uint32_t clear_val = 0;
-   if (clear_flags & PIPE_CLEAR_DEPTH) {
-      if (pixel_size == 4) {
-         float f = (float)depth;
-         memcpy(&clear_val, &f, 4);
-      } else {
-         clear_val = (uint32_t)(depth * 65535.0);
-      }
+   uint32_t value[4] = { 0 };
+   if (pixel_size == 4) {
+      float f = (float)depth;
+      memcpy(&value[0], &f, 4);
+   } else {
+      value[0] = (uint32_t)(depth * 65535.0);
    }
 
-   for (unsigned y = dsty; y < dsty + height; y++) {
-      char *row = (char *)data + y * stride + dstx * pixel_size;
+   /* Level and layer left unbiased for the same reason as the colour
+    * attachment clear above. */
+   uint64_t offset = (uint64_t)dsty * stride + (uint64_t)dstx * pixel_size;
+
+   if (cp_clear_rect_kernel(cp, res, offset, width, height, stride,
+                            pixel_size, value, true))
+      return;
+
+   for (unsigned y = 0; y < height; y++) {
+      char *row = (char *)data + offset + (uint64_t)y * stride;
       for (unsigned x = 0; x < width; x++)
-         memcpy(row + x * pixel_size, &clear_val, pixel_size);
+         memcpy(row + (size_t)x * pixel_size, value, pixel_size);
    }
 }
 
@@ -658,8 +746,9 @@ static void
 cp_clear_texture(struct pipe_context *ctx, struct pipe_resource *res,
                  unsigned level, const struct pipe_box *box, const void *data)
 {
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *cp_res = cp_resource(res);
-   cp_batch_flush((struct cp_context *)ctx);
+   cp_batch_flush(cp);
    void *tex_data = cp_resource_data(cp_res);
    if (!tex_data)
       return;
@@ -668,12 +757,36 @@ cp_clear_texture(struct pipe_context *ctx, struct pipe_resource *res,
    unsigned stride = cp_res->lpr.row_stride[level];
    unsigned img_stride = cp_res->lpr.img_stride[level];
 
+   /* Already packed for us by util_pack_color_union in the frontend — packing
+    * it again here would produce a plausible wrong colour. Copied out into a
+    * full uint32_t[4] because the kernel argument is that wide and a narrow
+    * format only supplies the first few bytes. */
+   uint32_t value[4] = { 0 };
+   memcpy(value, data, MIN2(pixel_size, sizeof(value)));
+
+   /* A mip level lives at its own offset — clearing level 1 without this wrote
+    * over the top of level 0, which is where cp_buffer_map and
+    * cp_resource_copy_region have always looked (mip_offsets[level] + z *
+    * img_stride). This is an image operation with no draw path to disagree
+    * with, unlike the attachment clears above, so it can be made to agree with
+    * the rest of the addressing. A buffer has one level and no layout. */
+   uint64_t base = res->target == PIPE_BUFFER ? 0
+                                              : cp_res->lpr.mip_offsets[level];
+
    for (int z = box->z; z < box->z + box->depth; z++) {
-      for (int y = box->y; y < box->y + box->height; y++) {
-         char *row = (char *)tex_data + z * img_stride + y * stride + box->x * pixel_size;
-         for (int x = 0; x < box->width; x++) {
-            memcpy(row + x * pixel_size, data, pixel_size);
-         }
+      uint64_t offset = base +
+                        (uint64_t)z * img_stride +
+                        (uint64_t)box->y * stride +
+                        (uint64_t)box->x * pixel_size;
+
+      if (cp_clear_rect_kernel(cp, cp_res, offset, box->width, box->height,
+                               stride, pixel_size, value, false))
+         continue;
+
+      for (int y = 0; y < box->height; y++) {
+         char *row = (char *)tex_data + offset + (uint64_t)y * stride;
+         for (int x = 0; x < box->width; x++)
+            memcpy(row + (size_t)x * pixel_size, data, pixel_size);
       }
    }
 }
