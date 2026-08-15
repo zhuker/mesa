@@ -1392,6 +1392,14 @@ certain; whether removing it moves the frame depends on the vertex shader's
 current share of GPU time, which this document's own rule says to measure rather
 than argue about. One `tests/cp_profile.sh` run answers it.
 
+**That run has been made, and the answer is no.** On `gltfscenerendering` —
+93% GPU busy, kernel-bound, the sample this entry names as where it should show
+— `cp_vertex_fetch` is **1.9%** of GPU time and the vertex shader about **0.27
+ms of a 15 ms frame**. The frame is 63% fragment shader. Removing up to six
+sevenths of a 2% item is not worth the output-layout indirection it costs. The
+redundancy is still real and the entry stays for a workload whose vertex stage
+matters; this sample is not it, and neither is anything else in the set.
+
 The one coupling is with the output layout, not with anything in Phase 3: the VS
 output array becomes indexed per distinct vertex rather than per assembled
 vertex, so the rasterizer's `num_varyings + 1` stride needs an indirection.
