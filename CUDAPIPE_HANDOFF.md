@@ -194,24 +194,25 @@ stored — milliseconds per frame, the mean over the run (`cp_perf_run.sh ... 60
 compared, and is far too few to time: at sixty the render loop is a minority of
 the process. `tests/TESTING.md` has the measurement that settles it.
 
-| | nvidia | cudapipe | llvmpipe | before draw ranges | before the A-buffer | before any perf work |
+| | nvidia | cudapipe | llvmpipe | before the register cap | before draw ranges | before any perf work |
 |---|---|---|---|---|---|---|
-| gltfscenerendering | 0.1 | **15.3** | 15.2 | 15.3 | 15.1 | 343.9 |
-| instancing | 0.1 | **7.0** | 73.0 | 7.1 | 7.1 | 241.7 |
+| gltfscenerendering | 0.1 | **13.9** | 15.2 | 15.3 | 15.3 | 343.9 |
+| instancing | 0.1 | **6.7** | 73.0 | 7.0 | 7.1 | 241.7 |
 | multithreading | 0.3 | **6.0** | 96.9 | 6.0 | 6.0 | 156.6 |
-| particlesystem | 0.1 | **4.5** | 15.7 | 5.1 | 35.1 | 1361.7 |
-| multisampling | 0.0 | **3.4** | 5.3 | 3.4 | 3.4 | 41.1 |
-| **bloom** | 0.0 | **2.2** | 3.6 | 12.1 | 12.1 | 558.0 |
-| pbribl | 0.0 | **1.6** | 2.7 | 1.6 | 1.7 | 135.4 |
-| **vulkanscene** | 0.0 | **1.5** | 9.4 | 2.8 | 2.8 | 183.1 |
+| particlesystem | 0.1 | **4.1** | 15.7 | 4.5 | 5.1 | 1361.7 |
+| multisampling | 0.0 | **3.3** | 5.3 | 3.4 | 3.4 | 41.1 |
+| bloom | 0.0 | **2.2** | 3.6 | 2.2 | 12.1 | 558.0 |
+| pbribl | 0.0 | **1.6** | 2.7 | 1.6 | 1.6 | 135.4 |
+| vulkanscene | 0.0 | **1.5** | 9.4 | 1.5 | 2.8 | 183.1 |
 | dynamicuniformbuffer | 0.0 | **1.3** | 1.0 | 1.3 | 1.3 | 128.5 |
-| **total, one frame of each** | **0.9** | **50.0** | **232.1** | **61.8** | **91.8** | **3792.2** |
+| **total, one frame of each** | **0.9** | **47.6** | **232.1** | **50.0** | **61.8** | **3792.2** |
 
-**cudapipe finishes the sweep 4.64x ahead of llvmpipe**, and **every sample
-above 1.3 ms is at or ahead of it** — what remains behind are the sub-millisecond
-samples like `triangle` and `texture3d`, which measure the driver's per-frame
-floor rather than anything about drawing. It was 16x behind. Seven passes got it
-there; five have their own write-up:
+**cudapipe finishes the sweep 4.88x ahead of llvmpipe**, ahead of it on twelve
+of the seventeen samples, and **every sample above 1.5 ms is ahead of it** —
+`gltfscenerendering` included, as of the eighth pass. What remains behind are
+five sub-1.3 ms samples like `triangle` and `texture3d`, which measure the
+driver's per-frame floor rather than anything about drawing. It was 16x behind.
+Eight passes got it there; five have their own write-up:
 
 - `PERFORMANCE_PROGRESS.md` — the first pass, 3792 -> 207 ms. 96% of it was
   three defects rather than any optimization, the largest being that
@@ -266,6 +267,19 @@ behind them were wrong in instructive ways.
   neither predicted. The per-triangle draw index that pass expected to need
   turned out not to be needed at all — `bloom`'s draws differ in nothing but the
   range.
+
+The eighth pass has no write-up either; it is one commit, "pick each shader's
+register cap by trying both", 50 -> 47.6 ms. `ncu` had Sponza's fragment shader
+at 195 registers and one 256-thread block per SM, latency-bound with no
+spilling. The plan proposed capping only the shaders whose register count costs
+occupancy — but **every fragment shader that links the sampler is exactly 195
+registers, in all 17 samples**, because that is the *sampler's* allocation and
+not the shader's, so the count cannot discriminate. `__launch_bounds__` is worse:
+`.minnctapersm 2` makes every sampler-linked shader fail to load. What
+discriminates is whether capping buys an occupancy step, which is not
+predictable from the count — so the driver compiles both builds and times them
+on the application's own draws, keeping the capped one unless it is more than 5%
+worse. texturemipmapgen -13.3%, particlesystem -10.0%, gltfscenerendering -8.1%.
 
 NVIDIA's column is not a rendering time. Offscreen benchmarking measures
 recording and submitting a frame, and nothing waits for the GPU until the pass
@@ -370,8 +384,11 @@ cudapipe Gallium driver
     │   5. cp_fs_interpolate    (compact into 2x2 quads, interpolate varyings)
     │   6. Fragment shader kernel (four threads per quad)
     │   7. cp_fs_writeback      (drop helpers, discard mask, blend, attachment)
-    │   steps 4-7 repeat: up to CP_DISCARD_LAYERS times for an alpha-tested
-    │   draw, up to CP_BLEND_LAYERS times for a blended one
+    │   steps 4-7 repeat up to CP_DISCARD_LAYERS times for an alpha-tested draw.
+    │   A blended draw takes the A-buffer instead — rasterized once into
+    │   per-pixel fragment lists, sorted, shaded and composited once; see
+    │   ABUFFER.md. Only the draws it refuses (multisample, depth-writing, more
+    │   than one attachment) fall back to CP_BLEND_LAYERS passes of 4-7.
     ├── blit: cp_resolve_samples when a multisample source meets a
     │   single-sample destination, a plain copy or format translate otherwise
     └── flush: cuCtxSynchronize + scratch reclaim
@@ -437,9 +454,23 @@ passes while keeping every pixel parallel within one.
 
 Passes are bounded by the primitive count and by `CP_BLEND_LAYERS`, and the
 loop stops as soon as a pass selects nothing — the second pass, for the blended
-draws that do not overlap themselves. particlesystem's fire is 512 additive
-sprites piled tens deep and converges at 256 layers; 1024 gives a bit-identical
-image.
+draws that do not overlap themselves.
+
+**This is no longer the default path — see `ABUFFER.md`.** An eligible blended
+draw is rasterized once into per-pixel fragment lists sorted by submission
+index, shaded once and composited once; `CUDAPIPE_NO_ABUFFER=1` puts it back on
+the loop above, and draws the A-buffer refuses still take it.
+
+Two things this paragraph used to say are wrong, both measured while building
+that. **particlesystem's fire is not additive**: the pipeline is
+`src = ONE, dst = ONE_MINUS_SRC_ALPHA, op = ADD`, premultiplied *over*, which is
+order-dependent. It behaves additively only where the texture's alpha is near
+zero, and that is data the driver cannot see. **And it does not converge at 256
+layers — it hits the cap.** A census counting at `emit_fragment()` puts the true
+maximum depth at 411, with 4,040 pixels deeper than `CP_BLEND_LAYERS` and
+**13.6% of all coverage never composited**. That 1024 gives a bit-identical
+image is still true and is now explained: the core saturates long before either
+bound, so the dropped layers are invisible rather than absent.
 
 **Multisampling resolves coverage and depth per sample and shades per pixel.**
 The rasterizer tests each sample position in turn — the standard Vulkan
@@ -516,10 +547,10 @@ smooth.
    `gltfscenerendering` 15697 -> 25036, `instancing` 3506 -> 5346,
    `texturecubemap` 4144 -> 4774. Do not re-apply it wholesale; the two halves of
    it have not been measured separately.
-5. **A blended draw costs one `cuStreamSynchronize` per layer.** The host reads
-   a managed flag between passes to decide whether another is worth launching.
-   That is the first thing to attack if blended draws ever dominate a frame; the
-   flag could instead drive a device-side loop or a launch graph.
+5. **Largely closed twice over.** The peel loop's host sync per layer became a
+   doubling interval in Phase 1a, and the loop itself is no longer the default —
+   an eligible blended draw takes the A-buffer and syncs once, to read the
+   fragment count. What is left applies only to draws the A-buffer refuses.
 6. **Peeling does not combine with the alpha-test retry loop.** Both want the
    same multi-pass machinery for different reasons, so a shader that discards
    keeps the retry path and gets the old single-layer blending. No sample in the
@@ -807,7 +838,10 @@ retried.
 | `CUDAPIPE_NO_BINCACHE` | rebuild the binning queues on every peel pass, as before |
 | `CUDAPIPE_SMALL_THRESHOLD` / `MEDIUM_THRESHOLD` / `POINT_THRESHOLD` | rasterizer stage boundaries, `-D` at NVRTC time — sweep without rebuilding |
 | `CUDAPIPE_TILE_BOUND` | `0` puts stage 3 back to walking the whole tile |
-| `CUDAPIPE_MAX_REGISTERS` | cap shader registers via `CU_JIT_MAX_REGISTERS` |
+| `CUDAPIPE_MAX_REGISTERS` | cap shader registers via `CU_JIT_MAX_REGISTERS`; forces every shader, bypassing the policy below |
+| `CUDAPIPE_NO_REGCAP` | disable the per-shader register-cap policy — the driver compiles both builds and times them on real draws |
+| `CUDAPIPE_SHADER_STATS=1` | every shader's registers, spill, blocks/SM and capping decision |
+| `CUDAPIPE_REGCAP_STATIC=1` / `CUDAPIPE_TUNE_VETO` | the compile-time-only shape, kept measurable; the veto threshold (not load-bearing between 1.03 and 1.05) |
 | `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
 
 ```bash
@@ -852,7 +886,15 @@ retried.
   have to multiply the allocation by `nr_samples`.
 * LLVM's NVPTX backend only knows architectures that existed when it was
   released, so `CP_MAX_PTX_SM` in `cp_nir_to_llvm.c` caps the architecture and
-  lets the driver JIT forward. Raise it together with the PTX ISA version.
+  lets the driver JIT forward. **Do not raise it expecting a win — `SM120.md`
+  asked and answered this.** LLVM 18 tops out at `sm_90a`/`ptx83` and sm_120
+  needs PTX ISA 8.7, so it cannot emit loadable sm_120 PTX at any setting; the
+  register allocation and SASS already target sm_120 because ptxas compiles for
+  the context's device whatever the PTX names; and the sm_86 → sm_120 delta for
+  a shader is tensor cores and TMA, which the NVPTX backend only emits from
+  intrinsics. The features that would help this driver — `griddepcontrol`,
+  clusters — are already open to the `.cu` kernels, which go through NVRTC at
+  `compute_120` and never touch LLVM.
 * **Batching's correctness rests on deferral, not on merging, and the invariant
   is not self-enforcing.** Holding a draw back means `cp_draw_execute()` runs
   after the next draw's state has been bound, which rendered `vulkanscene` 12.9%

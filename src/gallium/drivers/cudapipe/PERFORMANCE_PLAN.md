@@ -65,7 +65,18 @@ standing regressions (`gltfscenerendering`, `texture3d`) included.
 | **total over the sweep** | **3792.15 ms** | **205.3 / 206.7 ms** | **168.10 ms** | **149.83 ms** | **108.98 ms** | **~34.8x** |
 | llvmpipe, same sweep | 233.00 ms | 233.00 ms | 232.14 ms | 232.14 ms | 232.14 ms | — |
 
-cudapipe is now **2.13x faster than llvmpipe** over the set.
+**Four more passes since, and this table stops at the fifth.** The sweep is now
+**47.58 ms and 4.88x llvmpipe**, ahead of it on twelve of seventeen samples with
+every sample above 1.5 ms ahead. In order: the peel loop's binning cache, point
+threshold and tile bound (109 → 92); the A-buffer replacing the peel loop
+(92 → 62, `ABUFFER.md`); draws with differing index ranges merging (62 → 50,
+`BATCHING.md`); and a per-shader register cap chosen by timing both builds
+(50 → 47.6). `CUDAPIPE_HANDOFF.md` carries the current per-sample table — this
+document is a plan, and its numbers are the state each item was decided against
+rather than the state of the driver.
+
+cudapipe was **2.13x faster than llvmpipe** over the set at the point this table
+ends.
 
 Two runs of the final build are quoted because they differ by 0.6%, which is
 about the run-to-run spread of the sweep and worth carrying so that a later
@@ -790,6 +801,21 @@ understates anything else on the plan — but that is an argument for measuring 
 against a representative scene, not a number.
 
 ## Fragment shader occupancy — a real item, and not a layout one
+
+**Done, and both shapes proposed below turned out to be wrong.** `ncu` confirms
+the diagnosis — registers bind occupancy at one block per SM, no spilling,
+latency-bound — but the compile-time signal does not discriminate: **every
+fragment shader that links the sampler is exactly 195 registers, in all 17
+samples**, because 195 is the *sampler's* allocation. So "cap only the shaders
+whose count is costing occupancy" selects the same set a fixed cap does.
+`__launch_bounds__` is worse: `.minnctapersm 2` makes every sampler-linked
+shader fail to load, and on shaders that do not link it, it *raises* the count.
+What discriminates is whether capping buys an occupancy step, which is not
+predictable from the count — so the driver compiles both builds and times them
+on the application's own draws. `texturemipmapgen` −13.3%, `particlesystem`
+−10.0%, `gltfscenerendering` −8.1%, the sweep 50 → 47.6 ms. The `bloom` +3.2%
+below does not carry forward; it was measured when bloom was 12 ms with 151
+unbatched draws a frame.
 
 `ncu` puts the Sponza fragment shader at **195 registers per thread**, which
 fits one 256-thread block on an SM: theoretical occupancy 16.7%, achieved 8.8%,
