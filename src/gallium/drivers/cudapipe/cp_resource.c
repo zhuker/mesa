@@ -243,10 +243,26 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
 
    unsigned src_stride = src_res->lpr.row_stride[src_level];
    unsigned dst_stride = dst_res->lpr.row_stride[dst_level];
-   unsigned pixel_size = util_format_get_blocksize(src->format);
 
-   if (!src_stride) src_stride = src->width0 * pixel_size;
-   if (!dst_stride) dst_stride = dst->width0 * pixel_size;
+   /*
+    * The unit of a copy is a block, not a pixel. They are the same thing for
+    * an uncompressed format, but a BC1 block is 8 bytes covering 4x4 pixels,
+    * so measuring the box in pixels reads and writes sixteen times the real
+    * extent — far enough past the end of the allocation to fault. The box
+    * itself is in pixels, hence the conversion here rather than at the call.
+    */
+   unsigned block_size = util_format_get_blocksize(src->format);
+   unsigned blocks_w = util_format_get_nblocksx(src->format, src_box->width);
+   unsigned blocks_h = util_format_get_nblocksy(src->format, src_box->height);
+   unsigned src_bx = util_format_get_nblocksx(src->format, src_box->x);
+   unsigned src_by = util_format_get_nblocksy(src->format, src_box->y);
+   unsigned dst_bx = util_format_get_nblocksx(dst->format, dstx);
+   unsigned dst_by = util_format_get_nblocksy(dst->format, dsty);
+
+   if (!src_stride)
+      src_stride = util_format_get_nblocksx(src->format, src->width0) * block_size;
+   if (!dst_stride)
+      dst_stride = util_format_get_nblocksx(dst->format, dst->width0) * block_size;
 
    unsigned src_img_stride = src_res->lpr.img_stride[src_level];
    unsigned dst_img_stride = dst_res->lpr.img_stride[dst_level];
@@ -267,14 +283,14 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
    for (int z = 0; z < src_box->depth; z++) {
       char *s = (char *)src_data + src_off +
                 (src_box->z + z) * src_img_stride +
-                (unsigned)src_box->y * src_stride +
-                (unsigned)src_box->x * pixel_size;
+                src_by * src_stride +
+                src_bx * block_size;
       char *d = (char *)dst_data + dst_off +
                 (dstz + z) * dst_img_stride +
-                dsty * dst_stride +
-                dstx * pixel_size;
-      unsigned row_bytes = (unsigned)src_box->width * pixel_size;
-      for (int y = 0; y < src_box->height; y++) {
+                dst_by * dst_stride +
+                dst_bx * block_size;
+      unsigned row_bytes = blocks_w * block_size;
+      for (unsigned y = 0; y < blocks_h; y++) {
          memcpy(d + y * dst_stride, s + y * src_stride, row_bytes);
       }
    }
