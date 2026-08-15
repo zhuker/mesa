@@ -370,6 +370,21 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    /* Same format and same size */
    if (info->src.format == info->dst.format && src_w == dst_w && src_h == dst_h) {
       cuCtxSetCurrent(cp->screen->cuda_ctx);
+
+      /*
+       * In blocks, not pixels — the same confusion cp_resource_copy_region had.
+       * util_format_get_blocksize is bytes per block while the box is in
+       * pixels, so a BC1 blit would walk sixteen times its real extent. Both
+       * formats are equal in this arm, so one set of block counts serves both
+       * sides; for an uncompressed format a block is one pixel and every value
+       * below is what it was.
+       */
+      unsigned bw = util_format_get_nblocksx(info->src.format, src_w);
+      unsigned bh = util_format_get_nblocksy(info->src.format, src_h);
+      unsigned sbx = util_format_get_nblocksx(info->src.format, info->src.box.x);
+      unsigned sby = util_format_get_nblocksy(info->src.format, info->src.box.y);
+      unsigned dbx = util_format_get_nblocksx(info->dst.format, info->dst.box.x);
+      unsigned dby = util_format_get_nblocksy(info->dst.format, info->dst.box.y);
       /* If both are CUDA-managed, use GPU copy (stays in stream order).
        * Otherwise sync and memcpy (one side is host-only memory). */
       if (src_res->cuda_managed && dst_res->cuda_managed) {
@@ -379,18 +394,16 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
             copy.srcDevice = (CUdeviceptr)(uintptr_t)src_data +
                              src_res->lpr.mip_offsets[info->src.level] +
                              (info->src.box.z + z) * src_img_stride +
-                             (unsigned)info->src.box.y * src_stride +
-                             (unsigned)info->src.box.x * src_pixel_size;
+                             sby * src_stride + sbx * src_pixel_size;
             copy.srcPitch = src_stride;
             copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
             copy.dstDevice = (CUdeviceptr)(uintptr_t)dst_data +
                              dst_res->lpr.mip_offsets[info->dst.level] +
                              (info->dst.box.z + z) * dst_img_stride +
-                             (unsigned)info->dst.box.y * dst_stride +
-                             (unsigned)info->dst.box.x * dst_pixel_size;
+                             dby * dst_stride + dbx * dst_pixel_size;
             copy.dstPitch = dst_stride;
-            copy.WidthInBytes = (unsigned)src_w * src_pixel_size;
-            copy.Height = (unsigned)src_h;
+            copy.WidthInBytes = bw * src_pixel_size;
+            copy.Height = bh;
             cuMemcpy2D(&copy);
          }
       } else {
@@ -399,15 +412,13 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
             char *s = (char *)src_data +
                       src_res->lpr.mip_offsets[info->src.level] +
                       (info->src.box.z + z) * src_img_stride +
-                      (unsigned)info->src.box.y * src_stride +
-                      (unsigned)info->src.box.x * src_pixel_size;
+                      sby * src_stride + sbx * src_pixel_size;
             char *d = (char *)dst_data +
                       dst_res->lpr.mip_offsets[info->dst.level] +
                       (info->dst.box.z + z) * dst_img_stride +
-                      (unsigned)info->dst.box.y * dst_stride +
-                      (unsigned)info->dst.box.x * dst_pixel_size;
-            unsigned row_bytes = (unsigned)src_w * src_pixel_size;
-            for (int y = 0; y < src_h; y++)
+                      dby * dst_stride + dbx * dst_pixel_size;
+            unsigned row_bytes = bw * src_pixel_size;
+            for (unsigned y = 0; y < bh; y++)
                memcpy(d + y * dst_stride, s + y * src_stride, row_bytes);
          }
       }

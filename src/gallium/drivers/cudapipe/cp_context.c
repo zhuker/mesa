@@ -5285,6 +5285,18 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    if (num_draws == 0 || draws[0].count == 0)
       return;
 
+   /*
+    * Culling both faces draws nothing. cp_cull_mode() returns 0 for that case
+    * — "keep everything" — with a comment saying the draw is skipped instead,
+    * and nothing skipped it, so a draw that should have rendered nothing
+    * rendered in full. Points have no winding, and the rasterizer already
+    * ignores culling for them, so they are exempt here too.
+    */
+   if (info->mode != MESA_PRIM_POINTS &&
+       (cp->rasterizer.cull_face & PIPE_FACE_FRONT_AND_BACK) ==
+       PIPE_FACE_FRONT_AND_BACK)
+      return;
+
    cuCtxSetCurrent(screen->cuda_ctx);
 
    bool blended = false;
