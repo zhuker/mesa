@@ -107,9 +107,47 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
       samples = CP_MAX_SAMPLES;
    cp->fb_samples = samples;
 
-   /* Reallocate the visibility and depth buffers if the size changed */
+   /*
+    * Size the five framebuffer-sized buffers, growing only.
+    *
+    * These used to be reallocated whenever the bound size differed from the
+    * last one, which is fine for a workload that renders one size and
+    * pathological for one that does not: a real capture alternates 1280x720
+    * with a 160x90 bloom pyramid many times a frame, so an equality test threw
+    * all five away and rebuilt them in both directions 9.5 times a frame. That
+    * measured 356 GB of allocation churn over a replay and 3.4 ms a frame,
+    * with the device idle for every microsecond of it.
+    *
+    * Keeping the largest is safe because nothing here is addressed by capacity:
+    * every kernel that reads these is bounded by the width and height passed at
+    * launch, and the depth clear below uses the bound size, so a buffer sized
+    * for 921,600 pixels serves a 14,400-pixel pass and clears only the part in
+    * use. The two counts are tracked separately because visbuf and depthbuf
+    * scale with samples and the other three do not.
+    */
    unsigned w = state->width, h = state->height;
-   if (w != cp->visbuf_w || h != cp->visbuf_h || samples != cp->visbuf_samples) {
+   size_t px = (size_t)w * h;
+   size_t px_samples = px * samples;
+
+   /*
+    * A different size means the depth contents at these addresses belong to
+    * some other framebuffer, whether or not the buffer was big enough to keep.
+    * The reallocation used to imply this; now that it no longer happens on
+    * every change, say it directly.
+    */
+   if (w != cp->visbuf_w || h != cp->visbuf_h || samples != cp->visbuf_samples)
+      cp->depthbuf_cleared = false;
+
+   cp->visbuf_w = cp->depthbuf_w = w;
+   cp->visbuf_h = cp->depthbuf_h = h;
+   cp->visbuf_samples = samples;
+
+   if (px > 0 && (px > cp->fb_cap_px || px_samples > cp->fb_cap_px_samples)) {
+      /* Grow both to the new high-water mark, so a later pass that is wider
+       * but has fewer samples does not come back here. */
+      cp->fb_cap_px = MAX2(cp->fb_cap_px, px);
+      cp->fb_cap_px_samples = MAX2(cp->fb_cap_px_samples, px_samples);
+
       if (cp->visbuf)
          cuMemFree(cp->visbuf);
       if (cp->depthbuf)
@@ -125,28 +163,28 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
       cp->reject = 0;
       cp->resolved = 0;
       cp->peel_next = 0;
-      cp->visbuf_w = cp->depthbuf_w = w;
-      cp->visbuf_h = cp->depthbuf_h = h;
-      cp->visbuf_samples = samples;
-      if (w > 0 && h > 0) {
-         cuCtxSetCurrent(cp->screen->cuda_ctx);
-         CUresult e1 = cuMemAlloc(&cp->visbuf,
-                                  (size_t)w * h * samples * sizeof(uint64_t));
-         CUresult e2 = cuMemAlloc(&cp->depthbuf,
-                                  (size_t)w * h * samples * sizeof(uint32_t));
-         cuMemAlloc(&cp->reject,
-                    (size_t)w * h * CP_DISCARD_LAYERS * sizeof(uint32_t));
-         cuMemAlloc(&cp->resolved, (size_t)w * h);
-         cuMemAlloc(&cp->peel_next, (size_t)w * h * sizeof(uint32_t));
-         /* Managed, because the host reads it between passes to decide
-          * whether another one is worth launching. */
-         if (!cp->peel_any)
-            cuMemAllocManaged(&cp->peel_any, sizeof(uint32_t),
-                              CU_MEM_ATTACH_GLOBAL);
-         if (e1 != CUDA_SUCCESS || e2 != CUDA_SUCCESS)
-            fprintf(stderr, "cudapipe: visbuf/depthbuf alloc %ux%u failed "
-                    "(%d, %d)\n", w, h, e1, e2);
-      }
+
+      cuCtxSetCurrent(cp->screen->cuda_ctx);
+      CUresult e1 = cuMemAlloc(&cp->visbuf,
+                               cp->fb_cap_px_samples * sizeof(uint64_t));
+      CUresult e2 = cuMemAlloc(&cp->depthbuf,
+                               cp->fb_cap_px_samples * sizeof(uint32_t));
+      CP_CU_WARN(cuMemAlloc(&cp->reject,
+                            cp->fb_cap_px * CP_DISCARD_LAYERS * sizeof(uint32_t)),
+                 "cuMemAlloc(reject)");
+      CP_CU_WARN(cuMemAlloc(&cp->resolved, cp->fb_cap_px), "cuMemAlloc(resolved)");
+      CP_CU_WARN(cuMemAlloc(&cp->peel_next, cp->fb_cap_px * sizeof(uint32_t)),
+                 "cuMemAlloc(peel_next)");
+      /* Managed, because the host reads it between passes to decide
+       * whether another one is worth launching. */
+      if (!cp->peel_any)
+         cuMemAllocManaged(&cp->peel_any, sizeof(uint32_t),
+                           CU_MEM_ATTACH_GLOBAL);
+      if (e1 != CUDA_SUCCESS || e2 != CUDA_SUCCESS)
+         fprintf(stderr, "cudapipe: visbuf/depthbuf alloc %zu px x %u samples "
+                 "failed (%d, %d)\n", cp->fb_cap_px, samples, e1, e2);
+
+      /* Contents are new, whatever was cleared before is gone. */
       cp->depthbuf_cleared = false;
    }
 
@@ -1942,6 +1980,9 @@ struct cp_abuf {
     */
    CUdeviceptr blk_counts, blk_offsets, blk_list, blk_list_count;
    CUdeviceptr bsum1, bsum1x, bsum2, bsum2x, bsum3, quad_overflow, dbg;
+   /* The single allocation sum3, bsum3 and clist_count are carved out of,
+    * so that the per-draw readback is one copy rather than three. */
+   CUdeviceptr counters;
    unsigned bnb1, bnb2, bnb3, nblocks, quad_width;
    CUdeviceptr quad_prim, quad_mask, peel_mask, quad_block;
    unsigned quad_capacity;
@@ -2137,15 +2178,29 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
 
    /* The fixed-size counters and the events, once per process. */
    if (!ab->sum3) {
-      if (!cp_abuf_alloc(ab, &ab->sum3, 4 * 3, "sum3+counters") ||
+      /*
+       * Every eligible draw drains the stream and then reads six words back,
+       * and they used to be three allocations and therefore three separate
+       * synchronous copies: 628 of them a frame, 2.8 ms, with the device idle
+       * for 93% of it. One allocation in the order the readback wants makes it
+       * one copy.
+       *
+       * The words are laid out sum3 | bsum3 | clist_count so that
+       * CP_ABUF_COUNTERS covers all six; the existing derived pointers stay
+       * offsets into it exactly as they were.
+       */
+      if (!cp_abuf_alloc(ab, &ab->counters, 4 * CP_ABUF_COUNTERS,
+                         "sum3+bsum3+clist_count") ||
           !cp_abuf_alloc(ab, &ab->list_count, 4, "list_count") ||
           !cp_abuf_alloc(ab, &ab->blk_list_count, 4, "block worklist count") ||
-          !cp_abuf_alloc(ab, &ab->bsum3, 4 * 2, "block sum3+overflow") ||
           !cp_abuf_alloc(ab, &ab->dbg, CP_ABUF_DBG_COUNTERS * 4,
                          "debug counters"))
          return false;
-      /* Three words in one allocation: the scan total, the fill's overflow
-       * counter and the sort's long-run counter. */
+
+      ab->sum3 = ab->counters;              /* scan total, fill overflow, long runs */
+      ab->bsum3 = ab->counters + 4 * 3;     /* quad total, quad overflow */
+      ab->clist_count = ab->counters + 4 * 5;
+
       ab->overflow = ab->sum3 + 4;
       ab->long_runs = ab->sum3 + 8;
       ab->quad_overflow = ab->bsum3 + 4;
@@ -2242,9 +2297,8 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
           !cp_abuf_alloc(ab, &ab->clist, ab->cap_pixels * sizeof(uint32_t),
                          "composite worklist"))
          return false;
-      if (!ab->clist_count &&
-          !cp_abuf_alloc(ab, &ab->clist_count, 4, "composite worklist count"))
-         return false;
+      /* clist_count is carved out of ab->counters above, so that the
+       * per-draw readback stays a single copy; nothing to allocate. */
    }
 
    if (cp_abuf.verify && n > ab->cap_log_pixels) {
@@ -4465,14 +4519,16 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
        * approximately.
        */
       if (cp_abuf.composite) {
-         uint32_t q[2] = { 0, 0 }, c3[3] = { 0, 0, 0 };
+         uint32_t ctr[CP_ABUF_COUNTERS] = { 0 };
          cuStreamSynchronize(cp->stream);
-         cuMemcpyDtoH(q, ab->bsum3, sizeof(q));
-         cuMemcpyDtoH(c3, ab->sum3, sizeof(c3));
-         /* Free, since the drain is already paid for: the composite's grid is
-          * then the covered pixels rather than the framebuffer, which on a
-          * sample covering 4% of it is 140 blocks instead of 3,600. */
-         cuMemcpyDtoH(&abuf_covered, ab->clist_count, sizeof(abuf_covered));
+         /* One copy: sum3, bsum3 and clist_count are contiguous. The last of
+          * them is free rather than merely cheap now — the composite's grid is
+          * the covered pixels rather than the framebuffer, which on a sample
+          * covering 4% of it is 140 blocks instead of 3,600. */
+         cuMemcpyDtoH(ctr, ab->counters, sizeof(ctr));
+         const uint32_t *c3 = &ctr[0];
+         const uint32_t *q = &ctr[3];
+         abuf_covered = ctr[5];
          abuf_quads = q[0];
          abuf_prod = q[0] != 0 && q[1] == 0 && c3[1] == 0;
          if (!abuf_prod) {

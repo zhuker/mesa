@@ -193,6 +193,15 @@ struct cp_rasterize_args {
 #define CP_ABUF_DBG_DEGENERATE  2  /* ... whose interpolation refused a covered pixel */
 #define CP_ABUF_DBG_FULL        3  /* ... dropped because the fragment buffer filled */
 #define CP_ABUF_DBG_SLOT_BAD    4  /* shaded fragments whose A-buffer slot was out of range */
+/*
+ * The six words the host reads back after each A-buffer drain, in one
+ * allocation and in this order: sum3 (scan total, fill overflow, long runs),
+ * bsum3 (quad total, quad overflow), then clist_count. Contiguous so the
+ * readback is a single copy — it happens once per eligible draw, which is
+ * hundreds of times a frame.
+ */
+#define CP_ABUF_COUNTERS        6
+
 #define CP_ABUF_DBG_COUNTERS    5
 
 /*

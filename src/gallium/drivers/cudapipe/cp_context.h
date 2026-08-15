@@ -193,6 +193,21 @@ struct cp_context {
    CUdeviceptr peel_next;   /* per-pixel: first primitive not yet blended */
    CUdeviceptr peel_any;    /* one uint32, managed: a pass found work to do */
    unsigned visbuf_w, visbuf_h;
+   /*
+    * What the five framebuffer-sized buffers were actually allocated for, as
+    * opposed to what is bound now. They are kept at the largest size seen and
+    * only reallocated when that grows, because an application renders more
+    * than one size: this capture runs fifteen render passes a frame at
+    * 1280x720 and 160x90, and an equality test against the bound size
+    * reallocated all five in both directions 9.5 times a frame — 356 GB of
+    * churn over a replay, 3.4 ms a frame, every microsecond of it with the
+    * device idle.
+    *
+    * Two counts because they do not scale together: visbuf and depthbuf are
+    * per sample, the other three are per pixel.
+    */
+   size_t fb_cap_px;
+   size_t fb_cap_px_samples;
 
    /* Depth buffer for the render pass, one sortable uint32 per pixel. This is
     * what carries occlusion across draws. */
