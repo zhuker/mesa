@@ -705,13 +705,93 @@ cp_build_vertex_refs(const struct pipe_draw_info *info,
 }
 
 /*
+ * Describe a vertex format for the fetch kernel.
+ *
+ * Vulkan delivers every component of a vertex attribute in its own 32 bit
+ * slot however narrow it is in memory, so the fetch has to widen anything that
+ * is not already 32 bits per component. cp_screen.c's claim that attributes
+ * are "fetched as raw bytes and reinterpreted by the shader" holds only for
+ * the 32-bit-per-component formats; for an R8G8B8A8_UINT it packs all four
+ * components into the first slot, which a shader indexing an array with the
+ * result reads as a value up to 2^32.
+ *
+ * Fills nr_chan, chan_bytes and swizzle, and returns the conversion. Formats
+ * whose channels are not a whole number of bytes, or not all the same width,
+ * keep the old verbatim copy — they would need bitfield extraction, and
+ * nothing reaching this driver uses one.
+ */
+static enum cp_vf_conv
+cp_vertex_format(enum pipe_format format, uint32_t *nr_chan,
+                 uint32_t *chan_bytes, uint32_t *swizzle)
+{
+   const struct util_format_description *desc =
+      util_format_description(format);
+
+   *nr_chan = 0;
+   *chan_bytes = 0;
+   *swizzle = 0x3210;
+
+   if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN)
+      return CP_VF_CONV_COPY32;
+
+   const struct util_format_channel_description *chan = &desc->channel[0];
+   unsigned size = chan->size;
+
+   if (size % 8 || size > 32)
+      return CP_VF_CONV_COPY32;
+
+   for (unsigned c = 1; c < desc->nr_channels; c++) {
+      if (desc->channel[c].size != size ||
+          desc->channel[c].type != chan->type ||
+          desc->channel[c].normalized != chan->normalized ||
+          desc->channel[c].pure_integer != chan->pure_integer)
+         return CP_VF_CONV_COPY32;
+   }
+
+   *nr_chan = desc->nr_channels;
+   *chan_bytes = size / 8;
+
+   uint32_t swz = 0;
+   for (unsigned c = 0; c < 4; c++) {
+      unsigned s = c < 4 ? desc->swizzle[c] : PIPE_SWIZZLE_0;
+      /* Anything that is not a plain channel reference reads as the zero fill
+       * or as fill_w, so point it past the channel count and let the kernel
+       * skip it. */
+      swz |= (uint32_t)(s <= PIPE_SWIZZLE_W ? s : 0xf) << (c * 4);
+   }
+   *swizzle = swz;
+
+   if (size == 32)
+      return CP_VF_CONV_COPY32;
+
+   switch (chan->type) {
+   case UTIL_FORMAT_TYPE_FLOAT:
+      return size == 16 ? CP_VF_CONV_FLOAT16 : CP_VF_CONV_COPY32;
+   case UTIL_FORMAT_TYPE_UNSIGNED:
+      if (chan->normalized)
+         return CP_VF_CONV_UNORM;
+      return chan->pure_integer ? CP_VF_CONV_UINT : CP_VF_CONV_USCALED;
+   case UTIL_FORMAT_TYPE_SIGNED:
+      if (chan->normalized)
+         return CP_VF_CONV_SNORM;
+      return chan->pure_integer ? CP_VF_CONV_SINT : CP_VF_CONV_SSCALED;
+   default:
+      return CP_VF_CONV_COPY32;
+   }
+}
+
+/*
  * The value a vertex attribute's fourth component reads as when the format
  * doesn't supply one. Vulkan defines the missing components of a vertex
  * attribute as (0, 0, 0, 1), and the zero-filled slot already covers y and z.
  * Returns 0 when the format supplies all four components and nothing is due.
+ *
+ * Which one it is follows from the conversion rather than from the format:
+ * every conversion that produces a float wants 1.0f, and only the ones that
+ * leave an integer in the slot want an integer 1.
  */
 static uint32_t
-cp_vertex_fill_w(enum pipe_format format)
+cp_vertex_fill_w(enum pipe_format format, enum cp_vf_conv conv)
 {
    const struct util_format_description *desc =
       util_format_description(format);
@@ -719,23 +799,30 @@ cp_vertex_fill_w(enum pipe_format format)
    if (!desc || desc->nr_channels >= 4)
       return 0;
 
-   if (desc->channel[0].type == UTIL_FORMAT_TYPE_FLOAT) {
-      float one = 1.0f;
-      uint32_t bits;
-      memcpy(&bits, &one, 4);
-      return bits;
+   bool is_float;
+   switch (conv) {
+   case CP_VF_CONV_UINT:
+   case CP_VF_CONV_SINT:
+      is_float = false;
+      break;
+   case CP_VF_CONV_COPY32:
+      /* Untouched 32 bit components: float unless the format is a plain
+       * integer one. */
+      is_float = desc->channel[0].type == UTIL_FORMAT_TYPE_FLOAT ||
+                 desc->channel[0].normalized;
+      break;
+   default:
+      is_float = true;   /* unorm, snorm, uscaled, sscaled, half */
+      break;
    }
 
-   /* Normalised formats also read as 1.0, and this driver hands the shader
-    * floats for them, so only the plain integer formats want an integer 1. */
-   if (desc->channel[0].normalized) {
-      float one = 1.0f;
-      uint32_t bits;
-      memcpy(&bits, &one, 4);
-      return bits;
-   }
+   if (!is_float)
+      return 1;
 
-   return 1;
+   float one = 1.0f;
+   uint32_t bits;
+   memcpy(&bits, &one, 4);
+   return bits;
 }
 
 /* 0 = keep everything, 1 = drop positive-area triangles, 2 = drop negative. */
@@ -3318,7 +3405,16 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
             vf_args.elem_src_offset[e] = elem->src_offset;
             vf_args.elem_src_stride[e] = elem->src_stride;
             vf_args.elem_attr_size[e] = util_format_get_blocksize(elem->src_format);
-            vf_args.elem_fill_w[e] = cp_vertex_fill_w(elem->src_format);
+
+            uint32_t nr_chan, chan_bytes, swizzle;
+            enum cp_vf_conv conv = cp_vertex_format(elem->src_format, &nr_chan,
+                                                    &chan_bytes, &swizzle);
+            vf_args.elem_nr_chan[e] = nr_chan;
+            vf_args.elem_chan_bytes[e] = chan_bytes;
+            vf_args.elem_conv[e] = conv;
+            vf_args.elem_swizzle[e] = swizzle;
+
+            vf_args.elem_fill_w[e] = cp_vertex_fill_w(elem->src_format, conv);
             vf_args.elem_instance_divisor[e] = elem->instance_divisor;
          }
 

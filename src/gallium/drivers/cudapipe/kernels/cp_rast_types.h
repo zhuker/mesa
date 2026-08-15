@@ -809,6 +809,28 @@ struct cp_rast_queues {
 #define CP_MAX_VERTEX_ELEMENTS_VF 16
 #define CP_MAX_VERTEX_BUFFERS_VF 16
 
+/*
+ * How a vertex attribute's components are converted on the way into the
+ * shader's 16 byte input slot.
+ *
+ * Vulkan hands the shader every component in its own 32 bit slot however
+ * narrow it is in memory, so an R8G8B8A8_UINT attribute arrives as four uints
+ * and not as one packed word. Anything that is not already 32 bits per
+ * component therefore has to be expanded during the fetch — copying the raw
+ * bytes leaves all four components in the first slot, which reads as a value
+ * up to 2^32 where a small integer was meant.
+ */
+enum cp_vf_conv {
+   CP_VF_CONV_COPY32 = 0,   /* 32 bits per component: the bytes are already right */
+   CP_VF_CONV_UINT,         /* integer, zero extended */
+   CP_VF_CONV_SINT,         /* integer, sign extended */
+   CP_VF_CONV_UNORM,        /* unsigned normalised -> float */
+   CP_VF_CONV_SNORM,        /* signed normalised -> float */
+   CP_VF_CONV_USCALED,      /* unsigned integer -> float */
+   CP_VF_CONV_SSCALED,      /* signed integer -> float */
+   CP_VF_CONV_FLOAT16,      /* half -> float */
+};
+
 struct cp_vertex_fetch_args {
    uint64_t output;
    uint64_t index_buffer;
@@ -817,6 +839,16 @@ struct cp_vertex_fetch_args {
    uint32_t elem_src_offset[CP_MAX_VERTEX_ELEMENTS_VF];
    uint32_t elem_src_stride[CP_MAX_VERTEX_ELEMENTS_VF];
    uint32_t elem_attr_size[CP_MAX_VERTEX_ELEMENTS_VF];
+   /* The format as the fetch has to expand it: how many components it
+    * supplies, how wide each one is in the vertex buffer, one of
+    * enum cp_vf_conv, and where each destination component reads from in
+    * memory (four nibbles, low nibble first) for formats whose channels are
+    * not in RGBA order. CP_VF_CONV_COPY32 ignores all of these and takes the
+    * verbatim-copy path. */
+   uint32_t elem_nr_chan[CP_MAX_VERTEX_ELEMENTS_VF];
+   uint32_t elem_chan_bytes[CP_MAX_VERTEX_ELEMENTS_VF];
+   uint32_t elem_conv[CP_MAX_VERTEX_ELEMENTS_VF];
+   uint32_t elem_swizzle[CP_MAX_VERTEX_ELEMENTS_VF];
    /* Vulkan fills the components a vertex format does not supply with
     * (0, 0, 0, 1), so an attribute with fewer than four components needs a
     * one written into its w slot. Holds the bit pattern of that one, which is

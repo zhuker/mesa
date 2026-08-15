@@ -7,6 +7,75 @@
  */
 #include "cp_rast_types.h"
 
+/*
+ * Widen one component of a narrow vertex format to the 32 bits the shader
+ * reads. `raw` holds the component's bytes, `bytes` is 1 or 2; the result is
+ * the bit pattern of the uint, int or float the shader expects.
+ *
+ * The half decode is written out by hand because NVRTC compiles these kernels
+ * from source at runtime with no CUDA headers available, so cuda_fp16.h and
+ * __half2float are out of reach.
+ */
+__device__ static inline uint32_t
+cp_vf_expand(uint32_t raw, uint32_t bytes, uint32_t conv)
+{
+   uint32_t bits = bytes * 8;
+   if (bits >= 32)
+      return raw;
+
+   int32_t sext = (int32_t)(raw << (32 - bits)) >> (32 - bits);
+   float f;
+
+   switch (conv) {
+   case CP_VF_CONV_UINT:
+      return raw;
+   case CP_VF_CONV_SINT:
+      return (uint32_t)sext;
+   case CP_VF_CONV_UNORM:
+      f = (float)raw / (float)((1u << bits) - 1u);
+      break;
+   case CP_VF_CONV_SNORM:
+      /* The most negative value maps to -1.0 and so does the one below it,
+       * which is why this clamps rather than dividing by 2^(bits-1). */
+      f = (float)sext / (float)((1u << (bits - 1)) - 1u);
+      if (f < -1.0f)
+         f = -1.0f;
+      break;
+   case CP_VF_CONV_USCALED:
+      f = (float)raw;
+      break;
+   case CP_VF_CONV_SSCALED:
+      f = (float)sext;
+      break;
+   case CP_VF_CONV_FLOAT16: {
+      uint32_t h = raw & 0xffff;
+      uint32_t sign = (h & 0x8000u) << 16;
+      uint32_t exp = (h >> 10) & 0x1f;
+      uint32_t man = h & 0x3ffu;
+
+      if (exp == 0) {
+         if (man == 0)
+            return sign;                      /* +-0 */
+         /* Subnormal: normalise into the float exponent range. */
+         uint32_t shift = 0;
+         do {
+            man <<= 1;
+            shift++;
+         } while (!(man & 0x400u));
+         man &= 0x3ffu;
+         return sign | ((127u - 15u - shift + 1u) << 23) | (man << 13);
+      }
+      if (exp == 31)
+         return sign | 0x7f800000u | (man << 13);   /* inf / nan */
+      return sign | ((exp + 127u - 15u) << 23) | (man << 13);
+   }
+   default:
+      return raw;
+   }
+
+   return __float_as_uint(f);
+}
+
 extern "C" __global__ void
 cp_vertex_fetch(struct cp_vertex_fetch_args args)
 {
@@ -118,7 +187,34 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
        * CUDA_ERROR_MISALIGNED_ADDRESS, so use the widest unit the source
        * address actually allows. dst is always 16 byte aligned.
        */
-      if (size == 16 && ((uintptr_t)src & 15) == 0) {
+      if (args.elem_conv[e] != CP_VF_CONV_COPY32) {
+         /*
+          * Narrower than 32 bits per component. The shader addresses component
+          * c of attribute e at e * 16 + c * 4 whatever the format, so each
+          * component has to be widened into its own slot — copying the bytes
+          * would leave them packed in the first one.
+          */
+         uint32_t nch = args.elem_nr_chan[e];
+         uint32_t cb = args.elem_chan_bytes[e];
+         uint32_t conv = args.elem_conv[e];
+         uint32_t swz = args.elem_swizzle[e];
+         uint32_t *d32 = (uint32_t *)dst;
+
+         for (uint32_t c = 0; c < nch && c < 4; c++) {
+            uint32_t sc = (swz >> (c * 4)) & 0xf;
+            if (sc >= nch)
+               continue;   /* leaves the zero fill, and fill_w below */
+
+            const unsigned char *p = (const unsigned char *)src + sc * cb;
+            uint32_t bytes_read = 0;
+            /* Byte at a time: Vulkan aligns an attribute only to its component
+             * size, so a 16 bit component can sit on an odd address. */
+            for (uint32_t b = 0; b < cb; b++)
+               bytes_read |= (uint32_t)p[b] << (b * 8);
+
+            d32[c] = cp_vf_expand(bytes_read, cb, conv);
+         }
+      } else if (size == 16 && ((uintptr_t)src & 15) == 0) {
          *(float4 *)dst = *(const float4 *)src;
       } else if (((uintptr_t)src & 3) == 0 && (size & 3) == 0) {
          for (uint32_t w = 0; w < size / 4; w++)
