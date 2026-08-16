@@ -854,15 +854,9 @@ cp_store_dst(void *ptr, uint32_t encoding, const float *c)
    }
 }
 
-extern "C" __global__ void
-cp_fs_writeback(struct cp_fs_writeback_args args)
+static __device__ __forceinline__ void
+cp_fs_writeback_one(const struct cp_fs_writeback_args &args, uint32_t i)
 {
-   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-   uint32_t limit = args.pixel_counter
-      ? *(const uint32_t *)(uintptr_t)args.pixel_counter
-      : args.num_pixels;
-   if (i >= limit)
-      return;
 
    /* A helper lane exists only to supply derivatives to its quad. Without
     * multisampling the mask is 0 or 1; with it, one bit per sample won. */
@@ -947,6 +941,24 @@ cp_fs_writeback(struct cp_fs_writeback_args args)
 
    cp_store_dst(dst_ptr, args.color_encoding, out);
    }
+}
+
+/*
+ * One thread per shaded slot, striding: the slot count lives on the device,
+ * so the grid the host launches is a statement of how much machine to use
+ * rather than a bound anything depends on — the launch used to be sized to
+ * the framebuffer's worst case and spent more time scheduling idle blocks
+ * than writing pixels on small draws.
+ */
+extern "C" __global__ void
+cp_fs_writeback(struct cp_fs_writeback_args args)
+{
+   uint32_t limit = args.pixel_counter
+      ? *(const uint32_t *)(uintptr_t)args.pixel_counter
+      : args.num_pixels;
+   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < limit;
+        i += gridDim.x * blockDim.x)
+      cp_fs_writeback_one(args, i);
 }
 
 /*

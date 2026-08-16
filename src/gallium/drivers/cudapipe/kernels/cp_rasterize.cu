@@ -1704,15 +1704,19 @@ cp_seg_of_prim(const uint32_t *base, uint32_t nsegs, uint32_t prim)
 extern "C" __global__ void
 cp_abuf_seg_count(struct cp_abuf_seg_args args)
 {
-   uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+   /* The quad total lives on the device when this launches, so the grid is a
+    * fixed statement of how much machine to use and the threads stride. */
    uint32_t total = *(const uint32_t *)(uintptr_t)args.num_quads_dev;
-   if (q >= total || q >= args.num_quads)
-      return;
-   uint32_t prim = ((const uint32_t *)(uintptr_t)args.quad_prim)[q];
-   uint32_t seg = cp_seg_of_prim(
-      (const uint32_t *)(uintptr_t)args.seg_prim_base, args.nsegs, prim);
-   ((unsigned char *)(uintptr_t)args.quad_seg)[q] = (unsigned char)seg;
-   atomicAdd((unsigned int *)(uintptr_t)args.seg_counts + seg, 1u);
+   if (total > args.num_quads)
+      total = args.num_quads;
+   for (uint32_t q = blockIdx.x * blockDim.x + threadIdx.x; q < total;
+        q += gridDim.x * blockDim.x) {
+      uint32_t prim = ((const uint32_t *)(uintptr_t)args.quad_prim)[q];
+      uint32_t seg = cp_seg_of_prim(
+         (const uint32_t *)(uintptr_t)args.seg_prim_base, args.nsegs, prim);
+      ((unsigned char *)(uintptr_t)args.quad_seg)[q] = (unsigned char)seg;
+      atomicAdd((unsigned int *)(uintptr_t)args.seg_counts + seg, 1u);
+   }
 }
 
 extern "C" __global__ void

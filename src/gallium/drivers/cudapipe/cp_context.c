@@ -1416,7 +1416,12 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
       /* A shader the compiler marked as a register-cap candidate is timed
        * here, both as built and capped, and the faster build kept. */
       bool timed = cp_tune_before(cp, fs);
-      CUresult fs_err = cuLaunchKernel(fs->kernel, (num_threads + 255) / 256,
+      /* Compiled shaders grid-stride now, so the launch is capped: the count
+       * is device-side and num_threads is the framebuffer's worst case, so a
+       * small draw's launch was mostly scheduling idle blocks. 4096 blocks
+       * of 256 is far past what fills the machine. */
+      CUresult fs_err = cuLaunchKernel(fs->kernel,
+                                       MIN2((num_threads + 255) / 256, 4096u),
                                        1, 1, 256, 1, 1, 0, cp->stream,
                                        fs_params, NULL);
       if (fs_err != CUDA_SUCCESS) {
@@ -1659,8 +1664,11 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    if (color_data) {
       void *wb_params[] = { &wb };
       cp_nvtx_push("writeback");
+      /* The kernel strides, so the grid is capped: num_pixels is the
+       * framebuffer's worst case and the launch was spending more time
+       * scheduling idle blocks than writing pixels on small draws. */
       CP_LAUNCH(screen->kernels.fs_writeback,
-                     (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
+                     MIN2((num_pixels + 255) / 256, 2048u), 1, 1, 256, 1, 1,
                      0, cp->stream, wb_params, NULL);
       cp_nvtx_pop();   /* writeback */
    }
@@ -3403,8 +3411,13 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          return; } while (0);
 
    /* Clear visbuf to VISBUF_EMPTY (all-ones). cuMemsetD32 fills 32-bit words
-    * which is faster than a kernel launch for a bulk fill. */
-   cuMemsetD32Async(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples, cp->stream);
+    * which is faster than a kernel launch for a bulk fill. A segment append
+    * skips it: the A-buffer passes never touch the visibility buffer, and at
+    * a segment per blended batch this was most of the frame's memset traffic.
+    * The fallback path re-executes classically and clears its own. */
+   if (!cp->pass.appending)
+      cuMemsetD32Async(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples,
+                       cp->stream);
 
    if (!cp->depthbuf_cleared)
       cp_clear_depthbuf(cp, 1.0f);
@@ -4042,8 +4055,9 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
 
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
+         /* Compiled shaders grid-stride; see the fragment launch. */
          CUresult vs_err = cuLaunchKernel(cp->vs_shader->kernel,
-            (total_verts + 255) / 256, 1, 1, 256, 1, 1,
+            MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
             0, cp->stream, vs_params, NULL);
 
          if (vs_err == CUDA_SUCCESS) {
@@ -5778,8 +5792,8 @@ cp_pass_finish(struct cp_context *cp)
    {
       void *p[] = { &sa };
       CP_LAUNCH(screen->kernels.abuf_seg_count,
-                     ((unsigned)ab->quad_capacity + 255) / 256, 1, 1,
-                     256, 1, 1, 0, cp->stream, p, NULL);
+                     MIN2(((unsigned)ab->quad_capacity + 255) / 256, 1024u),
+                     1, 1, 256, 1, 1, 0, cp->stream, p, NULL);
    }
 
    /* --- the drain: the six counters and the per-segment quad counts --- */

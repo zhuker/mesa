@@ -45,6 +45,10 @@ struct ntl_context {
    LLVMBasicBlockRef entry_block;
    unsigned md_invariant_load;
 
+   /* The grid-stride loop's induction value, standing in for ctaid.x inside
+    * a drawing stage's body; null outside one. See emit_workgroup_id(). */
+   LLVMValueRef virtual_bid;
+
    /* Set when the shader samples a texture, so the sampler PTX gets linked in. */
    bool uses_tex;
    /*
@@ -229,6 +233,11 @@ emit_workgroup_id(struct ntl_context *ctx, unsigned component)
       "llvm.nvvm.read.ptx.sreg.ctaid.y",
       "llvm.nvvm.read.ptx.sreg.ctaid.z",
    };
+   /* Inside a drawing stage's grid-stride loop the block id is virtual — the
+    * loop's induction value — so every slot-derived address follows the loop.
+    * See the kernel skeleton in emit_function_body(). */
+   if (component == 0 && ctx->virtual_bid)
+      return ctx->virtual_bid;
    return emit_nvptx_read_sreg(ctx, names[component]);
 }
 
@@ -2223,6 +2232,8 @@ emit_function(struct ntl_context *ctx)
     * but the first `counter` results, which is why the arithmetic came out
     * right and the frame took 400 times longer than the work in it.
     */
+   LLVMBasicBlockRef stride_latch = NULL;
+   LLVMValueRef vbid_phi = NULL, stride_next = NULL;
    if (ctx->nir->info.stage == MESA_SHADER_VERTEX ||
        ctx->nir->info.stage == MESA_SHADER_FRAGMENT) {
       LLVMTypeRef i32_t = LLVMInt32TypeInContext(ctx->llvm_ctx);
@@ -2235,16 +2246,44 @@ emit_function(struct ntl_context *ctx)
 
       LLVMValueRef bid = emit_workgroup_id(ctx, 0);
       LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
-      LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
-         LLVMBuildMul(ctx->builder, bid, LLVMConstInt(i32_t, 256, false), ""), tid, "");
-      LLVMValueRef oob = LLVMBuildICmp(ctx->builder, LLVMIntUGE, vid, count, "");
+      LLVMValueRef nblocks =
+         emit_nvptx_read_sreg(ctx, "llvm.nvvm.read.ptx.sreg.nctaid.x");
 
+      /*
+       * Grid-stride: the slot count lives on the device, so the host sizes
+       * the grid for the worst case — the whole framebuffer twice over, for
+       * a fragment shader — and may cap it. The loop's induction value is a
+       * virtual block id that emit_workgroup_id() returns inside the body,
+       * so every slot-derived address follows the loop; a grid at the worst
+       * case runs each body exactly once, which is the code this replaces.
+       */
+      LLVMBasicBlockRef header = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "stride_head");
       LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "shader_body");
-      LLVMBasicBlockRef early_ret = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "shader_ret");
-      LLVMBuildCondBr(ctx->builder, oob, early_ret, body);
-      LLVMPositionBuilderAtEnd(ctx->builder, early_ret);
+      stride_latch = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "stride_latch");
+      LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "shader_ret");
+
+      LLVMBuildBr(ctx->builder, header);
+      LLVMPositionBuilderAtEnd(ctx->builder, header);
+      vbid_phi = LLVMBuildPhi(ctx->builder, i32_t, "vbid");
+      LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, vbid_phi,
+                      LLVMConstInt(i32_t, 256, false), ""), tid, "");
+      LLVMValueRef oob = LLVMBuildICmp(ctx->builder, LLVMIntUGE, vid, count, "");
+      LLVMBuildCondBr(ctx->builder, oob, done, body);
+
+      LLVMPositionBuilderAtEnd(ctx->builder, done);
       LLVMBuildRetVoid(ctx->builder);
+
+      LLVMPositionBuilderAtEnd(ctx->builder, stride_latch);
+      stride_next = LLVMBuildAdd(ctx->builder, vbid_phi, nblocks, "vbid_next");
+      LLVMBuildBr(ctx->builder, header);
+
+      LLVMValueRef inc_v[2] = { bid, stride_next };
+      LLVMBasicBlockRef inc_b[2] = { entry, stride_latch };
+      LLVMAddIncoming(vbid_phi, inc_v, inc_b, 2);
+
       LLVMPositionBuilderAtEnd(ctx->builder, body);
+      ctx->virtual_bid = vbid_phi;
 
       /*
        * Helper invocations, for a fragment shader that writes memory.
@@ -2275,20 +2314,24 @@ emit_function(struct ntl_context *ctx)
          LLVMValueRef helper = LLVMBuildICmp(ctx->builder, LLVMIntEQ, cov,
             LLVMConstInt(i8_t, 0, false), "");
 
+         /* A helper lane skips this slot and strides on to its next one. */
          LLVMBasicBlockRef body2 = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "shader_body_covered");
-         LLVMBasicBlockRef helper_ret = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "helper_ret");
-         LLVMBuildCondBr(ctx->builder, helper, helper_ret, body2);
-         LLVMPositionBuilderAtEnd(ctx->builder, helper_ret);
-         LLVMBuildRetVoid(ctx->builder);
+         LLVMBuildCondBr(ctx->builder, helper, stride_latch, body2);
          LLVMPositionBuilderAtEnd(ctx->builder, body2);
       }
    }
 
    emit_cf_list(ctx, &impl->body);
 
-   /* Add return if no terminator */
-   if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder)))
-      LLVMBuildRetVoid(ctx->builder);
+   /* Close the body: back to the stride loop's latch for a drawing stage,
+    * a plain return for compute. */
+   if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder))) {
+      if (stride_latch)
+         LLVMBuildBr(ctx->builder, stride_latch);
+      else
+         LLVMBuildRetVoid(ctx->builder);
+   }
+   ctx->virtual_bid = NULL;
 
    free(ctx->ssa_defs);
    free(ctx->regs);
