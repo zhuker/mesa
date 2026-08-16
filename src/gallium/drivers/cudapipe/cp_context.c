@@ -2021,6 +2021,14 @@ struct cp_abuf {
     * comes within CP_ABUF_GROW_AT of it. See the constants above for why the
     * growth is bounded the way it is. */
    CUdeviceptr frags;
+   /*
+    * The single-pass build's records: one (pixel << 32 | prim) uint64 per
+    * fragment, appended by the count pass through rec_cursor (one uint32,
+    * carved out of `counters` past the segment quad counts) and replayed by
+    * cp_abuf_fill_recs in place of the second rasterization. Sized and freed
+    * with `frags`, and the same entry capacity bounds both.
+    */
+   CUdeviceptr recs, rec_cursor;
    unsigned capacity;
    unsigned growths;        /* times it has been grown this process */
    unsigned peak;           /* largest population any draw has counted */
@@ -2248,8 +2256,8 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
        * offsets into it exactly as they were.
        */
       if (!cp_abuf_alloc(ab, &ab->counters,
-                         4 * (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS),
-                         "sum3+bsum3+clist_count+seg counts") ||
+                         4 * (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS + 1),
+                         "sum3+bsum3+clist_count+seg counts+rec cursor") ||
           !cp_abuf_alloc(ab, &ab->list_count, 4, "list_count") ||
           !cp_abuf_alloc(ab, &ab->blk_list_count, 4, "block worklist count") ||
           !cp_abuf_alloc(ab, &ab->dbg, CP_ABUF_DBG_COUNTERS * 4,
@@ -2264,6 +2272,8 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
       ab->long_runs = ab->sum3 + 8;
       ab->quad_overflow = ab->bsum3 + 4;
       ab->seg_counts = ab->counters + 4 * CP_ABUF_COUNTERS;
+      ab->rec_cursor = ab->counters +
+                       4 * (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS);
    }
    if (!ab->events_ready) {
       for (int i = 0; i < (int)ARRAY_SIZE(ab->ev); i++) {
@@ -2472,6 +2482,7 @@ cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
     * the card rather than the old and the new at once. Nothing in them is
     * live: the count pass writes only the per-pixel counters. */
    cp_abuf_free(&ab->frags);
+   cp_abuf_free(&ab->recs);
    cp_abuf_free(&ab->quad_prim);
    cp_abuf_free(&ab->quad_mask);
    cp_abuf_free(&ab->quad_block);
@@ -2485,6 +2496,10 @@ cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
    ab->colors_ready = false;
 
    if (!cp_abuf_alloc(ab, &ab->frags, want * sizeof(uint32_t), "fragments"))
+      return false;
+   if (!cp_debug->no_abuf_append &&
+       !cp_abuf_alloc(ab, &ab->recs, want * sizeof(uint64_t),
+                      "fragment records"))
       return false;
    ab->capacity = (unsigned)want;
 
@@ -2518,14 +2533,14 @@ cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
       fprintf(stderr, "abuffer: grew the fragment array %u -> %u entries "
               "(%.1f MB, %.1f MB of quads) — a draw counted %u, which is "
               "%.0f%% of what it had; growth %u of %u\n",
-              was, ab->capacity, want * 4.0 / (1024.0 * 1024.0),
+              was, ab->capacity, want * (ab->recs ? 12.0 : 4.0) / (1024.0 * 1024.0),
               want * 13.0 / (1024.0 * 1024.0), total,
               was ? 100.0 * total / was : 0.0, ab->growths,
               CP_ABUF_MAX_GROWTHS);
    } else {
       fprintf(stderr, "abuffer: fragment array %u entries (%.1f MB, %.1f MB "
               "of quads) from a first count of %u\n", ab->capacity,
-              want * 4.0 / (1024.0 * 1024.0), want * 13.0 / (1024.0 * 1024.0),
+              want * (ab->recs ? 12.0 : 4.0) / (1024.0 * 1024.0), want * 13.0 / (1024.0 * 1024.0),
               total);
    }
 
@@ -4392,6 +4407,11 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
    bool abuf_log = false;
    unsigned abuf_deep_n = 0;
    uint32_t abuf_total = 0;
+   /* The records buffer the count pass appended into, if it appended at all.
+    * Compared against ab->recs again at the fill: the first-draw bootstrap
+    * sizes the arrays between count and fill, and a records buffer allocated
+    * or replaced there holds nothing this draw's count wrote. */
+   CUdeviceptr abuf_recs_filled = 0;
    /* Whether this draw is rendered by the A-buffer instead of by the peel
     * loop, and how many quads its merge produced. Both settled after the
     * merge; see there. */
@@ -4509,9 +4529,21 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       if (!cp->pass.appending) {
          cuMemsetD32Async(ab->counts, 0, n, cp->stream);
          cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
+         if (ab->recs)
+            cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
       }
       if (cp->pass.appending)
          aa.abuf_prim_base = cp->pass.next_prim;
+      /* Single-pass build: this counting launch also appends the records the
+       * fill will replay, so it needs the array bound the fill would have
+       * used. First-draw bootstrap runs count-only — the records array is
+       * sized from this draw's count, along with everything else. */
+      if (ab->recs) {
+         aa.abuf_recs = ab->recs;
+         aa.abuf_rec_cursor = ab->rec_cursor;
+         aa.abuf_capacity = ab->capacity;
+         abuf_recs_filled = ab->recs;
+      }
       cuMemsetD32Async(cp->cur_qset.counts, 0, 2, cp->stream);
       aa.abuf_mode = CP_ABUF_COUNT;
       rast_queues.mode = CP_QUEUE_FILL;
@@ -4605,6 +4637,11 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
           * see cp_abuf_size_arrays(). */
          if (abuf_total > ab->peak)
             ab->peak = abuf_total;
+         /* size_arrays may free and replace the records buffer, and a
+          * replacement can land at the old address — so a drained draw always
+          * refills by rasterizing. These are the bootstrap and the
+          * non-compositing modes; every hot draw takes the clamp branch. */
+         abuf_recs_filled = 0;
          if (!cp_abuf_size_arrays(ab, abuf_total))
             abuf = false;
          else if (abuf_total > ab->capacity) {
@@ -4662,20 +4699,30 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
 
       /* --- step 3: fill --- */
       cuMemsetD32Async(ab->cursor, 0, n, cp->stream);
-      cuMemsetD32Async(cp->cur_qset.counts, 0, 2, cp->stream);
-      aa.abuf_mode = CP_ABUF_FILL;
-      rast_queues.mode = CP_QUEUE_FILL;
       cp_abuf_mark(ab->ev[3], cp->stream);
-      void *ap[] = { &aa, &rast_queues };
-      CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
-                     (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
-                     0, cp->stream, ap, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
-                     CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
-                     256, 1, 1, 0, cp->stream, ap, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
-                     CLAMP(rast_num_triangles * 8, 512u, 2048u), 1, 1,
-                     64, 1, 1, 0, cp->stream, ap, NULL);
+      if (abuf_recs_filled && screen->kernels.abuf_fill_recs) {
+         /* The count pass already appended every (pixel, prim) record; the
+          * fill is a linear replay instead of a second rasterization. */
+         void *fp[] = { &ab->recs, &ab->rec_cursor, &ab->capacity, &ab->frags,
+                        &ab->offsets, &ab->counts, &ab->cursor, &ab->overflow,
+                        &ab->capacity };
+         CP_LAUNCH(screen->kernels.abuf_fill_recs, 1024, 1, 1, 256, 1, 1,
+                        0, cp->stream, fp, NULL);
+      } else {
+         cuMemsetD32Async(cp->cur_qset.counts, 0, 2, cp->stream);
+         aa.abuf_mode = CP_ABUF_FILL;
+         rast_queues.mode = CP_QUEUE_FILL;
+         void *ap[] = { &aa, &rast_queues };
+         CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
+                        (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
+                        0, cp->stream, ap, NULL);
+         CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
+                        CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
+                        256, 1, 1, 0, cp->stream, ap, NULL);
+         CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
+                        CLAMP(rast_num_triangles * 8, 512u, 2048u), 1, 1,
+                        64, 1, 1, 0, cp->stream, ap, NULL);
+      }
       cp_abuf_mark(ab->ev[4], cp->stream);
 
       /* --- step 4: sort. The worklist build is inside this measurement: it
@@ -5808,36 +5855,50 @@ cp_pass_finish(struct cp_context *cp)
                      0, cp->stream, p, NULL);
    }
 
-   /* --- fill: one relaunch per segment from its saved arguments, fanned
-    * back out over the side streams behind the scan --- */
-   cuMemsetD32Async(ab->cursor, 0, n, cp->stream);
-   cp_pass_broadcast(cp, nsegs);
+   /* --- fill --- */
    CUstream pass_main = cp->stream;
-   for (unsigned s = 0; s < nsegs; s++) {
-      struct cp_pass_seg *sg = &segs[s];
-      if (cp->seg_streams[0])
-         cp->stream = cp_pass_seg_stream(cp, s);
-      struct cp_rasterize_args aa = sg->rast;
-      aa.abuf_frags = ab->frags;
-      aa.abuf_capacity = ab->capacity;
-      aa.abuf_mode = CP_ABUF_FILL;
-      struct cp_rast_queues q = sg->queues;
-      q.mode = CP_QUEUE_FILL;
-      /* The segment's own queue set, saved with its arguments. */
-      cuMemsetD32Async(q.nontrivial_count, 0, 2, cp->stream);
-      void *ap[] = { &aa, &q };
-      CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
-                     (sg->rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
-                     0, cp->stream, ap, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
-                     CLAMP((sg->rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
-                     256, 1, 1, 0, cp->stream, ap, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
-                     CLAMP(sg->rast_num_triangles * 8, 512u, 2048u), 1, 1,
-                     64, 1, 1, 0, cp->stream, ap, NULL);
+   cuMemsetD32Async(ab->cursor, 0, n, cp->stream);
+   if (ab->recs && screen->kernels.abuf_fill_recs) {
+      /* Single-pass build: every segment's count already appended its
+       * records (ab->recs cannot change mid-episode — a pending growth
+       * refuses the append), so the whole episode's fill is one linear
+       * replay on the main stream, and the fan-out/join the per-segment
+       * relaunches needed disappears with them. */
+      void *fp[] = { &ab->recs, &ab->rec_cursor, &ab->capacity, &ab->frags,
+                     &ab->offsets, &ab->counts, &ab->cursor, &ab->overflow,
+                     &ab->capacity };
+      CP_LAUNCH(screen->kernels.abuf_fill_recs, 2048, 1, 1, 256, 1, 1,
+                     0, cp->stream, fp, NULL);
+   } else {
+      /* One relaunch per segment from its saved arguments, fanned back out
+       * over the side streams behind the scan. */
+      cp_pass_broadcast(cp, nsegs);
+      for (unsigned s = 0; s < nsegs; s++) {
+         struct cp_pass_seg *sg = &segs[s];
+         if (cp->seg_streams[0])
+            cp->stream = cp_pass_seg_stream(cp, s);
+         struct cp_rasterize_args aa = sg->rast;
+         aa.abuf_frags = ab->frags;
+         aa.abuf_capacity = ab->capacity;
+         aa.abuf_mode = CP_ABUF_FILL;
+         struct cp_rast_queues q = sg->queues;
+         q.mode = CP_QUEUE_FILL;
+         /* The segment's own queue set, saved with its arguments. */
+         cuMemsetD32Async(q.nontrivial_count, 0, 2, cp->stream);
+         void *ap[] = { &aa, &q };
+         CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
+                        (sg->rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
+                        0, cp->stream, ap, NULL);
+         CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
+                        CLAMP((sg->rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
+                        256, 1, 1, 0, cp->stream, ap, NULL);
+         CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
+                        CLAMP(sg->rast_num_triangles * 8, 512u, 2048u), 1, 1,
+                        64, 1, 1, 0, cp->stream, ap, NULL);
+      }
+      cp->stream = pass_main;
+      cp_pass_join(cp, nsegs);
    }
-   cp->stream = pass_main;
-   cp_pass_join(cp, nsegs);
 
    /* --- sort, both worklists --- */
    {
@@ -6156,6 +6217,8 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
       }
       cuMemsetD32Async(ab->counts, 0, (size_t)w * h, cp->stream);
       cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
+      if (ab->recs)
+         cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
       if (cp->seg_streams[0])
          cuEventRecord(cp->pass_gate, cp->stream);
    }

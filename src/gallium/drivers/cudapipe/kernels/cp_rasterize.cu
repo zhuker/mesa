@@ -565,6 +565,30 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
       uint32_t p = (uint32_t)py * args->width + (uint32_t)px;
       if (args->abuf_mode == CP_ABUF_COUNT) {
          atomicAdd((unsigned int *)(uintptr_t)args->abuf_counts + p, 1u);
+         if (args->abuf_recs) {
+            /* Warp-aggregated append: the cursor is one word the whole device
+             * hammers, so the warp's emitting lanes reserve their slots with
+             * a single atomic. The blocks are 1-D multiples of 32, and the
+             * code from the mask capture to the shuffle is straight-line, so
+             * the opportunistic-warp pattern is sound here. Order across
+             * warps is arbitrary — the per-pixel sort erases it, the same
+             * way it erases today's fill-cursor races. */
+            unsigned mask = __activemask();
+            unsigned lane = threadIdx.x & 31u;
+            unsigned leader = __ffs(mask) - 1u;
+            uint32_t base = 0;
+            if (lane == leader)
+               base = atomicAdd((unsigned int *)(uintptr_t)args->abuf_rec_cursor,
+                                (unsigned)__popc(mask));
+            base = __shfl_sync(mask, base, leader);
+            uint32_t slot = base + __popc(mask & ((1u << lane) - 1u));
+            if (slot < args->abuf_capacity)
+               ((uint64_t *)(uintptr_t)args->abuf_recs)[slot] =
+                  ((uint64_t)p << 32) |
+                  (uint64_t)(args->abuf_prim_base + tri_id);
+            else
+               atomicAdd((unsigned int *)(uintptr_t)args->abuf_overflow, 1u);
+         }
       } else {
          uint32_t slot = atomicAdd((unsigned int *)(uintptr_t)args->abuf_cursor
                                    + p, 1u);
@@ -1262,6 +1286,40 @@ cp_abuf_clamp_runs(uint32_t *counts, const uint32_t *offsets,
          counts[p] = room;
          atomicAdd(overflow, c - room);
       }
+   }
+}
+
+/*
+ * The fill, replayed from the records the count pass appended instead of
+ * rasterized a second time. Each record already names its pixel and its
+ * primitive, so placing it is the same cursor-and-bounds sequence
+ * emit_fragment's fill mode runs — kept identical on purpose, including the
+ * double bound and the overflow report, so the drain's verdict means the same
+ * thing whichever fill produced it. The record count lives on the device (the
+ * host never drained for it), clamped to the array because an overflowing
+ * count pass ran the cursor past the end.
+ */
+extern "C" __global__ void
+cp_abuf_fill_recs(const uint64_t *recs, const uint32_t *rec_cursor,
+                  uint32_t rec_capacity, uint32_t *frags,
+                  const uint32_t *offsets, const uint32_t *counts,
+                  uint32_t *cursor, uint32_t *overflow, uint32_t capacity)
+{
+   uint32_t nrec = *rec_cursor;
+   if (nrec > rec_capacity)
+      nrec = rec_capacity;
+   uint32_t stride = gridDim.x * blockDim.x;
+   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < nrec;
+        i += stride) {
+      uint64_t rec = recs[i];
+      uint32_t p = (uint32_t)(rec >> 32);
+      uint32_t slot = atomicAdd(cursor + p, 1u);
+      uint32_t n = counts[p];
+      uint32_t base = offsets[p];
+      if (slot < n && base + slot < capacity)
+         frags[base + slot] = (uint32_t)rec;
+      else
+         atomicAdd(overflow, 1u);
    }
 }
 

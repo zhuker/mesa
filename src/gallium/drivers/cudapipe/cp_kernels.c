@@ -223,6 +223,7 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
    cuModuleGetFunction(&k->abuf_quad_count, k->module, "cp_abuf_quad_count");
    cuModuleGetFunction(&k->abuf_clear_slots, k->module, "cp_abuf_clear_slots");
    cuModuleGetFunction(&k->abuf_clamp_runs, k->module, "cp_abuf_clamp_runs");
+   cuModuleGetFunction(&k->abuf_fill_recs, k->module, "cp_abuf_fill_recs");
    cuModuleGetFunction(&k->abuf_quad_fill, k->module, "cp_abuf_quad_fill");
    cuModuleGetFunction(&k->abuf_seg_count, k->module, "cp_abuf_seg_count");
    cuModuleGetFunction(&k->abuf_seg_scatter, k->module, "cp_abuf_seg_scatter");

@@ -170,6 +170,16 @@ struct cp_rasterize_args {
     * ids by the slots of every segment before it. Zero outside an episode.
     */
    uint32_t abuf_prim_base;
+   /*
+    * Single-pass build. When abuf_recs is non-null a counting launch also
+    * appends one 64-bit (pixel << 32 | prim) record per fragment through the
+    * one global cursor, so the fill never has to rasterize a second time —
+    * cp_abuf_fill_recs replays the records instead. Appends past
+    * abuf_capacity land in abuf_overflow, exactly as a fill that ran out of
+    * room would.
+    */
+   uint64_t abuf_recs;       /* uint64 per fragment: pixel << 32 | prim */
+   uint64_t abuf_rec_cursor; /* uint32: the records' one append cursor */
 };
 
 #define CP_ABUF_OFF     0u
