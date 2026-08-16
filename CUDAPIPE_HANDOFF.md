@@ -10,6 +10,25 @@ The feature set is driven by what Roblox's HeadlessStreamer actually requires,
 measured from a GFXReconstruct capture — see
 `src/gallium/drivers/cudapipe/tests/headless_streamer_requirements.txt`.
 
+That capture now *replays* against the driver, all 1,509 frames of it, which is
+a much stronger thing than reading its requirements. Three documents carry that
+work and are the place to start on it:
+
+- `src/gallium/drivers/cudapipe/HEADLESS_STREAMER_PERF.md` — the capture, the
+  six bugs that stopped it replaying, what each fix was worth, how frame
+  correctness is verified against a software reference, and where the frame goes
+  now. **Read the correctness method before trusting any frame comparison.**
+- `src/gallium/drivers/cudapipe/TODO_CONFORMANCE.md` — what dEQP says, fixed and
+  outstanding. Second priority.
+- `src/gallium/drivers/cudapipe/TODO_DEBUG_FLAGS.md` — the driver reads 44
+  environment variables and there is no list of them; this is the inventory and
+  a plan for a registry. Third priority, but it contains two silent-`undef`
+  paths in the shader backend that are worth fixing on their own.
+
+`tests/GFXRECONSTRUCT.md` is how to capture and replay in the first place,
+including why an application that never presents needs a different extraction
+path entirely.
+
 ## Build
 
 ```bash
@@ -47,11 +66,37 @@ VK_DRIVER_FILES=$PWD/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv
 The Sascha Willems samples at `~/git/Vulkan` all render offscreen and
 reproducibly, which makes them a differential oracle: run the same binary
 against the NVIDIA ICD and against cudapipe, and diff the frames. That is a far
-stronger signal than dEQP's pass/fail, and it found every bug fixed so far.
+stronger signal than dEQP's pass/fail.
 
 `tests/headless_streamer_samples.txt` is the minimal set — each entry is the
 simplest sample covering a capability the capture needs, with the mapping in the
 file.
+
+**It is a regression guard, not evidence, and this sentence used to claim
+otherwise.** It said the sweep "found every bug fixed so far", which stopped
+being true the moment a real application was replayed against the driver. Six
+bugs came out of that capture in a week and **four of them are structurally
+unreachable by this set** — not unlucky, unreachable:
+
+| bug | why no sample can find it |
+|---|---|
+| packed vertex attributes never expanded | exactly one sample binds an 8-bit vertex attribute (`imgui`, UNORM colour), and `gltfskinning` converts glTF's packed joints to float on load |
+| clipper missing the `z <= w` plane | `VK_COMPARE_OP_GREATER` appears nowhere in the tree — nothing uses reversed-Z |
+| A-buffer disabling itself on resize | a sample that renders one size never triggers it |
+| fragment shaders skipped with no colour attachment | only `oit/geometry.frag` writes memory from a fragment shader |
+
+Five separate times this session a green sweep meant "did not touch it" rather
+than "works". So for each change, find the thing that actually exercises it —
+`tests/TODO_CONFORMANCE.md` ends with the lookup table, and
+`HEADLESS_STREAMER_PERF.md` has the same one. Note also that `renderheadless`'s
+row in the correctness gate is two absences agreeing: its stored directory is
+empty, so is the reference, and a diff of one against the other reports
+IDENTICAL.
+
+What the set *is* good at is bit-identity. Ten of the eighteen are fully
+deterministic, so "byte-identical over sixty frames" is a far stronger statement
+than any tolerance check, and it is what caught both real regressions this
+branch produced.
 
 ```bash
 cd ~/git/Vulkan
@@ -194,18 +239,28 @@ stored — milliseconds per frame, the mean over the run (`cp_perf_run.sh ... 60
 compared, and is far too few to time: at sixty the render loop is a minority of
 the process. `tests/TESTING.md` has the measurement that settles it.
 
-| | nvidia | cudapipe | llvmpipe | before the register cap | before draw ranges | before any perf work |
+| | nvidia | cudapipe | llvmpipe | before the capture work | before the register cap | before any perf work |
 |---|---|---|---|---|---|---|
-| gltfscenerendering | 0.1 | **13.9** | 15.2 | 15.3 | 15.3 | 343.9 |
-| instancing | 0.1 | **6.7** | 73.0 | 7.0 | 7.1 | 241.7 |
-| multithreading | 0.3 | **6.0** | 96.9 | 6.0 | 6.0 | 156.6 |
-| particlesystem | 0.1 | **4.1** | 15.7 | 4.5 | 5.1 | 1361.7 |
-| multisampling | 0.0 | **3.3** | 5.3 | 3.4 | 3.4 | 41.1 |
-| bloom | 0.0 | **2.2** | 3.6 | 2.2 | 12.1 | 558.0 |
-| pbribl | 0.0 | **1.6** | 2.7 | 1.6 | 1.6 | 135.4 |
-| vulkanscene | 0.0 | **1.5** | 9.4 | 1.5 | 2.8 | 183.1 |
-| dynamicuniformbuffer | 0.0 | **1.3** | 1.0 | 1.3 | 1.3 | 128.5 |
-| **total, one frame of each** | **0.9** | **47.6** | **232.1** | **50.0** | **61.8** | **3792.2** |
+| gltfscenerendering | 0.1 | **14.3** | 15.2 | 13.9 | 15.3 | 343.9 |
+| instancing | 0.1 | **6.1** | 73.0 | 6.7 | 7.0 | 241.7 |
+| multithreading | 0.3 | **5.5** | 96.9 | 6.0 | 6.0 | 156.6 |
+| particlesystem | 0.1 | **3.5** | 15.7 | 4.1 | 4.5 | 1361.7 |
+| multisampling | 0.0 | **2.6** | 5.3 | 3.3 | 3.4 | 41.1 |
+| bloom | 0.0 | **1.4** | 3.6 | 2.2 | 2.2 | 558.0 |
+| pbribl | 0.0 | **1.1** | 2.7 | 1.6 | 1.6 | 135.4 |
+| vulkanscene | 0.0 | **0.9** | 9.4 | 1.5 | 1.5 | 183.1 |
+| dynamicuniformbuffer | 0.0 | **0.3** | 1.0 | 1.3 | 1.3 | 128.5 |
+| **total, one frame of each** | **0.9** | **38.3** | **232.1** | **47.6** | **50.0** | **3792.2** |
+
+The ninth pass is the one that produced the fourth column, and it did not set
+out to touch the sweep at all — see `HEADLESS_STREAMER_PERF.md`. Making a real
+application's capture replay found allocation churn that these samples are
+host-bound on: `triangle` −84%, `texturemipmapgen` −45%, `bloom` −34%,
+`dynamicuniformbuffer` −78% from a small-allocation arena and grow-only
+framebuffer buffers. The capture itself went 276 → 82 ms a frame over the same
+work. `gltfscenerendering` reads +3% here and measured at parity under paired
+alternating arms; it spreads 6.9% across three runs of one build, so read it
+that way rather than as a regression.
 
 **cudapipe finishes the sweep 4.88x ahead of llvmpipe**, ahead of it on twelve
 of the seventeen samples, and **every sample above 1.5 ms is ahead of it** —
@@ -378,7 +433,8 @@ cudapipe Gallium driver
     ├── the pipeline, per batch:
     │   1. cp_vertex_fetch      (GPU gathers attributes)
     │   2. Vertex shader kernel (NIR → PTX)
-    │   3. cp_clip_triangles    (near plane and w > 0)
+    │   3. cp_clip_triangles    (z >= 0, w > 0, and z <= w — the last is
+    │      the near plane under a reversed-Z projection, which the capture uses)
     │   4. cp_rasterize_stage1/2/3 (adaptive: thread, warp, block per tile),
     │      bounded by the clip rectangle: framebuffer ∩ viewport ∩ scissor
     │   5. cp_fs_interpolate    (compact into 2x2 quads, interpolate varyings)
@@ -389,6 +445,8 @@ cudapipe Gallium driver
     │   per-pixel fragment lists, sorted, shaded and composited once; see
     │   ABUFFER.md. Only the draws it refuses (multisample, depth-writing, more
     │   than one attachment) fall back to CP_BLEND_LAYERS passes of 4-7.
+    │   Consecutive blended draws now merge into one A-buffer episode, which
+    │   needed per-draw fragment bindings and a stable clipper; see BATCHING.md.
     ├── blit: cp_resolve_samples when a multisample source meets a
     │   single-sample destination, a plain copy or format translate otherwise
     └── flush: cuCtxSynchronize + scratch reclaim
@@ -562,8 +620,12 @@ smooth.
    discards to 1 within four passes; halving the layers from 8 to 4 costs it
    0.14% of the frame, and anything still discarding after the last layer is
    lost.
-8. **BC1/BC3 decode is written but never exercised** — no upstream sample uses
-   compressed textures, and the capture has 576 BC images.
+8. **BC1/BC3 decode is exercised by the capture now**, and the first thing it
+   found was not in the decoder: `cp_resource_copy_region` measured copies in
+   pixels while multiplying by the *block* size, so a BC1 `vkCmdCopyImage`
+   walked 16x its extent and ran off the allocation. Fixed, along with the
+   identical bug in `cp_blit`. No upstream sample uses compressed textures, so
+   the capture remains the only coverage.
 9. **`multithreading` (0.23%) has no diagnosis**, and the sample is
    nondeterministic: two runs of the same build differ, because thread
    scheduling changes the order its command buffers are recorded. Do not read
@@ -616,7 +678,15 @@ smooth.
    pixels. No sample in the set uses these equations, which is why it went
    unnoticed; `ABUFFER.md` has the matrix.
 15. **`cp_clip_triangles` compacts its output with `atomicAdd`, so post-clip
-   primitive order is not stable run to run.** Vulkan defines rasterization
+   primitive order is not stable run to run — half fixed.** A stable mode now
+   exists and is used for blended batches: input triangle *t* owns output slots
+   *4t..4t+3*, and the slots it does not fill are retired as zero-area triangles
+   that `setup_triangle` already rejects. It costs nothing (stage 1 was always
+   sized for four times the input) and it is what makes blending exactly
+   submission-ordered — the driver is now bit-identical against itself on the
+   capture, where it used to differ by ~0.3% of pixels. The compacting path
+   still runs for everything else, so the paragraph below stands for unblended
+   draws. Vulkan defines rasterization
    order by primitive order, so this breaks the guarantee independently of
    anything else — it was simply invisible while batches were small and ties
    were rare. Merging draws that replay different index ranges made it
@@ -641,14 +711,45 @@ smooth.
 `textureSize` reading as zero made a blur kernel compute `1/0` for its tap
 offsets and sample at infinity, blackening a whole frame; `terminate_if`
 returning undef collapsed shaders; `gl_InstanceIndex` silently did nothing for a
-while. `CUDAPIPE_DEBUG_SHADER=1` lists them. Treat a zero from a missing feature
-as a fault, not a default.
+while. Treat a zero from a missing feature as a fault, not a default.
+
+`gl_FrontFacing` is the most expensive instance so far, and it is the one that
+changed how this is reported. `nir_intrinsic_load_front_face` had no case in the
+backend, so it became `undef`, so a surface shader's tangent frame was flipped
+by an undefined sign, so every lit surface in a real application lost its direct
+lighting. The frames looked plausible — dim, faintly green — and finding it took
+bisecting one frame to a single draw and dumping every descriptor of it from two
+drivers. `CUDAPIPE_DEBUG_SHADER=1` had been printing
+`unhandled intrinsic 'load_front_face'` the whole time, behind a variable nobody
+sets until they already suspect the shader.
+
+**So that warning is unconditional now**, once per intrinsic name. It cost
+nothing and it is compile time, not draw time. The very next silent-render bug
+after it took four commands to diagnose, mostly because the *absence* of that
+warning eliminated an entire class of cause immediately. Two siblings are still
+gated on the env var and should not be — `TODO_DEBUG_FLAGS.md` names them.
 
 **A CUDA fault is sticky and surfaces at the wrong place.** An `imageLoad` one
 texel outside its image killed a whole frame: the context faulted, the next
 `cuMemAlloc` failed, and draws then bailed out for want of a visibility buffer
 several stages away from the cause. `compute-sanitizer` turns this back into a
 kernel name and a line.
+
+It reappeared in a worse form and is worth knowing in that form too. A vertex
+shader indexing an array with an unexpanded packed attribute read about two
+gigabytes out of bounds; the context died with `CUDA_ERROR_ILLEGAL_ADDRESS`;
+`cp_allocate_memory` then returned NULL, which nothing checked; and lavapipe
+took that NULL straight to `memset()`. The visible failure was a segfault inside
+libc **with no cudapipe frame in the backtrace at all**. Under
+`CUDA_LAUNCH_BLOCKING=1` the first two errors the driver reported were a vertex
+shader launch and `fs_interpolate` — both merely the first launches *after* the
+fault, neither the cause.
+
+Two things follow. The driver reports failures now (`CP_CU_WARN`, `CP_LAUNCH`),
+and for the sticky errors it says so explicitly and names the tools, because
+"the first report is not the cause" is the part that costs a day. And
+`compute-sanitizer` remains the thing that actually answers it: about sixty
+seconds on a capture that faults in five.
 
 **Floating point contraction breaks exact symmetry, and the rasterizer depends
 on it.** Coverage is watertight only if the two triangles sharing an edge
@@ -834,7 +935,9 @@ retried.
 | `CUDAPIPE_DEBUG_WORK` | shaded pixels against threads launched, per shading pass (syncs) |
 | `CUDAPIPE_NVTX` | NVTX timeline ranges per draw and stage; read with `tests/cp_prof_nvtx.py` |
 | `CUDAPIPE_NO_ABUFFER` | back to the peel loop for blended draws — see `ABUFFER.md`. The A-buffer is the default |
-| `CUDAPIPE_ABUFFER_COMPOSITE=0` / `_VERIFY=1` / `_LAYERS=N` / `_TIMING=0` | build the lists beside the peel loop; the stepwise checks; cap the composite; drop the timing drain |
+| `CUDAPIPE_ABUFFER_COMPOSITE=0` / `_VERIFY=1` / `_LAYERS=N` / `_TIMING=1` | build the lists beside the peel loop; the stepwise checks; cap the composite; **switch the stage timing on** — it defaults off, and this row said `_TIMING=0` for a long time, which reads as though it defaults on |
+| `CUDAPIPE_NO_ABUF_BATCH` | stop merging consecutive blended draws into one A-buffer episode |
+| `CUDAPIPE_SMALL_ALLOC` / `_MAX` / `_WARMUP` / `_STATS` | the small-allocation arena: `advise\|pinned\|managed\|off\|blocksonly`, the size ceiling, how many allocations before it opens, and an exit-time dump |
 | `CUDAPIPE_NO_BINCACHE` | rebuild the binning queues on every peel pass, as before |
 | `CUDAPIPE_SMALL_THRESHOLD` / `MEDIUM_THRESHOLD` / `POINT_THRESHOLD` | rasterizer stage boundaries, `-D` at NVRTC time — sweep without rebuilding |
 | `CUDAPIPE_TILE_BOUND` | `0` puts stage 3 back to walking the whole tile |
@@ -843,6 +946,13 @@ retried.
 | `CUDAPIPE_SHADER_STATS=1` | every shader's registers, spill, blocks/SM and capping decision |
 | `CUDAPIPE_REGCAP_STATIC=1` / `CUDAPIPE_TUNE_VETO` | the compile-time-only shape, kept measurable; the veto threshold (not load-bearing between 1.03 and 1.05) |
 | `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
+
+**This table is incomplete and always has been** — the driver reads 44
+environment variables across 68 call sites, and the ones above are the subset
+somebody remembered to write down. `TODO_DEBUG_FLAGS.md` has the full inventory
+with each one's parsing and default, and a plan to generate tables like this
+one from a registry so they stop drifting. Until then, `grep -rn 'getenv(' 
+src/gallium/drivers/cudapipe/` is the authority, not this table.
 
 ```bash
 /usr/local/cuda/bin/compute-sanitizer --tool memcheck --print-limit 2 \
