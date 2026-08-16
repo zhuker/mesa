@@ -86,6 +86,10 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
    /* Determine the actual vertex index for this assembled vertex */
    uint32_t vertex_id;
    uint32_t instance_id;
+   /* Which merged draw this vertex belongs to; stays 0 on the refs path,
+    * which never coexists with a batch. The gather below indexes the
+    * per-draw base table with it. */
+   uint32_t row = 0;
 
    if (args.vertex_ids) {
       /* Pre-expanded topology (strip/fan/points): read from the refs array */
@@ -110,7 +114,6 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
        * a few hundred bytes at most. Nothing here runs for an unbatched draw —
        * num_draw_slices is zero and every value above stands.
        */
-      uint32_t row = 0;
       if (args.num_draw_slices) {
          const struct cp_draw_slice *sl =
             (const struct cp_draw_slice *)(uintptr_t)args.draw_slices;
@@ -161,7 +164,13 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
    char *out = (char *)(uintptr_t)args.output + (uint64_t)v * args.vs_in_stride;
 
    for (uint32_t e = 0; e < args.num_elements; e++) {
-      uint64_t vb_base = args.vb_bases[args.elem_vb_idx[e]];
+      /* A batch carries one row of per-element base addresses per merged
+       * draw, so draws bound to different vertex buffers merge; without one
+       * the launch-wide bases stand, which is the unbatched path unchanged. */
+      uint64_t vb_base = args.elem_bases
+         ? ((const uint64_t *)(uintptr_t)args.elem_bases)
+              [row * CP_VB_TABLE_STRIDE + e]
+         : args.vb_bases[args.elem_vb_idx[e]];
       if (!vb_base)
          continue;
 

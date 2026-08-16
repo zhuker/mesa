@@ -254,7 +254,13 @@ cp_set_scissor_states(struct pipe_context *ctx, unsigned start_slot,
 {
    struct cp_context *cp = (struct cp_context *)ctx;
    if (num_scissors > 0) {
-      if (memcmp(&cp->scissor, &scissors[0], sizeof(cp->scissor)))
+      /* A batch on the stable clipper records the scissor per draw, so a
+       * pending one survives the change; one that cannot resolve a primitive
+       * to its draw still has to go. Same condition as the key builder's. */
+      if (cp->batch.pending &&
+          !(cp->batch.blended ||
+            (cp->fs_shader && cp->fs_shader->reads_const_bufs)) &&
+          memcmp(&cp->scissor, &scissors[0], sizeof(cp->scissor)))
          cp_batch_flush_why(cp, "scissor");
       cp->scissor = scissors[0];
    }
@@ -3229,7 +3235,8 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                 const struct pipe_draw_start_count_bias *draws,
                 unsigned num_draws, unsigned batch_draws,
                 const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table,
-                const uint32_t *draw_ids)
+                const uint32_t *draw_ids, const uint64_t *vb_table,
+                const struct pipe_scissor_state *scissors)
 {
    struct cp_screen *screen = cp->screen;
    struct pipe_framebuffer_state *fb = &cp->framebuffer;
@@ -3375,11 +3382,25 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
    int clip_y0 = MAX2(0, (int)(vp_y + 0.499f));
    int clip_x1 = MIN2((int)w - 1, (int)(vp_x + vp_w - 0.501f));
    int clip_y1 = MIN2((int)h - 1, (int)(vp_y + vp_h - 0.501f));
-   if (cp->rasterizer.scissor) {
-      clip_x0 = MAX2(clip_x0, (int)cp->scissor.minx);
-      clip_y0 = MAX2(clip_y0, (int)cp->scissor.miny);
-      clip_x1 = MIN2(clip_x1, (int)cp->scissor.maxx - 1);
-      clip_y1 = MIN2(clip_y1, (int)cp->scissor.maxy - 1);
+   /*
+    * A batch whose primitives can be resolved to their draw — the same
+    * stable-clip condition as the fragment tables — carries one rectangle
+    * per draw instead of folding the scissor in here, so draws that disagree
+    * on it merge. Everything else takes the recorded (or live, unbatched)
+    * scissor exactly as before. A deferred draw's scissor is its snapshot,
+    * not the live state.
+    */
+   bool rows_stable = cp->blend_enabled ||
+      (cp->fs_shader && cp->fs_shader->reads_const_bufs);
+   bool per_draw_rects = scissors && batch_draws > 1 && rows_stable &&
+      cp->rasterizer.scissor;
+   if (cp->rasterizer.scissor && !per_draw_rects) {
+      const struct pipe_scissor_state *sc0 =
+         scissors ? &scissors[0] : &cp->scissor;
+      clip_x0 = MAX2(clip_x0, (int)sc0->minx);
+      clip_y0 = MAX2(clip_y0, (int)sc0->miny);
+      clip_x1 = MIN2(clip_x1, (int)sc0->maxx - 1);
+      clip_y1 = MIN2(clip_y1, (int)sc0->maxy - 1);
    }
 
    struct cp_rasterize_args rast_args = {
@@ -3436,9 +3457,12 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
    cp_scratch_begin(cp);
 
    /* A shader with no declared inputs needs no vertex buffer: it builds its
-    * positions from gl_VertexIndex, which is how a fullscreen pass is drawn. */
+    * positions from gl_VertexIndex, which is how a fullscreen pass is drawn.
+    * A batch carries its own snapshot of the bindings, so the live state —
+    * which the next draw may have rebound over — is not consulted for one. */
    bool has_vs = cp->vs_shader && cp->vs_shader->kernel &&
-                 ((cp->num_vertex_buffers > 0 &&
+                 (vb_table != NULL ||
+                  (cp->num_vertex_buffers > 0 &&
                    cp->vertex_buffers[0].buffer.resource) ||
                   cp->num_vertex_elements == 0);
 
@@ -3560,8 +3584,9 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       /* A vertex shader may build its positions from gl_VertexIndex alone and
        * declare no inputs at all, which is how a fullscreen pass is drawn.
        * That draw binds no vertex buffer, and skipping it loses every
-       * post-processing and skybox pass. */
-      if (vb_data2 || cp->num_vertex_elements == 0) {
+       * post-processing and skybox pass. A batch's bindings are its snapshot,
+       * not the live state. */
+      if (vb_table != NULL || vb_data2 || cp->num_vertex_elements == 0) {
          unsigned stride;
          unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
          unsigned out_stride = num_vs_outputs * 16;
@@ -3697,6 +3722,43 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
              * rather than from the vertex; see cp_fs_interp_args. */
             if (fs_ubo_table)
                cp->fs_batch.slices = slices_dev;
+
+            /*
+             * The per-draw clip rectangles, when the batch's draws may
+             * disagree on the scissor: each is the batch-wide rectangle —
+             * which then carries no scissor at all — intersected with that
+             * draw's recorded one. The rasterizer resolves a primitive to
+             * its rectangle through the slice table above.
+             */
+            if (per_draw_rects) {
+               int32_t rects[CP_MAX_BATCH_DRAWS][4];
+               for (unsigned d = 0; d < batch_draws; d++) {
+                  rects[d][0] = MAX2(clip_x0, (int)scissors[d].minx);
+                  rects[d][1] = MAX2(clip_y0, (int)scissors[d].miny);
+                  rects[d][2] = MIN2(clip_x1, (int)scissors[d].maxx - 1);
+                  rects[d][3] = MIN2(clip_y1, (int)scissors[d].maxy - 1);
+               }
+               CUdeviceptr rects_dev = cp_upload(cp, rects,
+                  (size_t)batch_draws * sizeof(rects[0]));
+               if (!rects_dev) { FREE(refs); return; }
+               rast_args.rect_draw_slices = slices_dev;
+               rast_args.clip_rects = rects_dev;
+               rast_args.num_rect_slices = batch_draws;
+               rast_args.rect_prim_shift = 0;   /* 2 once stable clip runs */
+            }
+         }
+
+         /* The batch's per-draw vertex-buffer bases. Uploaded for a batch of
+          * one too: a deferred draw runs after the next draw's bindings were
+          * set over the live ones, so the snapshot is the only true copy. */
+         CUdeviceptr elem_bases_dev = 0;
+         if (vb_table) {
+            elem_bases_dev = cp_upload(cp, vb_table,
+               (size_t)batch_draws * CP_VB_TABLE_STRIDE * sizeof(uint64_t));
+            if (!elem_bases_dev) {
+               FREE(refs);
+               return;
+            }
          }
 
          struct cp_vertex_fetch_args vf_args = {
@@ -3715,6 +3777,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
             .draw_slices = slices_dev,
             .num_draw_slices = slices_dev ? batch_draws : 0,
             .out_batch_rows = batch_rows,
+            .elem_bases = elem_bases_dev,
          };
 
          /* Set up index buffer for direct GPU indexing (triangle list only).
@@ -4008,8 +4071,10 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                      rast_args.positions = clipped;
                      rast_args.tri_count = clip_count;
                      rast_num_triangles = max_clipped;
-                     if (stable_clip)
+                     if (stable_clip) {
                         cp->fs_batch.prim_shift = 2;
+                        rast_args.rect_prim_shift = 2;
+                     }
                   } else {
                      fprintf(stderr, "cudapipe: clip launch failed (%d)\n",
                              clip_err);
@@ -5058,7 +5123,17 @@ cp_batch_build_key(struct cp_context *cp, const struct pipe_draw_info *info,
     */
 
    key->viewport = cp->viewport;
-   key->scissor = cp->scissor;
+   /*
+    * The scissor is a merge condition only where a primitive cannot be
+    * resolved to its draw: a batch on the stable clipper carries one clip
+    * rectangle per draw instead (see cp_rasterize_args.clip_rects), and with
+    * the scissor test off in the rasterizer state the value is unread. The
+    * rasterizer state itself stays keyed, so the enable bit agrees across
+    * any batch.
+    */
+   if (cp->rasterizer.scissor &&
+       !(blended || (cp->fs_shader && cp->fs_shader->reads_const_bufs)))
+      key->scissor = cp->scissor;
    key->rasterizer = cp->rasterizer;
    key->depth_stencil = cp->depth_stencil;
    key->blend_state = cp->blend_state;
@@ -5069,10 +5144,6 @@ cp_batch_build_key(struct cp_context *cp, const struct pipe_draw_info *info,
    key->num_vertex_elements = cp->num_vertex_elements;
    key->vertex_stride = cp->vertex_stride;
    key->num_vertex_buffers = cp->num_vertex_buffers;
-   for (unsigned i = 0; i < cp->num_vertex_buffers && i < 16; i++) {
-      key->vertex_buffers[i].resource = cp->vertex_buffers[i].buffer.resource;
-      key->vertex_buffers[i].offset = cp->vertex_buffers[i].buffer_offset;
-   }
 
    key->num_vs_ubos = cp->num_vs_ubos;
    /*
@@ -5115,7 +5186,7 @@ cp_batch_key_report_diff(const struct cp_batch_key *a,
       F(viewport), F(scissor), F(rasterizer), F(depth_stencil),
       F(blend_state), F(blend_enabled),
       F(vertex_elements), F(num_vertex_elements), F(vertex_stride),
-      F(num_vertex_buffers), F(vertex_buffers),
+      F(num_vertex_buffers),
       F(num_fs_ubos), F(num_vs_ubos),
       F(sampler_table), F(num_samplers),
    };
@@ -5321,8 +5392,29 @@ cp_batch_record(struct cp_context *cp,
          frow[i] = (uint64_t)(uintptr_t)cp->fs_ubos[i].buffer;
    }
 
+   /* The vertex-buffer bases, resolved per element the way the launch would
+    * resolve them — snapshotted for the same reason as the uniform rows. */
+   {
+      uint64_t *vrow = cp->batch.vb_bases +
+         (size_t)cp->batch.ndraws * CP_VB_TABLE_STRIDE;
+      memset(vrow, 0, CP_VB_TABLE_STRIDE * sizeof(*vrow));
+      for (unsigned e = 0; e < cp->num_vertex_elements &&
+                           e < CP_VB_TABLE_STRIDE; e++) {
+         unsigned vb_idx = cp->vertex_elements[e].vertex_buffer_index;
+         if (vb_idx < cp->num_vertex_buffers && vb_idx < 16 &&
+             cp->vertex_buffers[vb_idx].buffer.resource) {
+            void *data = cp_resource_data(
+               cp_resource(cp->vertex_buffers[vb_idx].buffer.resource));
+            if (data)
+               vrow[e] = (uint64_t)(uintptr_t)data +
+                  cp->vertex_buffers[vb_idx].buffer_offset;
+         }
+      }
+   }
+
    cp->batch.draws[cp->batch.ndraws] = *draw;
    cp->batch.draw_ids[cp->batch.ndraws] = drawid_offset;
+   cp->batch.scissors[cp->batch.ndraws] = cp->scissor;
    cp->batch.tris += tris;
    cp->batch.ndraws++;
 }
@@ -5365,7 +5457,8 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
    (void)blended;
    cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
                    cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
-                   cp->batch.fs_ubos, cp->batch.draw_ids);
+                   cp->batch.fs_ubos, cp->batch.draw_ids, cp->batch.vb_bases,
+                   cp->batch.scissors);
 }
 
 static void
@@ -5442,7 +5535,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
 
    cp_batch_flush_why(cp, "the next draw cannot be batched");
    cp_draw_execute(cp, info, drawid_offset, draws, num_draws, 1, NULL, NULL,
-                   NULL);
+                   NULL, NULL, NULL);
 }
 
 static void
@@ -6135,17 +6228,9 @@ cp_set_vertex_buffers(struct pipe_context *ctx, unsigned count,
 {
    struct cp_context *cp = (struct cp_context *)ctx;
 
-   if (cp->batch.pending) {
-      bool same = count == cp->num_vertex_buffers;
-      for (unsigned i = 0; same && i < count && i < 16; i++) {
-         const struct pipe_vertex_buffer *nb = buffers ? &buffers[i] : NULL;
-         same = nb &&
-            nb->buffer.resource == cp->vertex_buffers[i].buffer.resource &&
-            nb->buffer_offset == cp->vertex_buffers[i].buffer_offset;
-      }
-      if (!same)
-         cp_batch_flush_why(cp, "vertex buffers");
-   }
+   /* A pending batch survives this: it snapshotted one row of resolved
+    * per-element bases per draw at cp_batch_record() time, so nothing it will
+    * read is live state. A count change breaks the key on its own. */
 
    for (unsigned i = 0; i < count; i++) {
       if (buffers) {

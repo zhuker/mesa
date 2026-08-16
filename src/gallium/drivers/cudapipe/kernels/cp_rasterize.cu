@@ -350,6 +350,29 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
    float4 *positions = (float4 *)(uintptr_t)args->positions;
    uint32_t pos_stride = args->num_varyings + 1;
 
+   /*
+    * The clip rectangle this primitive is bounded by: the batch-wide one, or
+    * its own draw's when the batch carries per-draw scissors. The rects are
+    * precomputed as the full intersection on the host, so no second clamp.
+    */
+   int clip_x0 = args->clip_x0, clip_y0 = args->clip_y0;
+   int clip_x1 = args->clip_x1, clip_y1 = args->clip_y1;
+   if (args->clip_rects) {
+      const struct cp_draw_slice *sl =
+         (const struct cp_draw_slice *)(uintptr_t)args->rect_draw_slices;
+      uint32_t vert = (tri_id >> args->rect_prim_shift) * 3u;
+      uint32_t lo = 0, hi = args->num_rect_slices - 1;
+      while (lo < hi) {
+         uint32_t mid = (lo + hi + 1) >> 1;
+         if (sl[mid].vert_begin <= vert)
+            lo = mid;
+         else
+            hi = mid - 1;
+      }
+      const int4 r = ((const int4 *)(uintptr_t)args->clip_rects)[lo];
+      clip_x0 = r.x; clip_y0 = r.y; clip_x1 = r.z; clip_y1 = r.w;
+   }
+
    float4 v0 = positions[(tri_id * 3 + 0) * pos_stride];
    float4 v1 = positions[(tri_id * 3 + 1) * pos_stride];
    float4 v2 = positions[(tri_id * 3 + 2) * pos_stride];
@@ -386,10 +409,10 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
       s->sx0 = cx; s->sy0 = cy;
       s->inv_area = 1.0f;
 
-      s->ix_min = max((int)floorf(s->pt_x0), args->clip_x0);
-      s->iy_min = max((int)floorf(s->pt_y0), args->clip_y0);
-      s->ix_max = min((int)ceilf(s->pt_x1), args->clip_x1);
-      s->iy_max = min((int)ceilf(s->pt_y1), args->clip_y1);
+      s->ix_min = max((int)floorf(s->pt_x0), clip_x0);
+      s->iy_min = max((int)floorf(s->pt_y0), clip_y0);
+      s->ix_max = min((int)ceilf(s->pt_x1), clip_x1);
+      s->iy_max = min((int)ceilf(s->pt_y1), clip_y1);
       return s->ix_min <= s->ix_max && s->iy_min <= s->iy_max;
    }
 
@@ -441,10 +464,10 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
     * stage walks a box with a negative width — two negative sides multiply
     * into a plausible-looking area.
     */
-   s->ix_min = max((int)floorf(min_x), args->clip_x0);
-   s->iy_min = max((int)floorf(min_y), args->clip_y0);
-   s->ix_max = min((int)ceilf(max_x), args->clip_x1);
-   s->iy_max = min((int)ceilf(max_y), args->clip_y1);
+   s->ix_min = max((int)floorf(min_x), clip_x0);
+   s->iy_min = max((int)floorf(min_y), clip_y0);
+   s->ix_max = min((int)ceilf(max_x), clip_x1);
+   s->iy_max = min((int)ceilf(max_y), clip_y1);
 
    return s->ix_min <= s->ix_max && s->iy_min <= s->iy_max;
 }
@@ -1019,12 +1042,12 @@ cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues qu
       int col = (int)threadIdx.x;
       int px = tile_x + col;
 
-      if (col < CP_TILE_SIZE && px >= args.clip_x0 && px <= args.clip_x1) {
+      if (col < CP_TILE_SIZE && px >= sh_s.ix_min && px <= sh_s.ix_max) {
          for (int row = 0; row < CP_TILE_SIZE; row++) {
             int py = tile_y + row;
-            if (py > args.clip_y1)
+            if (py > sh_s.iy_max)
                break;
-            if (py < args.clip_y0)
+            if (py < sh_s.iy_min)
                continue;
 #endif
 

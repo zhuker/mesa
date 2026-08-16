@@ -76,6 +76,19 @@ struct cp_rasterize_args {
     * draws nothing.
     */
    int32_t clip_x0, clip_y0, clip_x1, clip_y1;
+   /*
+    * Per-draw clip rectangles, for a batch whose draws disagree on the
+    * scissor. clip_rects points at one int4 {x0,y0,x1,y1} per merged draw —
+    * already intersected with the batch-wide rectangle above, which then
+    * carries only framebuffer ∩ viewport. setup_triangle() resolves the
+    * primitive to its draw through draw_slices, the same search
+    * cp_write_batch_rows() does. Zero means every primitive takes clip_*
+    * above, which is the unbatched path unchanged.
+    */
+   uint64_t rect_draw_slices;  /* const struct cp_draw_slice * */
+   uint64_t clip_rects;        /* const int4 *, one per draw */
+   uint32_t num_rect_slices;
+   uint32_t rect_prim_shift;
    /* Rasterizer state */
    uint32_t cull_mode;      /* 0=none, 1=front, 2=back */
    uint32_t front_face;     /* 0=CCW, 1=CW */
@@ -992,6 +1005,18 @@ struct cp_vertex_fetch_args {
     * Zero when the shader has no use for it.
     */
    uint64_t out_batch_rows;
+   /*
+    * Per-draw vertex-buffer bases: CP_VB_TABLE_STRIDE uint64 per merged draw,
+    * one resolved base address per vertex *element* (buffer data plus
+    * buffer_offset — the element's own src_offset stays in elem_src_offset).
+    * Zero for an unbatched draw, where vb_bases above stands. A batch always
+    * carries it, because a deferred draw's bindings may be rebound before the
+    * batch runs — deferral is the hazard, not merging.
+    */
+   uint64_t elem_bases;    /* const uint64_t *, rows of CP_VB_TABLE_STRIDE */
 };
+
+/* uint64 entries per draw in the per-draw vertex-buffer base table. */
+#define CP_VB_TABLE_STRIDE 16
 
 #endif /* CP_RAST_TYPES_H */

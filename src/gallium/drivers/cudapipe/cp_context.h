@@ -78,13 +78,12 @@ struct cp_batch_key {
    struct pipe_blend_state blend_state;
    uint32_t blend_enabled;
 
-   /* Vertex input. */
+   /* Vertex input. The buffer *bindings* are absent: a batch carries one row
+    * of resolved per-element base addresses per draw, so draws bound to
+    * different vertex buffers merge. The element layout and the buffer count
+    * stay — they shape the gather itself. */
    struct pipe_vertex_element vertex_elements[16];
    uint32_t num_vertex_elements, vertex_stride, num_vertex_buffers;
-   struct {
-      const void *resource;
-      uint32_t offset;
-   } vertex_buffers[16];
 
    /* Binding *counts* only: both stages carry their per-draw pointer tables,
     * but each launch fills its table's rows this many entries wide, so the
@@ -133,6 +132,13 @@ struct cp_context {
        */
       bool blended;
       uint64_t fs_ubos[CP_MAX_BATCH_DRAWS * CP_MAX_CONST_BUFFERS];
+      /* One row of resolved per-element vertex-buffer bases per draw, so
+       * draws bound to different vertex buffers merge — see
+       * cp_vertex_fetch_args.elem_bases. */
+      uint64_t vb_bases[CP_MAX_BATCH_DRAWS * CP_VB_TABLE_STRIDE];
+      /* The scissor each draw was recorded under, for the per-draw clip
+       * rectangles — see cp_rasterize_args.clip_rects. */
+      struct pipe_scissor_state scissors[CP_MAX_BATCH_DRAWS];
    } batch;
 
    /*
