@@ -417,6 +417,40 @@ cp_image_format_size(enum pipe_format format, unsigned fallback_bits)
    return size ? size : MAX2(fallback_bits / 8, 1u);
 }
 
+/*
+ * Report, once per name, that the backend is about to emit undef.
+ *
+ * Every caller of this is a hole in the backend that produces undef and lets
+ * it propagate through everything downstream, which is the failure mode that
+ * cost the most time in this driver: load_front_face was missing, so
+ * gl_FrontFacing was undef, so every surface in a captured application lost
+ * its direct lighting, and the frames looked merely dim rather than wrong.
+ * 1c0ad4094fa made the intrinsic case say so unconditionally; the two ALU
+ * cases below are the same bug wearing a different hat and were missed.
+ *
+ * This is compile time, not draw time — a few lines for a shader that will
+ * render wrong. Names come from NIR's static info tables, so comparing the
+ * pointer is an exact test and costs nothing. Past 32 distinct names the
+ * dedup gives up and repeats, which is the right way to degrade: something is
+ * very wrong by then and the first lines have already been printed.
+ */
+static void
+warn_undef_once(const char *what, const char *name)
+{
+   static const char *said[32];
+   static unsigned num_said;
+
+   for (unsigned i = 0; i < num_said; i++)
+      if (said[i] == name)
+         return;
+
+   if (num_said < ARRAY_SIZE(said))
+      said[num_said++] = name;
+
+   fprintf(stderr, "cudapipe: %s '%s' is not implemented — the shader using "
+           "it computes on undef and will render wrong.\n", what, name);
+}
+
 static void
 emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
 {
@@ -1282,24 +1316,7 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
        * time: a handful of lines for a shader that will render wrong, against
        * however long it takes to work that out from the picture.
        */
-      static const char *said[32];
-      static unsigned num_said;
-      const char *name = nir_intrinsic_infos[instr->intrinsic].name;
-      bool seen = false;
-
-      for (unsigned i = 0; i < num_said; i++)
-         if (said[i] == name) {
-            seen = true;
-            break;
-         }
-
-      if (!seen) {
-         if (num_said < ARRAY_SIZE(said))
-            said[num_said++] = name;
-         fprintf(stderr, "cudapipe: intrinsic '%s' is not implemented — the "
-                 "shader reading it computes on undef and will render "
-                 "wrong.\n", name);
-      }
+      warn_undef_once("intrinsic", nir_intrinsic_infos[instr->intrinsic].name);
 
       if (nir_intrinsic_infos[instr->intrinsic].has_dest) {
          unsigned num_comp = instr->def.num_components;
@@ -1381,6 +1398,7 @@ build_intrinsic(struct ntl_context *ctx, const char *name,
 static void
 emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
 {
+
    LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
    unsigned num_comp = instr->def.num_components;
    unsigned bit_size = instr->def.bit_size;
@@ -1746,19 +1764,19 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       break;
    default:
       /* Same trap as the intrinsics: undef propagates silently and can fold a
-       * whole shader to a constant, so make the gap visible when debugging. */
-      if (getenv("CUDAPIPE_DEBUG_SHADER"))
-         fprintf(stderr, "cudapipe: unhandled ALU op '%s' -> undef\n",
-                 nir_op_infos[instr->op].name);
+       * whole shader to a constant, so say so — always, not just when someone
+       * already suspects the shader enough to set a debug variable. */
+      warn_undef_once("ALU op", nir_op_infos[instr->op].name);
       result = LLVMGetUndef(dst_type);
       break;
    }
 
-   /* build_intrinsic() returns NULL if LLVM doesn't know the name. */
+   /* build_intrinsic() returns NULL if LLVM doesn't know the name. Same
+    * outcome as the unhandled-op case above, reached a different way: the op
+    * is handled, but the LLVM intrinsic it lowers to does not exist. */
    if (!result) {
-      if (getenv("CUDAPIPE_DEBUG_SHADER"))
-         fprintf(stderr, "cudapipe: no LLVM intrinsic for '%s' -> undef\n",
-                 nir_op_infos[instr->op].name);
+      warn_undef_once("the LLVM intrinsic for ALU op",
+                      nir_op_infos[instr->op].name);
       result = LLVMGetUndef(dst_type);
    }
 
