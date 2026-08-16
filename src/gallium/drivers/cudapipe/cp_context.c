@@ -4521,8 +4521,9 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
                      CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                      256, 1, 1, 0, cp->stream, ap, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
-                     0, cp->stream, ap, NULL);
+      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
+                     CLAMP(rast_num_triangles * 8, 512u, 2048u), 1, 1,
+                     64, 1, 1, 0, cp->stream, ap, NULL);
       cp_abuf_mark(ab->ev[1], cp->stream);
 
       /* The segment is counted; everything from the scan on happens once,
@@ -4667,8 +4668,9 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
                      CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                      256, 1, 1, 0, cp->stream, ap, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
-                     0, cp->stream, ap, NULL);
+      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
+                     CLAMP(rast_num_triangles * 8, 512u, 2048u), 1, 1,
+                     64, 1, 1, 0, cp->stream, ap, NULL);
       cp_abuf_mark(ab->ev[4], cp->stream);
 
       /* --- step 4: sort. The worklist build is inside this measurement: it
@@ -5799,8 +5801,9 @@ cp_pass_finish(struct cp_context *cp)
       CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
                      CLAMP((sg->rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                      256, 1, 1, 0, cp->stream, ap, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
-                     0, cp->stream, ap, NULL);
+      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
+                     CLAMP(sg->rast_num_triangles * 8, 512u, 2048u), 1, 1,
+                     64, 1, 1, 0, cp->stream, ap, NULL);
    }
    cp->stream = pass_main;
    cp_pass_join(cp, nsegs);

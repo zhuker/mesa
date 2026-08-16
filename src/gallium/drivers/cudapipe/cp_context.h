@@ -200,7 +200,7 @@ struct cp_context {
     * queue set, since the queues are rebuilt per launch group and two
     * streams may be in one concurrently.
     */
-#define CP_PASS_STREAMS 4
+#define CP_PASS_STREAMS 8
    CUstream seg_streams[CP_PASS_STREAMS];
    CUevent seg_ev[CP_PASS_STREAMS];
    CUevent pass_gate;
