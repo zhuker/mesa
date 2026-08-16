@@ -1,8 +1,27 @@
 # Plan: one registry for the driver's 44 environment switches
 
-Self-contained spec for a session picking this up cold. The inventory below is
-complete as of `b35443cfbbb` — it is the whole point of this document, so that
-the work starts from a list rather than from `grep`.
+> **Done.** All seven steps were carried out; the registry is `cp_debug.c`, the
+> generated table is `FLAGS.md`, and `CUDAPIPE_HELP=1` prints it from a running
+> driver. The rule that a new switch goes in the registry rather than into a
+> `getenv` is in `CLAUDE.md`; the mechanics of adding one are in
+> `CUDAPIPE_HANDOFF.md` "Debug".
+>
+> **The document below is the plan as written, kept for its reasoning, and it
+> is wrong in three places.** The inventory it calls complete is missing
+> `CUDAPIPE_NVTX`; `CUDAPIPE_DEBUG_SHADER` no longer exists, because step 1
+> removed its last two uses; so the count is 43, not 44. Step 7's renaming was
+> deliberately not done — it is churn against scripts, and the generated table
+> plus `CUDAPIPE_HELP` solved the finding-them problem that the renaming was
+> for. What the steps actually cost and what verifying them turned up is in the
+> commit messages, which are the record; two things worth carrying forward:
+>
+> - **`CUDAPIPE_DEBUG_FS` cannot be verified by diffing output.** It dumps the
+>   shaded-pixel list in GPU scheduling order, so it hashes differently on
+>   every run of any build. Check its contract instead.
+> - **`gltfscenerendering` and `vulkanscene` do not render deterministically**,
+>   at roughly a 10% rate, with no flags set and in a build predating all of
+>   this work. Two runs, or even ten, say "stable" and are wrong. Frame
+>   comparison on those samples is not a usable signal; `texture` is stable.
 
 Third priority, behind `HEADLESS_STREAMER_PERF.md` and `TODO_CONFORMANCE.md`.
 But it is cheap, and it is the change that most reduces the cost of the *next*

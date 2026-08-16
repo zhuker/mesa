@@ -327,11 +327,13 @@ CUDAPIPE_ABUFFER=1 CUDAPIPE_ABUFFER_VERIFY=1 VK_DRIVER_FILES=$ICD build/bin/part
 DESC="..." $T/cp_iterate.sh mylabel abufw0
 ```
 
-| variable | effect |
-|---|---|
-| `CUDAPIPE_NO_ABUFFER` | back to the peel loop |
-| `CUDAPIPE_ABUFFER_COMPOSITE=0` | build the lists beside the peel loop, still peel |
-| `CUDAPIPE_ABUFFER_VERIFY=1` | the step-by-step checks above; ~240 MB of comparison buffers |
-| `CUDAPIPE_ABUFFER_TIMING=0` | drop the per-draw drain the CUDA-event timings need |
-| `CUDAPIPE_ABUFFER_LAYERS=N` | cap the composite, for bisecting against the peel cap |
-| `CUDAPIPE_ABUF_COMPILE` | force the kernels in or out of the NVRTC build |
+The switches for this subsystem are the A-buffer section of
+[`FLAGS.md`](FLAGS.md), which is generated from the registry in `cp_debug.c`
+and cannot drift. `CUDAPIPE_HELP=1` prints the same thing from a running
+driver, with what each one resolved to.
+
+The table that used to be here was wrong, which is why it is gone: it gave
+`CUDAPIPE_ABUFFER_TIMING=0` as the way to drop the per-draw drain, implying
+the timing defaulted on. It has defaulted off since the A-buffer stopped being
+opt-in, so anyone following that line set a variable that changed nothing.
+`CUDAPIPE_ABUFFER_TIMING=1` is what turns it on.

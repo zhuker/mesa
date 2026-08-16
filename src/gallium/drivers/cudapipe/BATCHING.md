@@ -287,6 +287,6 @@ is now set for every draw rather than only for real batches.
 Opaque batches still require identical fragment bindings; extending the table
 to them is small now, and is this document's `gltfscenerendering` item.
 
-| variable | effect |
-|---|---|
-| `CUDAPIPE_NO_ABUF_BATCH=1` | blended draws take the A-buffer one at a time |
+The batching switches are the draw-batching section of
+[`FLAGS.md`](FLAGS.md), generated from `cp_debug.c`; `CUDAPIPE_NO_ABUF_BATCH=1`
+makes blended draws take the A-buffer one at a time.

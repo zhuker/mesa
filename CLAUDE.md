@@ -17,6 +17,35 @@ PERFORMANCE_PROGRESS,PHASE_1A,INSTANCING,BATCHING,ABUFFER}.md` are records of pa
 passes. Their forward-looking sections have been overtaken and say so where
 they have.
 
+## Environment switches
+
+The driver has 43 of them and reads **none** of them with `getenv`. They are
+declared in one array in `src/gallium/drivers/cudapipe/cp_debug.c`, resolved
+once at screen creation into a read-only `struct cp_debug`, and read as
+`cp_debug->field`.
+
+**A new switch goes in that array. Do not add a `getenv` to the driver.** The
+array is the single source of truth for the name, the parse, the default and
+the one-line meaning, which is what makes `CUDAPIPE_HELP=1` and the generated
+`FLAGS.md` correct by construction. A `getenv` somewhere else is invisible to
+both, and the flags are this driver's debugging surface — the point of the
+registry is that the next person can find them without grep.
+
+- `src/gallium/drivers/cudapipe/FLAGS.md` — all of them, generated.
+- `CUDAPIPE_HELP=1 <any vulkan app>` — the same table, with what each one
+  resolved to in that process.
+- `tests/cp_debug_doc.py --check` — fails if `FLAGS.md` has drifted from the
+  registry. Run it after touching the array.
+
+Two boolean kinds exist and both are load-bearing: **presence** flags are set
+by the variable existing at all, so `CUDAPIPE_DEBUG_DRAW=0` turns tracing
+**on**, and **value** flags read the value, so `=0` turns them off. That is
+not a design, it is what they grew into, and it is preserved on purpose.
+`CUDAPIPE_HELP=1` says which kind each one is; check before assuming `=0` is
+off.
+
+`CUDAPIPE_HANDOFF.md` "Debug" has the mechanics of adding one.
+
 ## Profiling
 
 Ask these in order; `tests/TESTING.md` "Finding where the time goes" is the

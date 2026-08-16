@@ -20,10 +20,9 @@ work and are the place to start on it:
   now. **Read the correctness method before trusting any frame comparison.**
 - `src/gallium/drivers/cudapipe/TODO_CONFORMANCE.md` — what dEQP says, fixed and
   outstanding. Second priority.
-- `src/gallium/drivers/cudapipe/TODO_DEBUG_FLAGS.md` — the driver reads 44
-  environment variables and there is no list of them; this is the inventory and
-  a plan for a registry. Third priority, but it contains two silent-`undef`
-  paths in the shader backend that are worth fixing on their own.
+- `src/gallium/drivers/cudapipe/FLAGS.md` — every environment switch the
+  driver reads, generated from the registry in `cp_debug.c`. `CUDAPIPE_HELP=1`
+  prints the same table from a running driver.
 
 `tests/GFXRECONSTRUCT.md` is how to capture and replay in the first place,
 including why an application that never presents needs a different extraction
@@ -726,8 +725,10 @@ sets until they already suspect the shader.
 **So that warning is unconditional now**, once per intrinsic name. It cost
 nothing and it is compile time, not draw time. The very next silent-render bug
 after it took four commands to diagnose, mostly because the *absence* of that
-warning eliminated an entire class of cause immediately. Two siblings are still
-gated on the env var and should not be — `TODO_DEBUG_FLAGS.md` names them.
+warning eliminated an entire class of cause immediately. Its two siblings in
+`emit_alu` — an unhandled ALU op, and an op whose LLVM intrinsic does not
+exist — were gated on the variable for a while longer and are unconditional
+too now; all three share `warn_undef_once()`.
 
 **A CUDA fault is sticky and surfaces at the wrong place.** An `imageLoad` one
 texel outside its image killed a whole frame: the context faulted, the next
@@ -918,41 +919,60 @@ retried.
 
 ## Debug
 
-| Variable | Effect |
-|---|---|
-| `CUDAPIPE_DEBUG_DRAW` | draws, blend state, why a draw was skipped, clears, blits |
-| `CUDAPIPE_DEBUG_TIME` | per-draw timing breakdown |
-| `CUDAPIPE_DEBUG_TEX` | sampler/texture descriptor resolution |
-| `CUDAPIPE_DEBUG_FS` | per-pixel fragment inputs/outputs, VS output positions |
-| `CUDAPIPE_DEBUG_LAUNCH` | compute UBO/SSBO bindings |
-| `CUDAPIPE_DEBUG_VFETCH` | dump what the GPU vertex fetch gathered (syncs) |
-| `CUDAPIPE_DEBUG_DISCARD` | covered and discarded pixels per alpha-test pass (syncs) |
-| `CUDAPIPE_DEBUG_SHADER` | warn on unhandled NIR intrinsics |
-| `CUDAPIPE_DEBUG_BATCH` | why each draw batch ended |
-| `CUDAPIPE_DEBUG_BATCHDIFF` | which field of the batch key differed — "state or geometry" is one `memcmp` and this is what names it |
-| `CUDAPIPE_NO_BATCH` | disable draw batching; reproduces the unbatched frame byte for byte |
-| `CUDAPIPE_BATCH_MAX` | cap the batch size; `1` is the bit-identical check |
-| `CUDAPIPE_DEBUG_WORK` | shaded pixels against threads launched, per shading pass (syncs) |
-| `CUDAPIPE_NVTX` | NVTX timeline ranges per draw and stage; read with `tests/cp_prof_nvtx.py` |
-| `CUDAPIPE_NO_ABUFFER` | back to the peel loop for blended draws — see `ABUFFER.md`. The A-buffer is the default |
-| `CUDAPIPE_ABUFFER_COMPOSITE=0` / `_VERIFY=1` / `_LAYERS=N` / `_TIMING=1` | build the lists beside the peel loop; the stepwise checks; cap the composite; **switch the stage timing on** — it defaults off, and this row said `_TIMING=0` for a long time, which reads as though it defaults on |
-| `CUDAPIPE_NO_ABUF_BATCH` | stop merging consecutive blended draws into one A-buffer episode |
-| `CUDAPIPE_SMALL_ALLOC` / `_MAX` / `_WARMUP` / `_STATS` | the small-allocation arena: `advise\|pinned\|managed\|off\|blocksonly`, the size ceiling, how many allocations before it opens, and an exit-time dump |
-| `CUDAPIPE_NO_BINCACHE` | rebuild the binning queues on every peel pass, as before |
-| `CUDAPIPE_SMALL_THRESHOLD` / `MEDIUM_THRESHOLD` / `POINT_THRESHOLD` | rasterizer stage boundaries, `-D` at NVRTC time — sweep without rebuilding |
-| `CUDAPIPE_TILE_BOUND` | `0` puts stage 3 back to walking the whole tile |
-| `CUDAPIPE_MAX_REGISTERS` | cap shader registers via `CU_JIT_MAX_REGISTERS`; forces every shader, bypassing the policy below |
-| `CUDAPIPE_NO_REGCAP` | disable the per-shader register-cap policy — the driver compiles both builds and times them on real draws |
-| `CUDAPIPE_SHADER_STATS=1` | every shader's registers, spill, blocks/SM and capping decision |
-| `CUDAPIPE_REGCAP_STATIC=1` / `CUDAPIPE_TUNE_VETO` | the compile-time-only shape, kept measurable; the veto threshold (not load-bearing between 1.03 and 1.05) |
-| `CUDAPIPE_DUMP_NIR` / `DUMP_PTX` / `DUMP_IR` | dump shader IR at each stage |
+The driver's environment switches are declared in one array in
+`cp_debug.c`, and [`src/gallium/drivers/cudapipe/FLAGS.md`](src/gallium/drivers/cudapipe/FLAGS.md)
+is generated from it — all 43, with each one's type, default and meaning.
+`CUDAPIPE_HELP=1` in front of any Vulkan app prints the same table from the
+running driver, with the value each variable resolved to in that process,
+which is the form to reach for when the question is what a run was actually
+configured to do.
 
-**This table is incomplete and always has been** — the driver reads 44
-environment variables across 68 call sites, and the ones above are the subset
-somebody remembered to write down. `TODO_DEBUG_FLAGS.md` has the full inventory
-with each one's parsing and default, and a plan to generate tables like this
-one from a registry so they stop drifting. Until then, `grep -rn 'getenv(' 
-src/gallium/drivers/cudapipe/` is the authority, not this table.
+The table that used to be here is gone. It listed the subset somebody
+remembered to write down, it had drifted (it gave `CUDAPIPE_ABUFFER_TIMING=0`
+as if the timing defaulted on, when it defaults off), and it outlived at least
+one variable it documented. That is what hand-maintained tables do, and it is
+why the generated one replaced it.
+
+### Adding a switch
+
+Add an entry to `flags[]` in `cp_debug.c` and a field to `struct cp_debug` in
+`cp_debug.h`, then read it as `cp_debug->field`. **Do not call `getenv` in the
+driver**; the registry is what makes `FLAGS.md` and `CUDAPIPE_HELP` correct by
+construction, and a read somewhere else is invisible to both.
+
+The field name is the variable name minus `CUDAPIPE_`, lowercased, with no
+exceptions, so knowing one gives you the other. Everything is resolved once at
+screen creation and read-only afterwards — early enough for `cp_kernels_init()`,
+which turns four of them into NVRTC `-D` options.
+
+Pick the type deliberately, because two of them are booleans:
+
+| type | parse | use when |
+|---|---|---|
+| `CP_FLAG_BOOL_PRESENCE` | set if the variable exists at all | never, for something new — it means `=0` turns the flag **on** |
+| `CP_FLAG_BOOL_VALUE` | `atoi(v) != 0` | any new boolean |
+| `CP_FLAG_OPT_BOOL` / `CP_FLAG_OPT_INT` | unset, or the value | "not given" and "0" have to differ |
+| `CP_FLAG_UINT` / `_U64` / `_INT` / `_FLOAT` | with `.dflt`, and `.has_range` to clamp | numbers |
+| `CP_FLAG_ENUM` | named values, `.values` | more than two arms |
+
+`BOOL_PRESENCE` exists because most of the old flags are that shape and
+somebody's script sets one to 0 today; it is preserved, not recommended.
+
+Then regenerate the doc and check it in:
+
+```bash
+src/gallium/drivers/cudapipe/tests/cp_debug_doc.py           # rewrite FLAGS.md
+src/gallium/drivers/cudapipe/tests/cp_debug_doc.py --check   # fails if stale
+```
+
+A flag that stops working is invisible, because these are off in every normal
+run and nothing tests them. When changing how one is read, run something with
+it actually set, before and after, and diff the output — that is the only real
+verification available. Note that `CUDAPIPE_DEBUG_FS` cannot be diffed that
+way: it dumps the shaded-pixel list in GPU scheduling order and hashes
+differently on every run of any build. Check its contract instead — the line
+caps, and that every line is on the requested row.
+
 
 ```bash
 /usr/local/cuda/bin/compute-sanitizer --tool memcheck --print-limit 2 \
