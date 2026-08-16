@@ -268,3 +268,124 @@ Between cycles the histograms answer "why": `CUDAPIPE_DEBUG_BATCH` /
 `CUDAPIPE_DEBUG_BATCHDIFF` piped through `sort | uniq -c` for batch breaks,
 `CUDAPIPE_DEBUG_PASSSEQ` + `passseq_stats.py` for pass structure. Resolve
 cushim call-site offsets with `addr2line -e <the .so> -f <offset>`.
+
+---
+
+# Session 2: 42.5 → 35.0 ms
+
+Four commits, `53d221399d6..dcb29473a7f`, every one gated by the same
+discipline (capture MEAN exactly 0.441%/0.002%, loading screens bit-exact,
+18-sample sweep, only the two standing verdicts). Sweep labels
+`p4_recfill`, `p4_ppflush`, `p4_segmerge`, `p5_inst` under
+`~/git/Vulkan/build/iter/`. The session log with every measurement is
+`~/claude-scratchpad/perf16/BASELINE.md` (Progress logs 7-10 and three
+negative results).
+
+| build | median ms | what changed |
+|---|---|---|
+| session start (`38b84429c80`) | 42.6 | — |
+| single-pass A-buffer build | 40.9 | `53d221399d6` |
+| drainless flush + honest fences + drainless barriers | 40.8 | `601df245e75` |
+| merged shading groups | 40.6 | `7a495f72346` |
+| instanced draws batch | **35.0** | `dcb29473a7f` |
+
+p95 56.1 → 47.2. What each was:
+
+1. **Single-pass A-buffer build** (item 1, staged): the count rasterization
+   also appends `(pixel << 32 | prim)` u64 records through one
+   warp-aggregated global cursor; the fill is `cp_abuf_fill_recs`, a linear
+   replay with today's exact cursor/bounds/overflow semantics, so downstream
+   is bit-identical and the episode's per-segment fill relaunches (and their
+   broadcast/join) vanish. The radix half of the design was **evaluated and
+   skipped**: at this capture's episode sizes (~12 episodes/frame), five
+   8-bit passes × (histogram + scatter + scan ladder) is ~26 launches per
+   episode against the ~150 µs the bitonic sort plus scan actually cost —
+   net loss on launch latency alone. `CUDAPIPE_NO_ABUF_APPEND=1` restores
+   the two-pass build.
+2. **Drainless flush**: the arenas ping-pong through `CP_FLUSH_GENS` (8)
+   generations; `cp_flush` records a retire event and waits the generation
+   from seven flushes ago (measured: 47,797 waits = 10 ms per *run*). The
+   fence is now real — a refcounted `cp_fence` holding an event recorded on
+   `cp->stream` after the episode joins; a bare destroy double-freed under
+   the first triangle because one submit's fence lands in several vk_syncs.
+   `cp_fence_finish` waits that event, and `handle_pipeline_barrier` in
+   lvp_execute flushes without finishing for cudapipe only — stream order
+   already meets a barrier's device-device dependencies and every host
+   reader drains on its own. Wall-neutral (the episode drain absorbed the
+   freed 5.1 ms, as both relocation lessons predict) but 29.7 full pipeline
+   drains per frame are gone; `CUDAPIPE_FLUSH_DRAIN=1` restores the drain.
+3. **Merged shading groups** (item 3, first half): same-(vs,fs,ubos,mode)
+   segments shade as one launch over a group-major slice of the grouped
+   quad list; the interpolator resolves each quad's positions/slices/bases
+   through a `cp_seg_range` table and the group's fs-UBO rows concatenate
+   behind per-range row bases. Segments-to-groups is **5.4×** on this
+   capture (9.3 segments per blended run, 1.7 unique keys — much more than
+   the 2× estimated). Interpolate launches −3.9×, `main` device −27%/s —
+   and the union didn't move, because the shades were already fanned out.
+   Kept for the structure; `CUDAPIPE_NO_SEG_MERGE=1` restores per-segment.
+4. **Instanced draws batch** (item 5, the sleeper): the slice table's pad
+   word is now per-draw `verts_per_instance` and the fetch kernel divides
+   within the slice; `instance_count` stays in the key so same-count clumps
+   merge. Everything else — fs rows, clip rects, the VS's per-vertex
+   zero-based instance id — already worked. **−5.6 ms, the largest single
+   step of the pass**, and mostly not from the shading trios: the ~60 solo
+   classic executes per frame each paid drains, memsets and ~12 launches of
+   host machinery, and all of that went with them (stream syncs 47 →
+   19/frame, launches 2,928 → 2,053/frame).
+
+## Negative results (do not re-try; measurements in BASELINE.md)
+
+- **Register caps.** NCU shows the big fragment shaders at 156-195
+  regs/thread, 14-18% occupancy, 5-6% SM issue, and it still is not an
+  occupancy problem: static 128 (`CUDAPIPE_REGCAP_STATIC=1`), forced 96 and
+  forced 64 all regressed the capture (41.3/42.2/42.1 vs 40.75). Spills
+  cost more than warps buy; the runtime tuner's veto is right.
+- **fs_in SoA layout.** The varying loads really are 4.2-of-32
+  bytes-per-sector uncoalesced — and a full plane-major implementation
+  (interp + codegen + plane-stride upload, capture-gate clean) changed
+  per-kernel device time by *zero* (main@4096 91.0 vs 91.1 µs). L1/L2
+  absorb the waste; the latency chain is texture fetches. Reverted.
+- **Async device copies, again.** Re-measured under the drainless pipeline
+  as this document asked: still 0.0 (35.02 → 34.97). Reverted again.
+
+## Where the frame is now (35.0 ms, from trace_inst.sqlite + cushim_inst)
+
+- Union-busy ≈ 26.5 ms/frame (75.7%). The **main stream owns ~17.2 ms** of
+  it: compiled fs ~5.5 (68 launches/frame of gx=4096 at 67 µs — texture
+  latency at 14-18% occupancy), opaque raster stages 3.0, `cp_abuf_sort`
+  1.9, `cp_fs_interpolate` 1.6, seg count/scatter 1.5, writeback 0.7,
+  vertex fetch + clip 1.3, composite 0.4.
+- Episode drains are the one big wait left: 12.5/frame, 19.5 ms wall — the
+  host in `cp_pass_finish` while the device runs that critical chain. They
+  are the big passes' blended kind-runs; the count is already minimal, and
+  speculative (drain-free) episode completion is **unsound** for the same
+  interleave reason as the `B1,O,B2` counterexample — a failed episode's
+  repaint would land after later opaque color.
+- The opaque runs have **merge ratio 1.00** on (vs,fs) — every batch in a
+  run has a unique shader pair — so opaque episodes' win is not fewer
+  trios; it is overdraw elimination in the fs plus per-shade-key grouping
+  across the index_resource breaks (12.4/frame). The full deferral scout
+  (depth is written only by writeback; the visbuf carries depth in its high
+  word; color ordering pins the boundary to a consecutive opaque run;
+  `cp_seg_range` needs a `prim_end` for filters) is in BASELINE.md's
+  session-2 notes.
+
+## What is left, re-ranked
+
+1. **The texture sampler path.** The fs floor is latency in
+   `cp_tex_sample` — a fully generic device function (every target, wrap
+   and filter mode branched at runtime) whose linked allocation is what
+   pins every textured shader at 195 registers. Specializing it at JIT time
+   per bound sampler state (the sampler table is in the batch key already)
+   attacks both the register ceiling and the dependent-load chain — the
+   only lever left on the ~10 ms of `main`.
+2. **Opaque episodes** for overdraw + shade-key grouping (~1-2 ms critical),
+   using the range table and the scout above.
+3. **Eligibility tail**: `depthfunc` (11/frame) and `topology` (8/frame)
+   solo executes.
+4. **Bloom chain latency**: the copies are measured-neutral twice now; what
+   remains is the per-pass fixed cost itself.
+
+A sober forecast: 2-4 are each ~1-2 ms; reaching 16 requires 1 to roughly
+halve the fragment-shading floor, and then the episode drains (which shrink
+with the device chain under them) come down with everything else.
