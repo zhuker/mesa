@@ -201,6 +201,8 @@ struct cp_context {
     * streams may be in one concurrently.
     */
 #define CP_PASS_STREAMS 8
+/* Arena generations cp_flush ping-pongs through; see the scratch struct. */
+#define CP_FLUSH_GENS 8
    CUstream seg_streams[CP_PASS_STREAMS];
    CUevent seg_ev[CP_PASS_STREAMS];
    CUevent pass_gate;
@@ -396,10 +398,24 @@ struct cp_context {
    size_t upload_size;
    size_t upload_offset;
 
-   /* Old scratch system — kept during transition */
+   /*
+    * The arenas rewind at every cp_flush, and the flush no longer drains the
+    * device first: the managed scratch and the upload ring are split into
+    * CP_FLUSH_GENS generations, the flush records a retire event behind the
+    * generation it is leaving and rewinds into the one whose event — from
+    * CP_FLUSH_GENS-1 flushes ago — it waits, which is almost always already
+    * signalled. Reuse without reallocation, which is the property the old
+    * flush-time drain existed to keep (see the measured regression quoted at
+    * the drain it replaced). flush_gens is 1 under CUDAPIPE_FLUSH_DRAIN,
+    * which restores the drain and the old single-generation behaviour.
+    */
+   unsigned flush_gens;
+   CUevent flush_retire[CP_FLUSH_GENS];
+   bool flush_retire_recorded[CP_FLUSH_GENS];
+
    struct {
-      CUdeviceptr base[2];
-      size_t size[2];
+      CUdeviceptr base[CP_FLUSH_GENS];
+      size_t size[CP_FLUSH_GENS];
       size_t used;
       size_t peak;
       unsigned current;

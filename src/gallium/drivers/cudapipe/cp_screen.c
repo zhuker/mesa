@@ -9,6 +9,7 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 
+#include "util/u_atomic.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
 #include "util/format/u_format.h"
@@ -340,6 +341,22 @@ cp_fence_reference(struct pipe_screen *screen,
                    struct pipe_fence_handle **dst,
                    struct pipe_fence_handle *src)
 {
+   /* One submit's fence is signalled into several vk_syncs, each holding the
+    * same handle, so this really is reference counting — a bare destroy here
+    * double-freed the event under the first triangle. The last release
+    * destroys; before any of this, 31.7 events leaked per frame. */
+   struct cp_fence *s = (struct cp_fence *)src;
+   struct cp_fence *d = (struct cp_fence *)*dst;
+   if (d == s)
+      return;
+   if (s)
+      p_atomic_inc(&s->refcount);
+   if (d && p_atomic_dec_zero(&d->refcount)) {
+      struct cp_screen *cp = (struct cp_screen *)screen;
+      cuCtxSetCurrent(cp->cuda_ctx);
+      cuEventDestroy(d->event);
+      free(d);
+   }
    *dst = src;
 }
 
@@ -351,7 +368,11 @@ cp_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
       return true;
    struct cp_screen *cp = (struct cp_screen *)screen;
    cuCtxSetCurrent(cp->cuda_ctx);
-   cuCtxSynchronize();
+   /* The event was recorded on the context's main stream after every side
+    * stream joined it (see cp_flush), so waiting it means everything queued
+    * before the flush has retired — without also draining work queued since,
+    * which is what the cuCtxSynchronize that used to be here cost. */
+   cuEventSynchronize(((struct cp_fence *)fence)->event);
    return true;
 }
 

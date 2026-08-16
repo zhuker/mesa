@@ -3218,7 +3218,20 @@ static void handle_wait_events2(struct vk_cmd_queue_entry *cmd,
 static void handle_pipeline_barrier(struct vk_cmd_queue_entry *cmd,
                                     struct rendering_state *state)
 {
-   finish_fence(state);
+   /*
+    * cudapipe: a barrier's device-to-device dependencies are already met by
+    * CUDA stream ordering once the deferred work is submitted, and its
+    * host-side reads all pass through map/copy paths that drain on their
+    * own — so flush without waiting. Only that driver: llvmpipe rasterizes
+    * asynchronously on CPU threads and needs the finished fence for
+    * cross-draw visibility. The end-of-command-buffer finish_fence below is
+    * untouched either way, so a VkFence still means the device is done.
+    */
+   struct pipe_screen *screen = state->pctx->screen;
+   if (strstr(screen->get_name(screen), "cudapipe"))
+      state->pctx->flush(state->pctx, NULL, 0);
+   else
+      finish_fence(state);
 }
 
 static void handle_begin_query(struct vk_cmd_queue_entry *cmd,

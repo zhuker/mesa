@@ -116,6 +116,9 @@ static const struct cp_flag_def flags[] = {
    { "CUDAPIPE_NO_PASS_EPISODE", CP_FLAG_BOOL_VALUE, F(no_pass_episode),
      "disable pass episodes: consecutive blended batches stop sharing one "
      "A-buffer build and drain" },
+   { "CUDAPIPE_FLUSH_DRAIN", CP_FLAG_BOOL_VALUE, F(flush_drain),
+     "restore the draining flush: cp_flush waits for the whole device and "
+     "rewinds the arenas in place instead of ping-ponging generations" },
    { "CUDAPIPE_NO_ABUF_APPEND", CP_FLAG_BOOL_VALUE, F(no_abuf_append),
      "disable the single-pass A-buffer build: the count pass stops appending "
      "(pixel, prim) records and the fill rasterizes a second time" },

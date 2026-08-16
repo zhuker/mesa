@@ -108,6 +108,9 @@ cp_destroy_context(struct pipe_context *ctx)
    }
    if (cp->pass_gate)
       cuEventDestroy(cp->pass_gate);
+   for (unsigned i = 0; i < CP_FLUSH_GENS; i++)
+      if (cp->flush_retire[i])
+         cuEventDestroy(cp->flush_retire[i]);
    if (ctx->stream_uploader)
       u_upload_destroy(ctx->stream_uploader);
    FREE(cp);
@@ -470,17 +473,26 @@ cp_upload_begin(struct cp_context *cp, size_t size, void **host_out)
    size_t dev_off = ALIGN_POT(cp->arena_offset, 256);
    size_t host_off = ALIGN_POT(cp->upload_offset, 256);
 
-   if (dev_off + size > cp->arena_size || host_off + size > cp->upload_size) {
+   /* The ring is partitioned into generations; this epoch owns one slice of
+    * it and the flush rewinds to the next. flush_gens is 1 when the flush
+    * still drains, which makes the slice the whole ring, as before. */
+   size_t dev_slice = cp->arena_size / cp->flush_gens;
+   size_t host_slice = cp->upload_size / cp->flush_gens;
+   unsigned gen = cp->scratch.current;
+
+   if (dev_off + size > (gen + 1) * dev_slice ||
+       host_off + size > (gen + 1) * host_slice) {
       /*
        * Out of room before a flush came round. Rewinding would let this draw
        * overwrite staging a previous draw's copy has not read yet, so fall
-       * back to a synchronous copy from the caller's own memory, which cannot
-       * be reused early because it does not return until the copy is made.
+       * back to a full drain, after which the whole slice is reusable.
        */
       cuCtxSynchronize();
-      cp->arena_offset = cp->upload_offset = 0;
-      dev_off = host_off = 0;
-      if (size > cp->arena_size || size > cp->upload_size)
+      cp->arena_offset = gen * dev_slice;
+      cp->upload_offset = gen * host_slice;
+      dev_off = cp->arena_offset;
+      host_off = cp->upload_offset;
+      if (size > dev_slice || size > host_slice)
          return 0;
    }
 
@@ -549,10 +561,14 @@ cp_scratch_reset(struct cp_context *cp)
    cp->dscratch.num_overflow = 0;
    cp->dscratch.used = 0;
 
-   /* Callers of this have already waited for the device, so the staging the
-    * uploads were copied out of is free to be written over again. */
-   cp->arena_offset = 0;
-   cp->upload_offset = 0;
+   /* Callers of this have already waited for the whole device, so the
+    * staging the uploads were copied out of is free to be written over
+    * again — rewound to the current generation's slice, since the epoch
+    * arithmetic in cp_upload_begin keeps running either way. */
+   cp->arena_offset = (size_t)cp->scratch.current *
+                      (cp->arena_size / cp->flush_gens);
+   cp->upload_offset = (size_t)cp->scratch.current *
+                       (cp->upload_size / cp->flush_gens);
 }
 
 static void
@@ -561,7 +577,7 @@ cp_scratch_destroy(struct cp_context *cp)
    cuCtxSynchronize();
    for (unsigned i = 0; i < cp->scratch.num_overflow; i++)
       cuMemFree(cp->scratch.overflow[i]);
-   for (unsigned i = 0; i < 2; i++) {
+   for (unsigned i = 0; i < CP_FLUSH_GENS; i++) {
       if (cp->scratch.base[i])
          cuMemFree(cp->scratch.base[i]);
    }
@@ -6243,6 +6259,12 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
    cp->cur_qset = saved_qset;
 
    if (cp->pass.append_failed) {
+      /* The failed append may have run vertex work and uploads on its side
+       * stream before backing out; when it was the would-be first segment,
+       * cp_pass_finish below returns without joining anything, and the flush
+       * fence — recorded on the main stream only — would not cover it. Join
+       * every side stream so it always does. */
+      cp_pass_join(cp, CP_PASS_STREAMS);
       cp_pass_finish(cp);
       cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
                       cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
@@ -6552,41 +6574,58 @@ cp_flush(struct pipe_context *ctx, struct pipe_fence_handle **fence,
     * queued. */
    cp_batch_flush(cp);
 
+   /* On cp->stream, after cp_batch_flush: every side stream's episode work
+    * has been joined into the main stream by cp_pass_finish, so this event
+    * really does cover everything the context has queued — unlike the legacy
+    * NULL stream it used to be recorded on, which orders against nothing
+    * because cp->stream is CU_STREAM_NON_BLOCKING. cp_fence_finish waits on
+    * exactly this event. */
    if (fence) {
-      CUevent event;
-      cuEventCreate(&event, CU_EVENT_DISABLE_TIMING);
-      cuEventRecord(event, 0);
-      *fence = (struct pipe_fence_handle *)(uintptr_t)event;
+      struct cp_fence *f = malloc(sizeof(*f));
+      if (f) {
+         f->refcount = 1;
+         cuEventCreate(&f->event, CU_EVENT_DISABLE_TIMING);
+         cuEventRecord(f->event, cp->stream);
+      }
+      *fence = (struct pipe_fence_handle *)f;
    }
 
    /*
-    * Sync and reclaim the scratch arenas.
+    * Reclaim the scratch arenas.
     *
-    * The plan asks for this drain to go, on the grounds that it is the host
-    * waiting for work it could be queueing behind — and the premise is sound:
-    * the GPU is no longer the "99% utilized" the original comment claimed,
-    * but 66-80% on the launch-heavy samples by tests/cp_gpu_busy.sh.
+    * An earlier attempt simply deleted the drain here and let the threshold
+    * reclaim in cp_scratch_alloc() cope. Measured regression: +0.4% over the
+    * sweep, pbribl +14.5%, negativeviewportheight +9.2%, texture +8.5%,
+    * texturecubemap +6.4% — because rewinding at flush is what lets the same
+    * pages be reused without reallocating, and deferring it swapped many
+    * cheap syncs for occasional expensive cuMemFree/cuMemAlloc churn.
     *
-    * Removing it is nonetheless a regression, measured: +0.4% over the sweep,
-    * pbribl +14.5%, negativeviewportheight +9.2%, texture +8.5%,
-    * texturecubemap +6.4%. Correctness and memory were both fine — the peak
-    * stayed at 3.4 GB of 32, because cp_scratch_alloc() still reclaims at
-    * CP_SCRATCH_RECLAIM_BYTES.
+    * This is the reclaim-without-reallocating that comment asked for: the
+    * arenas are split into CP_FLUSH_GENS generations, the flush records a
+    * retire event behind the generation it is leaving and rewinds into the
+    * next one, waiting that generation's own event from CP_FLUSH_GENS-1
+    * flushes ago — by then almost always signalled, so the flush stops
+    * draining the pipeline it just fed. The overflow arenas, whose cuMemFree
+    * genuinely needs an idle device, wait for the threshold reclaim or
+    * teardown, both of which still drain first.
     *
-    * That reclaim is exactly why it loses. Resetting here costs a drain and
-    * nothing else, because the arena is rewound to zero and the next frame
-    * reuses the same pages. Deferring it until an arena has handed out a
-    * gigabyte means the reclaim path runs instead, and that one frees and
-    * reallocates the overflow buffers — cuMemAlloc and cuMemFree are tens of
-    * microseconds each where a drain of an almost-idle queue is a few. Trading
-    * many cheap syncs for occasional expensive reallocation is the wrong way
-    * round.
-    *
-    * So this stays until the arena can be reclaimed without reallocating,
-    * which is a change to cp_scratch_alloc() rather than to this line.
+    * CUDAPIPE_FLUSH_DRAIN=1 restores the old full drain (flush_gens == 1).
     */
-   cuCtxSynchronize();
-   cp_scratch_reset(cp);
+   if (cp->flush_gens <= 1 || !cp->flush_retire[0]) {
+      cuCtxSynchronize();
+      cp_scratch_reset(cp);
+   } else {
+      unsigned gen = cp->scratch.current;
+      cuEventRecord(cp->flush_retire[gen], cp->stream);
+      cp->flush_retire_recorded[gen] = true;
+      gen = (gen + 1) % cp->flush_gens;
+      cp->scratch.current = gen;
+      if (cp->flush_retire_recorded[gen])
+         cuEventSynchronize(cp->flush_retire[gen]);
+      cp->scratch.used = 0;
+      cp->arena_offset = (size_t)gen * (cp->arena_size / cp->flush_gens);
+      cp->upload_offset = (size_t)gen * (cp->upload_size / cp->flush_gens);
+   }
    cp_nvtx_mark("flush");
 }
 
@@ -7670,6 +7709,23 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
     * and exactly the behaviour this replaces. */
    if (cuStreamCreate(&ctx->stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS)
       ctx->stream = NULL;
+
+   /* The flush's generation ring; see cp_flush. A failed event creation
+    * falls back to the draining flush by leaving flush_retire[0] null. */
+   ctx->flush_gens = cp_debug->flush_drain ? 1 : CP_FLUSH_GENS;
+   if (ctx->flush_gens > 1) {
+      for (unsigned i = 0; i < ctx->flush_gens; i++) {
+         if (cuEventCreate(&ctx->flush_retire[i],
+                           CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
+            for (unsigned j = 0; j < i; j++) {
+               cuEventDestroy(ctx->flush_retire[j]);
+               ctx->flush_retire[j] = NULL;
+            }
+            ctx->flush_retire[0] = NULL;
+            break;
+         }
+      }
+   }
    CUdeviceptr state_dev;
    if (cuMemAllocManaged(&state_dev, sizeof(struct cp_gpu_state),
                          CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
