@@ -168,6 +168,27 @@ drive their own frames — so they have nothing to time and get no row.
 mode or not; the script deletes it so that a timed pass really does leave
 nothing behind.
 
+**Which means `renderheadless` is not in the correctness gate either, and its
+row lies about it.** Its stored directory is empty, so is the nvidia
+reference, `verdict.txt` says `missing`, and a bit-identity diff of one empty
+directory against another reports IDENTICAL. That is not a pass; it is two
+absences agreeing. A change that broke `renderheadless` outright would show up
+as `missing` and `IDENTICAL`, exactly as it does today.
+
+It came up when framebuffer-sized buffers were made grow-only, where
+`renderheadless` was one of the four size-changing samples most likely to
+break. Checking it meant running it by hand against both builds in separate
+working directories and comparing the `headless.ppm` each left behind:
+
+```sh
+cd $(mktemp -d) && VK_ICD_FILENAMES=$OLD_ICD ~/git/Vulkan/build/bin/renderheadless
+cd $(mktemp -d) && VK_ICD_FILENAMES=$NEW_ICD ~/git/Vulkan/build/bin/renderheadless
+md5sum */headless.ppm
+```
+
+Worth doing whenever a change could plausibly touch it, and worth fixing in
+the harness the day someone needs it more than once.
+
 **The frame count is the one flag that may differ, and only because it was
 measured.** Everything else has to mirror the storing run. Sixty frames is
 right for storing — it is the animation the samples were set up to render, and
