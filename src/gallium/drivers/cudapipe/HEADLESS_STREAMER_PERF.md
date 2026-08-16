@@ -293,6 +293,28 @@ mostly from the last two — those samples are host-bound on exactly the
 allocation churn removed (`triangle` −84%, `texturemipmapgen` −45%, `bloom`
 −34%).
 
+### Against the other two drivers
+
+Same command, no dumps, two runs each:
+
+| driver | wall | ms/frame | note |
+|---|---|---|---|
+| NVIDIA | 4.94 s | **3.27** | almost certainly not GPU-bound — this is how fast gfxrecon can submit |
+| release llvmpipe | 101.1 s | **66.9** | the correctness reference, same lavapipe frontend |
+| cudapipe | 123.8 s | **82.0** | was 276 at the first successful replay |
+
+cudapipe started this work 3.6x slower than release llvmpipe on this capture and
+is now within 23% of it.
+
+**Subtract the replay overhead before quoting a ratio.** `gfxrecon-info`, which
+parses the file and renders nothing, takes **1.46 s**. That is a floor on what
+both drivers pay for reading 2.4 GB, and it is ~30% of NVIDIA's entire wall
+time against 1.2% of cudapipe's. Rendering-only the gap is nearer **35x** than
+the 25x the wall times suggest. Two caveats in the other direction: `info` may
+decode less than replay does, so 1.46 s is a lower bound on the overhead; and
+NVIDIA's column is a replay ceiling rather than a rendering one, so it says what
+the harness can deliver, not what the hardware can.
+
 ### The three that mattered
 
 **A-buffer survives resize** (−19%). Grow-only capacity sized to the largest
