@@ -256,7 +256,7 @@ out to touch the sweep at all — see `HEADLESS_STREAMER_PERF.md`. Making a real
 application's capture replay found allocation churn that these samples are
 host-bound on: `triangle` −84%, `texturemipmapgen` −45%, `bloom` −34%,
 `dynamicuniformbuffer` −78% from a small-allocation arena and grow-only
-framebuffer buffers. The capture itself went 276 → 82 ms a frame over the same
+framebuffer buffers. The capture itself went 276 → 77 ms a frame (median) over the same
 work. `gltfscenerendering` reads +3% here and measured at parity under paired
 alternating arms; it spreads 6.9% across three runs of one build, so read it
 that way rather than as a regression.

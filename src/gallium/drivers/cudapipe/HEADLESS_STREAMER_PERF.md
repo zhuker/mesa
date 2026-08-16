@@ -1,10 +1,15 @@
 # HeadlessStreamer: making the capture run, and run fast
 
 A GFXReconstruct capture of the application this driver exists for went from
-crashing 4.7 seconds in to replaying all 1,509 frames at 82 ms each, with the
-frames closer to a software reference than when it started. This is the record
-of that: what was wrong, what it cost, how correctness was checked, and what is
-left.
+crashing 4.7 seconds in to replaying all 1,509 frames at a median of 77 ms —
+**12.3 fps** — with the frames closer to a software reference than when it
+started. This is the record of that: what was wrong, what it cost, how
+correctness was checked, and what is left.
+
+Quote the median, and measure it with the plugin below rather than dividing
+wall time by frames. Both software drivers have a lazy-compilation tail that
+makes their means lie: llvmpipe's mean is 61% above its median because one of
+its frames takes **9.9 seconds**.
 
 Branch `cudapipe-gfxr-replay`, thirteen commits from `53b819b3cbf`.
 
@@ -193,18 +198,23 @@ tests/cp_gfxr_frames.py fps submits.txt
 
 Measured this way, over all 1,510 frames:
 
-| | cudapipe | NVIDIA |
-|---|---|---|
-| first→last submit | 122.5 s — **12.3 fps** | 4.66 s — **323.9 fps** |
-| mean frame | 81.15 ms | 3.09 ms |
-| **median frame** | **77.42 ms** | **2.84 ms** |
-| p5 / p95 | 70.80 / 95.11 | 2.76 / 3.35 |
-| min / max | 8.84 / **753.52** | 1.30 / 38.86 |
+| | cudapipe | release llvmpipe | NVIDIA |
+|---|---|---|---|
+| first→last submit | 122.5 s — **12.3 fps** | 101.3 s — **14.9 fps** | 4.66 s — **323.9 fps** |
+| mean frame | 81.15 ms | 67.10 ms | 3.09 ms |
+| **median frame** | **77.42 ms** | **41.76 ms** | **2.84 ms** |
+| p5 / p95 | 70.80 / 95.11 | 38.46 / 58.12 | 2.76 / 3.35 |
+| min / max | 8.84 / 753.52 | 6.90 / **9857.18** | 1.30 / 38.86 |
 
-**Prefer the median.** cudapipe's mean is 5% above its median because one frame
-costs 753 ms — a lazy shader compile, not rendering. The median also agrees with
-the block-index slope (79.1 ms) to within 2%, which is two independent methods
-cross-checking.
+**Prefer the median, and this table is why.** cudapipe's mean is 5% above its
+median because one frame costs 753 ms — a lazy shader compile, not rendering.
+llvmpipe's mean is **61%** above its median, because LLVM JITs a shader that
+costs it a single 9.9-second frame. Comparing the two drivers by wall time
+therefore compares their compilers as much as their rasterizers, and gets the
+answer wrong by a factor of one and a half.
+
+The median also agrees with the block-index slope (79.1 ms) to within 2%, which
+is two independent methods cross-checking.
 
 The p5–p95 spread is worth watching on its own: 70.8–95.1 ms is ±16% frame to
 frame, against NVIDIA's ±10%. A streamer cares about that as much as the mean.
@@ -349,14 +359,29 @@ allocation churn removed (`triangle` −84%, `texturemipmapgen` −45%, `bloom`
 
 Same command, no dumps, two runs each:
 
-| driver | wall | ms/frame | note |
-|---|---|---|---|
-| NVIDIA | 4.94 s | **3.27** | almost certainly not GPU-bound — this is how fast gfxrecon can submit |
-| release llvmpipe | 101.1 s | **66.9** | the correctness reference, same lavapipe frontend |
-| cudapipe | 123.8 s | **82.0** | was 276 at the first successful replay |
+Wall time first, then per frame. The two disagree, and the second is right.
 
-cudapipe started this work 3.6x slower than release llvmpipe on this capture and
-is now within 23% of it.
+| driver | wall | wall/frames | **median frame** | fps | max frame |
+|---|---|---|---|---|---|
+| NVIDIA | 4.94 s | 3.27 ms | **2.84 ms** | 323.9 | 38.9 ms |
+| release llvmpipe | 101.1 s | 66.9 ms | **41.76 ms** | 14.9 | **9,857 ms** |
+| cudapipe | 123.8 s | 82.0 ms | **77.42 ms** | 12.3 | 753 ms |
+
+**By wall time cudapipe looks 23% behind llvmpipe. By median it is 1.85x
+behind**, and the median is the honest number. llvmpipe's mean sits 61% above
+its median because it JITs shaders with LLVM and one frame of this capture
+costs it 9.9 seconds — roughly 38 s of its 101 s run is one-time compilation
+that cudapipe does not pay, NVRTC being both cheaper and better spread. That
+flattered the wall-clock comparison and an earlier version of this document
+repeated it.
+
+Read it this way: cudapipe *delivers* a session faster than llvmpipe would,
+because it starts up cheaper, and *renders* about half as fast once both are
+warm. Which one matters depends on whether the streamer is a long-running
+process or a short one.
+
+Against NVIDIA the gap is 27x by median. Subtract the replay overhead before
+quoting even that — see below.
 
 **Subtract the replay overhead before quoting a ratio.** `gfxrecon-info`, which
 parses the file and renders nothing, takes **1.46 s**. That is a floor on what
