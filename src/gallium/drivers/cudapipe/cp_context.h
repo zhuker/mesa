@@ -192,6 +192,27 @@ struct cp_context {
    } pass;
 
    /*
+    * The episode's side streams. Segment counts, fill relaunches and shades
+    * are mutually independent — the per-pixel counts and cursors are
+    * order-free atomics whose order the sort erases, and the dense shading
+    * slots are disjoint — so they fan out across these and join at the
+    * phases that read across segments. Stream k also owns its own rasterizer
+    * queue set, since the queues are rebuilt per launch group and two
+    * streams may be in one concurrently.
+    */
+#define CP_PASS_STREAMS 4
+   CUstream seg_streams[CP_PASS_STREAMS];
+   CUevent seg_ev[CP_PASS_STREAMS];
+   CUevent pass_gate;
+   bool pass_streams_ready;
+   struct cp_queue_set {
+      CUdeviceptr nontrivial, huge_tiles, counts;
+   } seg_qsets[CP_PASS_STREAMS];
+   /* What cp_draw_execute builds its queue struct from: the context-wide set
+    * normally, a segment stream's own during an append. */
+   struct cp_queue_set cur_qset;
+
+   /*
     * What the fragment shader launches of the draw now running should hand to
     * CP_ARG_SLOT_UBO_TABLE. Set once at the top of cp_draw_execute() so that
     * it cannot carry from one draw to the next, and read by

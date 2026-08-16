@@ -94,6 +94,20 @@ cp_destroy_context(struct pipe_context *ctx)
       cuMemFree(cp->sampler_table);
    cp_scratch_destroy(cp);
    free(cp->pass_segs);
+   for (unsigned k = 0; k < CP_PASS_STREAMS; k++) {
+      if (cp->seg_streams[k])
+         cuStreamDestroy(cp->seg_streams[k]);
+      if (cp->seg_ev[k])
+         cuEventDestroy(cp->seg_ev[k]);
+      if (cp->seg_qsets[k].nontrivial)
+         cuMemFree(cp->seg_qsets[k].nontrivial);
+      if (cp->seg_qsets[k].huge_tiles)
+         cuMemFree(cp->seg_qsets[k].huge_tiles);
+      if (cp->seg_qsets[k].counts)
+         cuMemFree(cp->seg_qsets[k].counts);
+   }
+   if (cp->pass_gate)
+      cuEventDestroy(cp->pass_gate);
    if (ctx->stream_uploader)
       u_upload_destroy(ctx->stream_uploader);
    FREE(cp);
@@ -4182,10 +4196,10 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     * loop below, which runs for pass 0 as well — clearing them here too was
     * two host calls per draw that the first pass immediately repeated. */
    struct cp_rast_queues rast_queues = {
-      .nontrivial = cp->rast_nontrivial,
-      .nontrivial_count = cp->rast_nontrivial_count,
-      .huge_tiles = cp->rast_huge_tiles,
-      .huge_count = cp->rast_huge_count,
+      .nontrivial = cp->cur_qset.nontrivial,
+      .nontrivial_count = cp->cur_qset.counts,
+      .huge_tiles = cp->cur_qset.huge_tiles,
+      .huge_count = cp->cur_qset.counts + sizeof(uint32_t),
       .mode = CP_QUEUE_FILL,
    };
 
@@ -4485,13 +4499,15 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
        * clears run for the first segment only; every segment's fragments then
        * carry its own primitive-slot base, which is what makes the episode's
        * one sort come out in submission order. */
-      if (!cp->pass.appending || cp->pass.nsegs == 0) {
+      /* An episode's clears run once, on the main stream in cp_pass_append(),
+       * gated ahead of every segment stream. */
+      if (!cp->pass.appending) {
          cuMemsetD32Async(ab->counts, 0, n, cp->stream);
          cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
       }
       if (cp->pass.appending)
          aa.abuf_prim_base = cp->pass.next_prim;
-      cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
+      cuMemsetD32Async(cp->cur_qset.counts, 0, 2, cp->stream);
       aa.abuf_mode = CP_ABUF_COUNT;
       rast_queues.mode = CP_QUEUE_FILL;
       cp_abuf_mark(ab->ev[0], cp->stream);
@@ -4640,7 +4656,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
 
       /* --- step 3: fill --- */
       cuMemsetD32Async(ab->cursor, 0, n, cp->stream);
-      cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
+      cuMemsetD32Async(cp->cur_qset.counts, 0, 2, cp->stream);
       aa.abuf_mode = CP_ABUF_FILL;
       rast_queues.mode = CP_QUEUE_FILL;
       cp_abuf_mark(ab->ev[3], cp->stream);
@@ -4864,7 +4880,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
        * the first pass arrived at — clearing them would leave stages 2 and 3
        * reading an empty queue. */
       if (rast_queues.mode != CP_QUEUE_REUSE)
-         cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
+         cuMemsetD32Async(cp->cur_qset.counts, 0, 2, cp->stream);
 
       /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
       cp_nvtx_push("raster");
@@ -5586,7 +5602,67 @@ cp_pass_appendable(struct cp_context *cp)
       if (!cp->pass_segs)
          return false;
    }
+
+   /* The side streams and their queue sets, once. Failure leaves every
+    * seg_streams[] entry null and the episode runs on the main stream. */
+   if (!cp->pass_streams_ready) {
+      cp->pass_streams_ready = true;
+      bool ok = cuEventCreate(&cp->pass_gate,
+                              CU_EVENT_DISABLE_TIMING) == CUDA_SUCCESS;
+      for (unsigned k = 0; ok && k < CP_PASS_STREAMS; k++) {
+         ok = cuStreamCreate(&cp->seg_streams[k],
+                             CU_STREAM_NON_BLOCKING) == CUDA_SUCCESS &&
+              cuEventCreate(&cp->seg_ev[k],
+                            CU_EVENT_DISABLE_TIMING) == CUDA_SUCCESS &&
+              cuMemAlloc(&cp->seg_qsets[k].nontrivial,
+                         (size_t)CP_MAX_NONTRIVIAL * sizeof(uint32_t)) ==
+                 CUDA_SUCCESS &&
+              cuMemAlloc(&cp->seg_qsets[k].huge_tiles,
+                         (size_t)CP_MAX_HUGE_TILES *
+                         sizeof(struct cp_tile_pair)) == CUDA_SUCCESS &&
+              cuMemAlloc(&cp->seg_qsets[k].counts, 256) == CUDA_SUCCESS;
+      }
+      if (!ok) {
+         fprintf(stderr, "cudapipe: pass-episode streams unavailable; "
+                 "episodes run on the main stream\n");
+         memset(cp->seg_streams, 0, sizeof(cp->seg_streams));
+      }
+   }
    return true;
+}
+
+/* The stream a segment's own work runs on: its slice of the side streams, or
+ * the main stream when they could not be created. */
+static CUstream
+cp_pass_seg_stream(struct cp_context *cp, unsigned s)
+{
+   CUstream st = cp->seg_streams[s % CP_PASS_STREAMS];
+   return st ? st : cp->stream;
+}
+
+/* Join every side stream a finished phase used back into the main stream. */
+static void
+cp_pass_join(struct cp_context *cp, unsigned nsegs)
+{
+   if (!cp->seg_streams[0])
+      return;
+   unsigned used = MIN2(nsegs, (unsigned)CP_PASS_STREAMS);
+   for (unsigned k = 0; k < used; k++) {
+      cuEventRecord(cp->seg_ev[k], cp->seg_streams[k]);
+      cuStreamWaitEvent(cp->stream, cp->seg_ev[k], 0);
+   }
+}
+
+/* The reverse: gate every side stream behind the main stream's tail. */
+static void
+cp_pass_broadcast(struct cp_context *cp, unsigned nsegs)
+{
+   if (!cp->seg_streams[0])
+      return;
+   cuEventRecord(cp->pass_gate, cp->stream);
+   unsigned used = MIN2(nsegs, (unsigned)CP_PASS_STREAMS);
+   for (unsigned k = 0; k < used; k++)
+      cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0);
 }
 
 /* Everything cp_draw_execute reads from live context state that varies per
@@ -5647,6 +5723,10 @@ static void
 cp_pass_fallback(struct cp_context *cp, struct cp_pass_seg *segs,
                  unsigned nsegs)
 {
+   /* The abandoned episode's kernels may still be in flight on the side
+    * streams, writing the shared lists the re-execution is about to clear. */
+   cp_pass_join(cp, nsegs);
+
    struct cp_pass_live lv;
    cp_pass_live_save(cp, &lv);
    for (unsigned s = 0; s < nsegs; s++) {
@@ -5681,6 +5761,10 @@ cp_pass_finish(struct cp_context *cp)
    cuCtxSetCurrent(screen->cuda_ctx);
    CP_NVTX_SCOPEF("episode %u segs", nsegs);
 
+   /* The segments' count phases ran on the side streams; the scan reads
+    * across all of them. */
+   cp_pass_join(cp, nsegs);
+
    /* --- scan the accumulated counts, clamp the runs to the array --- */
    cp_abuf_scan(cp, screen, ab, (unsigned)n);
    {
@@ -5691,17 +5775,23 @@ cp_pass_finish(struct cp_context *cp)
                      0, cp->stream, p, NULL);
    }
 
-   /* --- fill: one relaunch per segment from its saved arguments --- */
+   /* --- fill: one relaunch per segment from its saved arguments, fanned
+    * back out over the side streams behind the scan --- */
    cuMemsetD32Async(ab->cursor, 0, n, cp->stream);
+   cp_pass_broadcast(cp, nsegs);
+   CUstream pass_main = cp->stream;
    for (unsigned s = 0; s < nsegs; s++) {
       struct cp_pass_seg *sg = &segs[s];
+      if (cp->seg_streams[0])
+         cp->stream = cp_pass_seg_stream(cp, s);
       struct cp_rasterize_args aa = sg->rast;
       aa.abuf_frags = ab->frags;
       aa.abuf_capacity = ab->capacity;
       aa.abuf_mode = CP_ABUF_FILL;
       struct cp_rast_queues q = sg->queues;
       q.mode = CP_QUEUE_FILL;
-      cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
+      /* The segment's own queue set, saved with its arguments. */
+      cuMemsetD32Async(q.nontrivial_count, 0, 2, cp->stream);
       void *ap[] = { &aa, &q };
       CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
                      (sg->rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
@@ -5712,6 +5802,8 @@ cp_pass_finish(struct cp_context *cp)
       CP_LAUNCH(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
                      0, cp->stream, ap, NULL);
    }
+   cp->stream = pass_main;
+   cp_pass_join(cp, nsegs);
 
    /* --- sort, both worklists --- */
    {
@@ -5856,7 +5948,8 @@ cp_pass_finish(struct cp_context *cp)
                      256, 1, 1, 0, cp->stream, p, NULL);
    }
 
-   /* --- shade each segment densely over its own quads --- */
+   /* --- shade each segment densely over its own quads, fanned out --- */
+   cp_pass_broadcast(cp, nsegs);
    struct cp_pass_live lv;
    cp_pass_live_save(cp, &lv);
    struct cp_seg_desc descs[CP_PASS_MAX_SEGS];
@@ -5866,6 +5959,8 @@ cp_pass_finish(struct cp_context *cp)
       uint32_t sq = ctr[CP_ABUF_COUNTERS + s];
       if (!sq)
          continue;
+      if (cp->seg_streams[0])
+         cp->stream = cp_pass_seg_stream(cp, s);
       cp->vs_shader = sg->vs;
       cp->fs_shader = sg->fs;
       cp->num_fs_ubos = sg->num_fs_ubos;
@@ -5893,7 +5988,9 @@ cp_pass_finish(struct cp_context *cp)
       descs[s].fs_out_stride = ss.fs_out_stride;
       descs[s].num_slots = ss.num_slots;
    }
+   cp->stream = pass_main;
    cp_pass_live_restore(cp, &lv);
+   cp_pass_join(cp, nsegs);
    if (failed) {
       cp_pass_fallback(cp, segs, nsegs);
       return;
@@ -6005,6 +6102,39 @@ cp_pass_record_segment(struct cp_context *cp,
 static void
 cp_pass_append(struct cp_context *cp, unsigned ndraws)
 {
+   struct cp_abuf *ab = &cp_abuf;
+   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+
+   /*
+    * Episode start: size the per-pixel arrays for this framebuffer and clear
+    * the shared lists once, on the main stream, with the gate event recorded
+    * behind them — every segment stream waits on it before its first work.
+    */
+   if (cp->pass.nsegs == 0) {
+      unsigned w = fb->width, h = fb->height;
+      if (!w || !h || !cp_abuf_setup(ab, w, h)) {
+         cp_pass_finish(cp);
+         cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
+                         cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
+                         cp->batch.fs_ubos, cp->batch.draw_ids,
+                         cp->batch.vb_bases, cp->batch.scissors);
+         return;
+      }
+      cuMemsetD32Async(ab->counts, 0, (size_t)w * h, cp->stream);
+      cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
+      if (cp->seg_streams[0])
+         cuEventRecord(cp->pass_gate, cp->stream);
+   }
+
+   CUstream saved_stream = cp->stream;
+   struct cp_queue_set saved_qset = cp->cur_qset;
+   if (cp->seg_streams[0]) {
+      unsigned k = cp->pass.nsegs % CP_PASS_STREAMS;
+      cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0);
+      cp->stream = cp->seg_streams[k];
+      cp->cur_qset = cp->seg_qsets[k];
+   }
+
    cp->pass.appending = true;
    cp->pass.append_failed = false;
    cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
@@ -6012,6 +6142,9 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
                    cp->batch.fs_ubos, cp->batch.draw_ids, cp->batch.vb_bases,
                    cp->batch.scissors);
    cp->pass.appending = false;
+   cp->stream = saved_stream;
+   cp->cur_qset = saved_qset;
+
    if (cp->pass.append_failed) {
       cp_pass_finish(cp);
       cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
@@ -7471,6 +7604,12 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->rast_huge_count = ctx->rast_counts + sizeof(uint32_t);
    cuMemAlloc(&ctx->rast_huge_tiles,
               (size_t)CP_MAX_HUGE_TILES * sizeof(struct cp_tile_pair));
+
+   /* What cp_draw_execute builds its queue struct from; a pass-episode
+    * segment append swaps in its stream's own set and restores this one. */
+   ctx->cur_qset.nontrivial = ctx->rast_nontrivial;
+   ctx->cur_qset.huge_tiles = ctx->rast_huge_tiles;
+   ctx->cur_qset.counts = ctx->rast_counts;
 
    return &ctx->base;
 }
