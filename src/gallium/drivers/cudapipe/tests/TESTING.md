@@ -268,7 +268,14 @@ two `.so` files, write one ICD json each pointing at its `library_path`, and
 alternate. A change worth under 3% may simply not be resolvable in wall time,
 and is better argued from a direct count — an `LD_PRELOAD` shim over the CUDA
 driver API costs 0.1% and gives exact per-call-site totals, where CUPTI would
-distort this driver badly.
+distort this driver badly. The shim is
+`~/claude-scratchpad/perf276/cushim.c`, and it has one trap that once cost a
+whole (empty) profile: **never wrap the preloaded replay in `/usr/bin/time`
+or any other launcher.** Every process that inherits the preload writes the
+report at exit, so the wrapper — which made no CUDA calls — exits last and
+overwrites the real report with an empty one. Set `CUSHIM_OUT` and run the
+replay bare; resolve the call-site offsets it prints with
+`addr2line -e <the .so> -f <offset>`.
 
 **The rest of the flags have to mirror the storing run exactly**, which is easy
 to get wrong, because offscreen benchmarking quietly ignores the options a
@@ -505,7 +512,7 @@ code before believing it.
 
 ## Finding where the time goes
 
-Four questions, in this order. Answering the first with the wrong tool is the
+Five questions, in this order. Answering the first with the wrong tool is the
 mistake this section exists to prevent.
 
 ### 1. Is the frame kernel-bound or host-bound?
@@ -788,6 +795,57 @@ the median launch to 93.6 µs without touching the gather at all. See
 The general form: **a kernel whose duration is absurd for the work it
 describes is reporting somebody else's page faults.** Ask what the host wrote
 just before it ran.
+
+### 5. Since the driver runs on several streams: union, relocation, structure
+
+Three rules from the pass-episodes work (`../EPISODES.md`), each learned by
+getting it wrong first. They apply to any profile taken after pass episodes
+landed, because the driver has run on up to nine streams since.
+
+**Sum device time as a union of intervals, not per kernel.** Kernels on
+different streams overlap, so `sum(end - start)` over the kernel table
+overstates the device by the overlap factor — 1.36x at the end of that
+session, and it grows with every change that overlaps more. Merge the
+sorted intervals (kernels, memsets, memcpys together) and measure the union;
+the per-kernel sums are still what *ranks* the kernels, but any claim of the
+form "the device is busy N ms a frame" or any estimate of a change's ceiling
+has to come from the union. The old profiles' shares silently assumed one
+stream and were right only while that was true.
+
+**A removed wait is only a win if the total across all sync sites drops.**
+The stream is a queue: take away the drain that used to empty it and the
+next synchronisation downstream inherits the backlog. This is not
+hypothetical — it happened twice in one session. Removing the per-draw
+A-buffer drains moved 8.5 s of waiting into `cp_flush`'s
+`cuCtxSynchronize`; removing the bloom pyramid's count drains moved the
+wait into the copies between filter passes, for a wall-neutral result both
+times the site-local number looked like a victory. After any change that
+removes or defers a synchronisation, re-run the shim and compare the **sum
+over every sync site** — `cuStreamSynchronize` and `cuCtxSynchronize`
+together — against the baseline, and credit only what the frame median
+confirms.
+
+**When the question is structural, count events before profiling.** A
+profile says where time went; it cannot say how often each *cause* fired,
+and the causes are what a structural change addresses. The decisive
+measurements of the episodes session were event histograms over the whole
+replay, each a one-line pipe: `CUDAPIPE_DEBUG_BATCH` and
+`CUDAPIPE_DEBUG_BATCHDIFF` through `sort | uniq -c` gave the exact
+distribution of batch-break causes (which is what made the per-draw-table
+work targeted), and `CUDAPIPE_DEBUG_PASSSEQ` with
+`~/claude-scratchpad/perf16/passseq_stats.py` gave the pass structure —
+draws, shaders, opaque/blended interleave per pass — which killed one
+planned design outright and re-scoped another before either was built. A
+histogram that costs one replay is cheaper than a wrong week.
+
+Two dead ends are recorded in `../EPISODES.md` so they are not retried: the
+scheduling of idle blocks in worst-case-sized grids is not a measurable
+cost (grid-striding every compiled shader and capping the grids was
+bit-identical and wall-neutral), and per-call CUDA API overhead stopped
+being the wall the moment call counts fell — what remained was small
+latency-bound kernels *serialized on one stream*, which is why overlapping
+them across streams was the largest single win of the session and shrinking
+or merging them is the direction that keeps paying.
 
 ---
 
