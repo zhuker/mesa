@@ -298,6 +298,24 @@ struct cp_clip_args {
 #define CP_ARG_SLOT_FRONT_FACE 12
 
 /*
+ * Coverage: one byte per shaded slot, written by the interpolator, non-zero
+ * for a lane the primitive actually covers.
+ *
+ * The fragment stage shades whole 2x2 quads so that derivatives can be taken
+ * across one, which means a lane outside the primitive is shaded too. Vulkan
+ * calls those helper invocations, and says their stores and atomics have no
+ * effect — cp_fs_writeback enforces that for colour and depth by consulting
+ * this mask, and for everything else it did not need enforcing, because a
+ * fragment shader had no other way to write anything.
+ *
+ * A shader with side effects does. So the slot is filled, and read, only for
+ * a shader the compiler saw write memory: it returns before its body if its
+ * lane is a helper. Filled with null for every other shader, which is what
+ * keeps the generated code for one identical.
+ */
+#define CP_ARG_SLOT_COVERAGE 13
+
+/*
  * One merged draw's slice of the assembled vertex stream.
  *
  * A batch concatenates its draws, so vertex v of the launch belongs to the
@@ -404,6 +422,17 @@ struct cp_fs_interp_args {
    uint32_t point_mode;
    int32_t psiz_slot;
    int32_t pntc_input;
+   /*
+    * The fragment shader input slot gl_FragCoord occupies, or -1.
+    *
+    * It is a shader_in variable at VARYING_SLOT_POS, so the host's match by
+    * varying location pairs it with the vertex shader's gl_Position output and
+    * the loop below would interpolate *clip space* into it. What the shader is
+    * owed is the window coordinate, which is the `fc` this function already
+    * computes for the frag_coord array — so the slot is named here and written
+    * from that instead, exactly as pntc_input is.
+    */
+   int32_t pos_input;
    uint32_t num_samples;
    /*
     * TEMPORARY (CUDAPIPE_ABUFFER). What this interpolation emitted, folded

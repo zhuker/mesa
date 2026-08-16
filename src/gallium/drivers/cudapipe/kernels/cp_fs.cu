@@ -114,14 +114,13 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
    float persp2 = b2 * inv_w2;
    float inv_persp = 1.0f / (persp0 + persp1 + persp2);
 
-   if (args->frag_coord) {
-      float4 fc;
-      fc.x = cx;
-      fc.y = cy;
-      fc.z = (b0 * ndc_z0 + b1 * ndc_z1 + b2 * ndc_z2) * 0.5f + 0.5f;
-      fc.w = persp0 + persp1 + persp2;
+   float4 fc;
+   fc.x = cx;
+   fc.y = cy;
+   fc.z = (b0 * ndc_z0 + b1 * ndc_z1 + b2 * ndc_z2) * 0.5f + 0.5f;
+   fc.w = persp0 + persp1 + persp2;
+   if (args->frag_coord)
       ((float4 *)(uintptr_t)args->frag_coord)[slot] = fc;
-   }
 
    const char *vs_out = (const char *)(uintptr_t)args->vs_out;
    char *fs_in = (char *)(uintptr_t)args->fs_in + (size_t)slot * args->fs_in_stride;
@@ -162,6 +161,11 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
          *(float4 *)(fs_in + args->pntc_input * 16) =
             make_float4((cx - px0) / size, (cy - py0) / size, 0.0f, 1.0f);
       }
+
+      /* gl_FragCoord — see pos_input. */
+      if (args->pos_input >= 0 &&
+          (uint32_t)args->pos_input < args->num_fs_inputs)
+         *(float4 *)(fs_in + args->pos_input * 16) = fc;
       return true;
    }
 
@@ -185,6 +189,13 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
 
       *(float4 *)(fs_in + i * 16) = value;
    }
+
+   /* gl_FragCoord — see pos_input. Written after the loop so that it overwrites
+    * the clip-space position the location match would otherwise have left
+    * there. */
+   if (args->pos_input >= 0 &&
+       (uint32_t)args->pos_input < args->num_fs_inputs)
+      *(float4 *)(fs_in + args->pos_input * 16) = fc;
    return true;
 }
 

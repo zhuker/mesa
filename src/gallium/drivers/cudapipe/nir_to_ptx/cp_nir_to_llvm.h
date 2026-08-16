@@ -112,6 +112,18 @@ struct cp_shader_binary {
    bool uses_discard;
 
    /*
+    * Whether the shader writes globally visible memory — a storage image, an
+    * SSBO, a global address — by store or by atomic. Vulkan lets a fragment
+    * shader exist purely for those writes, with no colour attachment at all
+    * (the `oit` sample builds its per-pixel linked lists that way), so the
+    * fragment stage cannot be skipped just because there is nowhere to put a
+    * colour. Gathered from the intrinsics rather than read out of
+    * nir_shader_info, so that it describes the NIR this PTX was generated
+    * from and cannot go stale behind a lowering pass.
+    */
+   bool writes_memory;
+
+   /*
     * Whether the fragment shader reads gl_FrontFacing. Only then does the
     * interpolator write the per-slot facing byte the shader reads, which is
     * one byte per shaded pixel and so worth not writing for the shaders — the

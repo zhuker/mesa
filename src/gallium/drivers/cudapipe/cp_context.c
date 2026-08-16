@@ -988,6 +988,17 @@ cp_fs_interp_setup(struct cp_context *cp, const struct pipe_draw_info *info,
     * from the pixel's position within the point. */
    interp->pntc_input = cp_slot_for_location(fs->in_location, num_fs_inputs,
                                              VARYING_SLOT_PNTC);
+   /*
+    * gl_FragCoord is a shader_in at VARYING_SLOT_POS, so the match below pairs
+    * it with the vertex shader's gl_Position and interpolates clip space into
+    * it. The window coordinate the shader is owed is what the interpolator
+    * already computes for the frag_coord array, so name the slot and let it
+    * write that instead. Without this every gl_FragCoord read a fragment
+    * shader makes returns the clip-space position — which for the `oit`
+    * geometry pass indexes its head-index image at negative coordinates.
+    */
+   interp->pos_input = cp_slot_for_location(fs->in_location, num_fs_inputs,
+                                            VARYING_SLOT_POS);
 
    /* Match each fragment shader input to the vertex shader output carrying the
     * same varying location. */
@@ -1230,7 +1241,7 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
                     CUdeviceptr counter, CUdeviceptr fs_in,
                     unsigned fs_in_stride, CUdeviceptr fs_out,
                     CUdeviceptr frag_coord, CUdeviceptr discard_mask,
-                    CUdeviceptr front_face,
+                    CUdeviceptr front_face, CUdeviceptr coverage,
                     unsigned num_threads, CUevent ev_before,
                     CUdeviceptr batch_rows)
 {
@@ -1272,6 +1283,10 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
    fs_args_host[6] = (void *)(uintptr_t)frag_coord;
    fs_args_host[CP_ARG_SLOT_DISCARD] = (void *)(uintptr_t)discard_mask;
    fs_args_host[CP_ARG_SLOT_FRONT_FACE] = (void *)(uintptr_t)front_face;
+   /* Only a shader that writes memory reads this, and only such a shader is
+    * given it — see CP_ARG_SLOT_COVERAGE. */
+   fs_args_host[CP_ARG_SLOT_COVERAGE] =
+      fs->writes_memory ? (void *)(uintptr_t)coverage : NULL;
    fs_args_host[CP_ARG_SLOT_UBO_TABLE] =
       (void *)(uintptr_t)(fs_args_dev + fs_tbl_off);
    fs_args_host[CP_ARG_SLOT_BATCH_ROWS] = batch_rows
@@ -1560,8 +1575,8 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
    unsigned num_pixels = max_pixels;
 
    if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
-                            frag_coord, discard_mask, front_face, num_pixels, 0,
-                            batch_rows))
+                            frag_coord, discard_mask, front_face, coverage,
+                            num_pixels, 0, batch_rows))
       return;
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
@@ -1608,12 +1623,24 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
          : 0,
    };
 
-   void *wb_params[] = { &wb };
-   cp_nvtx_push("writeback");
-   CP_LAUNCH(screen->kernels.fs_writeback,
-                  (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
-                  0, cp->stream, wb_params, NULL);
-   cp_nvtx_pop();   /* writeback */
+   /*
+    * An attachmentless pass has no colour to write back. It reaches this
+    * function at all because its fragment shader has side effects — storage
+    * image and SSBO writes, which the shader launch above has already made —
+    * and cp_fs_writeback does nothing else that such a pass asks for: `reject`
+    * and `resolved` belong to the discard retry, which needs a colour target
+    * to be enabled at all, and depth writeback never ran for a colourless
+    * draw because the whole fragment stage used to be skipped for one. So the
+    * launch is skipped rather than given a null `color_out` to dereference.
+    */
+   if (color_data) {
+      void *wb_params[] = { &wb };
+      cp_nvtx_push("writeback");
+      CP_LAUNCH(screen->kernels.fs_writeback,
+                     (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
+                     0, cp->stream, wb_params, NULL);
+      cp_nvtx_pop();   /* writeback */
+   }
    cp_stage_end(cp, CP_STAGE_WRITEBACK);
 
    /* How much of the shading launch does any work. Syncs, so debug only, and
@@ -1712,7 +1739,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
                  fin[i * (fs_in_stride / 4) + 0], fin[i * (fs_in_stride / 4) + 1],
                  fout[i * (fs_out_stride / 4) + 0], fout[i * (fs_out_stride / 4) + 1],
                  fout[i * (fs_out_stride / 4) + 2], fout[i * (fs_out_stride / 4) + 3],
-                 cb[px]);
+                 cb ? cb[px] : 0u);
       }
       free(vs_out); free(plist_buf); free(fin_buf); free(fout_buf);
    }
@@ -3037,7 +3064,8 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
    }
 
    if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
-                            frag_coord, discard_mask, front_face, num_slots,
+                            frag_coord, discard_mask, front_face, coverage,
+                            num_slots,
                             cp_abuf.timing ? ab->ev[13] : 0, batch_rows))
       return false;
    cp_abuf_mark(ab->ev[14], cp->stream);
@@ -3249,7 +3277,18 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
 
    if (!screen->kernels.initialized || !screen->kernels.rasterize_triangles)
       return;
-   if (!fb->nr_cbufs && !fb->zsbuf.texture)
+   /*
+    * A draw with nowhere to put a colour and nowhere to put a depth normally
+    * has nothing to do. The exception is a fragment shader that writes memory:
+    * Vulkan allows a subpass with no attachments at all whose fragment shader
+    * exists purely for its storage-image and SSBO writes, and the `oit` sample
+    * builds its per-pixel fragment lists in exactly such a pass. Those writes
+    * are the draw's output, so the draw is not skippable — see `fs_side_effects`
+    * further down, which carries the same condition through the rest of the
+    * function.
+    */
+   if (!fb->nr_cbufs && !fb->zsbuf.texture &&
+       !(cp->fs_shader && cp->fs_shader->writes_memory))
       do { if (getenv("CUDAPIPE_DEBUG_DRAW"))
             fprintf(stderr, "  skipped: no colour or depth attachment\n");
          return; } while (0);
@@ -4014,6 +4053,17 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                 cp->reject && cp->resolved && color_data;
 
    /*
+    * A fragment shader whose output is not a colour. Vulkan allows a subpass
+    * with no attachments at all, and a fragment shader that runs in it purely
+    * to write a storage image or an SSBO — which is how the `oit` sample
+    * builds the per-pixel linked list it sorts and blends in a second pass.
+    * The fragment stage used to be skipped whenever there was nowhere to put a
+    * colour, so that first pass never ran and the sample rendered its
+    * background.
+    */
+   bool fs_side_effects = cp->fs_shader && cp->fs_shader->writes_memory;
+
+   /*
     * Blended geometry needs every layer, not the nearest one. The visibility
     * buffer resolves a single fragment per pixel, which is what makes opaque
     * overdraw cost one shade — and exactly wrong for transparency, where
@@ -4032,8 +4082,20 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     * Discard already owns the multi-pass machinery for its own reasons, so the
     * two do not combine yet and alpha-tested draws keep the retry path.
     */
-   bool peel = !retry && color_data && cp->blend_enabled &&
-               cp->peel_next && screen->kernels.peel_advance;
+   /*
+    * A side-effect-only pass needs every layer for the same reason a blended
+    * one does, and needs it more literally: the visibility buffer resolves one
+    * fragment per pixel, so without peeling the linked list `oit` builds gets
+    * a single node per pixel — the nearest — and the sort in its second pass
+    * has nothing to sort. Peeling shades each covered fragment exactly once,
+    * in submission order, which is what a shader with side effects is entitled
+    * to. Written as a disjoint arm rather than folded into the condition
+    * above, so that a draw which has a colour attachment reaches this line
+    * with exactly the answer it reached it with before.
+    */
+   bool peel = !retry && cp->peel_next && screen->kernels.peel_advance &&
+               ((color_data && cp->blend_enabled) ||
+                (!color_data && fs_side_effects));
    /* A draw can never stack more layers than it has primitives, so a blended
     * draw of two triangles costs two passes rather than the cap. */
    unsigned peel_passes = MIN2((unsigned)CP_BLEND_LAYERS,
@@ -4709,8 +4771,9 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
 
       /* Shade every covered pixel by running the fragment shader on the GPU:
        * interpolate its inputs, launch it, then blend its output into the
-       * attachment. */
-      if (color_data)
+       * attachment — or, for a shader that exists for its stores rather than
+       * for a colour, just the first two. */
+      if (color_data || fs_side_effects)
          cp_shade_fragments(cp, info, visbuf, rast_args.positions, vs_output_buf,
                             num_triangles, w, h, color_data,
                             vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,

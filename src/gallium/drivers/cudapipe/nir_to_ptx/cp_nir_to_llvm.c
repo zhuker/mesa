@@ -57,6 +57,14 @@ struct ntl_context {
    bool reads_const_bufs;
    bool needs_link;   /* pull in cp_sampler.cu for its device helpers */
 
+   /*
+    * Set when the shader writes globally visible memory. Gathered from the
+    * intrinsics before code generation starts, so that the fragment prologue
+    * and the flag the driver records afterwards are the same answer about the
+    * same NIR. See cp_nir_writes_memory().
+    */
+   bool writes_memory;
+
    LLVMBasicBlockRef break_block;
    LLVMBasicBlockRef continue_block;
 
@@ -2181,6 +2189,43 @@ emit_function(struct ntl_context *ctx)
       LLVMPositionBuilderAtEnd(ctx->builder, early_ret);
       LLVMBuildRetVoid(ctx->builder);
       LLVMPositionBuilderAtEnd(ctx->builder, body);
+
+      /*
+       * Helper invocations, for a fragment shader that writes memory.
+       *
+       * A quad is shaded whole so that derivatives can be taken across it, so
+       * a lane the primitive does not cover is shaded too. Vulkan says such a
+       * lane's stores and atomics have no effect; cp_fs_writeback enforces
+       * that for colour and depth by consulting the same mask, and until a
+       * fragment shader could write anything else there was nothing more to
+       * enforce. There is now: `oit` appends a node to a per-pixel linked list
+       * from the fragment stage, and a helper lane appends one for a pixel the
+       * triangle never covered.
+       *
+       * Emitted only when the shader writes memory, so a shader that does not
+       * compiles to exactly what it compiled to before — and the slot is null
+       * for one anyway. Such a shader also forfeits its helper lanes'
+       * derivatives, which is the price of the rule; nothing in this tree both
+       * writes memory and differentiates.
+       */
+      if (ctx->nir->info.stage == MESA_SHADER_FRAGMENT && ctx->writes_memory) {
+         LLVMTypeRef i8_t = LLVMInt8TypeInContext(ctx->llvm_ctx);
+         LLVMValueRef cov_arr = cp_arg_slot(ctx, CP_ARG_SLOT_COVERAGE);
+         LLVMValueRef cov_ptr = LLVMBuildGEP2(ctx->builder, i8_t,
+            LLVMBuildBitCast(ctx->builder, cov_arr,
+                             LLVMPointerType(i8_t, 0), ""), &vid, 1, "");
+         LLVMValueRef cov = LLVMBuildLoad2(ctx->builder, i8_t, cov_ptr, "coverage");
+         LLVMSetAlignment(cov, 1);
+         LLVMValueRef helper = LLVMBuildICmp(ctx->builder, LLVMIntEQ, cov,
+            LLVMConstInt(i8_t, 0, false), "");
+
+         LLVMBasicBlockRef body2 = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "shader_body_covered");
+         LLVMBasicBlockRef helper_ret = LLVMAppendBasicBlockInContext(ctx->llvm_ctx, ctx->function, "helper_ret");
+         LLVMBuildCondBr(ctx->builder, helper, helper_ret, body2);
+         LLVMPositionBuilderAtEnd(ctx->builder, helper_ret);
+         LLVMBuildRetVoid(ctx->builder);
+         LLVMPositionBuilderAtEnd(ctx->builder, body2);
+      }
    }
 
    emit_cf_list(ctx, &impl->body);
@@ -2678,6 +2723,30 @@ cp_shader_swap_build(struct cp_shader_binary *bin)
 #undef CP_SWAP
 }
 
+/*
+ * Whether the shader writes globally visible memory — a storage image, an
+ * SSBO, a global address — by store or by atomic.
+ *
+ * Read off the intrinsics rather than out of nir_shader_info, so that it
+ * describes the NIR this compile is looking at and cannot be a stale answer
+ * left by whatever last ran nir_shader_gather_info().
+ */
+static bool
+cp_nir_writes_memory(struct nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            if (nir_intrinsic_writes_external_memory(nir_instr_as_intrinsic(instr)))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 struct cp_shader_binary *
 cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
                       const char *sampler_ptx)
@@ -2688,6 +2757,10 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    ctx.sm_minor = sm_minor;
 
    cp_lower_nir(nir);
+
+   /* After the lowering, which is the NIR the prologue below is generated
+    * for and the NIR the flag on the binary has to describe. */
+   ctx.writes_memory = cp_nir_writes_memory(nir);
 
    /* Convert from SSA to reg form to eliminate phi nodes */
    nir_convert_from_ssa(nir, true, false);
@@ -2807,6 +2880,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    bin->nir_num_outputs = nir->num_outputs;
    bin->nir_num_inputs = nir->num_inputs;
    bin->reads_const_bufs = ctx.reads_const_bufs;
+   bin->writes_memory = ctx.writes_memory;
 
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
