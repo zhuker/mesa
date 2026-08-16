@@ -110,6 +110,7 @@ struct cp_debug {
    bool no_abuf_batch;
    bool no_pass_episode;
    bool flush_drain;
+   bool no_seg_merge;
    bool no_abuf_append;
    bool no_batch;
    bool no_bincache;

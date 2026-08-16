@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-47 switches.
+48 switches.
 
 ## Tracing
 
@@ -46,6 +46,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_NO_ABUF_BATCH` | bool (presence) | `off` | — | disable batching of A-buffer draws |
 | `CUDAPIPE_NO_PASS_EPISODE` | bool (value) | `off` | — | disable pass episodes: consecutive blended batches stop sharing one A-buffer build and drain |
 | `CUDAPIPE_FLUSH_DRAIN` | bool (value) | `off` | — | restore the draining flush: cp_flush waits for the whole device and rewinds the arenas in place instead of ping-ponging generations |
+| `CUDAPIPE_NO_SEG_MERGE` | bool (value) | `off` | — | disable merged shading groups: every episode segment shades in its own launch group, as before |
 | `CUDAPIPE_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |
 | `CUDAPIPE_NO_BATCH` | bool (presence) | `off` | — | disable draw batching entirely |
 | `CUDAPIPE_NO_BINCACHE` | bool (presence) | `off` | — | disable the compiled-kernel binary cache |

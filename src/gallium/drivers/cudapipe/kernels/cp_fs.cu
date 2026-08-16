@@ -291,6 +291,10 @@ cp_write_batch_rows(const struct cp_fs_interp_args *args, uint32_t prim,
       row = lo;
    }
 
+   /* row_base places a merged group's row in its concatenated table; zero
+    * everywhere else. */
+   row += args->row_base;
+
    for (int i = 0; i < 4; i++)
       rows[base + i] = row;
 }
@@ -319,6 +323,35 @@ cp_abuf_interpolate(struct cp_fs_interp_args args)
 
    uint32_t b = ((const uint32_t *)(uintptr_t)args.abuf_quad_block)[q];
    uint32_t gprim = ((const uint32_t *)(uintptr_t)args.abuf_quad_prim)[q];
+
+   /*
+    * A merged group's launch spans segments, so the launch-wide vertex
+    * stream, slice table and bases are placeholders; resolve this quad's own
+    * through the range table — the same last-base-not-past search the quad
+    * bucketing runs — into the by-value argument copy, and everything below
+    * reads as it always did. vs_out is the same buffer as positions on this
+    * path, exactly as the per-segment shade passes them.
+    */
+   if (args.seg_ranges && args.num_seg_ranges) {
+      const struct cp_seg_range *rr =
+         (const struct cp_seg_range *)(uintptr_t)args.seg_ranges;
+      uint32_t lo = 0, hi = args.num_seg_ranges - 1;
+      while (lo < hi) {
+         uint32_t mid = (lo + hi + 1u) >> 1;
+         if (rr[mid].prim_base <= gprim)
+            lo = mid;
+         else
+            hi = mid - 1;
+      }
+      args.positions = rr[lo].positions;
+      args.vs_out = rr[lo].positions;
+      args.abuf_prim_base = rr[lo].prim_base;
+      args.draw_slices = rr[lo].draw_slices;
+      args.num_draw_slices = rr[lo].num_draw_slices;
+      args.prim_shift = rr[lo].prim_shift;
+      args.row_base = rr[lo].row_base;
+   }
+
    uint32_t prim = gprim - args.abuf_prim_base;
    uint32_t mask = ((const unsigned char *)(uintptr_t)args.abuf_quad_mask)[q];
 

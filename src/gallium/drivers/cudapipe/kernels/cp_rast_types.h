@@ -554,6 +554,17 @@ struct cp_fs_interp_args {
     * drainless draw sizes its launches to what cannot be exceeded and the
     * interpolator stops here. Zero means abuf_num_quads is exact. */
    uint64_t num_quads_dev;
+   /*
+    * Merged shading groups: when set, this launch spans several segments and
+    * each quad resolves its own positions, slice table, prim base and row
+    * base through this table (struct cp_seg_range[num_seg_ranges], sorted by
+    * prim_base) instead of the launch-wide fields above. row_base is what
+    * cp_write_batch_rows adds to the row it finds, landing it in the group's
+    * concatenated fs-UBO table; zero everywhere else.
+    */
+   uint64_t seg_ranges;
+   uint32_t num_seg_ranges;
+   uint32_t row_base;
 };
 
 struct cp_fs_writeback_args {
@@ -634,6 +645,26 @@ struct cp_seg_desc {
    uint64_t discard;        /* uint8 per dense slot; 0 = discards nothing */
    uint32_t fs_out_stride;
    uint32_t num_slots;      /* bound on a dense slot index */
+};
+
+/*
+ * One segment of a merged shading group, for the interpolator. Segments with
+ * the same shading identity — same shaders, same constant-buffer count —
+ * shade in one launch over the group's contiguous slice of the grouped quad
+ * list, and the interpolator resolves each quad's own segment by its global
+ * primitive id through this table (sorted by prim_base, the same search the
+ * quad bucketing uses). The fields are exactly what the launch-wide
+ * arguments can no longer be when one launch spans segments: the segment's
+ * clipped vertex stream, its slice table, and where its fs-UBO rows landed
+ * in the group's concatenated table.
+ */
+struct cp_seg_range {
+   uint64_t positions;      /* the segment's clipped vertex buffer */
+   uint64_t draw_slices;    /* struct cp_draw_slice[num_draw_slices], or 0 */
+   uint32_t num_draw_slices;
+   uint32_t prim_base;      /* first episode-global primitive slot */
+   uint32_t row_base;       /* first row in the group's concatenated tables */
+   uint32_t prim_shift;
 };
 
 /*

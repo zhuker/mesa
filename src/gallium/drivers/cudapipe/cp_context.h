@@ -191,6 +191,10 @@ struct cp_context {
       unsigned w, h;                /* the episode's framebuffer */
    } pass;
 
+   /* A merged shading group's concatenated fs-UBO rows, staged here before
+    * the upload; sized for the worst episode, allocated on first use. */
+   uint64_t *pass_group_ubos;
+
    /*
     * The episode's side streams. Segment counts, fill relaunches and shades
     * are mutually independent — the per-pixel counts and cursors are

@@ -94,6 +94,7 @@ cp_destroy_context(struct pipe_context *ctx)
       cuMemFree(cp->sampler_table);
    cp_scratch_destroy(cp);
    free(cp->pass_segs);
+   free(cp->pass_group_ubos);
    for (unsigned k = 0; k < CP_PASS_STREAMS; k++) {
       if (cp->seg_streams[k])
          cuStreamDestroy(cp->seg_streams[k]);
@@ -3004,6 +3005,11 @@ struct cp_abuf_seg_shade {
    CUdeviceptr quad_list;      /* the episode's grouped quad indices */
    uint32_t quad_list_base;    /* this segment's first entry */
    uint32_t prim_base;         /* subtracted from global primitive ids */
+   /* A merged group: the launch spans several segments, each quad resolving
+    * its own vertex stream and slice table through this table; prim_base
+    * above is then only the placeholder the table overrides. */
+   CUdeviceptr ranges;         /* struct cp_seg_range[num_ranges] */
+   uint32_t num_ranges;
    /* out */
    CUdeviceptr fs_out, coverage, discard;
    uint32_t fs_out_stride, num_slots;
@@ -3112,6 +3118,8 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
       interp.quad_list = seg->quad_list;
       interp.quad_list_base = seg->quad_list_base;
       interp.abuf_prim_base = seg->prim_base;
+      interp.seg_ranges = seg->ranges;
+      interp.num_seg_ranges = seg->num_ranges;
    } else {
       /* num_quads may be a provable bound rather than the drained total; the
        * device knows the exact number, and when the two are equal the
@@ -3126,8 +3134,10 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
    CUdeviceptr batch_rows = 0;
    if (cp->fs_batch.ndraws > 1 && fs->reads_const_bufs) {
       /* A batch the interpolator cannot resolve would shade every draw of it
-       * with the first one's material. Say so rather than render it. */
-      if (!cp->fs_batch.slices) {
+       * with the first one's material. Say so rather than render it. A
+       * merged group carries its slice tables per range instead, where a
+       * member that is not a batch legitimately has none. */
+      if (!cp->fs_batch.slices && !(seg && seg->ranges)) {
          fprintf(stderr, "abuffer: a batch of %u has no slice table; refusing "
                  "to shade it\n", cp->fs_batch.ndraws);
          return false;
@@ -6026,12 +6036,55 @@ cp_pass_finish(struct cp_context *cp)
    if (!quads)
       return;   /* nothing covered anything; there is nothing to composite */
 
-   /* --- dense bases, scatter --- */
-   uint32_t seg_base_host[CP_PASS_MAX_SEGS];
-   uint32_t running = 0;
+   /*
+    * --- merge segments into shading groups ---
+    *
+    * The capture's big passes alternate two vertex shaders draw by draw, so
+    * an episode carries several times more segments than distinct shading
+    * identities. Segments whose shade would be launched with the same
+    * shaders, constant-buffer count and primitive mode shade as one group
+    * over one contiguous slice of the grouped quad list — the interpolator
+    * resolves each quad's own vertex stream and slice table through a range
+    * table — and the composite still resolves per *segment*, through descs
+    * synthesized as offsets into the group's arrays. Everything before this
+    * point, the fallback, and the bucketing kernels are unchanged: grouping
+    * is purely how the dense bases are laid out and how many shade launch
+    * groups run.
+    */
+   uint8_t seg_group[CP_PASS_MAX_SEGS];
+   unsigned group_first[CP_PASS_MAX_SEGS];
+   unsigned ngroups = 0;
    for (unsigned s = 0; s < nsegs; s++) {
-      seg_base_host[s] = running;
-      running += ctr[CP_ABUF_COUNTERS + s];
+      unsigned g = ngroups;
+      if (!cp_debug->no_seg_merge) {
+         for (unsigned i = 0; i < ngroups; i++) {
+            struct cp_pass_seg *f = &segs[group_first[i]];
+            if (f->vs == segs[s].vs && f->fs == segs[s].fs &&
+                f->num_fs_ubos == segs[s].num_fs_ubos &&
+                f->info.mode == segs[s].info.mode) {
+               g = i;
+               break;
+            }
+         }
+      }
+      if (g == ngroups)
+         group_first[ngroups++] = s;
+      seg_group[s] = (uint8_t)g;
+   }
+
+   /* --- dense bases, group-major so each group's quads are one slice --- */
+   uint32_t seg_base_host[CP_PASS_MAX_SEGS];
+   uint32_t group_base[CP_PASS_MAX_SEGS], group_quads[CP_PASS_MAX_SEGS];
+   uint32_t running = 0;
+   for (unsigned g = 0; g < ngroups; g++) {
+      group_base[g] = running;
+      for (unsigned s = 0; s < nsegs; s++) {
+         if (seg_group[s] != g)
+            continue;
+         seg_base_host[s] = running;
+         running += ctr[CP_ABUF_COUNTERS + s];
+      }
+      group_quads[g] = running - group_base[g];
    }
    if (running != quads) {
       cp_pass_fallback(cp, segs, nsegs);
@@ -6059,45 +6112,116 @@ cp_pass_finish(struct cp_context *cp)
                      256, 1, 1, 0, cp->stream, p, NULL);
    }
 
-   /* --- shade each segment densely over its own quads, fanned out --- */
+   /* --- shade each group densely over its slice of the quads, fanned out --- */
    cp_pass_broadcast(cp, nsegs);
    struct cp_pass_live lv;
    cp_pass_live_save(cp, &lv);
    struct cp_seg_desc descs[CP_PASS_MAX_SEGS];
    memset(descs, 0, sizeof(descs));
-   for (unsigned s = 0; s < nsegs && !failed; s++) {
-      struct cp_pass_seg *sg = &segs[s];
-      uint32_t sq = ctr[CP_ABUF_COUNTERS + s];
-      if (!sq)
+   for (unsigned g = 0; g < ngroups && !failed; g++) {
+      uint32_t gq = group_quads[g];
+      if (!gq)
          continue;
+      struct cp_pass_seg *sg = &segs[group_first[g]];
+      unsigned members = 0;
+      for (unsigned s = 0; s < nsegs; s++)
+         members += seg_group[s] == g;
       if (cp->seg_streams[0])
-         cp->stream = cp_pass_seg_stream(cp, s);
+         cp->stream = cp_pass_seg_stream(cp, g);
       cp->vs_shader = sg->vs;
       cp->fs_shader = sg->fs;
       cp->num_fs_ubos = sg->num_fs_ubos;
-      cp->fs_batch.ubos = sg->fs_ubos;
-      cp->fs_batch.ndraws = sg->ndraws;
-      cp->fs_batch.slices = sg->slices_dev;
-      cp->fs_batch.prim_shift = sg->prim_shift;
       struct cp_abuf_seg_shade ss = {
          .quad_list = grouped,
-         .quad_list_base = seg_base_host[s],
+         .quad_list_base = group_base[g],
          .prim_base = sg->prim_base,
       };
+      if (members == 1) {
+         cp->fs_batch.ubos = sg->fs_ubos;
+         cp->fs_batch.ndraws = sg->ndraws;
+         cp->fs_batch.slices = sg->slices_dev;
+         cp->fs_batch.prim_shift = sg->prim_shift;
+      } else {
+         /*
+          * The group's range table, and — when the fragment shader reads
+          * constant buffers — its members' fs-UBO rows concatenated, each
+          * range knowing where its rows landed. The interpolator writes
+          * group-global rows, so the shader indexes the concatenated table
+          * exactly as it indexes a single batch's.
+          */
+         struct cp_seg_range ranges[CP_PASS_MAX_SEGS];
+         unsigned nr = 0;
+         uint32_t rows = 0;
+         bool need_rows = sg->fs->reads_const_bufs;
+         if (need_rows && !cp->pass_group_ubos) {
+            cp->pass_group_ubos =
+               malloc((size_t)CP_PASS_MAX_SEGS * CP_MAX_BATCH_DRAWS *
+                      CP_ARG_UBO_STRIDE * sizeof(uint64_t));
+            if (!cp->pass_group_ubos) {
+               failed = true;
+               break;
+            }
+         }
+         for (unsigned s = 0; s < nsegs; s++) {
+            if (seg_group[s] != g)
+               continue;
+            struct cp_pass_seg *m = &segs[s];
+            ranges[nr++] = (struct cp_seg_range) {
+               .positions = m->rast.positions,
+               .draw_slices = m->slices_dev,
+               .num_draw_slices = m->ndraws,
+               .prim_base = m->prim_base,
+               .row_base = rows,
+               .prim_shift = m->prim_shift,
+            };
+            if (need_rows)
+               memcpy(cp->pass_group_ubos + (size_t)rows * CP_ARG_UBO_STRIDE,
+                      m->fs_ubos,
+                      (size_t)m->ndraws * CP_ARG_UBO_STRIDE *
+                      sizeof(uint64_t));
+            rows += m->ndraws;
+         }
+         CUdeviceptr ranges_dev =
+            cp_upload(cp, ranges, (size_t)nr * sizeof(ranges[0]));
+         if (!ranges_dev) {
+            failed = true;
+            break;
+         }
+         ss.ranges = ranges_dev;
+         ss.num_ranges = nr;
+         /* The launch-wide table and slices are placeholders the ranges
+          * override per quad; ndraws is the concatenated row count, which
+          * is what enables the batch-rows path and sizes the upload. */
+         cp->fs_batch.ubos = need_rows ? cp->pass_group_ubos : sg->fs_ubos;
+         cp->fs_batch.ndraws = rows;
+         cp->fs_batch.slices = sg->slices_dev;
+         cp->fs_batch.prim_shift = sg->prim_shift;
+      }
       float ti, ts, tc;
       if (!cp_abuf_shade(cp, &sg->info, ab, sg->rast.positions,
                          sg->rast.positions, w, h,
                          sg->rast.vp_scale_x, sg->rast.vp_scale_y,
                          sg->rast.vp_trans_x, sg->rast.vp_trans_y,
-                         sq, 0, false, NULL, false, &ti, &ts, &tc, &ss)) {
+                         gq, 0, false, NULL, false, &ti, &ts, &tc, &ss)) {
          failed = true;
          break;
       }
-      descs[s].fs_out = ss.fs_out;
-      descs[s].coverage = ss.coverage;
-      descs[s].discard = ss.discard;
-      descs[s].fs_out_stride = ss.fs_out_stride;
-      descs[s].num_slots = ss.num_slots;
+      /* Per-segment descs, as offsets into the group's dense arrays: the
+       * composite still resolves by segment, so quad_seg and the bucketing
+       * kernels never learned about groups. */
+      for (unsigned s = 0; s < nsegs; s++) {
+         if (seg_group[s] != g)
+            continue;
+         uint32_t sq = ctr[CP_ABUF_COUNTERS + s];
+         if (!sq)
+            continue;
+         uint32_t off = (seg_base_host[s] - group_base[g]) * 4u;
+         descs[s].fs_out = ss.fs_out + (size_t)off * ss.fs_out_stride;
+         descs[s].coverage = ss.coverage ? ss.coverage + off : 0;
+         descs[s].discard = ss.discard ? ss.discard + off : 0;
+         descs[s].fs_out_stride = ss.fs_out_stride;
+         descs[s].num_slots = sq * 4u;
+      }
    }
    cp->stream = pass_main;
    cp_pass_live_restore(cp, &lv);
