@@ -18,6 +18,10 @@ work and are the place to start on it:
   six bugs that stopped it replaying, what each fix was worth, how frame
   correctness is verified against a software reference, and where the frame goes
   now. **Read the correctness method before trusting any frame comparison.**
+- `src/gallium/drivers/cudapipe/EPISODES.md` — the tenth performance pass,
+  77 → 42.5 ms/frame on that capture: per-draw batch tables, pass episodes
+  and their side streams, the fresh frame anatomy, and the ranked designs
+  toward 16 ms. The place to start for any further performance work.
 - `src/gallium/drivers/cudapipe/TODO_CONFORMANCE.md` — what dEQP says, fixed and
   outstanding. Second priority.
 - `src/gallium/drivers/cudapipe/FLAGS.md` — every environment switch the
