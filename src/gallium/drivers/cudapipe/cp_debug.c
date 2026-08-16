@@ -194,6 +194,11 @@ static const struct cp_flag_def flags[] = {
 static struct cp_debug debug_state;
 const struct cp_debug *cp_debug = &debug_state;
 
+/* Whether each variable was present in the environment, which is not always
+ * recoverable from the parsed value: a flag defaulting on and a flag set to 1
+ * land in the same field. apply_couplings() needs the difference. */
+static bool present_in_env[ARRAY_SIZE(flags)];
+
 static void *
 field(const struct cp_flag_def *f)
 {
@@ -213,13 +218,15 @@ clamp_to_range(const struct cp_flag_def *f, int64_t v)
 }
 
 static void
-parse_one(const struct cp_flag_def *f)
+parse_one(const struct cp_flag_def *f, unsigned index)
 {
    const char *v = getenv(f->name);
    bool present = v != NULL;
 
    if (present && f->empty_is_unset && !*v)
       present = false;
+
+   present_in_env[index] = present;
 
    switch (f->type) {
    case CP_FLAG_BOOL_PRESENCE:
@@ -288,8 +295,17 @@ parse_one(const struct cp_flag_def *f)
    }
 }
 
+static bool
+flag_was_set(const char *name)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(flags); i++)
+      if (!strcmp(flags[i].name, name))
+         return present_in_env[i];
+   return false;
+}
+
 /*
- * The three couplings the table cannot express. Each is a real dependency in
+ * The couplings the table cannot express. Each is a real dependency in
  * the code being replaced, not a tidy-up.
  */
 static void
@@ -301,7 +317,7 @@ apply_couplings(void)
     * result left alone. So COMPOSITE defaults to !VERIFY, and an explicit
     * COMPOSITE wins outright.
     */
-   if (!getenv("CUDAPIPE_ABUFFER_COMPOSITE"))
+   if (!flag_was_set("CUDAPIPE_ABUFFER_COMPOSITE"))
       debug_state.abuffer_composite = !debug_state.abuffer_verify;
    if (debug_state.abuffer_composite)
       debug_state.abuffer_verify = false;
@@ -434,7 +450,7 @@ cp_debug_init(void)
    done = true;
 
    for (unsigned i = 0; i < ARRAY_SIZE(flags); i++)
-      parse_one(&flags[i]);
+      parse_one(&flags[i], i);
 
    apply_couplings();
 

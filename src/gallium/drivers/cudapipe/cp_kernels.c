@@ -51,19 +51,20 @@ static const char cp_rast_types_src[] =
 bool
 cp_kernels_instrumented(void)
 {
-   static int on = -1;
-   if (on < 0) {
-      /* CUDAPIPE_ABUF_COMPILE=1 compiles the branches in without turning any
-       * feature on, which is the only way to measure what they cost; =0
-       * refuses them outright. */
-      const char *force = getenv("CUDAPIPE_ABUF_COMPILE");
-      if (force && *force)
-         on = atoi(force) != 0;
-      else
-         on = (getenv("CUDAPIPE_ABUFFER_VERIFY") ||
-               getenv("CUDAPIPE_FRAG_CENSUS")) ? 1 : 0;
-   }
-   return on == 1;
+   /* CUDAPIPE_ABUF_COMPILE=1 compiles the branches in without turning any
+    * feature on, which is the only way to measure what they cost; =0 refuses
+    * them outright. */
+   if (cp_debug->abuf_compile.set)
+      return cp_debug->abuf_compile.value;
+
+   /*
+    * Otherwise they are compiled in when something needs them. This used to
+    * test CUDAPIPE_ABUFFER_VERIFY for presence while cp_abuf_enabled() tested
+    * it for value, so CUDAPIPE_ABUFFER_VERIFY=0 switched the verification off
+    * and still paid to compile the kernels it would have used. Nobody was
+    * bitten because everybody sets =1. It now means off in both places.
+    */
+   return cp_debug->abuffer_verify || cp_debug->frag_census;
 }
 
 /*
