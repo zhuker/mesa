@@ -3081,6 +3081,11 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
       interp.quad_list = seg->quad_list;
       interp.quad_list_base = seg->quad_list_base;
       interp.abuf_prim_base = seg->prim_base;
+   } else {
+      /* num_quads may be a provable bound rather than the drained total; the
+       * device knows the exact number, and when the two are equal the
+       * minimum changes nothing. */
+      interp.num_quads_dev = ab->bsum3;
    }
    cp_fs_interp_setup(cp, info, fs, num_fs_inputs, num_vs_outputs, &interp);
 
@@ -4780,7 +4785,33 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
        * any of them is a draw the peel loop renders, not a draw rendered
        * approximately.
        */
-      if (cp_abuf.composite) {
+      /*
+       * A draw of a couple of triangles cannot overflow anything: its
+       * fragments are bounded by primitives times pixels and its quads by
+       * primitives times blocks, both provably inside the arrays. So the
+       * drain that exists to ask whether the lists are complete has a known
+       * answer, and the shading launches size themselves to the bound with
+       * the interpolator stopping at the device's own quad total. This is
+       * the bloom pyramid's shape — a fullscreen filter quad per pass,
+       * twenty drains a frame on the capture — and it keeps that chain fed
+       * instead of emptying the device between filters. Batched draws keep
+       * the drain (a garbage batch row would dereference a garbage table
+       * entry), as do memory-writing shaders (their side-effect gate reads
+       * coverage the interpolator never wrote for slots past the total).
+       */
+      bool bounded = cp_abuf.composite && !cp_abuf.verify && !cp_abuf.timing &&
+                     num_triangles <= 2 && cp->fs_batch.ndraws <= 1 &&
+                     cp->fs_shader && !cp->fs_shader->writes_memory &&
+                     (size_t)ab->nblocks * rast_num_triangles * 4 <=
+                        (size_t)(512u << 10) &&
+                     (size_t)rast_num_triangles * n <= ab->capacity &&
+                     (size_t)ab->nblocks * rast_num_triangles <=
+                        ab->quad_capacity;
+      if (bounded) {
+         abuf_prod = true;
+         abuf_quads = (uint32_t)((size_t)ab->nblocks * rast_num_triangles);
+         abuf_covered = 0;   /* the composite covers the framebuffer */
+      } else if (cp_abuf.composite) {
          uint32_t ctr[CP_ABUF_COUNTERS] = { 0 };
          cuStreamSynchronize(cp->stream);
          /* One copy: sum3, bsum3 and clist_count are contiguous. The last of

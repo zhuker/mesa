@@ -299,7 +299,13 @@ extern "C" __global__ void
 cp_abuf_interpolate(struct cp_fs_interp_args args)
 {
    uint32_t iq = blockIdx.x * blockDim.x + threadIdx.x;
-   if (iq >= args.abuf_num_quads)
+   uint32_t nq = args.abuf_num_quads;
+   if (args.num_quads_dev) {
+      uint32_t d = *(const uint32_t *)(uintptr_t)args.num_quads_dev;
+      if (d < nq)
+         nq = d;
+   }
+   if (iq >= nq)
       return;
 
    /* Pass-episode mode shades one segment's quads densely: thread i takes

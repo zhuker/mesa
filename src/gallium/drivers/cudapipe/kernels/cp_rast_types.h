@@ -540,6 +540,10 @@ struct cp_fs_interp_args {
    uint64_t quad_list;
    uint32_t quad_list_base;
    uint32_t abuf_prim_base;
+   /* The device's own quad total, when abuf_num_quads is only a bound: a
+    * drainless draw sizes its launches to what cannot be exceeded and the
+    * interpolator stops here. Zero means abuf_num_quads is exact. */
+   uint64_t num_quads_dev;
 };
 
 struct cp_fs_writeback_args {
