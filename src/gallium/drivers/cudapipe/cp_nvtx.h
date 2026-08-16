@@ -24,6 +24,8 @@
  * branch on a cached flag.
  */
 
+#include "cp_debug.h"
+
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -37,10 +39,7 @@ static inline bool
 cp_nvtx_enabled(void)
 {
 #ifdef CP_HAVE_NVTX
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = getenv("CUDAPIPE_NVTX") ? 1 : 0;
-   return enabled != 0;
+   return cp_debug->nvtx;
 #else
    return false;
 #endif

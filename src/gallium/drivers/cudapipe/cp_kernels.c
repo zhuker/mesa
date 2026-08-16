@@ -1,4 +1,5 @@
 #include "cp_kernels.h"
+#include "cp_debug.h"
 #include "cp_screen.h"
 #include "util/u_memory.h"
 #include "util/macros.h"
@@ -110,32 +111,28 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
    if (cp_kernels_instrumented())
       opts[num_opts++] = "-DCP_ABUF_INSTRUMENT=1";
 
-   const char *small_env = getenv("CUDAPIPE_SMALL_THRESHOLD");
-   if (small_env && *small_env) {
+   if (cp_debug->small_threshold.set) {
       snprintf(small_opt, sizeof(small_opt), "-DCP_SMALL_THRESHOLD=%d",
-               atoi(small_env));
+               cp_debug->small_threshold.value);
       opts[num_opts++] = small_opt;
    }
-   const char *medium_env = getenv("CUDAPIPE_MEDIUM_THRESHOLD");
-   if (medium_env && *medium_env) {
+   if (cp_debug->medium_threshold.set) {
       snprintf(medium_opt, sizeof(medium_opt), "-DCP_MEDIUM_THRESHOLD=%d",
-               atoi(medium_env));
+               cp_debug->medium_threshold.value);
       opts[num_opts++] = medium_opt;
    }
-   const char *point_env = getenv("CUDAPIPE_POINT_THRESHOLD");
-   if (point_env && *point_env) {
+   if (cp_debug->point_threshold.set) {
       snprintf(point_opt, sizeof(point_opt), "-DCP_POINT_THRESHOLD=%d",
-               atoi(point_env));
+               cp_debug->point_threshold.value);
       opts[num_opts++] = point_opt;
    }
    /* Not a threshold but the same kind of knob: whether stage 3 walks the
     * whole tile or only the part of it the primitive's bounding box reaches.
     * CUDAPIPE_TILE_BOUND=0 compiles the full-tile walk back, so the two can be
     * compared without a rebuild. */
-   const char *tilebound_env = getenv("CUDAPIPE_TILE_BOUND");
-   if (tilebound_env && *tilebound_env) {
+   if (cp_debug->tile_bound.set) {
       snprintf(tilebound_opt, sizeof(tilebound_opt), "-DCP_TILE_BOUND=%d",
-               atoi(tilebound_env));
+               cp_debug->tile_bound.value);
       opts[num_opts++] = tilebound_opt;
    }
 

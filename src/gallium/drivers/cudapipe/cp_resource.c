@@ -1010,22 +1010,7 @@ static struct {
 static enum cp_arena_mode
 cp_arena_mode(void)
 {
-   static int mode = -1;
-
-   if (mode < 0) {
-      const char *v = getenv("CUDAPIPE_SMALL_ALLOC");
-      if (!v || !strcmp(v, "advise"))
-         mode = CP_ARENA_ADVISE;
-      else if (!strcmp(v, "pinned"))
-         mode = CP_ARENA_PINNED;
-      else if (!strcmp(v, "managed"))
-         mode = CP_ARENA_MANAGED;
-      else if (!strcmp(v, "blocksonly"))
-         mode = CP_ARENA_BLOCKSONLY;
-      else
-         mode = CP_ARENA_OFF;
-   }
-   return (enum cp_arena_mode)mode;
+   return (enum cp_arena_mode)cp_debug->small_alloc;
 }
 
 /*
@@ -1036,15 +1021,7 @@ cp_arena_mode(void)
 static uint64_t
 cp_arena_max_size(void)
 {
-   static uint64_t max = 0;
-
-   if (max == 0) {
-      const char *v = getenv("CUDAPIPE_SMALL_ALLOC_MAX");
-      max = v ? strtoull(v, NULL, 0) : CP_ARENA_DEFAULT_MAX;
-      if (max > CP_ARENA_MAX_SIZE)
-         max = CP_ARENA_MAX_SIZE;
-   }
-   return max;
+   return cp_debug->small_alloc_max;
 }
 
 /* Instrumentation. Plain counters, no getenv on the path; dumped at exit only
@@ -1058,7 +1035,7 @@ static struct {
 static void
 cp_arena_stats_dump(void)
 {
-   if (!getenv("CUDAPIPE_SMALL_ALLOC_STATS"))
+   if (!cp_debug->small_alloc_stats)
       return;
    fprintf(stderr, "cudapipe arena: alloc %" PRIu64 " reuse %" PRIu64
            " grow %" PRIu64 " free_hit %" PRIu64 " free_miss %" PRIu64 "\n",
@@ -1134,13 +1111,7 @@ static uint64_t cp_arena_seen;
 static uint64_t
 cp_arena_warmup(void)
 {
-   static uint64_t warmup = UINT64_MAX;
-
-   if (warmup == UINT64_MAX) {
-      const char *v = getenv("CUDAPIPE_SMALL_ALLOC_WARMUP");
-      warmup = v ? strtoull(v, NULL, 0) : CP_ARENA_DEFAULT_WARMUP;
-   }
-   return warmup;
+   return cp_debug->small_alloc_warmup;
 }
 
 /* -1 for anything the arena does not serve. */

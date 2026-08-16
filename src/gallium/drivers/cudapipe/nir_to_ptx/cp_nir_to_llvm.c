@@ -1,4 +1,5 @@
 #include "cp_nir_to_llvm.h"
+#include "cp_debug.h"
 
 #include "compiler/nir/nir.h"
 #include "util/u_memory.h"
@@ -2595,14 +2596,10 @@ load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
                          const char *sampler_ptx, bool is_fragment,
                          const char *stage)
 {
-   static int forced = -1, disabled, use_static;
-   if (forced < 0) {
-      const char *env = getenv("CUDAPIPE_MAX_REGISTERS");
-      forced = env && atoi(env) > 0 ? atoi(env) : 0;
-      disabled = getenv("CUDAPIPE_NO_REGCAP") ? 1 : 0;
-      use_static = getenv("CUDAPIPE_REGCAP_STATIC") ? 1 : 0;
-   }
-   bool stats = getenv("CUDAPIPE_SHADER_STATS") != NULL;
+   const int forced = (int)cp_debug->max_registers;
+   const int disabled = cp_debug->no_regcap;
+   const int use_static = cp_debug->regcap_static;
+   const bool stats = cp_debug->shader_stats;
 
    bin->sampler_ptx = sampler_ptx;
 
@@ -2829,8 +2826,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
     *
     * So it is left off, and the driver caps registers directly instead.
     */
-   const char *lb = getenv("CUDAPIPE_LAUNCH_BOUNDS");
-   if (lb && atoi(lb) > 0) {
+   if (cp_debug->launch_bounds > 0) {
       LLVMValueRef ntid[] = {
          ctx.function,
          LLVMMDStringInContext(ctx.llvm_ctx, "maxntidx", 8),
@@ -2841,7 +2837,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
       LLVMValueRef ctasm[] = {
          ctx.function,
          LLVMMDStringInContext(ctx.llvm_ctx, "minctasm", 8),
-         LLVMConstInt(i32, atoi(lb), false),
+         LLVMConstInt(i32, (int)cp_debug->launch_bounds, false),
       };
       LLVMAddNamedMetadataOperand(ctx.module, "nvvm.annotations",
                                   LLVMMDNodeInContext(ctx.llvm_ctx, ctasm, 3));
@@ -2858,7 +2854,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
       return NULL;
    }
 
-   if (getenv("CUDAPIPE_DUMP_IR"))
+   if (cp_debug->dump_ir)
       LLVMDumpModule(ctx.module);
 
    /* Verify — if invalid IR, bail out instead of crashing in PTX emission */
@@ -2884,9 +2880,9 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    if (!ptx)
       return NULL;
 
-   if (getenv("CUDAPIPE_DUMP_PTX"))
+   if (cp_debug->dump_ptx)
       fprintf(stderr, "cudapipe: generated PTX (%zu bytes):\n%s\n", ptx_size, ptx);
-   if (getenv("CUDAPIPE_DUMP_NIR"))
+   if (cp_debug->dump_nir)
       nir_print_shader(nir, stderr);
 
    struct cp_shader_binary *bin = CALLOC_STRUCT(cp_shader_binary);

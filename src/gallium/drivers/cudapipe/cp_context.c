@@ -538,10 +538,7 @@ cp_scratch_destroy(struct cp_context *cp)
 static bool
 cp_timing_enabled(void)
 {
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = getenv("CUDAPIPE_DEBUG_TIME") ? 1 : 0;
-   return enabled;
+   return cp_debug->debug_time;
 }
 
 /*
@@ -1133,10 +1130,7 @@ cp_tune_harvest(struct cp_shader_tune *t)
 static bool
 cp_tune_before(struct cp_context *cp, struct cp_shader_binary *fs)
 {
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = getenv("CUDAPIPE_NO_REGCAP") ? 0 : 1;
-   if (!enabled || !fs->tune_cap || fs->tune_done)
+   if (cp_debug->no_regcap || !fs->tune_cap || fs->tune_done)
       return false;
 
    struct cp_shader_tune *t = &fs->tune;
@@ -1163,12 +1157,11 @@ cp_tune_before(struct cp_context *cp, struct cp_shader_binary *fs)
       }
 
       double capped = cp_tune_median(t, 0), as_built = cp_tune_median(t, 1);
-      const char *v = getenv("CUDAPIPE_TUNE_VETO");
-      bool keep = capped < as_built * (v ? atof(v) : CP_TUNE_VETO);
+      bool keep = capped < as_built * cp_debug->tune_veto;
       if (keep)
          t->swap_pending = true;   /* back to capped, on the next launch */
 
-      if (getenv("CUDAPIPE_SHADER_STATS"))
+      if (cp_debug->shader_stats)
          fprintf(stderr, "cudapipe: shader trial regs %3d -> %3d (cap %d): "
                  "%.1f us -> %.1f us median of %d, %s\n",
                  fs->num_regs, t->regs_capped, fs->tune_cap, as_built, capped,
@@ -1761,10 +1754,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 static bool
 cp_census_enabled(void)
 {
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = getenv("CUDAPIPE_FRAG_CENSUS") ? 1 : 0;
-   return enabled == 1;
+   return cp_debug->frag_census;
 }
 
 static int
@@ -2069,7 +2059,7 @@ cp_abuf_enabled(void)
        * CUDAPIPE_NO_BATCH and CUDAPIPE_NO_BINCACHE. CUDAPIPE_ABUFFER=1 still
        * means what it always did and is now a no-op, so a command line or a
        * script written against the opt-in version still does what it says. */
-      cp_abuf.enabled = getenv("CUDAPIPE_NO_ABUFFER") ? 0 : 1;
+      cp_abuf.enabled = cp_debug->no_abuffer ? 0 : 1;
 
       /*
        * Compositing and verifying are exclusive, because the verification is
@@ -2082,27 +2072,19 @@ cp_abuf_enabled(void)
        * the host-side walks over them are not something a frame being
        * measured should be carrying.
        */
-      const char *v = getenv("CUDAPIPE_ABUFFER_VERIFY");
-      const char *c = getenv("CUDAPIPE_ABUFFER_COMPOSITE");
-      cp_abuf.verify = v ? atoi(v) != 0 : 0;
-      cp_abuf.composite = c ? atoi(c) != 0 : !cp_abuf.verify;
-      if (cp_abuf.composite)
-         cp_abuf.verify = 0;
+      cp_abuf.verify = cp_debug->abuffer_verify;
+      cp_abuf.composite = cp_debug->abuffer_composite;
 
-      const char *n = getenv("CUDAPIPE_ABUFFER_VERIFY_DRAWS");
-      cp_abuf.verify_max = n ? (unsigned)atoi(n) : 8;
+      cp_abuf.verify_max = cp_debug->abuffer_verify_draws;
       /* The per-draw event breakdown costs a drain and a line of stderr per
        * draw, which nothing on the default path wants — it was on by default
        * while the path was opt-in and something being examined, and is off by
        * default now that it is how blended draws are rendered. */
-      const char *t = getenv("CUDAPIPE_ABUFFER_TIMING");
-      cp_abuf.timing = t ? atoi(t) != 0 : 0;
+      cp_abuf.timing = cp_debug->abuffer_timing;
       /* Likewise the running commentary on which draws are eligible: useful
        * when the question is why a draw peeled, noise on every other run. */
-      const char *d = getenv("CUDAPIPE_ABUFFER_DEBUG");
-      cp_abuf.debug = d ? atoi(d) != 0 : 0;
-      const char *l = getenv("CUDAPIPE_ABUFFER_LAYERS");
-      cp_abuf.max_layers = l && *l ? (unsigned)atoi(l) : 0;
+      cp_abuf.debug = cp_debug->abuffer_debug;
+      cp_abuf.max_layers = cp_debug->abuffer_layers;
    }
    return cp_abuf.enabled == 1;
 }
@@ -2122,10 +2104,7 @@ cp_abuf_enabled(void)
 static bool
 cp_abuf_batch_enabled(void)
 {
-   static int on = -1;
-   if (on < 0)
-      on = getenv("CUDAPIPE_NO_ABUF_BATCH") ? 0 : 1;
-   return on == 1;
+   return !cp_debug->no_abuf_batch;
 }
 
 static void
@@ -4174,10 +4153,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     * nothing the loop rewinds below can touch them: the first pass builds
     * them, the rest reuse them, and the counters are simply not reset.
     */
-   static int bincache = -1;
-   if (bincache < 0)
-      bincache = getenv("CUDAPIPE_NO_BINCACHE") ? 0 : 1;
-   bool cache_queues = peel && bincache;
+   bool cache_queues = peel && !cp_debug->no_bincache;
 
    /*
     * TEMPORARY: fragment census. One line per draw so the peeled one can be
@@ -5293,10 +5269,7 @@ cp_batch_eligible(struct cp_context *cp, const struct pipe_draw_info *info,
                   const struct pipe_draw_start_count_bias *draws,
                   unsigned num_draws, bool *blended)
 {
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = getenv("CUDAPIPE_NO_BATCH") ? 0 : 1;
-   if (!enabled)
+   if (cp_debug->no_batch)
       return false;
 
    if (!cp_batch_structural(cp, info, indirect, draws, num_draws))
@@ -5353,14 +5326,7 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
    if (!cp->batch.pending)
       return;
 
-   /* Resolved once: a sample with a hundred single-draw batches a frame calls
-    * this on the path the batching is meant to make cheaper. */
-   static int debug = -1;
-   if (debug < 0)
-      debug = (getenv("CUDAPIPE_DEBUG_BATCH") ? 1 : 0) |
-              (getenv("CUDAPIPE_DEBUG_DRAW") ? 2 : 0);
-
-   if (debug & 1)
+   if (cp_debug->debug_batch)
       fprintf(stderr, "cudapipe: batch of %u ends: %s\n", cp->batch.ndraws, why);
 
    unsigned ndraws = cp->batch.ndraws;
@@ -5372,7 +5338,7 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
    cp->batch.tris = 0;
    cp->batch.blended = false;
 
-   if (debug & 2) {
+   if (cp_debug->debug_draw) {
       fprintf(stderr, "cudapipe: batch of %u draws\n", ndraws);
       for (unsigned d = 0; d < MIN2(ndraws, 4u); d++) {
          fprintf(stderr, "  row %u:", d);
@@ -5427,21 +5393,13 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       /* The cap, overridable so that a suspect batch can be bisected by size
        * without a rebuild — 1 exercises the whole batched path on a batch of
        * one, which is the case that has to stay bit-identical. */
-      static int cap = -1;
-      if (cap < 0) {
-         const char *e = getenv("CUDAPIPE_BATCH_MAX");
-         cap = e && *e ? CLAMP(atoi(e), 1, CP_MAX_BATCH_DRAWS)
-                       : CP_MAX_BATCH_DRAWS;
-      }
+      const unsigned cap = cp_debug->batch_max;
 
       if (cp->batch.pending) {
          const char *why = NULL;
          if (memcmp(&key, &cp->batch.key, sizeof(key))) {
             why = "the next draw differs in state or geometry";
-            static int diffdbg = -1;
-            if (diffdbg < 0)
-               diffdbg = getenv("CUDAPIPE_DEBUG_BATCHDIFF") ? 1 : 0;
-            if (diffdbg)
+            if (cp_debug->debug_batchdiff)
                cp_batch_key_report_diff(&key, &cp->batch.key);
          }
          else if (cp->batch.ndraws >= (unsigned)cap)
@@ -5828,7 +5786,7 @@ cp_create_fs_state(struct pipe_context *ctx,
 
    struct nir_shader *nir = (struct nir_shader *)state->ir.nir;
 
-   if (getenv("CUDAPIPE_DUMP_NIR")) {
+   if (cp_debug->dump_nir) {
       fprintf(stderr, "=== FS NIR ===\n");
       nir_print_shader(nir, stderr);
    }
@@ -5872,7 +5830,7 @@ cp_create_vs_state(struct pipe_context *ctx,
 
    struct nir_shader *nir = (struct nir_shader *)state->ir.nir;
 
-   if (getenv("CUDAPIPE_DUMP_NIR")) {
+   if (cp_debug->dump_nir) {
       fprintf(stderr, "=== VS NIR ===\n");
       nir_print_shader(nir, stderr);
    }
@@ -5901,10 +5859,7 @@ cp_bind_vs_state(struct pipe_context *ctx, void *state)
        * distinct binary here between every draw, which ends the batch before
        * the key is ever consulted, and that is invisible from the key's own
        * diagnostics. */
-      static int diffdbg = -1;
-      if (diffdbg < 0)
-         diffdbg = getenv("CUDAPIPE_DEBUG_BATCHDIFF") ? 1 : 0;
-      if (diffdbg)
+      if (cp_debug->debug_batchdiff)
          fprintf(stderr, "cudapipe: batchdiff vs bind %p -> %p\n",
                  (void *)cp->vs_shader, state);
       cp_batch_flush_why(cp, "vertex shader");
