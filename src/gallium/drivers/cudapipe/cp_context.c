@@ -1309,7 +1309,7 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
 
    cp_upload_end(cp, fs_args_dev, fs_blk, fs_blk_bytes);
 
-   if (getenv("CUDAPIPE_DEBUG_TEX")) {
+   if (cp_debug->debug_tex) {
       fprintf(stderr, "cudapipe: sampler table %p (%u entries) for FS module\n",
               (void *)(uintptr_t)cp->sampler_table, cp->num_samplers);
 
@@ -1420,7 +1420,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 
    if (!fs || !fs->kernel || !vs_output_buf || !cp->vs_shader ||
        !screen->kernels.fs_interpolate || !screen->kernels.fs_writeback) {
-      if (getenv("CUDAPIPE_DEBUG_DRAW"))
+      if (cp_debug->debug_draw)
          fprintf(stderr, "  no fragment stage: fs=%p kernel=%p vs_out=%p vs=%p\n",
                  (void *)fs, fs ? (void *)fs->kernel : NULL,
                  (void *)(uintptr_t)vs_output_buf, (void *)cp->vs_shader);
@@ -1637,7 +1637,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 
    /* How much of the shading launch does any work. Syncs, so debug only, and
     * read it on a deterministic sample. */
-   if (getenv("CUDAPIPE_DEBUG_WORK")) {
+   if (cp_debug->debug_work) {
       uint32_t shaded = 0;
       cuStreamSynchronize(cp->stream);
       cuMemcpyDtoH(&shaded, counter, sizeof(shaded));
@@ -1646,7 +1646,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
               ((w + 1) / 2) * ((h + 1) / 2), w * h);
    }
 
-   if (getenv("CUDAPIPE_DEBUG_DISCARD")) {
+   if (cp_debug->debug_discard) {
       /* Both live in device-only memory now, so they have to be fetched
        * rather than read through the pointer. This path already synchronises,
        * which is what makes that affordable. */
@@ -1667,14 +1667,14 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
               reject_pass, covered, nd);
    }
 
-   if (getenv("CUDAPIPE_DEBUG_DRAW"))
+   if (cp_debug->debug_draw)
       fprintf(stderr, "  shaded %u pixels (%u fs inputs, %u tris) "
               "blend=%u src=%u dst=%u mask=0x%x\n",
               num_pixels, num_fs_inputs, num_triangles,
               rt->blend_enable, rt->rgb_src_factor, rt->rgb_dst_factor,
               wb.blend.colormask);
 
-   if (getenv("CUDAPIPE_DEBUG_FS")) {
+   if (cp_debug->debug_fs) {
       /*
        * Everything printed below is device-only, so it is fetched whole
        * first. Wasteful, and correct for a path that already synchronises
@@ -1696,10 +1696,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       cuMemcpyDtoH(fin_buf, fs_in, (size_t)num_pixels * fs_in_stride);
       cuMemcpyDtoH(fout_buf, fs_out, (size_t)num_pixels * fs_out_stride);
 
-      const char *step_env = getenv("CUDAPIPE_DEBUG_FS_VSTEP");
-      unsigned vstep = step_env ? (unsigned)atoi(step_env) : 1;
-      if (vstep < 1)
-         vstep = 1;
+      unsigned vstep = cp_debug->debug_fs_vstep;   /* registry clamps to >= 1 */
       for (unsigned v = 0; v < num_triangles * 3 && v < 6 * vstep; v += vstep) {
          fprintf(stderr, "  vtx%u:", v);
          for (unsigned s = 0; s < num_vs_outputs; s++)
@@ -1716,8 +1713,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       const uint32_t *plist = plist_buf;
       const float *fin = fin_buf;
       const float *fout = fout_buf;
-      const char *row_env = getenv("CUDAPIPE_DEBUG_FS_ROW");
-      int want_row = row_env ? atoi(row_env) : -1;
+      int want_row = cp_debug->debug_fs_row;
       unsigned shown = 0;
       for (unsigned i = 0; i < num_pixels && shown < (want_row >= 0 ? 64u : 8u); i++) {
          unsigned px = plist[i];
@@ -3267,7 +3263,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     */
    if (!fb->nr_cbufs && !fb->zsbuf.texture &&
        !(cp->fs_shader && cp->fs_shader->writes_memory))
-      do { if (getenv("CUDAPIPE_DEBUG_DRAW"))
+      do { if (cp_debug->debug_draw)
             fprintf(stderr, "  skipped: no colour or depth attachment\n");
          return; } while (0);
    if (num_draws == 0 || draws[0].count == 0)
@@ -3302,7 +3298,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
    }
 
    if (total_triangles == 0)
-      do { if (getenv("CUDAPIPE_DEBUG_DRAW"))
+      do { if (cp_debug->debug_draw)
             fprintf(stderr, "  skipped: no triangles\n");
          return; } while (0);
    unsigned num_triangles = total_triangles;
@@ -3316,7 +3312,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       struct cp_resource *color_res = cp_resource(fb->cbufs[0].texture);
       color_data = cp_resource_data(color_res);
    }
-   if (getenv("CUDAPIPE_DEBUG_DRAW") && !color_data)
+   if (cp_debug->debug_draw && !color_data)
       fprintf(stderr, "  color=(nil) reason: nr_cbufs=%u tex=%p data=%p\n",
               fb->nr_cbufs, fb->nr_cbufs ? (void*)fb->cbufs[0].texture : NULL,
               fb->nr_cbufs && fb->cbufs[0].texture ?
@@ -3332,7 +3328,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     * Occlusion between draws is carried by the depth buffer instead. */
    CUdeviceptr visbuf = cp->visbuf;
    if (!visbuf)
-      do { if (getenv("CUDAPIPE_DEBUG_DRAW"))
+      do { if (cp_debug->debug_draw)
             fprintf(stderr, "  skipped: no visibility buffer\n");
          return; } while (0);
 
@@ -3770,7 +3766,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
 
          /* Dump what the GPU fetch actually gathered, which is the quickest way to
           * tell a bad attribute layout from a bad shader. Syncs, so debug only. */
-         if (getenv("CUDAPIPE_DEBUG_VFETCH") && vs_input_buf) {
+         if (cp_debug->debug_vfetch && vs_input_buf) {
             /* Device-only; fetch the two vertices this prints. */
             cuCtxSynchronize();
             unsigned nfetch = MIN2(2u, total_verts);
@@ -3997,7 +3993,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
    }
    cp_stage_end(cp, CP_STAGE_VERTEX);
 
-   if (getenv("CUDAPIPE_DEBUG_DRAW")) {
+   if (cp_debug->debug_draw) {
       fprintf(stderr, "cudapipe: [samples=%u] draw %u tris (%u instances), fb=%ux%u, "
               "vp=[%.0f,%.0f,%.0f,%.0f] stride=%u scale=[%.1f,%.1f] color=%p\n",
               fb_samples, num_triangles, instance_count, w, h, vp_x, vp_y, vp_w, vp_h,
@@ -4698,7 +4694,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          s3_blocks, 1, 1, 64, 1, 1,
          0, cp->stream, s3_params, NULL);
 
-      if (rast_err != CUDA_SUCCESS && getenv("CUDAPIPE_DEBUG_DRAW"))
+      if (rast_err != CUDA_SUCCESS && cp_debug->debug_draw)
          fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
       cp_nvtx_pop();   /* raster */
       cp_stage_end(cp, CP_STAGE_RASTERIZE);
@@ -5464,7 +5460,7 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    cuCtxSetCurrent(cp->screen->cuda_ctx);
 
    /* Debug: print bound UBO/SSBO pointers */
-   if (getenv("CUDAPIPE_DEBUG_LAUNCH")) {
+   if (cp_debug->debug_launch) {
       for (unsigned i = 0; i < cp->num_compute_ubos; i++) {
          fprintf(stderr, "  UBO[%u] = %p (size %u)", i, cp->compute_ubos[i].buffer, cp->compute_ubos[i].buffer_size);
          if (cp->compute_ubos[i].buffer && cp->compute_ubos[i].buffer_size >= 16) {
@@ -5519,7 +5515,7 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    void *args_ptr_val = (void *)(uintptr_t)args_dev;
    void *kernel_params[] = { &args_ptr_val };
 
-   if (getenv("CUDAPIPE_DEBUG_LAUNCH")) {
+   if (cp_debug->debug_launch) {
       fprintf(stderr, "  args_dev=%p arg_ptrs_host[19]=%p (UBO[1])\n",
               (void*)(uintptr_t)args_dev, arg_ptrs_host[19]);
    }
@@ -5928,7 +5924,7 @@ static void
 cp_bind_sampler_states(struct pipe_context *ctx, mesa_shader_stage shader,
                        unsigned start, unsigned count, void **states)
 {
-   if (getenv("CUDAPIPE_DEBUG_TEX")) {
+   if (cp_debug->debug_tex) {
       fprintf(stderr, "cudapipe: bind_sampler_states stage=%d start=%u count=%u\n",
               shader, start, count);
       for (unsigned i = 0; i < count; i++) {
@@ -5975,7 +5971,7 @@ cp_set_sampler_views(struct pipe_context *ctx, mesa_shader_stage shader,
                      struct pipe_sampler_view **views)
 {
    struct cp_context *cp = (struct cp_context *)ctx;
-   if (getenv("CUDAPIPE_DEBUG_TEX"))
+   if (cp_debug->debug_tex)
       fprintf(stderr, "cudapipe: set_sampler_views stage=%d start=%u count=%u views=%p\n",
               shader, start, count, (void *)views);
    if (shader != MESA_SHADER_FRAGMENT)
@@ -6450,7 +6446,7 @@ cp_register_sampler(struct cp_context *cp, const struct pipe_sampler_state *stat
    cp->sampler_table_host[cp->num_samplers] = info;
    cuMemcpyHtoD(cp->sampler_table + cp->num_samplers * sizeof(info),
                 &info, sizeof(info));
-   if (getenv("CUDAPIPE_DEBUG_TEX"))
+   if (cp_debug->debug_tex)
       fprintf(stderr, "cudapipe: sampler[%u] wrap=%u,%u min=%u mag=%u mip=%u\n",
               cp->num_samplers, info.wrap_s, info.wrap_t,
               info.min_img_filter, info.mag_img_filter, info.min_mip_filter);
@@ -6523,7 +6519,7 @@ cp_create_texture_handle(struct pipe_context *ctx,
          cuMemcpyHtoD(info_dev, &info_host, sizeof(info_host));
          h->functions = (void *)(uintptr_t)info_dev;
 
-         if (getenv("CUDAPIPE_DEBUG_TEX"))
+         if (cp_debug->debug_tex)
             fprintf(stderr, "cudapipe: texture handle %ux%u fmt=%u enc=%u "
                     "stride=%u base=%p\n", info->width, info->height,
                     info->format, info->encoding, info->row_stride[0],

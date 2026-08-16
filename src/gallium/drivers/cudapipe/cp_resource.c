@@ -208,7 +208,7 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
    void *data = cp_resource_data(res);
    if (!data)
       return NULL;
-   if (getenv("CUDAPIPE_DEBUG_DRAW") && (usage & PIPE_MAP_READ) &&
+   if (cp_debug->debug_draw && (usage & PIPE_MAP_READ) &&
        resource->width0 * resource->height0 >= 921600)
       fprintf(stderr, "cudapipe: map READ %ux%u data=%p managed=%d tex=%d\n",
               resource->width0, resource->height0, data, res->cuda_managed,
@@ -310,7 +310,7 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    cp_batch_flush(cp);
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
-   if (getenv("CUDAPIPE_DEBUG_DRAW"))
+   if (cp_debug->debug_draw)
       fprintf(stderr, "cudapipe: blit %ux%u -> %ux%u src=%p dst=%p "
               "srcsamples=%u dstsamples=%u fmt=%u->%u\n",
               info->src.box.width, info->src.box.height,
@@ -361,7 +361,7 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
          .num_samples = src_samples,
          .encoding = cp_color_encoding_from_format(info->src.format),
       };
-      if (getenv("CUDAPIPE_DEBUG_DRAW"))
+      if (cp_debug->debug_draw)
          fprintf(stderr, "  resolve %ux%u samples=%u sstride=%u srcstride=%u "
                  "dststride=%u enc=%d\n", ra.width, ra.height, ra.num_samples,
                  ra.sample_stride, ra.src_stride, ra.dst_stride, ra.encoding);
@@ -812,7 +812,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
    /* A clear overwrites what the held-back draws were going to draw into. */
    cp_batch_flush(cp_ctx);
 
-   if (getenv("CUDAPIPE_DEBUG_DRAW"))
+   if (cp_debug->debug_draw)
       fprintf(stderr, "cudapipe: clear buffers=0x%x color=[%.2f,%.2f,%.2f,%.2f]\n",
               buffers, color ? color->f[0] : 0, color ? color->f[1] : 0,
               color ? color->f[2] : 0, color ? color->f[3] : 0);
