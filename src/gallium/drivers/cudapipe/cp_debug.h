@@ -97,6 +97,7 @@ struct cp_debug {
    bool debug_time;
    bool debug_batch;
    bool debug_batchdiff;
+   bool debug_passseq;
    bool frag_census;
    bool nvtx;
 

@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-43 switches.
+44 switches.
 
 ## Tracing
 
@@ -34,6 +34,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_DEBUG_TIME` | bool (presence) | `off` | — | time the pipeline stages |
 | `CUDAPIPE_DEBUG_BATCH` | bool (presence) | `off` | — | report why each draw batch ended |
 | `CUDAPIPE_DEBUG_BATCHDIFF` | bool (presence) | `off` | — | report which state field broke a batch, field by field |
+| `CUDAPIPE_DEBUG_PASSSEQ` | bool (value) | `off` | — | log one line per framebuffer bind and per draw: shaders, blendedness, eligibility — the raw material for pass-structure statistics |
 | `CUDAPIPE_FRAG_CENSUS` | bool (presence) | `off` | — | count fragments per draw; also compiles the instrumented kernels in |
 | `CUDAPIPE_NVTX` | bool (presence) | `off` | — | push an NVTX range around each draw and stage, for nsys |
 

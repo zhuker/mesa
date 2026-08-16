@@ -100,6 +100,9 @@ static const struct cp_flag_def flags[] = {
      "report why each draw batch ended" },
    { "CUDAPIPE_DEBUG_BATCHDIFF", CP_FLAG_BOOL_PRESENCE, F(debug_batchdiff),
      "report which state field broke a batch, field by field" },
+   { "CUDAPIPE_DEBUG_PASSSEQ", CP_FLAG_BOOL_VALUE, F(debug_passseq),
+     "log one line per framebuffer bind and per draw: shaders, blendedness, "
+     "eligibility — the raw material for pass-structure statistics" },
    { "CUDAPIPE_FRAG_CENSUS", CP_FLAG_BOOL_PRESENCE, F(frag_census),
      "count fragments per draw; also compiles the instrumented kernels in" },
    { "CUDAPIPE_NVTX", CP_FLAG_BOOL_PRESENCE, F(nvtx),

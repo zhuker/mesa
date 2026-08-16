@@ -94,6 +94,12 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
     * draws were recorded against the framebuffer that is going away. */
    cp_batch_flush_why(cp, "framebuffer");
 
+   if (cp_debug->debug_passseq)
+      fprintf(stderr, "passseq fb %ux%u cbuf=%p zs=%p\n",
+              state->width, state->height,
+              state->nr_cbufs ? (void *)state->cbufs[0].texture : NULL,
+              (void *)state->zsbuf.texture);
+
    util_copy_framebuffer_state(&cp->framebuffer, state);
 
    /* Coverage and depth are per sample, so the buffers scale with the sample
@@ -5491,7 +5497,45 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
    cuCtxSetCurrent(screen->cuda_ctx);
 
    bool blended = false;
-   if (cp_batch_eligible(cp, info, indirect, draws, num_draws, &blended)) {
+   bool eligible = cp_batch_eligible(cp, info, indirect, draws, num_draws,
+                                     &blended);
+
+   if (cp_debug->debug_passseq) {
+      /* Mirrors the eligibility tests, so an ineligible draw says which one
+       * refused it — statistics only, never consulted for a decision. */
+      const char *why = "";
+      unsigned t = cp_triangles_for_draw(info->mode, draws[0].count);
+      if (!eligible) {
+         if (cp_debug->no_batch) why = ":nobatch";
+         else if (!cp->vs_shader || !cp->vs_shader->kernel ||
+                  !cp->fs_shader || !cp->fs_shader->kernel) why = ":noshader";
+         else if (info->mode != MESA_PRIM_TRIANGLES) why = ":topology";
+         else if (num_draws != 1 || indirect) why = ":multidraw";
+         else if (MAX2(info->instance_count, 1u) != 1) why = ":instanced";
+         else if (info->has_user_indices) why = ":userindex";
+         else if (!cp->num_vertex_buffers ||
+                  !cp->vertex_buffers[0].buffer.resource) why = ":novb";
+         else if (!cp->framebuffer.nr_cbufs ||
+                  !cp->framebuffer.cbufs[0].texture ||
+                  !cp->visbuf || !cp->depthbuf) why = ":nofb";
+         else if (t == 0 || t > CP_MAX_BATCH_TRIS) why = ":toobig";
+         else if (!cp->blend_enabled) {
+            why = cp->fs_shader->uses_discard ? ":discard" : ":depthfunc";
+         } else {
+            if (cp->fs_shader->uses_discard) why = ":discard";
+            else if (!cp->peel_next) why = ":nopeel";
+            else if (MAX2(cp->fb_samples, 1u) != 1 ||
+                     cp->depth_stencil.depth_writemask) why = ":abufgate";
+            else why = ":abufmisc";
+         }
+      }
+      fprintf(stderr, "passseq draw vs=%p fs=%p %s%s tris=%u vp=%.0fx%.0f\n",
+              (void *)cp->vs_shader, (void *)cp->fs_shader,
+              !eligible ? "inelig" : blended ? "blended" : "opaque", why, t,
+              cp->viewport.scale[0] * 2.0f, cp->viewport.scale[1] * 2.0f);
+   }
+
+   if (eligible) {
       struct cp_batch_key key;
       cp_batch_build_key(cp, info, draws, &key, blended);
 
