@@ -363,6 +363,46 @@ def manifest_regions(dump_dir):
     return out
 
 
+def cmd_fps(args):
+    """Per-frame timing from the submit log the replay plugin writes.
+
+    A capture that never presents defeats gfxrecon's own FPS measurement —
+    --measurement-file writes nothing at all, because frames are delimited by
+    vkQueuePresentKHR. The replay event plugin reports queue submits instead,
+    with gfxrecon's timestamps, and an application that submits a fixed number
+    of times per frame turns those into frame boundaries.
+    """
+    ts = []
+    for line in open(args.submits):
+        line = line.split()
+        if line:
+            ts.append(int(line[0]))
+    if len(ts) < args.per_frame * 2:
+        sys.exit("only %d submits; need at least %d" % (len(ts), args.per_frame * 2))
+
+    starts = ts[::args.per_frame]
+    dt = [(b - a) / 1e6 for a, b in zip(starts, starts[1:])]
+    dt_s = sorted(dt)
+    span = (ts[-1] - ts[0]) / 1e9
+    n = len(dt)
+
+    def pct(p):
+        return dt_s[min(len(dt_s) - 1, int(len(dt_s) * p / 100))]
+
+    print("frames measured     %d   (%d submits, %d per frame)"
+          % (n, len(ts), args.per_frame))
+    print("first->last submit  %.2f s  ->  %.1f fps" % (span, n / span))
+    print("mean                %.2f ms" % (sum(dt) / n))
+    print("median              %.2f ms" % dt_s[n // 2])
+    print("p5 / p95            %.2f / %.2f ms" % (pct(5), pct(95)))
+    print("min / max           %.2f / %.2f ms" % (dt_s[0], dt_s[-1]))
+    print()
+    print("Prefer the median. The mean carries the lazy shader compilation in")
+    print("the first hundred frames, and one frame of it can be a hundred times")
+    print("the median.")
+    return 0
+
+
 def cmd_png(args):
     regions = manifest_regions(args.dir)
     size = None
@@ -449,6 +489,12 @@ def main():
                    help="do not pass --remove-unsupported")
     p.add_argument("--gfxrecon-replay")
     p.set_defaults(func=cmd_replay)
+
+    p = sub.add_parser("fps", help="per-frame timing from a replay-plugin submit log")
+    p.add_argument("submits", help="file written by cp_gfxr_fps_plugin")
+    p.add_argument("--per-frame", type=int, default=2,
+                   help="queue submits per frame (default 2, what this capture does)")
+    p.set_defaults(func=cmd_fps)
 
     p = sub.add_parser("png", help="convert dumped .bin readbacks to PNG")
     p.add_argument("dir")

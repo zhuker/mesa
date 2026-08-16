@@ -160,6 +160,58 @@ lazily as each is first used. Quote the mean for throughput (a session pays
 startup once) and the slope for rendering changes. They are ~4% apart; do not
 mix them.
 
+### Per-frame timing, without wall clock
+
+Wall time answers throughput. It cannot say what a frame costs, what the spread
+is, or where the outliers are — and on this capture the mean and the median are
+5% apart because the first hundred frames carry the lazy shader compilation.
+
+**gfxrecon's own FPS measurement is useless here.** `--measurement-file` writes
+*no file at all*, because it delimits frames at `vkQueuePresentKHR` and there
+are none. Neither does `--measurement-frame-range`.
+
+`vkQueueSubmit` is not interposable either — gfxrecon resolves entry points
+through `vkGetDeviceProcAddr` into its own dispatch table, so an `LD_PRELOAD`
+never sees them.
+
+What does work is gfxrecon's replay event plugin, which reports
+`QUEUE_SUBMIT_BEGIN`/`END` with its own timestamps and is driver-agnostic —
+the same plugin measures cudapipe, llvmpipe and NVIDIA without any of them
+knowing. `tests/cp_gfxr_fps_plugin.cpp` is thirty lines; this application
+submits exactly twice per frame, so submit boundaries are frame boundaries.
+
+```sh
+g++ -std=c++17 -O2 -shared -fPIC -I ~/gfxreconstruct/framework/plugin/public \
+    -o fps_plugin.so tests/cp_gfxr_fps_plugin.cpp
+
+gfxrecon-replay -m remap --remove-unsupported --log-file /dev/null \
+  --replay-event-plugin-path $PWD/fps_plugin.so \
+  --replay-event-plugin-params $PWD/submits.txt  $CAP
+
+tests/cp_gfxr_frames.py fps submits.txt
+```
+
+Measured this way, over all 1,510 frames:
+
+| | cudapipe | NVIDIA |
+|---|---|---|
+| first→last submit | 122.5 s — **12.3 fps** | 4.66 s — **323.9 fps** |
+| mean frame | 81.15 ms | 3.09 ms |
+| **median frame** | **77.42 ms** | **2.84 ms** |
+| p5 / p95 | 70.80 / 95.11 | 2.76 / 3.35 |
+| min / max | 8.84 / **753.52** | 1.30 / 38.86 |
+
+**Prefer the median.** cudapipe's mean is 5% above its median because one frame
+costs 753 ms — a lazy shader compile, not rendering. The median also agrees with
+the block-index slope (79.1 ms) to within 2%, which is two independent methods
+cross-checking.
+
+The p5–p95 spread is worth watching on its own: 70.8–95.1 ms is ±16% frame to
+frame, against NVIDIA's ±10%. A streamer cares about that as much as the mean.
+
+By median the gap is **27x**, against the 25x the wall clocks give — the wall
+figure is diluted by NVIDIA spending ~30% of its run parsing the file.
+
 ### Noise, and paired A/B
 
 Run-to-run spread can reach **±4%**, because `cp_tune_before` times register-cap
