@@ -1,6 +1,7 @@
 #ifndef CP_CONTEXT_H
 #define CP_CONTEXT_H
 
+#include "cp_debug.h"   /* CP_MAX_BATCH_DRAWS and the rest of the tunables */
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
 #include <cuda.h>
@@ -35,7 +36,6 @@ struct cp_shader_binary;
  * from its triangle count (the clipper's output, four per input triangle)
  * scale with the batch and the arena has a hard limit.
  */
-#define CP_MAX_BATCH_DRAWS 128
 #define CP_MAX_BATCH_TRIS  (256 * 1024)
 
 /*

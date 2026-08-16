@@ -1,4 +1,5 @@
 #include "cp_screen.h"
+#include "cp_debug.h"
 #include "cp_context.h"
 #include "cp_resource.h"
 #include "cp_public.h"
@@ -385,6 +386,11 @@ struct pipe_screen *
 cudapipe_create_screen(struct sw_winsys *winsys)
 {
    struct cp_screen *screen;
+
+   /* Before anything else reads a flag, and in particular before
+    * cp_kernels_init() below, which resolves four of them into NVRTC -D
+    * options. */
+   cp_debug_init();
 
    screen = CALLOC_STRUCT(cp_screen);
    if (!screen)

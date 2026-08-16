@@ -1080,7 +1080,6 @@ cp_fs_interp_setup(struct cp_context *cp, const struct pipe_draw_info *info,
  * samples that gain against what they cost on the samples that do not.
  * CUDAPIPE_NO_REGCAP turns the whole thing off.
  */
-#define CP_TUNE_VETO 1.05   /* how much worse capped has to be to be refused */
 
 static int
 cp_tune_cmp_float(const void *a, const void *b)

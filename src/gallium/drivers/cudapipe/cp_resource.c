@@ -1,6 +1,7 @@
 #include "cp_screen.h"
 #include "cp_context.h"
 #include "cp_resource.h"
+#include "cp_debug.h"
 #include "kernels/cp_rast_types.h"
 
 #include "pipe/p_defines.h"
@@ -981,23 +982,9 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
  * CUDAPIPE_SMALL_ALLOC_STATS prints the allocation mix and the arena's hit
  * rates at exit, whether or not the arena ever opened.
  */
-#define CP_ARENA_MIN_SHIFT   6
-#define CP_ARENA_CLASSES     5
-#define CP_ARENA_MAX_SIZE    ((uint64_t)1 << (CP_ARENA_MIN_SHIFT + CP_ARENA_CLASSES - 1))
-#define CP_ARENA_DEFAULT_MAX ((uint64_t)128)
 #define CP_ARENA_BLOCK_SIZE  ((size_t)2 * 1024 * 1024)
 #define CP_ARENA_MAX_BLOCKS  64
 
-enum cp_arena_mode {
-   CP_ARENA_OFF = 0,
-   CP_ARENA_PINNED,
-   CP_ARENA_MANAGED,
-   CP_ARENA_ADVISE,
-   /* Diagnostic: open the blocks and advise them exactly as `advise` does, but
-    * serve nothing out of them, so that "the blocks exist" and "the small
-    * allocations moved into them" can be told apart by measurement. */
-   CP_ARENA_BLOCKSONLY,
-};
 
 struct cp_arena_block {
    char *base;
@@ -1141,7 +1128,6 @@ cp_arena_stats_dump(void)
  *
  * CUDAPIPE_SMALL_ALLOC_WARMUP overrides it; 0 is the ungated behaviour.
  */
-#define CP_ARENA_DEFAULT_WARMUP 64
 
 static uint64_t cp_arena_seen;
 
