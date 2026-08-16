@@ -62,13 +62,12 @@ struct cp_batch_key {
 
    /* The draw itself. The index *range* is not here: a batch carries a table
     * of them and cp_vertex_fetch searches it, which is what lets a scene of
-    * different meshes out of one buffer merge at all. The range comes back
-    * only for a shader that reads gl_BaseVertex or gl_DrawID, which a batch
-    * has one copy of. */
-   uint32_t mode, index_size, instance_count, start_instance, drawid_offset;
+    * different meshes out of one buffer merge at all. Neither are the draw
+    * parameters — gl_BaseVertex, gl_BaseInstance, gl_DrawID resolve per draw
+    * through the parameter rows at args[7]. start_instance stays: the fetch
+    * kernel's instance-divisor gather reads it as one scalar. */
+   uint32_t mode, index_size, instance_count, start_instance;
    const void *index_resource;
-   uint32_t draw_start, draw_count;
-   int32_t draw_index_bias;
 
    /* Pipeline state, whole structs: a field added upstream is then covered
     * without anything here having to name it. */
@@ -87,11 +86,10 @@ struct cp_batch_key {
       uint32_t offset;
    } vertex_buffers[16];
 
-   /* Fragment bindings, which a batch may *not* vary — see cp_rast_types.h.
-    * The vertex count is here too, since the table's rows are that wide. */
+   /* Binding *counts* only: both stages carry their per-draw pointer tables,
+    * but each launch fills its table's rows this many entries wide, so the
+    * width itself has to agree across a batch. */
    uint32_t num_fs_ubos, num_vs_ubos;
-   const void *fs_ubos[CP_MAX_CONST_BUFFERS];
-   uint32_t fs_ubo_sizes[CP_MAX_CONST_BUFFERS];
    uint64_t sampler_table;
    uint32_t num_samplers;
 };
@@ -119,6 +117,9 @@ struct cp_context {
        * the slice table cp_vertex_fetch searches. */
       struct pipe_draw_start_count_bias draws[CP_MAX_BATCH_DRAWS];
       unsigned drawid_offset;
+      /* gl_DrawID per merged draw — the offset recorded when it joined, for
+       * the per-draw parameter rows at args[7]. */
+      uint32_t draw_ids[CP_MAX_BATCH_DRAWS];
       /* One row of vertex-stage uniform pointers per draw, in the layout the
        * shader indexes: row * CP_ARG_UBO_STRIDE + binding. */
       uint64_t vs_ubos[CP_MAX_BATCH_DRAWS * CP_MAX_CONST_BUFFERS];

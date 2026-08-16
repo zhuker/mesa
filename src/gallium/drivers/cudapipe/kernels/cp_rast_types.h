@@ -282,9 +282,10 @@ struct cp_clip_args {
  * offsets. cp_vertex_fetch does that search already to know what to gather,
  * and writes the answer here instead of the shader repeating it.
  *
- * Only the vertex stage reads them. Draws whose *fragment* bindings differ are
- * not merged at all, so the fragment shader keeps loading args[18 + i] and its
- * generated code is untouched.
+ * Both drawing stages read them: the vertex stage's rows are written by
+ * cp_vertex_fetch, the fragment stage's by the interpolator (see
+ * cp_write_batch_rows), and every batch — blended or opaque — carries its
+ * fragment bindings per draw through the same table.
  */
 #define CP_ARG_SLOT_UBO_TABLE  9
 #define CP_ARG_SLOT_BATCH_ROWS 10
@@ -333,6 +334,13 @@ struct cp_draw_slice {
  * CP_MAX_CONST_BUFFERS and the 18.. layout it stands in for. */
 #define CP_ARG_UBO_STRIDE 16
 #define CP_ARG_UBO_BASE 18
+
+/* uint32 words per draw in the draw-parameter table at args[7]:
+ * [0] first_vertex, [1] base_instance, [2] draw_id, [3] base_vertex
+ * (0 for a non-indexed draw, where first_vertex is the draw's start).
+ * The vertex shader indexes it by its batch row, so an unbatched draw's
+ * single row reads exactly as the flat triple this used to be. */
+#define CP_ARG_DRAW_PARAM_STRIDE 4
 
 /* enum pipe_compare_func */
 enum cp_compare_func {
