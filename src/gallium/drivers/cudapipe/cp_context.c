@@ -3420,19 +3420,23 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
    total_triangles *= instance_count;
 
    /* What one draw of the batch contributes, which is what the instance
-    * arithmetic below divides by. A batch is never instanced, so this is the
-    * unbatched draw's own count and nothing else reads it. */
+    * arithmetic below divides by. Only the unbatched launch-wide
+    * verts_per_instance reads it — a batch resolves instancing out of its
+    * slice table instead. */
    unsigned tris_per_draw = total_triangles;
 
    /*
     * A batch concatenates its merged draws, and they need not be the same
-    * size: `draws` holds one range per merged draw. That is the whole of what
-    * makes the grids below bigger.
+    * size: `draws` holds one range per merged draw. Instances multiply each
+    * draw's contribution — instance_count is in the batch key, so it is one
+    * number for the whole batch. That is the whole of what makes the grids
+    * below bigger.
     */
    if (batch_draws > 1) {
       total_triangles = 0;
       for (unsigned d = 0; d < batch_draws; d++)
          total_triangles += cp_triangles_for_draw(info->mode, draws[d].count);
+      total_triangles *= instance_count;
    }
 
    if (total_triangles == 0)
@@ -3833,14 +3837,19 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          if (batch_draws > 1) {
             struct cp_draw_slice slices[CP_MAX_BATCH_DRAWS];
             uint32_t vbegin = 0;
+            unsigned inst = MAX2(info->instance_count, 1u);
             for (unsigned d = 0; d < batch_draws; d++) {
+               unsigned dverts =
+                  cp_triangles_for_draw(info->mode, draws[d].count) * 3;
                slices[d].vert_begin = vbegin;
                slices[d].index_bytes =
                   indexed ? (uint32_t)draws[d].start * info->index_size : 0;
                slices[d].first_vertex =
                   indexed ? (uint32_t)draws[d].index_bias : draws[d].start;
-               slices[d].pad = 0;
-               vbegin += cp_triangles_for_draw(info->mode, draws[d].count) * 3;
+               /* Zero for a plain draw, so the fetch skips the division; the
+                * span covers every instance either way. */
+               slices[d].verts_per_instance = inst > 1 ? dverts : 0;
+               vbegin += dverts * inst;
             }
             slices_dev = cp_upload(cp, slices,
                                    (size_t)batch_draws * sizeof(slices[0]));
@@ -5466,8 +5475,6 @@ cp_batch_structural(struct cp_context *cp, const struct pipe_draw_info *info,
       return false;
    if (info->mode != MESA_PRIM_TRIANGLES || num_draws != 1 || indirect)
       return false;
-   if (MAX2(info->instance_count, 1u) != 1)
-      return false;
    if (info->has_user_indices)
       return false;
    if (info->index_size && !info->index.resource)
@@ -5499,10 +5506,16 @@ cp_batch_structural(struct cp_context *cp, const struct pipe_draw_info *info,
             return false;
 
    /* One draw over the cap is worth nothing to a batch and would grow the
-    * clipper's output buffer past what the arena will hand out. */
-   if (cp_triangles_for_draw(info->mode, draws[0].count) == 0 ||
-       cp_triangles_for_draw(info->mode, draws[0].count) > CP_MAX_BATCH_TRIS)
-      return false;
+    * clipper's output buffer past what the arena will hand out. Instances
+    * multiply the assembled stream, so they count here — silently admitting
+    * a small draw with many instances is exactly how the cap would fail. */
+   {
+      uint64_t tris = (uint64_t)cp_triangles_for_draw(info->mode,
+                                                      draws[0].count) *
+                      MAX2(info->instance_count, 1u);
+      if (tris == 0 || tris > CP_MAX_BATCH_TRIS)
+         return false;
+   }
 
    return true;
 }
@@ -6533,7 +6546,12 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       struct cp_batch_key key;
       cp_batch_build_key(cp, info, draws, &key, blended);
 
-      unsigned tris = cp_triangles_for_draw(info->mode, draws[0].count);
+      /* Instances included: this is what accumulates into batch.tris, which
+       * the triangle cap and every grid downstream are sized from. The
+       * structural gate above already refused anything whose product
+       * overflows the cap. */
+      unsigned tris = cp_triangles_for_draw(info->mode, draws[0].count) *
+                      MAX2(info->instance_count, 1u);
 
       /* The cap, overridable so that a suspect batch can be bisected by size
        * without a rebuild — 1 exercises the whole batched path on a batch of

@@ -114,6 +114,7 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
        * a few hundred bytes at most. Nothing here runs for an unbatched draw —
        * num_draw_slices is zero and every value above stands.
        */
+      uint32_t verts_per_instance = args.verts_per_instance;
       if (args.num_draw_slices) {
          const struct cp_draw_slice *sl =
             (const struct cp_draw_slice *)(uintptr_t)args.draw_slices;
@@ -129,6 +130,9 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
          local = v - sl[row].vert_begin;
          first_vertex = sl[row].first_vertex;
          ib += sl[row].index_bytes;
+         /* A batch carries the per-draw instance shape here; the launch-wide
+          * scalar cannot describe more than one draw and is passed zero. */
+         verts_per_instance = sl[row].verts_per_instance;
       }
 
       /* The vertex shader picks its own draw's uniform bindings out of this. */
@@ -136,9 +140,9 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
          ((uint32_t *)(uintptr_t)args.out_batch_rows)[v] = row;
 
       instance_id = 0;
-      if (args.verts_per_instance) {
-         instance_id = local / args.verts_per_instance;
-         local = local % args.verts_per_instance;
+      if (verts_per_instance) {
+         instance_id = local / verts_per_instance;
+         local = local % verts_per_instance;
       }
 
       if (args.index_buffer && args.index_size > 0) {

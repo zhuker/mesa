@@ -362,7 +362,11 @@ struct cp_draw_slice {
    uint32_t vert_begin;    /* first assembled vertex of this draw */
    uint32_t index_bytes;   /* byte offset of its first index into the IB */
    uint32_t first_vertex;  /* index_bias when indexed, draw start when not */
-   uint32_t pad;
+   /* Assembled vertices per instance for an instanced draw, 0 for a plain
+    * one — the same convention as the launch-wide field, which a batch
+    * ignores in favour of this. vert_begin spans count that includes every
+    * instance, so the fetch's slice search needs no other change. */
+   uint32_t verts_per_instance;
 };
 /* Entries per draw in the table at CP_ARG_SLOT_UBO_TABLE; matches
  * CP_MAX_CONST_BUFFERS and the 18.. layout it stands in for. */
