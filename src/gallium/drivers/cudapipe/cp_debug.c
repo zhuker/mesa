@@ -113,6 +113,9 @@ static const struct cp_flag_def flags[] = {
      "disable the A-buffer; blended draws go back to the direct path" },
    { "CUDAPIPE_NO_ABUF_BATCH", CP_FLAG_BOOL_PRESENCE, F(no_abuf_batch),
      "disable batching of A-buffer draws" },
+   { "CUDAPIPE_NO_PASS_EPISODE", CP_FLAG_BOOL_VALUE, F(no_pass_episode),
+     "disable pass episodes: consecutive blended batches stop sharing one "
+     "A-buffer build and drain" },
    { "CUDAPIPE_NO_BATCH", CP_FLAG_BOOL_PRESENCE, F(no_batch),
      "disable draw batching entirely" },
    { "CUDAPIPE_NO_BINCACHE", CP_FLAG_BOOL_PRESENCE, F(no_bincache),

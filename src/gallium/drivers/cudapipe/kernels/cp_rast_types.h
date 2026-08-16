@@ -162,6 +162,14 @@ struct cp_rasterize_args {
    uint64_t abuf_overflow;  /* uint32: fragments the fill could not place */
    uint32_t abuf_capacity;  /* entries in abuf_frags */
    uint32_t abuf_mode;      /* CP_ABUF_* below */
+   /*
+    * Added to the local triangle id in the fragment the A-buffer records —
+    * and nowhere else. A pass episode rasterizes each segment from its own
+    * clipped buffer, whose triangle ids start at zero, but the merged
+    * per-pixel lists sort on the recorded id, so each segment offsets its
+    * ids by the slots of every segment before it. Zero outside an episode.
+    */
+   uint32_t abuf_prim_base;
 };
 
 #define CP_ABUF_OFF     0u
@@ -214,6 +222,9 @@ struct cp_rasterize_args {
  * hundreds of times a frame.
  */
 #define CP_ABUF_COUNTERS        6
+/* Behind the six: one quad count per pass-episode segment, in the same
+ * allocation so the episode's one drain reads everything in one copy. */
+#define CP_PASS_MAX_SEGS        64
 
 #define CP_ABUF_DBG_COUNTERS    5
 
@@ -516,6 +527,19 @@ struct cp_fs_interp_args {
     * stable mode, 0 when it did not run at all. */
    uint32_t prim_shift;
    uint64_t out_batch_rows;   /* Out: uint32 per shaded slot */
+   /*
+    * Pass-episode mode: shade one segment's quads, densely. quad_list holds
+    * the episode's quad indices grouped by segment; this launch covers
+    * abuf_num_quads entries starting at quad_list_base, thread i shading
+    * quad quad_list[quad_list_base + i] into dense slots 4i..4i+3. The quad
+    * stream's primitive ids are episode-global, so abuf_prim_base is
+    * subtracted before this segment's own vertex stream and slice table are
+    * addressed. quad_list null outside an episode, and everything above
+    * reads as it always did.
+    */
+   uint64_t quad_list;
+   uint32_t quad_list_base;
+   uint32_t abuf_prim_base;
 };
 
 struct cp_fs_writeback_args {
@@ -577,6 +601,47 @@ struct cp_abuf_composite_args {
     * against it; the point of this path is that it has no such cap. */
    uint32_t max_layers;
    struct cp_blend_desc blend;
+   /*
+    * Pass-episode resolution. Shading ran per segment into dense per-segment
+    * arrays, so a global shading slot out of shade_slot — quad * 4 + lane —
+    * resolves through the quad's segment and its dense position to that
+    * segment's own buffers. All null outside an episode, where fs_out,
+    * coverage and discard_mask above are the single segment's arrays.
+    */
+   uint64_t quad_seg;       /* uint8 per quad: segment index */
+   uint64_t quad_dense;     /* uint32 per quad: dense position in segment */
+   uint64_t seg_desc;       /* struct cp_seg_desc[segments] */
+};
+
+/* One pass-episode segment's shading arrays, for the composite. */
+struct cp_seg_desc {
+   uint64_t fs_out;
+   uint64_t coverage;       /* uint8 per dense slot; 0 = shader has none */
+   uint64_t discard;        /* uint8 per dense slot; 0 = discards nothing */
+   uint32_t fs_out_stride;
+   uint32_t num_slots;      /* bound on a dense slot index */
+};
+
+/*
+ * Bucketing the episode's quad stream by segment: `count` walks the quads,
+ * resolves each to its segment by the global primitive id, counts per
+ * segment and records the segment per quad; `scatter` then places each
+ * quad's index into the grouped list at its segment's base. Between the two
+ * the host has read the counts back (in the episode's one drain) and
+ * computed the bases.
+ */
+struct cp_abuf_seg_args {
+   uint64_t quad_prim;      /* uint32 per quad: episode-global primitive */
+   uint64_t seg_prim_base;  /* uint32 per segment: first primitive slot */
+   uint64_t seg_counts;     /* uint32 per segment: quads (atomic) */
+   uint64_t quad_seg;       /* uint8 per quad: out (count) / in (scatter) */
+   uint64_t num_quads_dev;  /* uint32*: the quad total (count reads it) */
+   uint32_t nsegs;
+   uint32_t num_quads;      /* count: grid bound; scatter: exact total */
+   uint64_t seg_cursor;     /* uint32 per segment: atomic (scatter) */
+   uint64_t seg_base;       /* uint32 per segment: dense base (scatter) */
+   uint64_t grouped;        /* uint32 per quad: quad indices by segment */
+   uint64_t quad_dense;     /* uint32 per quad: dense position in segment */
 };
 
 /*

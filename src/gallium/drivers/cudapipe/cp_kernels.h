@@ -43,6 +43,8 @@ struct cp_kernels {
    CUfunction abuf_clamp_runs;
    CUfunction abuf_clear_slots;
    CUfunction abuf_quad_fill;
+   CUfunction abuf_seg_count;
+   CUfunction abuf_seg_scatter;
    CUfunction abuf_interpolate;
    CUfunction abuf_scatter_colors;
    CUfunction abuf_composite;

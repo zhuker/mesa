@@ -574,7 +574,8 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
           * fill that disagrees with the count is reported rather than allowed
           * to write over the next pixel's fragments. */
          if (slot < n && base + slot < args->abuf_capacity)
-            ((uint32_t *)(uintptr_t)args->abuf_frags)[base + slot] = tri_id;
+            ((uint32_t *)(uintptr_t)args->abuf_frags)[base + slot] =
+               args->abuf_prim_base + tri_id;
          else
             atomicAdd((unsigned int *)(uintptr_t)args->abuf_overflow, 1u);
       }
@@ -1678,4 +1679,51 @@ cp_resolve_visbuf(struct cp_resolve_args args)
    uint32_t bi = (uint32_t)(fminf(fmaxf(b, 0.0f), 1.0f) * 255.0f + 0.5f);
    uint32_t ai = (uint32_t)(fminf(fmaxf(a, 0.0f), 1.0f) * 255.0f + 0.5f);
    color_out[y * args.width + x] = ri | (gi << 8) | (bi << 16) | (ai << 24);
+}
+
+/*
+ * Pass-episode quad bucketing — see struct cp_abuf_seg_args. Which segment a
+ * quad belongs to follows from its global primitive id: the last segment
+ * whose first primitive slot is not past it. Segments are few (<= 64) and
+ * the table is in cache, so the search is a handful of steps.
+ */
+static __device__ __forceinline__ uint32_t
+cp_seg_of_prim(const uint32_t *base, uint32_t nsegs, uint32_t prim)
+{
+   uint32_t lo = 0, hi = nsegs - 1;
+   while (lo < hi) {
+      uint32_t mid = (lo + hi + 1) >> 1;
+      if (base[mid] <= prim)
+         lo = mid;
+      else
+         hi = mid - 1;
+   }
+   return lo;
+}
+
+extern "C" __global__ void
+cp_abuf_seg_count(struct cp_abuf_seg_args args)
+{
+   uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t total = *(const uint32_t *)(uintptr_t)args.num_quads_dev;
+   if (q >= total || q >= args.num_quads)
+      return;
+   uint32_t prim = ((const uint32_t *)(uintptr_t)args.quad_prim)[q];
+   uint32_t seg = cp_seg_of_prim(
+      (const uint32_t *)(uintptr_t)args.seg_prim_base, args.nsegs, prim);
+   ((unsigned char *)(uintptr_t)args.quad_seg)[q] = (unsigned char)seg;
+   atomicAdd((unsigned int *)(uintptr_t)args.seg_counts + seg, 1u);
+}
+
+extern "C" __global__ void
+cp_abuf_seg_scatter(struct cp_abuf_seg_args args)
+{
+   uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+   if (q >= args.num_quads)
+      return;
+   uint32_t seg = ((const unsigned char *)(uintptr_t)args.quad_seg)[q];
+   uint32_t pos = atomicAdd((unsigned int *)(uintptr_t)args.seg_cursor + seg, 1u);
+   uint32_t at = ((const uint32_t *)(uintptr_t)args.seg_base)[seg] + pos;
+   ((uint32_t *)(uintptr_t)args.grouped)[at] = q;
+   ((uint32_t *)(uintptr_t)args.quad_dense)[q] = pos;
 }

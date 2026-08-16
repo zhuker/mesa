@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-44 switches.
+45 switches.
 
 ## Tracing
 
@@ -44,6 +44,7 @@ deliberately: someone's script sets one of these to 0 today.
 |---|---|---|---|---|
 | `CUDAPIPE_NO_ABUFFER` | bool (presence) | `off` | — | disable the A-buffer; blended draws go back to the direct path |
 | `CUDAPIPE_NO_ABUF_BATCH` | bool (presence) | `off` | — | disable batching of A-buffer draws |
+| `CUDAPIPE_NO_PASS_EPISODE` | bool (value) | `off` | — | disable pass episodes: consecutive blended batches stop sharing one A-buffer build and drain |
 | `CUDAPIPE_NO_BATCH` | bool (presence) | `off` | — | disable draw batching entirely |
 | `CUDAPIPE_NO_BINCACHE` | bool (presence) | `off` | — | disable the compiled-kernel binary cache |
 

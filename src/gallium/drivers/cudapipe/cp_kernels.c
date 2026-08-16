@@ -224,6 +224,8 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
    cuModuleGetFunction(&k->abuf_clear_slots, k->module, "cp_abuf_clear_slots");
    cuModuleGetFunction(&k->abuf_clamp_runs, k->module, "cp_abuf_clamp_runs");
    cuModuleGetFunction(&k->abuf_quad_fill, k->module, "cp_abuf_quad_fill");
+   cuModuleGetFunction(&k->abuf_seg_count, k->module, "cp_abuf_seg_count");
+   cuModuleGetFunction(&k->abuf_seg_scatter, k->module, "cp_abuf_seg_scatter");
    /* Only present when the instrumentation was compiled in, so only looked
     * up then; the draw path checks the pointers before launching. */
    if (cp_kernels_instrumented()) {

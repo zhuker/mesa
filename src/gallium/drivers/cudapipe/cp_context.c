@@ -51,6 +51,20 @@ static_assert(offsetof(struct lp_sampler_descriptor, sampler_index) ==
 static void cp_scratch_destroy(struct cp_context *cp);
 static void cp_abuf_report(void);
 static void cp_scratch_reset(struct cp_context *cp);
+static void cp_pass_record_segment(struct cp_context *cp,
+                                   const struct cp_rasterize_args *aa,
+                                   const struct cp_rast_queues *queues,
+                                   unsigned rast_num_triangles,
+                                   unsigned num_triangles,
+                                   const struct pipe_draw_info *info,
+                                   unsigned drawid_offset, unsigned ndraws,
+                                   const struct pipe_draw_start_count_bias *draws,
+                                   const uint64_t *vs_ubo_table,
+                                   const uint64_t *fs_ubo_table,
+                                   const uint32_t *draw_ids,
+                                   const uint64_t *vb_table,
+                                   const struct pipe_scissor_state *scissors);
+void cp_pass_finish(struct cp_context *cp);
 
 static void
 cp_destroy_context(struct pipe_context *ctx)
@@ -79,6 +93,7 @@ cp_destroy_context(struct pipe_context *ctx)
    if (cp->sampler_table)
       cuMemFree(cp->sampler_table);
    cp_scratch_destroy(cp);
+   free(cp->pass_segs);
    if (ctx->stream_uploader)
       u_upload_destroy(ctx->stream_uploader);
    FREE(cp);
@@ -1969,6 +1984,10 @@ struct cp_abuf {
    /* The sort's worklist, and the two failure counters the kernels bump. */
    CUdeviceptr list, list_count, overflow, long_runs;
 
+   /* Pass-episode segment quad counts, carved out of `counters` behind the
+    * six words so the episode's one drain reads everything in one copy. */
+   CUdeviceptr seg_counts;
+
    /* The composite's own worklist: every pixel with at least one fragment,
     * where the sort's holds only those with more than one. Separate arrays
     * rather than one with the looser threshold, so the sort keeps costing what
@@ -2206,8 +2225,9 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
        * CP_ABUF_COUNTERS covers all six; the existing derived pointers stay
        * offsets into it exactly as they were.
        */
-      if (!cp_abuf_alloc(ab, &ab->counters, 4 * CP_ABUF_COUNTERS,
-                         "sum3+bsum3+clist_count") ||
+      if (!cp_abuf_alloc(ab, &ab->counters,
+                         4 * (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS),
+                         "sum3+bsum3+clist_count+seg counts") ||
           !cp_abuf_alloc(ab, &ab->list_count, 4, "list_count") ||
           !cp_abuf_alloc(ab, &ab->blk_list_count, 4, "block worklist count") ||
           !cp_abuf_alloc(ab, &ab->dbg, CP_ABUF_DBG_COUNTERS * 4,
@@ -2221,6 +2241,7 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
       ab->overflow = ab->sum3 + 4;
       ab->long_runs = ab->sum3 + 8;
       ab->quad_overflow = ab->bsum3 + 4;
+      ab->seg_counts = ab->counters + 4 * CP_ABUF_COUNTERS;
    }
    if (!ab->events_ready) {
       for (int i = 0; i < (int)ARRAY_SIZE(ab->ev); i++) {
@@ -2921,6 +2942,20 @@ cp_abuf_verify_quads(struct cp_abuf *ab, unsigned w, unsigned h,
  * perspective-correct interpolation that can drift is the failure this driver
  * has already been bitten by.
  */
+/*
+ * A pass episode's per-segment shading: which slice of the grouped quad list
+ * this segment shades, and — filled in on success — the dense arrays its
+ * shader produced, for the episode's one composite to resolve through.
+ */
+struct cp_abuf_seg_shade {
+   CUdeviceptr quad_list;      /* the episode's grouped quad indices */
+   uint32_t quad_list_base;    /* this segment's first entry */
+   uint32_t prim_base;         /* subtracted from global primitive ids */
+   /* out */
+   CUdeviceptr fs_out, coverage, discard;
+   uint32_t fs_out_stride, num_slots;
+};
+
 static bool
 cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
               struct cp_abuf *ab, CUdeviceptr positions,
@@ -2929,7 +2964,8 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
               float vp_trans_x, float vp_trans_y,
               uint32_t num_quads, uint32_t num_covered, bool record_colors,
               void *color_data, bool composite, float *t_interp,
-              float *t_shade, float *t_composite)
+              float *t_shade, float *t_composite,
+              struct cp_abuf_seg_shade *seg)
 {
    struct cp_screen *screen = cp->screen;
    struct cp_shader_binary *fs = cp->fs_shader;
@@ -3019,6 +3055,11 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
       .dbg_slot = dbg_slot,
       .abuf_num_quads = num_quads,
    };
+   if (seg) {
+      interp.quad_list = seg->quad_list;
+      interp.quad_list_base = seg->quad_list_base;
+      interp.abuf_prim_base = seg->prim_base;
+   }
    cp_fs_interp_setup(cp, info, fs, num_fs_inputs, num_vs_outputs, &interp);
 
    /* Which merged draw's fragment bindings each shaded slot is to use. Only a
@@ -3059,6 +3100,17 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
                             cp_abuf.timing ? ab->ev[13] : 0, batch_rows))
       return false;
    cp_abuf_mark(ab->ev[14], cp->stream);
+
+   /* A segment's colours are composited once for the whole episode, through
+    * the per-quad segment map — hand the arrays back instead. */
+   if (seg) {
+      seg->fs_out = fs_out;
+      seg->coverage = coverage;
+      seg->discard = discard_mask;
+      seg->fs_out_stride = fs_out_stride;
+      seg->num_slots = num_slots;
+      return true;
+   }
 
    if (record_colors && screen->kernels.abuf_scatter_colors) {
       void *p[] = { &fs_out, &fs_out_stride, &dbg_slot, &counter, &num_slots,
@@ -3459,8 +3511,12 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     * attributed to nothing. */
    cp_stage_end(cp, -1);
 
-   /* Reclaim last draw's scratch and size the arena for this one. */
-   cp_scratch_begin(cp);
+   /* Reclaim last draw's scratch and size the arena for this one. A pass
+    * episode owns the epoch instead: every segment's clipped stream has to
+    * survive until the episode's shading has read it, so only the first
+    * segment reclaims and the rest allocate beyond. */
+   if (!cp->pass.appending || cp->pass.nsegs == 0)
+      cp_scratch_begin(cp);
 
    /* A shader with no declared inputs needs no vertex buffer: it builds its
     * positions from gl_VertexIndex, which is how a fullscreen pass is drawn.
@@ -3505,8 +3561,10 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     * and spent 62% of it with the GPU idle, because passing
     * CP_SCRATCH_RECLAIM_BYTES makes cp_scratch_alloc() drain the device and
     * free the overflow arenas — and it was passing it several times a frame.
-    */
-   cp->dscratch.used = 0;
+    *
+    * Same episode exception as the managed arena above. */
+   if (!cp->pass.appending || cp->pass.nsegs == 0)
+      cp->dscratch.used = 0;
 
    /*
     * For TRIANGLE_LIST with a VS, the vertex fetch kernel indexes the IB
@@ -4178,7 +4236,11 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
    unsigned passes = retry ? CP_DISCARD_LAYERS
                    : peel ? peel_passes : 1;
 
-   if (peel) {
+   /* A segment append never runs the peel loop — on episode failure the
+    * segment re-executes classically, which sets this up itself — and the
+    * A-buffer count must see the unfiltered population, so peel_next stays
+    * out of the rasterizer arguments. */
+   if (peel && !cp->pass.appending) {
       cuMemsetD32Async(cp->peel_next, 0, (size_t)w * h, cp->stream);
       rast_args.peel_next = cp->peel_next;
       rast_args.peel_any = cp->peel_any;
@@ -4370,6 +4432,21 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     * asked at three quarters of it. No draw on the traced workloads asks at
     * all after the first.
     */
+   /*
+    * A segment append can only proceed onto the shared-episode path: no
+    * growth pending (handled between episodes), a fragment array to fill, the
+    * clamp kernel, and compositing mode. Anything else backs out — the
+    * caller finishes the episode without this segment and re-executes it
+    * classically. The vertex work above is repeated then; the case is rare.
+    */
+   if (cp->pass.appending &&
+       (!abuf || ab->grow_to || !ab->frags || !cp_abuf.composite ||
+        !screen->kernels.abuf_clamp_runs ||
+        cp->pass.nsegs >= CP_PASS_MAX_SEGS)) {
+      cp->pass.append_failed = true;
+      return;
+   }
+
    if (abuf && ab->grow_to) {
       uint32_t want = ab->grow_to;
       ab->grow_to = 0;
@@ -4388,9 +4465,18 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       aa.abuf_cursor = ab->cursor;
       aa.abuf_overflow = ab->overflow;
 
-      /* --- step 1: count --- */
-      cuMemsetD32Async(ab->counts, 0, n, cp->stream);
-      cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
+      /* --- step 1: count ---
+       *
+       * An episode's per-pixel counts accumulate across its segments, so the
+       * clears run for the first segment only; every segment's fragments then
+       * carry its own primitive-slot base, which is what makes the episode's
+       * one sort come out in submission order. */
+      if (!cp->pass.appending || cp->pass.nsegs == 0) {
+         cuMemsetD32Async(ab->counts, 0, n, cp->stream);
+         cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
+      }
+      if (cp->pass.appending)
+         aa.abuf_prim_base = cp->pass.next_prim;
       cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
       aa.abuf_mode = CP_ABUF_COUNT;
       rast_queues.mode = CP_QUEUE_FILL;
@@ -4408,6 +4494,16 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       CP_LAUNCH(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
                      0, cp->stream, ap, NULL);
       cp_abuf_mark(ab->ev[1], cp->stream);
+
+      /* The segment is counted; everything from the scan on happens once,
+       * at cp_pass_finish(). */
+      if (cp->pass.appending) {
+         cp_pass_record_segment(cp, &aa, &rast_queues, rast_num_triangles,
+                                num_triangles, info, drawid_offset,
+                                batch_draws, draws, vs_ubo_table,
+                                fs_ubo_table, draw_ids, vb_table, scissors);
+         return;
+      }
 
       /* --- step 2: prefix sum --- */
       cp_abuf_scan(cp, screen, ab, (unsigned)n);
@@ -4917,7 +5013,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                                 abuf_covered,
                                 ab->colors_ready && cp_abuf_dbg.colors,
                                 color_data, abuf_prod,
-                                &t_qinterp, &t_qshade, &t_composite);
+                                &t_qinterp, &t_qshade, &t_composite, NULL);
          /*
           * A composite that could not be launched has drawn nothing, and the
           * peel loop has already been skipped. Nothing can recover the draw at
@@ -5425,14 +5521,509 @@ cp_batch_record(struct cp_context *cp,
    cp->batch.ndraws++;
 }
 
+/*
+ * ---- Pass episodes ----
+ *
+ * Consecutive blended batches share one A-buffer build, one drain and one
+ * composite. Each flushed blended batch becomes a segment: its vertex stage
+ * and count rasterization ran at append time (inside cp_draw_execute, which
+ * returned after the count when cp->pass.appending was set), its fragments
+ * carrying an episode-global primitive base so the one sort's ascending
+ * order is submission order across segments. cp_pass_finish() then runs the
+ * scan, the per-segment fills, the sort, the quad merge, buckets the quads
+ * by segment, drains once, shades each segment densely over its own quads,
+ * and composites the lot through the per-quad segment map.
+ *
+ * An episode never spans a change to anything the composite or the
+ * rasterizer read episode-wide — framebuffer, viewport, blend, depth,
+ * rasterizer state — because every setter of those flushes through
+ * cp_batch_flush_why(), which finishes the episode. Only the four
+ * per-segment changes defer: a draw whose key broke the batch, and the
+ * vertex-shader, fragment-shader and vertex-elements binds.
+ */
+
+static bool
+cp_pass_appendable(struct cp_context *cp)
+{
+   struct cp_screen *screen = cp->screen;
+   struct cp_abuf *ab = &cp_abuf;
+
+   if (cp_debug->no_pass_episode || cp_debug->no_abuf_batch)
+      return false;
+   /* The verification, timing and census modes read per-draw state the
+    * episode deliberately does not keep. */
+   if (!cp_abuf_enabled() || ab->disabled || cp_abuf.verify ||
+       !cp_abuf.composite || cp_abuf.timing || cp_census_enabled())
+      return false;
+   if (!screen->kernels.abuf_seg_count || !screen->kernels.abuf_seg_scatter ||
+       !screen->kernels.abuf_clamp_runs || !screen->kernels.abuf_composite ||
+       !screen->kernels.abuf_interpolate || !screen->kernels.abuf_quad_fill)
+      return false;
+   /* The first eligible draw sizes the fragment array with a drain of its
+    * own; episodes start once it exists. A pending growth is likewise served
+    * between episodes. */
+   if (!ab->frags || ab->grow_to || !ab->shade_slot || !ab->clist)
+      return false;
+   if (cp->pass.nsegs >= CP_PASS_MAX_SEGS ||
+       cp->pass.next_prim > (1u << 30))
+      return false;
+   if (!cp->pass_segs) {
+      cp->pass_segs = calloc(CP_PASS_MAX_SEGS, sizeof(*cp->pass_segs));
+      if (!cp->pass_segs)
+         return false;
+   }
+   return true;
+}
+
+/* Everything cp_draw_execute reads from live context state that varies per
+ * segment, saved and restored around the fallback and the shading loop. */
+struct cp_pass_live {
+   struct cp_shader_binary *vs, *fs;
+   struct pipe_vertex_element vertex_elements[16];
+   unsigned num_vertex_elements, vertex_stride;
+   unsigned num_vs_ubos, num_fs_ubos;
+   struct cp_fs_batch fs_batch;
+};
+
+static void
+cp_pass_live_save(struct cp_context *cp, struct cp_pass_live *lv)
+{
+   lv->vs = cp->vs_shader;
+   lv->fs = cp->fs_shader;
+   memcpy(lv->vertex_elements, cp->vertex_elements,
+          sizeof(lv->vertex_elements));
+   lv->num_vertex_elements = cp->num_vertex_elements;
+   lv->vertex_stride = cp->vertex_stride;
+   lv->num_vs_ubos = cp->num_vs_ubos;
+   lv->num_fs_ubos = cp->num_fs_ubos;
+   lv->fs_batch = cp->fs_batch;
+}
+
+static void
+cp_pass_live_restore(struct cp_context *cp, const struct cp_pass_live *lv)
+{
+   cp->vs_shader = lv->vs;
+   cp->fs_shader = lv->fs;
+   memcpy(cp->vertex_elements, lv->vertex_elements,
+          sizeof(lv->vertex_elements));
+   cp->num_vertex_elements = lv->num_vertex_elements;
+   cp->vertex_stride = lv->vertex_stride;
+   cp->num_vs_ubos = lv->num_vs_ubos;
+   cp->num_fs_ubos = lv->num_fs_ubos;
+   cp->fs_batch = lv->fs_batch;
+}
+
+static void
+cp_pass_seg_restore(struct cp_context *cp, const struct cp_pass_seg *sg)
+{
+   cp->vs_shader = sg->vs;
+   cp->fs_shader = sg->fs;
+   memcpy(cp->vertex_elements, sg->vertex_elements,
+          sizeof(sg->vertex_elements));
+   cp->num_vertex_elements = sg->num_vertex_elements;
+   cp->vertex_stride = sg->vertex_stride;
+   cp->num_vs_ubos = sg->num_vs_ubos;
+   cp->num_fs_ubos = sg->num_fs_ubos;
+}
+
+/* The episode could not deliver; render every segment the classic way, in
+ * submission order, from its snapshot. Rasterization is idempotent — the
+ * abandoned lists were never read by anything that draws. */
+static void
+cp_pass_fallback(struct cp_context *cp, struct cp_pass_seg *segs,
+                 unsigned nsegs)
+{
+   struct cp_pass_live lv;
+   cp_pass_live_save(cp, &lv);
+   for (unsigned s = 0; s < nsegs; s++) {
+      struct cp_pass_seg *sg = &segs[s];
+      cp_pass_seg_restore(cp, sg);
+      cp_draw_execute(cp, &sg->info, sg->drawid_offset, sg->draws, 1,
+                      sg->ndraws, sg->vs_ubos, sg->fs_ubos, sg->draw_ids,
+                      sg->vb_bases, sg->scissors);
+   }
+   cp_pass_live_restore(cp, &lv);
+}
+
+void
+cp_pass_finish(struct cp_context *cp)
+{
+   struct cp_screen *screen = cp->screen;
+   struct cp_abuf *ab = &cp_abuf;
+   unsigned nsegs = cp->pass.nsegs;
+
+   if (!nsegs)
+      return;
+
+   /* Cleared first: nothing below may see the episode as still open. */
+   cp->pass.nsegs = 0;
+   cp->pass.next_prim = 0;
+
+   struct cp_pass_seg *segs = cp->pass_segs;
+   unsigned w = cp->pass.w, h = cp->pass.h;
+   size_t n = (size_t)w * h;
+   bool failed = false;
+
+   cuCtxSetCurrent(screen->cuda_ctx);
+   CP_NVTX_SCOPEF("episode %u segs", nsegs);
+
+   /* --- scan the accumulated counts, clamp the runs to the array --- */
+   cp_abuf_scan(cp, screen, ab, (unsigned)n);
+   {
+      unsigned nn = (unsigned)n;
+      void *p[] = { &ab->counts, &ab->offsets, &ab->sum3, &nn,
+                    &ab->capacity, &ab->overflow };
+      CP_LAUNCH(screen->kernels.abuf_clamp_runs, 1024, 1, 1, 256, 1, 1,
+                     0, cp->stream, p, NULL);
+   }
+
+   /* --- fill: one relaunch per segment from its saved arguments --- */
+   cuMemsetD32Async(ab->cursor, 0, n, cp->stream);
+   for (unsigned s = 0; s < nsegs; s++) {
+      struct cp_pass_seg *sg = &segs[s];
+      struct cp_rasterize_args aa = sg->rast;
+      aa.abuf_frags = ab->frags;
+      aa.abuf_capacity = ab->capacity;
+      aa.abuf_mode = CP_ABUF_FILL;
+      struct cp_rast_queues q = sg->queues;
+      q.mode = CP_QUEUE_FILL;
+      cuMemsetD32Async(cp->rast_counts, 0, 2, cp->stream);
+      void *ap[] = { &aa, &q };
+      CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
+                     (sg->rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
+                     0, cp->stream, ap, NULL);
+      CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
+                     CLAMP((sg->rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
+                     256, 1, 1, 0, cp->stream, ap, NULL);
+      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf, 2048, 1, 1, 64, 1, 1,
+                     0, cp->stream, ap, NULL);
+   }
+
+   /* --- sort, both worklists --- */
+   {
+      unsigned nn = (unsigned)n, min2 = 2;
+      cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
+      void *wp[] = { &ab->counts, &nn, &min2, &ab->list, &ab->list_count };
+      CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
+                     256, 1, 1, 0, cp->stream, wp, NULL);
+      void *sp[] = { &ab->frags, &ab->offsets, &ab->counts, &ab->list,
+                     &ab->list_count, &ab->long_runs };
+      CP_LAUNCH(screen->kernels.abuf_sort, 4096, 1, 1, 256, 1, 1,
+                     0, cp->stream, sp, NULL);
+      unsigned min1 = 1;
+      cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
+      void *cw[] = { &ab->counts, &nn, &min1, &ab->clist, &ab->clist_count };
+      CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
+                     256, 1, 1, 0, cp->stream, cw, NULL);
+   }
+
+   /* --- the quad stream --- */
+   unsigned nblocks = ab->nblocks, qw = ab->quad_width;
+   cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
+   {
+      void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_list,
+                    &ab->blk_list_count };
+      CP_LAUNCH(screen->kernels.abuf_block_worklist,
+                     (nblocks + 255) / 256, 1, 1, 256, 1, 1,
+                     0, cp->stream, p, NULL);
+   }
+   cuMemsetD32Async(ab->blk_counts, 0, nblocks, cp->stream);
+   cuMemsetD32Async(ab->bsum3, 0, 2, cp->stream);
+   cuMemsetD32Async(ab->dbg, 0, CP_ABUF_DBG_COUNTERS, cp->stream);
+   {
+      void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
+                    &ab->blk_list, &ab->blk_list_count, &ab->blk_counts };
+      CP_LAUNCH(screen->kernels.abuf_quad_count, 1024, 1, 1, 32, 1, 1,
+                     0, cp->stream, p, NULL);
+   }
+   cp_abuf_scan_n(cp, screen, ab->blk_counts, ab->blk_offsets, ab->bsum1,
+                  ab->bsum1x, ab->bsum2, ab->bsum2x, ab->bsum3, nblocks,
+                  ab->bnb1, ab->bnb2, ab->bnb3);
+   {
+      void *p[] = { &ab->shade_slot, &ab->sum3, &ab->capacity };
+      CP_LAUNCH(screen->kernels.abuf_clear_slots, 1024, 1, 1,
+                     256, 1, 1, 0, cp->stream, p, NULL);
+   }
+   {
+      void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
+                    &ab->blk_list, &ab->blk_list_count, &ab->blk_offsets,
+                    &ab->quad_prim, &ab->quad_mask, &ab->peel_mask,
+                    &ab->quad_block, &ab->shade_slot, &ab->quad_capacity,
+                    &ab->quad_overflow };
+      CP_LAUNCH(screen->kernels.abuf_quad_fill, 1024, 1, 1, 32, 1, 1,
+                     0, cp->stream, p, NULL);
+   }
+
+   /* --- bucket the quads by segment, before the drain so the counts ride
+    * it --- */
+   CUdeviceptr quad_seg = cp_scratch_alloc_device(cp, ab->quad_capacity);
+   uint32_t seg_prims[CP_PASS_MAX_SEGS];
+   for (unsigned s = 0; s < nsegs; s++)
+      seg_prims[s] = segs[s].prim_base;
+   CUdeviceptr seg_prims_dev = cp_upload(cp, seg_prims, (size_t)nsegs * 4);
+   if (!quad_seg || !seg_prims_dev) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+   cuMemsetD32Async(ab->seg_counts, 0, CP_PASS_MAX_SEGS, cp->stream);
+   struct cp_abuf_seg_args sa = {
+      .quad_prim = ab->quad_prim,
+      .seg_prim_base = seg_prims_dev,
+      .seg_counts = ab->seg_counts,
+      .quad_seg = quad_seg,
+      .num_quads_dev = ab->bsum3,
+      .nsegs = nsegs,
+      .num_quads = (uint32_t)ab->quad_capacity,
+   };
+   {
+      void *p[] = { &sa };
+      CP_LAUNCH(screen->kernels.abuf_seg_count,
+                     ((unsigned)ab->quad_capacity + 255) / 256, 1, 1,
+                     256, 1, 1, 0, cp->stream, p, NULL);
+   }
+
+   /* --- the drain: the six counters and the per-segment quad counts --- */
+   uint32_t ctr[CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS] = { 0 };
+   cuStreamSynchronize(cp->stream);
+   cuMemcpyDtoH(ctr, ab->counters,
+                sizeof(uint32_t) * (CP_ABUF_COUNTERS + nsegs));
+
+   uint32_t total = ctr[0], fill_over = ctr[1];
+   uint32_t quads = ctr[3], quad_over = ctr[4], covered = ctr[5];
+
+   if (total > ab->peak)
+      ab->peak = total;
+   if (ab->frags && !ab->grow_capped && ab->growths < CP_ABUF_MAX_GROWTHS &&
+       (double)total > (double)ab->capacity * CP_ABUF_GROW_AT)
+      ab->grow_to = MAX2(ab->grow_to, total);
+
+   if (fill_over || quad_over) {
+      static int said = 0;
+      if (!said++)
+         fprintf(stderr, "abuffer: episode of %u segments overflowed "
+                 "(fragments=%u quads=%u); re-rendering it segment by "
+                 "segment\n", nsegs, fill_over, quad_over);
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+   if (!quads)
+      return;   /* nothing covered anything; there is nothing to composite */
+
+   /* --- dense bases, scatter --- */
+   uint32_t seg_base_host[CP_PASS_MAX_SEGS];
+   uint32_t running = 0;
+   for (unsigned s = 0; s < nsegs; s++) {
+      seg_base_host[s] = running;
+      running += ctr[CP_ABUF_COUNTERS + s];
+   }
+   if (running != quads) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+   CUdeviceptr grouped = cp_scratch_alloc_device(cp, (size_t)quads * 4);
+   CUdeviceptr quad_dense = cp_scratch_alloc_device(cp, (size_t)quads * 4);
+   CUdeviceptr seg_cursor = cp_scratch_alloc_device(cp,
+                                                    (size_t)nsegs * 4);
+   CUdeviceptr seg_base_dev = cp_upload(cp, seg_base_host,
+                                        (size_t)nsegs * 4);
+   if (!grouped || !quad_dense || !seg_cursor || !seg_base_dev) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+   cuMemsetD32Async(seg_cursor, 0, nsegs, cp->stream);
+   sa.num_quads = quads;
+   sa.seg_cursor = seg_cursor;
+   sa.seg_base = seg_base_dev;
+   sa.grouped = grouped;
+   sa.quad_dense = quad_dense;
+   {
+      void *p[] = { &sa };
+      CP_LAUNCH(screen->kernels.abuf_seg_scatter, (quads + 255) / 256, 1, 1,
+                     256, 1, 1, 0, cp->stream, p, NULL);
+   }
+
+   /* --- shade each segment densely over its own quads --- */
+   struct cp_pass_live lv;
+   cp_pass_live_save(cp, &lv);
+   struct cp_seg_desc descs[CP_PASS_MAX_SEGS];
+   memset(descs, 0, sizeof(descs));
+   for (unsigned s = 0; s < nsegs && !failed; s++) {
+      struct cp_pass_seg *sg = &segs[s];
+      uint32_t sq = ctr[CP_ABUF_COUNTERS + s];
+      if (!sq)
+         continue;
+      cp->vs_shader = sg->vs;
+      cp->fs_shader = sg->fs;
+      cp->num_fs_ubos = sg->num_fs_ubos;
+      cp->fs_batch.ubos = sg->fs_ubos;
+      cp->fs_batch.ndraws = sg->ndraws;
+      cp->fs_batch.slices = sg->slices_dev;
+      cp->fs_batch.prim_shift = sg->prim_shift;
+      struct cp_abuf_seg_shade ss = {
+         .quad_list = grouped,
+         .quad_list_base = seg_base_host[s],
+         .prim_base = sg->prim_base,
+      };
+      float ti, ts, tc;
+      if (!cp_abuf_shade(cp, &sg->info, ab, sg->rast.positions,
+                         sg->rast.positions, w, h,
+                         sg->rast.vp_scale_x, sg->rast.vp_scale_y,
+                         sg->rast.vp_trans_x, sg->rast.vp_trans_y,
+                         sq, 0, false, NULL, false, &ti, &ts, &tc, &ss)) {
+         failed = true;
+         break;
+      }
+      descs[s].fs_out = ss.fs_out;
+      descs[s].coverage = ss.coverage;
+      descs[s].discard = ss.discard;
+      descs[s].fs_out_stride = ss.fs_out_stride;
+      descs[s].num_slots = ss.num_slots;
+   }
+   cp_pass_live_restore(cp, &lv);
+   if (failed) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+
+   /* --- one composite for the whole episode --- */
+   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+   void *color_data = (fb->nr_cbufs && fb->cbufs[0].texture)
+      ? cp_resource_data(cp_resource(fb->cbufs[0].texture)) : NULL;
+   CUdeviceptr descs_dev = cp_upload(cp, descs,
+                                     (size_t)nsegs * sizeof(descs[0]));
+   if (!color_data || !descs_dev) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+   struct cp_abuf_composite_args ca = {
+      .offsets = ab->offsets,
+      .counts = ab->counts,
+      .shade_slot = ab->shade_slot,
+      .color_out = (uint64_t)(uintptr_t)color_data,
+      .list = ab->clist,
+      .list_count = ab->clist_count,
+      .capacity = ab->capacity,
+      .color_encoding = (uint32_t)MAX2(
+         cp_color_encoding_from_format(fb->cbufs[0].format), 0),
+      .max_layers = cp_abuf.max_layers,
+      .blend = cp_blend_desc_for(cp),
+      .quad_seg = quad_seg,
+      .quad_dense = quad_dense,
+      .seg_desc = descs_dev,
+   };
+   void *p[] = { &ca };
+   unsigned nwork = covered ? covered : (unsigned)n;
+   cp_nvtx_push("composite");
+   CUresult ce = cuLaunchKernel(screen->kernels.abuf_composite,
+                                (nwork + 255) / 256, 1, 1, 256, 1, 1,
+                                0, cp->stream, p, NULL);
+   cp_nvtx_pop();
+   if (ce != CUDA_SUCCESS) {
+      fprintf(stderr, "abuffer: episode composite launch failed (%d); "
+              "re-rendering segment by segment\n", ce);
+      cp_pass_fallback(cp, segs, nsegs);
+   }
+}
+
+/* Record the segment cp_draw_execute has just counted; called from inside
+ * it, with the count launches already on the stream. */
+static void
+cp_pass_record_segment(struct cp_context *cp,
+                       const struct cp_rasterize_args *aa,
+                       const struct cp_rast_queues *queues,
+                       unsigned rast_num_triangles, unsigned num_triangles,
+                       const struct pipe_draw_info *info,
+                       unsigned drawid_offset, unsigned ndraws,
+                       const struct pipe_draw_start_count_bias *draws,
+                       const uint64_t *vs_ubo_table,
+                       const uint64_t *fs_ubo_table,
+                       const uint32_t *draw_ids, const uint64_t *vb_table,
+                       const struct pipe_scissor_state *scissors)
+{
+   struct cp_pass_seg *sg = &cp->pass_segs[cp->pass.nsegs];
+
+   memset(sg, 0, sizeof(*sg));
+   sg->rast = *aa;
+   sg->queues = *queues;
+   sg->rast_num_triangles = rast_num_triangles;
+   sg->num_triangles = num_triangles;
+   sg->prim_base = cp->pass.next_prim;
+   sg->prim_slots = rast_num_triangles;
+   sg->prim_shift = cp->fs_batch.prim_shift;
+   sg->vs = cp->vs_shader;
+   sg->fs = cp->fs_shader;
+   sg->info = *info;
+   sg->ndraws = ndraws;
+   sg->drawid_offset = drawid_offset;
+   sg->slices_dev = cp->fs_batch.slices;
+   memcpy(sg->draws, draws, (size_t)ndraws * sizeof(draws[0]));
+   if (draw_ids)
+      memcpy(sg->draw_ids, draw_ids, (size_t)ndraws * sizeof(draw_ids[0]));
+   if (scissors)
+      memcpy(sg->scissors, scissors, (size_t)ndraws * sizeof(scissors[0]));
+   if (vs_ubo_table)
+      memcpy(sg->vs_ubos, vs_ubo_table,
+             (size_t)ndraws * CP_ARG_UBO_STRIDE * sizeof(uint64_t));
+   if (fs_ubo_table)
+      memcpy(sg->fs_ubos, fs_ubo_table,
+             (size_t)ndraws * CP_ARG_UBO_STRIDE * sizeof(uint64_t));
+   if (vb_table)
+      memcpy(sg->vb_bases, vb_table,
+             (size_t)ndraws * CP_VB_TABLE_STRIDE * sizeof(uint64_t));
+   memcpy(sg->vertex_elements, cp->vertex_elements,
+          sizeof(sg->vertex_elements));
+   sg->num_vertex_elements = cp->num_vertex_elements;
+   sg->vertex_stride = cp->vertex_stride;
+   sg->num_vs_ubos = cp->num_vs_ubos;
+   sg->num_fs_ubos = cp->num_fs_ubos;
+
+   if (cp->pass.nsegs == 0) {
+      cp->pass.w = aa->width;
+      cp->pass.h = aa->height;
+   }
+   cp->pass.nsegs++;
+   cp->pass.next_prim += rast_num_triangles;
+}
+
+/* Append the pending batch to the episode as a segment; on a refusal deep
+ * enough that only cp_draw_execute could see it, finish the episode and
+ * render the batch the classic way — its draws came after every segment's. */
+static void
+cp_pass_append(struct cp_context *cp, unsigned ndraws)
+{
+   cp->pass.appending = true;
+   cp->pass.append_failed = false;
+   cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
+                   cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
+                   cp->batch.fs_ubos, cp->batch.draw_ids, cp->batch.vb_bases,
+                   cp->batch.scissors);
+   cp->pass.appending = false;
+   if (cp->pass.append_failed) {
+      cp_pass_finish(cp);
+      cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
+                      cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
+                      cp->batch.fs_ubos, cp->batch.draw_ids,
+                      cp->batch.vb_bases, cp->batch.scissors);
+   }
+}
+
 void
 cp_batch_flush(struct cp_context *cp)
 {
    cp_batch_flush_why(cp, "a readback, a clear or a flush");
 }
 
+/*
+ * The deferrable flush: the pending batch either joins the pass episode as a
+ * segment or executes, but a pending *episode* stays open. Only the four
+ * per-segment state changes may call this — a draw whose key broke the
+ * batch, and the vertex-shader, fragment-shader and vertex-elements binds.
+ * Everything else goes through cp_batch_flush_why(), which also finishes the
+ * episode, because everything else either observes rendering or changes
+ * state the episode reads episode-wide.
+ */
 void
-cp_batch_flush_why(struct cp_context *cp, const char *why)
+cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
 {
    if (!cp->batch.pending)
       return;
@@ -5460,11 +6051,24 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
       }
    }
 
-   (void)blended;
+   if (blended && cp_pass_appendable(cp)) {
+      cp_pass_append(cp, ndraws);
+      return;
+   }
+
+   /* Whatever the episode holds was submitted before these draws. */
+   cp_pass_finish(cp);
    cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
                    cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
                    cp->batch.fs_ubos, cp->batch.draw_ids, cp->batch.vb_bases,
                    cp->batch.scissors);
+}
+
+void
+cp_batch_flush_why(struct cp_context *cp, const char *why)
+{
+   cp_batch_flush_defer_why(cp, why);
+   cp_pass_finish(cp);
 }
 
 static void
@@ -5562,7 +6166,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             cp_batch_record(cp, &draws[0], tris, drawid_offset);
             return;
          }
-         cp_batch_flush_why(cp, why);
+         cp_batch_flush_defer_why(cp, why);
       }
 
       /* Whatever was pending has gone; this draw opens the next batch. */
@@ -5902,7 +6506,7 @@ cp_bind_vertex_elements_state(struct pipe_context *ctx, void *state)
           ve->stride != cp->vertex_stride ||
           memcmp(cp->vertex_elements, ve->elements,
                  ve->num_elements * sizeof(struct pipe_vertex_element)))
-         cp_batch_flush_why(cp, "vertex elements");
+         cp_batch_flush_defer_why(cp, "vertex elements");
       memcpy(cp->vertex_elements, ve->elements, ve->num_elements * sizeof(struct pipe_vertex_element));
       cp->num_vertex_elements = ve->num_elements;
       cp->vertex_stride = ve->stride;
@@ -5925,6 +6529,8 @@ cp_bind_vertex_elements_state(struct pipe_context *ctx, void *state)
 static void
 cp_delete_vertex_elements_state(struct pipe_context *ctx, void *state)
 {
+   /* A pass-episode segment may still name this state; render it first. */
+   cp_batch_flush((struct cp_context *)ctx);
    FREE(state);  /* frees cp_vertex_elements_state */
 }
 
@@ -5962,13 +6568,15 @@ cp_bind_fs_state(struct pipe_context *ctx, void *state)
 {
    struct cp_context *cp = (struct cp_context *)ctx;
    if (cp->fs_shader != (struct cp_shader_binary *)state)
-      cp_batch_flush_why(cp, "fragment shader");
+      cp_batch_flush_defer_why(cp, "fragment shader");
    cp->fs_shader = (struct cp_shader_binary *)state;
 }
 
 static void
 cp_delete_fs_state(struct pipe_context *ctx, void *state)
 {
+   /* A pass-episode segment may still name this shader; render it first. */
+   cp_batch_flush((struct cp_context *)ctx);
    cp_shader_binary_destroy((struct cp_shader_binary *)state);
 }
 
@@ -6014,7 +6622,7 @@ cp_bind_vs_state(struct pipe_context *ctx, void *state)
       if (cp_debug->debug_batchdiff)
          fprintf(stderr, "cudapipe: batchdiff vs bind %p -> %p\n",
                  (void *)cp->vs_shader, state);
-      cp_batch_flush_why(cp, "vertex shader");
+      cp_batch_flush_defer_why(cp, "vertex shader");
    }
    cp->vs_shader = (struct cp_shader_binary *)state;
 }
@@ -6029,6 +6637,8 @@ cp_bind_tes_state(struct pipe_context *ctx, void *state) {}
 static void
 cp_delete_vs_state(struct pipe_context *ctx, void *state)
 {
+   /* A pass-episode segment may still name this shader; render it first. */
+   cp_batch_flush((struct cp_context *)ctx);
    FREE(state);
 }
 

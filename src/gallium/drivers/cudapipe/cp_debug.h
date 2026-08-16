@@ -108,6 +108,7 @@ struct cp_debug {
    /* Subsystem switches. */
    bool no_abuffer;
    bool no_abuf_batch;
+   bool no_pass_episode;
    bool no_batch;
    bool no_bincache;
    bool no_regcap;

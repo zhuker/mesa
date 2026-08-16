@@ -142,13 +142,63 @@ struct cp_context {
    } batch;
 
    /*
+    * A pass episode: consecutive blended batches sharing one A-buffer build,
+    * one drain and one composite. Each flushed blended batch becomes a
+    * *segment* — its vertex stage and A-buffer count rasterization run at
+    * append time, into per-pixel lists shared by the whole episode, with its
+    * primitive ids offset so that the sort's ascending order is submission
+    * order across segments. Everything else — scan, fill, sort, quad merge,
+    * the drain, per-segment shading, the composite — happens at
+    * cp_pass_finish(). See cp_batch_flush_why() for what may defer and what
+    * must finish.
+    */
+   struct cp_pass_seg {
+      /* Saved as of the end of the vertex stage; the finish patches the
+       * A-buffer fields and relaunches the fill stages from it. */
+      struct cp_rasterize_args rast;
+      struct cp_rast_queues queues;
+      unsigned rast_num_triangles;
+      unsigned num_triangles;
+      uint32_t prim_base;           /* first episode-global primitive slot */
+      uint32_t prim_slots;          /* slots this segment occupies */
+      unsigned prim_shift;
+      /* Shading state. */
+      struct cp_shader_binary *vs, *fs;
+      struct pipe_draw_info info;
+      unsigned ndraws;
+      unsigned drawid_offset;
+      CUdeviceptr slices_dev;
+      /* The batch snapshot, both for the per-segment shade (fs rows) and for
+       * re-executing the segment classically when the episode falls back. */
+      struct pipe_draw_start_count_bias draws[CP_MAX_BATCH_DRAWS];
+      uint32_t draw_ids[CP_MAX_BATCH_DRAWS];
+      struct pipe_scissor_state scissors[CP_MAX_BATCH_DRAWS];
+      uint64_t vs_ubos[CP_MAX_BATCH_DRAWS * CP_ARG_UBO_STRIDE];
+      uint64_t fs_ubos[CP_MAX_BATCH_DRAWS * CP_ARG_UBO_STRIDE];
+      uint64_t vb_bases[CP_MAX_BATCH_DRAWS * CP_VB_TABLE_STRIDE];
+      /* Live state the fallback restores before re-executing. */
+      struct pipe_vertex_element vertex_elements[16];
+      unsigned num_vertex_elements, vertex_stride;
+      unsigned num_vs_ubos, num_fs_ubos;
+   } *pass_segs;                    /* [CP_PASS_MAX_SEGS], at context create */
+
+   struct {
+      unsigned nsegs;
+      unsigned total_draws;
+      uint32_t next_prim;           /* running global slot base */
+      bool appending;               /* a segment append is inside execute */
+      bool append_failed;           /* the append could not take the path */
+      unsigned w, h;                /* the episode's framebuffer */
+   } pass;
+
+   /*
     * What the fragment shader launches of the draw now running should hand to
     * CP_ARG_SLOT_UBO_TABLE. Set once at the top of cp_draw_execute() so that
     * it cannot carry from one draw to the next, and read by
     * cp_fs_launch_shader() — which both shading paths go through, and which is
     * three call frames below where the batch is known.
     */
-   struct {
+   struct cp_fs_batch {
       const uint64_t *ubos;   /* rows of CP_ARG_UBO_STRIDE, or NULL */
       unsigned ndraws;
       /* Where the interpolator looks a primitive's draw up; the same table
@@ -383,6 +433,11 @@ void cp_batch_flush(struct cp_context *cp);
  * looks batchable is producing batches of one.
  */
 void cp_batch_flush_why(struct cp_context *cp, const char *why);
+/* The deferrable variant: the pending batch may become a pass-episode
+ * segment, and a pending episode stays open. Only for state changes an
+ * episode carries per segment; see the definition. */
+void cp_batch_flush_defer_why(struct cp_context *cp, const char *why);
+void cp_pass_finish(struct cp_context *cp);
 
 /*
  * How the sampler and the fragment writeback decode and encode a format, or

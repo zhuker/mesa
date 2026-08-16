@@ -298,17 +298,27 @@ cp_write_batch_rows(const struct cp_fs_interp_args *args, uint32_t prim,
 extern "C" __global__ void
 cp_abuf_interpolate(struct cp_fs_interp_args args)
 {
-   uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-   if (q >= args.abuf_num_quads)
+   uint32_t iq = blockIdx.x * blockDim.x + threadIdx.x;
+   if (iq >= args.abuf_num_quads)
       return;
 
+   /* Pass-episode mode shades one segment's quads densely: thread i takes
+    * the i-th quad of this segment's slice of the grouped list and shading
+    * slots 4i..4i+3; outside an episode the list is null and q == i. The
+    * quad stream's primitive ids are episode-global, so the segment's base
+    * is subtracted before its own vertex stream and slices are addressed. */
+   uint32_t q = args.quad_list
+      ? ((const uint32_t *)(uintptr_t)args.quad_list)[args.quad_list_base + iq]
+      : iq;
+
    uint32_t b = ((const uint32_t *)(uintptr_t)args.abuf_quad_block)[q];
-   uint32_t prim = ((const uint32_t *)(uintptr_t)args.abuf_quad_prim)[q];
+   uint32_t gprim = ((const uint32_t *)(uintptr_t)args.abuf_quad_prim)[q];
+   uint32_t prim = gprim - args.abuf_prim_base;
    uint32_t mask = ((const unsigned char *)(uintptr_t)args.abuf_quad_mask)[q];
 
    uint32_t qx = (b % args.quad_width) * 2;
    uint32_t qy = (b / args.quad_width) * 2;
-   uint32_t base = q * 4u;
+   uint32_t base = iq * 4u;
 
    cp_write_batch_rows(&args, prim, base);
 
@@ -336,7 +346,7 @@ cp_abuf_interpolate(struct cp_fs_interp_args args)
 #if CP_ABUF_INSTRUMENT
       if (dbg_slot)
          dbg_slot[base + i] = (covered && ok)
-            ? cp_abuf_slot_for(&args, pixel, prim) : 0xFFFFFFFFu;
+            ? cp_abuf_slot_for(&args, pixel, gprim) : 0xFFFFFFFFu;
 #endif
    }
 }
@@ -993,20 +1003,49 @@ cp_abuf_composite(struct cp_abuf_composite_args args)
       uint32_t slot = shade_slot[s];
       /* A slot the merge could not place. It cannot be read, and dropping the
        * rest of the run with it would compose the layers out of order. */
-      if (slot == 0xFFFFFFFFu || slot >= args.num_slots)
+      if (slot == 0xFFFFFFFFu)
          continue;
+
+      /*
+       * Pass-episode resolution: shading ran per segment into dense arrays,
+       * so the global slot — quad * 4 + lane — resolves through the quad's
+       * segment and dense position to that segment's own buffers. Outside an
+       * episode the launch-wide arrays below stand.
+       */
+      const char *fs_out_base = (const char *)(uintptr_t)args.fs_out;
+      uint32_t fs_out_stride = args.fs_out_stride;
+      const unsigned char *cov = coverage;
+      const unsigned char *dis = discard_mask;
+      if (args.seg_desc) {
+         uint32_t qd = slot >> 2u;
+         uint32_t seg = ((const unsigned char *)(uintptr_t)args.quad_seg)[qd];
+         const struct cp_seg_desc *sd =
+            &((const struct cp_seg_desc *)(uintptr_t)args.seg_desc)[seg];
+         uint32_t dense =
+            ((const uint32_t *)(uintptr_t)args.quad_dense)[qd] * 4u +
+            (slot & 3u);
+         if (dense >= sd->num_slots)
+            continue;
+         slot = dense;
+         fs_out_base = (const char *)(uintptr_t)sd->fs_out;
+         fs_out_stride = sd->fs_out_stride;
+         cov = (const unsigned char *)(uintptr_t)sd->coverage;
+         dis = (const unsigned char *)(uintptr_t)sd->discard;
+      } else if (slot >= args.num_slots) {
+         continue;
+      }
+
       /* What cp_fs_writeback drops before blending: a lane the interpolation
        * refused, and a fragment the shader discarded. Neither contributes
        * colour, and on this path neither contributes depth either, since a
        * draw that writes depth is not eligible. */
-      if (coverage && !coverage[slot])
+      if (cov && !cov[slot])
          continue;
-      if (discard_mask && discard_mask[slot])
+      if (dis && dis[slot])
          continue;
 
       const float4 *fs_out =
-         (const float4 *)((const char *)(uintptr_t)args.fs_out +
-                          (size_t)slot * args.fs_out_stride);
+         (const float4 *)(fs_out_base + (size_t)slot * fs_out_stride);
       float src[4] = { fs_out->x, fs_out->y, fs_out->z, fs_out->w };
 
       float out[4];
