@@ -1010,3 +1010,11 @@ removes one `cuMemcpyHtoDAsync` per fragment shader launch and one per compute
 dispatch. The new replay measures 7.44--7.46 ms versus 7.47 ms immediately
 before the change; the effect is small but consistently reduces host/API work
 without adding device work.
+
+The new capture has 13 fragment shaders with two or four statically traceable
+sampler descriptors, versus 29 with zero or one. Specializing the multi-sampler
+subset only when every descriptor resolved to the same state moved the new
+capture from 7.46 ms to 7.43 ms, but regressed the old capture from 24.83 ms to
+25.15 ms. That global-state generalization was reverted. Future multi-sampler
+work needs per-texture-instruction literal entry points; making every call use
+one shared state does not remove enough code to justify the added variants.
