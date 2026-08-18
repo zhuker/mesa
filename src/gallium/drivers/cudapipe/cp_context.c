@@ -361,13 +361,14 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
     * asked for tens of gigabytes and did exactly that. Failing here turns the
     * same mistake into a black frame and a message.
     */
-   if (want > CP_SCRATCH_MAX_BYTES) {
+   if (end > CP_SCRATCH_MAX_BYTES) {
       fprintf(stderr, "cudapipe: scratch arena wants %zu bytes, over the %zu "
               "cap — refusing. A stage is almost certainly allocating per "
               "pass instead of reusing.\n",
-              want, (size_t)CP_SCRATCH_MAX_BYTES);
+              end, (size_t)CP_SCRATCH_MAX_BYTES);
       return NULL;
    }
+   want = MIN2(want, (size_t)CP_SCRATCH_MAX_BYTES);
    CUdeviceptr new_base;
    CUresult err = cuMemAllocManaged(&new_base, want, CU_MEM_ATTACH_GLOBAL);
    if (err != CUDA_SUCCESS) {
@@ -415,11 +416,12 @@ cp_scratch_alloc_device(struct cp_context *cp, size_t bytes)
 
    size_t want = MAX2(end, cp->dscratch.size * 2);
    want = MAX2(want, (size_t)1 << 20);
-   if (want > CP_SCRATCH_MAX_BYTES) {
+   if (end > CP_SCRATCH_MAX_BYTES) {
       fprintf(stderr, "cudapipe: device scratch wants %zu bytes, over the %zu "
-              "cap — refusing.\n", want, (size_t)CP_SCRATCH_MAX_BYTES);
+              "cap — refusing.\n", end, (size_t)CP_SCRATCH_MAX_BYTES);
       return 0;
    }
+   want = MIN2(want, (size_t)CP_SCRATCH_MAX_BYTES);
 
    CUdeviceptr new_base;
    CUresult err = cuMemAlloc(&new_base, want);

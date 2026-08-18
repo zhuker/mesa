@@ -1074,3 +1074,36 @@ the standing NVIDIA differences remain `gltfscenerendering` and `texture3d`.
 Crossroads frames 633, 756, and 907 are byte-for-byte identical to the corrected
 reference. The post-split UVM artifact is
 `~/claude-scratchpad/perf16/uvm-memory-split-1787065175/`.
+
+## Session 14: scratch growth cap correctness
+
+The `sync_series_final` sweep contained a significant correctness regression
+that its performance summary did not call out: `instancing` and
+`multithreading` lost most of their objects. Both logs repeatedly reported a
+device-scratch request above the 8 GiB safety cap. The regression began with
+opaque episodes, which made the persistent arena large enough to expose an old
+allocator bug: growth chose `max(required, current * 2)` and rejected that
+value when it exceeded the cap, even when `required` itself still fit below the
+cap. Thus a valid allocation following a large episode failed solely because
+the geometric growth heuristic overshot.
+
+Both managed and device-only scratch arenas now reject only when the requested
+end offset exceeds the cap, and clamp the geometric growth target to the cap.
+Focused 60-frame renders restore both samples; their worst mean pixel delta
+against `p16_final26` is 0.08 and 0.02 respectively, rather than the roughly
+12--13 mean delta of the broken output.
+
+The complete 18-sample, 60-stored-frame sweep is
+`~/git/Vulkan/build/iter/scratch-cap-correctness`. Every rendered frame is
+within its frame-zero budget against `p16_final26`; there are no new sample
+crashes or timeouts. The NVIDIA comparison still reports the standing
+`gltfscenerendering` and `texture3d` differences, and `renderheadless` remains
+absent from the offscreen comparison. Instancing rises from the broken
+iteration's 3.68 ms to 5.83 ms and multithreading from 5.21 ms to 5.53 ms in
+the short timing pass. The first number is not a performance regression to
+optimize away: the faster run omitted most of the requested geometry.
+
+Correctness sweeps are a release gate, not supporting telemetry. Any newly
+large frame delta, missing geometry, sample crash, or timeout must be reported
+explicitly before a performance result is accepted, even if the aggregate
+timing report does not flag it.
