@@ -1018,3 +1018,22 @@ capture from 7.46 ms to 7.43 ms, but regressed the old capture from 24.83 ms to
 25.15 ms. That global-state generalization was reverted. Future multi-sampler
 work needs per-texture-instruction literal entry points; making every call use
 one shared state does not remove enough code to justify the added variants.
+
+## Session 12: unified-memory profile
+
+Nsight Systems 2026.4.1 traced both CPU and GPU unified-memory page faults over
+a 14.31-second steady-state window of the newer gfxrecon capture. It recorded
+509,695 GPU faults across 673 pages and 71,898 CPU faults across 791 pages.
+GPU fault intervals occupy a 1.552-second union, 10.84% of the window. UVM
+migrated 14.25 GB, of which 1.71 GB was directly attributed to page faults and
+12.53 GB to speculative prefetch around them. CPU faults overwhelmingly came
+from host memcpy (66,192 events), confirming the expected host-write/device-read
+ping-pong rather than cold startup alone.
+
+At the replay's approximately 7.45 ms median this corresponds to an estimated
+265 GPU faults, 37 CPU faults, and 7.42 MB of migration per frame. Nsight
+instrumentation can perturb timing, so the 10.84% union is not itself a promised
+speedup, but the counts and migration volume are large enough to promote split
+host-visible and true device-local Vulkan memory ahead of persistent execution.
+The trace is stored under
+`~/claude-scratchpad/perf16/uvm-profile-1787062168/`.
