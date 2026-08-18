@@ -18,7 +18,9 @@ struct cp_resource {
    struct llvmpipe_resource lpr;    /* compatible with lavapipe's expectations */
    CUdeviceptr device_ptr;
    bool cuda_managed;
+   bool device_local;
    bool owns_data;
+   uint64_t allocation_size;
 };
 
 static inline struct cp_resource *

@@ -172,6 +172,12 @@ cp_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pt)
    FREE(res);
 }
 
+struct cp_transfer {
+   struct pipe_transfer base;
+   void *staging;
+   uint64_t staging_size;
+};
+
 static void *
 cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
               unsigned level, unsigned usage, const struct pipe_box *box,
@@ -179,9 +185,10 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
 {
    struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *res = cp_resource(resource);
-   struct pipe_transfer *transfer = CALLOC_STRUCT(pipe_transfer);
-   if (!transfer)
+   struct cp_transfer *cp_transfer = CALLOC_STRUCT(cp_transfer);
+   if (!cp_transfer)
       return NULL;
+   struct pipe_transfer *transfer = &cp_transfer->base;
 
    /* A map is where the host looks at what the GPU drew, so any draws still
     * being held back for merging have to be submitted before the sync below
@@ -205,8 +212,31 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
    *out_transfer = transfer;
 
    void *data = cp_resource_data(res);
-   if (!data)
+   if (!data) {
+      FREE(cp_transfer);
       return NULL;
+   }
+   if (res->device_local) {
+      cp_transfer->staging_size = res->allocation_size;
+      cp_transfer->staging = malloc(cp_transfer->staging_size);
+      if (!cp_transfer->staging) {
+         FREE(cp_transfer);
+         return NULL;
+      }
+      if (!(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) &&
+          !(usage & PIPE_MAP_DISCARD_RANGE)) {
+         cuCtxSetCurrent(cp->screen->cuda_ctx);
+         CUresult err = cuMemcpyDtoH(cp_transfer->staging, res->device_ptr,
+                                    cp_transfer->staging_size);
+         if (err != CUDA_SUCCESS) {
+            CP_CU_WARN(err, "device-local resource map readback");
+            FREE(cp_transfer->staging);
+            FREE(cp_transfer);
+            return NULL;
+         }
+      }
+      data = cp_transfer->staging;
+   }
    if (cp_debug->debug_draw && (usage & PIPE_MAP_READ) &&
        resource->width0 * resource->height0 >= 921600)
       fprintf(stderr, "cudapipe: map READ %ux%u data=%p managed=%d tex=%d\n",
@@ -226,7 +256,23 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
 static void
 cp_buffer_unmap(struct pipe_context *ctx, struct pipe_transfer *transfer)
 {
-   FREE(transfer);
+   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_transfer *cp_transfer = (struct cp_transfer *)transfer;
+   if (cp_transfer->staging) {
+      struct cp_resource *res = cp_resource(transfer->resource);
+      if (transfer->usage & PIPE_MAP_WRITE) {
+         cuCtxSetCurrent(cp->screen->cuda_ctx);
+         CUresult err = cuMemcpyHtoDAsync(res->device_ptr,
+                                          cp_transfer->staging,
+                                          cp_transfer->staging_size,
+                                          cp->stream);
+         if (err == CUDA_SUCCESS)
+            err = cuStreamSynchronize(cp->stream);
+         CP_CU_WARN(err, "device-local resource map upload");
+      }
+      FREE(cp_transfer->staging);
+   }
+   FREE(cp_transfer);
 }
 
 static void
@@ -314,6 +360,38 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
             memcpy(d + y * dst_stride, s + y * src_stride, row_bytes);
       }
    }
+}
+
+static void *
+cp_stage_device_resource(struct cp_context *cp, struct cp_resource *res)
+{
+   if (!res->device_local)
+      return cp_resource_data(res);
+   void *staging = malloc(res->allocation_size);
+   if (!staging)
+      return NULL;
+   CUresult err = cuMemcpyDtoH(staging, res->device_ptr,
+                               res->allocation_size);
+   if (err != CUDA_SUCCESS) {
+      CP_CU_WARN(err, "device-local CPU fallback readback");
+      free(staging);
+      return NULL;
+   }
+   return staging;
+}
+
+static void
+cp_unstage_device_resource(struct cp_context *cp, struct cp_resource *res,
+                           void *staging, bool written)
+{
+   if (!res->device_local)
+      return;
+   if (written) {
+      CUresult err = cuMemcpyHtoD(res->device_ptr, staging,
+                                  res->allocation_size);
+      CP_CU_WARN(err, "device-local CPU fallback upload");
+   }
+   free(staging);
 }
 
 static void
@@ -449,6 +527,17 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
     * have written src_data. */
    cuCtxSetCurrent(cp->screen->cuda_ctx);
    cuCtxSynchronize();
+   void *src_staging = cp_stage_device_resource(cp, src_res);
+   void *dst_staging = cp_stage_device_resource(cp, dst_res);
+   if (!src_staging || !dst_staging) {
+      if (src_staging)
+         cp_unstage_device_resource(cp, src_res, src_staging, false);
+      if (dst_staging)
+         cp_unstage_device_resource(cp, dst_res, dst_staging, false);
+      return;
+   }
+   src_data = src_staging;
+   dst_data = dst_staging;
 
    /* Same size but a different format: a straight format conversion. This is
     * the path a readback takes, where an application blits its B8G8R8A8
@@ -468,6 +557,8 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
                                info->src.box.x, info->src.box.y,
                                src_w, src_h);
       }
+      cp_unstage_device_resource(cp, dst_res, dst_staging, true);
+      cp_unstage_device_resource(cp, src_res, src_staging, false);
       return;
    }
 
@@ -491,6 +582,8 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
       free(row);
       free(taps);
       free(out_rgba);
+      cp_unstage_device_resource(cp, dst_res, dst_staging, false);
+      cp_unstage_device_resource(cp, src_res, src_staging, false);
       return;
    }
 
@@ -572,6 +665,8 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    free(row);
    free(taps);
    free(out_rgba);
+   cp_unstage_device_resource(cp, dst_res, dst_staging, true);
+   cp_unstage_device_resource(cp, src_res, src_staging, false);
 }
 
 static void
@@ -1140,6 +1235,25 @@ static struct {
    size_t bytes;
 } cp_managed_cache;
 
+struct cp_device_memory {
+   struct cp_device_memory *next;
+   CUdeviceptr dev;
+   uint64_t size;
+};
+
+static struct cp_device_memory *cp_device_memories;
+
+static struct cp_device_memory *
+cp_device_memory_find(struct pipe_memory_allocation *mem)
+{
+   for (struct cp_device_memory *entry = cp_device_memories; entry;
+        entry = entry->next) {
+      if ((struct pipe_memory_allocation *)entry == mem)
+         return entry;
+   }
+   return NULL;
+}
+
 static uint32_t
 cp_managed_cache_size(uint64_t size)
 {
@@ -1421,6 +1535,43 @@ cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
    return (struct pipe_memory_allocation *)(uintptr_t)dev;
 }
 
+static struct pipe_memory_allocation *
+cp_allocate_memory_device(struct pipe_screen *screen, uint64_t size)
+{
+   struct cp_screen *cp = (struct cp_screen *)screen;
+   struct cp_device_memory *mem = CALLOC_STRUCT(cp_device_memory);
+   if (!mem)
+      return NULL;
+   cuCtxSetCurrent(cp->cuda_ctx);
+   CUresult err = cuMemAlloc(&mem->dev, size);
+   if (err != CUDA_SUCCESS) {
+      CP_CU_WARN(err, "cuMemAlloc for device-local VkDeviceMemory");
+      FREE(mem);
+      return NULL;
+   }
+   mem->size = size;
+   simple_mtx_lock(&cp_arena.lock);
+   mem->next = cp_device_memories;
+   cp_device_memories = mem;
+   simple_mtx_unlock(&cp_arena.lock);
+   return (struct pipe_memory_allocation *)mem;
+}
+
+static void
+cp_clear_memory(struct pipe_screen *screen,
+                struct pipe_memory_allocation *mem, uint64_t size)
+{
+   struct cp_screen *cp = (struct cp_screen *)screen;
+   simple_mtx_lock(&cp_arena.lock);
+   struct cp_device_memory *device_mem = cp_device_memory_find(mem);
+   simple_mtx_unlock(&cp_arena.lock);
+   if (!device_mem)
+      return;
+   cuCtxSetCurrent(cp->cuda_ctx);
+   CUresult err = cuMemsetD8(device_mem->dev, 0, size);
+   CP_CU_WARN(err, "cuMemsetD8 for zero-initialized VkDeviceMemory");
+}
+
 static void
 cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
 {
@@ -1428,6 +1579,21 @@ cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
 
    if (!mem)
       return;
+
+   simple_mtx_lock(&cp_arena.lock);
+   struct cp_device_memory **link = &cp_device_memories;
+   while (*link && (struct pipe_memory_allocation *)*link != mem)
+      link = &(*link)->next;
+   struct cp_device_memory *device_mem = *link;
+   if (device_mem)
+      *link = device_mem->next;
+   simple_mtx_unlock(&cp_arena.lock);
+   if (device_mem) {
+      cuCtxSetCurrent(cp->cuda_ctx);
+      cuMemFree(device_mem->dev);
+      FREE(device_mem);
+      return;
+   }
 
    if (cp_arena_free((void *)mem))
       return;
@@ -1442,6 +1608,12 @@ cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
 static void *
 cp_map_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
 {
+   simple_mtx_lock(&cp_arena.lock);
+   struct cp_device_memory *device_mem = cp_device_memory_find(mem);
+   CUdeviceptr dev = device_mem ? device_mem->dev : 0;
+   simple_mtx_unlock(&cp_arena.lock);
+   if (device_mem)
+      return (void *)(uintptr_t)dev;
    return (void *)mem;
 }
 
@@ -1456,14 +1628,22 @@ cp_resource_bind_backing(struct pipe_screen *screen, struct pipe_resource *pt,
                          uint64_t size, uint64_t mem_offset)
 {
    struct cp_resource *res = cp_resource(pt);
-   void *ptr = (char *)mem + mem_offset;
+   simple_mtx_lock(&cp_arena.lock);
+   struct cp_device_memory *device_mem = cp_device_memory_find(mem);
+   CUdeviceptr base = device_mem ? device_mem->dev : (CUdeviceptr)(uintptr_t)mem;
+   uint64_t allocation_size = device_mem ? device_mem->size : 0;
+   simple_mtx_unlock(&cp_arena.lock);
+   void *ptr = (void *)(uintptr_t)(base + mem_offset);
    res->lpr.data = ptr;
    res->lpr.tex_data = ptr;
-   /* cp_allocate_memory hands out managed memory, so the GPU paths (blit,
-    * vertex fetch) can use this resource directly. The allocation itself is
-    * owned by the VkDeviceMemory, not by the resource. */
+   /* Both host-visible managed memory and device-local cuMemAlloc addresses
+    * are directly usable by the CUDA paths. The allocation itself is owned
+    * by the VkDeviceMemory, not by the resource. */
    res->cuda_managed = true;
+   res->device_local = device_mem != NULL;
    res->device_ptr = (CUdeviceptr)(uintptr_t)ptr;
+   res->allocation_size = allocation_size > mem_offset
+      ? allocation_size - mem_offset : size;
    return true;
 }
 
@@ -1499,6 +1679,8 @@ cudapipe_init_screen_resource_funcs(struct pipe_screen *screen)
    screen->resource_create_unbacked = cp_resource_create_unbacked;
    screen->resource_destroy = cp_resource_destroy;
    screen->allocate_memory = cp_allocate_memory;
+   screen->allocate_memory_device = cp_allocate_memory_device;
+   screen->clear_memory = cp_clear_memory;
    screen->free_memory = cp_free_memory;
    screen->resource_bind_backing = cp_resource_bind_backing;
    screen->resource_get_param = cp_resource_get_param;

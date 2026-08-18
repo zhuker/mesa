@@ -1037,3 +1037,40 @@ speedup, but the counts and migration volume are large enough to promote split
 host-visible and true device-local Vulkan memory ahead of persistent execution.
 The trace is stored under
 `~/claude-scratchpad/perf16/uvm-profile-1787062168/`.
+
+## Session 13: split host-visible and device-local memory
+
+Lavapipe now exposes three memory types when its screen supplies the optional
+device allocator: device-local-only, host-visible/coherent/cached, and a managed
+compatibility type carrying both sets of flags. Ordinary llvmpipe still exposes
+its original single universal type. Cudapipe backs the first type with
+`cuMemAlloc`; the other two retain the managed/pinned allocation path and its
+small-allocation/cache policy. The compatibility type avoids rejecting software
+that explicitly requires both flag sets without attracting the samples, whose
+first-match searches select the two specialized types.
+
+Device allocations are opaque Gallium allocation objects containing their CUDA
+address. Resource binding unwraps that address, normal copies and rendering stay
+device-to-device, and CPU maps or format-conversion blits explicitly stage the
+allocation through host memory. `VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT`
+uses a device memset rather than dereferencing the opaque address. A bounded
+device-allocation cache was also tested; retaining its VRAM worsened the old
+capture from 25.39 to 25.80 ms, so it was removed.
+
+The newer Crossroads capture improves from 7.44--7.46 ms to 7.18--7.21 ms
+median, about 3.5--3.8%. Its 14-second UVM trace changes as follows:
+
+| metric | managed-only | split | change |
+|---|---:|---:|---:|
+| migrated bytes | 14.25 GB | 1.59 GB | -88.9% |
+| GPU faults | 509,695 | 403,209 | -20.9% |
+| unique GPU-fault pages | 673 | 212 | -68.5% |
+| CPU faults | 71,898 | 34,451 | -52.1% |
+| GPU-fault interval union | 10.84% | 5.73% | -47.1% |
+
+The older, overflow-heavy capture regresses from 24.83 to 25.39 ms. The full
+18-sample, 60-frame sweep is pixel-stable relative to the preceding iteration;
+the standing NVIDIA differences remain `gltfscenerendering` and `texture3d`.
+Crossroads frames 633, 756, and 907 are byte-for-byte identical to the corrected
+reference. The post-split UVM artifact is
+`~/claude-scratchpad/perf16/uvm-memory-split-1787065175/`.

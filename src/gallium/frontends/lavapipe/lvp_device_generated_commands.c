@@ -310,6 +310,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetGeneratedCommandsMemoryRequirementsEXT(
     const VkGeneratedCommandsMemoryRequirementsInfoEXT* pInfo,
     VkMemoryRequirements2*                      pMemoryRequirements)
 {
+   VK_FROM_HANDLE(lvp_device, lvp_device, device);
    VK_FROM_HANDLE(lvp_indirect_command_layout_ext, elayout, pInfo->indirectCommandsLayout);
 
    size_t size = sizeof(struct list_head);
@@ -324,7 +325,8 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetGeneratedCommandsMemoryRequirementsEXT(
 
    size *= pInfo->maxSequenceCount;
 
-   pMemoryRequirements->memoryRequirements.memoryTypeBits = 1;
+   pMemoryRequirements->memoryRequirements.memoryTypeBits =
+      lvp_host_memory_type_bits(lvp_device->pscreen);
    pMemoryRequirements->memoryRequirements.alignment = 4;
    pMemoryRequirements->memoryRequirements.size = align(size, pMemoryRequirements->memoryRequirements.alignment);
 }

@@ -511,6 +511,38 @@ trace_screen_allocate_memory(struct pipe_screen *_screen,
 }
 
 static struct pipe_memory_allocation *
+trace_screen_allocate_memory_device(struct pipe_screen *_screen,
+                                    uint64_t size)
+{
+   struct trace_screen *tr_scr = trace_screen(_screen);
+   struct pipe_screen *screen = tr_scr->screen;
+   struct pipe_memory_allocation *result;
+
+   trace_dump_call_begin("pipe_screen", "allocate_memory_device");
+   trace_dump_arg(ptr, screen);
+   trace_dump_arg(uint, size);
+   result = screen->allocate_memory_device(screen, size);
+   trace_dump_ret(ptr, result);
+   trace_dump_call_end();
+   return result;
+}
+
+static void
+trace_screen_clear_memory(struct pipe_screen *_screen,
+                          struct pipe_memory_allocation *pmem,
+                          uint64_t size)
+{
+   struct trace_screen *tr_scr = trace_screen(_screen);
+   struct pipe_screen *screen = tr_scr->screen;
+   trace_dump_call_begin("pipe_screen", "clear_memory");
+   trace_dump_arg(ptr, screen);
+   trace_dump_arg(ptr, pmem);
+   trace_dump_arg(uint, size);
+   screen->clear_memory(screen, pmem, size);
+   trace_dump_call_end();
+}
+
+static struct pipe_memory_allocation *
 trace_screen_allocate_memory_fd(struct pipe_screen *_screen,
                                 uint64_t size,
                                 int *fd,
@@ -1488,6 +1520,10 @@ trace_screen_create(struct pipe_screen *screen)
    tr_scr->base.resource_bind_backing = trace_screen_resource_bind_backing;
    tr_scr->base.resource_from_handle = trace_screen_resource_from_handle;
    tr_scr->base.allocate_memory = trace_screen_allocate_memory;
+   if (screen->allocate_memory_device)
+      tr_scr->base.allocate_memory_device = trace_screen_allocate_memory_device;
+   if (screen->clear_memory)
+      tr_scr->base.clear_memory = trace_screen_clear_memory;
    SCR_INIT(allocate_memory_fd);
    tr_scr->base.free_memory = trace_screen_free_memory;
    SCR_INIT(free_memory_fd);

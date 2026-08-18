@@ -172,6 +172,18 @@ struct lvp_physical_device {
    struct wsi_device wsi_device;
 };
 
+static inline uint32_t
+lvp_memory_type_bits(struct pipe_screen *screen)
+{
+   return screen->allocate_memory_device ? 7u : 1u;
+}
+
+static inline uint32_t
+lvp_host_memory_type_bits(struct pipe_screen *screen)
+{
+   return screen->allocate_memory_device ? 6u : 1u;
+}
+
 struct lvp_instance {
    struct vk_instance vk;
 
@@ -244,6 +256,7 @@ void lvp_device_get_cache_uuid(void *uuid);
 
 enum lvp_device_memory_type {
    LVP_DEVICE_MEMORY_TYPE_DEFAULT,
+   LVP_DEVICE_MEMORY_TYPE_DEVICE_LOCAL,
    LVP_DEVICE_MEMORY_TYPE_USER_PTR,
    LVP_DEVICE_MEMORY_TYPE_OPAQUE_FD,
    LVP_DEVICE_MEMORY_TYPE_DMA_BUF,

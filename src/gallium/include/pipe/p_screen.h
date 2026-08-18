@@ -654,6 +654,16 @@ struct pipe_screen {
    struct pipe_memory_allocation *(*allocate_memory)(struct pipe_screen *screen,
                                                      uint64_t size);
    /**
+    * Optional device-local allocation path. When present, Vulkan frontends
+    * may expose a non-host-visible memory type backed by this allocation.
+    */
+   struct pipe_memory_allocation *(*allocate_memory_device)(
+      struct pipe_screen *screen, uint64_t size);
+   /** Initialize an opaque allocation without requiring a host mapping. */
+   void (*clear_memory)(struct pipe_screen *screen,
+                        struct pipe_memory_allocation *pmem,
+                        uint64_t size);
+   /**
     * Free previously allocated backing memory.
     */
    void (*free_memory)(struct pipe_screen *screen,

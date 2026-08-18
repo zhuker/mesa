@@ -1791,14 +1791,32 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceMemoryProperties(
    VkPhysicalDevice                            physicalDevice,
    VkPhysicalDeviceMemoryProperties*           pMemoryProperties)
 {
-   pMemoryProperties->memoryTypeCount = 1;
+   VK_FROM_HANDLE(lvp_physical_device, pdevice, physicalDevice);
+   bool split = pdevice->pscreen->allocate_memory_device != NULL;
+   pMemoryProperties->memoryTypeCount = split ? 3 : 1;
    pMemoryProperties->memoryTypes[0] = (VkMemoryType) {
-      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-      VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+      .propertyFlags = split ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT :
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+         VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
       .heapIndex = 0,
    };
+   if (split) {
+      pMemoryProperties->memoryTypes[1] = (VkMemoryType) {
+         .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+         .heapIndex = 0,
+      };
+      pMemoryProperties->memoryTypes[2] = (VkMemoryType) {
+         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+         .heapIndex = 0,
+      };
+   }
 
    VkDeviceSize low_size = 3ULL*1024*1024*1024;
    VkDeviceSize total_size;
@@ -1840,7 +1858,9 @@ lvp_GetMemoryHostPointerPropertiesEXT(
 {
    switch (handleType) {
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: {
-      pMemoryHostPointerProperties->memoryTypeBits = 1;
+      VK_FROM_HANDLE(lvp_device, device, _device);
+      pMemoryHostPointerProperties->memoryTypeBits =
+         lvp_host_memory_type_bits(device->pscreen);
       return VK_SUCCESS;
    }
    default:
@@ -2234,7 +2254,10 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateMemory(
    if (mem == NULL)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   mem->memory_type = LVP_DEVICE_MEMORY_TYPE_DEFAULT;
+   bool device_local = device->pscreen->allocate_memory_device &&
+      pAllocateInfo->memoryTypeIndex == 0;
+   mem->memory_type = device_local ? LVP_DEVICE_MEMORY_TYPE_DEVICE_LOCAL :
+                                     LVP_DEVICE_MEMORY_TYPE_DEFAULT;
    mem->backed_fd = -1;
 
    if (mem->vk.host_ptr) {
@@ -2292,19 +2315,30 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateMemory(
    }
 #endif
    else {
-      mem->pmem = device->pscreen->allocate_memory(device->pscreen, pAllocateInfo->allocationSize);
+      mem->pmem = device_local
+         ? device->pscreen->allocate_memory_device(device->pscreen,
+                                                   pAllocateInfo->allocationSize)
+         : device->pscreen->allocate_memory(device->pscreen,
+                                             pAllocateInfo->allocationSize);
       if (!mem->pmem) {
          goto fail;
       }
       mem->map = device->pscreen->map_memory(device->pscreen, mem->pmem);
-      if (device->poison_mem) {
+      if (!device_local && device->poison_mem) {
          /* this is a value that will definitely break things */
          memset(mem->map, UINT8_MAX / 2 + 1, pAllocateInfo->allocationSize);
       }
-      set_mem_priority(mem, priority);
+      if (!device_local)
+         set_mem_priority(mem, priority);
       /* XXX: this should be memset_s or memset_explicit but they are not supported */
-      if (mem_flags && mem_flags->flags & VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT)
-         memset(mem->map, 0, pAllocateInfo->allocationSize);
+      if (mem_flags &&
+          mem_flags->flags & VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT) {
+         if (device_local && device->pscreen->clear_memory)
+            device->pscreen->clear_memory(device->pscreen, mem->pmem,
+                                          pAllocateInfo->allocationSize);
+         else
+            memset(mem->map, 0, pAllocateInfo->allocationSize);
+      }
    }
 
    *pMem = lvp_device_memory_to_handle(mem);
@@ -2332,6 +2366,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_FreeMemory(
 
    switch(mem->memory_type) {
    case LVP_DEVICE_MEMORY_TYPE_DEFAULT:
+   case LVP_DEVICE_MEMORY_TYPE_DEVICE_LOCAL:
       device->pscreen->free_memory(device->pscreen, mem->pmem);
       break;
 #ifdef PIPE_MEMORY_FD
@@ -2361,6 +2396,9 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_MapMemory2KHR(
       *ppData = NULL;
       return VK_SUCCESS;
    }
+
+   if (mem->memory_type == LVP_DEVICE_MEMORY_TYPE_DEVICE_LOCAL)
+      return VK_ERROR_MEMORY_MAP_FAILED;
 
    *ppData = (char *)mem->map + pMemoryMapInfo->offset;
    return VK_SUCCESS;
@@ -2394,7 +2432,9 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetDeviceBufferMemoryRequirements(
     const VkDeviceBufferMemoryRequirements*     pInfo,
     VkMemoryRequirements2*                      pMemoryRequirements)
 {
-   pMemoryRequirements->memoryRequirements.memoryTypeBits = 1;
+   VK_FROM_HANDLE(lvp_device, device, _device);
+   pMemoryRequirements->memoryRequirements.memoryTypeBits =
+      lvp_memory_type_bits(device->pscreen);
    pMemoryRequirements->memoryRequirements.alignment = 64;
 
    if (pInfo->pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
@@ -2422,7 +2462,9 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetDeviceImageMemoryRequirements(
     const VkDeviceImageMemoryRequirements*     pInfo,
     VkMemoryRequirements2*                      pMemoryRequirements)
 {
-   pMemoryRequirements->memoryRequirements.memoryTypeBits = 1;
+   VK_FROM_HANDLE(lvp_device, device, _device);
+   pMemoryRequirements->memoryRequirements.memoryTypeBits =
+      lvp_memory_type_bits(device->pscreen);
    pMemoryRequirements->memoryRequirements.alignment = 0;
    pMemoryRequirements->memoryRequirements.size = 0;
 
@@ -2454,6 +2496,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetBufferMemoryRequirements(
    VkBuffer                                    _buffer,
    VkMemoryRequirements*                       pMemoryRequirements)
 {
+   VK_FROM_HANDLE(lvp_device, lvp_device, device);
    VK_FROM_HANDLE(lvp_buffer, buffer, _buffer);
 
    pMemoryRequirements->alignment = 64;
@@ -2462,16 +2505,8 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetBufferMemoryRequirements(
       os_get_page_size(&alignment);
       pMemoryRequirements->alignment = alignment;
    }
-   /* The Vulkan spec (git aaed022) says:
-    *
-    *    memoryTypeBits is a bitfield and contains one bit set for every
-    *    supported memory type for the resource. The bit `1<<i` is set if and
-    *    only if the memory type `i` in the VkPhysicalDeviceMemoryProperties
-    *    structure for the physical device is supported.
-    *
-    * We support exactly one memory type.
-    */
-   pMemoryRequirements->memoryTypeBits = 1;
+   pMemoryRequirements->memoryTypeBits =
+      lvp_memory_type_bits(lvp_device->pscreen);
 
    pMemoryRequirements->size = buffer->total_size;
 }
@@ -2503,8 +2538,10 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetImageMemoryRequirements(
    VkImage                                     _image,
    VkMemoryRequirements*                       pMemoryRequirements)
 {
+   VK_FROM_HANDLE(lvp_device, lvp_device, device);
    VK_FROM_HANDLE(lvp_image, image, _image);
-   pMemoryRequirements->memoryTypeBits = 1;
+   pMemoryRequirements->memoryTypeBits =
+      lvp_memory_type_bits(lvp_device->pscreen);
 
    pMemoryRequirements->size = image->size;
    pMemoryRequirements->alignment = image->alignment;
@@ -2679,8 +2716,8 @@ lvp_GetMemoryFdPropertiesKHR(VkDevice _device,
    assert(pMemoryFdProperties->sType == VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR);
 
    if (assert_memhandle_type(handleType)) {
-      // There is only one memoryType so select this one
-      pMemoryFdProperties->memoryTypeBits = 1;
+      pMemoryFdProperties->memoryTypeBits =
+         lvp_host_memory_type_bits(device->pscreen);
    }
    else {
       const struct lvp_physical_device *pdev = lvp_device_physical(device);
