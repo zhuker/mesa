@@ -1298,14 +1298,6 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
                     CUevent ev_before,
                     CUdeviceptr batch_rows)
 {
-   /* Both blocks go to the device by DMA rather than through managed memory
-    * the host has just dirtied — see cp_upload(). */
-   uint32_t fs_stride_host = fs_in_stride;
-   CUdeviceptr stride_dev = cp_upload(cp, &fs_stride_host,
-                                      sizeof(fs_stride_host));
-   if (!stride_dev)
-      return false;
-
    /*
     * The argument block, and behind it the per-draw uniform table the shader
     * indexes into — one upload, because the block holds the table's device
@@ -1409,7 +1401,8 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
    void **fs_args_host = (void **)fs_blk;
    fs_args_host[0] = (void *)(uintptr_t)counter;
    fs_args_host[2] = (void *)(uintptr_t)fs_in;
-   fs_args_host[3] = (void *)(uintptr_t)stride_dev;
+   fs_args_host[3] =
+      (void *)(uintptr_t)(fs_args_dev + fs_scal_off + 2 * sizeof(uint32_t));
    fs_args_host[4] = (void *)(uintptr_t)fs_out;
    fs_args_host[6] = (void *)(uintptr_t)frag_coord;
    fs_args_host[CP_ARG_SLOT_DISCARD] = (void *)(uintptr_t)discard_mask;
@@ -1431,6 +1424,7 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
    ((uint32_t *)((char *)fs_blk + fs_scal_off))[0] = 0;
    ((uint32_t *)((char *)fs_blk + fs_scal_off))[1] =
       batch_rows ? 0xFFFFFFFFu : 0u;
+   ((uint32_t *)((char *)fs_blk + fs_scal_off))[2] = fs_in_stride;
 
    uint64_t *fs_tbl = (uint64_t *)((char *)fs_blk + fs_tbl_off);
    for (unsigned d = 0; d < rows; d++) {
@@ -7133,23 +7127,26 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
     *
     * This is allocated as managed memory so the GPU can access it.
     */
-   uint32_t grid_size[3] = { grid[0], grid[1], grid[2] };
-
    /*
-    * Both blocks go into the upload arena by DMA, the way the draw path's
-    * argument blocks do. They used to be a cuMemAllocManaged pair freed after
+    * The block goes into the upload arena by DMA, the way the draw path's
+    * argument blocks do. It used to be a cuMemAllocManaged pair freed after
     * the dispatch, which is what the cuCtxSynchronize below them was for —
     * the memory could not be released until the kernel reading it had
     * finished. Nothing here needs the host to wait: the arena is reclaimed in
     * bulk, and a managed block the host has just written is the page-fault
     * stall cp_upload() exists to avoid.
     */
-   CUdeviceptr grid_dev = cp_upload(cp, grid_size, sizeof(grid_size));
-   if (!grid_dev)
+   const size_t args_bytes = 34 * sizeof(void *);
+   const size_t grid_off = args_bytes;
+   void *block_host;
+   CUdeviceptr args_dev = cp_upload_begin(cp, grid_off + 3 * sizeof(uint32_t),
+                                          &block_host);
+   if (!args_dev)
       return;
 
-   void *arg_ptrs_host[34] = {0};
-   arg_ptrs_host[0] = (void *)(uintptr_t)grid_dev;
+   memset(block_host, 0, grid_off + 3 * sizeof(uint32_t));
+   void **arg_ptrs_host = block_host;
+   arg_ptrs_host[0] = (void *)(uintptr_t)(args_dev + grid_off);
    arg_ptrs_host[1] = NULL;
 
    for (unsigned i = 0; i < CP_MAX_SHADER_BUFFERS; i++)
@@ -7158,9 +7155,11 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
    for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++)
       arg_ptrs_host[18 + i] = cp->compute_ubos[i].buffer;
 
-   CUdeviceptr args_dev = cp_upload(cp, arg_ptrs_host, sizeof(arg_ptrs_host));
-   if (!args_dev)
-      return;
+   uint32_t *grid_size = (uint32_t *)((char *)block_host + grid_off);
+   grid_size[0] = grid[0];
+   grid_size[1] = grid[1];
+   grid_size[2] = grid[2];
+   cp_upload_end(cp, args_dev, block_host, grid_off + 3 * sizeof(uint32_t));
 
    void *args_ptr_val = (void *)(uintptr_t)args_dev;
    void *kernel_params[] = { &args_ptr_val };

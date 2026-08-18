@@ -1001,3 +1001,12 @@ measures 7.47 ms with variants enabled and 7.51 ms with them disabled; the old
 capture measures 24.97 ms enabled. This is a small win, but it also restores the
 intended specialization path instead of permanently falling back after compile
 failure.
+
+Two scalar argument uploads were redundant. Fragment shaders uploaded their
+input stride separately even though the main argument allocation already has
+inline scalar storage, and compute dispatches uploaded their three grid sizes
+separately from the pointer array. Both now use one contiguous DMA block. This
+removes one `cuMemcpyHtoDAsync` per fragment shader launch and one per compute
+dispatch. The new replay measures 7.44--7.46 ms versus 7.47 ms immediately
+before the change; the effect is small but consistently reduces host/API work
+without adding device work.
