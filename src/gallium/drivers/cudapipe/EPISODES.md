@@ -911,3 +911,48 @@ useful implementation first needs reusable stable graph bodies for both
 pipelines. Per-episode graph construction would add more work than it removes.
 This remains the next architectural synchronization project rather than a safe
 local patch.
+
+## Session 11: undefined allocation initialization and executor boundary
+
+The largest blocking-memory cost was not resource initialization. It was
+clearing every fresh or recycled `VkDeviceMemory` allocation even though
+Vulkan defines ordinary allocation contents as undefined. Lavapipe already
+performs the required host clear when
+`VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT` is present, after mapping the
+allocation. Cudapipe therefore no longer calls `cp_zero_managed` from
+`cp_allocate_memory`; directly created resources retain their initialization.
+
+This deletes all 1,571 blocking `cuMemsetD8` calls in the new replay, previously
+830.6 ms of CUDA API time. The new capture improves from 8.47 to **7.52 ms**
+median and the old capture from 26.21 to **25.06 ms**. The complete 60-frame,
+18-sample sweep is behavior-stable relative to the preceding build and moves
+34.01 to 33.88 ms (-0.4%); the same standing `gltfscenerendering` and
+`texture3d` NVIDIA-reference verdicts remain. Crossroads frames 633, 756, and
+907 are bit-exact against the corrected pre-change images.
+
+With allocation clearing gone, the current cushim replay wall is 15.06 seconds.
+The 8,333 episode drains consume 5.45 seconds (**36.2% of wall**), standalone
+A-buffer drains another 0.86 seconds, and kernel launch API work 0.93 seconds.
+The blocking initialization line is absent. The CPU decision is now more
+clearly the dominant remaining cost.
+
+Two device-sized-work variants were measured and rejected. Making ordinary
+interpolation use a capped resident grid measured 7.48 ms on the new capture
+but 25.09 ms on the old one, effectively noise versus 7.52/25.06, and was
+reverted. Generated `main` and writeback already grid-stride over GPU-resident
+counts; reducing `main` from 4,096 to 2,048 blocks regressed 7.48 to 7.53 ms and
+was reverted. Raising the A-buffer startup floor from 5 to 8 million fragments
+did not avoid the observed two-million-fragment overflow, increased resident
+memory by roughly 75 MB across fragment and quad arrays, and regressed 7.52 to
+7.56 ms, so it too was reverted.
+
+The overflow is live rather than theoretical: the correctness probe records a
+new-capture draw exceeding even the enlarged array and safely falling back to
+peeling. Consequently the episode counter read cannot be replaced by an
+unchecked fast path. A correct device executor must include both branches
+before any visible writeback: the normal grouped A-buffer shade/composite and
+the classic per-segment fallback. The fallback itself contains device-dependent
+peel termination plus dynamically linked shader launches. CUDA conditional
+graphs therefore require reusable graph bodies for the complete normal and
+fallback pipelines, stable cyclic argument storage, and kernel-node parameter
+updates; a conditional node around only the composite is insufficient.

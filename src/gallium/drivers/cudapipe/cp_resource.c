@@ -1392,10 +1392,12 @@ cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
    uint32_t cached_size = cp_managed_cache_size(size);
    if (cached_size) {
       dev = cp_managed_cache_take(cached_size);
-      if (dev) {
-         cp_zero_managed(dev, size);
+      /* Vulkan allocation contents are undefined unless lavapipe handles
+       * VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT after mapping. Clearing
+       * every recycled allocation here made an otherwise free operation a
+       * blocking device memset. */
+      if (dev)
          return (struct pipe_memory_allocation *)(uintptr_t)dev;
-      }
    }
 
    /*
@@ -1414,7 +1416,8 @@ cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
 
    if (cached_size && !cp_managed_cache_add(dev, cached_size))
       cached_size = 0;
-   cp_zero_managed(dev, size);
+   /* See the cache-hit path above: ordinary VkDeviceMemory is intentionally
+    * left undefined, as required by Vulkan. */
    return (struct pipe_memory_allocation *)(uintptr_t)dev;
 }
 
