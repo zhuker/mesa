@@ -1,5 +1,6 @@
 #include "cp_context.h"
 #include "cp_screen.h"
+#include "cp_kernels.h"
 #include "cp_nvtx.h"
 #include "cp_resource.h"
 #include "nir_to_ptx/cp_nir_to_llvm.h"
@@ -59,6 +60,7 @@ static void cp_pass_record_segment(struct cp_context *cp,
                                    const struct pipe_draw_info *info,
                                    unsigned drawid_offset, unsigned ndraws,
                                    const struct pipe_draw_start_count_bias *draws,
+                                   const uint32_t *instance_counts,
                                    const uint64_t *vs_ubo_table,
                                    const uint64_t *fs_ubo_table,
                                    const uint32_t *draw_ids,
@@ -1292,7 +1294,8 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
                     unsigned fs_in_stride, CUdeviceptr fs_out,
                     CUdeviceptr frag_coord, CUdeviceptr discard_mask,
                     CUdeviceptr front_face, CUdeviceptr coverage,
-                    unsigned num_threads, CUevent ev_before,
+                    CUdeviceptr fused_interp, unsigned num_threads,
+                    CUevent ev_before,
                     CUdeviceptr batch_rows)
 {
    /* Both blocks go to the device by DMA rather than through managed memory
@@ -1317,6 +1320,80 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
    const uint64_t *tbl_src = cp->fs_batch.ubos;
    unsigned rows = (tbl_src && fs->reads_const_bufs)
       ? MAX2(cp->fs_batch.ndraws, 1u) : 1;
+   struct cp_sampler_info resolved_samplers[CP_MAX_TEX_DESCS];
+   bool samplers_resolved = !cp_debug->no_sampler_variant &&
+      fs->num_tex_descs == 1 && !fs->tex_descs_dynamic && tbl_src;
+   for (unsigned i = 0; i < fs->num_tex_descs && samplers_resolved; i++) {
+      const struct cp_tex_desc_ref *ref = &fs->tex_descs[i];
+      bool have_state = false;
+      if (ref->ubo_slot >= CP_ARG_UBO_STRIDE) {
+         samplers_resolved = false;
+         break;
+      }
+      for (unsigned r = 0; r < rows; r++) {
+         const uint64_t *row = tbl_src + (size_t)r * CP_ARG_UBO_STRIDE;
+         const char *base = (const char *)(uintptr_t)row[ref->ubo_slot];
+         if (!base) {
+            samplers_resolved = false;
+            break;
+         }
+         unsigned index = *(const unsigned *)(base + ref->sampler_offset +
+                                              CP_DESC_SAMPLER_INDEX_OFFSET);
+         if (index >= cp->num_samplers) {
+            samplers_resolved = false;
+            break;
+         }
+         const struct cp_sampler_info *state =
+            &cp->sampler_table_host[index];
+         if (have_state && memcmp(&resolved_samplers[i], state,
+                                  sizeof(*state))) {
+            samplers_resolved = false;
+            break;
+         }
+         memcpy(&resolved_samplers[i], state, sizeof(*state));
+         have_state = true;
+      }
+   }
+   struct cp_sampler_variant *sampler_variant = samplers_resolved
+      ? cp_shader_find_sampler_variant(fs, resolved_samplers,
+                                       fs->num_tex_descs) : NULL;
+   if (samplers_resolved && !sampler_variant &&
+       fs->num_sampler_variants < CP_MAX_SAMPLER_VARIANTS &&
+       (!fs->tune_cap || fs->tune_done)) {
+      char *sampler_ptx = cp_compile_sampler_variant(cp->screen,
+                                                     resolved_samplers);
+      if (sampler_ptx) {
+         cp_shader_build_sampler_variant(fs, sampler_ptx, resolved_samplers,
+                                         fs->num_tex_descs);
+         free(sampler_ptx);
+      }
+      sampler_variant = cp_shader_find_sampler_variant(
+         fs, resolved_samplers, fs->num_tex_descs);
+   }
+   bool use_sampler_variant = sampler_variant != NULL;
+   CUmodule launch_module = use_sampler_variant
+      ? sampler_variant->module : fs->module;
+   CUfunction launch_kernel = use_sampler_variant
+      ? sampler_variant->kernel : fs->kernel;
+   if (cp_debug->debug_tex && !fs->tex_descs_reported) {
+      fs->tex_descs_reported = true;
+      fprintf(stderr, "cudapipe: FS sampler refs=%u dynamic=%u rows=%u\n",
+              fs->num_tex_descs, fs->tex_descs_dynamic, rows);
+      for (unsigned r = 0; r < rows; r++) {
+         const uint64_t *row = tbl_src
+            ? tbl_src + (size_t)r * CP_ARG_UBO_STRIDE : NULL;
+         for (unsigned i = 0; i < fs->num_tex_descs; i++) {
+            const struct cp_tex_desc_ref *ref = &fs->tex_descs[i];
+            const char *base = row && ref->ubo_slot < CP_ARG_UBO_STRIDE
+               ? (const char *)(uintptr_t)row[ref->ubo_slot] : NULL;
+            unsigned sampler = base
+               ? *(const unsigned *)(base + ref->sampler_offset +
+                                      CP_DESC_SAMPLER_INDEX_OFFSET) : 0;
+            fprintf(stderr, "  row=%u ubo=%u offset=%u sampler=%u\n",
+                    r, ref->ubo_slot, ref->sampler_offset, sampler);
+         }
+      }
+   }
    const size_t fs_args_bytes = 64 * sizeof(void *);
    const size_t fs_scal_off = fs_args_bytes;   /* row 0, then the mask */
    const size_t fs_tbl_off = fs_args_bytes + 16;
@@ -1341,6 +1418,8 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
     * given it — see CP_ARG_SLOT_COVERAGE. */
    fs_args_host[CP_ARG_SLOT_COVERAGE] =
       fs->writes_memory ? (void *)(uintptr_t)coverage : NULL;
+   fs_args_host[CP_ARG_SLOT_FUSED_INTERP] =
+      (void *)(uintptr_t)fused_interp;
    fs_args_host[CP_ARG_SLOT_UBO_TABLE] =
       (void *)(uintptr_t)(fs_args_dev + fs_tbl_off);
    fs_args_host[CP_ARG_SLOT_BATCH_ROWS] = batch_rows
@@ -1374,22 +1453,6 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
    if (cp_debug->debug_tex) {
       fprintf(stderr, "cudapipe: sampler table %p (%u entries) for FS module\n",
               (void *)(uintptr_t)cp->sampler_table, cp->num_samplers);
-
-      /* Walk each bound descriptor the way the sampler does, so a mismatch
-       * between what the host bound and what the shader samples is visible. */
-      for (unsigned b = 0; b < cp->num_fs_ubos; b++) {
-         if (!cp->fs_ubos[b].buffer)
-            continue;
-         const char *desc = (const char *)cp->fs_ubos[b].buffer;
-         const struct cp_texture_info *ti =
-            *(const struct cp_texture_info *const *)(desc + CP_DESC_IMAGE_FUNCTIONS_OFFSET);
-         if (!ti)
-            continue;
-         fprintf(stderr, "  fs_ubo[%u]: %ux%u enc=%u stride=%u levels=%u..%u "
-                 "base=%p\n", b, ti->width, ti->height, ti->encoding,
-                 ti->row_stride[0], ti->first_level, ti->last_level,
-                 (void *)(uintptr_t)ti->base);
-      }
    }
 
    /*
@@ -1406,31 +1469,41 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
    {
       CUdeviceptr sym;
       size_t sym_size;
-      if (!fs->globals_resolved) {
-         if (cuModuleGetGlobal(&sym, &sym_size, fs->module,
+      bool *globals_resolved = use_sampler_variant
+         ? &sampler_variant->globals_resolved : &fs->globals_resolved;
+      CUdeviceptr *sym_sampler_table = use_sampler_variant
+         ? &sampler_variant->sym_sampler_table : &fs->sym_sampler_table;
+      CUdeviceptr *sym_quad_derivs = use_sampler_variant
+         ? &sampler_variant->sym_quad_derivs : &fs->sym_quad_derivs;
+      uint64_t *last_sampler_table = use_sampler_variant
+         ? &sampler_variant->last_sampler_table : &fs->last_sampler_table;
+      int *last_quad_derivs = use_sampler_variant
+         ? &sampler_variant->last_quad_derivs : &fs->last_quad_derivs;
+      if (!*globals_resolved) {
+         if (cuModuleGetGlobal(&sym, &sym_size, launch_module,
                                "cp_sampler_table") == CUDA_SUCCESS)
-            fs->sym_sampler_table = sym;
-         if (cuModuleGetGlobal(&sym, &sym_size, fs->module,
+            *sym_sampler_table = sym;
+         if (cuModuleGetGlobal(&sym, &sym_size, launch_module,
                                "cp_quad_derivs") == CUDA_SUCCESS)
-            fs->sym_quad_derivs = sym;
+            *sym_quad_derivs = sym;
          /* Nothing has been written yet, and zero is a value the sampler
           * table can legitimately take, so neither cache is valid until the
           * first write below. */
-         fs->last_sampler_table = ~(uint64_t)0;
-         fs->last_quad_derivs = -1;
-         fs->globals_resolved = true;
+         *last_sampler_table = ~(uint64_t)0;
+         *last_quad_derivs = -1;
+         *globals_resolved = true;
       }
 
-      if (cp->sampler_table && fs->sym_sampler_table &&
-          fs->last_sampler_table != (uint64_t)cp->sampler_table) {
+      if (cp->sampler_table && *sym_sampler_table &&
+          *last_sampler_table != (uint64_t)cp->sampler_table) {
          uint64_t addr = (uint64_t)cp->sampler_table;
-         cuMemcpyHtoD(fs->sym_sampler_table, &addr, sizeof(addr));
-         fs->last_sampler_table = addr;
+         cuMemcpyHtoD(*sym_sampler_table, &addr, sizeof(addr));
+         *last_sampler_table = addr;
       }
-      if (fs->sym_quad_derivs && fs->last_quad_derivs != 1) {
+      if (*sym_quad_derivs && *last_quad_derivs != 1) {
          int on = 1;
-         cuMemcpyHtoD(fs->sym_quad_derivs, &on, sizeof(on));
-         fs->last_quad_derivs = 1;
+         cuMemcpyHtoD(*sym_quad_derivs, &on, sizeof(on));
+         *last_quad_derivs = 1;
       }
    }
 
@@ -1446,12 +1519,12 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
          cuEventRecord(ev_before, cp->stream);
       /* A shader the compiler marked as a register-cap candidate is timed
        * here, both as built and capped, and the faster build kept. */
-      bool timed = cp_tune_before(cp, fs);
+      bool timed = use_sampler_variant ? false : cp_tune_before(cp, fs);
       /* Compiled shaders grid-stride now, so the launch is capped: the count
        * is device-side and num_threads is the framebuffer's worst case, so a
        * small draw's launch was mostly scheduling idle blocks. 4096 blocks
        * of 256 is far past what fills the machine. */
-      CUresult fs_err = cuLaunchKernel(fs->kernel,
+      CUresult fs_err = cuLaunchKernel(launch_kernel,
                                        MIN2((num_threads + 255) / 256, 4096u),
                                        1, 1, 256, 1, 1, 0, cp->stream,
                                        fs_params, NULL);
@@ -1460,7 +1533,8 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
                  fs_err);
          return false;
       }
-      cp_tune_after(cp, fs, timed);
+      if (!use_sampler_variant)
+         cp_tune_after(cp, fs, timed);
    }
    return true;
 }
@@ -1480,7 +1554,8 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
                    float vp_scale_x, float vp_scale_y,
                    float vp_trans_x, float vp_trans_y,
                    CUdeviceptr reject, CUdeviceptr resolved,
-                   unsigned reject_pass)
+                   unsigned reject_pass, CUdeviceptr seg_ranges,
+                   unsigned num_seg_ranges)
 {
    struct cp_screen *screen = cp->screen;
    struct cp_shader_binary *fs = cp->fs_shader;
@@ -1570,6 +1645,8 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
       .dbg_quad_prim = cp_abuf_dbg.quad_prim,
       .dbg_peel_mask = cp_abuf_dbg.peel_mask,
       .dbg_counters = cp_abuf_dbg.counters,
+      .seg_ranges = seg_ranges,
+      .num_seg_ranges = num_seg_ranges,
    };
 
    cp_fs_interp_setup(cp, info, fs, num_fs_inputs, num_vs_outputs, &interp);
@@ -1635,7 +1712,7 @@ cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
 
    if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
                             frag_coord, discard_mask, front_face, coverage,
-                            num_pixels, 0, batch_rows))
+                            0, num_pixels, 0, batch_rows))
       return;
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
@@ -1946,6 +2023,7 @@ cp_census_dump(const char *what, unsigned draw_seq, unsigned peel_seq,
  * is about twelve times what particlesystem needs; a draw that wants more is
  * refused rather than allocated for. */
 #define CP_ABUF_MAX_FRAGS (32u * 1024u * 1024u)
+#define CP_ABUF_MIN_FRAGS (5u * 1024u * 1024u)
 
 /* Both paths' shaded colours, one float4 and one write count per slot each.
  * The measured population needs about 135 MB of this; a draw wanting more is
@@ -2474,7 +2552,8 @@ cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
    if (grow && (ab->grow_capped || ab->growths >= CP_ABUF_MAX_GROWTHS))
       return true;
 
-   size_t want = (size_t)total * CP_ABUF_HEADROOM + CP_ABUF_SLACK;
+   size_t want = MAX2((size_t)total * CP_ABUF_HEADROOM + CP_ABUF_SLACK,
+                      (size_t)CP_ABUF_MIN_FRAGS);
    if (want > CP_ABUF_MAX_FRAGS) {
       if (ab->frags) {
          /* Keep what is there. Draws that fit still take the path; draws that
@@ -2625,8 +2704,26 @@ static void
 cp_abuf_scan_n(struct cp_context *cp, struct cp_screen *screen,
                CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x,
                CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3,
-               unsigned n, unsigned nb1, unsigned nb2, unsigned nb3)
+               unsigned n, unsigned nb1, unsigned nb2, unsigned nb3,
+               CUdeviceptr clamp_counts, uint32_t clamp_capacity,
+               CUdeviceptr clamp_overflow)
 {
+   if (nb1 <= CP_ABUF_SCAN_BLOCK) {
+      void *p0[] = { &in, &out, &s1, &n };
+      CP_LAUNCH(screen->kernels.abuf_scan_block, nb1, 1, 1,
+                     CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, p0, NULL);
+
+      void *p1[] = { &s1, &s1x, &s3, &nb1 };
+      CP_LAUNCH(screen->kernels.abuf_scan_block, 1, 1, 1,
+                     CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, p1, NULL);
+
+      void *pa[] = { &out, &s1x, &n, &clamp_counts, &s3,
+                     &clamp_capacity, &clamp_overflow };
+      CP_LAUNCH(screen->kernels.abuf_scan_add, nb1, 1, 1,
+                     CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, pa, NULL);
+      return;
+   }
+
    struct { CUdeviceptr in, out, sums; unsigned n, grid; } lvl[3] = {
       { in, out, s1, n,   nb1 },
       { s1,  s1x, s2, nb1, nb2 },
@@ -2641,9 +2738,14 @@ cp_abuf_scan_n(struct cp_context *cp, struct cp_screen *screen,
    for (int i = 1; i >= 0; i--) {
       CUdeviceptr data = i ? s1x : out;
       CUdeviceptr sums = i ? s2x : s1x;
+      CUdeviceptr counts = i ? 0 : clamp_counts;
+      CUdeviceptr total = i ? 0 : s3;
+      uint32_t capacity = i ? 0 : clamp_capacity;
+      CUdeviceptr overflow = i ? 0 : clamp_overflow;
       unsigned cnt = i ? nb1 : n;
       unsigned grid = i ? nb2 : nb1;
-      void *p[] = { &data, &sums, &cnt };
+      void *p[] = { &data, &sums, &cnt, &counts, &total, &capacity,
+                    &overflow };
       CP_LAUNCH(screen->kernels.abuf_scan_add, grid, 1, 1,
                      CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, p, NULL);
    }
@@ -2654,7 +2756,8 @@ cp_abuf_scan(struct cp_context *cp, struct cp_screen *screen,
              struct cp_abuf *ab, unsigned n)
 {
    cp_abuf_scan_n(cp, screen, ab->counts, ab->offsets, ab->sum1, ab->sum1x,
-                  ab->sum2, ab->sum2x, ab->sum3, n, ab->nb1, ab->nb2, ab->nb3);
+                  ab->sum2, ab->sum2x, ab->sum3, n, ab->nb1, ab->nb2, ab->nb3,
+                  ab->counts, ab->capacity, ab->overflow);
 }
 
 /* Deepest pixels first, for the full-depth half of the comparison. */
@@ -3113,6 +3216,7 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
       .abuf_counts = ab->counts,
       .dbg_slot = dbg_slot,
       .abuf_num_quads = num_quads,
+      .num_quads_dev = ab->bsum3,
    };
    if (seg) {
       interp.quad_list = seg->quad_list;
@@ -3120,11 +3224,6 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
       interp.abuf_prim_base = seg->prim_base;
       interp.seg_ranges = seg->ranges;
       interp.num_seg_ranges = seg->num_ranges;
-   } else {
-      /* num_quads may be a provable bound rather than the drained total; the
-       * device knows the exact number, and when the two are equal the
-       * minimum changes nothing. */
-      interp.num_quads_dev = ab->bsum3;
    }
    cp_fs_interp_setup(cp, info, fs, num_fs_inputs, num_vs_outputs, &interp);
 
@@ -3151,20 +3250,13 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
       interp.prim_shift = cp->fs_batch.prim_shift;
    }
 
-   void *ip[] = { &interp };
-   cp_abuf_mark(ab->ev[11], cp->stream);
-   CUresult e = cuLaunchKernel(screen->kernels.abuf_interpolate,
-                               (num_quads + 255) / 256, 1, 1, 256, 1, 1,
-                               0, cp->stream, ip, NULL);
-   cp_abuf_mark(ab->ev[12], cp->stream);
-   if (e != CUDA_SUCCESS) {
-      fprintf(stderr, "abuffer: cp_abuf_interpolate launch failed (%d)\n", e);
+   CUdeviceptr interp_dev = cp_upload(cp, &interp, sizeof(interp));
+   if (!interp_dev)
       return false;
-   }
 
    if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
                             frag_coord, discard_mask, front_face, coverage,
-                            num_slots,
+                            interp_dev, num_slots,
                             cp_abuf.timing ? ab->ev[13] : 0, batch_rows))
       return false;
    cp_abuf_mark(ab->ev[14], cp->stream);
@@ -3361,7 +3453,8 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                 const struct pipe_draw_start_count_bias *draws,
                 unsigned num_draws, unsigned batch_draws,
                 const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table,
-                const uint32_t *draw_ids, const uint64_t *vb_table,
+                const uint32_t *draw_ids, const uint32_t *instance_counts,
+                const uint64_t *vb_table,
                 const struct pipe_scissor_state *scissors)
 {
    struct cp_screen *screen = cp->screen;
@@ -3434,9 +3527,12 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     */
    if (batch_draws > 1) {
       total_triangles = 0;
-      for (unsigned d = 0; d < batch_draws; d++)
-         total_triangles += cp_triangles_for_draw(info->mode, draws[d].count);
-      total_triangles *= instance_count;
+      for (unsigned d = 0; d < batch_draws; d++) {
+         unsigned draw_instances = instance_counts
+            ? MAX2(instance_counts[d], 1u) : instance_count;
+         total_triangles += cp_triangles_for_draw(info->mode, draws[d].count) *
+                            draw_instances;
+      }
    }
 
    if (total_triangles == 0)
@@ -3537,7 +3633,6 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       clip_x1 = MIN2(clip_x1, (int)sc0->maxx - 1);
       clip_y1 = MIN2(clip_y1, (int)sc0->maxy - 1);
    }
-
    struct cp_rasterize_args rast_args = {
       .framebuffer = visbuf,
       .color_buffer = (uint64_t)(uintptr_t)color_data,
@@ -3578,6 +3673,8 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          (cp->depth_stencil.depth_func == PIPE_FUNC_GREATER ||
           cp->depth_stencil.depth_func == PIPE_FUNC_GEQUAL),
    };
+   if (cp->pass.appending && cp->pass.opaque)
+      rast_args.abuf_prim_base = cp->pass.next_prim;
 
    /* Names this draw on the timeline for the rest of the function, however it
     * leaves — see CP_NVTX_SCOPE. */
@@ -3837,8 +3934,9 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
          if (batch_draws > 1) {
             struct cp_draw_slice slices[CP_MAX_BATCH_DRAWS];
             uint32_t vbegin = 0;
-            unsigned inst = MAX2(info->instance_count, 1u);
             for (unsigned d = 0; d < batch_draws; d++) {
+               unsigned inst = instance_counts
+                  ? MAX2(instance_counts[d], 1u) : instance_count;
                unsigned dverts =
                   cp_triangles_for_draw(info->mode, draws[d].count) * 3;
                slices[d].vert_begin = vbegin;
@@ -4144,9 +4242,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
              */
             if (screen->kernels.clip_triangles &&
                 num_vs_outputs <= CP_MAX_CLIP_SLOTS) {
-               /* Three planes turn one triangle into a hexagon at worst, and
-                * the fan over that is four triangles. */
-               unsigned max_clipped = num_triangles * 4;
+               unsigned max_clipped = num_triangles * CP_CLIP_MAX_OUT;
                CUdeviceptr clipped = cp_scratch_alloc_device(
                   cp, (size_t)max_clipped * 3 * out_stride);
                CUdeviceptr clip_count = cp_scratch_alloc_device(cp, 4);
@@ -4175,7 +4271,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                    * A batch of blended draws is composited in primitive
                    * order, so its primitives have to *be* in submission order
                    * — which compaction by atomicAdd does not promise. Stable
-                   * mode gives every input triangle four slots of its own and
+                   * mode gives every input triangle a fixed slot range and
                    * retires the ones it does not fill, so the count is the
                    * whole array and the rasterizer skips the holes on their
                    * zero area. Only for a batch: a single draw keeps the
@@ -4219,8 +4315,8 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                      rast_args.tri_count = clip_count;
                      rast_num_triangles = max_clipped;
                      if (stable_clip) {
-                        cp->fs_batch.prim_shift = 2;
-                        rast_args.rect_prim_shift = 2;
+                        cp->fs_batch.prim_shift = 3;
+                        rast_args.rect_prim_shift = 3;
                      }
                   } else {
                      fprintf(stderr, "cudapipe: clip launch failed (%d)\n",
@@ -4522,14 +4618,13 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
     */
    /*
     * A segment append can only proceed onto the shared-episode path: no
-    * growth pending (handled between episodes), a fragment array to fill, the
-    * clamp kernel, and compositing mode. Anything else backs out — the
+    * growth pending (handled between episodes), a fragment array to fill, and
+    * compositing mode. Anything else backs out — the
     * caller finishes the episode without this segment and re-executes it
     * classically. The vertex work above is repeated then; the case is rare.
     */
-   if (cp->pass.appending &&
+   if (cp->pass.appending && !cp->pass.opaque &&
        (!abuf || ab->grow_to || !ab->frags || !cp_abuf.composite ||
-        !screen->kernels.abuf_clamp_runs ||
         cp->pass.nsegs >= CP_PASS_MAX_SEGS)) {
       cp->pass.append_failed = true;
       return;
@@ -4603,7 +4698,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       if (cp->pass.appending) {
          cp_pass_record_segment(cp, &aa, &rast_queues, rast_num_triangles,
                                 num_triangles, info, drawid_offset,
-                                batch_draws, draws, vs_ubo_table,
+                                batch_draws, draws, instance_counts, vs_ubo_table,
                                 fs_ubo_table, draw_ids, vb_table, scissors);
          return;
       }
@@ -4645,24 +4740,11 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
        * the per-pixel counts on the host before the fill, and there is no
        * later drain in those modes to read the total in.
        */
-      bool drain_for_count = !ab->frags || !cp_abuf.composite ||
-                             !screen->kernels.abuf_clamp_runs;
+      bool drain_for_count = !ab->frags || !cp_abuf.composite;
 
       if (!drain_for_count) {
-         /*
-          * Since nobody looks, nothing may index the array outside it. The
-          * offsets are a prefix sum, so a count larger than the array leaves
-          * later pixels with runs beginning or ending past its end, and the
-          * sort and the merge index frags + offsets[p] with no bound of their
-          * own. See cp_abuf_clamp_runs — which also records what it cut as
-          * overflow, so the draw this happens to is refused below and rendered
-          * by the peel loop rather than composited short.
-          */
-         unsigned nn = (unsigned)n;
-         void *p[] = { &ab->counts, &ab->offsets, &ab->sum3, &nn,
-                       &ab->capacity, &ab->overflow };
-         CP_LAUNCH(screen->kernels.abuf_clamp_runs, 1024, 1, 1, 256, 1, 1,
-                        0, cp->stream, p, NULL);
+         /* The final prefix-add clamps runs against the fragment array and
+          * records overflow while it already has every offset in registers. */
       } else {
          cuStreamSynchronize(cp->stream);
          cuMemcpyDtoH(&abuf_total, ab->sum3, sizeof(uint32_t));
@@ -4824,25 +4906,8 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       cp_abuf_mark(ab->ev[9], cp->stream);
       cp_abuf_scan_n(cp, screen, ab->blk_counts, ab->blk_offsets, ab->bsum1,
                      ab->bsum1x, ab->bsum2, ab->bsum2x, ab->bsum3, nblocks,
-                     ab->bnb1, ab->bnb2, ab->bnb3);
+                     ab->bnb1, ab->bnb2, ab->bnb3, 0, 0, 0);
       {
-         /* Slots the merge cannot place stay 0xFFFFFFFF and are skipped by the
-          * composite, so a fill that fell short loses a layer rather than
-          * reading whatever the last draw left there. Only the run actually in
-          * use is cleared — by a kernel rather than a memset, because the
-          * length of that run is now only on the device. */
-         if (ab->shade_slot && screen->kernels.abuf_clear_slots) {
-            void *p[] = { &ab->shade_slot, &ab->sum3, &ab->capacity };
-            CP_LAUNCH(screen->kernels.abuf_clear_slots, 1024, 1, 1,
-                           256, 1, 1, 0, cp->stream, p, NULL);
-         } else if (ab->shade_slot) {
-            /* Without it, the whole array: clearing more than the draw uses is
-             * only slower, and clearing less would let the composite read a
-             * slot map the last draw wrote. */
-            cuMemsetD32Async(ab->shade_slot, 0xFFFFFFFF,
-                             abuf_total ? abuf_total : ab->capacity,
-                             cp->stream);
-         }
          void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
                        &ab->blk_list, &ab->blk_list_count, &ab->blk_offsets,
                        &ab->quad_prim, &ab->quad_mask, &ab->peel_mask,
@@ -5041,6 +5106,15 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       cp_nvtx_pop();   /* raster */
       cp_stage_end(cp, CP_STAGE_RASTERIZE);
 
+      if (cp->pass.appending && cp->pass.opaque) {
+         cp_pass_record_segment(cp, &rast_args, &rast_queues,
+                                rast_num_triangles, num_triangles, info,
+                                drawid_offset, batch_draws, draws,
+                                instance_counts, vs_ubo_table, fs_ubo_table, draw_ids,
+                                vb_table, scissors);
+         return;
+      }
+
       /* TEMPORARY: read back the census of this one pass and print it. */
       if (census && pass == 0) {
          size_t bytes = (size_t)w * h * sizeof(uint32_t);
@@ -5092,7 +5166,7 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                             vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
                             retry ? cp->reject : 0,
                             retry ? cp->resolved : 0,
-                            pass);
+                            pass, 0, 0);
 
       if (peel) {
          /* Step past what this pass blended, and stop once the interval finds
@@ -5357,7 +5431,6 @@ cp_batch_build_key(struct cp_context *cp, const struct pipe_draw_info *info,
 
    key->mode = info->mode;
    key->index_size = info->index_size;
-   key->instance_count = info->instance_count;
    key->start_instance = info->start_instance;
    key->index_resource = info->index_size ? info->index.resource : NULL;
    /*
@@ -5428,7 +5501,7 @@ cp_batch_key_report_diff(const struct cp_batch_key *a,
       F(vs), F(fs),
       F(cbuf_texture), F(zs_texture), F(color_data), F(visbuf), F(depthbuf),
       F(fb_w), F(fb_h), F(fb_nr_cbufs), F(fb_samples), F(cbuf_format),
-      F(mode), F(index_size), F(instance_count), F(start_instance),
+      F(mode), F(index_size), F(start_instance),
       F(index_resource),
       F(viewport), F(scissor), F(rasterizer), F(depth_stencil),
       F(blend_state), F(blend_enabled),
@@ -5623,7 +5696,7 @@ cp_batch_eligible(struct cp_context *cp, const struct pipe_draw_info *info,
 static void
 cp_batch_record(struct cp_context *cp,
                 const struct pipe_draw_start_count_bias *draw, unsigned tris,
-                unsigned drawid_offset)
+                unsigned drawid_offset, unsigned instance_count)
 {
    uint64_t *row = cp->batch.vs_ubos +
       (size_t)cp->batch.ndraws * CP_ARG_UBO_STRIDE;
@@ -5664,6 +5737,7 @@ cp_batch_record(struct cp_context *cp,
    }
 
    cp->batch.draws[cp->batch.ndraws] = *draw;
+   cp->batch.instance_counts[cp->batch.ndraws] = instance_count;
    cp->batch.draw_ids[cp->batch.ndraws] = drawid_offset;
    cp->batch.scissors[cp->batch.ndraws] = cp->scissor;
    cp->batch.tris += tris;
@@ -5705,8 +5779,8 @@ cp_pass_appendable(struct cp_context *cp)
        !cp_abuf.composite || cp_abuf.timing || cp_census_enabled())
       return false;
    if (!screen->kernels.abuf_seg_count || !screen->kernels.abuf_seg_scatter ||
-       !screen->kernels.abuf_clamp_runs || !screen->kernels.abuf_composite ||
-       !screen->kernels.abuf_interpolate || !screen->kernels.abuf_quad_fill)
+       !screen->kernels.abuf_composite || !screen->kernels.abuf_interpolate ||
+       !screen->kernels.abuf_quad_fill)
       return false;
    /* The first eligible draw sizes the fragment array with a drain of its
     * own; episodes start once it exists. A pending growth is likewise served
@@ -5746,6 +5820,28 @@ cp_pass_appendable(struct cp_context *cp)
                  "episodes run on the main stream\n");
          memset(cp->seg_streams, 0, sizeof(cp->seg_streams));
       }
+   }
+   return true;
+}
+
+static bool
+cp_opaque_appendable(struct cp_context *cp)
+{
+   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+   if (cp_debug->no_opaque_episode || !cp_batch_order_free(cp) ||
+       !cp->fs_shader || cp->fs_shader->writes_memory ||
+       MAX2(cp->fb_samples, 1u) != 1 || fb->nr_cbufs != 1 ||
+       !fb->cbufs[0].texture ||
+       cp_color_encoding_from_format(fb->cbufs[0].format) < 0)
+      return false;
+   if (cp->pass.opaque &&
+       (cp->pass.nsegs >= CP_PASS_MAX_SEGS ||
+        cp->pass.next_prim > (1u << 30)))
+      return false;
+   if (!cp->pass_segs) {
+      cp->pass_segs = calloc(CP_PASS_MAX_SEGS, sizeof(*cp->pass_segs));
+      if (!cp->pass_segs)
+         return false;
    }
    return true;
 }
@@ -5853,9 +5949,321 @@ cp_pass_fallback(struct cp_context *cp, struct cp_pass_seg *segs,
       cp_pass_seg_restore(cp, sg);
       cp_draw_execute(cp, &sg->info, sg->drawid_offset, sg->draws, 1,
                       sg->ndraws, sg->vs_ubos, sg->fs_ubos, sg->draw_ids,
-                      sg->vb_bases, sg->scissors);
+                      sg->instance_counts, sg->vb_bases, sg->scissors);
    }
    cp_pass_live_restore(cp, &lv);
+}
+
+static void
+cp_opaque_finish(struct cp_context *cp)
+{
+   unsigned nsegs = cp->pass.nsegs;
+   if (!nsegs)
+      return;
+
+   struct cp_pass_seg *segs = cp->pass_segs;
+   unsigned w = cp->pass.w, h = cp->pass.h;
+   cp->pass.nsegs = 0;
+   cp->pass.next_prim = 0;
+   cp->pass.opaque = false;
+
+   uint8_t seg_group[CP_PASS_MAX_SEGS];
+   unsigned group_first[CP_PASS_MAX_SEGS];
+   unsigned ngroups = 0;
+   for (unsigned s = 0; s < nsegs; s++) {
+      unsigned group = ngroups;
+      if (!cp_debug->no_seg_merge) {
+         for (unsigned g = 0; g < ngroups; g++) {
+            struct cp_pass_seg *first = &segs[group_first[g]];
+            if (first->vs == segs[s].vs && first->fs == segs[s].fs &&
+                first->num_fs_ubos == segs[s].num_fs_ubos &&
+                first->info.mode == segs[s].info.mode &&
+                first->ndraws == segs[s].ndraws &&
+                !memcmp(first->fs_ubos, segs[s].fs_ubos,
+                        (size_t)first->ndraws * CP_ARG_UBO_STRIDE *
+                           sizeof(uint64_t))) {
+               group = g;
+               break;
+            }
+         }
+      }
+      if (group == ngroups)
+         group_first[ngroups++] = s;
+      seg_group[s] = (uint8_t)group;
+   }
+
+   if (!cp->pass_group_ubos) {
+      cp->pass_group_ubos =
+         malloc((size_t)CP_PASS_MAX_SEGS * CP_MAX_BATCH_DRAWS *
+                CP_ARG_UBO_STRIDE * sizeof(uint64_t));
+      if (!cp->pass_group_ubos) {
+         cp_pass_fallback(cp, segs, nsegs);
+         return;
+      }
+   }
+
+   struct cp_seg_range ranges[CP_PASS_MAX_SEGS];
+   unsigned group_range_base[CP_PASS_MAX_SEGS];
+   unsigned group_range_count[CP_PASS_MAX_SEGS];
+   unsigned nranges = 0;
+   for (unsigned g = 0; g < ngroups; g++) {
+      unsigned group_rows = 0;
+      group_range_base[g] = nranges;
+      for (unsigned s = 0; s < nsegs; s++) {
+         if (seg_group[s] != g)
+            continue;
+         struct cp_pass_seg *seg = &segs[s];
+         ranges[nranges++] = (struct cp_seg_range) {
+            .positions = seg->rast.positions,
+            .draw_slices = seg->slices_dev,
+            .num_draw_slices = seg->ndraws,
+            .prim_base = seg->prim_base,
+            .prim_end = seg->prim_base + seg->prim_slots,
+            .row_base = group_rows,
+            .prim_shift = seg->prim_shift,
+         };
+         group_rows += seg->ndraws;
+      }
+      group_range_count[g] = nranges - group_range_base[g];
+   }
+   CUdeviceptr ranges_dev = cp_upload(cp, ranges,
+                                      (size_t)nranges * sizeof(ranges[0]));
+   if (!ranges_dev) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+
+   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+   void *color_data = fb->nr_cbufs && fb->cbufs[0].texture
+      ? cp_resource_data(cp_resource(fb->cbufs[0].texture)) : NULL;
+   if (!color_data) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+
+   struct cp_pass_live live;
+   cp_pass_live_save(cp, &live);
+   size_t shade_mark = cp->scratch.used;
+   size_t shade_dmark = cp->dscratch.used;
+   for (unsigned g = 0; g < ngroups; g++) {
+      struct cp_pass_seg *seg = &segs[group_first[g]];
+      unsigned group_rows = 0;
+      for (unsigned s = 0; s < nsegs; s++) {
+         if (seg_group[s] != g)
+            continue;
+         struct cp_pass_seg *member = &segs[s];
+         memcpy(cp->pass_group_ubos +
+                   (size_t)group_rows * CP_ARG_UBO_STRIDE,
+                member->fs_ubos,
+                (size_t)member->ndraws * CP_ARG_UBO_STRIDE *
+                   sizeof(uint64_t));
+         group_rows += member->ndraws;
+      }
+      cp->scratch.used = shade_mark;
+      cp->dscratch.used = shade_dmark;
+      cp_pass_seg_restore(cp, seg);
+      cp->fs_batch.ubos = cp->pass_group_ubos;
+      cp->fs_batch.ndraws = group_rows;
+      cp->fs_batch.slices = seg->slices_dev;
+      cp->fs_batch.prim_shift = seg->prim_shift;
+      cp_shade_fragments(cp, &seg->info, cp->visbuf, seg->rast.positions,
+                         seg->rast.positions, seg->num_triangles, w, h,
+                         color_data, seg->rast.vp_scale_x,
+                         seg->rast.vp_scale_y, seg->rast.vp_trans_x,
+                         seg->rast.vp_trans_y, 0, 0, 0,
+                         ranges_dev + (size_t)group_range_base[g] *
+                            sizeof(ranges[0]),
+                         group_range_count[g]);
+   }
+   cp_pass_live_restore(cp, &live);
+}
+
+static bool
+cp_pass_finish_bounded_groups(struct cp_context *cp,
+                              struct cp_pass_seg *segs,
+                              unsigned nsegs, unsigned w, unsigned h)
+{
+   struct cp_abuf *ab = &cp_abuf;
+   size_t quad_bound = 0;
+
+   for (unsigned s = 0; s < nsegs; s++) {
+      if (segs[s].rast_num_triangles > SIZE_MAX / ab->nblocks ||
+          quad_bound > SIZE_MAX -
+             (size_t)segs[s].rast_num_triangles * ab->nblocks)
+         return false;
+      quad_bound += (size_t)segs[s].rast_num_triangles * ab->nblocks;
+   }
+
+   if (!quad_bound || quad_bound > ab->quad_capacity ||
+       quad_bound > ab->capacity / 4u ||
+       quad_bound > CP_ABUF_MAX_SHADE_SLOTS / 4u)
+      return false;
+
+   uint8_t seg_group[CP_PASS_MAX_SEGS];
+   unsigned group_first[CP_PASS_MAX_SEGS];
+   unsigned ngroups = 0;
+   for (unsigned s = 0; s < nsegs; s++) {
+      unsigned group = ngroups;
+      for (unsigned i = 0; i < ngroups; i++) {
+         struct cp_pass_seg *first = &segs[group_first[i]];
+         if (first->vs == segs[s].vs && first->fs == segs[s].fs &&
+             first->num_fs_ubos == segs[s].num_fs_ubos &&
+             first->info.mode == segs[s].info.mode) {
+            group = i;
+            break;
+         }
+      }
+      if (group == ngroups)
+         group_first[ngroups++] = s;
+      seg_group[s] = group;
+   }
+
+   CUdeviceptr quad_seg = 0;
+   if (ngroups > 1) {
+      quad_seg = cp_scratch_alloc_device(cp, quad_bound);
+      uint32_t seg_prims[CP_PASS_MAX_SEGS];
+      for (unsigned s = 0; s < nsegs; s++)
+         seg_prims[s] = segs[s].prim_base;
+      CUdeviceptr seg_prims_dev = cp_upload(cp, seg_prims, (size_t)nsegs * 4);
+      if (!quad_seg || !seg_prims_dev)
+         return false;
+      struct cp_abuf_seg_args bucket = {
+         .quad_prim = ab->quad_prim,
+         .seg_prim_base = seg_prims_dev,
+         .quad_seg = quad_seg,
+         .num_quads_dev = ab->bsum3,
+         .nsegs = nsegs,
+         .num_quads = quad_bound,
+         .warp_aggregate = false,
+      };
+      void *bucket_params[] = { &bucket };
+      CP_LAUNCH(cp->screen->kernels.abuf_seg_count,
+                MIN2(((unsigned)quad_bound + 255) / 256, 1024u),
+                1, 1, 256, 1, 1, 0, cp->stream, bucket_params, NULL);
+   }
+
+   struct cp_seg_range ranges[CP_PASS_MAX_SEGS];
+   struct cp_seg_desc descs[CP_PASS_MAX_SEGS] = {0};
+   struct cp_abuf_seg_shade group_shades[CP_PASS_MAX_SEGS] = {0};
+   struct cp_pass_live live;
+   cp_pass_live_save(cp, &live);
+   bool shaded = true;
+   for (unsigned group = 0; group < ngroups && shaded; group++) {
+      struct cp_pass_seg *first = &segs[group_first[group]];
+      bool need_rows = first->fs->reads_const_bufs;
+      if (need_rows && !cp->pass_group_ubos) {
+         cp->pass_group_ubos =
+            malloc((size_t)CP_PASS_MAX_SEGS * CP_MAX_BATCH_DRAWS *
+                   CP_ARG_UBO_STRIDE * sizeof(uint64_t));
+         if (!cp->pass_group_ubos) {
+            shaded = false;
+            break;
+         }
+      }
+
+      uint32_t rows = 0;
+      unsigned nranges = 0;
+      for (unsigned s = 0; s < nsegs; s++) {
+         if (seg_group[s] != group)
+            continue;
+         struct cp_pass_seg *seg = &segs[s];
+         ranges[nranges++] = (struct cp_seg_range) {
+            .positions = seg->rast.positions,
+            .draw_slices = seg->slices_dev,
+            .num_draw_slices = seg->ndraws,
+            .prim_base = seg->prim_base,
+            .prim_end = seg->prim_base + seg->prim_slots,
+            .row_base = rows,
+            .prim_shift = seg->prim_shift,
+         };
+         if (need_rows)
+            memcpy(cp->pass_group_ubos + (size_t)rows * CP_ARG_UBO_STRIDE,
+                   seg->fs_ubos,
+                   (size_t)seg->ndraws * CP_ARG_UBO_STRIDE * sizeof(uint64_t));
+         rows += seg->ndraws;
+      }
+      CUdeviceptr ranges_dev =
+         cp_upload(cp, ranges, (size_t)nranges * sizeof(ranges[0]));
+      if (!ranges_dev) {
+         shaded = false;
+         break;
+      }
+
+      cp->vs_shader = first->vs;
+      cp->fs_shader = first->fs;
+      cp->num_fs_ubos = first->num_fs_ubos;
+      cp->fs_batch.ubos = need_rows ? cp->pass_group_ubos : first->fs_ubos;
+      cp->fs_batch.ndraws = rows;
+      cp->fs_batch.slices = first->slices_dev;
+      cp->fs_batch.prim_shift = first->prim_shift;
+      struct cp_abuf_seg_shade shade = {
+         .prim_base = first->prim_base,
+         .ranges = ranges_dev,
+         .num_ranges = nranges,
+      };
+      float ti, ts, tc;
+      shaded = cp_abuf_shade(
+         cp, &first->info, ab, first->rast.positions, first->rast.positions,
+         w, h, first->rast.vp_scale_x, first->rast.vp_scale_y,
+         first->rast.vp_trans_x, first->rast.vp_trans_y,
+         (uint32_t)quad_bound, 0, false, NULL, false, &ti, &ts, &tc, &shade);
+      if (!shaded)
+         break;
+      group_shades[group] = shade;
+      for (unsigned s = 0; s < nsegs; s++) {
+         if (seg_group[s] != group)
+            continue;
+         descs[s] = (struct cp_seg_desc) {
+            .fs_out = shade.fs_out,
+            .coverage = shade.coverage,
+            .discard = shade.discard,
+            .fs_out_stride = shade.fs_out_stride,
+            .num_slots = shade.num_slots,
+            .global_slots = true,
+         };
+      }
+   }
+   cp_pass_live_restore(cp, &live);
+   if (!shaded)
+      return false;
+
+   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+   void *color_data = (fb->nr_cbufs && fb->cbufs[0].texture)
+      ? cp_resource_data(cp_resource(fb->cbufs[0].texture)) : NULL;
+   CUdeviceptr descs_dev = ngroups > 1
+      ? cp_upload(cp, descs, (size_t)nsegs * sizeof(descs[0])) : 0;
+   if (!color_data || (ngroups > 1 && !descs_dev))
+      return false;
+
+   struct cp_abuf_seg_shade *direct = &group_shades[0];
+   struct cp_abuf_composite_args ca = {
+      .offsets = ab->offsets,
+      .counts = ab->counts,
+      .shade_slot = ab->shade_slot,
+      .fs_out = ngroups == 1 ? direct->fs_out : 0,
+      .coverage = ngroups == 1 ? direct->coverage : 0,
+      .discard_mask = ngroups == 1 ? direct->discard : 0,
+      .color_out = (uint64_t)(uintptr_t)color_data,
+      .list = ab->clist,
+      .list_count = ab->clist_count,
+      .fs_out_stride = ngroups == 1 ? direct->fs_out_stride : 0,
+      .num_slots = ngroups == 1 ? direct->num_slots : 0,
+      .capacity = ab->capacity,
+      .color_encoding = (uint32_t)MAX2(
+         cp_color_encoding_from_format(fb->cbufs[0].format), 0),
+      .max_layers = cp_abuf.max_layers,
+      .blend = cp_blend_desc_for(cp),
+      .quad_seg = ngroups > 1 ? quad_seg : 0,
+      .seg_desc = ngroups > 1 ? descs_dev : 0,
+   };
+   void *params[] = { &ca };
+   CUresult err = cuLaunchKernel(cp->screen->kernels.abuf_composite,
+                                 ((size_t)w * h + 255) / 256, 1, 1,
+                                 256, 1, 1, 0, cp->stream, params, NULL);
+   if (err != CUDA_SUCCESS)
+      fprintf(stderr, "abuffer: bounded grouped composite launch failed "
+              "(%d)\n", err);
+   return err == CUDA_SUCCESS;
 }
 
 void
@@ -5867,6 +6275,10 @@ cp_pass_finish(struct cp_context *cp)
 
    if (!nsegs)
       return;
+   if (cp->pass.opaque) {
+      cp_opaque_finish(cp);
+      return;
+   }
 
    /* Cleared first: nothing below may see the episode as still open. */
    cp->pass.nsegs = 0;
@@ -5886,13 +6298,6 @@ cp_pass_finish(struct cp_context *cp)
 
    /* --- scan the accumulated counts, clamp the runs to the array --- */
    cp_abuf_scan(cp, screen, ab, (unsigned)n);
-   {
-      unsigned nn = (unsigned)n;
-      void *p[] = { &ab->counts, &ab->offsets, &ab->sum3, &nn,
-                    &ab->capacity, &ab->overflow };
-      CP_LAUNCH(screen->kernels.abuf_clamp_runs, 1024, 1, 1, 256, 1, 1,
-                     0, cp->stream, p, NULL);
-   }
 
    /* --- fill --- */
    CUstream pass_main = cp->stream;
@@ -5941,20 +6346,37 @@ cp_pass_finish(struct cp_context *cp)
 
    /* --- sort, both worklists --- */
    {
-      unsigned nn = (unsigned)n, min2 = 2;
-      cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
-      void *wp[] = { &ab->counts, &nn, &min2, &ab->list, &ab->list_count };
-      CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
-                     256, 1, 1, 0, cp->stream, wp, NULL);
+      unsigned nn = (unsigned)n;
+      unsigned max_short = cp_debug->abuf_short_sort_max;
+      unsigned min_long = cp_debug->no_abuf_short_sort ? 2 : max_short + 1;
+      if (!cp_debug->no_abuf_short_sort) {
+         cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
+         cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
+         void *ssp[] = { &ab->frags, &ab->offsets, &ab->counts, &nn,
+                         &max_short, &ab->clist, &ab->clist_count,
+                         &min_long, &ab->list, &ab->list_count };
+         CP_LAUNCH(screen->kernels.abuf_sort_short,
+                        MIN2((nn + 255) / 256, 4096u), 1, 1, 256, 1, 1,
+                        0, cp->stream, ssp, NULL);
+      } else {
+         cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
+         void *wp[] = { &ab->counts, &nn, &min_long, &ab->list,
+                        &ab->list_count };
+         CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
+                        256, 1, 1, 0, cp->stream, wp, NULL);
+      }
       void *sp[] = { &ab->frags, &ab->offsets, &ab->counts, &ab->list,
                      &ab->list_count, &ab->long_runs };
       CP_LAUNCH(screen->kernels.abuf_sort, 4096, 1, 1, 256, 1, 1,
                      0, cp->stream, sp, NULL);
-      unsigned min1 = 1;
-      cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
-      void *cw[] = { &ab->counts, &nn, &min1, &ab->clist, &ab->clist_count };
-      CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
-                     256, 1, 1, 0, cp->stream, cw, NULL);
+      if (cp_debug->no_abuf_short_sort) {
+         unsigned min1 = 1;
+         cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
+         void *cw[] = { &ab->counts, &nn, &min1, &ab->clist,
+                        &ab->clist_count };
+         CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
+                        256, 1, 1, 0, cp->stream, cw, NULL);
+      }
    }
 
    /* --- the quad stream --- */
@@ -5978,12 +6400,7 @@ cp_pass_finish(struct cp_context *cp)
    }
    cp_abuf_scan_n(cp, screen, ab->blk_counts, ab->blk_offsets, ab->bsum1,
                   ab->bsum1x, ab->bsum2, ab->bsum2x, ab->bsum3, nblocks,
-                  ab->bnb1, ab->bnb2, ab->bnb3);
-   {
-      void *p[] = { &ab->shade_slot, &ab->sum3, &ab->capacity };
-      CP_LAUNCH(screen->kernels.abuf_clear_slots, 1024, 1, 1,
-                     256, 1, 1, 0, cp->stream, p, NULL);
-   }
+                  ab->bnb1, ab->bnb2, ab->bnb3, 0, 0, 0);
    {
       void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
                     &ab->blk_list, &ab->blk_list_count, &ab->blk_offsets,
@@ -5993,6 +6410,9 @@ cp_pass_finish(struct cp_context *cp)
       CP_LAUNCH(screen->kernels.abuf_quad_fill, 1024, 1, 1, 32, 1, 1,
                      0, cp->stream, p, NULL);
    }
+
+   if (cp_pass_finish_bounded_groups(cp, segs, nsegs, w, h))
+      return;
 
    /* --- bucket the quads by segment, before the drain so the counts ride
     * it --- */
@@ -6014,6 +6434,7 @@ cp_pass_finish(struct cp_context *cp)
       .num_quads_dev = ab->bsum3,
       .nsegs = nsegs,
       .num_quads = (uint32_t)ab->quad_capacity,
+      .warp_aggregate = !cp_debug->no_abuf_warp_bucket,
    };
    {
       void *p[] = { &sa };
@@ -6184,6 +6605,7 @@ cp_pass_finish(struct cp_context *cp)
                .draw_slices = m->slices_dev,
                .num_draw_slices = m->ndraws,
                .prim_base = m->prim_base,
+               .prim_end = m->prim_base + m->prim_slots,
                .row_base = rows,
                .prim_shift = m->prim_shift,
             };
@@ -6294,6 +6716,7 @@ cp_pass_record_segment(struct cp_context *cp,
                        const struct pipe_draw_info *info,
                        unsigned drawid_offset, unsigned ndraws,
                        const struct pipe_draw_start_count_bias *draws,
+                       const uint32_t *instance_counts,
                        const uint64_t *vs_ubo_table,
                        const uint64_t *fs_ubo_table,
                        const uint32_t *draw_ids, const uint64_t *vb_table,
@@ -6316,6 +6739,12 @@ cp_pass_record_segment(struct cp_context *cp,
    sg->drawid_offset = drawid_offset;
    sg->slices_dev = cp->fs_batch.slices;
    memcpy(sg->draws, draws, (size_t)ndraws * sizeof(draws[0]));
+   if (instance_counts)
+      memcpy(sg->instance_counts, instance_counts,
+             (size_t)ndraws * sizeof(instance_counts[0]));
+   else
+      for (unsigned d = 0; d < ndraws; d++)
+         sg->instance_counts[d] = info->instance_count;
    if (draw_ids)
       memcpy(sg->draw_ids, draw_ids, (size_t)ndraws * sizeof(draw_ids[0]));
    if (scissors)
@@ -6353,6 +6782,9 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
    struct cp_abuf *ab = &cp_abuf;
    struct pipe_framebuffer_state *fb = &cp->framebuffer;
 
+   if (cp->pass.nsegs && cp->pass.opaque)
+      cp_pass_finish(cp);
+
    /*
     * Episode start: size the per-pixel arrays for this framebuffer and clear
     * the shared lists once, on the main stream, with the gate event recorded
@@ -6365,7 +6797,8 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
          cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
                          cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
                          cp->batch.fs_ubos, cp->batch.draw_ids,
-                         cp->batch.vb_bases, cp->batch.scissors);
+                         cp->batch.instance_counts, cp->batch.vb_bases,
+                         cp->batch.scissors);
          return;
       }
       cuMemsetD32Async(ab->counts, 0, (size_t)w * h, cp->stream);
@@ -6389,7 +6822,8 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
    cp->pass.append_failed = false;
    cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
                    cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
-                   cp->batch.fs_ubos, cp->batch.draw_ids, cp->batch.vb_bases,
+                   cp->batch.fs_ubos, cp->batch.draw_ids,
+                   cp->batch.instance_counts, cp->batch.vb_bases,
                    cp->batch.scissors);
    cp->pass.appending = false;
    cp->stream = saved_stream;
@@ -6406,7 +6840,48 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
       cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
                       cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
                       cp->batch.fs_ubos, cp->batch.draw_ids,
-                      cp->batch.vb_bases, cp->batch.scissors);
+                      cp->batch.instance_counts, cp->batch.vb_bases,
+                      cp->batch.scissors);
+   }
+}
+
+static void
+cp_opaque_append(struct cp_context *cp, unsigned ndraws)
+{
+   if (cp->pass.nsegs && !cp->pass.opaque)
+      cp_pass_finish(cp);
+   if (cp->pass.nsegs >= CP_PASS_MAX_SEGS) {
+      cp_pass_finish(cp);
+   }
+
+   if (!cp->pass.nsegs) {
+      struct pipe_framebuffer_state *fb = &cp->framebuffer;
+      cp->pass.opaque = true;
+      cp->pass.w = fb->width;
+      cp->pass.h = fb->height;
+      cp->pass.next_prim = 0;
+      cuMemsetD32Async(cp->visbuf, 0xFFFFFFFF,
+                       (size_t)fb->width * fb->height * 2,
+                       cp->stream);
+   }
+
+   unsigned before = cp->pass.nsegs;
+   cp->pass.appending = true;
+   cp->pass.append_failed = false;
+   cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
+                   cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
+                   cp->batch.fs_ubos, cp->batch.draw_ids,
+                   cp->batch.instance_counts, cp->batch.vb_bases,
+                   cp->batch.scissors);
+   cp->pass.appending = false;
+
+   if (cp->pass.append_failed || cp->pass.nsegs == before) {
+      cp_pass_finish(cp);
+      cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
+                      cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
+                      cp->batch.fs_ubos, cp->batch.draw_ids,
+                      cp->batch.instance_counts, cp->batch.vb_bases,
+                      cp->batch.scissors);
    }
 }
 
@@ -6458,12 +6933,17 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
       cp_pass_append(cp, ndraws);
       return;
    }
+   if (!blended && cp_opaque_appendable(cp)) {
+      cp_opaque_append(cp, ndraws);
+      return;
+   }
 
    /* Whatever the episode holds was submitted before these draws. */
    cp_pass_finish(cp);
    cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
                    cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
-                   cp->batch.fs_ubos, cp->batch.draw_ids, cp->batch.vb_bases,
+                   cp->batch.fs_ubos, cp->batch.draw_ids,
+                   cp->batch.instance_counts, cp->batch.vb_bases,
                    cp->batch.scissors);
 }
 
@@ -6571,7 +7051,8 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
             why = "the triangle cap";
 
          if (!why) {
-            cp_batch_record(cp, &draws[0], tris, drawid_offset);
+            cp_batch_record(cp, &draws[0], tris, drawid_offset,
+                            info->instance_count);
             return;
          }
          cp_batch_flush_defer_why(cp, why);
@@ -6585,13 +7066,14 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
       /* Set before the first row is recorded: cp_batch_record() reads it to
        * decide whether the fragment bindings have to be snapshotted too. */
       cp->batch.blended = blended;
-      cp_batch_record(cp, &draws[0], tris, drawid_offset);
+      cp_batch_record(cp, &draws[0], tris, drawid_offset,
+                      info->instance_count);
       return;
    }
 
    cp_batch_flush_why(cp, "the next draw cannot be batched");
    cp_draw_execute(cp, info, drawid_offset, draws, num_draws, 1, NULL, NULL,
-                   NULL, NULL, NULL);
+                   NULL, NULL, NULL, NULL);
 }
 
 static void
@@ -6982,7 +7464,7 @@ cp_create_fs_state(struct pipe_context *ctx,
 
    struct cp_shader_binary *bin = cp_compile_nir_to_ptx(nir,
       cp->screen->sm_major, cp->screen->sm_minor,
-      cp->screen->kernels.sampler_ptx);
+      cp->screen->kernels.sampler_ptx, cp->screen->kernels.fs_helper_ptx);
    if (!bin)
       bin = CALLOC_STRUCT(cp_shader_binary);
    return bin;
@@ -7028,7 +7510,7 @@ cp_create_vs_state(struct pipe_context *ctx,
 
    struct cp_shader_binary *bin = cp_compile_nir_to_ptx(nir,
       cp->screen->sm_major, cp->screen->sm_minor,
-      cp->screen->kernels.sampler_ptx);
+      cp->screen->kernels.sampler_ptx, NULL);
    if (!bin)
       bin = CALLOC_STRUCT(cp_shader_binary);
    return bin;
@@ -7080,7 +7562,7 @@ cp_create_compute_state(struct pipe_context *ctx,
    struct nir_shader *nir = (struct nir_shader *)state->prog;
    struct cp_shader_binary *bin = cp_compile_nir_to_ptx(nir,
       cp->screen->sm_major, cp->screen->sm_minor,
-      cp->screen->kernels.sampler_ptx);
+      cp->screen->kernels.sampler_ptx, NULL);
    if (!bin) {
       /* Return empty binary so lavapipe doesn't get NULL */
       bin = CALLOC_STRUCT(cp_shader_binary);

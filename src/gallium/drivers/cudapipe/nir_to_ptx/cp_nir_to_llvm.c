@@ -1479,6 +1479,17 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
                              (w == 16) ? LLVMHalfTypeInContext(ctx->llvm_ctx) :
                                          LLVMFloatTypeInContext(ctx->llvm_ctx);
             src[i] = LLVMBuildBitCast(ctx->builder, src[i], ft, "");
+         } else if (src[i] &&
+                    LLVMGetTypeKind(LLVMTypeOf(src[i])) == LLVMVectorTypeKind &&
+                    LLVMGetTypeKind(LLVMGetElementType(LLVMTypeOf(src[i]))) ==
+                       LLVMIntegerTypeKind) {
+            LLVMTypeRef elem = LLVMGetElementType(LLVMTypeOf(src[i]));
+            unsigned w = LLVMGetIntTypeWidth(elem);
+            LLVMTypeRef ft = (w == 64) ? LLVMDoubleTypeInContext(ctx->llvm_ctx) :
+                             (w == 16) ? LLVMHalfTypeInContext(ctx->llvm_ctx) :
+                                         LLVMFloatTypeInContext(ctx->llvm_ctx);
+            src[i] = LLVMBuildBitCast(ctx->builder, src[i],
+               LLVMVectorType(ft, LLVMGetVectorSize(LLVMTypeOf(src[i]))), "");
          }
       }
    }
@@ -1676,6 +1687,34 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    case nir_op_f2u32:
       result = LLVMBuildFPToUI(ctx->builder, src[0], get_llvm_type(ctx, 32, 1), "");
       break;
+   case nir_op_f2f32: {
+      LLVMTypeRef st = LLVMTypeOf(src[0]);
+      LLVMTypeRef elem = LLVMGetTypeKind(st) == LLVMVectorTypeKind
+         ? LLVMGetElementType(st) : st;
+      LLVMTypeKind kind = LLVMGetTypeKind(elem);
+      LLVMTypeRef f32 = LLVMFloatTypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef out = num_comp > 1 ? LLVMVectorType(f32, num_comp) : f32;
+      if (kind == LLVMHalfTypeKind)
+         result = LLVMBuildFPExt(ctx->builder, src[0], out, "");
+      else if (kind == LLVMDoubleTypeKind)
+         result = LLVMBuildFPTrunc(ctx->builder, src[0], out, "");
+      else
+         result = src[0];
+      break;
+   }
+   case nir_op_unpack_32_2x16: {
+      LLVMTypeRef i16 = LLVMInt16TypeInContext(ctx->llvm_ctx);
+      LLVMValueRef lo = LLVMBuildTrunc(ctx->builder, src[0], i16, "");
+      LLVMValueRef hi32 = LLVMBuildLShr(ctx->builder, src[0],
+         LLVMConstInt(i32, 16, false), "");
+      LLVMValueRef hi = LLVMBuildTrunc(ctx->builder, hi32, i16, "");
+      result = LLVMGetUndef(LLVMVectorType(i16, 2));
+      result = LLVMBuildInsertElement(ctx->builder, result, lo,
+         LLVMConstInt(i32, 0, false), "");
+      result = LLVMBuildInsertElement(ctx->builder, result, hi,
+         LLVMConstInt(i32, 1, false), "");
+      break;
+   }
    case nir_op_i2i64:
       result = LLVMBuildSExt(ctx->builder, src[0], get_llvm_type(ctx, 64, 1), "");
       break;
@@ -1862,6 +1901,41 @@ emit_load_const(struct ntl_context *ctx, nir_load_const_instr *instr)
    }
 }
 
+static int32_t
+cp_tex_flags(const nir_tex_instr *tex)
+{
+   int32_t flags;
+   switch (tex->sampler_dim) {
+   case GLSL_SAMPLER_DIM_1D:
+      flags = tex->is_array ? CP_TEX_1D_ARRAY : CP_TEX_1D;
+      break;
+   case GLSL_SAMPLER_DIM_3D:
+      flags = CP_TEX_3D;
+      break;
+   case GLSL_SAMPLER_DIM_CUBE:
+      flags = tex->is_array ? CP_TEX_CUBE_ARRAY : CP_TEX_CUBE;
+      break;
+   case GLSL_SAMPLER_DIM_2D:
+   case GLSL_SAMPLER_DIM_RECT:
+   case GLSL_SAMPLER_DIM_EXTERNAL:
+   case GLSL_SAMPLER_DIM_MS:
+      flags = tex->is_array ? CP_TEX_2D_ARRAY : CP_TEX_2D;
+      break;
+   default:
+      flags = -1;
+      break;
+   }
+
+   if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
+      flags |= CP_TEX_FETCH;
+   else if (tex->op == nir_texop_txl)
+      flags |= CP_TEX_LOD;
+   else if (tex->op == nir_texop_txb)
+      flags |= CP_TEX_BIAS;
+
+   return flags;
+}
+
 /*
  * Texture sampling.
  *
@@ -1899,35 +1973,7 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
       }
    }
 
-   /* Map the sampler dimensionality onto what the sampler understands. */
-   int32_t flags;
-   switch (tex->sampler_dim) {
-   case GLSL_SAMPLER_DIM_1D:
-      flags = tex->is_array ? CP_TEX_1D_ARRAY : CP_TEX_1D;
-      break;
-   case GLSL_SAMPLER_DIM_3D:
-      flags = CP_TEX_3D;
-      break;
-   case GLSL_SAMPLER_DIM_CUBE:
-      flags = tex->is_array ? CP_TEX_CUBE_ARRAY : CP_TEX_CUBE;
-      break;
-   case GLSL_SAMPLER_DIM_2D:
-   case GLSL_SAMPLER_DIM_RECT:
-   case GLSL_SAMPLER_DIM_EXTERNAL:
-   case GLSL_SAMPLER_DIM_MS:
-      flags = tex->is_array ? CP_TEX_2D_ARRAY : CP_TEX_2D;
-      break;
-   default:
-      flags = -1;
-      break;
-   }
-
-   if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
-      flags |= CP_TEX_FETCH;
-   else if (tex->op == nir_texop_txl)
-      flags |= CP_TEX_LOD;
-   else if (tex->op == nir_texop_txb)
-      flags |= CP_TEX_BIAS;
+   int32_t flags = cp_tex_flags(tex);
 
    bool supported = flags >= 0 && tex_handle && coord &&
       (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
@@ -2076,6 +2122,81 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
                                       LLVMConstInt(i32, c, false), "");
       }
       set_ssa_def(ctx, &tex->def, vec);
+   }
+}
+
+static bool
+capture_tex_desc_ref(nir_tex_instr *tex, struct cp_tex_desc_ref *ref)
+{
+   nir_src *handle = NULL;
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type == nir_tex_src_sampler_handle) {
+         handle = &tex->src[i].src;
+         break;
+      }
+   }
+   if (!handle)
+      return false;
+
+   nir_instr *parent = nir_def_instr(handle->ssa);
+   if (parent->type != nir_instr_type_alu ||
+       nir_instr_as_alu(parent)->op != nir_op_iadd)
+      return false;
+   nir_alu_instr *add = nir_instr_as_alu(parent);
+   nir_src *base_src = NULL, *offset_src = NULL;
+   for (unsigned i = 0; i < 2; i++) {
+      nir_src *src = &add->src[i].src;
+      nir_instr *src_parent = nir_def_instr(src->ssa);
+      if (nir_src_is_const(*src))
+         offset_src = src;
+      else if (src_parent->type == nir_instr_type_intrinsic &&
+               nir_instr_as_intrinsic(src_parent)->intrinsic ==
+                  nir_intrinsic_load_const_buf_base_addr_lvp)
+         base_src = src;
+   }
+   if (!base_src || !offset_src)
+      return false;
+   nir_intrinsic_instr *base =
+      nir_instr_as_intrinsic(nir_def_instr(base_src->ssa));
+   if (!nir_src_is_const(base->src[0]))
+      return false;
+
+   ref->ubo_slot = nir_src_as_uint(base->src[0]);
+   ref->sampler_offset = nir_src_as_uint(*offset_src);
+   return true;
+}
+
+static void
+capture_tex_desc_refs(struct nir_shader *nir, struct cp_shader_binary *bin)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            int32_t flags = cp_tex_flags(tex);
+            bool sampled = flags >= 0 &&
+               (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
+                tex->op == nir_texop_txb);
+            if (!sampled)
+               continue;
+            struct cp_tex_desc_ref ref = { .flags = flags };
+            if (!capture_tex_desc_ref(tex, &ref)) {
+               bin->tex_descs_dynamic = true;
+               continue;
+            }
+            bool seen = false;
+            for (unsigned i = 0; i < bin->num_tex_descs; i++) {
+               seen |= bin->tex_descs[i].ubo_slot == ref.ubo_slot &&
+                       bin->tex_descs[i].sampler_offset == ref.sampler_offset;
+            }
+            if (!seen && bin->num_tex_descs < CP_MAX_TEX_DESCS)
+               bin->tex_descs[bin->num_tex_descs++] = ref;
+            else if (!seen)
+               bin->tex_descs_dynamic = true;
+         }
+      }
    }
 }
 
@@ -2284,6 +2405,35 @@ emit_function(struct ntl_context *ctx)
 
       LLVMPositionBuilderAtEnd(ctx->builder, body);
       ctx->virtual_bid = vbid_phi;
+
+      if (ctx->nir->info.stage == MESA_SHADER_FRAGMENT) {
+         LLVMTypeRef i8_ptr = LLVMPointerType(
+            LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+         LLVMValueRef interp = cp_arg_slot(ctx, CP_ARG_SLOT_FUSED_INTERP);
+         LLVMValueRef enabled = LLVMBuildICmp(ctx->builder, LLVMIntNE, interp,
+            LLVMConstNull(i8_ptr), "fused_interp_enabled");
+         LLVMBasicBlockRef call_interp = LLVMAppendBasicBlockInContext(
+            ctx->llvm_ctx, ctx->function, "fused_interp");
+         LLVMBasicBlockRef after_interp = LLVMAppendBasicBlockInContext(
+            ctx->llvm_ctx, ctx->function, "fused_interp_done");
+         LLVMBuildCondBr(ctx->builder, enabled, call_interp, after_interp);
+
+         LLVMPositionBuilderAtEnd(ctx->builder, call_interp);
+         LLVMTypeRef params[] = { i8_ptr, i32_t };
+         LLVMTypeRef helper_type = LLVMFunctionType(i32_t, params, 2, false);
+         LLVMValueRef helper = LLVMGetNamedFunction(
+            ctx->module, "cp_abuf_interpolate_lane");
+         if (!helper)
+            helper = LLVMAddFunction(ctx->module, "cp_abuf_interpolate_lane",
+                                     helper_type);
+         LLVMValueRef helper_args[] = { interp, vid };
+         LLVMValueRef valid = LLVMBuildCall2(ctx->builder, helper_type, helper,
+                                              helper_args, 2, "interp_valid");
+         valid = LLVMBuildICmp(ctx->builder, LLVMIntNE, valid,
+                              LLVMConstInt(i32_t, 0, false), "");
+         LLVMBuildCondBr(ctx->builder, valid, after_interp, stride_latch);
+         LLVMPositionBuilderAtEnd(ctx->builder, after_interp);
+      }
 
       /*
        * Helper invocations, for a fragment shader that writes memory.
@@ -2525,7 +2675,8 @@ capture_io_locations(struct nir_shader *nir, struct cp_shader_binary *bin)
  */
 static CUresult
 load_shader_module(CUmodule *module, const char *shader_ptx,
-                   const char *sampler_ptx, int max_regs)
+                   const char *sampler_ptx, const char *fs_helper_ptx,
+                   int max_regs)
 {
    CUjit_option jit_opts[1];
    void *jit_vals[1];
@@ -2536,7 +2687,7 @@ load_shader_module(CUmodule *module, const char *shader_ptx,
       num_jit++;
    }
 
-   if (!sampler_ptx)
+   if (!sampler_ptx && !fs_helper_ptx)
       return cuModuleLoadDataEx(module, shader_ptx, num_jit, jit_opts,
                                 jit_vals);
 
@@ -2545,8 +2696,14 @@ load_shader_module(CUmodule *module, const char *shader_ptx,
    if (err != CUDA_SUCCESS)
       return err;
 
-   err = cuLinkAddData(link, CU_JIT_INPUT_PTX, (void *)sampler_ptx,
-                       strlen(sampler_ptx) + 1, "cp_sampler.ptx", 0, NULL, NULL);
+   if (sampler_ptx)
+      err = cuLinkAddData(link, CU_JIT_INPUT_PTX, (void *)sampler_ptx,
+                          strlen(sampler_ptx) + 1, "cp_sampler.ptx", 0,
+                          NULL, NULL);
+   if (err == CUDA_SUCCESS && fs_helper_ptx)
+      err = cuLinkAddData(link, CU_JIT_INPUT_PTX, (void *)fs_helper_ptx,
+                          strlen(fs_helper_ptx) + 1, "cp_fs_helper.ptx", 0,
+                          NULL, NULL);
    if (err == CUDA_SUCCESS)
       err = cuLinkAddData(link, CU_JIT_INPUT_PTX, (void *)shader_ptx,
                           strlen(shader_ptx) + 1, "shader.ptx", 0, NULL, NULL);
@@ -2582,6 +2739,67 @@ measure_shader_cost(CUfunction fn, struct cp_shader_cost *cost)
                                                CP_SHADER_BLOCK_THREADS, 0);
 }
 
+bool
+cp_shader_build_sampler_variant(struct cp_shader_binary *bin,
+                                const char *sampler_ptx,
+                                const struct cp_sampler_info *states,
+                                unsigned num_states)
+{
+   if (!bin || !sampler_ptx || !states || !num_states ||
+       bin->num_sampler_variants >= CP_MAX_SAMPLER_VARIANTS)
+      return false;
+   if (cp_shader_find_sampler_variant(bin, states, num_states))
+      return true;
+
+   CUmodule module = NULL;
+   CUfunction kernel = NULL;
+   if (load_shader_module(&module, bin->ptx_text, sampler_ptx,
+                          bin->fs_helper_ptx,
+                          bin->reg_cap) != CUDA_SUCCESS)
+      return false;
+   if (cuModuleGetFunction(&kernel, module, "main") != CUDA_SUCCESS) {
+      cuModuleUnload(module);
+      return false;
+   }
+
+   struct cp_shader_cost cost;
+   measure_shader_cost(kernel, &cost);
+   struct cp_sampler_variant *variant =
+      &bin->sampler_variants[bin->num_sampler_variants];
+   variant->states = malloc((size_t)num_states * sizeof(*states));
+   if (!variant->states) {
+      cuModuleUnload(module);
+      return false;
+   }
+   memcpy(variant->states, states, (size_t)num_states * sizeof(*states));
+   variant->num_states = num_states;
+   variant->module = module;
+   variant->kernel = kernel;
+   variant->regs = cost.regs;
+   variant->spill_bytes = cost.spill;
+   variant->last_sampler_table = ~(uint64_t)0;
+   variant->last_quad_derivs = -1;
+   bin->num_sampler_variants++;
+   return true;
+}
+
+struct cp_sampler_variant *
+cp_shader_find_sampler_variant(struct cp_shader_binary *bin,
+                               const struct cp_sampler_info *states,
+                               unsigned num_states)
+{
+   if (!bin || !states || !num_states)
+      return NULL;
+   for (unsigned i = 0; i < bin->num_sampler_variants; i++) {
+      struct cp_sampler_variant *variant = &bin->sampler_variants[i];
+      if (variant->num_states == num_states &&
+          !memcmp(variant->states, states,
+                  (size_t)num_states * sizeof(*states)))
+         return &bin->sampler_variants[i];
+   }
+   return NULL;
+}
+
 /* Rebuild an already-loaded shader with a different register cap, in place.
  *
  * This is the compile-time shape of the policy — CUDAPIPE_REGCAP_STATIC — and
@@ -2603,6 +2821,7 @@ cp_shader_set_reg_cap(struct cp_shader_binary *bin, int max_regs)
    CUmodule mod = NULL;
    CUfunction fn = NULL;
    if (load_shader_module(&mod, bin->ptx_text, bin->sampler_ptx,
+                          bin->fs_helper_ptx,
                           max_regs) != CUDA_SUCCESS)
       return false;
    if (cuModuleGetFunction(&fn, mod, "main") != CUDA_SUCCESS) {
@@ -2673,7 +2892,8 @@ cp_shader_set_reg_cap(struct cp_shader_binary *bin, int max_regs)
  */
 static CUresult
 load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
-                         const char *sampler_ptx, bool is_fragment,
+                         const char *sampler_ptx, const char *fs_helper_ptx,
+                         bool is_fragment,
                          const char *stage)
 {
    const int forced = (int)cp_debug->max_registers;
@@ -2682,8 +2902,10 @@ load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
    const bool stats = cp_debug->shader_stats;
 
    bin->sampler_ptx = sampler_ptx;
+   bin->fs_helper_ptx = fs_helper_ptx;
 
-   CUresult err = load_shader_module(&bin->module, ptx, sampler_ptx, forced);
+   CUresult err = load_shader_module(&bin->module, ptx, sampler_ptx,
+                                     fs_helper_ptx, forced);
    if (err != CUDA_SUCCESS)
       return err;
    err = cuModuleGetFunction(&bin->kernel, bin->module, "main");
@@ -2755,7 +2977,7 @@ load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
    CUmodule alt = NULL;
    CUfunction alt_fn = NULL;
    struct cp_shader_cost alt_cost = {0};
-   if (load_shader_module(&alt, ptx, sampler_ptx, cap) == CUDA_SUCCESS &&
+   if (load_shader_module(&alt, ptx, sampler_ptx, fs_helper_ptx, cap) == CUDA_SUCCESS &&
        cuModuleGetFunction(&alt_fn, alt, "main") == CUDA_SUCCESS) {
       measure_shader_cost(alt_fn, &alt_cost);
    } else if (alt) {
@@ -2844,7 +3066,7 @@ cp_nir_writes_memory(struct nir_shader *nir)
 
 struct cp_shader_binary *
 cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
-                      const char *sampler_ptx)
+                      const char *sampler_ptx, const char *fs_helper_ptx)
 {
    struct ntl_context ctx = {0};
    ctx.nir = nir;
@@ -2856,6 +3078,8 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    /* After the lowering, which is the NIR the prologue below is generated
     * for and the NIR the flag on the binary has to describe. */
    ctx.writes_memory = cp_nir_writes_memory(nir);
+   struct cp_shader_binary tex_meta = {0};
+   capture_tex_desc_refs(nir, &tex_meta);
 
    /* Convert from SSA to reg form to eliminate phi nodes */
    nir_convert_from_ssa(nir, true, false);
@@ -2976,6 +3200,10 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    bin->reads_const_bufs = ctx.reads_const_bufs;
    bin->writes_memory = ctx.writes_memory;
 
+   bin->num_tex_descs = tex_meta.num_tex_descs;
+   memcpy(bin->tex_descs, tex_meta.tex_descs, sizeof(bin->tex_descs));
+   bin->tex_descs_dynamic = tex_meta.tex_descs_dynamic;
+
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -3015,6 +3243,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    bool needs_sampler = (ctx.uses_tex || ctx.needs_link) && sampler_ptx;
    CUresult err = load_shader_module_tuned(bin, ptx,
                                            needs_sampler ? sampler_ptx : NULL,
+                                           fs_helper_ptx,
                                            nir->info.stage == MESA_SHADER_FRAGMENT,
                                            mesa_shader_stage_name(nir->info.stage));
 
@@ -3038,6 +3267,11 @@ cp_shader_binary_destroy(struct cp_shader_binary *bin)
       cuModuleUnload(bin->module);
    if (bin->alt_module)
       cuModuleUnload(bin->alt_module);
+   for (unsigned i = 0; i < bin->num_sampler_variants; i++) {
+      if (bin->sampler_variants[i].module)
+         cuModuleUnload(bin->sampler_variants[i].module);
+      free(bin->sampler_variants[i].states);
+   }
    free(bin->ptx_text);
    FREE(bin);
 }

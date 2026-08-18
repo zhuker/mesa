@@ -136,7 +136,6 @@ cp_resource_create_unbacked(struct pipe_screen *screen,
                             const struct pipe_resource *tmpl,
                             uint64_t *size_required)
 {
-   struct cp_screen *cp = (struct cp_screen *)screen;
    struct cp_resource *res = CALLOC_STRUCT(cp_resource);
    if (!res)
       return NULL;
@@ -193,7 +192,7 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
    if (!(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) &&
        !(usage & PIPE_MAP_DISCARD_RANGE)) {
       cuCtxSetCurrent(cp->screen->cuda_ctx);
-      cuCtxSynchronize();
+      cuStreamSynchronize(cp->stream);
    }
 
    transfer->resource = resource;
@@ -273,7 +272,6 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
    unsigned dst_img_stride = dst_res->lpr.img_stride[dst_level];
 
    cuCtxSetCurrent(cp->screen->cuda_ctx);
-   cuCtxSynchronize();
 
    /*
     * Each mip level sits at its own offset inside the resource. Leaving that
@@ -285,18 +283,35 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
    unsigned src_off = src_res->lpr.mip_offsets[src_level];
    unsigned dst_off = dst_res->lpr.mip_offsets[dst_level];
 
-   for (int z = 0; z < src_box->depth; z++) {
-      char *s = (char *)src_data + src_off +
-                (src_box->z + z) * src_img_stride +
-                src_by * src_stride +
-                src_bx * block_size;
-      char *d = (char *)dst_data + dst_off +
-                (dstz + z) * dst_img_stride +
-                dst_by * dst_stride +
-                dst_bx * block_size;
-      unsigned row_bytes = blocks_w * block_size;
-      for (unsigned y = 0; y < blocks_h; y++) {
-         memcpy(d + y * dst_stride, s + y * src_stride, row_bytes);
+   if (src_res->cuda_managed && dst_res->cuda_managed) {
+      for (int z = 0; z < src_box->depth; z++) {
+         CUDA_MEMCPY2D copy = {0};
+         copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+         copy.srcDevice = (CUdeviceptr)(uintptr_t)src_data + src_off +
+                          (src_box->z + z) * src_img_stride +
+                          src_by * src_stride + src_bx * block_size;
+         copy.srcPitch = src_stride;
+         copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+         copy.dstDevice = (CUdeviceptr)(uintptr_t)dst_data + dst_off +
+                          (dstz + z) * dst_img_stride +
+                          dst_by * dst_stride + dst_bx * block_size;
+         copy.dstPitch = dst_stride;
+         copy.WidthInBytes = blocks_w * block_size;
+         copy.Height = blocks_h;
+         cuMemcpy2DAsync(&copy, cp->stream);
+      }
+   } else {
+      cuCtxSynchronize();
+      for (int z = 0; z < src_box->depth; z++) {
+         char *s = (char *)src_data + src_off +
+                   (src_box->z + z) * src_img_stride +
+                   src_by * src_stride + src_bx * block_size;
+         char *d = (char *)dst_data + dst_off +
+                   (dstz + z) * dst_img_stride +
+                   dst_by * dst_stride + dst_bx * block_size;
+         unsigned row_bytes = blocks_w * block_size;
+         for (unsigned y = 0; y < blocks_h; y++)
+            memcpy(d + y * dst_stride, s + y * src_stride, row_bytes);
       }
    }
 }
@@ -409,7 +424,7 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
             copy.dstPitch = dst_stride;
             copy.WidthInBytes = bw * src_pixel_size;
             copy.Height = bh;
-            cuMemcpy2D(&copy);
+            cuMemcpy2DAsync(&copy, cp->stream);
          }
       } else {
          cuCtxSynchronize();
@@ -1108,6 +1123,84 @@ cp_arena_stats_dump(void)
 
 static uint64_t cp_arena_seen;
 
+#define CP_MANAGED_CACHE_MIN       256u
+#define CP_MANAGED_CACHE_MAX       (4u * 1024u * 1024u)
+#define CP_MANAGED_CACHE_BYTES_MAX ((size_t)512u * 1024u * 1024u)
+#define CP_MANAGED_CACHE_ENTRIES   4096u
+
+struct cp_managed_cache_entry {
+   CUdeviceptr ptr;
+   uint32_t size;
+   bool free;
+};
+
+static struct {
+   struct cp_managed_cache_entry entries[CP_MANAGED_CACHE_ENTRIES];
+   unsigned count;
+   size_t bytes;
+} cp_managed_cache;
+
+static uint32_t
+cp_managed_cache_size(uint64_t size)
+{
+   if (size < CP_MANAGED_CACHE_MIN || size > CP_MANAGED_CACHE_MAX)
+      return 0;
+   uint32_t rounded = CP_MANAGED_CACHE_MIN;
+   while (rounded < size)
+      rounded <<= 1;
+   return rounded;
+}
+
+static CUdeviceptr
+cp_managed_cache_take(uint32_t size)
+{
+   CUdeviceptr ptr = 0;
+   simple_mtx_lock(&cp_arena.lock);
+   for (unsigned i = 0; i < cp_managed_cache.count; i++) {
+      struct cp_managed_cache_entry *entry = &cp_managed_cache.entries[i];
+      if (entry->free && entry->size == size) {
+         entry->free = false;
+         ptr = entry->ptr;
+         break;
+      }
+   }
+   simple_mtx_unlock(&cp_arena.lock);
+   return ptr;
+}
+
+static bool
+cp_managed_cache_add(CUdeviceptr ptr, uint32_t size)
+{
+   bool added = false;
+   simple_mtx_lock(&cp_arena.lock);
+   if (cp_managed_cache.count < CP_MANAGED_CACHE_ENTRIES &&
+       cp_managed_cache.bytes + size <= CP_MANAGED_CACHE_BYTES_MAX) {
+      cp_managed_cache.entries[cp_managed_cache.count++] =
+         (struct cp_managed_cache_entry) { ptr, size, false };
+      cp_managed_cache.bytes += size;
+      added = true;
+   }
+   simple_mtx_unlock(&cp_arena.lock);
+   return added;
+}
+
+static bool
+cp_managed_cache_put(CUdeviceptr ptr)
+{
+   bool found = false;
+   simple_mtx_lock(&cp_arena.lock);
+   for (unsigned i = 0; i < cp_managed_cache.count; i++) {
+      struct cp_managed_cache_entry *entry = &cp_managed_cache.entries[i];
+      if (entry->ptr == ptr) {
+         entry->free = true;
+         found = true;
+         break;
+      }
+   }
+   simple_mtx_unlock(&cp_arena.lock);
+   return found;
+}
+
 static uint64_t
 cp_arena_warmup(void)
 {
@@ -1296,6 +1389,15 @@ cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
       /* Out of arena; fall through to the allocator that was always here. */
    }
 
+   uint32_t cached_size = cp_managed_cache_size(size);
+   if (cached_size) {
+      dev = cp_managed_cache_take(cached_size);
+      if (dev) {
+         cp_zero_managed(dev, size);
+         return (struct pipe_memory_allocation *)(uintptr_t)dev;
+      }
+   }
+
    /*
     * Nobody up the stack checks this. lavapipe takes the result straight to
     * memset() in lvp_descriptor_set_create(), so a failure here arrives as a
@@ -1303,12 +1405,15 @@ cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
     * exactly how a sticky CUDA_ERROR_ILLEGAL_ADDRESS from some earlier kernel
     * presented, three frames removed from the kernel that caused it.
     */
-   CUresult err = cuMemAllocManaged(&dev, size, CU_MEM_ATTACH_GLOBAL);
+   CUresult err = cuMemAllocManaged(&dev, cached_size ? cached_size : size,
+                                    CU_MEM_ATTACH_GLOBAL);
    if (err != CUDA_SUCCESS) {
       CP_CU_WARN(err, "cuMemAllocManaged for VkDeviceMemory");
       return NULL;
    }
 
+   if (cached_size && !cp_managed_cache_add(dev, cached_size))
+      cached_size = 0;
    cp_zero_managed(dev, size);
    return (struct pipe_memory_allocation *)(uintptr_t)dev;
 }
@@ -1322,6 +1427,9 @@ cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
       return;
 
    if (cp_arena_free((void *)mem))
+      return;
+
+   if (cp_managed_cache_put((CUdeviceptr)(uintptr_t)mem))
       return;
 
    cuCtxSetCurrent(cp->cuda_ctx);

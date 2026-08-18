@@ -1,6 +1,7 @@
 #include "cp_kernels.h"
 #include "cp_debug.h"
 #include "cp_screen.h"
+#include "kernels/cp_rast_types.h"
 #include "util/u_memory.h"
 #include "util/macros.h"
 
@@ -159,6 +160,51 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
    return ptx;
 }
 
+char *
+cp_compile_sampler_variant(struct cp_screen *screen,
+                           const struct cp_sampler_info *info)
+{
+   uint32_t bits[8];
+   memcpy(&bits[0], &info->min_lod, 4);
+   memcpy(&bits[1], &info->max_lod, 4);
+   memcpy(&bits[2], &info->lod_bias, 4);
+   memcpy(&bits[3], &info->max_anisotropy, 4);
+   for (unsigned i = 0; i < 4; i++)
+      memcpy(&bits[4 + i], &info->border_color[i], 4);
+
+   char defines[2048];
+   int len = snprintf(defines, sizeof(defines),
+      "#define CP_SPECIALIZED_SAMPLER 1\n"
+      "#define CP_SPEC_WRAP_S %u\n#define CP_SPEC_WRAP_T %u\n"
+      "#define CP_SPEC_WRAP_R %u\n#define CP_SPEC_MIN_IMG %u\n"
+      "#define CP_SPEC_MAG_IMG %u\n#define CP_SPEC_MIP %u\n"
+      "#define CP_SPEC_UNNORM %u\n"
+      "#define CP_SPEC_MIN_LOD __int_as_float(0x%08xU)\n"
+      "#define CP_SPEC_MAX_LOD __int_as_float(0x%08xU)\n"
+      "#define CP_SPEC_LOD_BIAS __int_as_float(0x%08xU)\n"
+      "#define CP_SPEC_MAX_ANISO __int_as_float(0x%08xU)\n"
+      "#define CP_SPEC_BORDER_R __int_as_float(0x%08xU)\n"
+      "#define CP_SPEC_BORDER_G __int_as_float(0x%08xU)\n"
+      "#define CP_SPEC_BORDER_B __int_as_float(0x%08xU)\n"
+      "#define CP_SPEC_BORDER_A __int_as_float(0x%08xU)\n",
+      info->wrap_s, info->wrap_t, info->wrap_r, info->min_img_filter,
+      info->mag_img_filter, info->min_mip_filter, info->unnormalized_coords,
+      bits[0], bits[1], bits[2], bits[3], bits[4], bits[5], bits[6], bits[7]);
+   if (len < 0 || (size_t)len >= sizeof(defines))
+      return NULL;
+
+   size_t source_len = strlen(cp_sampler_src);
+   char *source = malloc((size_t)len + source_len + 1);
+   if (!source)
+      return NULL;
+   memcpy(source, defines, (size_t)len);
+   memcpy(source + len, cp_sampler_src, source_len + 1);
+   char *ptx = compile_cuda_source(source, "cp_sampler_variant.cu",
+                                   screen->sm_major, screen->sm_minor, true);
+   free(source);
+   return ptx;
+}
+
 /* Compile one kernel source and load it as a module. */
 static bool
 build_module(CUmodule *out, const char *src, const char *name,
@@ -218,6 +264,8 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
    cuModuleGetFunction(&k->abuf_scan_add, k->module, "cp_abuf_scan_add");
    cuModuleGetFunction(&k->abuf_worklist, k->module, "cp_abuf_worklist");
    cuModuleGetFunction(&k->abuf_sort, k->module, "cp_abuf_sort");
+   cuModuleGetFunction(&k->abuf_sort_short, k->module,
+                       "cp_abuf_sort_short");
    cuModuleGetFunction(&k->abuf_block_worklist, k->module,
                        "cp_abuf_block_worklist");
    cuModuleGetFunction(&k->abuf_quad_count, k->module, "cp_abuf_quad_count");
@@ -244,6 +292,8 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
     * same cp_interp_pixel; see cp_fs.cu. */
    cuModuleGetFunction(&k->abuf_interpolate, k->fs_module,
                        "cp_abuf_interpolate");
+   cuModuleGetFunction(&k->abuf_interpolate_ranges, k->fs_module,
+                       "cp_abuf_interpolate_ranges");
    cuModuleGetFunction(&k->abuf_composite, k->fs_module, "cp_abuf_composite");
    if (cp_kernels_instrumented())
       cuModuleGetFunction(&k->abuf_scatter_colors, k->fs_module,
@@ -259,6 +309,13 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
                                         screen->sm_major, screen->sm_minor, true);
    if (!k->sampler_ptx) {
       fprintf(stderr, "cudapipe: failed to compile texture sampler\n");
+      goto fail;
+   }
+   k->fs_helper_ptx = compile_cuda_source(cp_fs_src, "cp_fs_helper.cu",
+                                          screen->sm_major, screen->sm_minor,
+                                          true);
+   if (!k->fs_helper_ptx) {
+      fprintf(stderr, "cudapipe: failed to compile fragment helpers\n");
       goto fail;
    }
 
@@ -280,5 +337,6 @@ cp_kernels_destroy(struct cp_kernels *k)
    if (k->fs_module)
       cuModuleUnload(k->fs_module);
    free(k->sampler_ptx);
+   free(k->fs_helper_ptx);
    memset(k, 0, sizeof(*k));
 }

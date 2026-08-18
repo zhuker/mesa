@@ -39,9 +39,17 @@ cp_edge(float ax, float ay, float bx, float by, float px, float py)
  * lane, using a covered corner's triangle so its interpolated values lie on the
  * same surface. cp_fs_writeback drops it.
  */
+struct cp_interp_tri {
+   float sx0, sy0, sx1, sy1, sx2, sy2;
+   float ndc_z0, ndc_z1, ndc_z2;
+   float inv_w0, inv_w1, inv_w2, inv_area;
+   int vidx1, vidx2;
+   bool front;
+};
+
 static __device__ __forceinline__ bool
-cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
-                uint32_t pixel, uint32_t slot)
+cp_interp_setup(const struct cp_fs_interp_args *args, uint32_t tri_id,
+                struct cp_interp_tri *tri)
 {
    const float4 *positions = (const float4 *)(uintptr_t)args->positions;
    uint32_t pos_stride = args->vs_out_stride / 16;
@@ -50,38 +58,55 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
    float4 v1 = positions[(tri_id * 3 + 1) * pos_stride];
    float4 v2 = positions[(tri_id * 3 + 2) * pos_stride];
 
-   float inv_w0 = 1.0f / v0.w;
-   float inv_w1 = 1.0f / v1.w;
-   float inv_w2 = 1.0f / v2.w;
+   tri->inv_w0 = 1.0f / v0.w;
+   tri->inv_w1 = 1.0f / v1.w;
+   tri->inv_w2 = 1.0f / v2.w;
 
-   float sx0 = v0.x * inv_w0 * args->vp_scale_x + args->vp_trans_x;
-   float sy0 = v0.y * inv_w0 * args->vp_scale_y + args->vp_trans_y;
-   float sx1 = v1.x * inv_w1 * args->vp_scale_x + args->vp_trans_x;
-   float sy1 = v1.y * inv_w1 * args->vp_scale_y + args->vp_trans_y;
-   float sx2 = v2.x * inv_w2 * args->vp_scale_x + args->vp_trans_x;
-   float sy2 = v2.y * inv_w2 * args->vp_scale_y + args->vp_trans_y;
+   tri->sx0 = v0.x * tri->inv_w0 * args->vp_scale_x + args->vp_trans_x;
+   tri->sy0 = v0.y * tri->inv_w0 * args->vp_scale_y + args->vp_trans_y;
+   tri->sx1 = v1.x * tri->inv_w1 * args->vp_scale_x + args->vp_trans_x;
+   tri->sy1 = v1.y * tri->inv_w1 * args->vp_scale_y + args->vp_trans_y;
+   tri->sx2 = v2.x * tri->inv_w2 * args->vp_scale_x + args->vp_trans_x;
+   tri->sy2 = v2.y * tri->inv_w2 * args->vp_scale_y + args->vp_trans_y;
 
-   float ndc_z0 = v0.z * inv_w0;
-   float ndc_z1 = v1.z * inv_w1;
-   float ndc_z2 = v2.z * inv_w2;
+   tri->ndc_z0 = v0.z * tri->inv_w0;
+   tri->ndc_z1 = v1.z * tri->inv_w1;
+   tri->ndc_z2 = v2.z * tri->inv_w2;
 
    /* The rasterizer flips clockwise triangles so barycentrics come out
     * positive; mirror that here, and carry the swap through to the vertex
     * indices so varyings are fetched in the matching order. */
-   int vidx[3] = { 0, 1, 2 };
    float area = args->point_mode ? 1.0f
-              : cp_edge(sx0, sy0, sx1, sy1, sx2, sy2);
+              : cp_edge(tri->sx0, tri->sy0, tri->sx1, tri->sy1,
+                        tri->sx2, tri->sy2);
+   tri->vidx1 = 1;
+   tri->vidx2 = 2;
    if (area < 0.0f) {
       float t;
-      t = sx1; sx1 = sx2; sx2 = t;
-      t = sy1; sy1 = sy2; sy2 = t;
-      t = ndc_z1; ndc_z1 = ndc_z2; ndc_z2 = t;
-      t = inv_w1; inv_w1 = inv_w2; inv_w2 = t;
-      vidx[1] = 2; vidx[2] = 1;
+      t = tri->sx1; tri->sx1 = tri->sx2; tri->sx2 = t;
+      t = tri->sy1; tri->sy1 = tri->sy2; tri->sy2 = t;
+      t = tri->ndc_z1; tri->ndc_z1 = tri->ndc_z2; tri->ndc_z2 = t;
+      t = tri->inv_w1; tri->inv_w1 = tri->inv_w2; tri->inv_w2 = t;
+      tri->vidx1 = 2;
+      tri->vidx2 = 1;
       area = -area;
    }
    if (area == 0.0f)
       return false;
+
+   tri->inv_area = 1.0f / area;
+   tri->front = args->point_mode
+      ? true : ((tri->vidx1 == 1) == (args->front_ccw != 0));
+   return true;
+}
+
+static __device__ __forceinline__ bool
+cp_interp_pixel_prepared(struct cp_fs_interp_args *args, uint32_t tri_id,
+                         uint32_t pixel, uint32_t slot,
+                         const struct cp_interp_tri *tri)
+{
+   float cx = (float)(pixel % args->width) + 0.5f;
+   float cy = (float)(pixel / args->width) + 0.5f;
 
    /*
     * gl_FrontFacing. The sign of the area before the flip above is the
@@ -89,35 +114,31 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
     * winding, and Vulkan calls it front-facing.
     */
    if (args->front_face) {
-      /* vidx[1] is still 1 exactly when the area came out positive. */
-      bool front = args->point_mode
-         ? true : ((vidx[1] == 1) == (args->front_ccw != 0));
-      ((unsigned char *)(uintptr_t)args->front_face)[slot] = front ? 1 : 0;
+      ((unsigned char *)(uintptr_t)args->front_face)[slot] = tri->front ? 1 : 0;
    }
-
-   float inv_area = 1.0f / area;
-   float cx = (float)(pixel % args->width) + 0.5f;
-   float cy = (float)(pixel / args->width) + 0.5f;
 
    /* A helper lane lies outside the triangle, so its barycentrics go negative.
     * That is exactly what makes the derivative across the quad correct. */
    float b0 = args->point_mode ? 1.0f
-            : cp_edge(sx1, sy1, sx2, sy2, cx, cy) * inv_area;
+            : cp_edge(tri->sx1, tri->sy1, tri->sx2, tri->sy2, cx, cy) *
+              tri->inv_area;
    float b1 = args->point_mode ? 0.0f
-            : cp_edge(sx2, sy2, sx0, sy0, cx, cy) * inv_area;
+            : cp_edge(tri->sx2, tri->sy2, tri->sx0, tri->sy0, cx, cy) *
+              tri->inv_area;
    float b2 = 1.0f - b0 - b1;
 
    ((uint32_t *)(uintptr_t)args->pixel_list)[slot] = pixel;
 
-   float persp0 = b0 * inv_w0;
-   float persp1 = b1 * inv_w1;
-   float persp2 = b2 * inv_w2;
+   float persp0 = b0 * tri->inv_w0;
+   float persp1 = b1 * tri->inv_w1;
+   float persp2 = b2 * tri->inv_w2;
    float inv_persp = 1.0f / (persp0 + persp1 + persp2);
 
    float4 fc;
    fc.x = cx;
    fc.y = cy;
-   fc.z = (b0 * ndc_z0 + b1 * ndc_z1 + b2 * ndc_z2) * 0.5f + 0.5f;
+   fc.z = (b0 * tri->ndc_z0 + b1 * tri->ndc_z1 + b2 * tri->ndc_z2) *
+          0.5f + 0.5f;
    fc.w = persp0 + persp1 + persp2;
    if (args->frag_coord)
       ((float4 *)(uintptr_t)args->frag_coord)[slot] = fc;
@@ -156,8 +177,8 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
          if (size > CP_MAX_POINT_SIZE)
             size = CP_MAX_POINT_SIZE;
 
-         float px0 = sx0 - size * 0.5f;
-         float py0 = sy0 - size * 0.5f;
+         float px0 = tri->sx0 - size * 0.5f;
+         float py0 = tri->sy0 - size * 0.5f;
          *(float4 *)(fs_in + args->pntc_input * 16) =
             make_float4((cx - px0) / size, (cy - py0) / size, 0.0f, 1.0f);
       }
@@ -175,11 +196,11 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
 
       if (src >= 0) {
          const float4 *a0 = (const float4 *)(vs_out +
-            (size_t)(tri_id * 3 + vidx[0]) * args->vs_out_stride + src * 16);
+            (size_t)(tri_id * 3) * args->vs_out_stride + src * 16);
          const float4 *a1 = (const float4 *)(vs_out +
-            (size_t)(tri_id * 3 + vidx[1]) * args->vs_out_stride + src * 16);
+            (size_t)(tri_id * 3 + tri->vidx1) * args->vs_out_stride + src * 16);
          const float4 *a2 = (const float4 *)(vs_out +
-            (size_t)(tri_id * 3 + vidx[2]) * args->vs_out_stride + src * 16);
+            (size_t)(tri_id * 3 + tri->vidx2) * args->vs_out_stride + src * 16);
 
          value.x = (a0->x * persp0 + a1->x * persp1 + a2->x * persp2) * inv_persp;
          value.y = (a0->y * persp0 + a1->y * persp1 + a2->y * persp2) * inv_persp;
@@ -197,6 +218,15 @@ cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
        (uint32_t)args->pos_input < args->num_fs_inputs)
       *(float4 *)(fs_in + args->pos_input * 16) = fc;
    return true;
+}
+
+static __device__ __forceinline__ bool
+cp_interp_pixel(struct cp_fs_interp_args *args, uint32_t tri_id,
+                uint32_t pixel, uint32_t slot)
+{
+   struct cp_interp_tri tri;
+   return cp_interp_setup(args, tri_id, &tri) &&
+          cp_interp_pixel_prepared(args, tri_id, pixel, slot, &tri);
 }
 
 #if CP_ABUF_INSTRUMENT
@@ -299,8 +329,117 @@ cp_write_batch_rows(const struct cp_fs_interp_args *args, uint32_t prim,
       rows[base + i] = row;
 }
 
-extern "C" __global__ void
-cp_abuf_interpolate(struct cp_fs_interp_args args)
+static __device__ __forceinline__ bool
+cp_resolve_seg_range(struct cp_fs_interp_args *args, uint32_t gprim)
+{
+   if (!args->seg_ranges || !args->num_seg_ranges)
+      return true;
+
+   const struct cp_seg_range *ranges =
+      (const struct cp_seg_range *)(uintptr_t)args->seg_ranges;
+   uint32_t lo = 0, hi = args->num_seg_ranges - 1;
+   while (lo < hi) {
+      uint32_t mid = (lo + hi + 1u) >> 1;
+      if (ranges[mid].prim_base <= gprim)
+         lo = mid;
+      else
+         hi = mid - 1;
+   }
+   const struct cp_seg_range *range = &ranges[lo];
+   if (gprim < range->prim_base || gprim >= range->prim_end)
+      return false;
+
+   args->positions = range->positions;
+   args->vs_out = range->positions;
+   args->abuf_prim_base = range->prim_base;
+   args->draw_slices = range->draw_slices;
+   args->num_draw_slices = range->num_draw_slices;
+   args->prim_shift = range->prim_shift;
+   args->row_base = range->row_base;
+   return true;
+}
+
+extern "C" __device__ int
+cp_abuf_interpolate_lane(const struct cp_fs_interp_args *source, uint32_t slot)
+{
+   struct cp_fs_interp_args args = *source;
+   uint32_t iq = slot >> 2;
+   uint32_t lane = slot & 3u;
+   uint32_t nq = args.abuf_num_quads;
+   if (args.num_quads_dev) {
+      uint32_t exact = *(const uint32_t *)(uintptr_t)args.num_quads_dev;
+      if (exact < nq)
+         nq = exact;
+   }
+   if (iq >= nq)
+      return 0;
+
+   uint32_t q = args.quad_list
+      ? ((const uint32_t *)(uintptr_t)args.quad_list)[args.quad_list_base + iq]
+      : iq;
+   uint32_t block = ((const uint32_t *)(uintptr_t)args.abuf_quad_block)[q];
+   uint32_t gprim = ((const uint32_t *)(uintptr_t)args.abuf_quad_prim)[q];
+   if (!cp_resolve_seg_range(&args, gprim))
+      return 0;
+
+   uint32_t prim = gprim - args.abuf_prim_base;
+   uint32_t qx = (block % args.quad_width) * 2;
+   uint32_t qy = (block / args.quad_width) * 2;
+   uint32_t x = qx + (lane & 1u);
+   uint32_t y = qy + (lane >> 1);
+   bool in_fb = x < args.width && y < args.height;
+   uint32_t pixel = (y < args.height ? y : args.height - 1) * args.width +
+                    (x < args.width ? x : args.width - 1);
+   uint32_t mask = ((const unsigned char *)(uintptr_t)args.abuf_quad_mask)[q];
+
+   uint32_t *rows = (uint32_t *)(uintptr_t)args.out_batch_rows;
+   if (rows) {
+      uint32_t row = 0;
+      if (args.num_draw_slices > 1) {
+         const struct cp_draw_slice *s =
+            (const struct cp_draw_slice *)(uintptr_t)args.draw_slices;
+         uint32_t vert = (prim >> args.prim_shift) * 3u;
+         uint32_t lo = 0, hi = args.num_draw_slices - 1;
+         while (lo < hi) {
+            uint32_t mid = (lo + hi + 1u) >> 1;
+            if (s[mid].vert_begin <= vert)
+               lo = mid;
+            else
+               hi = mid - 1;
+         }
+         row = lo;
+      }
+      rows[slot] = row + args.row_base;
+   }
+
+   struct cp_interp_tri tri;
+   bool tri_ok = false;
+   if (lane == 0)
+      tri_ok = cp_interp_setup(&args, prim, &tri);
+   unsigned src_lane = threadIdx.x & ~3u;
+#define CP_QUAD_BCAST(field) \
+   tri.field = __shfl_sync(0xFFFFFFFFu, tri.field, src_lane)
+   CP_QUAD_BCAST(sx0); CP_QUAD_BCAST(sy0);
+   CP_QUAD_BCAST(sx1); CP_QUAD_BCAST(sy1);
+   CP_QUAD_BCAST(sx2); CP_QUAD_BCAST(sy2);
+   CP_QUAD_BCAST(ndc_z0); CP_QUAD_BCAST(ndc_z1); CP_QUAD_BCAST(ndc_z2);
+   CP_QUAD_BCAST(inv_w0); CP_QUAD_BCAST(inv_w1); CP_QUAD_BCAST(inv_w2);
+   CP_QUAD_BCAST(inv_area);
+   CP_QUAD_BCAST(vidx1); CP_QUAD_BCAST(vidx2);
+   tri.front = __shfl_sync(0xFFFFFFFFu, (int)tri.front, src_lane) != 0;
+   tri_ok = __shfl_sync(0xFFFFFFFFu, (int)tri_ok, src_lane) != 0;
+#undef CP_QUAD_BCAST
+   bool ok = tri_ok &&
+             cp_interp_pixel_prepared(&args, prim, pixel, slot, &tri);
+   if (args.coverage)
+      ((unsigned char *)(uintptr_t)args.coverage)[slot] =
+         (ok && in_fb && (mask & (1u << lane))) ? 1u : 0u;
+   return ok ? 1 : 0;
+}
+
+template <bool RANGES>
+static __device__ __forceinline__ void
+cp_abuf_interpolate_body(struct cp_fs_interp_args args)
 {
    uint32_t iq = blockIdx.x * blockDim.x + threadIdx.x;
    uint32_t nq = args.abuf_num_quads;
@@ -332,25 +471,8 @@ cp_abuf_interpolate(struct cp_fs_interp_args args)
     * reads as it always did. vs_out is the same buffer as positions on this
     * path, exactly as the per-segment shade passes them.
     */
-   if (args.seg_ranges && args.num_seg_ranges) {
-      const struct cp_seg_range *rr =
-         (const struct cp_seg_range *)(uintptr_t)args.seg_ranges;
-      uint32_t lo = 0, hi = args.num_seg_ranges - 1;
-      while (lo < hi) {
-         uint32_t mid = (lo + hi + 1u) >> 1;
-         if (rr[mid].prim_base <= gprim)
-            lo = mid;
-         else
-            hi = mid - 1;
-      }
-      args.positions = rr[lo].positions;
-      args.vs_out = rr[lo].positions;
-      args.abuf_prim_base = rr[lo].prim_base;
-      args.draw_slices = rr[lo].draw_slices;
-      args.num_draw_slices = rr[lo].num_draw_slices;
-      args.prim_shift = rr[lo].prim_shift;
-      args.row_base = rr[lo].row_base;
-   }
+   if (RANGES && !cp_resolve_seg_range(&args, gprim))
+      return;
 
    uint32_t prim = gprim - args.abuf_prim_base;
    uint32_t mask = ((const unsigned char *)(uintptr_t)args.abuf_quad_mask)[q];
@@ -362,6 +484,8 @@ cp_abuf_interpolate(struct cp_fs_interp_args args)
    cp_write_batch_rows(&args, prim, base);
 
    unsigned char *coverage = (unsigned char *)(uintptr_t)args.coverage;
+   struct cp_interp_tri interp_tri;
+   bool tri_ok = cp_interp_setup(&args, prim, &interp_tri);
 #if CP_ABUF_INSTRUMENT
    uint32_t *dbg_slot = (uint32_t *)(uintptr_t)args.dbg_slot;
 #endif
@@ -377,7 +501,8 @@ cp_abuf_interpolate(struct cp_fs_interp_args args)
                        (x < args.width ? x : args.width - 1);
       bool covered = in_fb && (mask & (1u << i));
 
-      bool ok = cp_interp_pixel(&args, prim, pixel, base + i);
+      bool ok = tri_ok && cp_interp_pixel_prepared(
+         &args, prim, pixel, base + i, &interp_tri);
       /* Single-sampled only, so a covered pixel wins sample 0 and nothing
        * else; the host refuses this path for anything else. */
       if (coverage)
@@ -388,6 +513,18 @@ cp_abuf_interpolate(struct cp_fs_interp_args args)
             ? cp_abuf_slot_for(&args, pixel, gprim) : 0xFFFFFFFFu;
 #endif
    }
+}
+
+extern "C" __global__ void
+cp_abuf_interpolate(struct cp_fs_interp_args args)
+{
+   cp_abuf_interpolate_body<false>(args);
+}
+
+extern "C" __global__ void
+cp_abuf_interpolate_ranges(struct cp_fs_interp_args args)
+{
+   cp_abuf_interpolate_body<true>(args);
 }
 
 #if CP_ABUF_INSTRUMENT
@@ -492,6 +629,10 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
    unsigned char *coverage = (unsigned char *)(uintptr_t)args.coverage;
 
    for (int t = 0; t < ntris; t++) {
+      struct cp_fs_interp_args tri_args = args;
+      if (!cp_resolve_seg_range(&tri_args, tris[t]))
+         continue;
+      uint32_t prim = tris[t] - tri_args.abuf_prim_base;
       uint32_t base = atomicAdd((unsigned int *)(uintptr_t)args.counter, 4u);
       if (base + 4 > args.max_pixels) {
 #if CP_ABUF_INSTRUMENT
@@ -505,7 +646,9 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
          return;
       }
 
-      cp_write_batch_rows(&args, tris[t], base);
+      cp_write_batch_rows(&tri_args, prim, base);
+      struct cp_interp_tri interp_tri;
+      bool tri_ok = cp_interp_setup(&tri_args, prim, &interp_tri);
 
       /* TEMPORARY: the quad's coverage as one 4-bit mask, which is the form
        * the A-buffer merge produces. Costs nothing when compiled out. */
@@ -525,7 +668,8 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
                   mask |= 1u << sm;
             }
          }
-         bool ok = cp_interp_pixel(&args, tris[t], pix[i], base + i);
+         bool ok = tri_ok && cp_interp_pixel_prepared(
+            &tri_args, prim, pix[i], base + i, &interp_tri);
          if (coverage)
             coverage[base + i] = ok ? (unsigned char)mask : 0;
          if (mask && !ok)
@@ -538,7 +682,7 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
           * be compared against it. A helper lane has no slot. */
          if (args.dbg_slot)
             ((uint32_t *)(uintptr_t)args.dbg_slot)[base + i] =
-               (mask && ok) ? cp_abuf_slot_for(&args, pix[i], tris[t])
+               (mask && ok) ? cp_abuf_slot_for(&tri_args, pix[i], tris[t])
                             : 0xFFFFFFFFu;
 #endif
       }
@@ -1072,7 +1216,7 @@ cp_abuf_composite(struct cp_abuf_composite_args args)
          uint32_t seg = ((const unsigned char *)(uintptr_t)args.quad_seg)[qd];
          const struct cp_seg_desc *sd =
             &((const struct cp_seg_desc *)(uintptr_t)args.seg_desc)[seg];
-         uint32_t dense =
+         uint32_t dense = sd->global_slots ? slot :
             ((const uint32_t *)(uintptr_t)args.quad_dense)[qd] * 4u +
             (slot & 3u);
          if (dense >= sd->num_slots)

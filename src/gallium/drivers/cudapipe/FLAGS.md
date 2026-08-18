@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-48 switches.
+53 switches.
 
 ## Tracing
 
@@ -45,6 +45,11 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_NO_ABUFFER` | bool (presence) | `off` | — | disable the A-buffer; blended draws go back to the direct path |
 | `CUDAPIPE_NO_ABUF_BATCH` | bool (presence) | `off` | — | disable batching of A-buffer draws |
 | `CUDAPIPE_NO_PASS_EPISODE` | bool (value) | `off` | — | disable pass episodes: consecutive blended batches stop sharing one A-buffer build and drain |
+| `CUDAPIPE_NO_OPAQUE_EPISODE` | bool (value) | `off` | — | disable consecutive opaque-run visibility deferral |
+| `CUDAPIPE_NO_SAMPLER_VARIANT` | bool (value) | `off` | — | disable literal-state fragment sampler variants |
+| `CUDAPIPE_NO_ABUF_SHORT_SORT` | bool (value) | `off` | — | disable the single-thread short A-buffer run sorter |
+| `CUDAPIPE_NO_ABUF_WARP_BUCKET` | bool (value) | `off` | — | disable warp-aggregated A-buffer segment bucketing atomics |
+| `CUDAPIPE_ABUF_SHORT_SORT_MAX` | uint | `16` | 2&ndash;64 | largest A-buffer run sorted by one thread |
 | `CUDAPIPE_FLUSH_DRAIN` | bool (value) | `off` | — | restore the draining flush: cp_flush waits for the whole device and rewinds the arenas in place instead of ping-ponging generations |
 | `CUDAPIPE_NO_SEG_MERGE` | bool (value) | `off` | — | disable merged shading groups: every episode segment shades in its own launch group, as before |
 | `CUDAPIPE_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |
@@ -86,7 +91,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_REGCAP_STATIC` | bool (presence) | `off` | — | cap registers from a static estimate instead of the trial |
 | `CUDAPIPE_MAX_REGISTERS` | uint | `0` | — | force a register cap on every shader; 0 leaves it to the driver |
 | `CUDAPIPE_LAUNCH_BOUNDS` | uint | `0` | — | emit maxntidx metadata with this block size; 0 emits none |
-| `CUDAPIPE_TUNE_VETO` | float | `1.05` | — | how much worse the capped build may be before it is refused |
+| `CUDAPIPE_TUNE_VETO` | float | `1.0` | — | how much worse the capped build may be before it is refused |
 | `CUDAPIPE_SHADER_STATS` | bool (presence) | `off` | — | report register counts and occupancy-trial outcomes |
 | `CUDAPIPE_DUMP_NIR` | bool (presence) | `off` | — | print each shader's NIR |
 | `CUDAPIPE_DUMP_IR` | bool (presence) | `off` | — | print each shader's LLVM IR |

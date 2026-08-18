@@ -4,7 +4,9 @@
 #include <cuda.h>
 #include <stdbool.h>
 
+struct cp_sampler_info;
 struct cp_screen;
+struct cp_tex_desc_ref;
 
 struct cp_kernels {
    CUmodule module;
@@ -36,6 +38,7 @@ struct cp_kernels {
    CUfunction abuf_scan_add;
    CUfunction abuf_worklist;
    CUfunction abuf_sort;
+   CUfunction abuf_sort_short;
    CUfunction abuf_peel_log;
    CUfunction abuf_peel_log_list;
    CUfunction abuf_block_worklist;
@@ -47,6 +50,7 @@ struct cp_kernels {
    CUfunction abuf_seg_count;
    CUfunction abuf_seg_scatter;
    CUfunction abuf_interpolate;
+   CUfunction abuf_interpolate_ranges;
    CUfunction abuf_scatter_colors;
    CUfunction abuf_composite;
 
@@ -61,6 +65,7 @@ struct cp_kernels {
    /* Relocatable PTX for the texture sampler, linked into each shader that
     * samples textures. Owned here; see cp_compile_nir_to_ptx(). */
    char *sampler_ptx;
+   char *fs_helper_ptx;
 
    bool initialized;
 };
@@ -71,5 +76,8 @@ bool cp_kernels_instrumented(void);
 
 bool cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen);
 void cp_kernels_destroy(struct cp_kernels *k);
+
+char *cp_compile_sampler_variant(struct cp_screen *screen,
+                                 const struct cp_sampler_info *info);
 
 #endif

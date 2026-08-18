@@ -66,7 +66,7 @@ struct cp_batch_key {
     * parameters — gl_BaseVertex, gl_BaseInstance, gl_DrawID resolve per draw
     * through the parameter rows at args[7]. start_instance stays: the fetch
     * kernel's instance-divisor gather reads it as one scalar. */
-   uint32_t mode, index_size, instance_count, start_instance;
+   uint32_t mode, index_size, start_instance;
    const void *index_resource;
 
    /* Pipeline state, whole structs: a field added upstream is then covered
@@ -115,6 +115,7 @@ struct cp_context {
       /* One index range per merged draw; cp_draw_execute() turns these into
        * the slice table cp_vertex_fetch searches. */
       struct pipe_draw_start_count_bias draws[CP_MAX_BATCH_DRAWS];
+      uint32_t instance_counts[CP_MAX_BATCH_DRAWS];
       unsigned drawid_offset;
       /* gl_DrawID per merged draw — the offset recorded when it joined, for
        * the per-draw parameter rows at args[7]. */
@@ -171,6 +172,7 @@ struct cp_context {
       /* The batch snapshot, both for the per-segment shade (fs rows) and for
        * re-executing the segment classically when the episode falls back. */
       struct pipe_draw_start_count_bias draws[CP_MAX_BATCH_DRAWS];
+      uint32_t instance_counts[CP_MAX_BATCH_DRAWS];
       uint32_t draw_ids[CP_MAX_BATCH_DRAWS];
       struct pipe_scissor_state scissors[CP_MAX_BATCH_DRAWS];
       uint64_t vs_ubos[CP_MAX_BATCH_DRAWS * CP_ARG_UBO_STRIDE];
@@ -188,6 +190,7 @@ struct cp_context {
       uint32_t next_prim;           /* running global slot base */
       bool appending;               /* a segment append is inside execute */
       bool append_failed;           /* the append could not take the path */
+      bool opaque;                  /* shared-visbuf opaque run, not A-buffer */
       unsigned w, h;                /* the episode's framebuffer */
    } pass;
 

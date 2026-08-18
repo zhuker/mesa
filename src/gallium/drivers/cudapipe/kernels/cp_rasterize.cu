@@ -129,9 +129,11 @@ struct tri_setup {
  * Clipping against the planes that make the perspective divide meaningful,
  * one thread per input triangle.
  *
- * Vulkan's view volume is 0 <= z <= w. Three planes matter here:
+ * Gallium presents clip coordinates with the OpenGL depth convention,
+ * -w <= x,y,z <= w. The six view-volume planes plus a small positive-W
+ * guard matter here:
  *
- *   z >= 0      one of the depth planes. Under the conventional projection it
+ *   z >= -w     one of the depth planes. Under the conventional projection it
  *               is the near plane, and a ground plane running to the horizon
  *               crosses it.
  *   z <= w      the other one. Under a reversed-Z projection — depth cleared
@@ -145,24 +147,30 @@ struct tri_setup {
  *   w >  0      not a clip plane of its own but implied by z <= w. A vertex
  *               with w <= 0 divides to a garbage position however small its z,
  *               so it has to go before setup_triangle() touches it.
+ *   -w <= x,y <= w
+ *               must be clipped in homogeneous space. Merely clamping the
+ *               screen-space bounding box leaves enormous post-divide edge
+ *               coefficients, which lose enough precision to drop parts of
+ *               large triangles near the side of the view.
  *
  * No one plane is enough: samples exist that only one of them fixes.
  *
  * Interpolation happens in clip space, before the divide, which is what makes
  * the split exact for both position and varyings.
  */
-#define CP_CLIP_NUM_PLANES 3
-#define CP_CLIP_MAX_VERTS 6   /* a triangle gains at most one vertex per plane */
-/* The fan over a hexagon, which is what the host sizes the output buffer for
- * and what stable mode reserves per input triangle. */
-#define CP_CLIP_MAX_OUT 4
+#define CP_CLIP_NUM_PLANES 7
+#define CP_CLIP_MAX_VERTS 10
 
 static __device__ __forceinline__ float
 clip_dist(const float4 *v, int plane)
 {
-   return plane == 0 ? v[0].z
+   return plane == 0 ? v[0].z + v[0].w
         : plane == 1 ? v[0].w - 1e-6f
-                     : v[0].w - v[0].z;
+        : plane == 2 ? v[0].w - v[0].z
+        : plane == 3 ? v[0].x + v[0].w
+        : plane == 4 ? v[0].w - v[0].x
+        : plane == 5 ? v[0].y + v[0].w
+                     : v[0].w - v[0].y;
 }
 
 static __device__ __forceinline__ void
@@ -214,7 +222,7 @@ static __device__ __forceinline__ float4 *
 clip_emit(struct cp_clip_args *args, float4 *out, uint32_t slots,
           uint32_t tri, uint32_t k)
 {
-   /* Stable mode owns slot 4*tri + k outright, so there is no counter to
+   /* Stable mode owns its fixed per-triangle range outright, so there is no counter to
     * contend on and no order to lose; see cp_clip_args::stable. */
    uint32_t o = args->stable
       ? tri * CP_CLIP_MAX_OUT + k
@@ -627,7 +635,8 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
    }
 
    uint32_t key = args->depth_key_invert ? ~depth_uint : depth_uint;
-   atomicMin(&visbuf[at], PACK_VISBUF(key, tri_id));
+   atomicMin(&visbuf[at],
+             PACK_VISBUF(key, args->abuf_prim_base + tri_id));
 }
 
 /*
@@ -1223,11 +1232,22 @@ cp_abuf_scan_block(const uint32_t *in, uint32_t *out, uint32_t *sums,
  * CP_ABUF_SCAN_BLOCK threads, which is what makes blockIdx the block index the
  * level above scanned. */
 extern "C" __global__ void
-cp_abuf_scan_add(uint32_t *data, const uint32_t *sums, uint32_t n)
+cp_abuf_scan_add(uint32_t *data, const uint32_t *sums, uint32_t n,
+                 uint32_t *counts, const uint32_t *total, uint32_t capacity,
+                 uint32_t *overflow)
 {
    uint32_t i = blockIdx.x * CP_ABUF_SCAN_BLOCK + threadIdx.x;
-   if (i < n)
+   if (i < n) {
       data[i] += sums[blockIdx.x];
+      if (counts && total && *total > capacity) {
+         uint32_t count = counts[i];
+         uint32_t room = data[i] < capacity ? capacity - data[i] : 0;
+         if (count > room) {
+            counts[i] = room;
+            atomicAdd(overflow, count - room);
+         }
+      }
+   }
 }
 
 /*
@@ -1391,6 +1411,44 @@ cp_abuf_sort(uint32_t *frags, const uint32_t *offsets, const uint32_t *counts,
       for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
          run[i] = key[i];
       __syncthreads();
+   }
+}
+
+/* Short runs dominate ordinary transparency. Giving each of them a 256-thread
+ * block costs more scheduling than sorting; one thread scanning the framebuffer
+ * handles the common 2..32 element case and leaves only long runs on the
+ * block-wide worklist path. */
+extern "C" __global__ void
+cp_abuf_sort_short(uint32_t *frags, const uint32_t *offsets,
+                   const uint32_t *counts, uint32_t npixels,
+                   uint32_t max_short, uint32_t *covered_list,
+                   uint32_t *covered_count, uint32_t min_long,
+                   uint32_t *long_list, uint32_t *long_count)
+{
+   uint32_t stride = gridDim.x * blockDim.x;
+   for (uint32_t p = blockIdx.x * blockDim.x + threadIdx.x; p < npixels;
+        p += stride) {
+      uint32_t n = counts[p];
+      if (!n)
+         continue;
+      uint32_t at = atomicAdd(covered_count, 1u);
+      covered_list[at] = p;
+      if (n >= min_long) {
+         uint32_t long_at = atomicAdd(long_count, 1u);
+         long_list[long_at] = p;
+      }
+      if (n < 2 || n > max_short)
+         continue;
+      uint32_t *run = frags + offsets[p];
+      for (uint32_t i = 1; i < n; i++) {
+         uint32_t value = run[i];
+         int32_t j = (int32_t)i - 1;
+         while (j >= 0 && run[j] > value) {
+            run[j + 1] = run[j];
+            j--;
+         }
+         run[j + 1] = value;
+      }
    }
 }
 
@@ -1770,10 +1828,21 @@ cp_abuf_seg_count(struct cp_abuf_seg_args args)
    for (uint32_t q = blockIdx.x * blockDim.x + threadIdx.x; q < total;
         q += gridDim.x * blockDim.x) {
       uint32_t prim = ((const uint32_t *)(uintptr_t)args.quad_prim)[q];
+      unsigned active = __activemask();
       uint32_t seg = cp_seg_of_prim(
          (const uint32_t *)(uintptr_t)args.seg_prim_base, args.nsegs, prim);
       ((unsigned char *)(uintptr_t)args.quad_seg)[q] = (unsigned char)seg;
-      atomicAdd((unsigned int *)(uintptr_t)args.seg_counts + seg, 1u);
+      if (!args.seg_counts)
+         continue;
+      if (!args.warp_aggregate) {
+         atomicAdd((unsigned int *)(uintptr_t)args.seg_counts + seg, 1u);
+         continue;
+      }
+      unsigned peers = __match_any_sync(active, seg);
+      int leader = __ffs(peers) - 1;
+      if ((int)(threadIdx.x & 31) == leader)
+         atomicAdd((unsigned int *)(uintptr_t)args.seg_counts + seg,
+                   (unsigned)__popc(peers));
    }
 }
 
@@ -1784,7 +1853,24 @@ cp_abuf_seg_scatter(struct cp_abuf_seg_args args)
    if (q >= args.num_quads)
       return;
    uint32_t seg = ((const unsigned char *)(uintptr_t)args.quad_seg)[q];
-   uint32_t pos = atomicAdd((unsigned int *)(uintptr_t)args.seg_cursor + seg, 1u);
+   if (!args.warp_aggregate) {
+      uint32_t pos = atomicAdd(
+         (unsigned int *)(uintptr_t)args.seg_cursor + seg, 1u);
+      uint32_t at = ((const uint32_t *)(uintptr_t)args.seg_base)[seg] + pos;
+      ((uint32_t *)(uintptr_t)args.grouped)[at] = q;
+      ((uint32_t *)(uintptr_t)args.quad_dense)[q] = pos;
+      return;
+   }
+   unsigned active = __activemask();
+   unsigned peers = __match_any_sync(active, seg);
+   int leader = __ffs(peers) - 1;
+   uint32_t group_pos = 0;
+   if ((int)(threadIdx.x & 31) == leader)
+      group_pos = atomicAdd((unsigned int *)(uintptr_t)args.seg_cursor + seg,
+                            (unsigned)__popc(peers));
+   group_pos = __shfl_sync(peers, group_pos, leader);
+   unsigned lane_mask = (1u << (threadIdx.x & 31)) - 1u;
+   uint32_t pos = group_pos + (uint32_t)__popc(peers & lane_mask);
    uint32_t at = ((const uint32_t *)(uintptr_t)args.seg_base)[seg] + pos;
    ((uint32_t *)(uintptr_t)args.grouped)[at] = q;
    ((uint32_t *)(uintptr_t)args.quad_dense)[q] = pos;

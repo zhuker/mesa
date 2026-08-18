@@ -6,4 +6,5 @@
 *.out
 /build
 .venv/
+venv/
 *.mda.tar

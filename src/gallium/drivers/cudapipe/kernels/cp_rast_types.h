@@ -289,6 +289,8 @@ struct cp_clip_args {
    uint32_t stable;
 };
 
+#define CP_CLIP_MAX_OUT 8
+
 #define CP_MAX_CLIP_SLOTS 16
 
 /* Shader kernel argument slots. 0..7 are the fixed stage inputs and 18.. are
@@ -349,6 +351,11 @@ struct cp_clip_args {
  * keeps the generated code for one identical.
  */
 #define CP_ARG_SLOT_COVERAGE 13
+
+/* Optional device pointer to cp_fs_interp_args.  When non-null, a fragment
+ * kernel prepares its own A-buffer input before executing the generated
+ * shader body, eliminating the separate interpolation launch. */
+#define CP_ARG_SLOT_FUSED_INTERP 14
 
 /*
  * One merged draw's slice of the assembled vertex stream.
@@ -649,6 +656,8 @@ struct cp_seg_desc {
    uint64_t discard;        /* uint8 per dense slot; 0 = discards nothing */
    uint32_t fs_out_stride;
    uint32_t num_slots;      /* bound on a dense slot index */
+   uint32_t global_slots;   /* arrays use the original quad slot directly */
+   uint32_t pad;
 };
 
 /*
@@ -667,6 +676,7 @@ struct cp_seg_range {
    uint64_t draw_slices;    /* struct cp_draw_slice[num_draw_slices], or 0 */
    uint32_t num_draw_slices;
    uint32_t prim_base;      /* first episode-global primitive slot */
+   uint32_t prim_end;       /* exclusive end of this segment's slot range */
    uint32_t row_base;       /* first row in the group's concatenated tables */
    uint32_t prim_shift;
 };
@@ -687,6 +697,8 @@ struct cp_abuf_seg_args {
    uint64_t num_quads_dev;  /* uint32*: the quad total (count reads it) */
    uint32_t nsegs;
    uint32_t num_quads;      /* count: grid bound; scatter: exact total */
+   uint32_t warp_aggregate;
+   uint32_t pad;
    uint64_t seg_cursor;     /* uint32 per segment: atomic (scatter) */
    uint64_t seg_base;       /* uint32 per segment: dense base (scatter) */
    uint64_t grouped;        /* uint32 per quad: quad indices by segment */
@@ -899,7 +911,7 @@ struct cp_draw_params {
 #define CP_SMALL_THRESHOLD   128
 #endif
 #ifndef CP_MEDIUM_THRESHOLD
-#define CP_MEDIUM_THRESHOLD  4096
+#define CP_MEDIUM_THRESHOLD  1536
 #endif
 
 /*

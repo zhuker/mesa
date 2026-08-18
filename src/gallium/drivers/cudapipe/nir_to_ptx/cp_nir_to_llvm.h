@@ -6,8 +6,32 @@
 #include <stdint.h>
 
 struct nir_shader;
+struct cp_sampler_info;
 
 #define CP_MAX_IO_SLOTS 32
+#define CP_MAX_TEX_DESCS 8
+#define CP_MAX_SAMPLER_VARIANTS 4
+
+struct cp_tex_desc_ref {
+   uint16_t ubo_slot;
+   uint16_t reserved;
+   uint32_t sampler_offset;
+   int32_t flags;
+};
+
+struct cp_sampler_variant {
+   CUmodule module;
+   CUfunction kernel;
+   struct cp_sampler_info *states;
+   unsigned num_states;
+   int regs;
+   int spill_bytes;
+   bool globals_resolved;
+   CUdeviceptr sym_sampler_table;
+   CUdeviceptr sym_quad_derivs;
+   uint64_t last_sampler_table;
+   int last_quad_derivs;
+};
 
 /* Launches timed per phase of a shader's register-cap trial, and how many are
  * thrown away at the start of one. See cp_tune_before() in cp_context.c. */
@@ -97,6 +121,7 @@ struct cp_shader_binary {
     * rebuilt with a different cap after the fact. NULL for a shader that
     * links nothing. */
    const char *sampler_ptx;
+   const char *fs_helper_ptx;
 
    /* Whether the shader reads gl_VertexIndex. Only then does a non-indexed
     * draw have to materialise the vertex id array the shader reads from. */
@@ -152,6 +177,16 @@ struct cp_shader_binary {
     */
    bool reads_const_bufs;
 
+   /* Statically traceable sampler descriptors used by this shader. Each
+    * sampler handle is a fixed byte offset from a constant-buffer base. */
+   unsigned num_tex_descs;
+   struct cp_tex_desc_ref tex_descs[CP_MAX_TEX_DESCS];
+   bool tex_descs_dynamic;
+   bool tex_descs_reported;
+
+   struct cp_sampler_variant sampler_variants[CP_MAX_SAMPLER_VARIANTS];
+   unsigned num_sampler_variants;
+
    /* Which VARYING_SLOT_* each I/O slot carries, so a fragment shader's inputs
     * can be matched to the vertex shader's outputs by location rather than by
     * position. Slots with no variable are VARYING_SLOT_MAX. */
@@ -182,10 +217,20 @@ struct cp_shader_binary {
  * the shader samples textures. May be NULL for shaders that cannot. */
 struct cp_shader_binary *
 cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
-                      const char *sampler_ptx);
+                      const char *sampler_ptx, const char *fs_helper_ptx);
 
 void
 cp_shader_binary_destroy(struct cp_shader_binary *bin);
+
+bool cp_shader_build_sampler_variant(struct cp_shader_binary *bin,
+                                     const char *sampler_ptx,
+                                     const struct cp_sampler_info *states,
+                                     unsigned num_states);
+
+struct cp_sampler_variant *
+cp_shader_find_sampler_variant(struct cp_shader_binary *bin,
+                               const struct cp_sampler_info *states,
+                               unsigned num_states);
 
 /* Rebuild a loaded shader with a register cap (0 for none), in place. The
  * caller must have drained the stream first. False leaves it untouched. */

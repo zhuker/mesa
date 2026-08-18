@@ -659,10 +659,31 @@ cp_tex_size(unsigned long long tex_handle, int lod, int component)
    return (int)size;
 }
 
-extern "C" __device__ float4
-cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
-              float c0, float c1, float c2, float explicit_lod,
-              int coord_slot, int flags)
+static __device__ __forceinline__ struct cp_sampler_info
+cp_load_sampler(unsigned long long samp_handle)
+{
+   struct cp_sampler_info samp;
+   if (samp_handle && cp_sampler_table) {
+      unsigned idx = *(const unsigned *)(samp_handle + CP_DESC_SAMPLER_INDEX_OFFSET);
+      samp = ((const struct cp_sampler_info *)cp_sampler_table)[idx];
+   } else {
+      samp.wrap_s = samp.wrap_t = samp.wrap_r = CP_WRAP_REPEAT;
+      samp.min_img_filter = samp.mag_img_filter = CP_FILTER_NEAREST;
+      samp.min_mip_filter = CP_MIPFILTER_NONE;
+      samp.unnormalized_coords = 0;
+      samp.min_lod = 0.0f; samp.max_lod = 0.0f; samp.lod_bias = 0.0f;
+      samp.max_anisotropy = 0.0f;
+      samp.border_color[0] = samp.border_color[1] = 0.0f;
+      samp.border_color[2] = 0.0f; samp.border_color[3] = 0.0f;
+   }
+   return samp;
+}
+
+static __device__ __forceinline__ float4
+cp_tex_sample_impl(unsigned long long tex_handle,
+                   struct cp_sampler_info samp,
+                   float c0, float c1, float c2, float explicit_lod,
+                   int coord_slot, int flags)
 {
    float4 result = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
 
@@ -676,20 +697,6 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
       return result;
 
    unsigned target = (unsigned)flags & CP_TEX_TARGET_MASK;
-
-   struct cp_sampler_info samp;
-   if (samp_handle && cp_sampler_table) {
-      unsigned idx = *(const unsigned *)(samp_handle + CP_DESC_SAMPLER_INDEX_OFFSET);
-      samp = ((const struct cp_sampler_info *)cp_sampler_table)[idx];
-   } else {
-      samp.wrap_s = samp.wrap_t = samp.wrap_r = CP_WRAP_REPEAT;
-      samp.min_img_filter = samp.mag_img_filter = CP_FILTER_NEAREST;
-      samp.min_mip_filter = CP_MIPFILTER_NONE;
-      samp.unnormalized_coords = 0;
-      samp.min_lod = 0.0f; samp.max_lod = 0.0f; samp.lod_bias = 0.0f;
-      samp.border_color[0] = samp.border_color[1] = 0.0f;
-      samp.border_color[2] = 0.0f; samp.border_color[3] = 0.0f;
-   }
 
    unsigned base_level = tex->first_level;
    unsigned max_level = tex->last_level > base_level ? tex->last_level : base_level;
@@ -985,6 +992,35 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
    }
    float inv = 1.0f / (float)aniso_taps;
    return make_float4(acc.r * inv, acc.g * inv, acc.b * inv, acc.a * inv);
+}
+
+extern "C" __device__ float4
+cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
+              float c0, float c1, float c2, float explicit_lod,
+              int coord_slot, int flags)
+{
+   struct cp_sampler_info samp;
+#ifdef CP_SPECIALIZED_SAMPLER
+   samp.wrap_s = CP_SPEC_WRAP_S;
+   samp.wrap_t = CP_SPEC_WRAP_T;
+   samp.wrap_r = CP_SPEC_WRAP_R;
+   samp.min_img_filter = CP_SPEC_MIN_IMG;
+   samp.mag_img_filter = CP_SPEC_MAG_IMG;
+   samp.min_mip_filter = CP_SPEC_MIP;
+   samp.unnormalized_coords = CP_SPEC_UNNORM;
+   samp.min_lod = CP_SPEC_MIN_LOD;
+   samp.max_lod = CP_SPEC_MAX_LOD;
+   samp.lod_bias = CP_SPEC_LOD_BIAS;
+   samp.max_anisotropy = CP_SPEC_MAX_ANISO;
+   samp.border_color[0] = CP_SPEC_BORDER_R;
+   samp.border_color[1] = CP_SPEC_BORDER_G;
+   samp.border_color[2] = CP_SPEC_BORDER_B;
+   samp.border_color[3] = CP_SPEC_BORDER_A;
+#else
+   samp = cp_load_sampler(samp_handle);
+#endif
+   return cp_tex_sample_impl(tex_handle, samp,
+                             c0, c1, c2, explicit_lod, coord_slot, flags);
 }
 
 /*

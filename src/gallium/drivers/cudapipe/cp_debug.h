@@ -70,7 +70,7 @@ enum cp_arena_mode {
 #define CP_ARENA_DEFAULT_WARMUP ((uint64_t)64)
 
 #define CP_MAX_BATCH_DRAWS 128
-#define CP_TUNE_VETO 1.05   /* how much worse capped has to be to be refused */
+#define CP_TUNE_VETO 1.0    /* retain a cap only when its trial is faster */
 
 /*
  * Field names are the variable name minus the CUDAPIPE_ prefix, lowercased,
@@ -109,6 +109,11 @@ struct cp_debug {
    bool no_abuffer;
    bool no_abuf_batch;
    bool no_pass_episode;
+   bool no_opaque_episode;
+   bool no_sampler_variant;
+   bool no_abuf_short_sort;
+   bool no_abuf_warp_bucket;
+   unsigned abuf_short_sort_max;
    bool flush_drain;
    bool no_seg_merge;
    bool no_abuf_append;

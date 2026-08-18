@@ -170,6 +170,21 @@ capture `frames` reports:
   image 240448       1 frames   640x360  VK_FORMAT_B8G8R8A8_UNORM
 ```
 
+To correlate every offscreen frame with its replay time, run the complete
+two-replay workflow:
+
+```sh
+tests/cp_gfxr_timeline.sh capture.gfxr /tmp/frame-timeline <icd.json>
+```
+
+The first replay records queue-submit timestamps without image dumping. The
+second dumps every render-target readback and converts it to PNG. The generated
+`/tmp/frame-timeline/index.html` references those PNG files (it does not embed
+them) and provides a clickable frame-time timeline, range slider, and keyboard
+navigation. Set `GFXR_SUBMITS_PER_FRAME` when the application does not use the
+HeadlessStreamer's two queue submits per rendered frame. `GFXRECON_REPLAY`,
+`GFXRECON_CONVERT`, and `GFXR_FPS_PLUGIN` override the tool paths.
+
 Three things about this are worth knowing before trusting the output:
 
 * **`--dump-resources` addresses commands by block index**, the counter GFXR
