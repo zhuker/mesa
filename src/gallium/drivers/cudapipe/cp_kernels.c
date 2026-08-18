@@ -164,6 +164,7 @@ char *
 cp_compile_sampler_variant(struct cp_screen *screen,
                            const struct cp_sampler_info *info)
 {
+   static_assert(sizeof(float) == sizeof(uint32_t), "32-bit float required");
    uint32_t bits[8];
    memcpy(&bits[0], &info->min_lod, 4);
    memcpy(&bits[1], &info->max_lod, 4);
@@ -179,14 +180,14 @@ cp_compile_sampler_variant(struct cp_screen *screen,
       "#define CP_SPEC_WRAP_R %u\n#define CP_SPEC_MIN_IMG %u\n"
       "#define CP_SPEC_MAG_IMG %u\n#define CP_SPEC_MIP %u\n"
       "#define CP_SPEC_UNNORM %u\n"
-      "#define CP_SPEC_MIN_LOD __int_as_float(0x%08xU)\n"
-      "#define CP_SPEC_MAX_LOD __int_as_float(0x%08xU)\n"
-      "#define CP_SPEC_LOD_BIAS __int_as_float(0x%08xU)\n"
-      "#define CP_SPEC_MAX_ANISO __int_as_float(0x%08xU)\n"
-      "#define CP_SPEC_BORDER_R __int_as_float(0x%08xU)\n"
-      "#define CP_SPEC_BORDER_G __int_as_float(0x%08xU)\n"
-      "#define CP_SPEC_BORDER_B __int_as_float(0x%08xU)\n"
-      "#define CP_SPEC_BORDER_A __int_as_float(0x%08xU)\n",
+      "#define CP_SPEC_MIN_LOD (__int_as_float((int)0x%08xU))\n"
+      "#define CP_SPEC_MAX_LOD (__int_as_float((int)0x%08xU))\n"
+      "#define CP_SPEC_LOD_BIAS (__int_as_float((int)0x%08xU))\n"
+      "#define CP_SPEC_MAX_ANISO (__int_as_float((int)0x%08xU))\n"
+      "#define CP_SPEC_BORDER_R (__int_as_float((int)0x%08xU))\n"
+      "#define CP_SPEC_BORDER_G (__int_as_float((int)0x%08xU))\n"
+      "#define CP_SPEC_BORDER_B (__int_as_float((int)0x%08xU))\n"
+      "#define CP_SPEC_BORDER_A (__int_as_float((int)0x%08xU))\n",
       info->wrap_s, info->wrap_t, info->wrap_r, info->min_img_filter,
       info->mag_img_filter, info->min_mip_filter, info->unnormalized_coords,
       bits[0], bits[1], bits[2], bits[3], bits[4], bits[5], bits[6], bits[7]);

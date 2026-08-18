@@ -956,3 +956,48 @@ peel termination plus dynamically linked shader launches. CUDA conditional
 graphs therefore require reusable graph bodies for the complete normal and
 fallback pipelines, stable cyclic argument storage, and kernel-node parameter
 updates; a conditional node around only the composite is insufficient.
+
+CUDA 12.8 conditional graphs were exercised directly on the target GPU. An
+`IF/ELSE` node whose condition is set by a preceding device kernel executes
+correctly. A 10,000-iteration microbenchmark measures 10.27 us per reusable
+conditional-graph launch versus 4.10 us for two direct one-block kernel
+launches. Conditional graphs are therefore not a profitable wrapper for one or
+two existing stages. They are still appropriate for the episode decision: one
+graph launch can replace a roughly 654 us average stream drain and the many
+normal/fallback launches below it. This reinforces the required granularity —
+cache the complete episode tail, not individual raster stages.
+
+There is also a toolchain prerequisite. The device setter calls
+`cudaGraphSetConditional`, supplied by the CUDA device runtime, while
+cudapipe's common kernels are currently compiled by NVRTC and loaded directly
+from PTX without `libcudadevrt`. The executor implementation must link a small
+setter module against the device-runtime archive (or move that one module to a
+build-time fatbin) before constructing conditional driver graphs. Adding the
+opaque handle to an ordinary NVRTC module without that link leaves an
+unresolved device function.
+
+The current capture's 8,333 drained episodes have a very small shape set:
+5,325 contain one segment, 2,730 contain nine, 195 contain five, 69 contain
+three, and 14 contain four. None overflowed. A deliberately unsafe diagnostic
+mode skipped the episode counter readback and assumed the bounded path; median
+frame time moved only from 7.52 ms to 7.40 ms. The large synchronization API
+duration therefore mostly represents GPU work on the critical path, not CPU
+decision overhead. A conditional executor remains useful for launch reduction,
+but is no longer the leading expected frame-time win.
+
+Unlinking fused A-buffer interpolation from generated fragment shaders reduced
+the three sampler-free shaders from the usual roughly 195 registers to 22, 12,
+and 4 registers. Textured/helper shaders remained at roughly 195 registers due
+to the sampler module. Restoring a separate interpolation launch globally made
+the new replay slower, 7.59 ms versus 7.52 ms, so the experiment was reverted.
+A dual module could retain a lean ordinary path for the few sampler-free
+shaders, but its likely benefit is smaller than its module/tuning complexity.
+
+Literal sampler variants had silently failed NVRTC compilation because the
+generated exact float constants were emitted as C++14-incompatible hex-float
+literals. They now use bit-preserving `__int_as_float((int)0x...U)` expressions,
+including correct handling of signed zero and special values. The new capture
+measures 7.47 ms with variants enabled and 7.51 ms with them disabled; the old
+capture measures 24.97 ms enabled. This is a small win, but it also restores the
+intended specialization path instead of permanently falling back after compile
+failure.
