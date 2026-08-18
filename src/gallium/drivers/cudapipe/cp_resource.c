@@ -362,6 +362,63 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
    }
 }
 
+static void
+cp_image_copy_buffer(struct pipe_context *ctx,
+                     struct pipe_resource *dst,
+                     struct pipe_resource *src,
+                     unsigned buffer_offset,
+                     unsigned buffer_stride,
+                     unsigned buffer_layer_stride,
+                     unsigned level,
+                     const struct pipe_box *box)
+{
+   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_resource *dst_res = cp_resource(dst);
+   struct cp_resource *src_res = cp_resource(src);
+
+   assert(dst->target != PIPE_BUFFER);
+   assert(src->target == PIPE_BUFFER);
+   assert(MAX2(dst->nr_samples, 1) == 1);
+
+   cp_batch_flush(cp);
+   void *dst_data = cp_resource_data(dst_res);
+   void *src_data = cp_resource_data(src_res);
+   if (!dst_data || !src_data)
+      return;
+
+   unsigned block_size = util_format_get_blocksize(dst->format);
+   unsigned width_blocks = util_format_get_nblocksx(dst->format, box->width);
+   unsigned height_blocks = util_format_get_nblocksy(dst->format, box->height);
+   unsigned dst_block_x = util_format_get_nblocksx(dst->format, box->x);
+   unsigned dst_block_y = util_format_get_nblocksy(dst->format, box->y);
+   unsigned row_bytes = width_blocks * block_size;
+   unsigned src_stride = buffer_stride ? buffer_stride : row_bytes;
+   unsigned src_layer_stride = buffer_layer_stride ? buffer_layer_stride :
+                                                       src_stride * height_blocks;
+   unsigned dst_stride = dst_res->lpr.row_stride[level];
+   unsigned dst_layer_stride = dst_res->lpr.img_stride[level];
+
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   for (int z = 0; z < box->depth; z++) {
+      CUDA_MEMCPY2D copy = {0};
+      copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+      copy.srcDevice = (CUdeviceptr)(uintptr_t)src_data + buffer_offset +
+                       (uint64_t)z * src_layer_stride;
+      copy.srcPitch = src_stride;
+      copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+      copy.dstDevice = (CUdeviceptr)(uintptr_t)dst_data +
+                       dst_res->lpr.mip_offsets[level] +
+                       (uint64_t)(box->z + z) * dst_layer_stride +
+                       (uint64_t)dst_block_y * dst_stride +
+                       (uint64_t)dst_block_x * block_size;
+      copy.dstPitch = dst_stride;
+      copy.WidthInBytes = row_bytes;
+      copy.Height = height_blocks;
+      CP_CU_WARN(cuMemcpy2DAsync(&copy, cp->stream),
+                 "buffer-to-image device copy");
+   }
+}
+
 static void *
 cp_stage_device_resource(struct cp_context *cp, struct cp_resource *res)
 {
@@ -394,6 +451,12 @@ cp_unstage_device_resource(struct cp_context *cp, struct cp_resource *res,
    free(staging);
 }
 
+static bool
+cp_resource_device_accessible(const struct cp_resource *res)
+{
+   return res->cuda_managed || res->device_local;
+}
+
 static void
 cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
 {
@@ -405,11 +468,16 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    void *dst_data = cp_resource_data(dst_res);
    if (cp_debug->debug_draw)
       fprintf(stderr, "cudapipe: blit %ux%u -> %ux%u src=%p dst=%p "
-              "srcsamples=%u dstsamples=%u fmt=%u->%u\n",
+              "srcsamples=%u dstsamples=%u fmt=%u->%u filter=%u "
+              "levels=%u->%u depth=%d->%d device=%u/%u kernel=%p\n",
               info->src.box.width, info->src.box.height,
               info->dst.box.width, info->dst.box.height, src_data, dst_data,
               info->src.resource->nr_samples, info->dst.resource->nr_samples,
-              info->src.format, info->dst.format);
+              info->src.format, info->dst.format, info->filter,
+              info->src.level, info->dst.level, info->src.box.depth,
+              info->dst.box.depth, cp_resource_device_accessible(src_res),
+              cp_resource_device_accessible(dst_res),
+              (void *)cp->screen->kernels.blit_linear);
    if (!src_data || !dst_data)
       return;
 
@@ -440,7 +508,8 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    if (src_samples > 1 && dst_samples == 1 &&
        info->src.format == info->dst.format &&
        src_w == dst_w && src_h == dst_h &&
-       src_res->cuda_managed && dst_res->cuda_managed &&
+       cp_resource_device_accessible(src_res) &&
+       cp_resource_device_accessible(dst_res) &&
        cp->screen->kernels.resolve_samples) {
       cuCtxSetCurrent(cp->screen->cuda_ctx);
       struct cp_resolve_msaa_args ra = {
@@ -465,6 +534,46 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
       return;
    }
 
+   if (info->src.format == PIPE_FORMAT_R11G11B10_FLOAT &&
+       info->dst.format == PIPE_FORMAT_R11G11B10_FLOAT &&
+       info->filter == PIPE_TEX_FILTER_LINEAR &&
+       src_samples == 1 && dst_samples == 1 &&
+       cp_resource_device_accessible(src_res) &&
+       cp_resource_device_accessible(dst_res) &&
+       cp->screen->kernels.blit_linear) {
+      unsigned layers = MAX2(info->dst.box.depth, 1);
+      struct cp_blit_linear_args args = {
+         .src = (uint64_t)(uintptr_t)src_data +
+                src_res->lpr.mip_offsets[info->src.level] +
+                (uint64_t)info->src.box.z * src_img_stride +
+                (uint64_t)info->src.box.y * src_stride +
+                (uint64_t)info->src.box.x * src_pixel_size,
+         .dst = (uint64_t)(uintptr_t)dst_data +
+                dst_res->lpr.mip_offsets[info->dst.level] +
+                (uint64_t)info->dst.box.z * dst_img_stride +
+                (uint64_t)info->dst.box.y * dst_stride +
+                (uint64_t)info->dst.box.x * dst_pixel_size,
+         .src_width = src_w,
+         .src_height = src_h,
+         .dst_width = dst_w,
+         .dst_height = dst_h,
+         .src_stride = src_stride,
+         .dst_stride = dst_stride,
+         .src_layer_stride = src_img_stride,
+         .dst_layer_stride = dst_img_stride,
+         .layers = layers,
+         .encoding = CP_COLOR_R11G11B10_FLOAT,
+      };
+      void *params[] = { &args };
+      cuCtxSetCurrent(cp->screen->cuda_ctx);
+      CUresult err = cuLaunchKernel(cp->screen->kernels.blit_linear,
+                                    (dst_w + 15) / 16, (dst_h + 15) / 16,
+                                    layers, 16, 16, 1, 0, cp->stream,
+                                    params, NULL);
+      CP_CU_WARN(err, "R11G11B10 linear blit");
+      return;
+   }
+
    /* Same format and same size */
    if (info->src.format == info->dst.format && src_w == dst_w && src_h == dst_h) {
       cuCtxSetCurrent(cp->screen->cuda_ctx);
@@ -485,7 +594,8 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
       unsigned dby = util_format_get_nblocksy(info->dst.format, info->dst.box.y);
       /* If both are CUDA-managed, use GPU copy (stays in stream order).
        * Otherwise sync and memcpy (one side is host-only memory). */
-      if (src_res->cuda_managed && dst_res->cuda_managed) {
+      if (cp_resource_device_accessible(src_res) &&
+          cp_resource_device_accessible(dst_res)) {
          for (int z = 0; z < info->src.box.depth; z++) {
             CUDA_MEMCPY2D copy = {0};
             copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
@@ -1696,6 +1806,7 @@ cudapipe_init_context_resource_funcs(struct pipe_context *ctx)
    ctx->texture_map = cp_buffer_map;
    ctx->texture_unmap = cp_buffer_unmap;
    ctx->resource_copy_region = cp_resource_copy_region;
+   ctx->image_copy_buffer = cp_image_copy_buffer;
    ctx->blit = cp_blit;
    ctx->clear = cp_clear;
    ctx->clear_buffer = cp_clear_buffer;

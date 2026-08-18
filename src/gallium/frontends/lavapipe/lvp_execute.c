@@ -2515,33 +2515,12 @@ static void handle_copy_buffer_to_image(struct vk_cmd_queue_entry *cmd,
       const VkImageAspectFlagBits aspects = copycmd->pRegions[i].imageSubresource.aspectMask;
       uint8_t plane = lvp_image_aspects_to_plane(dst_image, aspects);
 
-      sbox.x = region->bufferOffset;
-      sbox.y = 0;
-      sbox.z = 0;
-      sbox.width = lvp_buffer_from_handle(copycmd->srcBuffer)->bo->width0;
-      sbox.height = 1;
-      sbox.depth = 1;
-      src_data = state->pctx->buffer_map(state->pctx,
-                                           lvp_buffer_from_handle(copycmd->srcBuffer)->bo,
-                                           0,
-                                           PIPE_MAP_READ,
-                                           &sbox,
-                                           &src_t);
-
-
       box.x = region->imageOffset.x;
       box.y = region->imageOffset.y;
       box.z = dst_image->vk.image_type == VK_IMAGE_TYPE_3D ? region->imageOffset.z : region->imageSubresource.baseArrayLayer;
       box.width = region->imageExtent.width;
       box.height = region->imageExtent.height;
       box.depth = dst_image->vk.image_type == VK_IMAGE_TYPE_3D ? region->imageExtent.depth : subresource_layercount(dst_image, &region->imageSubresource);
-
-      dst_data = state->pctx->texture_map(state->pctx,
-                                           dst_image->planes[plane].bo,
-                                           region->imageSubresource.mipLevel,
-                                           PIPE_MAP_WRITE,
-                                           &box,
-                                           &dst_t);
 
       enum pipe_format dst_format = dst_image->planes[plane].bo->format;
       enum pipe_format src_format = dst_format;
@@ -2555,6 +2534,35 @@ static void handle_copy_buffer_to_image(struct vk_cmd_queue_entry *cmd,
 
       const struct vk_image_buffer_layout buffer_layout =
          vk_image_buffer_copy_layout(&dst_image->vk, &copycmd->pRegions[i]);
+      struct pipe_resource *src_buffer =
+         lvp_buffer_from_handle(copycmd->srcBuffer)->bo;
+      if (src_format == dst_format && state->pctx->image_copy_buffer) {
+         state->pctx->image_copy_buffer(state->pctx,
+                                        dst_image->planes[plane].bo,
+                                        src_buffer,
+                                        region->bufferOffset,
+                                        buffer_layout.row_stride_B,
+                                        buffer_layout.image_stride_B,
+                                        region->imageSubresource.mipLevel,
+                                        &box);
+         continue;
+      }
+
+      sbox.x = region->bufferOffset;
+      sbox.y = 0;
+      sbox.z = 0;
+      sbox.width = src_buffer->width0;
+      sbox.height = 1;
+      sbox.depth = 1;
+      src_data = state->pctx->buffer_map(state->pctx, src_buffer, 0,
+                                         PIPE_MAP_READ, &sbox, &src_t);
+      dst_data = state->pctx->texture_map(state->pctx,
+                                           dst_image->planes[plane].bo,
+                                           region->imageSubresource.mipLevel,
+                                           PIPE_MAP_WRITE,
+                                           &box,
+                                           &dst_t);
+
       if (src_format != dst_format) {
          lvp_image_copy_depth_box(dst_data, dst_format,
                         dst_t->stride, dst_t->layer_stride,

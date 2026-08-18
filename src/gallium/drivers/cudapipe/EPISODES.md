@@ -1107,3 +1107,84 @@ Correctness sweeps are a release gate, not supporting telemetry. Any newly
 large frame delta, missing geometry, sample crash, or timeout must be reported
 explicitly before a performance result is accepted, even if the aggregate
 timing report does not flag it.
+
+## Session 15: device blits and the full-allocation staging negative
+
+Two CPU blit fallbacks were moved onto CUDA-addressable storage. Linear
+`PIPE_FORMAT_R11G11B10_FLOAT` mip generation now runs in a device kernel with
+four bilinear taps and exact round-to-nearest-even packed-float conversion.
+The multisample resolve and equal-format copy predicates now explicitly accept
+both managed and device-local resources. The resolve broadening is descriptive
+rather than behavioral: device-local bindings already set `cuda_managed` to
+mean CUDA-addressable, so they passed the old predicate too.
+
+The full 18-sample, 60-frame sweep is
+`~/git/Vulkan/build/iter/gpu-blits`. Every stored frame stays within its
+frame-zero budget against `scratch-cap-correctness`; `texturemipmapgen` and
+`multisampling` are byte-identical for all 60 frames. The standing NVIDIA
+differences remain unchanged. Focused artifacts are under
+`/tmp/cp-gpublit-focus-1787069330`.
+
+This did **not** materially improve the old replay. Two medians were 25.22 and
+25.36 ms versus the 25.39 ms post-split reference (25.29 ms average, about
+0.4%, within run noise). More importantly, Nsight still records 5,130
+12,681,216-byte DtoH transfers and 5,130 matching HtoD transfers in its
+15-second window. Neither new blit kernel appears in that steady-state trace;
+the R11G11B10 mip generation occurs earlier during loading.
+
+The original attribution of those full-size copies to format-conversion blits
+was therefore wrong. A 499 Hz DWARF `perf` capture identifies the actual hot
+stacks as `handle_copy_buffer_to_image -> cp_buffer_map -> cuMemcpyDtoH` and
+`handle_copy_buffer_to_image -> cp_buffer_unmap -> cuMemcpyHtoDAsync`.
+`cp_buffer_map` currently allocates and downloads the resource's entire Vulkan
+memory allocation, even for a small mapped box, and `cp_buffer_unmap` uploads
+the entire allocation after a write. The capture is
+`~/claude-scratchpad/perf16/old-perf-map-1787070110/`; the matching Nsight
+artifact is
+`~/claude-scratchpad/perf16/gpublit-old-profile-1787069910/`.
+
+The next direct fix is range/box-local device staging: skip the initial DtoH
+for write-discard maps, copy only the mapped buffer interval for buffers, and
+copy only the addressed rows/layers for textures. It must preserve Gallium's
+returned pointer, stride, and layer-stride contracts rather than merely biasing
+a short allocation as though it contained the whole resource.
+
+## Session 16: native buffer-to-image copies
+
+Lavapipe's `vkCmdCopyBufferToImage` executor used to map the source buffer and
+destination texture and run `util_copy_box` on the CPU. That is sensible for a
+CPU renderer, but Cudapipe's device-local map fallback downloaded and uploaded
+the whole Vulkan allocation around every partial destination write. Gallium
+already has the optional `image_copy_buffer` hook for exactly this operation;
+Lavapipe now calls it for byte-identical format copies and retains its existing
+CPU path for depth/stencil aspect conversion.
+
+Cudapipe implements the hook as one asynchronous pitched `cuMemcpy2DAsync` per
+layer. It accounts for the Vulkan buffer offset, row/image strides, destination
+mip and layer offsets, and compressed-format block dimensions. Both resources
+remain CUDA-addressable and the copies stay ordered on the context stream.
+No llvmpipe behavior changes when the callback is absent.
+
+The steady-state Nsight window contains **zero** 12,681,216-byte copies, versus
+5,130 DtoH plus 5,130 HtoD before the change (roughly 130 GB of traffic). The
+profile artifact is
+`~/claude-scratchpad/perf16/image-copy-nsys-1787071183/`. Fixed-window kernel
+union rises from roughly 5.6 to 9.7 seconds because the replay completes many
+more frames inside the instrumented interval once the host no longer blocks on
+the staging copies; kernel time per frame is effectively unchanged.
+
+Uninstrumented wall time moves only modestly. Two clean old-capture medians are
+25.24 and 25.16 ms, averaging 25.20 ms, versus 25.29 ms for the preceding
+GPU-blit build and 25.39 ms for the original post-memory-split reference. The
+large copy cost was substantially overlapped with useful GPU work, so deleting
+it removes traffic and host blocking without promising its API-duration sum as
+a wall-time gain.
+
+The full 18-sample iteration is
+`~/git/Vulkan/build/iter/buffer-image-device`: all 1,020 stored frames remain
+inside their frame-zero budgets against `gpu-blits`, with a noise-level -0.9%
+aggregate timing move. The old capture's four established readbacks differ by
+0, 3, 21, and 84 bytes out of 3.69 MB; Crossroads frames 633, 756, and 907 are
+byte-for-byte identical to the corrected memory-split reference. Their artifacts
+are `~/claude-scratchpad/perf16/image-copy-old-frames-1787071300/` and
+`~/claude-scratchpad/perf16/image-copy-crossroads-frames-1787071378/`.

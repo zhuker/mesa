@@ -31,6 +31,7 @@ struct cp_kernels {
    CUfunction clear_visbuf;
    CUfunction peel_advance;
    CUfunction resolve_samples;
+   CUfunction blit_linear;
    CUfunction resolve_visbuf;
 
    /* A-buffer build, and the peel-loop log its verification compares against. */

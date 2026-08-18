@@ -289,6 +289,7 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
    cuModuleGetFunction(&k->fs_interpolate, k->fs_module, "cp_fs_interpolate");
    cuModuleGetFunction(&k->fs_writeback, k->fs_module, "cp_fs_writeback");
    cuModuleGetFunction(&k->resolve_samples, k->fs_module, "cp_resolve_samples");
+   cuModuleGetFunction(&k->blit_linear, k->fs_module, "cp_blit_linear");
    /* The quad-stream interpolator lives beside the peel one so both call the
     * same cp_interp_pixel; see cp_fs.cu. */
    cuModuleGetFunction(&k->abuf_interpolate, k->fs_module,

@@ -1001,6 +1001,21 @@ struct cp_resolve_msaa_args {
    uint32_t num_samples;
    int32_t encoding;
 };
+
+struct cp_blit_linear_args {
+   uint64_t src;
+   uint64_t dst;
+   uint32_t src_width;
+   uint32_t src_height;
+   uint32_t dst_width;
+   uint32_t dst_height;
+   uint32_t src_stride;
+   uint32_t dst_stride;
+   uint32_t src_layer_stride;
+   uint32_t dst_layer_stride;
+   uint32_t layers;
+   uint32_t encoding;
+};
 #define CP_MAX_NONTRIVIAL    1000000
 #define CP_MAX_HUGE_TILES    2000000
 
