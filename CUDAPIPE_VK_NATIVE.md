@@ -2203,3 +2203,40 @@ That contradiction, not the batching front end, is the whole remaining
 performance gap. It is now the sharpest open question in this driver: something
 differs per draw, is read through the fragment stage, and is *not* in the row
 that `cp_batch_record` writes.
+
+### The descriptor key's necessity, bisected: it breaks at three draws, not two
+
+`CUDAPIPE_BATCH_MAX` turns the long-standing open question into a measurement.
+`gltfscenerendering` with `CPVK_BATCH=1 CPVK_NO_DESC_KEY=1`, mean absolute
+difference against the reference:
+
+    BATCH_MAX  1     0.000
+               2     0.000
+               3     5.516
+               4     7.304
+               6    20.129
+               9    20.768
+              16    20.768
+
+Three runs each at 2 and 3: `[0.0, 0.0, 0.0]` and `[5.515, 5.516, 5.515]`. The
+boundary is exact and the error grows with the number of draws sharing a
+launch, which is the signature of a batch using one draw's state for all of
+them.
+
+Two draws merge correctly without the key; three do not. `cpvk_batchtex` has
+three draws, three descriptor sets and three textures, and merges correctly
+without it -- so the count alone is not the discriminator either, and whatever
+gltfscenerendering has that the test lacks is now bounded by "visible only at
+three or more".
+
+Things eliminated on the way: the row width is not it -- `CP_ARG_UBO_STRIDE`
+and `CP_MAX_CONST_BUFFERS` are both 16, so rows cannot spill. The binding
+counts are not it -- `num_vs_ubos` and `num_fs_ubos` are set to
+`CP_MAX_CONST_BUFFERS` for every draw, so the widths always agree.
+
+What is left is the mechanism that maps a *fragment* back to its draw's row:
+`cp->fs_batch.slices`, a table of per-draw vertex spans that the fragment
+stage searches by primitive. It is set only when `batch_draws > 1`, and the
+opaque path's version is the one gltfscenerendering takes. A search that
+returns the wrong row for the third and later draws would produce exactly this
+curve.
