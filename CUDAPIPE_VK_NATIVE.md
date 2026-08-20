@@ -3278,3 +3278,37 @@ comparison -- one shader line or one sampler field at a time, never an oracle
 for what the answer should be. Every conclusion in this session that rested on
 decoding a value from a colour has been retracted; none of the substitution
 results has.
+
+### Confirmed: the cube path lacks seamless filtering, and two earlier readings were stale
+
+A fresh run of the sphere test, rebuilt binary and regenerated images:
+
+    native LINEAR    6 distinct colours
+                     face 4: 1227 px, face 1: 137, face 2: 49, face 3: 38,
+                     face 0: 8
+    lavapipe LINEAR  112 distinct colours
+    expected faces   [0, 145, 49, 38, 1227, 0]
+
+**Native selects the correct faces** -- its histogram matches the expected one
+within the handful of pixels that sit exactly on a boundary. What it does not
+do is blend across a seam: six flat colours where lavapipe produces 112 by
+filtering a footprint that continues onto the adjacent face.
+
+That is seamless cube filtering, which Vulkan requires, and it is confirmed by
+the filter substitution: `VK_FILTER_NEAREST` makes the two drivers byte-
+identical, because with no footprint there is nothing to blend.
+
+**Two earlier readings in this file were wrong and both had the same cause.**
+"native reads face 0 everywhere" and "0.0% agreement with the expected faces"
+came from `.ppm` files generated several rebuilds earlier -- including one
+build carrying a device-side `printf` -- and compared against freshly computed
+expectations. The retraction of the face-selection diagnosis was itself
+mistaken; the original oracle was right and the data under it was old.
+
+The rule that catches this is the one already recorded for measurements and not
+yet applied to files: **regenerate every artefact after a rebuild**, and do not
+compare an image produced by one binary against a number produced by another.
+
+So `pbribl` is: a prefiltered environment cube sampled with `VK_FILTER_LINEAR`
+over a sphere, where every quad's footprint crosses a seam, on a driver that
+clamps each footprint inside one face.
