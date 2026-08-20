@@ -859,3 +859,30 @@ with known, structural causes: no draw batching at all, a `cuStreamSynchronize`
 per submit, and host loops for resolves and scaling blits. That is tractable
 engineering against a number the objective actually names, and it is where the
 next turns should go.
+
+## The replay-time gap is draw batching, and nothing else
+
+Measured rather than argued, with the Gallium driver's own `CUDAPIPE_NO_BATCH`
+switch as the control:
+
+    capture       gallium   gallium      native
+                  batched   no batch    (no batching)
+    Crossroads      7.13      27.88        24.28  ms
+    old capture    25.20     100.43        78.90  ms
+
+The native driver is **faster than the Gallium driver with batching turned
+off**, on both captures. It is not slow. It is missing one feature, and that
+feature accounts for the entire difference.
+
+Also measured and refuted: the `cuStreamSynchronize` per submit, which looked
+like the obvious cost -- 3,022 of them for 1,510 frames. Removing both syncs
+moves the Crossroads median from 24.29 ms to 24.28 ms. It costs nothing,
+because the work it waits for has already been waited on by the host reads
+around it.
+
+So the remaining performance work is one item: batching on the native path.
+The renderer's batching machinery is already compiled into this driver --
+`cp_batch_record`, the key, the flush discipline, the pass and opaque
+episodes, all of it moved across in the extraction -- and what is missing is
+the front end that fills a `cp_batch_key` and decides when to hold a draw
+back. `cp_draw_vbo` in the Gallium adapter is the worked example.
