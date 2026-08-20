@@ -5978,6 +5978,12 @@ cp_pass_broadcast(struct cp_context *cp, unsigned nsegs)
 struct cp_pass_live {
    struct cp_shader_binary *vs, *fs;
    struct pipe_vertex_element vertex_elements[16];
+   /* The resolved vertex input as well, because that is what the draw path
+    * reads. Saving only the Gallium array would leave a segment re-executed
+    * by the fallback gathering with whatever layout is live at the time. */
+   struct cp_vertex_elem velem[16];
+   uint64_t vb_base[16];
+   unsigned num_vertex_buffers;
    unsigned num_vertex_elements, vertex_stride;
    unsigned num_vs_ubos, num_fs_ubos;
    struct cp_fs_batch fs_batch;
@@ -5990,6 +5996,9 @@ cp_pass_live_save(struct cp_context *cp, struct cp_pass_live *lv)
    lv->fs = cp->fs_shader;
    memcpy(lv->vertex_elements, cp->vertex_elements,
           sizeof(lv->vertex_elements));
+   memcpy(lv->velem, cp->velem, sizeof(lv->velem));
+   memcpy(lv->vb_base, cp->vb_base, sizeof(lv->vb_base));
+   lv->num_vertex_buffers = cp->num_vertex_buffers;
    lv->num_vertex_elements = cp->num_vertex_elements;
    lv->vertex_stride = cp->vertex_stride;
    lv->num_vs_ubos = cp->num_vs_ubos;
@@ -6004,6 +6013,9 @@ cp_pass_live_restore(struct cp_context *cp, const struct cp_pass_live *lv)
    cp->fs_shader = lv->fs;
    memcpy(cp->vertex_elements, lv->vertex_elements,
           sizeof(lv->vertex_elements));
+   memcpy(cp->velem, lv->velem, sizeof(lv->velem));
+   memcpy(cp->vb_base, lv->vb_base, sizeof(lv->vb_base));
+   cp->num_vertex_buffers = lv->num_vertex_buffers;
    cp->num_vertex_elements = lv->num_vertex_elements;
    cp->vertex_stride = lv->vertex_stride;
    cp->num_vs_ubos = lv->num_vs_ubos;
@@ -6018,6 +6030,9 @@ cp_pass_seg_restore(struct cp_context *cp, const struct cp_pass_seg *sg)
    cp->fs_shader = sg->fs;
    memcpy(cp->vertex_elements, sg->vertex_elements,
           sizeof(sg->vertex_elements));
+   memcpy(cp->velem, sg->velem, sizeof(sg->velem));
+   memcpy(cp->vb_base, sg->vb_base, sizeof(sg->vb_base));
+   cp->num_vertex_buffers = sg->num_vertex_buffers;
    cp->num_vertex_elements = sg->num_vertex_elements;
    cp->vertex_stride = sg->vertex_stride;
    cp->num_vs_ubos = sg->num_vs_ubos;
@@ -6971,6 +6986,19 @@ cp_pass_finish(struct cp_context *cp)
    size_t n = (size_t)w * h;
    bool failed = false;
 
+   /*
+    * The fallback exists for overflow and allocation failure, which the
+    * sample set never reaches and the captures reach only on the standalone
+    * A-buffer path -- so the episode fallback is code the gate cannot
+    * exercise. This makes it reachable on purpose: every episode takes it,
+    * and the output must be identical, because re-executing the segments
+    * classically is defined to produce what the episode would have.
+    */
+   if (cp_debug->force_pass_fallback) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+
    cuCtxSetCurrent(screen->cuda_ctx);
    CP_NVTX_SCOPEF("episode %u segs", nsegs);
 
@@ -7443,6 +7471,9 @@ cp_pass_record_segment(struct cp_context *cp,
              (size_t)ndraws * CP_VB_TABLE_STRIDE * sizeof(uint64_t));
    memcpy(sg->vertex_elements, cp->vertex_elements,
           sizeof(sg->vertex_elements));
+   memcpy(sg->velem, cp->velem, sizeof(sg->velem));
+   memcpy(sg->vb_base, cp->vb_base, sizeof(sg->vb_base));
+   sg->num_vertex_buffers = cp->num_vertex_buffers;
    sg->num_vertex_elements = cp->num_vertex_elements;
    sg->vertex_stride = cp->vertex_stride;
    sg->num_vs_ubos = cp->num_vs_ubos;

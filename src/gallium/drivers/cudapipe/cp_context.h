@@ -187,6 +187,12 @@ struct cp_context {
       uint64_t vb_bases[CP_MAX_BATCH_DRAWS * CP_VB_TABLE_STRIDE];
       /* Live state the fallback restores before re-executing. */
       struct pipe_vertex_element vertex_elements[16];
+      /* And the resolved form, which is what cp_draw_execute actually reads:
+       * restoring only the Gallium array leaves a re-executed segment using
+       * whatever element layout happens to be live. */
+      struct cp_vertex_elem velem[16];
+      uint64_t vb_base[16];
+      unsigned num_vertex_buffers;
       unsigned num_vertex_elements, vertex_stride;
       unsigned num_vs_ubos, num_fs_ubos;
    } *pass_segs;                    /* [CP_PASS_MAX_SEGS], at context create */

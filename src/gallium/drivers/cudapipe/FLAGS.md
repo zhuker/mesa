@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-59 switches.
+60 switches.
 
 ## Tracing
 
@@ -54,6 +54,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_NO_SEG_MERGE` | bool (value) | `off` | — | disable merged shading groups: every episode segment shades in its own launch group, as before |
 | `CUDAPIPE_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |
 | `CUDAPIPE_NO_FUSED_ABUF_INTERP` | bool (value) | `off` | — | launch A-buffer interpolation separately instead of calling it from the generated fragment shader; performance experiment only |
+| `CUDAPIPE_FORCE_PASS_FALLBACK` | bool (value) | `off` | — | make every blended episode take the classic re-execution fallback; the output must be identical, which is what makes it a test |
 | `CUDAPIPE_TILE_CENSUS` | uint | `0` | 0&ndash;256 | tile edge in pixels for the blended tile-bin shader census; 0 is off, and it changes no rendering |
 | `CUDAPIPE_TILE_CENSUS_EVERY` | uint | `2000` | 1&ndash;1000000 | report the tile census this often, in episodes |
 | `CUDAPIPE_TILED_OPAQUE` | bool (value) | `off` | — | use the experimental opaque episode sort-middle tile rasterizer |

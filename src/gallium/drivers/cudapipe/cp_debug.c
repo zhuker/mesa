@@ -145,6 +145,10 @@ static const struct cp_flag_def flags[] = {
      F(no_fused_abuf_interp),
      "launch A-buffer interpolation separately instead of calling it from "
      "the generated fragment shader; performance experiment only" },
+   { "CUDAPIPE_FORCE_PASS_FALLBACK", CP_FLAG_BOOL_VALUE,
+     F(force_pass_fallback),
+     "make every blended episode take the classic re-execution fallback; the "
+     "output must be identical, which is what makes it a test" },
    { "CUDAPIPE_TILE_CENSUS", CP_FLAG_UINT, F(tile_census),
      "tile edge in pixels for the blended tile-bin shader census; 0 is off, "
      "and it changes no rendering", .dflt = 0, .has_range = true,
