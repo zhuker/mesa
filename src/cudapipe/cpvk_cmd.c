@@ -1003,15 +1003,11 @@ struct cpvk_batch_state {
    struct cp_viewport_state viewport;
    unsigned fb_samples;
    /*
-    * The fragment stage's bindings, by address.
-    *
-    * cp_batch_key deliberately omits the *vertex* stage's, because a batch
-    * carries one row of them per draw. It says nothing about the fragment
-    * stage's, and a batch carries only one set of those -- so two draws that
-    * sample different textures must not merge, and leaving these out shaded a
-    * whole batch with whichever descriptor arrived last. computeshader went
-    * from 4.4 to 83.5 and multithreading from exact to wrong before this was
-    * here.
+    * The fragment stage's bindings. The renderer carries them per draw and
+    * says so, so in principle they need not be a merge condition -- but
+    * taking them out moved pushconstants from 5.098 to 7.336 and bought
+    * nothing measurable (23.32 ms against 24.01 on Crossroads), so they stay
+    * until something explains that.
     */
    uint64_t fs_ubos[CP_MAX_CONST_BUFFERS];
 };
@@ -1129,6 +1125,44 @@ cpvk_batch_structural(struct cpvk_device *dev, const struct cpvk_draw *d)
    return true;
 }
 
+static bool cpvk_batch_eligible(struct cpvk_device *dev,
+                                const struct cpvk_draw *d, bool *blended);
+
+/*
+ * Whether this draw can join whatever is pending -- answered without touching
+ * the context, because the answer decides whether the context may be written.
+ * The key is built from the draw and its pipeline; the few context fields it
+ * needs (the framebuffer's buffers, the sampler table) belong to the pass and
+ * are already current.
+ */
+static bool
+cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw *d)
+{
+   struct cp_context *cp = &dev->renderer;
+   bool blended = false;
+
+   if (!cpvk_batch_eligible(dev, d, &blended))
+      return false;
+
+   unsigned tris = cp_triangles_for_draw(d->call.mode, d->range.count) *
+                   MAX2(d->call.instance_count, 1u);
+
+   if (!cp->batch.pending)
+      return true;
+
+   struct cp_batch_key key;
+   cpvk_build_batch_key(dev, d, &key, blended);
+
+   if (memcmp(&key, &cp->batch.key, sizeof(key)))
+      return false;
+   if (cp->batch.ndraws >= (unsigned)cp_debug->batch_max)
+      return false;
+   if (cp->batch.tris + tris > CP_MAX_BATCH_TRIS)
+      return false;
+
+   return true;
+}
+
 static bool
 cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw *d,
                     bool *blended)
@@ -1154,7 +1188,17 @@ cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw *d,
     * batch. Finding it is the remaining work, and CUDAPIPE_DEBUG_BATCHDIFF
     * against the Gallium driver's key on the same sample is the way in.
     */
-   return false;
+   /*
+    * Off. It is correct now -- every sample matches the unbatched result --
+    * and it is worth nothing measurable, because almost nothing merges: the
+    * key holds the pipeline's *address*, so two pipelines with identical
+    * state never merge, where the Gallium adapter compares the state itself
+    * and merges them. Keying on the resolved state instead is the work that
+    * would make this pay, and until then an always-false batcher is honest
+    * about what it does.
+    */
+   if (!getenv("CPVK_BATCH"))
+      return false;
 
    if (cp_debug->no_batch)
       return false;
@@ -1181,6 +1225,21 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
 {
    struct cp_context *cp = &dev->renderer;
    struct cpvk_pipeline *p = d->pipeline;
+
+   /*
+    * Decide about the batch *before* staging this draw's state.
+    *
+    * A flush renders what is already held back, and it reads the context to
+    * do it -- shaders, descriptors, vertex bindings. Staging first and
+    * deciding afterwards meant every flush rendered the previous batch with
+    * this draw's state. It showed up as computeshader being wrong even at
+    * CUDAPIPE_BATCH_MAX=1, where each draw is its own batch and the result is
+    * supposed to be bit-identical to not batching at all -- which is exactly
+    * what that flag is for.
+    */
+   bool batch_ok = cpvk_batch_can_join(dev, d);
+   if (!batch_ok)
+      cp_batch_flush_why(cp, "the next draw cannot join");
 
    cp->viewport = d->viewport;
    cp->scissor = d->scissor;
@@ -1257,41 +1316,20 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
     * Measured worth: with batching off the Gallium driver replays Crossroads
     * at 27.88 ms and with it at 7.13, and this driver had no batching at all.
     */
-   bool blended = false;
-   if (cpvk_batch_eligible(dev, d, &blended)) {
-      struct cp_batch_key key;
-      cpvk_build_batch_key(dev, d, &key, blended);
-
+   if (batch_ok) {
       unsigned tris = cp_triangles_for_draw(d->call.mode, d->range.count) *
                       MAX2(d->call.instance_count, 1u);
-      const unsigned cap = cp_debug->batch_max;
-
-      if (cp->batch.pending) {
-         const char *why = NULL;
-         if (memcmp(&key, &cp->batch.key, sizeof(key)))
-            why = "the next draw differs in state or geometry";
-         else if (cp->batch.ndraws >= (unsigned)cap)
-            why = "the draw cap";
-         else if (cp->batch.tris + tris > CP_MAX_BATCH_TRIS)
-            why = "the triangle cap";
-
-         if (!why) {
-            cp_batch_record(cp, &d->range, tris, 0, d->call.instance_count);
-            return;
-         }
-         cp_batch_flush_defer_why(cp, why);
+      if (!cp->batch.pending) {
+         cpvk_build_batch_key(dev, d, &cp->batch.key, false);
+         cp->batch.info = d->call;
+         cp->batch.drawid_offset = 0;
+         cp->batch.pending = true;
+         cp->batch.blended = false;
       }
-
-      cp->batch.key = key;
-      cp->batch.info = d->call;
-      cp->batch.drawid_offset = 0;
-      cp->batch.pending = true;
-      cp->batch.blended = blended;
       cp_batch_record(cp, &d->range, tris, 0, d->call.instance_count);
       return;
    }
 
-   cp_batch_flush_why(cp, "the next draw cannot be batched");
    cp_draw_execute(cp, &d->call, 0, &d->range, 1, 1, NULL, NULL, NULL, NULL,
                    NULL, NULL);
 }
