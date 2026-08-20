@@ -642,7 +642,23 @@ cpvk_compile_stage(struct cpvk_device *dev,
    cpvk_lower_nir(nir);
    cpvk_lower_descriptors(nir, layout);
 
-   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      /*
+       * A vertex shader's inputs are numbered by their attribute location,
+       * not compacted: the fetch kernel writes attribute N into slot N
+       * because cpvk_pipeline::velem is indexed by
+       * VkVertexInputAttributeDescription::location. Letting
+       * nir_assign_io_var_locations renumber them means the shader reads a
+       * slot the fetch never wrote whenever the locations are not exactly
+       * 0..n-1 in declaration order -- which is how pushconstants' spheres
+       * came out shaded by their normals instead of their colour.
+       */
+      nir_foreach_variable_with_modes(var, nir, nir_var_shader_in)
+         var->data.driver_location = var->data.location >= VERT_ATTRIB_GENERIC0
+            ? var->data.location - VERT_ATTRIB_GENERIC0 : var->data.location;
+   } else {
+      nir_assign_io_var_locations(nir, nir_var_shader_in);
+   }
    nir_assign_io_var_locations(nir, nir_var_shader_out);
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             cp_type_size_vec4, nir_lower_io_lower_64bit_to_32);

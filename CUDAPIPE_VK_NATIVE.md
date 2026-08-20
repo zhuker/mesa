@@ -1250,3 +1250,32 @@ happens *around* a batch that renders wrongly, rather than at the batch.
 The test that established all this is worth more than the answer would have
 been. It parameterises draw count, triangle count, varying count, framebuffer
 size and vertex layout, and it runs in a second.
+
+### A vertex shader's inputs are numbered by attribute location
+
+`pushconstants` drew its spheres as smooth RGB gradients where lavapipe and the
+Gallium driver draw flat per-sphere colours -- and the shader is
+`outColor = inColor * pushConsts.color.rgb`, so the gradient was a *vertex
+attribute* being fetched from the wrong place. The elements were right
+(offsets 0, 12 and 32 in a 96-byte stride, which is vkglTF::Vertex), so the
+fetch was writing the right data into the right slots and the shader was
+reading the wrong ones.
+
+`nir_assign_io_var_locations(nir, nir_var_shader_in)` renumbers a shader's
+inputs compactly. For a fragment shader that is right, because the varying
+match is by `var->data.location` and the backend records it. For a **vertex**
+shader it is wrong: the fetch kernel writes attribute N into slot N because
+`cpvk_pipeline::velem` is indexed by
+`VkVertexInputAttributeDescription::location`, so the driver location has to
+be the attribute location. Whenever a pipeline's locations are not exactly
+0..n-1 in declaration order, the shader reads a slot nothing wrote --
+`pushconstants` read the normal where the colour is.
+
+Vertex inputs now take `location - VERT_ATTRIB_GENERIC0` directly.
+`pushconstants` goes from 5.098 to **0.000**, the ninth sample to match, and
+nothing else moves.
+
+Found by looking at the two images. The triage that led there -- comparing
+distinct-colour counts between the native and Gallium renders of all ten wrong
+samples -- flagged this one as the odd one out in a single table: 32,040
+colours natively against 17.
