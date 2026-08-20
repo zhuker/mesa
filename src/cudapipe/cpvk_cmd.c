@@ -1083,6 +1083,8 @@ cpvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
          .dst = dst->mem->dev_ptr + dst->offset + r->dstOffset,
          .width_bytes = r->size,
          .rows = 1,
+         .src_end = src->mem->dev_ptr + src->offset + src->vk.size,
+         .dst_end = dst->mem->dev_ptr + dst->offset + dst->vk.size,
       };
    }
 }
@@ -1163,11 +1165,25 @@ cpvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
       if (!cpvk_image_plane(img, r->imageSubresource.mipLevel, &ib, &ip, &bpp))
          return;
 
+      /*
+       * In blocks, not texels. A block-compressed format has a blocksize per
+       * 4x4 block, so measuring a row as width * blocksize overstates it
+       * sixteenfold: the capture's 1024-wide BC image wanted a two-megabyte
+       * read out of a 128 KB staging buffer, and cuMemcpy2DAsync answers that
+       * by faulting inside libcuda. For an uncompressed format the block is
+       * one texel and this is the same arithmetic as before.
+       */
+      enum pipe_format pfmt = vk_format_to_pipe_format(img->vk.format);
       unsigned row_texels = r->bufferRowLength ? r->bufferRowLength
                                                : r->imageExtent.width;
       unsigned img_rows = r->bufferImageHeight ? r->bufferImageHeight
                                                : r->imageExtent.height;
-      size_t layer_bytes = (size_t)row_texels * img_rows * bpp;
+      size_t src_row = (size_t)util_format_get_nblocksx(pfmt, row_texels) * bpp;
+      size_t copy_row = (size_t)util_format_get_nblocksx(pfmt,
+                                                        r->imageExtent.width) * bpp;
+      unsigned copy_rows = util_format_get_nblocksy(pfmt, r->imageExtent.height);
+      size_t layer_bytes = src_row *
+                           util_format_get_nblocksy(pfmt, img_rows);
       unsigned layers = MAX2(r->imageSubresource.layerCount, 1u);
 
       for (unsigned l = 0; l < layers; l++) {
@@ -1181,10 +1197,15 @@ cpvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
                         img->level_size[r->imageSubresource.mipLevel] +
                    (size_t)r->imageOffset.y * ip +
                    (size_t)r->imageOffset.x * bpp,
-            .src_pitch = (size_t)row_texels * bpp,
+            .src_pitch = src_row,
             .dst_pitch = ip,
-            .width_bytes = (size_t)r->imageExtent.width * bpp,
-            .rows = r->imageExtent.height,
+            .width_bytes = copy_row,
+            .rows = copy_rows,
+            /* Both ends bounded: this is the path that uploads every texture
+             * and every mip level in a capture, and it was the one with no
+             * limits on it. */
+            .src_end = buf->mem->dev_ptr + buf->offset + buf->vk.size,
+            .dst_end = cpvk_image_end(img),
          };
       }
    }
@@ -1209,6 +1230,7 @@ cpvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
       if (!cpvk_image_plane(img, r->imageSubresource.mipLevel, &ib, &ip, &bpp))
          return;
 
+      enum pipe_format pfmt = vk_format_to_pipe_format(img->vk.format);
       unsigned row_texels = r->bufferRowLength ? r->bufferRowLength
                                                : r->imageExtent.width;
       struct cpvk_copy *c = cpvk_record_copy(cmd);
@@ -1221,9 +1243,12 @@ cpvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
                 (size_t)r->imageOffset.x * bpp,
          .dst = buf->mem->dev_ptr + buf->offset + r->bufferOffset,
          .src_pitch = ip,
-         .dst_pitch = (size_t)row_texels * bpp,
-         .width_bytes = (size_t)r->imageExtent.width * bpp,
-         .rows = r->imageExtent.height,
+         .dst_pitch = (size_t)util_format_get_nblocksx(pfmt, row_texels) * bpp,
+         .width_bytes = (size_t)util_format_get_nblocksx(pfmt,
+                                                        r->imageExtent.width) * bpp,
+         .rows = util_format_get_nblocksy(pfmt, r->imageExtent.height),
+         .src_end = cpvk_image_end(img),
+         .dst_end = buf->mem->dev_ptr + buf->offset + buf->vk.size,
       };
    }
 }
@@ -1440,6 +1465,17 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
 
    cuCtxSetCurrent(dev->cu_ctx);
 
+   if (getenv("CPVK_TRACE_COPY")) {
+      fprintf(stderr, "copy src=%p dst=%p %zux%zu pitch %zu->%zu "
+              "scale %ux%u->%ux%u samples=%u stride=%llu ends %p/%p\n",
+              (void *)(uintptr_t)c->src, (void *)(uintptr_t)c->dst,
+              c->width_bytes, c->rows, c->src_pitch, c->dst_pitch,
+              c->src_w, c->src_h, c->dst_w, c->dst_h, c->samples,
+              (unsigned long long)c->sample_stride,
+              (void *)(uintptr_t)c->src_end, (void *)(uintptr_t)c->dst_end);
+      fflush(stderr);
+   }
+
    /*
     * Refuse a copy that cannot be one. A zero endpoint is an image or buffer
     * whose memory was never bound, and a pitch narrower than the row is a
@@ -1467,9 +1503,11 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
        (c->src_end && src_reach > c->src_end) ||
        (c->dst_end && dst_reach > c->dst_end)) {
       fprintf(stderr, "cudapipe: refusing copy src=%p dst=%p %zux%zu "
-              "pitch %zu->%zu\n", (void *)(uintptr_t)c->src,
-              (void *)(uintptr_t)c->dst, c->width_bytes, c->rows,
-              c->src_pitch, c->dst_pitch);
+              "pitch %zu->%zu reach %p/%p ends %p/%p\n",
+              (void *)(uintptr_t)c->src, (void *)(uintptr_t)c->dst,
+              c->width_bytes, c->rows, c->src_pitch, c->dst_pitch,
+              (void *)(uintptr_t)src_reach, (void *)(uintptr_t)dst_reach,
+              (void *)(uintptr_t)c->src_end, (void *)(uintptr_t)c->dst_end);
       return;
    }
 
