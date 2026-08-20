@@ -1064,3 +1064,27 @@ that is too loose -- and it is bounded now: whatever indexes a batch's
 per-draw tables is right for two rows and wrong for three. `emit_batch_row`
 and the slice table `cp_vertex_fetch` searches are where to look, and a
 three-draw version of `cpvk_batch.c` would reproduce it in a second.
+
+### `first_vertex` comes from the batch's first draw
+
+Three-draw and two-draw batches differing in descriptors, uniform buffers or
+textures all merge correctly -- `cpvk_batch` now draws three triangles with
+three descriptor sets and is byte-identical to lavapipe. So the fault needs
+something none of those tests have, and `cp_draw_execute` has it in plain
+sight:
+
+    .first_vertex = indexed ? (unsigned)draws[0].index_bias : draws[0].start,
+
+The vertex fetch takes the *first* draw's vertex offset and applies it to the
+whole batch. gltfscenerendering's primitives each have their own
+`vertexOffset` into a shared buffer, so any batch of them fetches every draw's
+vertices from the first draw's base -- which is exactly a fault that grows
+with batch size and is invisible when every draw's offset is zero, as it is in
+every test here.
+
+`cpvk_draws_mergeable` now refuses to merge draws whose `index_bias` differs.
+That is conservative and it is honest about why: the batched path cannot
+express those draws today. Making it express them -- the slice table already
+carries a per-draw range, so it is the natural place for a per-draw bias -- is
+what would let a scene of meshes out of one buffer merge, which is the case
+batching exists for.

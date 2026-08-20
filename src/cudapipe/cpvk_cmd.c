@@ -1200,16 +1200,25 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
    CPVK_DIFF(a->call.index_size != b->call.index_size, "index size");
    CPVK_DIFF(a->call.index_ptr != b->call.index_ptr, "index buffer");
    CPVK_DIFF(a->call.start_instance != b->call.start_instance, "start instance");
+   /*
+    * The vertex offset, until the batched path stops taking it from the first
+    * draw. cp_draw_execute builds its vertex fetch with
+    * `first_vertex = draws[0].index_bias` for the whole batch, so draws whose
+    * vertexOffset differs must not merge -- which is what gltfscenerendering's
+    * per-primitive offsets are.
+    */
+   CPVK_DIFF(a->range.index_bias != b->range.index_bias, "vertex offset");
    CPVK_DIFF(a->call.instance_count != b->call.instance_count, "instance count");
    /*
-    * What the descriptors contain, not where the snapshot of them lives.
+    * The descriptors, by content.
     *
-    * Conservative: tests/cpvk_batch.c shows that two draws differing only in
-    * their descriptor set merge correctly without this, so it is not
-    * required for that case -- but gltfscenerendering, which differs in a
-    * *texture* per material, renders wrongly when it is removed. Until that
-    * difference is understood this stays, and it costs the merges a capture
-    * would want.
+    * cpvk_batch and cpvk_batchtex show two and three draws differing only in
+    * their descriptor set -- uniform buffers in one, textures in the other --
+    * merging correctly without this, so in principle the per-draw binding
+    * rows make it unnecessary. In practice removing it still costs
+    * gltfscenerendering its correctness (0.000 to 20.768) even with the
+    * vertex offset now a merge condition, and one measurement to the contrary
+    * in the same turn did not reproduce. It stays until that is settled.
     */
    CPVK_DIFF(memcmp(a->desc_hash, b->desc_hash, sizeof(a->desc_hash)),
              "descriptors");

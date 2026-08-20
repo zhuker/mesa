@@ -167,16 +167,23 @@ main(int argc, char **argv)
     * one nearer on the right, so neither wins outright and a depth test that
     * does nothing is visibly a different picture.
     */
-   const struct vertex verts[6] = {
-      { -0.8f, -0.7f, 0.3f, 255,  32,  32, 255 },
-      {  0.4f, -0.7f, 0.3f, 255,  32,  32, 255 },
-      { -0.2f,  0.8f, 0.3f, 255,  32,  32, 255 },
+   /* Three triangles side by side, so each draw's own colour is visible and
+    * nothing overlaps: a batch that shades them all from one row shows one
+    * colour where there should be three. */
+   const struct vertex verts[9] = {
+      { -0.9f, -0.6f, 0.5f, 255, 255, 255, 255 },
+      { -0.4f, -0.6f, 0.5f, 255, 255, 255, 255 },
+      { -0.65f, 0.6f, 0.5f, 255, 255, 255, 255 },
 
-      { -0.4f, -0.7f, 0.6f,  32,  64, 255, 255 },
-      {  0.8f, -0.7f, 0.6f,  32,  64, 255, 255 },
-      {  0.2f,  0.8f, 0.6f,  32,  64, 255, 255 },
+      { -0.25f,-0.6f, 0.5f, 255, 255, 255, 255 },
+      {  0.25f,-0.6f, 0.5f, 255, 255, 255, 255 },
+      {  0.0f,  0.6f, 0.5f, 255, 255, 255, 255 },
+
+      {  0.4f, -0.6f, 0.5f, 255, 255, 255, 255 },
+      {  0.9f, -0.6f, 0.5f, 255, 255, 255, 255 },
+      {  0.65f, 0.6f, 0.5f, 255, 255, 255, 255 },
    };
-   const uint16_t indices[6] = { 3, 4, 5, 0, 1, 2 };   /* far one first */
+   const uint16_t indices[9] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
 
    VkBuffer vbuf, ibuf;
    VkDeviceMemory vmem, imem;
@@ -218,15 +225,17 @@ main(int argc, char **argv)
    /* Two uniform buffers: binding 0 read by the vertex shader, binding 1 by
     * the fragment shader. */
    struct { float dx, dy, pad0, pad1; } vs_ubo = { 0.15f, -0.1f, 0, 0 };
-   struct { float r, g, b, a; } fs_ubo = { 1.0f, 0.2f, 0.2f, 1.0f };
-   struct { float r, g, b, a; } fs_ubo2 = { 0.2f, 0.4f, 1.0f, 1.0f };
+   struct { float r, g, b, a; } fs_ubo  = { 1.0f, 0.2f, 0.2f, 1.0f };
+   struct { float r, g, b, a; } fs_ubo2 = { 0.2f, 1.0f, 0.2f, 1.0f };
+   struct { float r, g, b, a; } fs_ubo3 = { 0.2f, 0.2f, 1.0f, 1.0f };
    VkBuffer ubuf[2];
    VkDeviceMemory umem[2];
-   const void *usrc[3] = { &vs_ubo, &fs_ubo, &fs_ubo2 };
-   const size_t usize[3] = { sizeof(vs_ubo), sizeof(fs_ubo), sizeof(fs_ubo2) };
-   VkBuffer ubuf3[3];
-   VkDeviceMemory umem3[3];
-   for (int u = 0; u < 3; u++) {
+   const void *usrc[4] = { &vs_ubo, &fs_ubo, &fs_ubo2, &fs_ubo3 };
+   const size_t usize[4] = { sizeof(vs_ubo), sizeof(fs_ubo),
+                             sizeof(fs_ubo2), sizeof(fs_ubo3) };
+   VkBuffer ubuf3[4];
+   VkDeviceMemory umem3[4];
+   for (int u = 0; u < 4; u++) {
       VkBufferCreateInfo bi = {
          .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
          .size = usize[u], .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT };
@@ -257,45 +266,39 @@ main(int argc, char **argv)
    VkDescriptorSetLayout dsl;
    CHECK(vkCreateDescriptorSetLayout(dev, &dsli, NULL, &dsl));
 
-   VkDescriptorPoolSize dps = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };
+   VkDescriptorPoolSize dps = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 6 };
    VkDescriptorPoolCreateInfo dpi = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-      .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &dps };
+      .maxSets = 3, .poolSizeCount = 1, .pPoolSizes = &dps };
    VkDescriptorPool dpool;
    CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &dpool));
    VkDescriptorSetAllocateInfo dsai = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
       .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
-   VkDescriptorSet dset[2];
-   VkDescriptorSetLayout dsls[2] = { dsl, dsl };
-   dsai.descriptorSetCount = 2;
+   VkDescriptorSet dset[3];
+   VkDescriptorSetLayout dsls[3] = { dsl, dsl, dsl };
+   dsai.descriptorSetCount = 3;
    dsai.pSetLayouts = dsls;
    CHECK(vkAllocateDescriptorSets(dev, &dsai, dset));
 
    /* Both sets share the vertex uniform and differ in the fragment one. */
-   VkDescriptorBufferInfo dbi[3] = {
-      { ubuf3[0], 0, VK_WHOLE_SIZE },
-      { ubuf3[1], 0, VK_WHOLE_SIZE },
-      { ubuf3[2], 0, VK_WHOLE_SIZE } };
-   VkWriteDescriptorSet writes[4] = {
-      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[0],
-        .dstBinding = 0, .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo = &dbi[0] },
-      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[0],
-        .dstBinding = 1, .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo = &dbi[1] },
-      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[1],
-        .dstBinding = 0, .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo = &dbi[0] },
-      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[1],
-        .dstBinding = 1, .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo = &dbi[2] },
-   };
-   vkUpdateDescriptorSets(dev, 4, writes, 0, NULL);
+   VkDescriptorBufferInfo dbi[4] = {
+      { ubuf3[0], 0, VK_WHOLE_SIZE }, { ubuf3[1], 0, VK_WHOLE_SIZE },
+      { ubuf3[2], 0, VK_WHOLE_SIZE }, { ubuf3[3], 0, VK_WHOLE_SIZE } };
+   VkWriteDescriptorSet writes[6];
+   for (int n = 0; n < 3; n++) {
+      writes[n * 2] = (VkWriteDescriptorSet){
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[n],
+         .dstBinding = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .pBufferInfo = &dbi[0] };
+      writes[n * 2 + 1] = (VkWriteDescriptorSet){
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[n],
+         .dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .pBufferInfo = &dbi[n + 1] };
+   }
+   vkUpdateDescriptorSets(dev, 6, writes, 0, NULL);
 
    VkPipelineLayoutCreateInfo pli = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -419,12 +422,11 @@ main(int argc, char **argv)
     * differ in the index range and carries a binding row per draw, so these
     * two are exactly what merging is supposed to handle.
     */
-   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
-                           &dset[0], 0, NULL);
-   vkCmdDrawIndexed(cmd, 3, 1, 0, 0, 0);
-   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
-                           &dset[1], 0, NULL);
-   vkCmdDrawIndexed(cmd, 3, 1, 3, 0, 0);
+   for (int n = 0; n < 3; n++) {
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0,
+                              1, &dset[n], 0, NULL);
+      vkCmdDrawIndexed(cmd, 3, 1, n * 3, 0, 0);
+   }
    endRendering(cmd);
    CHECK(vkEndCommandBuffer(cmd));
 
