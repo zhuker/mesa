@@ -8,11 +8,6 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 
-static int
-type_size_vec4(const struct glsl_type *type, bool bindless)
-{
-   return glsl_count_attribute_slots(type, false);
-}
 #include "kernels/cp_rast_types.h"
 
 #include "pipe/p_context.h"
@@ -1272,7 +1267,7 @@ cp_create_fs_state(struct pipe_context *ctx,
 
    /* Lower FS I/O */
    nir_lower_io(nir, nir_var_shader_in | nir_var_shader_out,
-                type_size_vec4, nir_lower_io_lower_64bit_to_32);
+                cp_type_size_vec4, nir_lower_io_lower_64bit_to_32);
 
    cuCtxSetCurrent(cp->screen->cuda_ctx);
 
@@ -1318,7 +1313,7 @@ cp_create_vs_state(struct pipe_context *ctx,
 
    /* Lower I/O derefs to explicit load_input/store_output */
    nir_lower_io(nir, nir_var_shader_in | nir_var_shader_out,
-                type_size_vec4, nir_lower_io_lower_64bit_to_32);
+                cp_type_size_vec4, nir_lower_io_lower_64bit_to_32);
 
    cuCtxSetCurrent(cp->screen->cuda_ctx);
 

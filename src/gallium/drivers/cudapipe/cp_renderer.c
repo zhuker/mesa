@@ -9,6 +9,7 @@
 
 #include "cp_renderer.h"
 #include "cp_nvtx.h"
+#include "compiler/glsl_types.h"
 
 /*
  * TEMPORARY (CUDAPIPE_ABUFFER): the merged quad array, for the one draw whose
@@ -6875,3 +6876,77 @@ cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
    }
 }
 
+
+
+/*
+ * The I/O slot size both front ends must lower with.
+ *
+ * Shared rather than copied: the vertex and fragment stages agree on where an
+ * output lands only because both were lowered by the same function, and a
+ * second copy that drifted would put the fragment shader's inputs at slots the
+ * vertex shader never wrote.
+ */
+int
+cp_type_size_vec4(const struct glsl_type *type, bool bindless)
+{
+   return glsl_count_attribute_slots(type, false);
+}
+
+
+/*
+ * Publish the driver-owned state into the device-visible copy.
+ *
+ * The Gallium adapter writes these fields one at a time as Gallium's state
+ * setters arrive, because that is the shape of the interface it is given.
+ * Vulkan hands the whole pipeline at once, so the native front end fills the
+ * driver's own structs and calls this. The two must agree field for field:
+ * the device kernels read only this copy, and a field left at zero is not a
+ * missing optimisation but a viewport that scales every vertex to a point,
+ * which is exactly how the first native draw rasterized one triangle and
+ * wrote nothing.
+ */
+void
+cp_context_publish_state(struct cp_context *cp)
+{
+   if (!cp->gpu_state)
+      return;
+
+   cp->gpu_state->vp_scale_x = cp->viewport.scale[0];
+   cp->gpu_state->vp_scale_y = cp->viewport.scale[1];
+   cp->gpu_state->vp_trans_x = cp->viewport.translate[0];
+   cp->gpu_state->vp_trans_y = cp->viewport.translate[1];
+
+   cp->gpu_state->depth_test = cp->depth_stencil.depth_enabled;
+   cp->gpu_state->depth_func = cp->depth_stencil.depth_func;
+   cp->gpu_state->depth_write = cp->depth_stencil.depth_writemask;
+   cp->gpu_state->depth_key_invert = cp->depth_stencil.depth_enabled &&
+      (cp->depth_stencil.depth_func == CP_FUNC_GREATER ||
+       cp->depth_stencil.depth_func == CP_FUNC_GEQUAL);
+
+   cp->gpu_state->blend_enable = cp->blend_desc.enable;
+   cp->gpu_state->colormask = cp->blend_desc.colormask ?
+      cp->blend_desc.colormask : 0xF;
+   cp->gpu_state->rgb_func = cp->blend_desc.rgb_func;
+   cp->gpu_state->rgb_src_factor = cp->blend_desc.rgb_src_factor;
+   cp->gpu_state->rgb_dst_factor = cp->blend_desc.rgb_dst_factor;
+   cp->gpu_state->alpha_func = cp->blend_desc.alpha_func;
+   cp->gpu_state->alpha_src_factor = cp->blend_desc.alpha_src_factor;
+   cp->gpu_state->alpha_dst_factor = cp->blend_desc.alpha_dst_factor;
+
+   cp->gpu_state->num_elements = cp->num_vertex_elements;
+   cp->gpu_state->vs_in_stride = cp->num_vertex_elements * 16;
+   for (unsigned i = 0; i < cp->num_vertex_elements && i < 16; i++) {
+      cp->gpu_state->elem_vb_idx[i] = cp->velem[i].vertex_buffer_index;
+      cp->gpu_state->elem_src_offset[i] = cp->velem[i].src_offset;
+      cp->gpu_state->elem_src_stride[i] = cp->velem[i].src_stride;
+      cp->gpu_state->elem_attr_size[i] = cp->velem[i].attr_size;
+      cp->gpu_state->elem_instance_divisor[i] = cp->velem[i].instance_divisor;
+   }
+   for (unsigned i = 0; i < CP_MAX_VERTEX_BUFFERS_VF; i++)
+      cp->gpu_state->vb_bases[i] = cp->vb_base[i];
+
+   for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
+      cp->gpu_state->vs_ubos[i] = cp->vs_ubos[i].managed_copy;
+      cp->gpu_state->fs_ubos[i] = cp->fs_ubos[i].managed_copy;
+   }
+}

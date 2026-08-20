@@ -828,6 +828,11 @@ void cp_context_set_framebuffer(struct cp_context *cp,
                                 const struct cp_fb_desc *fb,
                                 unsigned samples);
 
+struct glsl_type;
+int cp_type_size_vec4(const struct glsl_type *type, bool bindless);
+
+void cp_context_publish_state(struct cp_context *cp);
+
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 
 /*

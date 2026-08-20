@@ -25,6 +25,13 @@ static const struct vk_instance_extension_table cpvk_instance_extensions = {
 
 static const struct vk_device_extension_table cpvk_device_extensions = {
    /* Filled in as features land. Headless: no swapchain, ever. */
+
+   /* Dynamic rendering, because there is no other kind here: this driver has
+    * no tiler to hand a render pass to, and the runtime only builds the
+    * vkCmdBeginRendering entrypoint when the extension is advertised. Without
+    * it vkGetDeviceProcAddr returns NULL and the caller jumps to zero, which
+    * is what it did. */
+   .KHR_dynamic_rendering = true,
 };
 
 static void
@@ -38,6 +45,9 @@ cpvk_get_features(struct vk_features *features)
       .vertexPipelineStoresAndAtomics = true,
       .shaderClipDistance = false,
       .samplerAnisotropy = true,
+
+      /* Vulkan 1.3 / KHR_dynamic_rendering */
+      .dynamicRendering = true,
    };
 }
 

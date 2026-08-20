@@ -403,6 +403,14 @@ cpvk_CmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t count,
 }
 
 VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdSetViewport(VkCommandBuffer commandBuffer, uint32_t firstViewport,
+                    uint32_t count, const VkViewport *pViewports)
+{
+   if (firstViewport == 0)
+      cpvk_CmdSetViewportWithCount(commandBuffer, count, pViewports);
+}
+
+VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t count,
                             const VkRect2D *pScissors)
 {
@@ -416,6 +424,14 @@ cpvk_CmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t count,
       .maxx = pScissors[0].offset.x + pScissors[0].extent.width,
       .maxy = pScissors[0].offset.y + pScissors[0].extent.height,
    };
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdSetScissor(VkCommandBuffer commandBuffer, uint32_t firstScissor,
+                   uint32_t count, const VkRect2D *pScissors)
+{
+   if (firstScissor == 0)
+      cpvk_CmdSetScissorWithCount(commandBuffer, count, pScissors);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -468,14 +484,27 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
    memcpy(cp->vb_base, d->vb_base, sizeof(cp->vb_base));
    cp->num_vertex_buffers = d->num_vb;
 
-   /* The uniform rows the shaders read: one row, the descriptor addresses the
-    * command buffer resolved. Same slots the Gallium adapter fills. */
-   uint64_t ubo_row[CP_ARG_UBO_STRIDE] = { 0 };
-   for (unsigned i = 0; i < CP_ARG_UBO_STRIDE && i < 16; i++)
-      ubo_row[i] = d->addrs[i];
+   /*
+    * The descriptor sets the command buffer resolved become the shaders'
+    * constant buffers. A cudapipe descriptor set is an array of device
+    * addresses, which is exactly what a UBO binding is here, so the set
+    * address is the binding address.
+    */
+   for (unsigned i = 0; i < 16; i++) {
+      cp->vs_ubos[i].managed_copy = d->addrs[i];
+      cp->vs_ubos[i].buffer = NULL;
+      cp->vs_ubos[i].user_copy = false;
+      cp->fs_ubos[i].managed_copy = d->addrs[i];
+      cp->fs_ubos[i].buffer = NULL;
+      cp->fs_ubos[i].user_copy = false;
+   }
    cp->num_vs_ubos = cp->num_fs_ubos = 16;
 
-   uint32_t draw_id = 0, instances = d->call.instance_count;
-   cp_draw_execute(cp, &d->call, 0, &d->range, 1, 1, ubo_row, ubo_row,
-                   &draw_id, &instances, NULL, &d->scissor);
+   cp_context_publish_state(cp);
+
+   /* The single-draw call: every batch table NULL, which is the convention
+    * cp_draw_vbo uses when a draw is not merged. Batching on the native side
+    * comes later, and until it does this is the path that has to be right. */
+   cp_draw_execute(cp, &d->call, 0, &d->range, 1, 1, NULL, NULL, NULL, NULL,
+                   NULL, NULL);
 }
