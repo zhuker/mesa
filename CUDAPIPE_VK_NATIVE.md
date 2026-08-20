@@ -4354,3 +4354,32 @@ can defer freely.
 
 That is a renderer change of real size, and it is where this line of work
 stands. Six attempts have established what it must be, and none of them is it.
+
+### What the remaining 1.3x is made of
+
+Splitting the excess launches by kind, warm traces, per frame:
+
+                          native   gallium   excess
+    A-buffer and peel      396.9     114.1    282.8    55%
+    per-draw pipeline      360.0     130.6    229.4    45%
+    TOTAL                  756.9     244.7    512.2
+
+`cp_vertex_fetch` runs 51.2 times a frame here and 22.1 there for the same
+draws, so the Gallium driver puts **2.3x as many draws in each launch**.
+
+So the gap has two halves and both are the same cause seen twice. The Gallium
+driver merges more draws into a batch, which cuts the per-draw pipeline
+kernels; and it holds an episode open across more batches, which cuts the
+A-buffer builds. This driver's batches average 2.14 draws and its episodes hold
+one segment.
+
+Six attempts to lengthen episodes failed on memory. The merging half has not
+been attacked at all, and it is 45% of the excess: this front end refuses a
+merge on a different fragment shader, a different vertex shader, a scissor
+change or an instance count, where the Gallium adapter's key evidently
+tolerates more. Its `cpvk_draws_mergeable` was written to be conservative and
+has never been measured against what the reference actually merges.
+
+That is the cheaper half to attack and it needs no renderer change -- only a
+merge key that admits what the reference admits, verified by the sweep and both
+replays as everything else in this session has been.
