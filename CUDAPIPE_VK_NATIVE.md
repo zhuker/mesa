@@ -3805,3 +3805,30 @@ index also produced element 0 -- but that test compared images, not handles,
 and the handle is now printable. Re-running the printf against the
 constant-index shader distinguishes the two in one step, and should have been
 the test rather than the image comparison.
+
+### The sampler array index is dropped in every form
+
+Printing the handle for four builds of the same shader -- the sample's dynamic
+index and constant `samplers[0]`, `[1]`, `[2]`:
+
+    dynamic   samp_handle = base + 0x280   tex_handle = base + 0x240
+    const 0   samp_handle = base + 0x280   tex_handle = base + 0x240
+    const 1   samp_handle = base + 0x280   tex_handle = base + 0x240
+    const 2   samp_handle = base + 0x280   tex_handle = base + 0x240
+
+Identical in all four. A **compile-time constant** index of 2 produces the same
+handle as an index of 0, which rules out the uniform read: `ubo.samplerIndex`
+is irrelevant because the index never affects the handle at all, whatever its
+form.
+
+So the loss is in how a sampler *array* becomes a descriptor address. The three
+mechanisms already implemented -- `vulkan_resource_reindex`, the tex-src
+sampler and texture offsets, and a dynamic `vulkan_resource_index` -- are all
+bypassed, which means the array element is resolved somewhere else again,
+before any of them sees it. A separate `uniform sampler samplers[3]` reaches
+the tex instruction through a deref chain, and whatever lowers that chain to a
+handle is keeping the base and discarding the index.
+
+This is now a precise statement with a one-command check behind it, and the
+three fixes made while finding it are real gaps closed regardless: each would
+have made some other shader silently wrong.
