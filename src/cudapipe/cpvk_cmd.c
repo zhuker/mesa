@@ -2036,6 +2036,19 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
       return;
    }
 
+   if (getenv("CPVK_DEBUG_RT")) {
+      /* The first texels of the source, as halves: what the pass just
+       * rendered, before this copy places it. */
+      uint16_t h[8] = { 0 };
+      cuStreamSynchronize(cp->stream);
+      if (cuMemcpyDtoH(h, c->src, sizeof(h)) == CUDA_SUCCESS) {
+         fprintf(stderr, "copysrc halfs:");
+         for (int k = 0; k < 8; k++)
+            fprintf(stderr, " %04x", h[k]);
+         fprintf(stderr, "\n");
+      }
+   }
+
    if (c->src_w) {
       /*
        * A scaling blit, on the host and synchronously, for the same reason
@@ -2163,6 +2176,20 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
       .Height = c->rows,
    };
    cuMemcpy2DAsync(&m, cp->stream);
+
+   if (getenv("CPVK_DEBUG_RT")) {
+      /* And what landed, read back from the destination this copy just
+       * wrote: the face of the cube level, not the offscreen it came from. */
+      uint16_t hd[8] = { 0 };
+      cuStreamSynchronize(cp->stream);
+      if (cuMemcpyDtoH(hd, c->dst, sizeof(hd)) == CUDA_SUCCESS) {
+         fprintf(stderr, "copydst rows=%zu wb=%zu halfs:", (size_t)c->rows,
+                 (size_t)c->width_bytes);
+         for (int k = 0; k < 8; k++)
+            fprintf(stderr, " %04x", hd[k]);
+         fprintf(stderr, "\n");
+      }
+   }
 }
 
 

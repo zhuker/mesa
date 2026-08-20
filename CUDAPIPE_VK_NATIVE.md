@@ -1742,3 +1742,34 @@ on this path, or the prefilter shader's own output.
 count was zero because the `str.replace()` that inserted the print had not
 matched anything -- the edit silently did nothing. The rule that caught it is
 to assert that an edit changed the file before believing what it prints.
+
+### pbribl: the write side is verified end to end, and the read is wrong
+
+Reading the actual bytes settled what four turns of code-reading could not.
+
+**What the prefilter pass renders** (`copysrc`, the offscreen before the copy):
+
+    294a 2849 276e 3c00   ->  (0.041, 0.033, 0.029, 1.0)
+
+**What lands in the cube's deepest level** (`copydst`, 1x1, 8 bytes):
+
+    3237 30b2 302c 3c00   ->  (0.194, 0.147, 0.130, 1.0)
+
+Both are warm, R > G > B. Every one of the sixty copies is issued -- six faces
+at each of ten levels -- the view describes `target=3` cube, `enc=9`
+R16G16B16A16_FLOAT, `levels=0..9`, and there are sixteen level slots, so
+nothing is truncated.
+
+So the prefiltered cube is correct in memory, at every level, including the
+one the roughest sphere reads. The error is on the read side, and it scales
+with LOD, which is the clearest signal available:
+
+    x=150   roughness 0.995  lod ~9   native (1,1,1)       reference (25,17,10)
+    x=1120  low roughness    lod low  native (106,106,106) reference (112,111,112)
+
+Deep levels come back black; shallow ones are nearly right.
+
+The next step is the one named last turn and not taken: a unit test that
+samples a known cube at an explicit deep LOD and compares against lavapipe.
+Reading more of the sampler is what the last four turns did, and the write
+side being provably correct is what makes the test worth writing now.
