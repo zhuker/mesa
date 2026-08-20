@@ -839,45 +839,13 @@ cp_clear_rect_kernel(struct cp_context *cp, struct cp_resource *res,
                      unsigned stride, unsigned pixel_size,
                      const uint32_t value[4], bool depth)
 {
-   struct cp_device *screen = cp->screen;
-   CUfunction fn = depth ? screen->kernels.clear_depth_kernel
-                         : screen->kernels.clear_kernel;
-   void *data = cp_resource_data(res);
-
-   if (!fn || !data || !res->cuda_managed)
+   /* The managed-memory requirement is the Gallium resource's, not the
+    * renderer's: a native image is device memory the kernel writes directly. */
+   if (!res->cuda_managed)
       return false;
 
-   /* Both kernels index on the pixel size with no else arm, so a size they do
-    * not name writes nothing rather than something wrong — which is the worse
-    * failure of the two, because nothing looks like "the clear did not run".
-    * Depth is Z16/Z32F/Z24X8 only (cp_screen.c), colour excludes the
-    * three-component formats R8G8B8, R16G16B16 and R32G32B32. */
-   if (depth) {
-      if (pixel_size != 2 && pixel_size != 4)
-         return false;
-   } else if (pixel_size != 1 && pixel_size != 2 && pixel_size != 4 &&
-              pixel_size != 8 && pixel_size != 16) {
-      return false;
-   }
-
-   if (!width || !height)
-      return true;
-
-   struct cp_clear_args args = {
-      .target = (uint64_t)(uintptr_t)data + offset,
-      .width = width, .height = height,
-      .stride = stride,
-      .pixel_size = pixel_size,
-   };
-   memcpy(args.clear_value, value, sizeof(args.clear_value));
-
-   cuCtxSetCurrent(screen->cuda_ctx);
-   void *params[] = { &args };
-   cuLaunchKernel(fn,
-      (width + 15) / 16, (height + 15) / 16, 1,
-      16, 16, 1,
-      0, cp->stream, params, NULL);
-   return true;
+   return cp_clear_rect(cp, cp_resource_data(res), offset, width, height,
+                        stride, pixel_size, value, depth);
 }
 
 static void

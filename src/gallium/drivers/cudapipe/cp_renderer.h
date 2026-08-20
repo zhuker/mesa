@@ -833,6 +833,16 @@ int cp_type_size_vec4(const struct glsl_type *type, bool bindless);
 
 void cp_context_publish_state(struct cp_context *cp);
 
+/* The vertex-format description both front ends fetch with; see the
+ * definition for why a narrow attribute cannot be copied verbatim. */
+enum cp_vf_conv cp_vertex_format(enum pipe_format format, uint32_t *nr_chan,
+                                 uint32_t *chan_bytes, uint32_t *swizzle);
+uint32_t cp_vertex_fill_w(enum pipe_format format, enum cp_vf_conv conv);
+
+bool cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
+                   unsigned width, unsigned height, unsigned stride,
+                   unsigned pixel_size, const uint32_t value[4], bool depth);
+
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 
 /*
