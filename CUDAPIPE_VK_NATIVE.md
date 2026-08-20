@@ -886,3 +886,27 @@ The renderer's batching machinery is already compiled into this driver --
 episodes, all of it moved across in the extraction -- and what is missing is
 the front end that fills a `cp_batch_key` and decides when to hold a draw
 back. `cp_draw_vbo` in the Gallium adapter is the worked example.
+
+### Why nothing merges: the key is built from the previous draw
+
+`cpvk_batch_can_join` runs *before* the draw is staged into the context --
+which it must, because a flush renders what is held back and reads the context
+to do it. But `cpvk_build_batch_key` reads the context for the shaders, the
+vertex elements and the binding counts, so it compares each draw's key against
+a key built from its predecessor. `CUDAPIPE_DEBUG_BATCHDIFF` says it in one
+line: **the first differing byte is always +0**, which is `cp_batch_key::vs`.
+
+That is why batches are one or two draws long and why the state-based key
+bought nothing: 23.97 ms against 24.28 without batching, with batches of 1 and
+2 in gltfscenerendering.
+
+Replacing the pipeline pointer with the pipeline's state was still right --
+the samples are unchanged with it, `multithreading` slightly better -- and it
+is committed. Twelve vertex elements fit in the 768-byte blob beside
+everything else; a pipeline with more refuses to batch rather than batching on
+a key that does not describe it.
+
+The obvious repair is to build the key from `d` and `d->pipeline` instead of
+from `cp`. That was tried and took the sample count from 18/18 running to
+2/18, so more than the key reads the context at that point, and it was
+reverted. What exactly is not yet known.
