@@ -2304,3 +2304,38 @@ That is the next thing to check and the first candidate that explains the
 "three draws" boundary without hand-waving: three of gltfscenerendering's
 draws are the point where the expanded slot array crosses something the test's
 never approaches.
+
+### Scale eliminated; the fast test now covers everything but the answer
+
+`cpvk_batchbig` is `cpvk_batchtex` with `TPD` raised to 6,000 -- 48,000
+triangles in an eight-draw batch, past `gltfscenerendering`'s 45,184, and past
+it in expanded slots too (384,000 against 361,472):
+
+    clip: tris=48000 batch_draws=8 stable=1 reads_cb=1
+    key   vs off: IDENTICAL
+    nokey vs off: IDENTICAL
+
+Scale is not the discriminator either.
+
+The test's coverage, read from its own source rather than assumed:
+
+    nine draws, merged eight at a time
+    two descriptor sets: set 0 bound once, set 1 rebound per draw
+    nine textures, one per draw
+    indexed draws, differing firstIndex
+    the stable clip path
+    48,000 triangles
+
+That is `gltfscenerendering`'s structure in every respect anyone has named, and
+it merges correctly without the descriptor key.
+
+Eliminated across three turns, each with a measurement: batch size (the test
+has nine draws, not three), row width, binding counts, the row binary search,
+`prim_shift`, clipping, and now triangle count.
+
+What the sample still has that the test does not is its **data**: per-draw
+vertex offsets, materials that differ in pipeline state, and a draw order the
+test does not reproduce. The next diagnostic is not another hypothesis but
+`CUDAPIPE_DEBUG_BATCHDIFF` run on the sample twice -- once with the key and
+once without -- to see exactly which draws merge when it is removed. The
+answer is in that difference and nowhere else.
