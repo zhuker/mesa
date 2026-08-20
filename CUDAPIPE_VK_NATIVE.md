@@ -910,3 +910,29 @@ The obvious repair is to build the key from `d` and `d->pipeline` instead of
 from `cp`. That was tried and took the sample count from 18/18 running to
 2/18, so more than the key reads the context at that point, and it was
 reverted. What exactly is not yet known.
+
+### Why nothing merges, finally: one shader binary per pipeline
+
+With the batch decision made by comparing the draws themselves --
+`cpvk_draws_mergeable`, which touches no driver state and so is safe to run
+before the incoming draw is staged -- `CUDAPIPE_DEBUG_BATCHDIFF` names the
+field that breaks every batch in gltfscenerendering:
+
+    batchdiff: vertex shader
+
+The sample builds one pipeline per material and this driver compiles a fresh
+`cp_shader_binary` for each, so two draws whose SPIR-V is byte-identical hold
+different shader pointers. lavapipe deduplicates shader modules, which is why
+the Gallium driver merges the same draws into one of 45,120 triangles.
+
+The fix is a shader cache: compile once per unique SPIR-V and share the
+binary. It would make batching effective *and* cut pipeline-creation time,
+which is the other thing this driver spends the first hundred frames of a
+replay on.
+
+Three things had to be right before that could be seen, and each was wrong in
+its turn: the batch decision must precede staging (or a flush renders the
+previous batch with this draw's state); the key must not be built from the
+context at that point (or every draw is compared against its predecessor); and
+the descriptor addresses must not be a merge condition (this driver snapshots
+each bind into fresh memory, so they never repeat).

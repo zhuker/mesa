@@ -85,6 +85,18 @@ struct cpvk_device {
     */
    CUdeviceptr null_desc;
    CUdeviceptr null_data;
+
+   /*
+    * The last draw staged into the renderer, for deciding whether the next
+    * one may join its batch. A copy of the draw rather than anything read
+    * from the context, because the decision has to be made before the
+    * incoming draw is staged -- a flush renders what is held back and reads
+    * the context to do it -- and the context at that moment still describes
+    * the previous draw. Allocated once; struct cpvk_draw is declared later.
+    */
+   struct cpvk_draw *prev_draw;
+   bool prev_draw_valid;
+
 };
 
 /*

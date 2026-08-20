@@ -1135,6 +1135,71 @@ static bool cpvk_batch_eligible(struct cpvk_device *dev,
  * needs (the framebuffer's buffers, the sampler table) belong to the pass and
  * are already current.
  */
+/*
+ * Whether two draws may be merged, decided by comparing the draws themselves.
+ *
+ * Everything a draw carries that must match is here, and everything a batch is
+ * allowed to differ in -- the index range, the vertex-stage bindings, the
+ * per-draw scissor -- is deliberately absent, exactly as cp_batch_key
+ * documents for the Gallium side. The comparison touches no driver state at
+ * all, which is what makes it safe to run before the draw is staged.
+ */
+static bool
+cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
+{
+#define CPVK_DIFF(cond, what)                                   \
+   do {                                                         \
+      if (cond) {                                               \
+         if (cp_debug->debug_batchdiff)                          \
+            fprintf(stderr, "batchdiff: %s\n", what);           \
+         return false;                                          \
+      }                                                         \
+   } while (0)
+
+   /*
+    * The pipeline's state, not its identity. gltfscenerendering builds one
+    * pipeline per material and draws them back to back; comparing addresses
+    * made every batch a single draw, where the Gallium adapter compares the
+    * state itself and merges them.
+    */
+   if (a->pipeline != b->pipeline) {
+      const struct cpvk_pipeline *pa = a->pipeline, *pb = b->pipeline;
+      CPVK_DIFF(!pa || !pb, "pipeline");
+      CPVK_DIFF(pa->vs != pb->vs, "vertex shader");
+      CPVK_DIFF(pa->fs != pb->fs, "fragment shader");
+      CPVK_DIFF(memcmp(&pa->raster, &pb->raster, sizeof(pa->raster)), "rasterizer");
+      CPVK_DIFF(memcmp(&pa->depth, &pb->depth, sizeof(pa->depth)), "depth state");
+      CPVK_DIFF(memcmp(&pa->blend, &pb->blend, sizeof(pa->blend)), "blend state");
+      CPVK_DIFF(pa->topology != pb->topology, "topology");
+      CPVK_DIFF(pa->num_velem != pb->num_velem ||
+                pa->vertex_stride != pb->vertex_stride ||
+                memcmp(pa->velem, pb->velem,
+                       pa->num_velem * sizeof(pa->velem[0])), "vertex layout");
+      CPVK_DIFF(pa->samples != pb->samples, "sample count");
+   }
+   CPVK_DIFF(memcmp(&a->fb, &b->fb, sizeof(a->fb)), "framebuffer");
+   CPVK_DIFF(memcmp(&a->viewport, &b->viewport, sizeof(a->viewport)), "viewport");
+   CPVK_DIFF(memcmp(&a->scissor, &b->scissor, sizeof(a->scissor)), "scissor");
+   CPVK_DIFF(a->call.mode != b->call.mode, "topology");
+   CPVK_DIFF(a->call.index_size != b->call.index_size, "index size");
+   CPVK_DIFF(a->call.index_ptr != b->call.index_ptr, "index buffer");
+   CPVK_DIFF(a->call.start_instance != b->call.start_instance, "start instance");
+   CPVK_DIFF(a->call.instance_count != b->call.instance_count, "instance count");
+   /*
+    * The descriptor addresses are deliberately absent. cp_batch_record
+    * snapshots both stages' binding rows per draw, so they are what a batch
+    * is allowed to differ in -- and this driver snapshots each bind into
+    * fresh memory, so two draws binding the identical set never share an
+    * address. Comparing them made every batch one draw long.
+    */
+   CPVK_DIFF(a->num_vb != b->num_vb, "vertex buffer count");
+   CPVK_DIFF(memcmp(a->vb_base, b->vb_base, sizeof(a->vb_base)), "vertex buffers");
+   CPVK_DIFF(a->push_size != b->push_size, "push constant size");
+   CPVK_DIFF(memcmp(a->push, b->push, a->push_size), "push constants");
+   return true;
+#undef CPVK_DIFF
+}
+
 static bool
 cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw *d)
 {
@@ -1150,11 +1215,12 @@ cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw *d)
    if (!cp->batch.pending)
       return true;
 
-   struct cp_batch_key key;
-   cpvk_build_batch_key(dev, d, &key, blended);
-
-   if (memcmp(&key, &cp->batch.key, sizeof(key)))
+   if (!dev->prev_draw_valid || !dev->prev_draw ||
+       !cpvk_draws_mergeable(d, dev->prev_draw)) {
+      if (cp_debug->debug_batchdiff)
+         fprintf(stderr, "batchdiff: the draws differ\n");
       return false;
+   }
    if (cp->batch.ndraws >= (unsigned)cp_debug->batch_max)
       return false;
    if (cp->batch.tris + tris > CP_MAX_BATCH_TRIS)
@@ -1240,6 +1306,13 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
    bool batch_ok = cpvk_batch_can_join(dev, d);
    if (!batch_ok)
       cp_batch_flush_why(cp, "the next draw cannot join");
+
+   if (!dev->prev_draw)
+      dev->prev_draw = malloc(sizeof(*dev->prev_draw));
+   if (dev->prev_draw) {
+      *dev->prev_draw = *d;
+      dev->prev_draw_valid = true;
+   }
 
    cp->viewport = d->viewport;
    cp->scissor = d->scissor;
