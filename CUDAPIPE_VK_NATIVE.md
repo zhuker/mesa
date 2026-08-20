@@ -155,15 +155,27 @@ before layering behaviour on it — is the whole plan:
 
    Gallium references in `cp_context.c`: **334 → 264**.
 
-   What is left in the file is the Gallium *entry points* and what they hold:
-   `struct pipe_context base` at the head of `cp_context`, the CSO copies the
-   flush comparison and the batch key use, the resource and sampler-view
-   paths, and the two `PIPE_FORMAT` switch tables the native driver replaces
-   with its own table. The next structural step is inverting the containment —
-   a `cp_gallium` holding `pipe_context base` first and the renderer beside it,
-   which is 25 cast sites — and after that the batch key, which is the one
-   place where going driver-owned will genuinely change what merges and so
-   must be measured rather than assumed.
+   **Eighth slice: the containment.** `pipe_context` was the first member of
+   `cp_context` so that every entry point could cast one to the other. It now
+   sits in a `cp_gallium` beside the renderer, and `cp_ctx()` is the single
+   place that converts.
+
+   **That conversion is a function rather than a cast because of what happened
+   while making the change.** Ten hand-written casts in `cp_resource.c` and
+   three more inline in `cp_context.c` kept compiling and silently pointed at
+   the wrong offset. Every sample still exited 0. `triangle` rendered
+   differently and the capture went **28% wrong**, and the only thing that
+   said so was a byte comparison against a stored frame. That is this driver's
+   documented worst failure mode — an exit code of 0 and wrong pixels —
+   reproduced by a refactor the compiler had no way to catch. Nobody should be
+   able to write that cast by hand again.
+
+   What is left in the file is the Gallium entry points and what they hold:
+   the CSO copies the flush comparison and the batch key use, the resource and
+   sampler-view paths, and the two `PIPE_FORMAT` switch tables the native
+   driver replaces with its own. The next structural step is the batch key,
+   which is the one place where going driver-owned genuinely changes what
+   merges, and so has to be measured and accepted rather than assumed.
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
