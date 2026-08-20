@@ -1826,3 +1826,33 @@ which was the standing explanation for pbribl across three turns, is dead.
 
 Twelve tests pass now. Writing them cost about one turn and removed four
 hypotheses that code-reading had failed to remove across three.
+
+### The BRDF table is correct, and so was the arithmetic that said it mattered
+
+A new instrument, `rtout`, reads back a render target when the next pass binds
+over it -- the one class of intermediate this driver could not inspect, since a
+copy can be watched on both sides but an attachment that is rendered and then
+only sampled had nothing watching it.
+
+pbribl's BRDF lookup table, its first 512x512 pass:
+
+    rtout 512x512:  1cfc 3bf4  2374 3be1  2630 3bce
+                    (0.005, 0.994) (0.014, 0.985) (0.024, 0.975)
+
+Plausible scale and bias pairs, not zeros. The table is right.
+
+Worse for the theory: the *old*, wrong decode read those same bytes as
+R8G8B8A8 and produced (0.988, 0.11) -- also not zero. So the format fix,
+though a real bug, could never have been what zeroed pbribl's ambient term,
+and the pixels agreeing before and after now make sense.
+
+`ambient = reflection * (F * brdf.x + brdf.y)` with `brdf.y` near 1 is
+essentially `reflection`. For the spheres to come out *exactly* neutral,
+`reflection` itself has to be neutral. That is the prefiltered cube again --
+whose memory is provably warm at every level, and whose sampling `cpvk_cubelod`
+reproduces exactly.
+
+Those two facts cannot both hold for the same texture, so the next question is
+whether the shader is reading the texture it thinks it is: the fragment stage
+has five sampler table entries, and one wrong index would sample a different
+image with a sampler whose `lod=0.0..0.0` clamps every level to zero.
