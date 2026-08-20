@@ -4074,3 +4074,30 @@ The measured prize is still worth it -- 757 launches a frame against the
 Gallium driver's 245, for 1.3x the wall time -- but it is behind a memory bug
 in the shared episode code, not behind the flush rule that three attempts have
 now rewritten.
+
+### Where a fourth attempt should start: the scratch arena's reclaim is unguarded
+
+`cp_scratch_begin()` reclaims the bump arena when it has grown a few times or
+handed out more than `CP_SCRATCH_RECLAIM_BYTES`, by synchronising the context
+and resetting the pointer. Its own comment explains why the pointer is not
+reset between draws -- one draw's kernels may still be reading their buffers --
+and records that a frame of bloom once reached eleven gigabytes without the
+limit.
+
+**Nothing in it knows about an open pass episode.** A segment's rasterizer
+output lives in that arena and is read when the episode finishes, which may be
+many draws later. So while an episode is open there are only two outcomes: the
+reclaim fires and frees memory the episode still needs, or it does not fire and
+the arena grows. The three attempts at deferring the flush all made episodes
+longer, and both replays died of device memory rather than of corruption, which
+says which of the two happened here.
+
+That is where a fourth attempt starts: the arena's lifetime has to account for
+the episode's, either by refusing to reclaim while one is open and closing the
+episode when the arena crosses its limit, or by giving segments their own
+allocation with a matching free in `cp_pass_finish`. Neither of the three
+attempts touched either, which is why each of them found a different way to
+fail.
+
+Recorded rather than attempted, because three reverts in three turns is enough
+evidence that this needs the allocation design settled before the flush rule.
