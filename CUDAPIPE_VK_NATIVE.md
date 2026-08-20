@@ -2013,3 +2013,39 @@ spread over a minified region and not concentrated on edges, is exactly the
 signature measured. That is the next thing to test, and `cpvk_lodimp` can be
 turned into the test by generating its levels with a blit instead of writing
 them.
+
+### The native driver advertises Vulkan 1.0
+
+Found by accident, and it is the largest capability difference between the two
+drivers yet measured:
+
+    native   apiVersion 1.0.354
+    gallium  apiVersion 1.4.354
+
+A test calling `vkCmdBlitImage2` -- core since 1.3 -- segfaulted at address
+zero with the native driver and ran fine with the Gallium one. Not a driver
+crash: the loader has no entry to dispatch, so the call goes to a null
+pointer.
+
+`cpvk_device.c` says why 1.0 was chosen. `KHR_get_physical_device_properties2`
+was advertised and withdrawn because at apiVersion 1.0 the KHR alias
+entrypoints are not wired to the runtime's core implementations, and an
+application that enables the extension jumps through a null pointer. The note
+ends "it comes back with apiVersion 1.1, or with the aliases implemented
+explicitly", and neither has been done.
+
+This is not a regression -- both replays and all eighteen samples run, because
+they use extensions and 1.0 entry points -- but it is a real gap against a
+driver that reports 1.4, and any application built against 1.3 core will fault
+rather than fail cleanly. Worth fixing before the Gallium driver is deleted.
+
+### A fourteenth test: blit-generated mip chains match
+
+`cpvk_lodblit` writes a checkerboard into level 0 and builds levels 1 to 3
+with `vkCmdBlitImage`, exactly as a mip generator does, then samples the
+result with implicit level of detail. Native and Gallium are **identical**.
+
+So mip generation is not `texturemipmapgen`'s cause either -- which was this
+turn's hypothesis, and is now the fourth eliminated for that sample. Both
+drivers share the blit implementation as well as the sampler, so the surviving
+explanation has to be something they do not share.
