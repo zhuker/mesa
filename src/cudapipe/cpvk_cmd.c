@@ -295,6 +295,10 @@ cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
    cmd->index_ptr = NULL;
    cmd->index_size = 0;
    cmd->push_size = 0;
+   for (unsigned i = 0; i < cmd->num_desc_retired; i++)
+      cuMemFree(cmd->desc_retired[i]);
+   cmd->num_desc_retired = 0;
+   cmd->desc_arena_used = 0;
 }
 
 static void
@@ -304,6 +308,11 @@ cpvk_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd)
       container_of(vk_cmd, struct cpvk_cmd_buffer, vk);
 
    vk_command_buffer_finish(&cmd->vk);
+   for (unsigned i = 0; i < cmd->num_desc_retired; i++)
+      cuMemFree(cmd->desc_retired[i]);
+   free(cmd->desc_retired);
+   if (cmd->desc_arena)
+      cuMemFree(cmd->desc_arena);
    free(cmd->ops);
    vk_free(&cmd->vk.pool->alloc, cmd);
 }
@@ -353,6 +362,10 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->index_ptr = NULL;
    cmd->index_size = 0;
    cmd->push_size = 0;
+   for (unsigned i = 0; i < cmd->num_desc_retired; i++)
+      cuMemFree(cmd->desc_retired[i]);
+   cmd->num_desc_retired = 0;
+   cmd->desc_arena_used = 0;
    return VK_SUCCESS;
 }
 
@@ -374,6 +387,63 @@ cpvk_CmdBindPipeline(VkCommandBuffer commandBuffer,
    cmd->pipeline = pipeline;
 }
 
+/* Keep an outgrown arena alive until the command buffer is reset. */
+static void
+cpvk_arena_retire(struct cpvk_cmd_buffer *cmd, CUdeviceptr arena)
+{
+   if (cmd->num_desc_retired >= cmd->max_desc_retired) {
+      unsigned want = cmd->max_desc_retired ? cmd->max_desc_retired * 2 : 8;
+      CUdeviceptr *p = realloc(cmd->desc_retired, want * sizeof(*p));
+      if (!p)
+         return;   /* leaked until the device goes away; better than a crash */
+      cmd->desc_retired = p;
+      cmd->max_desc_retired = want;
+   }
+   cmd->desc_retired[cmd->num_desc_retired++] = arena;
+}
+
+/*
+ * Copy a descriptor set into memory this command buffer owns and return its
+ * device address. Managed, because the renderer reads descriptors on the host
+ * when it specialises a shader on its sampler state.
+ */
+static CUdeviceptr
+cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
+{
+   if (!set->host || !set->layout->num_descriptors)
+      return 0;
+
+   size_t bytes = (size_t)set->layout->num_descriptors *
+                  sizeof(struct cpvk_descriptor);
+
+   if (cmd->desc_arena_used + bytes > cmd->desc_arena_size) {
+      size_t want = MAX2(cmd->desc_arena_size * 2,
+                         cmd->desc_arena_used + bytes);
+      want = MAX2(want, (size_t)64 * 1024);
+      CUdeviceptr fresh;
+      if (cuMemAllocManaged(&fresh, want, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+         return set->buf;
+
+      /* The old arena is still referenced by the draws already recorded, so
+       * it is kept until the command buffer is reset rather than freed here.
+       * One leak per growth, bounded by the buffer's lifetime. */
+      if (cmd->desc_arena)
+         cpvk_arena_retire(cmd, cmd->desc_arena);
+      cmd->desc_arena = fresh;
+      cmd->desc_arena_host = (struct cpvk_descriptor *)(uintptr_t)fresh;
+      cmd->desc_arena_size = want;
+      cmd->desc_arena_used = 0;
+   }
+
+   struct cpvk_descriptor *dst =
+      (struct cpvk_descriptor *)((char *)cmd->desc_arena_host +
+                                 cmd->desc_arena_used);
+   CUdeviceptr addr = cmd->desc_arena + cmd->desc_arena_used;
+   memcpy(dst, set->host, bytes);
+   cmd->desc_arena_used += bytes;
+   return addr;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
                             const VkBindDescriptorSetsInfo *pInfo)
@@ -386,21 +456,30 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
       VK_FROM_HANDLE(cpvk_descriptor_set, set, pInfo->pDescriptorSets[i]);
       if (!set)
          continue;
-      unsigned base = layout->set_base[pInfo->firstSet + i];
-      for (unsigned d = 0; d < set->layout->num_descriptors; d++) {
-         if (base + d < CPVK_MAX_ARG_BUFS)
-            cmd->addrs[base + d] = set->addrs[d];
-      }
 
       /*
-       * Dynamic offsets, which were being ignored: a dynamic uniform buffer
-       * binding names one buffer and the draw picks the element out of it
-       * with an offset given at bind time. Ignoring them pointed every draw
-       * at element zero.
-       *
-       * They are consumed in binding order over the dynamic descriptors of
-       * each set, which is what the spec says and what the sample relies on.
+       * The set's buffer goes in the set's slot -- a copy of it, so that a
+       * later rebind cannot reach back into the draws already recorded.
+       * Every binding in it, buffer or texture or storage image alike, is an
+       * offset from here.
        */
+      unsigned slot = layout->set_slot[pInfo->firstSet + i];
+      CUdeviceptr snap_addr = cpvk_snapshot_set(cmd, set);
+      if (slot < CPVK_MAX_ARG_BUFS)
+         cmd->addrs[slot] = snap_addr;
+
+      /*
+       * Dynamic offsets: a dynamic uniform buffer binding names one buffer
+       * and the draw picks the element out of it with an offset given at
+       * bind time. They are consumed in binding order over the dynamic
+       * descriptors of each set, which is what the spec says and what the
+       * sample relies on -- and they are written into the snapshot rather
+       * than the set, because the next bind of the same set carries a
+       * different offset and must not rewrite this draw's.
+       */
+      struct cpvk_descriptor *snap =
+         (struct cpvk_descriptor *)(uintptr_t)snap_addr;
+
       for (unsigned b = 0; b < set->layout->num_bindings &&
                            dyn < pInfo->dynamicOffsetCount; b++) {
          VkDescriptorType ty = set->layout->bindings[b].type;
@@ -411,18 +490,10 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
                               dyn < pInfo->dynamicOffsetCount; e++) {
             unsigned flat = set->layout->bindings[b].flat + e;
             uint32_t off = pInfo->pDynamicOffsets[dyn++];
-            if (base + flat < CPVK_MAX_ARG_BUFS && set->addrs[flat])
-               cmd->addrs[base + flat] = set->addrs[flat] + off;
-            if (set->host)
-               set->host[flat].base = set->addrs[flat] + off;
+            if (snap && flat < CPVK_MAX_BINDINGS && set->addrs[flat])
+               snap[flat].base = set->addrs[flat] + off;
          }
       }
-
-      /* And the set itself, which is what a texture handle is an offset
-       * into. Buffers keep their own slot; this one is for images. */
-      unsigned slot = layout->set_slot[pInfo->firstSet + i];
-      if (slot < CPVK_MAX_ARG_BUFS)
-         cmd->addrs[slot] = set->buf;
    }
 }
 

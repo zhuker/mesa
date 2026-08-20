@@ -317,6 +317,23 @@ struct cpvk_cmd_buffer {
     */
    struct cpvk_op *ops;
    unsigned num_ops, max_ops;
+
+   /*
+    * Descriptor sets are snapshotted at bind time into memory this command
+    * buffer owns, and the draws point at the copy.
+    *
+    * They have to be. Execution is deferred to submit, and an application
+    * rebinds the same set with a different dynamic offset between draws --
+    * dynamicuniformbuffer does exactly that, once per object. Pointing every
+    * recorded draw at the live set means they all see whatever the last bind
+    * left behind, which is one object drawn twenty times.
+    */
+   CUdeviceptr desc_arena;
+   struct cpvk_descriptor *desc_arena_host;
+   size_t desc_arena_size, desc_arena_used;
+   /* Arenas outgrown while draws still point into them; freed at reset. */
+   CUdeviceptr *desc_retired;
+   unsigned num_desc_retired, max_desc_retired;
 };
 
 void cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d);

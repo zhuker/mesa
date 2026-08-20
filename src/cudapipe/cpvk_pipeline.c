@@ -30,8 +30,17 @@
 
 static const struct spirv_to_nir_options cpvk_spirv_options = {
    .environment = NIR_SPIRV_VULKAN,
-   .ubo_addr_format = nir_address_format_32bit_index_offset,
-   .ssbo_addr_format = nir_address_format_32bit_index_offset,
+   /*
+    * lavapipe's formats, and they have to be: this is what decides the width
+    * of the deref_cast SPIR-V builds for a buffer variable, and
+    * nir_lower_explicit_io asserts that a vec2_index_32bit_offset address is
+    * three components. Declaring the two-component format here and returning
+    * a three-component address from vulkan_resource_index produced a
+    * `32x2 deref_cast` over a `32x3 vec3` and an assertion inside the
+    * lowering, which reads as a bug in the lowering and is not one.
+    */
+   .ubo_addr_format = nir_address_format_vec2_index_32bit_offset,
+   .ssbo_addr_format = nir_address_format_vec2_index_32bit_offset,
    .phys_ssbo_addr_format = nir_address_format_64bit_global,
    .push_const_addr_format = nir_address_format_logical,
    .shared_addr_format = nir_address_format_32bit_offset,
@@ -112,17 +121,46 @@ lower_descriptors(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_vulkan_resource_index: {
       unsigned set = nir_intrinsic_desc_set(intr);
       unsigned binding = nir_intrinsic_binding(intr);
-      unsigned base = layout->set_base[set];
       const struct cpvk_descriptor_set_layout *sl =
          (const struct cpvk_descriptor_set_layout *)layout->vk.set_layouts[set];
-      if (sl && binding < sl->num_bindings)
-         base += sl->bindings[binding].flat;
+      unsigned flat = (sl && binding < sl->num_bindings)
+         ? sl->bindings[binding].flat : binding;
 
       b->cursor = nir_before_instr(&intr->instr);
-      nir_def *index = nir_iadd_imm(b, intr->src[0].ssa, base);
-      /* (index, offset) is the 32bit_index_offset address format. */
-      nir_def *addr = nir_vec2(b, index, nir_imm_int(b, 0));
+      /* (slot, byte offset in the set's buffer, 0) -- three components,
+       * which is what the format wants despite its name. The array index
+       * steps by one descriptor. */
+      nir_def *off =
+         nir_iadd_imm(b, nir_imul_imm(b, intr->src[0].ssa, CPVK_DESCRIPTOR_SIZE),
+                      flat * CPVK_DESCRIPTOR_SIZE);
+      nir_def *addr = nir_vec3(b, nir_imm_int(b, layout->set_slot[set]), off,
+                               nir_imm_int(b, 0));
       nir_def_replace(&intr->def, addr);
+      return true;
+   }
+
+   /*
+    * A buffer access still carrying the (slot, offset) pair becomes one
+    * against the descriptor: the set's buffer base plus the offset. The
+    * backend's emit_buffer_base dereferences a 64-bit source as a descriptor
+    * and reads the buffer pointer out of its first field, which is where
+    * cpvk_descriptor keeps it.
+    */
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_store_ssbo:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap: {
+      unsigned si = intr->intrinsic == nir_intrinsic_store_ssbo ? 1 : 0;
+      if (nir_src_num_components(intr->src[si]) == 1)
+         return false;
+
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *slot = nir_channel(b, intr->src[si].ssa, 0);
+      nir_def *offset = nir_channel(b, intr->src[si].ssa, 1);
+      nir_def *desc = nir_iadd(b, nir_load_const_buf_base_addr_lvp(b, slot),
+                               nir_u2u64(b, offset));
+      nir_src_rewrite(&intr->src[si], desc);
       return true;
    }
    case nir_intrinsic_load_vulkan_descriptor:
@@ -280,7 +318,11 @@ cpvk_lower_descriptors(nir_shader *nir,
             nir_metadata_control_flow, (void *)layout);
    NIR_PASS(_, nir, nir_lower_explicit_io,
             nir_var_mem_ubo | nir_var_mem_ssbo,
-            nir_address_format_32bit_index_offset);
+            nir_address_format_vec2_index_32bit_offset);
+   /* Again, for the loads that lowering just built: they carry the pair and
+    * have to become descriptor addresses too. */
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_descriptors,
+            nir_metadata_control_flow, (void *)layout);
    NIR_PASS(_, nir, nir_opt_dce);
 }
 
@@ -340,18 +382,25 @@ cpvk_CreatePipelineLayout(VkDevice _device,
     * therefore start at 1, and a layout that numbered them from 0 would have
     * every set's first binding shadowed by the push constants.
     */
-   unsigned flat = CPVK_UBO_PUSH_SLOT + 1;
+   /*
+    * One constant-buffer slot per descriptor set, with slot 0 the push
+    * constants. lavapipe's numbering, and it has to be: a slot per binding
+    * ran out. A capture's layouts wanted 17, 18, 22 and 23 slots where there
+    * are 16, and the bindings past the limit reached the shader as an address
+    * of zero and faulted a compute dispatch. A binding is an offset inside
+    * its set's buffer, so the count follows the number of sets and not the
+    * number of bindings.
+    */
    for (uint32_t s = 0; s < layout->vk.set_count; s++) {
-      layout->set_base[s] = flat;
-      struct cpvk_descriptor_set_layout *set =
-         (struct cpvk_descriptor_set_layout *)layout->vk.set_layouts[s];
-      if (set)
-         flat += set->num_descriptors;
+      layout->set_base[s] = 0;
+      layout->set_slot[s] = CPVK_UBO_PUSH_SLOT + 1 + s;
    }
-   /* One slot per set for the set's own buffer, after the per-binding ones. */
-   for (uint32_t s = 0; s < layout->vk.set_count; s++)
-      layout->set_slot[s] = flat++;
-   layout->num_descriptors = flat;
+   layout->num_descriptors = layout->vk.set_count;
+
+   if (layout->vk.set_count + 1 > CP_MAX_CONST_BUFFERS)
+      fprintf(stderr, "cudapipe: pipeline layout has %u descriptor sets and "
+              "there are %u slots\n", layout->vk.set_count,
+              CP_MAX_CONST_BUFFERS - 1);
 
    *pPipelineLayout = cpvk_pipeline_layout_to_handle(layout);
    return VK_SUCCESS;
