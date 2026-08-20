@@ -2799,3 +2799,40 @@ The change is kept because the condition is unnecessary by construction and was
 documented as temporary, not because it made anything faster. And the run-to-run
 spread here is 9.38 to 9.80 across the session, so nothing under about 5% in
 this measurement means anything.
+
+### Why the launch gap is not merging, and why the flush discipline will not transplant
+
+Batching on, with the vertex-offset condition removed, changes the launch count
+by nothing: 756.9 a frame against 752.9, where Gallium is 244.7. **The draws in
+this capture genuinely cannot merge** -- 32% of refusals are a different
+fragment shader and 21% a different vertex shader -- and the Gallium driver
+cannot merge them either. So the 3x launch gap is not merging, and that is now
+measured rather than argued.
+
+What Gallium does instead is accumulate *episodes* across draws that do not
+merge. Native cannot, because it finishes the episode on every draw, because
+`cp_batch_flush_why` is its only flush point.
+
+Two attempts to give it the others, both measured and both reverted:
+
+    state-change flush on viewport/scissor/blend/rasterizer/depth   11/18
+    + deferring flush on shader and vertex-element change           11/18
+    baseline                                                        15/18
+
+`pushconstants`, `pbribl`, `multithreading` and `gltfscenerendering` break
+either way. The Gallium adapter reaches the renderer through pipe_context
+setters that fire at bind time, in an order this front end does not reproduce
+by comparing state at draw time; the same five flushes in a different place are
+not the same discipline. Reverted, 15/18 restored.
+
+That is three attempts at the episode path in three turns, each correct-looking
+and each measured into the ground. What they establish between them:
+
+- the launch gap is real and is host-side (native uses *less* GPU time)
+- it is not merging, not the descriptor key, not blended episodes, not the
+  vertex-offset condition
+- it is episode accumulation, and episode accumulation needs the flush
+  discipline rebuilt at bind time rather than patched at draw time
+
+That last is a design change to this front end, not an adjustment, and it is
+where the remaining 1.36x lives.
