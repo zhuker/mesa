@@ -1518,3 +1518,26 @@ reading them. The remaining four:
 
 None of them prints a warning, which after today is worth stating as a
 result rather than a note: the cheap failures are gone.
+
+### computeshader: dispatches do not run in the order they were recorded
+
+The left half of the frame -- the source texture -- is exact. The right half,
+which a compute shader embosses, is **flat grey**, and an emboss of a constant
+is a constant, so the dispatch runs and writes and its reads return the same
+value everywhere.
+
+The command buffer keeps two things: `cmd->ops`, an ordered list of draws,
+copies and clears, and `cmd->dispatches`, a separate array. The executor runs
+**every dispatch first**, then the ops. So a dispatch always precedes every
+copy and draw recorded in the same command buffer, whatever order they were
+written in, and a compute shader reading an image that a recorded copy fills
+reads it empty.
+
+That is a structural bug independent of this sample and it is the one to fix
+next: dispatches belong in the ordered op list, not beside it. It is a real
+change rather than a small one, which is why it is written down here rather
+than attempted at the end of a session.
+
+Note what is *not* wrong: storage image writes work, the dispatch grid is
+right, compute descriptors resolve, and the graphics half of the same frame is
+byte-exact. The single ordering rule accounts for the whole difference.
