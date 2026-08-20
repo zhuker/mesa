@@ -393,6 +393,13 @@ struct cp_context {
 
    /* Vertex buffers and elements */
    struct pipe_vertex_buffer vertex_buffers[16];
+   /* Resolved when the buffers were bound: base address plus offset, which
+    * is all the draw path ever wanted from them. */
+   uint64_t vb_base[16];
+   /* And the elements, with the format already turned into the fetch
+    * kernel's conversion. The Gallium array beside this stays for the
+    * batch key and the pass-segment snapshot. */
+   struct cp_vertex_elem velem[16];
    unsigned num_vertex_buffers;
 
    struct pipe_vertex_element vertex_elements[16];

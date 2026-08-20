@@ -96,4 +96,26 @@ struct cp_fb_desc {
    bool has_zs;
 };
 
+/*
+ * Vertex input, resolved when the state was bound.
+ *
+ * The fetch kernel wants a conversion, a channel count and a channel size per
+ * element; the draw path was deriving all three from a pipe_format on every
+ * draw, along with the attribute's block size and its fill-w rule, and
+ * unwrapping a pipe_resource for each buffer base. None of that varies with
+ * the draw.
+ */
+struct cp_vertex_elem {
+   unsigned vertex_buffer_index;
+   unsigned src_offset;
+   unsigned src_stride;
+   unsigned instance_divisor;
+   unsigned attr_size;              /* bytes in memory */
+   unsigned nr_chan;
+   unsigned chan_bytes;
+   unsigned swizzle;
+   unsigned conv;                   /* enum cp_vf_conv */
+   unsigned fill_w;
+};
+
 #endif /* CP_DRAW_TYPES_H */

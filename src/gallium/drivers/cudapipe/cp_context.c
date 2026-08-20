@@ -3741,8 +3741,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
     * which the next draw may have rebound over — is not consulted for one. */
    bool has_vs = cp->vs_shader && cp->vs_shader->kernel &&
                  (vb_table != NULL ||
-                  (cp->num_vertex_buffers > 0 &&
-                   cp->vertex_buffers[0].buffer.resource) ||
+                  (cp->num_vertex_buffers > 0 && cp->vb_base[0]) ||
                   cp->num_vertex_elements == 0);
 
    /* Already resolved by whoever built the draw call: under Gallium that is
@@ -3818,11 +3817,11 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
    /* If no VS will run, pack positions from VB directly (passthrough).
     * When a VS is present, skip this — VS output provides positions. */
    if (!has_vs) {
-      if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
-         struct cp_resource *vb_res = cp_resource(cp->vertex_buffers[0].buffer.resource);
-         void *vb_data = cp_resource_data(vb_res);
-         if (vb_data) {
-            char *vb_start = (char *)vb_data + cp->vertex_buffers[0].buffer_offset;
+      if (cp->num_vertex_buffers > 0 && cp->vb_base[0]) {
+         {
+            /* Base and offset were folded together when the buffer was
+             * bound. */
+            char *vb_start = (char *)(uintptr_t)cp->vb_base[0];
             unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
 
             packed_positions =
@@ -3854,12 +3853,8 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
    /* VS execution */
    if (cp->vs_shader && cp->vs_shader->kernel) {
       CP_NVTX_SCOPE("vertex");
-      void *vb_data2 = NULL;
-      if (cp->num_vertex_buffers > 0 && cp->vertex_buffers[0].buffer.resource) {
-         struct cp_resource *vb_res2 =
-            cp_resource(cp->vertex_buffers[0].buffer.resource);
-         vb_data2 = cp_resource_data(vb_res2);
-      }
+      void *vb_data2 = (cp->num_vertex_buffers > 0)
+         ? (void *)(uintptr_t)cp->vb_base[0] : NULL;
 
       /* A vertex shader may build its positions from gl_VertexIndex alone and
        * declare no inputs at all, which is how a fullscreen pass is drawn.
@@ -4078,30 +4073,19 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                (slices_dev ? 0 : (uint64_t)draws[0].start * info->index_size);
 
          for (unsigned e = 0; e < cp->num_vertex_elements && e < 16; e++) {
-            const struct pipe_vertex_element *elem = &cp->vertex_elements[e];
+            const struct cp_vertex_elem *elem = &cp->velem[e];
             unsigned vb_idx = elem->vertex_buffer_index;
-            if (vb_idx < cp->num_vertex_buffers &&
-                cp->vertex_buffers[vb_idx].buffer.resource) {
-               struct cp_resource *evb = cp_resource(cp->vertex_buffers[vb_idx].buffer.resource);
-               void *evb_data = cp_resource_data(evb);
-               if (evb_data)
-                  vf_args.vb_bases[vb_idx] = (uint64_t)(uintptr_t)evb_data +
-                     cp->vertex_buffers[vb_idx].buffer_offset;
-            }
+            if (vb_idx < cp->num_vertex_buffers && cp->vb_base[vb_idx])
+               vf_args.vb_bases[vb_idx] = cp->vb_base[vb_idx];
             vf_args.elem_vb_idx[e] = vb_idx;
             vf_args.elem_src_offset[e] = elem->src_offset;
             vf_args.elem_src_stride[e] = elem->src_stride;
-            vf_args.elem_attr_size[e] = util_format_get_blocksize(elem->src_format);
-
-            uint32_t nr_chan, chan_bytes, swizzle;
-            enum cp_vf_conv conv = cp_vertex_format(elem->src_format, &nr_chan,
-                                                    &chan_bytes, &swizzle);
-            vf_args.elem_nr_chan[e] = nr_chan;
-            vf_args.elem_chan_bytes[e] = chan_bytes;
-            vf_args.elem_conv[e] = conv;
-            vf_args.elem_swizzle[e] = swizzle;
-
-            vf_args.elem_fill_w[e] = cp_vertex_fill_w(elem->src_format, conv);
+            vf_args.elem_attr_size[e] = elem->attr_size;
+            vf_args.elem_nr_chan[e] = elem->nr_chan;
+            vf_args.elem_chan_bytes[e] = elem->chan_bytes;
+            vf_args.elem_conv[e] = elem->conv;
+            vf_args.elem_swizzle[e] = elem->swizzle;
+            vf_args.elem_fill_w[e] = elem->fill_w;
             vf_args.elem_instance_divisor[e] = elem->instance_divisor;
          }
 
@@ -8104,6 +8088,28 @@ cp_bind_vertex_elements_state(struct pipe_context *ctx, void *state)
       cp->num_vertex_elements = ve->num_elements;
       cp->vertex_stride = ve->stride;
 
+      /* The format's consequences, worked out once. The fetch kernel reads
+       * these per draw and they do not vary with one. */
+      memset(cp->velem, 0, sizeof(cp->velem));
+      for (unsigned e = 0; e < ve->num_elements && e < 16; e++) {
+         const struct pipe_vertex_element *el = &ve->elements[e];
+         uint32_t nr_chan, chan_bytes, swizzle;
+         enum cp_vf_conv conv =
+            cp_vertex_format(el->src_format, &nr_chan, &chan_bytes, &swizzle);
+         cp->velem[e] = (struct cp_vertex_elem) {
+            .vertex_buffer_index = el->vertex_buffer_index,
+            .src_offset = el->src_offset,
+            .src_stride = el->src_stride,
+            .instance_divisor = el->instance_divisor,
+            .attr_size = util_format_get_blocksize(el->src_format),
+            .nr_chan = nr_chan,
+            .chan_bytes = chan_bytes,
+            .swizzle = swizzle,
+            .conv = conv,
+            .fill_w = cp_vertex_fill_w(el->src_format, conv),
+         };
+      }
+
       /* Update GPU-resident state */
       if (cp->gpu_state) {
          cp->gpu_state->num_elements = ve->num_elements;
@@ -8482,17 +8488,15 @@ cp_set_vertex_buffers(struct pipe_context *ctx, unsigned count,
    for (unsigned i = 0; i < count; i++) {
       if (buffers) {
          cp->vertex_buffers[i] = buffers[i];
-         /* Update GPU-resident state */
-         if (cp->gpu_state && buffers[i].buffer.resource) {
-            struct cp_resource *res = cp_resource(buffers[i].buffer.resource);
-            void *data = cp_resource_data(res);
-            cp->gpu_state->vb_bases[i] = data
-               ? (uint64_t)(uintptr_t)data + buffers[i].buffer_offset : 0;
-         } else if (cp->gpu_state) {
-            cp->gpu_state->vb_bases[i] = 0;
-         }
+         void *data = buffers[i].buffer.resource
+            ? cp_resource_data(cp_resource(buffers[i].buffer.resource)) : NULL;
+         cp->vb_base[i] = data
+            ? (uint64_t)(uintptr_t)data + buffers[i].buffer_offset : 0;
+         if (cp->gpu_state)
+            cp->gpu_state->vb_bases[i] = cp->vb_base[i];
       } else {
          memset(&cp->vertex_buffers[i], 0, sizeof(cp->vertex_buffers[i]));
+         cp->vb_base[i] = 0;
          if (cp->gpu_state)
             cp->gpu_state->vb_bases[i] = 0;
       }
