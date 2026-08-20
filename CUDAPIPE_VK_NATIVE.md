@@ -1949,3 +1949,32 @@ and the wrong level is read.
 
 Both are now bounded and characterised rather than merely nonzero, and the two
 have different causes, which the single mean-error number had hidden.
+
+### A thirteenth test isolates texturemipmapgen to a fractional LOD bias
+
+`cpvk_lodimp` is `cpvk_lod` with the level left to the sampler: the same four
+flat-coloured levels, the coordinate multiplied so each band is minified by a
+different factor, and a real derivative taken across the fragment quad. It is
+the first test in this tree that **differs from lavapipe**, and it differs
+small and systematically -- 641 pixels of 4,096, maximum 8 of 255.
+
+Because each level is one flat colour, the blend is invertible. A pixel in the
+band that lands between level 0 (red) and level 1 (green) gives the blend
+fraction directly from its red channel, over 227 samples:
+
+    lavapipe blend fraction   0.6773
+    native   blend fraction   0.7141
+    native LOD higher by      0.0368 levels   (sd 0.0087)
+    which is a rho ratio of   1.0259
+
+So this driver's implicit level of detail is about 2.6% larger than
+llvmpipe's, consistently, and it always reads slightly deeper into the chain.
+That is exactly `texturemipmapgen`'s signature -- not on edges, spread over
+the minified region, and brighter where the deeper levels are brighter.
+
+Explicit LOD is exact (`cpvk_lod`, `cpvk_cubelod`, `cpvk_cubelodf16` are all
+byte-identical), so the difference is in deriving rho from the quad, not in
+using it.
+
+Thirteen tests, twelve of them byte-identical and the thirteenth measuring a
+number rather than asserting one.
