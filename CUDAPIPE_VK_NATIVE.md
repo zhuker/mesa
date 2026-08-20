@@ -2917,3 +2917,36 @@ cube sampling exact including explicit LOD and half-float, descriptors written
 correctly, bindings resolving to the right textures, samplers carrying the
 right LOD range, and the material colour genuinely black by design. What is
 left is the sampler *table* at the moment the sphere draws shade.
+
+### pbribl: every CPU-side explanation is now eliminated
+
+The sampler table carries five entries for the last twelve draws of the frame,
+which are the spheres, so index 4 -- the prefiltered cube's -- is in range when
+they shade. That was the final link.
+
+The complete list, each checked by measurement rather than reading:
+
+    the material colour            black by design, read from the push block
+    the prefiltered cube's content warm at every level, read back from device
+                                   memory after the copies that build it
+    the cube's placement           all 60 copies issued, six faces x ten levels
+    the image layout               level-major with layers inside, matching
+                                   what the copy adds and what the sampler
+                                   indexes
+    cube sampling                  cpvk_cubelod and cpvk_cubelodf16 are
+                                   byte-identical to lavapipe at every face and
+                                   level, in both 8-bit and half-float
+    explicit LOD                   cpvk_lod byte-identical
+    the descriptors                23 writes at the right flat indices
+    the bindings                   2, 3 and 4 resolve to the irradiance cube,
+                                   the BRDF table and the prefiltered cube
+    the samplers                   index 4 with lod 0.0..10.0
+    the sampler table              five entries at the sphere draws
+
+Nothing on the host explains a neutral reflection from a warm cube. Whatever is
+left is device-side: what the fragment shader computes from a correct sampler,
+a correct texture and a correct level.
+
+`CUDAPIPE_DEBUG_FS` prints fragment values and was repaired earlier in this
+session, which makes it the instrument for that -- and this driver's history
+says the next step is to use it rather than to reason further.
