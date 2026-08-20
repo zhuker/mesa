@@ -1,7 +1,8 @@
 #ifndef CP_CONTEXT_H
 #define CP_CONTEXT_H
 
-#include "cp_debug.h"   /* CP_MAX_BATCH_DRAWS and the rest of the tunables */
+#include "cp_debug.h"
+#include "cp_draw_types.h"   /* CP_MAX_BATCH_DRAWS and the rest of the tunables */
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
 #include <cuda.h>
@@ -111,10 +112,10 @@ struct cp_context {
        * buffer is sized from and so what CP_MAX_BATCH_TRIS caps. */
       unsigned tris;
       struct cp_batch_key key;
-      struct pipe_draw_info info;
+      struct cp_draw_call info;
       /* One index range per merged draw; cp_draw_execute() turns these into
        * the slice table cp_vertex_fetch searches. */
-      struct pipe_draw_start_count_bias draws[CP_MAX_BATCH_DRAWS];
+      struct cp_draw_range draws[CP_MAX_BATCH_DRAWS];
       uint32_t instance_counts[CP_MAX_BATCH_DRAWS];
       unsigned drawid_offset;
       /* gl_DrawID per merged draw — the offset recorded when it joined, for
@@ -165,13 +166,13 @@ struct cp_context {
       unsigned prim_shift;
       /* Shading state. */
       struct cp_shader_binary *vs, *fs;
-      struct pipe_draw_info info;
+      struct cp_draw_call info;
       unsigned ndraws;
       unsigned drawid_offset;
       CUdeviceptr slices_dev;
       /* The batch snapshot, both for the per-segment shade (fs rows) and for
        * re-executing the segment classically when the episode falls back. */
-      struct pipe_draw_start_count_bias draws[CP_MAX_BATCH_DRAWS];
+      struct cp_draw_range draws[CP_MAX_BATCH_DRAWS];
       uint32_t instance_counts[CP_MAX_BATCH_DRAWS];
       uint32_t draw_ids[CP_MAX_BATCH_DRAWS];
       struct pipe_scissor_state scissors[CP_MAX_BATCH_DRAWS];
@@ -197,6 +198,39 @@ struct cp_context {
    /* A merged shading group's concatenated fs-UBO rows, staged here before
     * the upload; sized for the worst episode, allocated on first use. */
    uint64_t *pass_group_ubos;
+
+   /*
+    * CUDAPIPE_TILE_CENSUS. The accumulation runs for a whole framebuffer
+    * bind — the interval a tile renderer could hold colour and depth on
+    * chip — so the per-tile arrays are persistent and reset at the bind
+    * rather than allocated per episode, and the ordering key is a
+    * pass-global draw sequence rather than an episode-local primitive id.
+    * The histogram is managed memory the device accumulates into, so no
+    * per-pass readback exists.
+    */
+   CUdeviceptr tile_census_hist;
+   CUdeviceptr tile_census_mask, tile_census_quads;
+   CUdeviceptr tile_census_smin, tile_census_smax;
+   unsigned tile_census_alloc;      /* tiles the arrays are sized for */
+   unsigned tile_census_tiles_x, tile_census_tiles_y;
+   unsigned tile_census_w, tile_census_h;
+   bool tile_census_open;           /* a bind is being accumulated */
+   unsigned tile_census_seq;        /* pass-global draw order */
+   unsigned tile_census_nfs;
+   struct cp_shader_binary *tile_census_fs[64];
+   CUdeviceptr tile_census_refs;
+   uint64_t tile_census_marks;      /* episodes and opaque runs marked */
+   uint64_t tile_census_shaders;    /* their shaders, summed */
+   uint64_t tile_census_passes;
+   uint64_t tile_census_solo;       /* draws that took neither marked path */
+   uint64_t tile_census_marked_draws;
+   /* Whether a bind really is the interval a tile could stay resident: what
+    * touched the attachment while one was open, by kind. */
+   uint64_t tile_census_binds_cut;
+   uint64_t tile_census_cut_map, tile_census_cut_copy;
+   uint64_t tile_census_cut_flush, tile_census_cut_compute;
+   uint64_t tile_census_bind_draws; /* draws inside binds, summed */
+   bool tile_census_cut;            /* this bind has been interrupted */
 
    /*
     * The episode's side streams. Segment counts, fill relaunches and shades
@@ -482,6 +516,11 @@ void cp_batch_flush_why(struct cp_context *cp, const char *why);
  * episode carries per segment; see the definition. */
 void cp_batch_flush_defer_why(struct cp_context *cp, const char *why);
 void cp_pass_finish(struct cp_context *cp);
+enum cp_tile_census_cut_kind {
+   CP_TILE_CUT_MAP, CP_TILE_CUT_COPY, CP_TILE_CUT_FLUSH, CP_TILE_CUT_COMPUTE
+};
+void cp_tile_census_end_pass(struct cp_context *cp);
+void cp_tile_census_cut(struct cp_context *cp, enum cp_tile_census_cut_kind k);
 
 /*
  * How the sampler and the fragment writeback decode and encode a format, or

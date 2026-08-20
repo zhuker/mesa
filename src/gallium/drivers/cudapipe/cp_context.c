@@ -1,5 +1,6 @@
 #include "cp_context.h"
 #include "cp_screen.h"
+#include "cp_draw_types.h"
 #include "cp_kernels.h"
 #include "cp_nvtx.h"
 #include "cp_resource.h"
@@ -57,9 +58,9 @@ static void cp_pass_record_segment(struct cp_context *cp,
                                    const struct cp_rast_queues *queues,
                                    unsigned rast_num_triangles,
                                    unsigned num_triangles,
-                                   const struct pipe_draw_info *info,
+                                   const struct cp_draw_call *info,
                                    unsigned drawid_offset, unsigned ndraws,
-                                   const struct pipe_draw_start_count_bias *draws,
+                                   const struct cp_draw_range *draws,
                                    const uint32_t *instance_counts,
                                    const uint64_t *vs_ubo_table,
                                    const uint64_t *fs_ubo_table,
@@ -732,8 +733,8 @@ cp_triangles_for_draw(enum mesa_prim mode, unsigned count)
  * array, so the topology and indexing rules live in exactly one place.
  */
 static struct cp_vertex_ref *
-cp_build_vertex_refs(const struct pipe_draw_info *info,
-                     const struct pipe_draw_start_count_bias *draws,
+cp_build_vertex_refs(const struct cp_draw_call *info,
+                     const struct cp_draw_range *draws,
                      unsigned num_draws, unsigned instance_count,
                      const void *ib_base, unsigned num_triangles)
 {
@@ -1038,7 +1039,7 @@ cp_blend_desc_for(const struct cp_context *cp)
  * one is wrong about.
  */
 static void
-cp_fs_interp_setup(struct cp_context *cp, const struct pipe_draw_info *info,
+cp_fs_interp_setup(struct cp_context *cp, const struct cp_draw_call *info,
                    const struct cp_shader_binary *fs, unsigned num_fs_inputs,
                    unsigned num_vs_outputs, struct cp_fs_interp_args *interp)
 {
@@ -1548,7 +1549,7 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
  * blend its output into the colour attachment.
  */
 static void
-cp_shade_fragments(struct cp_context *cp, const struct pipe_draw_info *info,
+cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
                    CUdeviceptr visbuf, CUdeviceptr positions,
                    CUdeviceptr vs_output_buf, unsigned num_triangles,
                    unsigned w, unsigned h, void *color_data,
@@ -3122,7 +3123,7 @@ struct cp_abuf_seg_shade {
 };
 
 static bool
-cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
+cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
               struct cp_abuf *ab, CUdeviceptr positions,
               CUdeviceptr vs_output_buf, unsigned w, unsigned h,
               float vp_scale_x, float vp_scale_y,
@@ -3474,9 +3475,9 @@ cp_abuf_verify_colors(struct cp_abuf *ab, unsigned w, unsigned h,
  * to what it was.
  */
 static void
-cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
+cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                 unsigned drawid_offset,
-                const struct pipe_draw_start_count_bias *draws,
+                const struct cp_draw_range *draws,
                 unsigned num_draws, unsigned batch_draws,
                 const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table,
                 const uint32_t *draw_ids, const uint32_t *instance_counts,
@@ -3728,11 +3729,10 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
                    cp->vertex_buffers[0].buffer.resource) ||
                   cp->num_vertex_elements == 0);
 
-   const void *ib_base = NULL;
-   if (indexed && info->index.resource) {
-      struct cp_resource *ib_res = cp_resource(info->index.resource);
-      ib_base = cp_resource_data(ib_res);
-   }
+   /* Already resolved by whoever built the draw call: under Gallium that is
+    * cp_draw_vbo unwrapping a pipe_resource, natively it is the recorded
+    * index buffer's device address. */
+   const void *ib_base = indexed ? info->index_ptr : NULL;
 
    unsigned total_verts = num_triangles * 3;
 
@@ -5447,8 +5447,8 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
 
 /* Fill in everything two draws must agree on. See struct cp_batch_key. */
 static void
-cp_batch_build_key(struct cp_context *cp, const struct pipe_draw_info *info,
-                   const struct pipe_draw_start_count_bias *draws,
+cp_batch_build_key(struct cp_context *cp, const struct cp_draw_call *info,
+                   const struct cp_draw_range *draws,
                    struct cp_batch_key *key, bool blended)
 {
    struct pipe_framebuffer_state *fb = &cp->framebuffer;
@@ -5473,7 +5473,7 @@ cp_batch_build_key(struct cp_context *cp, const struct pipe_draw_info *info,
    key->mode = info->mode;
    key->index_size = info->index_size;
    key->start_instance = info->start_instance;
-   key->index_resource = info->index_size ? info->index.resource : NULL;
+   key->index_resource = info->index_size ? info->index_ptr : NULL;
    /*
     * The range is not a merge condition, and neither are the draw parameters
     * any more: a batch carries one slice per draw for the fetch kernel and
@@ -5576,9 +5576,9 @@ cp_batch_key_report_diff(const struct cp_batch_key *a,
  * above then decides which batch.
  */
 static bool
-cp_batch_structural(struct cp_context *cp, const struct pipe_draw_info *info,
+cp_batch_structural(struct cp_context *cp, const struct cp_draw_call *info,
                     const struct pipe_draw_indirect_info *indirect,
-                    const struct pipe_draw_start_count_bias *draws,
+                    const struct cp_draw_range *draws,
                     unsigned num_draws)
 {
    /* The pipeline the batched path takes: a compiled vertex shader over a
@@ -5591,7 +5591,7 @@ cp_batch_structural(struct cp_context *cp, const struct pipe_draw_info *info,
       return false;
    if (info->has_user_indices)
       return false;
-   if (info->index_size && !info->index.resource)
+   if (info->index_size && !info->index_ptr)
       return false;
 
    /* A vertex buffer is what the batch replays; a shader building its
@@ -5710,9 +5710,9 @@ cp_batch_abuf_ok(struct cp_context *cp)
 }
 
 static bool
-cp_batch_eligible(struct cp_context *cp, const struct pipe_draw_info *info,
+cp_batch_eligible(struct cp_context *cp, const struct cp_draw_call *info,
                   const struct pipe_draw_indirect_info *indirect,
-                  const struct pipe_draw_start_count_bias *draws,
+                  const struct cp_draw_range *draws,
                   unsigned num_draws, bool *blended)
 {
    if (cp_debug->no_batch)
@@ -5736,7 +5736,7 @@ cp_batch_eligible(struct cp_context *cp, const struct pipe_draw_info *info,
  * of the batch's tables. */
 static void
 cp_batch_record(struct cp_context *cp,
-                const struct pipe_draw_start_count_bias *draw, unsigned tris,
+                const struct cp_draw_range *draw, unsigned tris,
                 unsigned drawid_offset, unsigned instance_count)
 {
    uint64_t *row = cp->batch.vs_ubos +
@@ -7347,9 +7347,9 @@ cp_pass_record_segment(struct cp_context *cp,
                        const struct cp_rasterize_args *aa,
                        const struct cp_rast_queues *queues,
                        unsigned rast_num_triangles, unsigned num_triangles,
-                       const struct pipe_draw_info *info,
+                       const struct cp_draw_call *info,
                        unsigned drawid_offset, unsigned ndraws,
-                       const struct pipe_draw_start_count_bias *draws,
+                       const struct cp_draw_range *draws,
                        const uint32_t *instance_counts,
                        const uint64_t *vs_ubo_table,
                        const uint64_t *fs_ubo_table,
@@ -7590,14 +7590,35 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
 }
 
 static void
-cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
+cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *gallium_info,
             unsigned drawid_offset,
             const struct pipe_draw_indirect_info *indirect,
-            const struct pipe_draw_start_count_bias *draws,
+            const struct pipe_draw_start_count_bias *gallium_draws,
             unsigned num_draws)
 {
    struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_screen *screen = cp->screen;
+
+   /*
+    * The Gallium adapter, and the only place in the driver that sees
+    * Gallium's draw types. Everything below takes the driver's own
+    * description, which the native Vulkan front end fills in from a recorded
+    * command buffer instead. pipe_draw_start_count_bias and cp_draw_range
+    * are layout-compatible, so the array passes straight through.
+    */
+   struct cp_draw_call call = {
+      .mode = gallium_info->mode,
+      .index_size = gallium_info->index_size,
+      .instance_count = gallium_info->instance_count,
+      .start_instance = gallium_info->start_instance,
+      .has_user_indices = gallium_info->has_user_indices,
+      .index_ptr = (gallium_info->index_size && !gallium_info->has_user_indices &&
+                    gallium_info->index.resource)
+         ? cp_resource_data(cp_resource(gallium_info->index.resource)) : NULL,
+   };
+   const struct cp_draw_call *info = &call;
+   const struct cp_draw_range *draws =
+      (const struct cp_draw_range *)gallium_draws;
 
    if (!screen->kernels.initialized || !screen->kernels.rasterize_triangles)
       return;
