@@ -4648,3 +4648,32 @@ Eight defects fixed with a sample each behind them, six more correctness fixes
 that moved no sample and are recorded as such, and one measurement-harness bug
 -- a leaked environment variable -- that had silently invalidated every
 performance A/B taken after it appeared.
+
+### The driver now says which CPVK_ switches are in effect
+
+These are plain `getenv` flags rather than entries in `cp_debug.c`'s registry,
+so `CUDAPIPE_HELP=1` does not know about them and nothing announced them. That
+cost this session more than any bug in the driver: `CPVK_BATCH` and
+`CPVK_BATCH_BLEND` were left set in the driving shell, every process launched
+from it inherited them, and every performance A/B taken afterwards compared a
+feature against itself.
+
+`cpvk_report_env()` prints them once at instance creation, and is silent when
+none is set:
+
+    $ ./cpvk_tri ...
+    (silent)
+
+    $ CPVK_BATCH=1 CPVK_BATCH_BLEND=1 ./cpvk_tri ...
+    cudapipe: CPVK_ switches in effect: CPVK_BATCH=1 CPVK_BATCH_BLEND=1
+
+It deliberately reports `CPVK_BATCH` and `CPVK_BATCH_BLEND` even though the
+driver no longer reads them, so a shell or script still carrying one is told
+rather than silently ignored -- which is exactly the shape the failure took.
+
+18/18 samples run, 17/18 pixel-correct, fourteen unit tests pass.
+
+The proper fix is to move these into the `cp_debug.c` registry, where
+`CUDAPIPE_HELP=1` and the generated `FLAGS.md` would cover them by
+construction. That belongs with the rest of the front end's consolidation and
+is written down rather than done here.

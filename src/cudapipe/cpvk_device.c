@@ -332,9 +332,57 @@ cpvk_EnumerateInstanceExtensionProperties(const char *pLayerName,
       &cpvk_instance_extensions, pPropertyCount, pProperties);
 }
 
+/*
+ * The CPVK_ switches that are in effect, said once.
+ *
+ * These are plain getenv flags rather than entries in cp_debug.c's registry,
+ * so CUDAPIPE_HELP=1 does not know about them and nothing else announces them.
+ * That cost a day: CPVK_BATCH and CPVK_BATCH_BLEND were left set in a shell,
+ * every process launched from it inherited them, and every A/B measured after
+ * that compared a feature against itself. The numbers reproduced and meant
+ * nothing.
+ *
+ * A driver whose behaviour an invisible variable can change should say so.
+ * Silent when nothing is set, which is the common case.
+ */
+static void
+cpvk_report_env(void)
+{
+   static const char *const names[] = {
+      "CPVK_NO_BATCH", "CPVK_NO_BATCH_BLEND", "CPVK_NO_DESC_KEY",
+      "CPVK_KEEP_VOFF", "CPVK_KEEP_INSTKEY",
+      "CPVK_DEBUG_RT", "CPVK_DEBUG_PUSH", "CPVK_DEBUG_FACES",
+      "CPVK_DEBUG_EPISODE", "CPVK_DEBUG_PASS", "CPVK_DEBUG_ROWS",
+      "CPVK_DEBUG_CLIP",
+      /* Names this driver no longer reads, reported so that a script or a
+       * shell still carrying one is not silently ignored. */
+      "CPVK_BATCH", "CPVK_BATCH_BLEND",
+   };
+   bool any = false;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(names); i++) {
+      const char *v = getenv(names[i]);
+      if (!v)
+         continue;
+      if (!any) {
+         fprintf(stderr, "cudapipe: CPVK_ switches in effect:");
+         any = true;
+      }
+      fprintf(stderr, " %s=%s", names[i], v);
+   }
+   if (any)
+      fprintf(stderr, "\n");
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_EnumerateInstanceVersion(uint32_t *pApiVersion)
 {
+   static bool said;
+   if (!said) {
+      said = true;
+      cpvk_report_env();
+   }
+
    /*
     * The instance version caps everything above it. With this at 1.0 the
     * physical device could report 1.3 and vkGetDeviceProcAddr would still
