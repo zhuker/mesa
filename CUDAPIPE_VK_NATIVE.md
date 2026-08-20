@@ -1460,3 +1460,29 @@ and then reading the NIR it pointed at.
 the plaza reflected in them. `texturecubemap` is exact now, so cube *sampling*
 works and it is the environment cube's *generation* -- rendering into cube
 faces -- that is missing or wrong.
+
+### Array layers, honoured in two places, and neither explains pbribl
+
+Two places took an image's base address where they should have taken a
+subresource's:
+
+- `vkCmdBeginRendering` ignored the colour view's `baseArrayLayer` and
+  `baseMipLevel`, so rendering into a cube face or a mip level wrote to face
+  zero of level zero.
+- `vkCmdCopyImage` ignored both subresources' `baseArrayLayer`, so the six
+  copies that build a cube map all landed on face zero.
+
+Both are wrong by Vulkan's own definition and both are fixed. **Neither
+changed any sample**, including pbribl, whose reflections are what prompted
+looking: 1.472 before and after. Nothing regressed either -- 13/18 still
+pixel-correct, nine unit tests still passing.
+
+They are kept because a view's subresource selecting the layer is not a matter
+of opinion, and because an image written to the wrong layer is the kind of
+fault that surfaces later as something unrelated. But they are recorded here
+as unproven: no test in this tree renders to or copies into a non-zero layer,
+and adding one is the way to make them mean something.
+
+pbribl's environment cube therefore comes from somewhere else again --
+possibly rendered with `layerCount` greater than one in a single pass, which
+this driver does not implement at all and does not warn about.

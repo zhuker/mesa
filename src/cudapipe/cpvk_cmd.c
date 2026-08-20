@@ -721,7 +721,18 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       VK_FROM_HANDLE(cpvk_image_view, view, cat->imageView);
       if (view && view->image && view->image->mem) {
          cimg = view->image;
-         fb.color = (void *)(uintptr_t)(cimg->mem->dev_ptr + cimg->offset);
+         /*
+          * The view's subresource, not the image's base. A cube map is
+          * rendered one face at a time through a view whose baseArrayLayer
+          * selects the face, and a mip chain likewise through baseMipLevel.
+          * Ignoring both meant every face of pbribl's environment cube was
+          * rendered over face zero, so its spheres reflected nothing.
+          */
+         unsigned rlevel = MIN2(view->vk.base_mip_level, CPVK_MAX_MIP_LEVELS - 1);
+         fb.color = (void *)(uintptr_t)(cimg->mem->dev_ptr + cimg->offset +
+                                        cimg->level_offset[rlevel] +
+                                        (uint64_t)view->vk.base_array_layer *
+                                        cimg->level_size[rlevel]);
          /*
           * The view's format decides the encoding, not the image's. They are
           * usually the same and were assumed to be; when they are not, the
