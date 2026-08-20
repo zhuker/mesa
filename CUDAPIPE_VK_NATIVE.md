@@ -3653,3 +3653,30 @@ chains genuinely differ and every measurement here is consistent with it --
 including `cpvk_lodblit`, which builds a chain by blit and compares native
 against **Gallium**, and passes, because both go through the same code in that
 test's configuration.
+
+### The scaling blit now matches the Gallium adapter's, and texturemipmapgen is unmoved
+
+The Gallium driver's `cp_blit` does bilinear interpolation at pixel centres:
+
+    fx = (x + 0.5) * src_w / dst_w - 0.5
+    a  = tap[x0] + (tap[x1] - tap[x0]) * wx        and the same in y
+
+while this driver box-filtered the destination texel's source footprint. Those
+agree exactly for a power-of-two halving and differ everywhere else, which is
+why `cpvk_lodblit` -- an 8x8 chain halving to 1x1 -- could never tell them
+apart.
+
+The native blit now uses the Gallium formula, verified present in the file
+before building. **`texturemipmapgen` is unchanged at 0.456.** Nothing else
+moved either: 18/18 run, 15/18 pixel-correct, fourteen tests pass.
+
+So a real difference between the two drivers has been removed and it was not
+that sample's cause. Recorded as such, with the grep beside it, because a null
+result from an unverified edit is what cost twenty turns earlier today.
+
+What is now known about `texturemipmapgen`: the chain is built by
+`vkCmdBlitImage` with the same filter as the reference, the sampler is shared
+code, implicit LOD selection is byte-identical between the two drivers
+(`cpvk_lodimp`), and a blit-built chain sampled with implicit LOD is
+byte-identical (`cpvk_lodblit`). Every stage tests clean and the sample still
+differs in its minified centre, brighter and off the edges.

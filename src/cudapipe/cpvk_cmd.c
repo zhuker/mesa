@@ -2301,23 +2301,35 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
          for (unsigned x = 0; x < c->dst_w; x++) {
             uint8_t *o = dst + ((size_t)y * c->dst_w + x) * 4;
             if (c->filter_linear) {
-               /* The source footprint of this destination texel, averaged.
-                * Exact for the power-of-two halving a mip chain does. */
-               unsigned x0 = x * c->src_w / c->dst_w;
-               unsigned x1 = MAX2((x + 1) * c->src_w / c->dst_w, x0 + 1);
-               unsigned y0 = y * c->src_h / c->dst_h;
-               unsigned y1 = MAX2((y + 1) * c->src_h / c->dst_h, y0 + 1);
-               unsigned acc[4] = { 0, 0, 0, 0 }, n = 0;
-               for (unsigned sy = y0; sy < y1 && sy < c->src_h; sy++)
-                  for (unsigned sx = x0; sx < x1 && sx < c->src_w; sx++) {
-                     const uint8_t *s =
-                        src + ((size_t)sy * c->src_w + sx) * 4;
-                     for (int k = 0; k < 4; k++)
-                        acc[k] += s[k];
-                     n++;
-                  }
-               for (int k = 0; k < 4; k++)
-                  o[k] = n ? (uint8_t)((acc[k] + n / 2) / n) : 0;
+               /*
+                * Bilinear at pixel centres, which is what the Gallium
+                * adapter's blit does and therefore what the mip chains a
+                * sample builds have to match. This was a box filter over the
+                * destination texel's source footprint -- exact for a
+                * power-of-two halving and different everywhere else, which is
+                * texturemipmapgen's minified centre.
+                */
+               float fx = ((float)x + 0.5f) * (float)c->src_w /
+                          (float)c->dst_w - 0.5f;
+               float fy = ((float)y + 0.5f) * (float)c->src_h /
+                          (float)c->dst_h - 0.5f;
+               int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+               float wx = fx - (float)x0, wy = fy - (float)y0;
+               int x1 = CLAMP(x0 + 1, 0, (int)c->src_w - 1);
+               int y1 = CLAMP(y0 + 1, 0, (int)c->src_h - 1);
+               x0 = CLAMP(x0, 0, (int)c->src_w - 1);
+               y0 = CLAMP(y0, 0, (int)c->src_h - 1);
+
+               const uint8_t *p00 = src + ((size_t)y0 * c->src_w + x0) * 4;
+               const uint8_t *p10 = src + ((size_t)y0 * c->src_w + x1) * 4;
+               const uint8_t *p01 = src + ((size_t)y1 * c->src_w + x0) * 4;
+               const uint8_t *p11 = src + ((size_t)y1 * c->src_w + x1) * 4;
+               for (int k = 0; k < 4; k++) {
+                  float a = (float)p00[k] + ((float)p10[k] - (float)p00[k]) * wx;
+                  float b = (float)p01[k] + ((float)p11[k] - (float)p01[k]) * wx;
+                  float v = a + (b - a) * wy;
+                  o[k] = (uint8_t)(v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v + 0.5f));
+               }
             } else {
                unsigned sx = x * c->src_w / c->dst_w;
                unsigned sy = y * c->src_h / c->dst_h;
