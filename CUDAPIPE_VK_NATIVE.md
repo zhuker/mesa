@@ -2950,3 +2950,37 @@ a correct texture and a correct level.
 `CUDAPIPE_DEBUG_FS` prints fragment values and was repaired earlier in this
 session, which makes it the instrument for that -- and this driver's history
 says the next step is to use it rather than to reason further.
+
+### pbribl at the fragment: the inputs are right and the output is genuinely neutral
+
+`CUDAPIPE_DEBUG_FS` on the sphere draws:
+
+    fs_in[0] <- vs slot 1 (loc 32)      inWorldPos
+    fs_in[1] <- vs slot 2 (loc 33)      inNormal
+    px(270,311) in=[6.490 -0.995]  out=[0.608 0.608 0.608 1.000]
+    px(126,319) in=[9.291 -0.843]  out=[0.000 0.000 0.000 1.000]
+    vtx0: slot0=[-7.949 -0.116 11.926 12.021]  slot1=[7.609 -0.131 0.000 0.000]
+          slot2=[-0.991 -0.130 0.000 0.000]    slot3=[0.750 0.542 0.000 0.000]
+
+Two fragment inputs, wired from vertex slots 1 and 2, which is right:
+`pbribl.frag` declares `inWorldPos`, `inNormal` and `inUV`, and its albedo
+comes from push constants rather than the uv, so the third is dead and
+correctly dropped. The vertex outputs are sensible -- a clip position with
+w = 12.02, a world position, a unit normal, a uv.
+
+And the fragment output is exactly neutral, computed rather than clamped:
+0.608 in all three channels at one pixel, 0.000 at another, with the
+framebuffer under it warm where the plaza shows through.
+
+So the fragment stage receives correct interpolated inputs, addresses correct
+textures through correct samplers at correct levels, and computes a grey
+value. Every stage on both sides of the shader is now verified, and the
+remaining question is inside the arithmetic itself: which of `reflection`,
+`brdf` or `F` evaluates to something that makes
+`reflection * (F * brdf.x + brdf.y)` neutral when `reflection` is warm in
+memory.
+
+The instrument for that is a shader edit -- replace the term with a constant
+and see which one moves the picture -- rather than another read of the driver.
+That is where this stops, with every layer around the shader eliminated by
+measurement.
