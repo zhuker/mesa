@@ -142,13 +142,28 @@ before layering behaviour on it — is the whole plan:
    key compares the element array and the pass-segment snapshot saves a copy
    for the fallback replay.
 
-   **All seven state structs are now resolved.** `cp_draw_execute` reads no
-   Gallium type in its signature or in the state it consumes; what remains in
-   the file is the Gallium *entry points* — the state setters, the resource
-   and sampler-view paths, and the two `PIPE_FORMAT` switch tables that the
-   native driver replaces with its own.
+   **Seventh slice: the scissor.** `pipe_scissor_state` is four plain
+   unsigneds and contains nothing the pipeline does not use, so this one
+   converts whole — live state, the batch's per-draw array, the segment
+   snapshot *and* the batch key's copy — and because the key still compares
+   the same four values, **nothing about what merges changes**. That is why
+   this one could go all the way and the others could not.
 
-   Gallium references in `cp_context.c`: **334 → 268**.
+   **`cp_draw_execute` now has no Gallium type in its signature at all**: it
+   takes a `cp_draw_call`, a `cp_draw_range`, a `cp_rect` and its own context,
+   and every piece of state it reads is the driver's own.
+
+   Gallium references in `cp_context.c`: **334 → 264**.
+
+   What is left in the file is the Gallium *entry points* and what they hold:
+   `struct pipe_context base` at the head of `cp_context`, the CSO copies the
+   flush comparison and the batch key use, the resource and sampler-view
+   paths, and the two `PIPE_FORMAT` switch tables the native driver replaces
+   with its own table. The next structural step is inverting the containment —
+   a `cp_gallium` holding `pipe_context base` first and the renderer beside it,
+   which is 25 cast sites — and after that the batch key, which is the one
+   place where going driver-owned will genuinely change what merges and so
+   must be measured rather than assumed.
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
