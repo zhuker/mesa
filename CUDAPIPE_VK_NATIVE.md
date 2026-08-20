@@ -3962,3 +3962,46 @@ thirteen corner pixels of a cube seam at a maximum difference of 2.
 A capability difference, not a rendering defect -- and it sat behind a
 measurement that had been characterised three times as "edge coverage on
 silhouettes" without anyone asking what the reference was actually rendering.
+
+## Final state of this session
+
+    samples          18/18 run, 17/18 pixel-correct
+                     pbribl 0.0286, the only one above the 0.01 threshold
+    unit tests       14/14
+    Crossroads       native  9.42 ms   gallium  7.16 ms   1.32x
+    old capture      native 34.42 ms   gallium 25.29 ms   1.36x
+    both captures    1,496 and 1,510 frames, every frame, exit 0
+    Gallium driver   0 files changed from the branch point
+
+`pbribl`'s residual is 135 pixels above 4 and none above 16, at the frame's
+right edge where a cube seam projects, split 46 on the skybox and 89 on the
+spheres. It is a refinement in how this driver's seam re-projection picks a
+texel against llvmpipe's adjacency table, not a missing term.
+
+### What this session changed
+
+    8/18 -> 17/18 pixel-correct, and 9 -> 14 unit tests
+
+    outputs read back as undef            5 samples
+    gl_PointCoord not lowered             1
+    storage images with no extent         1
+    the multisample clear on one plane    1
+    vkCmdCopyImage ignoring the layer     1  (and pbribl's reflections)
+    sampler arrays always element 0       1
+    8x MSAA advertised                    1
+    seamless cube filtering               correctness, edges and corners
+    R16G16_SFLOAT decoded as R8G8B8A8     correctness
+    vkCmdBlitImage ignoring the layer     correctness
+    the blit's filter, now matching       correctness
+    vulkan_resource_reindex               correctness
+    tex-src sampler and texture offsets   correctness
+    dispatches in the ordered op list     correctness
+    the event API, apiVersion 1.1         capability
+
+### The objective
+
+The driver that ships is `src/gallium/drivers/cudapipe`, and `git diff
+e2e966953d7` against it is empty, so every recorded result for it stands. The
+native driver is one sample and about a third of a frame away, which is a
+different thing from where it started this session and still not the same thing
+as meeting it.
