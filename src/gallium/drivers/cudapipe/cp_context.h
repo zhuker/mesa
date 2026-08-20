@@ -300,12 +300,29 @@ struct cp_context {
    } timer;
 
    struct pipe_framebuffer_state framebuffer;
-   struct pipe_viewport_state viewport;
    struct pipe_scissor_state scissor;
+   /*
+    * What the pipeline reads, in the driver's own types: the viewport's scale
+    * and translate, three fields of the rasterizer and three of the depth
+    * state. Field names match Gallium's, so nothing that reads them changed.
+    */
+   struct cp_viewport_state viewport;
+   struct cp_raster_state rasterizer;
+   struct cp_depth_state depth_stencil;
+   /*
+    * And what the Gallium adapter compares to decide whether a held-back
+    * batch must be flushed, and what the batch key carries. Adapter-only, and
+    * gone with Gallium. The comparison deliberately did not move with the
+    * fields: narrowing it to what the pipeline reads would make batches
+    * larger than they are today, and batch size is what makes the clipper's
+    * unstable primitive order visible (gaps 15 and 16).
+    */
+   struct pipe_viewport_state viewport_cso;
+   struct pipe_rasterizer_state rasterizer_cso;
+   struct pipe_depth_stencil_alpha_state depth_stencil_cso;
 
    /* Visibility buffer, rebuilt per draw: it resolves which triangle of the
     * current draw wins each pixel. */
-   struct pipe_rasterizer_state rasterizer;
    CUdeviceptr visbuf;
    CUdeviceptr reject;      /* per-pixel discarded triangles, CP_DISCARD_LAYERS deep */
    CUdeviceptr resolved;    /* per-pixel byte: a fragment has been written */
@@ -346,7 +363,7 @@ struct cp_context {
    CUdeviceptr rast_nontrivial_count; /* atomic uint32_t, = rast_counts[0] */
    CUdeviceptr rast_huge_count;       /* atomic uint32_t, = rast_counts[1] */
 
-   struct pipe_depth_stencil_alpha_state depth_stencil;
+
 
    struct cp_shader_binary *compute_shader;
    struct cp_shader_binary *vs_shader;

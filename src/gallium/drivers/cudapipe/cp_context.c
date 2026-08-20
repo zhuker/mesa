@@ -281,9 +281,12 @@ cp_set_viewport_states(struct pipe_context *ctx, unsigned start_slot,
 {
    struct cp_context *cp = (struct cp_context *)ctx;
    if (num_viewports > 0) {
-      if (memcmp(&cp->viewport, &viewports[0], sizeof(cp->viewport)))
+      if (memcmp(&cp->viewport_cso, &viewports[0], sizeof(cp->viewport_cso)))
          cp_batch_flush_why(cp, "viewport");
-      cp->viewport = viewports[0];
+      cp->viewport_cso = viewports[0];
+      memcpy(cp->viewport.scale, viewports[0].scale, sizeof(cp->viewport.scale));
+      memcpy(cp->viewport.translate, viewports[0].translate,
+             sizeof(cp->viewport.translate));
       if (cp->gpu_state) {
          cp->gpu_state->vp_scale_x = viewports[0].scale[0];
          cp->gpu_state->vp_scale_y = viewports[0].scale[1];
@@ -929,7 +932,7 @@ cp_vertex_fill_w(enum pipe_format format, enum cp_vf_conv conv)
 
 /* 0 = keep everything, 1 = drop positive-area triangles, 2 = drop negative. */
 static uint32_t
-cp_cull_mode(const struct pipe_rasterizer_state *rs)
+cp_cull_mode(const struct cp_raster_state *rs)
 {
    bool cull_back = (rs->cull_face & PIPE_FACE_BACK) != 0;
    bool cull_front = (rs->cull_face & PIPE_FACE_FRONT) != 0;
@@ -5483,7 +5486,7 @@ cp_batch_build_key(struct cp_context *cp, const struct cp_draw_call *info,
     * kernel's instance-divisor gather still reads it as one scalar.
     */
 
-   key->viewport = cp->viewport;
+   key->viewport = cp->viewport_cso;
    /*
     * The scissor is a merge condition only where a primitive cannot be
     * resolved to its draw: a batch on the stable clipper carries one clip
@@ -5495,8 +5498,8 @@ cp_batch_build_key(struct cp_context *cp, const struct cp_draw_call *info,
    if (cp->rasterizer.scissor &&
        !(blended || (cp->fs_shader && cp->fs_shader->reads_const_bufs)))
       key->scissor = cp->scissor;
-   key->rasterizer = cp->rasterizer;
-   key->depth_stencil = cp->depth_stencil;
+   key->rasterizer = cp->rasterizer_cso;
+   key->depth_stencil = cp->depth_stencil_cso;
    key->blend_state = cp->blend_state;
    key->blend_enabled = cp->blend_enabled;
 
@@ -7989,9 +7992,14 @@ cp_bind_rasterizer_state(struct pipe_context *ctx, void *state)
       next = *(struct pipe_rasterizer_state *)state;
    else
       memset(&next, 0, sizeof(next));
-   if (memcmp(&cp->rasterizer, &next, sizeof(next)))
+   if (memcmp(&cp->rasterizer_cso, &next, sizeof(next)))
       cp_batch_flush_why(cp, "rasterizer state");
-   cp->rasterizer = next;
+   cp->rasterizer_cso = next;
+   cp->rasterizer = (struct cp_raster_state) {
+      .cull_face = next.cull_face,
+      .front_ccw = next.front_ccw,
+      .scissor = next.scissor,
+   };
 }
 
 static void
@@ -8020,11 +8028,16 @@ cp_bind_depth_stencil_alpha_state(struct pipe_context *ctx, void *state)
       next = *(struct pipe_depth_stencil_alpha_state *)state;
    else
       memset(&next, 0, sizeof(next));
-   if (memcmp(&cp->depth_stencil, &next, sizeof(next)))
+   if (memcmp(&cp->depth_stencil_cso, &next, sizeof(next)))
       cp_batch_flush_why(cp, "depth/stencil state");
 
    if (state) {
-      cp->depth_stencil = next;
+      cp->depth_stencil_cso = next;
+      cp->depth_stencil = (struct cp_depth_state) {
+         .depth_enabled = next.depth_enabled,
+         .depth_writemask = next.depth_writemask,
+         .depth_func = next.depth_func,
+      };
       if (cp->gpu_state) {
          cp->gpu_state->depth_test = cp->depth_stencil.depth_enabled;
          cp->gpu_state->depth_func = cp->depth_stencil.depth_func;

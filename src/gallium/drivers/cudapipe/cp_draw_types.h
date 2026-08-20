@@ -42,4 +42,36 @@ struct cp_draw_range {
    int index_bias;
 };
 
+/*
+ * The pipeline's view of the pipeline state.
+ *
+ * Only the fields the rasterizer and shading stages actually read: three of
+ * pipe_depth_stencil_alpha_state, three of pipe_rasterizer_state, and the
+ * viewport's scale and translate. Field names again match Gallium's so that
+ * introducing these changed nothing that reads them.
+ *
+ * The comparison that decides whether a held-back batch must be flushed still
+ * happens on the full Gallium state in the adapter, deliberately: narrowing it
+ * to the fields the pipeline reads would make batches larger than they are
+ * today, and batch size is what makes the clipper's unstable primitive order
+ * visible (handoff gaps 15 and 16). A factoring must not change what merges.
+ */
+
+struct cp_depth_state {
+   bool depth_enabled;
+   bool depth_writemask;
+   unsigned depth_func;             /* PIPE_FUNC_*, and CP_FUNC_* when Gallium is gone */
+};
+
+struct cp_raster_state {
+   unsigned cull_face;              /* PIPE_FACE_* */
+   bool front_ccw;
+   bool scissor;
+};
+
+struct cp_viewport_state {
+   float scale[3];
+   float translate[3];
+};
+
 #endif /* CP_DRAW_TYPES_H */
