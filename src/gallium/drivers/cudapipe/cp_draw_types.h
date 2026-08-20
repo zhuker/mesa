@@ -68,10 +68,17 @@ struct cp_draw_range {
  * visible (handoff gaps 15 and 16). A factoring must not change what merges.
  */
 
+/*
+ * The depth comparison uses enum cp_compare_func from the kernel ABI header,
+ * which is where it has always lived -- the kernels read it. The host was
+ * passing Gallium's PIPE_FUNC_* values into those fields and relying on the
+ * two agreeing; the adapter now static_asserts that they do, and the renderer
+ * names only the driver's own constants.
+ */
 struct cp_depth_state {
    bool depth_enabled;
    bool depth_writemask;
-   unsigned depth_func;             /* PIPE_FUNC_*, and CP_FUNC_* when Gallium is gone */
+   unsigned depth_func;             /* enum cp_compare_func */
 };
 
 struct cp_raster_state {

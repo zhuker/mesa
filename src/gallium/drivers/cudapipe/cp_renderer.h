@@ -551,6 +551,61 @@ void cp_tile_census_end_pass(struct cp_context *cp);
 
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 
+/*
+ * A backstop, not a budget. The arena accumulates across the draws of a frame
+ * and only resets after a few expansions, so a frame with a dozen draws at
+ * 1280x720 legitimately reaches two or three gigabytes. What this catches is
+ * the runaway: a stage allocating per pass rather than reusing asks for tens
+ * of gigabytes, and since the arena is managed memory it is backed by system
+ * RAM, so that does not fail — it invokes the OOM killer on the whole machine.
+ */
+#define CP_SCRATCH_MAX_BYTES ((size_t)8 << 30)
+
+/* Sync and reclaim once a frame's draws have run up this much. */
+#define CP_SCRATCH_RECLAIM_BYTES ((size_t)1 << 30)
+
+/*
+ * Stage timing, on CUDA events rather than on the host clock.
+ *
+ * This used to bracket each stage with clock_gettime. That measures how long
+ * the host spent issuing the stage, which was already only loosely related to
+ * how long the device spent running it and is now not related at all: every
+ * launch goes on a stream and returns immediately. A stage whose kernel runs
+ * for a millisecond and whose launch takes two microseconds was being
+ * reported as two microseconds, and the one unlucky stage that happened to
+ * follow a full queue absorbed everyone else's time.
+ *
+ * Events are recorded on the same stream as the work, so the interval between
+ * two of them is device time between those two points. Reading them back
+ * needs the stream to have reached the last one, which is a synchronisation —
+ * hence only under CUDAPIPE_DEBUG_TIME, and hence a pool rather than one pair
+ * per stage, because a blended draw runs the shading stages hundreds of times
+ * and every interval has to be recorded before any of them can be read.
+ */
+enum cp_stage {
+   CP_STAGE_ASSEMBLE,
+   CP_STAGE_VERTEX,
+   CP_STAGE_RASTERIZE,
+   CP_STAGE_INTERPOLATE,
+   CP_STAGE_FRAGMENT,
+   CP_STAGE_WRITEBACK,
+   CP_NUM_STAGES,
+};
+
+/* The scratch and upload arenas, and the per-stage timing they share. Used
+ * by every stage of the pipeline, so they moved to the renderer first. */
+void *cp_scratch_alloc(struct cp_context *cp, size_t size);
+CUdeviceptr cp_scratch_alloc_device(struct cp_context *cp, size_t size);
+CUdeviceptr cp_upload_begin(struct cp_context *cp, size_t size, void **host);
+void cp_upload_end(struct cp_context *cp, CUdeviceptr dst, const void *host,
+                   size_t size);
+CUdeviceptr cp_upload(struct cp_context *cp, const void *data, size_t size);
+void cp_scratch_begin(struct cp_context *cp);
+void cp_scratch_reset(struct cp_context *cp);
+void cp_scratch_destroy(struct cp_context *cp);
+bool cp_timing_enabled(void);
+void cp_stage_end(struct cp_context *cp, int stage);
+
 enum cp_tile_census_cut_kind {
    CP_TILE_CUT_MAP, CP_TILE_CUT_COPY, CP_TILE_CUT_FLUSH, CP_TILE_CUT_COMPUTE
 };
