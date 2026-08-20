@@ -28,10 +28,6 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
       struct cpvk_cmd_buffer *cmd =
          container_of(submit->command_buffers[i], struct cpvk_cmd_buffer, vk);
-      VkResult result = cpvk_execute_cmd_buffer(dev, cmd);
-      if (result != VK_SUCCESS)
-         return result;
-
       /* In record order: a clear after a draw must not run before it. */
       for (unsigned o = 0; o < cmd->num_ops; o++) {
          switch (cmd->ops[o].kind) {
@@ -50,6 +46,14 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          case CPVK_OP_DRAW:
             cpvk_execute_draw(dev, &cmd->ops[o].draw);
             break;
+         case CPVK_OP_DISPATCH: {
+            /* Here, in record order, and not before the copy that fills what
+             * it reads. */
+            VkResult r = cpvk_execute_dispatch(dev, &cmd->ops[o].dispatch);
+            if (r != VK_SUCCESS)
+               return r;
+            break;
+         }
          }
       }
    }

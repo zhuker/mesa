@@ -350,6 +350,13 @@ enum cpvk_op_kind {
    CPVK_OP_DRAW,
    CPVK_OP_CLEAR,
    CPVK_OP_COPY,
+   /*
+    * A dispatch is an op like any other, because it must run where it was
+    * recorded. Held in its own array it ran before every copy and draw in the
+    * command buffer, so computeshader's compute stage read the image its own
+    * recorded copy had not filled yet and embossed a constant.
+    */
+   CPVK_OP_DISPATCH,
 };
 
 struct cpvk_op {
@@ -363,6 +370,7 @@ struct cpvk_op {
       struct cpvk_copy copy;
       struct cp_fb_desc fb;
       struct cpvk_query_op query;
+      struct cpvk_dispatch dispatch;
    };
 };
 
@@ -431,6 +439,8 @@ void cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc 
 extern const struct vk_command_buffer_ops cpvk_cmd_buffer_ops;
 extern const struct vk_sync_type *const cpvk_sync_types[];
 
+VkResult cpvk_execute_dispatch(struct cpvk_device *dev,
+                               const struct cpvk_dispatch *d);
 VkResult cpvk_execute_cmd_buffer(struct cpvk_device *dev,
                                  struct cpvk_cmd_buffer *cmd);
 

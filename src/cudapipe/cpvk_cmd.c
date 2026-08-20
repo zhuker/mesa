@@ -532,6 +532,9 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
    }
 }
 
+static struct cpvk_op *
+cpvk_op_alloc(struct cpvk_cmd_buffer *cmd, enum cpvk_op_kind kind);
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
                      uint32_t baseGroupY, uint32_t baseGroupZ,
@@ -540,10 +543,14 @@ cpvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
 
-   if (cmd->num_dispatches >= CPVK_MAX_DISPATCHES || !cmd->pipeline)
+   if (!cmd->pipeline)
       return;
 
-   struct cpvk_dispatch *d = &cmd->dispatches[cmd->num_dispatches++];
+   /* In the op list, so that it runs where it was recorded. */
+   struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_DISPATCH);
+   if (!op)
+      return;
+   struct cpvk_dispatch *d = &op->dispatch;
    d->pipeline = cmd->pipeline;
    d->grid[0] = groupCountX;
    d->grid[1] = groupCountY;
@@ -556,85 +563,84 @@ cpvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
 /* ------------------------------------------------------------- execution */
 
 VkResult
-cpvk_execute_cmd_buffer(struct cpvk_device *dev, struct cpvk_cmd_buffer *cmd)
+cpvk_execute_dispatch(struct cpvk_device *dev,
+                       const struct cpvk_dispatch *d)
 {
-   for (unsigned i = 0; i < cmd->num_dispatches; i++) {
-      const struct cpvk_dispatch *d = &cmd->dispatches[i];
-      const struct cp_shader_binary *bin = d->pipeline->bin;
-      if (!bin || !bin->kernel)
-         continue;
+   const struct cp_shader_binary *bin = d->pipeline->bin;
+   if (!bin || !bin->kernel)
+      return VK_SUCCESS;
 
-      /* The argument block: an array of pointers, with the grid behind it,
-       * exactly as cp_launch_grid() builds it. */
-      const size_t args_bytes = CPVK_ARG_SLOTS * sizeof(void *);
-      const size_t total = args_bytes + 3 * sizeof(uint32_t);
+   /* The argument block: an array of pointers, with the grid behind it,
+    * exactly as cp_launch_grid() builds it. */
+   const size_t args_bytes = CPVK_ARG_SLOTS * sizeof(void *);
+   const size_t total = args_bytes + 3 * sizeof(uint32_t);
 
-      CUdeviceptr block;
-      if (cuMemAllocManaged(&block, total, CU_MEM_ATTACH_GLOBAL) !=
-          CUDA_SUCCESS)
-         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   CUdeviceptr block;
+   if (cuMemAllocManaged(&block, total, CU_MEM_ATTACH_GLOBAL) !=
+       CUDA_SUCCESS)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
-      void **slots = (void **)(uintptr_t)block;
-      memset(slots, 0, total);
-      slots[0] = (void *)(uintptr_t)(block + args_bytes);
-      for (unsigned s = 0; s < CPVK_MAX_ARG_BUFS; s++)
-         slots[CPVK_ARG_UBO_BASE + s] = (void *)(uintptr_t)
-            (d->addrs[s] ? d->addrs[s] : dev->null_desc);
+   void **slots = (void **)(uintptr_t)block;
+   memset(slots, 0, total);
+   slots[0] = (void *)(uintptr_t)(block + args_bytes);
+   for (unsigned s = 0; s < CPVK_MAX_ARG_BUFS; s++)
+      slots[CPVK_ARG_UBO_BASE + s] = (void *)(uintptr_t)
+         (d->addrs[s] ? d->addrs[s] : dev->null_desc);
 
-      /*
-       * The push constant block, in slot 0, which the graphics path staged
-       * and this one did not. A compute shader reading push constants
-       * therefore read address zero: compute-sanitizer reported an 8-byte
-       * read at 0x80, which is 128 bytes into a block that was not there.
-       */
-      CUdeviceptr push_block = 0;
-      if (d->push_size) {
-         if (cuMemAllocManaged(&push_block, d->push_size,
-                               CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
-            memcpy((void *)(uintptr_t)push_block, d->push, d->push_size);
-            slots[CPVK_ARG_UBO_BASE + CPVK_UBO_PUSH_SLOT] =
-               (void *)(uintptr_t)push_block;
-         }
+   /*
+    * The push constant block, in slot 0, which the graphics path staged
+    * and this one did not. A compute shader reading push constants
+    * therefore read address zero: compute-sanitizer reported an 8-byte
+    * read at 0x80, which is 128 bytes into a block that was not there.
+    */
+   CUdeviceptr push_block = 0;
+   if (d->push_size) {
+      if (cuMemAllocManaged(&push_block, d->push_size,
+                            CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
+         memcpy((void *)(uintptr_t)push_block, d->push, d->push_size);
+         slots[CPVK_ARG_UBO_BASE + CPVK_UBO_PUSH_SLOT] =
+            (void *)(uintptr_t)push_block;
       }
-
-      uint32_t *grid = (uint32_t *)((char *)slots + args_bytes);
-      grid[0] = d->grid[0];
-      grid[1] = d->grid[1];
-      grid[2] = d->grid[2];
-
-      void *kernel_args[] = { &block };
-      unsigned bx = MAX2(d->pipeline->local_size[0], (uint16_t)1);
-      unsigned by = MAX2(d->pipeline->local_size[1], (uint16_t)1);
-      unsigned bz = MAX2(d->pipeline->local_size[2], (uint16_t)1);
-      CUresult err = cuLaunchKernel(bin->kernel, d->grid[0], d->grid[1],
-                                    d->grid[2], bx, by, bz, 0, dev->stream,
-                                    kernel_args, NULL);
-      if (err != CUDA_SUCCESS) {
-         /* Name it. A submit that returns DEVICE_LOST and says nothing else
-          * is indistinguishable from every other way a replay can stop. */
-         const char *name = NULL;
-         cuGetErrorName(err, &name);
-         fprintf(stderr, "cudapipe: compute dispatch %ux%ux%u failed: %s (%d)\n",
-                 d->grid[0], d->grid[1], d->grid[2], name ? name : "?", err);
-         fprintf(stderr, "cudapipe:   pipeline %p, push=%u bytes, buffer slots:",
-                 (void *)d->pipeline, d->push_size);
-         for (unsigned s = 0; s < CPVK_MAX_ARG_BUFS; s++)
-            if (d->addrs[s])
-               fprintf(stderr, " [%u]=%p", s, (void *)(uintptr_t)d->addrs[s]);
-         fprintf(stderr, "\n");
-         cuMemFree(block);
-         return vk_error(dev, VK_ERROR_DEVICE_LOST);
-      }
-
-      /* The blocks are read by the kernel, so they cannot be released until
-       * the launch has run. One sync per dispatch is the wrong answer and is
-       * replaced by the upload arena when there is a frame to amortise it
-       * over; at one dispatch it is honest and obvious. */
-      cuStreamSynchronize(dev->stream);
-      cuMemFree(block);
-      if (push_block)
-         cuMemFree(push_block);
    }
+
+   uint32_t *grid = (uint32_t *)((char *)slots + args_bytes);
+   grid[0] = d->grid[0];
+   grid[1] = d->grid[1];
+   grid[2] = d->grid[2];
+
+   void *kernel_args[] = { &block };
+   unsigned bx = MAX2(d->pipeline->local_size[0], (uint16_t)1);
+   unsigned by = MAX2(d->pipeline->local_size[1], (uint16_t)1);
+   unsigned bz = MAX2(d->pipeline->local_size[2], (uint16_t)1);
+   CUresult err = cuLaunchKernel(bin->kernel, d->grid[0], d->grid[1],
+                                 d->grid[2], bx, by, bz, 0, dev->stream,
+                                 kernel_args, NULL);
+   if (err != CUDA_SUCCESS) {
+      /* Name it. A submit that returns DEVICE_LOST and says nothing else
+       * is indistinguishable from every other way a replay can stop. */
+      const char *name = NULL;
+      cuGetErrorName(err, &name);
+      fprintf(stderr, "cudapipe: compute dispatch %ux%ux%u failed: %s (%d)\n",
+              d->grid[0], d->grid[1], d->grid[2], name ? name : "?", err);
+      fprintf(stderr, "cudapipe:   pipeline %p, push=%u bytes, buffer slots:",
+              (void *)d->pipeline, d->push_size);
+      for (unsigned s = 0; s < CPVK_MAX_ARG_BUFS; s++)
+         if (d->addrs[s])
+            fprintf(stderr, " [%u]=%p", s, (void *)(uintptr_t)d->addrs[s]);
+      fprintf(stderr, "\n");
+      cuMemFree(block);
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
+   }
+
+   /* The blocks are read by the kernel, so they cannot be released until
+    * the launch has run. One sync per dispatch is the wrong answer and is
+    * replaced by the upload arena when there is a frame to amortise it
+    * over; at one dispatch it is honest and obvious. */
+   cuStreamSynchronize(dev->stream);
+   cuMemFree(block);
+   if (push_block)
+      cuMemFree(push_block);
+
    return VK_SUCCESS;
 }
 

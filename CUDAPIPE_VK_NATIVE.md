@@ -1541,3 +1541,30 @@ than attempted at the end of a session.
 Note what is *not* wrong: storage image writes work, the dispatch grid is
 right, compute descriptors resolve, and the graphics half of the same frame is
 byte-exact. The single ordering rule accounts for the whole difference.
+
+### Dispatches moved into the op list, and it fixed nothing
+
+A dispatch is now `CPVK_OP_DISPATCH` in `cmd->ops`, executed in record order
+beside draws, clears, copies and queries, instead of living in its own array
+that the executor drained first. `cpvk_execute_cmd_buffer` is gone; what it
+contained is `cpvk_execute_dispatch`, called from the op switch.
+
+This is right -- a dispatch must run where it was recorded, and a compute
+shader reading an image filled by a copy recorded before it was previously
+reading it empty -- and **it changed no sample**: computeshader is 4.427
+before and after, because it records its compute work in a separate command
+buffer, where the old ordering happened to be equivalent.
+
+Nothing regressed. 14/18 pixel-correct, nine unit tests pass, and both replays
+are unmoved at 1,496 frames / 24.39 ms and 1,510 / 79.09.
+
+So computeshader's flat grey is not ordering. What remains: the compute stage
+reads its input through `imageLoad` on a storage image, and a read that
+returns the same value for every texel points at the storage image's format
+decode rather than at its address, since the address being wrong would give
+garbage rather than a constant.
+
+Two structural fixes in a row have now cost a turn each and moved no number.
+Both were real bugs and both are worth keeping, but the pattern is worth
+naming: reading the image first and the code second is what found the four
+samples that did move today.
