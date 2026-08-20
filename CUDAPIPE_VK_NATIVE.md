@@ -1038,3 +1038,29 @@ texture handle itself is resolved per row and that is not yet tested.
 The next version of this test binds two different textures instead of two
 different uniform buffers. It is a small edit to a test that already exists
 and it either reproduces the bug in a second or narrows it again.
+
+### The merge bug is not descriptors, it is the third draw
+
+Two more tests, both passing, both byte-identical to lavapipe in every mode --
+unbatched, batched, and batched with the descriptor comparison removed:
+
+- `tests/cpvk_batch.c`: two draws differing only in a uniform buffer
+- `tests/cpvk_batchtex.c`: two draws differing only in a **texture**, which is
+  what gltfscenerendering's materials differ in
+
+So descriptors merge correctly, uniform buffers and combined image samplers
+alike. The descriptor comparison in the merge test is not buying correctness
+for either case.
+
+What it was buying is smaller batches, and `CUDAPIPE_BATCH_MAX` says exactly
+where the real fault is:
+
+    batch_max   1      2      3      4      8      64
+    mean        0.000  0.000  5.515  7.304  20.648 20.768
+
+Correct at one and two draws, wrong from three, and worse as the batch grows.
+That is a scale-dependent fault in the batched path, not a merge-condition
+that is too loose -- and it is bounded now: whatever indexes a batch's
+per-draw tables is right for two rows and wrong for three. `emit_batch_row`
+and the slice table `cp_vertex_fetch` searches are where to look, and a
+three-draw version of `cpvk_batch.c` would reproduce it in a second.
