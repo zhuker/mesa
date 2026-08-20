@@ -3892,3 +3892,29 @@ module failed LLVM verification -- the driver said so plainly and the shader
 never compiled. Doing the multiply in 32 bits and widening the result avoids
 it. The failure was loud, immediate and named its own cause, which is what the
 verifier is for.
+
+## State after the sampler-array fix
+
+    samples          18/18 run, 16/18 pixel-correct
+                     multisampling 0.553, pbribl 0.030
+    unit tests       14/14
+    Crossroads       native  9.43 ms   gallium  7.21 ms   1.31x
+    old capture      native 34.38 ms   gallium 25.18 ms   1.37x
+    Gallium driver   0 files changed from the branch point
+
+`pbribl`'s residual is 141 pixels above 4 and none above 16, split 95 on the
+spheres and 46 on the skybox, all at the right edge of the frame. Both surfaces
+sample cube maps, which makes the corner case left unimplemented in the
+seamless filter -- where three faces meet and a bilinear footprint has no
+fourth texel -- the natural explanation, and `cpvk_cubesph`'s own residual of
+18 pixels is the same shape.
+
+`multisampling`'s 0.553 is silhouette coverage, twenty-five-fold concentrated
+on high-gradient pixels, with sample positions identical to `lp_sample_pos_4x`.
+
+### The two remaining differences, and what they are not
+
+Neither is a missing feature or an absent term any more. Both are small,
+bounded, edge-localised numerical differences with a measured shape, which is a
+different position from the start of this session, when eight samples rendered
+wrong and three of them rendered nothing recognisable.
