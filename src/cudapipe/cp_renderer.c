@@ -5025,6 +5025,21 @@ cp_pass_appendable(struct cp_context *cp)
    struct cp_device *screen = cp->screen;
    struct cp_abuf *ab = &cp_abuf;
 
+   if (getenv("CPVK_DEBUG_PASS")) {
+      static int said;
+      if (said++ < 3)
+         fprintf(stderr, "pass?: nopass=%d noabufbatch=%d abuf_en=%d dis=%d "
+                 "verify=%d comp=%d timing=%d census=%d segcount=%d frags=%d "
+                 "grow=%d shade=%d clist=%d nsegs=%u\n",
+                 (int)cp_debug->no_pass_episode, (int)cp_debug->no_abuf_batch,
+                 (int)cp_abuf_enabled(), (int)ab->disabled, (int)cp_abuf.verify,
+                 (int)!!cp_abuf.composite, (int)cp_abuf.timing,
+                 (int)cp_census_enabled(),
+                 (int)!!screen->kernels.abuf_seg_count, (int)!!ab->frags,
+                 (int)!!ab->grow_to, (int)!!ab->shade_slot, (int)!!ab->clist,
+                 cp->pass.nsegs);
+   }
+
    if (cp_debug->no_pass_episode || cp_debug->no_abuf_batch)
       return false;
    /* The verification, timing and census modes read per-draw state the

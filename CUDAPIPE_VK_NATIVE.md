@@ -2430,3 +2430,47 @@ but it was being chased as a performance blocker and it is not one.
 Two turns went into it after the number that ruled it out had already been
 recorded. The rule that would have caught it: before chasing a blocker, check
 that removing it changes the thing it is supposed to be blocking.
+
+### The 3.4x replay gap, measured to its cause: no A-buffer pass episodes
+
+A 20-second CUDA trace of the Crossroads replay through each driver,
+normalised by the frames each managed in that window (native 820, gallium
+2,789):
+
+    kernel                  native/fr  gallium/fr   ratio
+    cp_peel_advance             109.3         0.1    1631
+    cp_abuf_worklist            220.6         1.8     121
+    cp_abuf_scan_add            329.8        13.4      25
+    cp_abuf_scan_block          550.3        23.0      24
+    cp_abuf_sort                110.3         4.8      23
+    main                        287.5        37.3       8
+    cp_vertex_fetch             143.3        22.2       6
+    cp_abuf_seg_count             0.0         3.0       -
+    cp_abuf_seg_scatter           0.0         2.4       -
+    cp_abuf_sort_short            0.0         3.9       -
+    TOTAL                      3381.4       245.4    13.8
+
+**3,381 launches a frame against 245.** The three kernels at exactly zero name
+the cause: `cp_abuf_seg_count`, `cp_abuf_seg_scatter` and `cp_abuf_sort_short`
+belong to the A-buffer *pass episode*, where many blended draws share one
+build, one sort and one peel. The native driver never runs them.
+
+`CPVK_DEBUG_PASS` shows `cp_pass_appendable()` is never called at all, with or
+without `CPVK_BATCH=1`. It is reached only from a batch flush, and
+`cpvk_batch_can_join` ends:
+
+    /* The blended path merges through the A-buffer ... the blended half is
+     * left to the single-draw path until there is a test that shows it
+     * right. */
+    return false;
+
+Every blended draw is refused, so no blended batch is ever staged, so no batch
+ever flushes into an episode, so every blended draw builds and peels its own
+A-buffer. `cp_peel_advance` at 109 launches a frame against gallium's 0.1 is
+that sentence in numbers.
+
+So the remaining performance gap is not batching in the sense that was being
+chased for the last several turns -- merging draws into one launch -- but the
+episode path built on top of it, which the front end has never enabled. The
+comment says what it needs: a test that shows the blended merge right.
+`cpvk_batchtex` and `cpvk_batchbig` are that test for the opaque half already.
