@@ -1385,3 +1385,32 @@ this driver's own tests only ever produce the first.
 Which form the sphere shader uses, and whether the mixed one resolves to the
 right slot, is the next question. The dumps are in hand and the tools all work
 now, which was not true an hour ago.
+
+### Both UBO forms are used and both are implemented
+
+The sphere shader is `dump@5143`: `inPos`/`inNormal`/`inUV` at GENERIC0/1/2,
+matching the three elements at 0, 12 and 24. It has sixteen
+`load_const_buf_base_addr_lvp` and twenty `load_ubo`, so it uses both
+addressing forms.
+
+Both are implemented and both are exercised by tests that pass:
+
+- the **scalar** form is what this driver's push-constant lowering emits --
+  `load_ubo(imm(slot), offset)` -- and `emit_buffer_base` sends a 32-bit
+  source to `emit_const_buf_base`, which reads the stage's constant-buffer
+  table.
+- the **64-bit** form is what a descriptor-set read becomes here:
+  `vulkan_resource_index` yields `(slot, offset)`, the second lowering pass
+  turns that into `load_const_buf_base_addr_lvp(slot) + offset`, which is the
+  descriptor's address, and `emit_buffer_base` dereferences it for the
+  buffer pointer at `cpvk_descriptor::base`. `cpvk_ubo` reads a uniform buffer
+  through a descriptor set and passes byte-identically.
+
+So the addressing forms are not the difference either. What is established:
+the vertex fetch delivers correct attributes, the uniform buffer is correct at
+the descriptor, both ways the shader can reach it are implemented and tested,
+and every vertex output is zero.
+
+The next step is inside that shader: dump `dump@5143` in full and trace what
+feeds its position output back to a source. Every layer around it has now been
+checked.
