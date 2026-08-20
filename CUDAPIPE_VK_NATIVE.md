@@ -3243,3 +3243,38 @@ merely wrong at seams, so this is a mechanism with evidence behind it rather
 than a finished diagnosis -- and the way to test it is a substitution again:
 sample with `VK_FILTER_NEAREST`, where seam blending cannot occur, and see
 whether the two drivers agree on the sphere.
+
+### The cube bug is in filtering, not face selection
+
+The same sphere of directions, the same shader, only the sampler's filter
+changed:
+
+    VK_FILTER_LINEAR    DIFFER     lavapipe 70 colours, native 2
+    VK_FILTER_NEAREST   IDENTICAL  6 colours each, 0 differing pixels
+
+With nearest filtering the two drivers agree exactly and **native selects all
+six faces**, which retires the face-selection theory for good: the direction is
+right, the face is right, and the fetch is right.
+
+What differs is what happens when a bilinear footprint reaches a face edge.
+Vulkan requires cube filtering to be seamless -- the footprint continues onto
+the adjacent face -- and this sampler clamps or wraps inside the level it is
+on, because `cp_wrap_texel` works on one 2D level and has no notion of an
+adjacent face.
+
+That is why every earlier cube test passed: they sample near face centres,
+where the footprint never reaches an edge. It is also exactly `pbribl`'s
+condition -- a prefiltered environment cube, sampled with `VK_FILTER_LINEAR`,
+over a sphere whose every quad sits near or across a seam.
+
+Two things are still unexplained and should not be glossed: native gives two
+distinct colours under LINEAR rather than the six flat ones that clamping alone
+would produce, and pbribl's spheres are uniformly neutral rather than wrong
+only near seams. So seamless filtering is established as *a* difference with a
+decisive test behind it, and may not be the whole of it.
+
+The bisect that got here used only substitutions and driver-to-driver
+comparison -- one shader line or one sampler field at a time, never an oracle
+for what the answer should be. Every conclusion in this session that rested on
+decoding a value from a colour has been retracted; none of the substitution
+results has.
