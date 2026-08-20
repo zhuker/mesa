@@ -3585,3 +3585,40 @@ handful of edge pixels rather than an absent lighting term.
 Both replays re-measured after the fix, since it touches every image copy in
 them: native 9.41 ms and 34.33 ms against gallium's 7.14 and 25.35. Unmoved,
 and the ratios hold at 1.32 and 1.35.
+
+### An audit of every change this session that measured nothing
+
+The lost copy fix prompted checking whether any other change was claimed but
+absent. Fifteen were checked against the tree by grepping for the code itself,
+not the commit message:
+
+    dispatch in the op list                  present
+    cpvk_execute_dispatch in the op switch   present
+    event stubs                              present
+    1.3 features declared                    present
+    ICD manifest at 1.0                      present
+    seamless cube filtering                  present
+    storage image extent                     present
+    multisample clear per plane              present
+    R16G16_SFLOAT texel encoding             present
+    outputs to temporaries                   present
+    gl_PointCoord as a varying               present
+    vertex-offset condition dropped          present
+    blended batches reach episodes           present
+    copy honours baseArrayLayer              present
+    apiVersion 1.1                           **MISSING**
+
+The device was reporting **1.3** while the ICD manifest says 1.0. The committed
+reasoning -- "1.1, not 1.3 ... a version number is a promise about what may be
+called" -- had been silently undone by the later turn that raised the version
+to test 1.3 features, where only the manifest was reverted after the replay
+regression.
+
+That is exactly the trap the file warns about twice: a device advertising 1.3
+behind a loader that will only dispatch 1.0. Restored to 1.1, for both the
+physical device and `vkEnumerateInstanceVersion`. `vkGetPhysicalDeviceProperties2`
+still resolves, so the fix that 1.1 was raised for still holds, and the sweep
+is unchanged.
+
+Grepping for the code rather than trusting the log found one absent change out
+of fifteen. The one that was absent had cost twenty turns.

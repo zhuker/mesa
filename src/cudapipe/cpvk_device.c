@@ -119,7 +119,7 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
        * gap; closing it means implementing those features, not editing this
        * number.
        */
-      .apiVersion = VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION),
+      .apiVersion = VK_MAKE_VERSION(1, 1, VK_HEADER_VERSION),
       .driverVersion = 1,
       .vendorID = 0x10de,          /* NVIDIA: the device really is one */
       .deviceID = 0,
@@ -331,7 +331,7 @@ cpvk_EnumerateInstanceVersion(uint32_t *pApiVersion)
     * because the loader will not dispatch past the version the instance
     * claims.
     */
-   *pApiVersion = VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION);
+   *pApiVersion = VK_MAKE_VERSION(1, 1, VK_HEADER_VERSION);
    return VK_SUCCESS;
 }
 
