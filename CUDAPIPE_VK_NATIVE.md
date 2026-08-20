@@ -3344,3 +3344,32 @@ Which is worth stating plainly: the substitution bisect found a genuine bug in
 the driver and did not find the one it was aimed at. The three tests that
 disagree with lavapipe are unchanged, and pbribl needs its own next
 substitution.
+
+### pbribl: the prefiltered cube reads as exactly zero
+
+Substituting the shader's own output for the term under suspicion, native
+against the Gallium driver on the same frame:
+
+    outColor = prefilteredReflection(R, roughness)
+        native  (0,0,0)         gallium (221,92,28) (96,49,24) (84,96,112)
+
+    outColor = textureLod(prefilteredMap, R, 0.0).rgb
+        native  (0,0,0)         gallium (225,93,29) (92,43,16) (255,255,255)
+
+So a single explicit-LOD read of the prefiltered cube returns **exactly zero**
+on this driver, per fragment, everywhere on the spheres -- not a neutral grey,
+not a wrong face, zero. The final image is neutral only because zero ambient
+leaves direct lighting, which is white light on a black albedo.
+
+That is a different failure from the one `cpvk_cubesph` reproduces, where the
+faces are right and only the seam blending was missing. The distinguishing
+properties of pbribl's cube against every cube in the test suite are its
+format and size: R16G16B16A16_SFLOAT at 512x512 with ten levels, against
+R8G8B8A8 and R16G16B16A16 at 8x8 with four. `cpvk_cubelodf16` covers the format
+but not the size, and covers band directions but not varying ones.
+
+So the next test is the intersection nothing has covered: a half-float cube
+large enough to have ten levels, sampled with a per-fragment varying direction.
+If that reads zero, pbribl is reproduced in a second and the seam work, which
+was real and is kept, will have been a detour taken because the bisect that
+found it was aimed at the wrong sample.
