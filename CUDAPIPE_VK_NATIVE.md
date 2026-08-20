@@ -203,6 +203,20 @@ before layering behaviour on it — is the whole plan:
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
+   **The split is finished.** `cp_renderer.c` is 6,758 lines and
+   `cp_context.c` is 2,240. The renderer — the draw, the shading launches, the
+   A-buffer, the batching, the episodes, the arenas, the register tuner — is
+   compiled into both drivers. What is left in `cp_context.c` is the Gallium
+   entry points, the resource and sampler-view paths, and the two
+   `PIPE_FORMAT` tables: the adapter, and nothing else.
+
+   Slices, each gated on the full capture and sweep: draw description, state,
+   blend, attachments, vertex input, scissor, containment, batch key, the
+   fallback-snapshot bug, the Gallium-free renderer struct, the device split,
+   `cp_context_init`, the renderer header and file, the arenas, the A-buffer,
+   vertex assembly, the draw itself, and the batching. Nineteen in all; the
+   capture read exactly 0.429% / 0.001% through every one.
+
 3. **Milestone 2 — device, queue, memory, buffers.** ✅ done for buffers;
    images outstanding. `vkCreateDevice` builds the CUDA context and a
    non-blocking stream; one queue, whose submit drains the stream because
