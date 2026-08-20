@@ -594,18 +594,23 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
    /*
     * The descriptor sets the command buffer resolved become the shaders'
     * constant buffers. A cudapipe descriptor set is an array of device
-    * addresses, which is exactly what a UBO binding is here, so the set
-    * address is the binding address.
+    * addresses, which is exactly what a UBO binding is here.
+    *
+    * It goes in `buffer`, which is the binding's device address, and not in
+    * `managed_copy`, which is where the Gallium adapter stages a binding that
+    * came from a user pointer. The single-draw path builds its uniform table
+    * out of `buffer`; filling the other field left the table full of nulls
+    * and the vertex shader read address zero.
     */
-   for (unsigned i = 0; i < 16; i++) {
-      cp->vs_ubos[i].managed_copy = d->addrs[i];
-      cp->vs_ubos[i].buffer = NULL;
+   for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
+      cp->vs_ubos[i].buffer = (void *)(uintptr_t)d->addrs[i];
+      cp->vs_ubos[i].managed_copy = 0;
       cp->vs_ubos[i].user_copy = false;
-      cp->fs_ubos[i].managed_copy = d->addrs[i];
-      cp->fs_ubos[i].buffer = NULL;
+      cp->fs_ubos[i].buffer = (void *)(uintptr_t)d->addrs[i];
+      cp->fs_ubos[i].managed_copy = 0;
       cp->fs_ubos[i].user_copy = false;
    }
-   cp->num_vs_ubos = cp->num_fs_ubos = 16;
+   cp->num_vs_ubos = cp->num_fs_ubos = CP_MAX_CONST_BUFFERS;
 
    cp_context_publish_state(cp);
 

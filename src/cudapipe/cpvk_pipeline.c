@@ -71,6 +71,23 @@ cpvk_lower_nir(nir_shader *nir)
    };
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
 
+   /*
+    * Scalarize, which is the shape the backend has only ever been given.
+    *
+    * emit_alu() applies an operand's swizzle only when the destination is
+    * scalar; for a vector destination it passes the source through at its own
+    * width. Under Gallium that is invisible, because lavapipe scalarizes for
+    * llvmpipe before cudapipe ever sees the shader. Reaching the backend with
+    * `pos.xy + ubo.d.xy` intact produced an LLVM module that failed
+    * verification with `fadd <3 x float>, <4 x float>` -- the two sources at
+    * their own widths, the swizzles dropped.
+    *
+    * Fixing emit_alu to build a shuffle would be the deeper repair, and it
+    * would put the backend on a path no shader has ever taken. This puts the
+    * native front end on the path every shader has taken instead.
+    */
+   NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+
    NIR_PASS(_, nir, nir_opt_dce);
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 }
@@ -334,6 +351,12 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
             ralloc_free(mem_ctx);
             break;
          }
+         if (cp_debug->dump_nir) {
+            fprintf(stderr, "=== %s NIR (native) ===\n",
+                    _mesa_shader_stage_to_string(nir->info.stage));
+            nir_print_shader(nir, stderr);
+         }
+
          cpvk_lower_nir(nir);
          cpvk_lower_descriptors(nir, cpvk_pipeline_layout_from_handle(info->layout));
 

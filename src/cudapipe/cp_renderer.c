@@ -6946,8 +6946,8 @@ cp_context_publish_state(struct cp_context *cp)
       cp->gpu_state->vb_bases[i] = cp->vb_base[i];
 
    for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
-      cp->gpu_state->vs_ubos[i] = cp->vs_ubos[i].managed_copy;
-      cp->gpu_state->fs_ubos[i] = cp->fs_ubos[i].managed_copy;
+      cp->gpu_state->vs_ubos[i] = (uint64_t)(uintptr_t)cp->vs_ubos[i].buffer;
+      cp->gpu_state->fs_ubos[i] = (uint64_t)(uintptr_t)cp->fs_ubos[i].buffer;
    }
 }
 
