@@ -987,3 +987,29 @@ one sampler state for a whole batch and falls back only if every row agrees.
 
 Until then the descriptor hash stays in the comparison: it is conservative,
 it is correct, and it costs the merges the capture would want.
+
+### Both binding tables are correct, and the merge is still wrong
+
+`CUDAPIPE_DEBUG_DRAW` now prints the fragment rows beside the vertex ones at
+flush. On gltfscenerendering's nine-draw batch both are per-draw and identical
+to each other, which is right for this driver -- both stages read the same
+descriptor sets:
+
+    vs row 0: 0x...800 0x...e000 0x...e0c0 ...
+    fs row 0: 0x...800 0x...e000 0x...e0c0 ...
+    vs row 1: 0x...900 0x...e000 0x...e140 ...
+    fs row 1: 0x...900 0x...e000 0x...e140 ...
+
+So the tables the shaders index are filled correctly for both stages.
+
+Also excluded, each with one run of an existing flag:
+
+- the sampler-variant specialisation (`CUDAPIPE_NO_SAMPLER_VARIANT=1`): 20.768
+  either way
+- the A-buffer (`CUDAPIPE_NO_ABUFFER=1`): 20.768 either way
+
+That leaves the core batched draw path itself. The next step is to reproduce
+it small: two draws, one pipeline, one vertex buffer, differing only in the
+descriptor set they bind, with the descriptor comparison removed. `cpvk_mesh`
+is the place for it, it runs in a second, and it would turn a nine-draw scene
+into the two-draw case that either works or does not.

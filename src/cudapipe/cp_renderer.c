@@ -6738,10 +6738,18 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
    if (cp_debug->debug_draw) {
       fprintf(stderr, "cudapipe: batch of %u draws\n", ndraws);
       for (unsigned d = 0; d < MIN2(ndraws, 4u); d++) {
-         fprintf(stderr, "  row %u:", d);
+         fprintf(stderr, "  vs row %u:", d);
          for (unsigned i = 0; i < cp->batch.key.num_vs_ubos; i++)
             fprintf(stderr, " %p",
                     (void *)(uintptr_t)cp->batch.vs_ubos[d * CP_ARG_UBO_STRIDE + i]);
+         fprintf(stderr, "\n");
+         /* And the fragment stage's, which the vertex ones do not stand in
+          * for: a batch whose materials differ differs here and nowhere
+          * else. */
+         fprintf(stderr, "  fs row %u:", d);
+         for (unsigned i = 0; i < cp->batch.key.num_fs_ubos; i++)
+            fprintf(stderr, " %p",
+                    (void *)(uintptr_t)cp->batch.fs_ubos[d * CP_ARG_UBO_STRIDE + i]);
          fprintf(stderr, "\n");
       }
    }
