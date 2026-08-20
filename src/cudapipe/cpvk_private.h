@@ -153,6 +153,23 @@ struct cpvk_descriptor_set {
    struct cpvk_descriptor *host;
 };
 
+/*
+ * A query pool. Timestamps are what the captures use; they are taken on the
+ * host when the recorded operation runs, which is the moment the stream has
+ * reached that point, because a submit synchronises before it returns.
+ *
+ * Occlusion and pipeline-statistics queries read zero and say so: the
+ * rasterizer counts nothing today, and a fabricated count is worse than an
+ * obvious one.
+ */
+struct cpvk_query_pool {
+   struct vk_object_base base;
+   VkQueryType type;
+   uint32_t count;
+   uint64_t *results;
+   bool *available;
+};
+
 struct cpvk_sampler {
    struct vk_object_base base;
    unsigned index;                    /* into cp_sampler_table */
@@ -221,8 +238,15 @@ struct cpvk_copy {
    bool swap_rb;
 };
 
+struct cpvk_query_op {
+   struct cpvk_query_pool *pool;
+   uint32_t first, count;
+   bool reset;                       /* else: write a timestamp at `first` */
+};
+
 enum cpvk_op_kind {
    CPVK_OP_BEGIN_RENDER,
+   CPVK_OP_QUERY,
    CPVK_OP_DRAW,
    CPVK_OP_CLEAR,
    CPVK_OP_COPY,
@@ -238,6 +262,7 @@ struct cpvk_op {
       struct cpvk_clear clear;
       struct cpvk_copy copy;
       struct cp_fb_desc fb;
+      struct cpvk_query_op query;
    };
 };
 
@@ -273,6 +298,7 @@ struct cpvk_cmd_buffer {
 void cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d);
 void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
 void cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
+void cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q);
 void cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb,
                                unsigned samples);
 
@@ -350,6 +376,8 @@ VK_DEFINE_HANDLE_CASTS(cpvk_instance, vk.base, VkInstance,
 VK_DEFINE_HANDLE_CASTS(cpvk_physical_device, vk.base, VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 VK_DEFINE_HANDLE_CASTS(cpvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_query_pool, base, VkQueryPool,
+                               VK_OBJECT_TYPE_QUERY_POOL)
 VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_sampler, base, VkSampler,
                                VK_OBJECT_TYPE_SAMPLER)
 VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_device_memory, vk.base, VkDeviceMemory,

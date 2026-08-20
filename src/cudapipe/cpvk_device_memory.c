@@ -41,6 +41,9 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          case CPVK_OP_CLEAR:
             cpvk_execute_clear(dev, &cmd->ops[o].clear);
             break;
+         case CPVK_OP_QUERY:
+            cpvk_execute_query(dev, &cmd->ops[o].query);
+            break;
          case CPVK_OP_COPY:
             cpvk_execute_copy(dev, &cmd->ops[o].copy);
             break;

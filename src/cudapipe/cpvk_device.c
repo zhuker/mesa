@@ -302,11 +302,23 @@ cpvk_GetPhysicalDeviceMemoryProperties(
     * host never touches, host-visible for staging, and a managed type for
     * software that demands both.
     */
+   /*
+    * The flags are the Gallium-hosted driver's, type for type, and that is
+    * not cosmetic. A capture records the memory type it allocated from and
+    * the replayer maps it onto a type here with at least the same
+    * properties; the managed type was missing HOST_CACHED, no replay type
+    * satisfied the capture's, and the replay aborted with "specified memory
+    * type index exceeds number of available memory types" before a frame
+    * was drawn. One heap for the same reason.
+    *
+    * Both host-visible types are honest: cuMemAllocHost is pinned and the
+    * CPU caches it, and managed memory is device-local and host-visible by
+    * construction.
+    */
    *pMemoryProperties = (VkPhysicalDeviceMemoryProperties) {
-      .memoryHeapCount = 2,
+      .memoryHeapCount = 1,
       .memoryHeaps[0] = { .size = pdev->vram,
                           .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT },
-      .memoryHeaps[1] = { .size = pdev->vram, .flags = 0 },
       .memoryTypeCount = 3,
       .memoryTypes[0] = { .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                           .heapIndex = 0 },
@@ -314,11 +326,12 @@ cpvk_GetPhysicalDeviceMemoryProperties(
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                              VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-                          .heapIndex = 1 },
+                          .heapIndex = 0 },
       .memoryTypes[2] = { .propertyFlags =
                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                             VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
                           .heapIndex = 0 },
    };
 }

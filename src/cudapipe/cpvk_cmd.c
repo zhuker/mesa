@@ -12,6 +12,7 @@
 
 #include "vk_format.h"
 #include "util/format/u_format.h"
+#include <time.h>
 #include "cpvk_private.h"
 
 #include "vk_alloc.h"
@@ -1157,4 +1158,177 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
       .Height = c->rows,
    };
    cuMemcpy2DAsync(&m, cp->stream);
+}
+
+
+/* ------------------------------------------------------------- queries */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_CreateQueryPool(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
+                     const VkAllocationCallbacks *pAllocator,
+                     VkQueryPool *pQueryPool)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+
+   struct cpvk_query_pool *pool =
+      vk_object_zalloc(&dev->vk, pAllocator, sizeof(*pool),
+                       VK_OBJECT_TYPE_QUERY_POOL);
+   if (!pool)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   pool->type = pCreateInfo->queryType;
+   pool->count = pCreateInfo->queryCount;
+   pool->results = calloc(pool->count, sizeof(*pool->results));
+   pool->available = calloc(pool->count, sizeof(*pool->available));
+   if (!pool->results || !pool->available) {
+      free(pool->results);
+      free(pool->available);
+      vk_object_free(&dev->vk, pAllocator, pool);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   *pQueryPool = cpvk_query_pool_to_handle(pool);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_DestroyQueryPool(VkDevice _device, VkQueryPool _pool,
+                      const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+   VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+
+   if (!pool)
+      return;
+   free(pool->results);
+   free(pool->available);
+   vk_object_free(&dev->vk, pAllocator, pool);
+}
+
+static void
+cpvk_record_query(struct cpvk_cmd_buffer *cmd, struct cpvk_query_pool *pool,
+                  uint32_t first, uint32_t count, bool reset)
+{
+   if (!pool)
+      return;
+   struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_QUERY);
+   if (!op)
+      return;
+   op->query = (struct cpvk_query_op) {
+      .pool = pool, .first = first, .count = count, .reset = reset,
+   };
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool _pool,
+                       uint32_t firstQuery, uint32_t queryCount)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+   cpvk_record_query(cmd, pool, firstQuery, queryCount, true);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+                        VkPipelineStageFlags2 stage, VkQueryPool _pool,
+                        uint32_t query)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+   cpvk_record_query(cmd, pool, query, 1, false);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdWriteTimestamp(VkCommandBuffer commandBuffer,
+                       VkPipelineStageFlagBits stage, VkQueryPool pool,
+                       uint32_t query)
+{
+   cpvk_CmdWriteTimestamp2(commandBuffer, stage, pool, query);
+}
+
+/* Occlusion and statistics queries: recorded so the pool becomes available,
+ * counted as zero because nothing counts them. */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool pool,
+                   uint32_t query, VkQueryControlFlags flags)
+{
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool _pool,
+                 uint32_t query)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+   cpvk_record_query(cmd, pool, query, 1, false);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_GetQueryPoolResults(VkDevice _device, VkQueryPool _pool,
+                         uint32_t firstQuery, uint32_t queryCount,
+                         size_t dataSize, void *pData, VkDeviceSize stride,
+                         VkQueryResultFlags flags)
+{
+   VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+
+   if (!pool)
+      return VK_ERROR_UNKNOWN;
+
+   char *out = pData;
+   VkResult result = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < queryCount; i++) {
+      uint32_t q = firstQuery + i;
+      bool avail = q < pool->count && pool->available[q];
+      uint64_t value = avail ? pool->results[q] : 0;
+
+      if (!avail)
+         result = VK_NOT_READY;
+
+      char *slot = out + (size_t)i * stride;
+      if (flags & VK_QUERY_RESULT_64_BIT) {
+         uint64_t *p = (uint64_t *)slot;
+         p[0] = value;
+         if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
+            p[1] = avail;
+      } else {
+         uint32_t *p = (uint32_t *)slot;
+         p[0] = (uint32_t)value;
+         if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
+            p[1] = avail;
+      }
+   }
+
+   return result;
+}
+
+void
+cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q)
+{
+   struct cpvk_query_pool *pool = q->pool;
+
+   if (q->reset) {
+      for (uint32_t i = 0; i < q->count; i++)
+         if (q->first + i < pool->count) {
+            pool->results[q->first + i] = 0;
+            pool->available[q->first + i] = false;
+         }
+      return;
+   }
+
+   if (q->first >= pool->count)
+      return;
+
+   uint64_t value = 0;
+   if (pool->type == VK_QUERY_TYPE_TIMESTAMP) {
+      /* Nanoseconds, which is what timestampPeriod says a tick is. The
+       * stream has reached this point because the ops before it have already
+       * been issued and a submit synchronises before returning. */
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      value = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+   }
+
+   pool->results[q->first] = value;
+   pool->available[q->first] = true;
 }
