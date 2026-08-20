@@ -1978,3 +1978,38 @@ using it.
 
 Thirteen tests, twelve of them byte-identical and the thirteenth measuring a
 number rather than asserting one.
+
+### Correction: the LOD bias is real, shared, and not texturemipmapgen's cause
+
+The measurement in the previous entry is right and its conclusion is wrong.
+
+`cpvk_lodimp` run against all three drivers:
+
+    native            vs gallium-cudapipe   IDENTICAL
+    native            vs lavapipe           DIFFER
+    gallium-cudapipe  vs lavapipe           DIFFER
+
+The 2.6% larger rho is **cudapipe's, not the native driver's**. Both cudapipe
+drivers share `cp_sampler.cu`, and llvmpipe computes its level with
+`lp_build_fast_log2`, a polynomial approximation, where this sampler uses
+CUDA's `__log2f`. Two different approximations of the same quantity, differing
+by 0.0368 levels. Nothing here regressed and nothing here is new.
+
+`texturemipmapgen` is measured against the **Gallium cudapipe** driver, which
+has the identical sampler, so implicit LOD cannot explain its difference. This
+is the mistake the project notes already warn about -- comparing against the
+wrong reference -- and it took a two-line check to catch, after a full entry
+had been written on the wrong premise.
+
+What the test is still worth: it pins native and Gallium byte-identical on
+implicit level-of-detail selection, which is a real property and was not known
+before.
+
+**Where that points instead.** The two drivers share the sampler but *not* the
+mip generation. `texturemipmapgen` builds its chain with `vkCmdBlitImage`, and
+this driver box-filters the source footprint on the host while the Gallium
+path goes through lavapipe's blit. A small difference in the generated levels,
+spread over a minified region and not concentrated on edges, is exactly the
+signature measured. That is the next thing to test, and `cpvk_lodimp` can be
+turned into the test by generating its levels with a blit instead of writing
+them.
