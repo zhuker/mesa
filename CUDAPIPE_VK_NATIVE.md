@@ -532,3 +532,27 @@ seconds for the Gallium-hosted driver. No frame markers reach the fps plugin
 in five minutes, so it is not merely slow by a constant: something is either
 looping or making no frame progress. That is the next thing to look at, and the
 first question is whether frame 1 ever completes.
+
+## Multisample images are allocated at single-sample size
+
+The resolve prints its operands now, and they say it outright:
+
+    vkCmdResolveImage src 1280x720 samples=4 size=3686400 mem=...
+                      dst 1280x720 samples=1 size=3686400 mem=...
+
+3,686,400 is 1280 x 720 x 4 bytes: one sample's worth. `cpvk_image` never
+looks at `VkImageCreateInfo::samples`, so a four-sample image asks for a
+quarter of the memory it needs, the application allocates that, and everything
+downstream is addressing memory that is not there. `cp_fb_desc::color_sample_stride`
+is never set either, which is the same omission from the other side: the
+renderer needs to know how far apart the samples are and is told zero.
+
+That is the bug behind the replay's remaining crash inside `cuMemcpy2DAsync`,
+and behind `multisampling` rendering black. Two things to fix together:
+
+- size an image as `w * h * bpp * samples`, and report that from
+  `vkGetImageMemoryRequirements`;
+- set `color_sample_stride` on the framebuffer description so the renderer
+  writes samples where the resolve later expects to find them.
+
+Then the resolve can average them instead of taking sample zero.

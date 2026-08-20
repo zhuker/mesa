@@ -284,6 +284,15 @@ struct cpvk_copy {
     */
    unsigned src_w, src_h, dst_w, dst_h, bpp;
    bool filter_linear;
+
+   /*
+    * The last byte each end may touch. A region computed from the wrong
+    * subresource -- a mip level's extent against another level's pitch, or a
+    * multisample image whose allocation holds one sample -- runs past the
+    * allocation, and cuMemcpy2DAsync answers that by faulting inside libcuda
+    * rather than returning an error.
+    */
+   uint64_t src_end, dst_end;
 };
 
 struct cpvk_query_op {

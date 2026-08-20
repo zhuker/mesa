@@ -1089,6 +1089,13 @@ cpvk_image_plane(const struct cpvk_image *img, unsigned level,
    return true;
 }
 
+/* One past the last byte an image's allocation covers. */
+static uint64_t
+cpvk_image_end(const struct cpvk_image *img)
+{
+   return (img && img->mem) ? img->mem->dev_ptr + img->offset + img->size : 0;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
                    const VkCopyImageInfo2 *pInfo)
@@ -1296,6 +1303,8 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
          .dst_pitch = dp,
          .width_bytes = (size_t)sw * sbpp,
          .rows = sh,
+         .src_end = cpvk_image_end(src),
+         .dst_end = cpvk_image_end(dst),
          .swap_rb = swap_rb,
          .src_w = scaling ? (unsigned)sw : 0,
          .src_h = scaling ? (unsigned)sh : 0,
@@ -1330,6 +1339,16 @@ cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
       said = true;
       fprintf(stderr, "cudapipe: vkCmdResolveImage takes sample zero and does "
               "not average; multisampled images resolve wrong\n");
+      fprintf(stderr, "cudapipe:   src %ux%u samples=%u size=%llu mem=%p, "
+              "dst %ux%u samples=%u size=%llu mem=%p\n",
+              src ? src->vk.extent.width : 0, src ? src->vk.extent.height : 0,
+              src ? src->vk.samples : 0,
+              src ? (unsigned long long)src->size : 0ull,
+              (void *)(src ? src->mem : NULL),
+              dst ? dst->vk.extent.width : 0, dst ? dst->vk.extent.height : 0,
+              dst ? dst->vk.samples : 0,
+              dst ? (unsigned long long)dst->size : 0ull,
+              (void *)(dst ? dst->mem : NULL));
    }
 
    for (uint32_t i = 0; i < pInfo->regionCount; i++) {
@@ -1353,6 +1372,8 @@ cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
          .dst_pitch = dp,
          .width_bytes = (size_t)r->extent.width * sbpp,
          .rows = r->extent.height,
+         .src_end = cpvk_image_end(src),
+         .dst_end = cpvk_image_end(dst),
       };
    }
 }
@@ -1384,6 +1405,39 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
    struct cp_context *cp = &dev->renderer;
 
    cuCtxSetCurrent(dev->cu_ctx);
+
+   /*
+    * Refuse a copy that cannot be one. A zero endpoint is an image or buffer
+    * whose memory was never bound, and a pitch narrower than the row is a
+    * region computed from the wrong subresource; CUDA takes both as an
+    * invitation to walk off the end.
+    */
+   /*
+    * A scaling blit describes its geometry in src_w/src_h and dst_w/dst_h and
+    * carries the source's row width in width_bytes, so the pitch and reach
+    * tests below do not apply to it -- they rejected three perfectly good mip
+    * downscales before this line existed.
+    */
+   uint64_t src_reach = c->src_w ? 0 :
+                        c->src + (uint64_t)(c->rows ? c->rows - 1 : 0) *
+                        (c->src_pitch ? c->src_pitch : c->width_bytes) +
+                        c->width_bytes;
+   uint64_t dst_reach = c->src_w ? 0 :
+                        c->dst + (uint64_t)(c->rows ? c->rows - 1 : 0) *
+                        (c->dst_pitch ? c->dst_pitch : c->width_bytes) +
+                        c->width_bytes;
+
+   if (!c->src || !c->dst || !c->width_bytes || !c->rows ||
+       (!c->src_w && c->src_pitch && c->src_pitch < c->width_bytes) ||
+       (!c->src_w && c->dst_pitch && c->dst_pitch < c->width_bytes) ||
+       (c->src_end && src_reach > c->src_end) ||
+       (c->dst_end && dst_reach > c->dst_end)) {
+      fprintf(stderr, "cudapipe: refusing copy src=%p dst=%p %zux%zu "
+              "pitch %zu->%zu\n", (void *)(uintptr_t)c->src,
+              (void *)(uintptr_t)c->dst, c->width_bytes, c->rows,
+              c->src_pitch, c->dst_pitch);
+      return;
+   }
 
    if (c->rows <= 1 && !c->src_pitch && !c->dst_pitch) {
       cuMemcpyDtoDAsync(c->dst, c->src, c->width_bytes, cp->stream);
