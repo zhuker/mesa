@@ -3140,3 +3140,35 @@ for the six faces of level 0.
 Two inferences from images have now been overturned by printing the value
 itself -- this one and the "prefiltered cube never copied" reading earlier.
 Both times the image was consistent with the wrong explanation.
+
+### Per-pixel, native reads one face where lavapipe reads three
+
+Decoding the face from each sampled pixel's red channel over the 1,459 covered
+pixels:
+
+    native    [1459, 0, 0, 0, 0, 0]
+    lavapipe  [ 725, 35, 490, 0, 0, 0]
+
+and the direction images the two drivers produce are byte-identical. So with
+the same per-fragment directions, the native driver reads face 0 for every
+pixel and lavapipe reads three different faces. That is a real, per-pixel
+difference and it does not depend on which face is "right".
+
+**What this does not settle.** Computing the expected face from the decoded
+direction with the standard dominant-axis rule gives
+`[8, 139, 51, 39, 1222, 0]` -- mostly +Z -- which matches *neither* driver. So
+that calculation is not a valid oracle here, whether because of the quantised
+direction image, the face convention, or the uv mapping, and it is not used to
+claim which driver is correct.
+
+The device print from the previous entry showed `face=1` chosen for threads 0
+to 7, which is consistent with this only if those threads are not among the
+covered pixels -- helper lanes, or another draw. Thread index is not pixel
+position, and treating it as such is what made the two readings look
+contradictory.
+
+So the established facts are narrow and solid: identical directions in, one
+face out on this driver and three on lavapipe, with the sampler demonstrably
+computing a non-zero face for at least some threads. The next instrument has
+to tie a thread to its pixel -- printing the fragment's coordinates beside the
+face -- because every reading that has not done so has been ambiguous.
