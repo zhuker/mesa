@@ -83,7 +83,22 @@ before layering behaviour on it — is the whole plan:
 
 1. **Factor, no behaviour change.** Split `cp_context.c` into a backend core
    with a Vulkan-shaped internal API and a thin Gallium adapter over it.
-   *Gate: 18-sample sweep byte-identical, capture at exactly 0.441% / 0.002%.*
+   *Gate: 18-sample sweep and capture unmoved.* **Started.** The first slice is
+   done and was chosen because its boundary was already almost there:
+   `cp_kernels_init()` took a `struct cp_screen` and used exactly two fields of
+   it, so it takes `sm_major, sm_minor` now and the file is free of Gallium
+   entirely. Both drivers build the same NVRTC kernels from the same sources.
+   Same for `cp_compile_sampler_variant`.
+
+   That slice also found a real bug in the native driver: `cp_debug_init()` was
+   never called, so all 59 environment switches read as their zero value rather
+   than what the environment asked for. `CUDAPIPE_HELP=1` now prints the same
+   table from either ICD.
+
+   What is shared today: the NIR→PTX compiler, the kernel suite, the flag
+   registry, the NIR options and the kernel ABI header. What is not: the
+   rasterizer *driving* code in `cp_context.c`, which is the rest of this
+   step.
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
