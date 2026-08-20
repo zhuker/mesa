@@ -1201,7 +1201,16 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
    CPVK_DIFF(a->call.index_ptr != b->call.index_ptr, "index buffer");
    CPVK_DIFF(a->call.start_instance != b->call.start_instance, "start instance");
    CPVK_DIFF(a->call.instance_count != b->call.instance_count, "instance count");
-   /* What the descriptors contain, not where the snapshot of them lives. */
+   /*
+    * What the descriptors contain, not where the snapshot of them lives.
+    *
+    * Conservative: tests/cpvk_batch.c shows that two draws differing only in
+    * their descriptor set merge correctly without this, so it is not
+    * required for that case -- but gltfscenerendering, which differs in a
+    * *texture* per material, renders wrongly when it is removed. Until that
+    * difference is understood this stays, and it costs the merges a capture
+    * would want.
+    */
    CPVK_DIFF(memcmp(a->desc_hash, b->desc_hash, sizeof(a->desc_hash)),
              "descriptors");
    CPVK_DIFF(a->num_vb != b->num_vb, "vertex buffer count");

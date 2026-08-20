@@ -1013,3 +1013,28 @@ it small: two draws, one pipeline, one vertex buffer, differing only in the
 descriptor set they bind, with the descriptor comparison removed. `cpvk_mesh`
 is the place for it, it runs in a second, and it would turn a nine-draw scene
 into the two-draw case that either works or does not.
+
+### Two draws differing only in a descriptor set merge correctly
+
+`tests/cpvk_batch.c`: one pipeline, one vertex buffer, one index buffer, two
+index ranges, and a different descriptor set bound before each, each tinting
+its triangle a different colour. Byte-identical to lavapipe in all three
+modes -- unbatched, batched with the descriptor comparison, and batched
+without it -- with both colours present:
+
+    (26,26,38) x2637   (51,13,32) x941   (32,13,51) x518
+
+So the per-draw binding rows carry descriptors correctly through a merge, and
+the descriptor comparison is not needed for this case. That is a direct test
+of the thing three turns of inference had been circling.
+
+Which means gltfscenerendering needs something this does not have. The
+difference that stands out: its materials differ in a **texture**, a combined
+image sampler, where this differs in a uniform buffer. The texture path reads
+`cp_texture_info` through a descriptor and has a per-batch sampler
+specialisation beside it; disabling that specialisation did not help, but the
+texture handle itself is resolved per row and that is not yet tested.
+
+The next version of this test binds two different textures instead of two
+different uniform buffers. It is a small edit to a test that already exists
+and it either reproduces the bug in a second or narrows it again.
