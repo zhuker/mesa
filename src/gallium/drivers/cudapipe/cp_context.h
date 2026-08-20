@@ -73,7 +73,7 @@ struct cp_batch_key {
    /* Pipeline state, whole structs: a field added upstream is then covered
     * without anything here having to name it. */
    struct pipe_viewport_state viewport;
-   struct pipe_scissor_state scissor;
+   struct cp_rect scissor;
    struct pipe_rasterizer_state rasterizer;
    struct pipe_depth_stencil_alpha_state depth_stencil;
    struct pipe_blend_state blend_state;
@@ -140,7 +140,7 @@ struct cp_context {
       uint64_t vb_bases[CP_MAX_BATCH_DRAWS * CP_VB_TABLE_STRIDE];
       /* The scissor each draw was recorded under, for the per-draw clip
        * rectangles — see cp_rasterize_args.clip_rects. */
-      struct pipe_scissor_state scissors[CP_MAX_BATCH_DRAWS];
+      struct cp_rect scissors[CP_MAX_BATCH_DRAWS];
    } batch;
 
    /*
@@ -175,7 +175,7 @@ struct cp_context {
       struct cp_draw_range draws[CP_MAX_BATCH_DRAWS];
       uint32_t instance_counts[CP_MAX_BATCH_DRAWS];
       uint32_t draw_ids[CP_MAX_BATCH_DRAWS];
-      struct pipe_scissor_state scissors[CP_MAX_BATCH_DRAWS];
+      struct cp_rect scissors[CP_MAX_BATCH_DRAWS];
       uint64_t vs_ubos[CP_MAX_BATCH_DRAWS * CP_ARG_UBO_STRIDE];
       uint64_t fs_ubos[CP_MAX_BATCH_DRAWS * CP_ARG_UBO_STRIDE];
       uint64_t vb_bases[CP_MAX_BATCH_DRAWS * CP_VB_TABLE_STRIDE];
@@ -303,7 +303,7 @@ struct cp_context {
                                                  * clears and the blits */
    /* What the draw path reads, resolved when the framebuffer was bound. */
    struct cp_fb_desc fb;
-   struct pipe_scissor_state scissor;
+   struct cp_rect scissor;
    /*
     * What the pipeline reads, in the driver's own types: the viewport's scale
     * and translate, three fields of the rasterizer and three of the depth

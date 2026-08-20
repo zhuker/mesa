@@ -66,7 +66,7 @@ static void cp_pass_record_segment(struct cp_context *cp,
                                    const uint64_t *fs_ubo_table,
                                    const uint32_t *draw_ids,
                                    const uint64_t *vb_table,
-                                   const struct pipe_scissor_state *scissors);
+                                   const struct cp_rect *scissors);
 void cp_pass_finish(struct cp_context *cp);
 
 static void
@@ -329,7 +329,12 @@ cp_set_scissor_states(struct pipe_context *ctx, unsigned start_slot,
             (cp->fs_shader && cp->fs_shader->reads_const_bufs)) &&
           memcmp(&cp->scissor, &scissors[0], sizeof(cp->scissor)))
          cp_batch_flush_why(cp, "scissor");
-      cp->scissor = scissors[0];
+      /* Field-wise rather than a cast: the two structs happen to agree today
+       * and nothing should quietly depend on that. */
+      cp->scissor = (struct cp_rect) {
+         .minx = scissors[0].minx, .miny = scissors[0].miny,
+         .maxx = scissors[0].maxx, .maxy = scissors[0].maxy,
+      };
    }
 }
 
@@ -3505,7 +3510,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                 const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table,
                 const uint32_t *draw_ids, const uint32_t *instance_counts,
                 const uint64_t *vb_table,
-                const struct pipe_scissor_state *scissors)
+                const struct cp_rect *scissors)
 {
    struct cp_screen *screen = cp->screen;
    const struct cp_fb_desc *fb = &cp->fb;
@@ -3669,7 +3674,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
    bool per_draw_rects = scissors && batch_draws > 1 && rows_stable &&
       cp->rasterizer.scissor;
    if (cp->rasterizer.scissor && !per_draw_rects) {
-      const struct pipe_scissor_state *sc0 =
+      const struct cp_rect *sc0 =
          scissors ? &scissors[0] : &cp->scissor;
       clip_x0 = MAX2(clip_x0, (int)sc0->minx);
       clip_y0 = MAX2(clip_y0, (int)sc0->miny);
@@ -7349,7 +7354,7 @@ cp_pass_record_segment(struct cp_context *cp,
                        const uint64_t *vs_ubo_table,
                        const uint64_t *fs_ubo_table,
                        const uint32_t *draw_ids, const uint64_t *vb_table,
-                       const struct pipe_scissor_state *scissors)
+                       const struct cp_rect *scissors)
 {
    struct cp_pass_seg *sg = &cp->pass_segs[cp->pass.nsegs];
 

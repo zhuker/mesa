@@ -34,6 +34,17 @@ struct cp_draw_call {
    unsigned indirect_offset;
 };
 
+/* The scissor rectangle. Layout-compatible with pipe_scissor_state, which is
+ * four plain unsigneds and contains nothing the pipeline does not use -- so
+ * unlike the other state, converting the batch key's copy too changes nothing
+ * about what merges. */
+struct cp_rect {
+   unsigned minx;
+   unsigned miny;
+   unsigned maxx;
+   unsigned maxy;
+};
+
 /* Layout-compatible with pipe_draw_start_count_bias on purpose: the batch and
  * episode snapshots copy arrays of these around. */
 struct cp_draw_range {
