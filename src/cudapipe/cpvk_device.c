@@ -85,8 +85,21 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
        * entrypoints to its core implementations, so an application that
        * enables KHR_get_physical_device_properties2 -- or calls any 1.1-and-
        * later core entry point such as vkCmdBlitImage2 -- jumps through a
-       * null pointer in the loader. The Gallium driver this one replaces
-       * reports 1.4.
+       * null pointer in the loader.
+       *
+       * And 1.1, not 1.3, which was tried here and measured. Every sample and
+       * both replays still passed at 1.3, but `vkCreateDevice` asking for
+       * `VkPhysicalDeviceVulkan13Features` came back
+       * VK_ERROR_FEATURE_NOT_PRESENT: 1.3 makes a long list of features
+       * mandatory -- synchronization2, inlineUniformBlock, privateData,
+       * maintenance4, shaderTerminateInvocation, subgroupSizeControl and more
+       * -- and this driver declares one of them. Reporting 1.3 claims all of
+       * them, and a version number is a promise about what may be called, not
+       * a request for what happens to work today.
+       *
+       * The Gallium driver this one replaces reports 1.4, so this is still a
+       * gap; closing it means implementing those features, not editing this
+       * number.
        */
       .apiVersion = VK_MAKE_VERSION(1, 1, VK_HEADER_VERSION),
       .driverVersion = 1,

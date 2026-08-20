@@ -2070,3 +2070,29 @@ This does not close the gap -- the driver it replaces reports 1.4, and 1.2 and
 1.1. It does remove the specific trap the file documented, and
 `KHR_get_physical_device_properties2` can now be advertised without the
 segfault that took it out.
+
+### 1.3 was tried and rejected, on evidence
+
+Raising `apiVersion` to 1.3 was tempting -- it is what makes `vkCmdBlitImage2`
+and the rest of the 1.3 core dispatch -- and everything passed under it: all
+eighteen samples ran, fifteen pixel-correct, the replays gave 1,496 frames at
+24.35 ms and 1,510 at 79.22.
+
+It is still wrong, and one check shows why. A device created the way a real
+1.3 application creates one, asking for `VkPhysicalDeviceVulkan13Features`
+with `dynamicRendering` and `synchronization2`:
+
+    vkCreateDevice ... VK_ERROR_FEATURE_NOT_PRESENT
+
+Vulkan 1.3 makes a long list of features mandatory -- `synchronization2`,
+`inlineUniformBlock`, `privateData`, `maintenance4`,
+`shaderTerminateInvocation`, `subgroupSizeControl` among them -- and
+`cpvk_get_features` declares exactly one, `dynamicRendering`. A version number
+is a promise about what may be called, not a report of what happens to work on
+the samples at hand. Advertising 1.3 would have every 1.3 application fail at
+device creation instead of at the feature it actually wanted, which is the
+same trap that took `KHR_get_physical_device_properties2` out at 1.0.
+
+So it stays at 1.1, which is honest and which fixed a real null dispatch. The
+gap to the Gallium driver's 1.4 closes by implementing those features, not by
+editing the number -- and that is now written where the number is.
