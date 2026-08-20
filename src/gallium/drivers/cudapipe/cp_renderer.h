@@ -793,6 +793,33 @@ struct cp_vertex_ref * cp_build_vertex_refs(const struct cp_draw_call *info, con
 uint32_t cp_cull_mode(const struct cp_raster_state *rs);
 struct cp_blend_desc cp_blend_desc_for(const struct cp_context *cp);
 
+bool cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info, struct cp_abuf *ab, CUdeviceptr positions, CUdeviceptr vs_output_buf, unsigned w, unsigned h, float vp_scale_x, float vp_scale_y, float vp_trans_x, float vp_trans_y, uint32_t num_quads, uint32_t num_covered, bool record_colors, void *color_data, bool composite, float *t_interp, float *t_shade, float *t_composite, struct cp_abuf_seg_shade *seg);
+
+/*
+ * TEMPORARY (CUDAPIPE_ABUFFER): the merged quad array, for the one draw whose
+ * peel loop is being compared against it. Zero for every other draw, and for
+ * every draw once the verification budget is spent, so the instrumented
+ * interpolator is not carried by frames that are only being timed.
+ */
+struct cp_abuf_dbg_state {
+   CUdeviceptr blk_offsets, blk_counts, quad_prim, peel_mask, counters;
+   /*
+    * Step 3b: where the peel path deposits its shaded colours. One slot per
+    * (pixel, primitive) — the A-buffer's own indexing — so the two paths can
+    * be compared without either of them agreeing on an order.
+    */
+   CUdeviceptr frags, offsets, counts, colors, writes;
+   uint32_t capacity;
+};
+extern struct cp_abuf_dbg_state cp_abuf_dbg;
+
+
+void cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info, unsigned drawid_offset, const struct cp_draw_range *draws, unsigned num_draws, unsigned batch_draws, const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table, const uint32_t *draw_ids, const uint32_t *instance_counts, const uint64_t *vb_table, const struct cp_rect *scissors);
+void cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info, CUdeviceptr visbuf, CUdeviceptr positions, CUdeviceptr vs_output_buf, unsigned num_triangles, unsigned w, unsigned h, void *color_data, float vp_scale_x, float vp_scale_y, float vp_trans_x, float vp_trans_y, CUdeviceptr reject, CUdeviceptr resolved, unsigned reject_pass, CUdeviceptr seg_ranges, unsigned num_seg_ranges);
+
+/* Defined in cp_context.c until the pass machinery follows. */
+void cp_pass_record_segment(struct cp_context *cp, const struct cp_rasterize_args *aa, const struct cp_rast_queues *queues, unsigned rast_num_triangles, unsigned num_triangles, const struct cp_draw_call *info, unsigned drawid_offset, unsigned ndraws, const struct cp_draw_range *draws, const uint32_t *instance_counts, const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table, const uint32_t *draw_ids, const uint64_t *vb_table, const struct cp_rect *scissors);
+
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 
 /*
