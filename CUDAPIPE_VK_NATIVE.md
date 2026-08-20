@@ -3680,3 +3680,31 @@ code, implicit LOD selection is byte-identical between the two drivers
 (`cpvk_lodimp`), and a blit-built chain sampled with implicit LOD is
 byte-identical (`cpvk_lodblit`). Every stage tests clean and the sample still
 differs in its minified centre, brighter and off the edges.
+
+### texturemipmapgen: anisotropy eliminated
+
+The sample creates four samplers and one of them has `aniso=16.0`, which made
+the anisotropic path a candidate -- it is the most intricate code in the
+sampler. Forcing `max_anisotropy` to zero in the driver changes the sample's
+mean difference by nothing at all: 0.456 either way. The view it renders
+offscreen uses the plain trilinear sampler, index 2, `lod=0.0..10.0`,
+`aniso=0.0`.
+
+The diagnostic flag was removed again rather than left in, since it measured
+nothing and the driver's flag surface is meant to be worth reading.
+
+The elimination list for this sample is now:
+
+    the mip chain's construction   blit, same filter as the reference
+    the blit filter                 now bilinear at pixel centres, matching
+    implicit LOD selection          byte-identical between the drivers
+    a blit-built chain sampled      byte-identical
+    anisotropy                      not used by the rendered view
+    edges                           the difference is not on them
+    the sampler                     shared code with the reference driver
+
+and the difference is unchanged at 0.456, brighter than the reference, in the
+minified centre. Every component tests clean in isolation, which after today
+suggests the next step is not another component but a substitution inside the
+sample itself -- the technique that resolved pbribl after the same kind of
+impasse.
