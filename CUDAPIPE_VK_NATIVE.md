@@ -4715,3 +4715,57 @@ episode records segments and shades them all at the end, which is what makes
 its storage grow without bound. The Gallium driver lives with the same model
 and gets away with it because its episodes end at natural points this front end
 does not have.
+
+## The A-buffer was costing more than it saved on both captures
+
+`CUDAPIPE_NO_ABUFFER=1` on the native driver: **6.75 ms against 8.79** on
+Crossroads and **21.89 against 31.12** on the older capture. On the Gallium
+driver the same switch costs 4.5x -- 32.40 against 7.14 -- which is what
+`ABUFFER.md` records and what made the native result worth explaining rather
+than believing.
+
+The explanation is that this front end batches blended draws whether or not the
+A-buffer is on, and the Gallium driver's blended batching is part of the
+A-buffer path. Turn the A-buffer off there and the batching goes with it; turn
+it off here and the peel loop runs on batches. `CUDAPIPE_NO_ABUFFER=1
+CPVK_NO_BATCH_BLEND=1` is 13.25 ms, which is the same statement from the other
+side.
+
+So the A-buffer's cost is fixed -- clears, three count stages, a two-level
+scan, the merge, the sort, the composite, about ten launches -- and this driver
+was paying it on many small blended batches where the Gallium driver paid it on
+a few large ones. That is the same 4.4x more A-buffer builds the kernel trace
+showed, seen from the cost side rather than the count side.
+
+### The fix is to ask whether the batch is big enough to pay for it
+
+`CPVK_ABUF_MIN_TRIS`, default **256**, measured rather than chosen:
+
+    threshold     Crossroads    particlesystem
+    0 (before)      8.78 ms         5.55 ms
+    256             7.84            5.56
+    1024            7.82            --
+    4096            7.83            --
+    16384           7.74            33.67
+    65536           6.76            33.28
+
+The whole benefit on the captures is there at 256, and the samples do not
+notice: particlesystem 5.55 against 5.56, vulkanscene 4.51 against 4.52, bloom
+7.46 against 7.44, gltfscenerendering 21.34 against 20.44. Above about 4096
+particlesystem starts peeling batches that should not, and by 16384 it costs
+six times what it should.
+
+The sample-side measurements had to be taken over a 500-frame span. Over 40
+frames the same comparison read 2.94x, which was startup noise, and it looked
+exactly like a regression.
+
+### Where this leaves the driver
+
+    capture        native    gallium   recorded    ratio
+    Crossroads     7.85 ms   7.19 ms   7.17 ms     1.092x
+    older         25.32     25.22     25.20        1.004x
+
+The older capture is at parity -- 0.4%, well inside the ~5% run-to-run spread.
+Crossroads is 1.09x, from 1.23x.
+
+18/18 samples run, 17/18 pixel-correct, fourteen unit tests pass.

@@ -338,6 +338,33 @@ cp_scratch_begin(struct cp_context *cp)
    }
 }
 
+
+/*
+ * Triangles a blended batch must have before the A-buffer's fixed cost is
+ * worth paying.
+ *
+ * 256 is measured, not chosen: on the two captures the whole benefit of
+ * peeling small batches is already there at 256, and the samples are
+ * unaffected -- particlesystem is 5.55 ms against 5.56, vulkanscene 4.51
+ * against 4.52, bloom 7.46 against 7.44. Above about 4096 particlesystem
+ * starts peeling batches that should not, and by 16384 it costs six times
+ * what it should.
+ *
+ * CPVK_ABUF_MIN_TRIS=0 disables the test, which is the behaviour before it.
+ */
+static unsigned
+cp_abuf_min_tris(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *s = getenv("CPVK_ABUF_MIN_TRIS");
+      v = s ? atoi(s) : 256;
+      if (v < 0)
+         v = 0;
+   }
+   return (unsigned)v;
+}
+
 /* Reset scratch after all GPU work is done. Frees overflow arenas (old
  * arenas that were replaced during growth) and resets the bump pointer.
  * The current arena is kept at its grown size. */
@@ -4094,6 +4121,27 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
          abuf = cp_abuf_setup(ab, w, h);
       }
    }
+
+   /*
+    * A batch too small to pay for the build.
+    *
+    * The A-buffer costs about ten launches whatever the draw's size: the
+    * clears, three count stages, a two-level scan, the merge, the sort and the
+    * composite. A draw with real depth complexity buys that back many times
+    * over -- particlesystem is 11.8x slower peeling -- and a small one does
+    * not, because it peels in one or two passes.
+    *
+    * The native front end batches blended draws whether or not the A-buffer is
+    * on, which the Gallium driver does not, so it arrives here with many small
+    * blended batches where that driver had few large ones. On both captures
+    * the A-buffer is a net loss because of it: 8.79 ms against 6.75, and 31.12
+    * against 21.89.
+    *
+    * So the fixed cost is asked for explicitly, from the triangle count, which
+    * is known here before anything has been spent.
+    */
+   if (abuf && cp_abuf_min_tris() && rast_num_triangles < cp_abuf_min_tris())
+      abuf = false;
 
    /*
     * A growth an earlier draw asked for. It happens here, before this draw
