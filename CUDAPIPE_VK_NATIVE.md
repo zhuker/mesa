@@ -1792,3 +1792,37 @@ lod.
 The value of the test is not only the answer. It runs in under a second
 against either driver, where the same question asked through pbribl costs a
 minute and a sample's worth of confounds.
+
+### Two formats decoded as the wrong one by accident
+
+`VK_FORMAT_R16G16_SFLOAT` and `VK_FORMAT_R16_SFLOAT` carried texel encoding
+`0` in the format table. Zero is not a sentinel here -- it is
+`CP_TEXEL_R8G8B8A8_UNORM`, the first enumerator -- so every sample of those
+formats decoded half-float pairs as four bytes. The sampler has had
+`CP_TEXEL_R16G16_SFLOAT` and `CP_TEXEL_R16_SFLOAT` all along; only the table
+entry was missing. `VK_FORMAT_A2B10G10R10_UNORM_PACK32` was the same and is
+fixed with them.
+
+pbribl's BRDF lookup table is R16G16_SFLOAT, and its texture handle now prints
+`enc=28` where it printed `enc=0`.
+
+    pbribl  1.472 -> 1.255
+
+The spheres, however, are pixel-for-pixel unchanged and still *exactly*
+neutral, so the gain came from elsewhere in the frame and the image-based
+lighting term is still zero. Since the lookup table now decodes, what is left
+is its **content**: unlike the cube it is rendered and never copied, so the
+`copydst` instrument cannot see it.
+
+### Three tests that each eliminated a hypothesis
+
+    cpvk_lod         2D, four levels, textureLod        identical to lavapipe
+    cpvk_cubelod     cube, six faces x four levels      identical to lavapipe
+    cpvk_cubelodf16  the same cube as R16G16B16A16      identical to lavapipe
+
+The cube test reads back the exact face and level it asked for at every depth
+-- red names the face, green names the level -- so explicit-LOD cube sampling,
+which was the standing explanation for pbribl across three turns, is dead.
+
+Twelve tests pass now. Writing them cost about one turn and removed four
+hypotheses that code-reading had failed to remove across three.

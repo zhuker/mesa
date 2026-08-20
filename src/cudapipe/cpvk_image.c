@@ -38,10 +38,19 @@ static const struct cpvk_format_info cpvk_formats[] = {
    { VK_FORMAT_R32G32B32A32_SFLOAT, CP_TEXEL_R32G32B32A32_FLOAT, CP_COLOR_R32G32B32A32_FLOAT,  false },
    { VK_FORMAT_R32G32_SFLOAT,       CP_TEXEL_R32G32_FLOAT,       -1,                           false },
    { VK_FORMAT_R32_SFLOAT,          CP_TEXEL_R32_FLOAT,          -1,                           false },
-   { VK_FORMAT_R16G16_SFLOAT,       0,                           CP_COLOR_R16G16_SFLOAT,       false },
-   { VK_FORMAT_R16_SFLOAT,          0,                           CP_COLOR_R16_SFLOAT,          false },
+   /*
+    * These two decoded as texel encoding 0, which is R8G8B8A8_UNORM -- the
+    * first enumerator, not a deliberate choice. The sampler has had the right
+    * decode for both all along. pbribl's BRDF lookup table is R16G16_SFLOAT,
+    * so every half pair came back as four bytes of near-zero, its whole
+    * image-based lighting term evaluated to zero, and its spheres rendered
+    * with direct light only: exactly neutral, against a reference that is
+    * warm.
+    */
+   { VK_FORMAT_R16G16_SFLOAT,       CP_TEXEL_R16G16_SFLOAT,      CP_COLOR_R16G16_SFLOAT,       false },
+   { VK_FORMAT_R16_SFLOAT,          CP_TEXEL_R16_SFLOAT,         CP_COLOR_R16_SFLOAT,          false },
    { VK_FORMAT_B10G11R11_UFLOAT_PACK32, CP_TEXEL_R11G11B10_FLOAT, CP_COLOR_R11G11B10_FLOAT,    false },
-   { VK_FORMAT_A2B10G10R10_UNORM_PACK32, 0,                      CP_COLOR_A2B10G10R10_UNORM,   false },
+   { VK_FORMAT_A2B10G10R10_UNORM_PACK32, CP_TEXEL_A2B10G10R10_UNORM, CP_COLOR_A2B10G10R10_UNORM, false },
    { VK_FORMAT_R5G6B5_UNORM_PACK16, CP_TEXEL_R5G6B5_UNORM,       -1,                           false },
    { VK_FORMAT_D32_SFLOAT,          0,                           -1,                           true  },
    { VK_FORMAT_D32_SFLOAT_S8_UINT,  0,                           -1,                           true  },
