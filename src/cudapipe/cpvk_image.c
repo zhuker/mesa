@@ -327,8 +327,9 @@ cpvk_CreateImageView(VkDevice _device,
 
          if (cp_debug->debug_tex) {
             const struct cp_texture_info *ti = view->tex_info_host;
-            fprintf(stderr, "cudapipe: texture handle %ux%u fmt=%u enc=%u "
+            fprintf(stderr, "cudapipe: texture handle %p %ux%u fmt=%u enc=%u "
                     "target=%u levels=%u..%u stride=%u base=%p\n",
+                    (void *)(uintptr_t)view->tex_info,
                     ti->width, ti->height, ti->format, ti->encoding,
                     ti->target, ti->first_level, ti->last_level,
                     ti->row_stride[0], (void *)(uintptr_t)ti->base);

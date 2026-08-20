@@ -2890,3 +2890,30 @@ about a third slower than the driver they must replace.
 - Print more than one slot, index or field than the hypothesis needs. Slot 1
   alone looked exactly like the bug.
 - Run-to-run spread on these replays is 5%. Nothing smaller is a result.
+
+### pbribl: the descriptors resolve to the right textures
+
+Correlating the texture-info handle printed at view creation with the handle
+each descriptor binding carries:
+
+    binding 2 -> 0x...116200   64x64  target=3 enc=10   the irradiance cube
+    binding 3 -> 0x...115e00   512x512 target=1 enc=28  the BRDF lookup table
+    binding 4 -> 0x...126800   512x512 target=3 enc=9   the prefiltered cube,
+                                                        levels 0..9
+
+Every one is right, with the right target, format and level range, and the
+sampler indices are 1 through 4 with index 4 -- the prefiltered cube's --
+carrying `lod=0.0..10.0`.
+
+The FS sampler table is built 114 times in the run: once with three entries,
+42 times with four and 71 times with five. Index 4 is only in range once the
+table has five, and the spheres are drawn last, so they should see the full
+table -- but that is the one thing in this chain not yet directly verified, and
+a sampler index one past the end of the table read at shade time would produce
+exactly a neutral result from a correct cube.
+
+So the elimination list for pbribl now reads: cube content warm at every level,
+cube sampling exact including explicit LOD and half-float, descriptors written
+correctly, bindings resolving to the right textures, samplers carrying the
+right LOD range, and the material colour genuinely black by design. What is
+left is the sampler *table* at the moment the sphere draws shade.
