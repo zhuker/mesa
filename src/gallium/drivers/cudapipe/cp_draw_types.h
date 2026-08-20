@@ -81,8 +81,16 @@ struct cp_depth_state {
    unsigned depth_func;             /* enum cp_compare_func */
 };
 
+/* Face bits, the driver's own. Gallium's values, asserted by the adapter. */
+enum cp_face {
+   CP_FACE_NONE = 0,
+   CP_FACE_FRONT = 1,
+   CP_FACE_BACK = 2,
+   CP_FACE_FRONT_AND_BACK = 3,
+};
+
 struct cp_raster_state {
-   unsigned cull_face;              /* PIPE_FACE_* */
+   unsigned cull_face;              /* enum cp_face */
    bool front_ccw;
    bool scissor;
 };

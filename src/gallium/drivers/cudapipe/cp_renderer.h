@@ -535,9 +535,7 @@ struct cp_context {
    } dscratch;
 };
 
-uint32_t cp_depth_to_sortable(float depth);
 
-void cp_clear_depthbuf(struct cp_context *cp, float depth);
 
 void cp_batch_flush(struct cp_context *cp);
 
@@ -778,6 +776,22 @@ void cp_abuf_verify(struct cp_abuf *ab, unsigned w, unsigned h, uint32_t total, 
 void cp_abuf_verify_quads(struct cp_abuf *ab, unsigned w, unsigned h, uint32_t total_frags, uint32_t total_quads, unsigned passes_run, uint32_t quad_overflow, const uint32_t *dbg);
 void cp_census_dump(const char *what, unsigned draw_seq, unsigned peel_seq, unsigned num_triangles, unsigned num_samples, const uint32_t *counts, unsigned w, unsigned h);
 bool cp_census_enabled(void);
+
+/* One assembled vertex: which vertex of the bound buffers it reads, and which
+ * instance it belongs to. */
+struct cp_vertex_ref {
+   uint32_t vertex;
+   uint32_t instance;
+};
+
+uint32_t cp_depth_to_sortable(float depth);
+void cp_clear_depthbuf(struct cp_context *cp, float depth);
+void cp_stage_resolve(struct cp_context *cp, double *ms);
+int32_t cp_slot_for_location(const unsigned *locations, unsigned count, unsigned location);
+unsigned cp_triangles_for_draw(enum mesa_prim mode, unsigned count);
+struct cp_vertex_ref * cp_build_vertex_refs(const struct cp_draw_call *info, const struct cp_draw_range *draws, unsigned num_draws, unsigned instance_count, const void *ib_base, unsigned num_triangles);
+uint32_t cp_cull_mode(const struct cp_raster_state *rs);
+struct cp_blend_desc cp_blend_desc_for(const struct cp_context *cp);
 
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 

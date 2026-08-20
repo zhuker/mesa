@@ -8,8 +8,11 @@
  */
 
 #include "cp_renderer.h"
+#include "nir_to_ptx/cp_nir_to_llvm.h"
 
 #include <inttypes.h>
+
+#include "util/u_memory.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -1500,3 +1503,192 @@ cp_abuf_verify_quads(struct cp_abuf *ab, unsigned w, unsigned h,
  * perspective-correct interpolation that can drift is the failure this driver
  * has already been bitten by.
  */
+
+/* Sortable-uint form of a depth value: monotonic in the float, so the
+ * rasterizer's integer compares order the same way floats would. */
+uint32_t
+cp_depth_to_sortable(float depth)
+{
+   union { float f; uint32_t u; } v = { .f = depth };
+   uint32_t mask = -((int32_t)v.u >> 31) | 0x80000000u;
+   return v.u ^ mask;
+}
+
+void
+cp_clear_depthbuf(struct cp_context *cp, float depth)
+{
+   if (!cp->depthbuf)
+      return;
+
+   uint32_t value = cp_depth_to_sortable(depth);
+   size_t count = (size_t)cp->depthbuf_w * cp->depthbuf_h;
+
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   cuMemsetD32Async(cp->depthbuf, value, count * MAX2(cp->visbuf_samples, 1u), cp->stream);
+   cp->depthbuf_cleared = true;
+}
+
+/* Resolve every interval recorded this draw into per-stage totals. Costs one
+ * synchronisation, which is why it is debug-only. */
+void
+cp_stage_resolve(struct cp_context *cp, double *ms)
+{
+   struct cp_stage_timer *t = &cp->timer;
+   if (t->num < 2) {
+      t->num = 0;
+      return;
+   }
+
+   cuEventSynchronize(t->events[t->num - 1]);
+   for (unsigned i = 1; i < t->num; i++) {
+      float dt = 0.0f;
+      int stage = t->stages[i];
+      if (stage >= 0 && stage < CP_NUM_STAGES &&
+          cuEventElapsedTime(&dt, t->events[i - 1], t->events[i]) == CUDA_SUCCESS)
+         ms[stage] += dt;
+   }
+   t->num = 0;
+}
+
+/*
+ * Which shader I/O slot carries a given varying location, or -1 if none does.
+ * gl_PointSize and gl_PointCoord reach the kernels this way like any other
+ * varying, rather than through a dedicated path.
+ */
+int32_t
+cp_slot_for_location(const unsigned *locations, unsigned count,
+                     unsigned location)
+{
+   for (unsigned i = 0; i < count && i < CP_MAX_IO_SLOTS; i++)
+      if (locations[i] == location)
+         return (int32_t)i;
+   return -1;
+}
+
+
+/* Number of triangles one draw of `count` vertices produces. */
+unsigned
+cp_triangles_for_draw(enum mesa_prim mode, unsigned count)
+{
+   if (mode == MESA_PRIM_TRIANGLE_STRIP || mode == MESA_PRIM_TRIANGLE_FAN)
+      return count >= 3 ? count - 2 : 0;
+   if (mode == MESA_PRIM_POINTS)
+      return count;
+   return count / 3;
+}
+
+/*
+ * Resolve every assembled vertex once: expand the primitive topology, apply
+ * the index buffer, and repeat the whole thing per instance.
+ *
+ * Everything downstream (positions, shader inputs, vertex ids) indexes this
+ * array, so the topology and indexing rules live in exactly one place.
+ */
+struct cp_vertex_ref *
+cp_build_vertex_refs(const struct cp_draw_call *info,
+                     const struct cp_draw_range *draws,
+                     unsigned num_draws, unsigned instance_count,
+                     const void *ib_base, unsigned num_triangles)
+{
+   struct cp_vertex_ref *refs =
+      MALLOC(sizeof(*refs) * num_triangles * 3);
+   if (!refs)
+      return NULL;
+
+   bool indexed = info->index_size > 0;
+   unsigned index_size = info->index_size;
+   unsigned out_tri = 0;
+
+   for (unsigned inst = 0; inst < instance_count; inst++) {
+      for (unsigned d = 0; d < num_draws; d++) {
+         unsigned count = draws[d].count;
+         unsigned first = draws[d].start;
+         int base_vertex = indexed ? draws[d].index_bias : 0;
+
+         const void *ib_data = NULL;
+         if (indexed && ib_base)
+            ib_data = (const char *)ib_base + (size_t)first * index_size;
+
+         unsigned draw_tris = cp_triangles_for_draw(info->mode, count);
+
+         for (unsigned tri = 0; tri < draw_tris; tri++) {
+            unsigned idx[3];
+            if (info->mode == MESA_PRIM_POINTS) {
+               /* Each point becomes a degenerate triangle: the rasterizer will
+                * expand it into a screen-aligned quad later using point size. */
+               idx[0] = tri;
+               idx[1] = tri;
+               idx[2] = tri;
+            } else if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
+               /* Odd triangles swap two vertices to keep the winding. */
+               idx[0] = tri;
+               idx[1] = tri + 1 + (tri & 1);
+               idx[2] = tri + 2 - (tri & 1);
+            } else if (info->mode == MESA_PRIM_TRIANGLE_FAN) {
+               idx[0] = 0;
+               idx[1] = tri + 1;
+               idx[2] = tri + 2;
+            } else {
+               idx[0] = tri * 3 + 0;
+               idx[1] = tri * 3 + 1;
+               idx[2] = tri * 3 + 2;
+            }
+
+            for (unsigned vi = 0; vi < 3; vi++) {
+               unsigned vertex;
+               if (indexed && ib_data) {
+                  unsigned raw = index_size == 2
+                     ? ((const uint16_t *)ib_data)[idx[vi]]
+                     : ((const uint32_t *)ib_data)[idx[vi]];
+                  vertex = (unsigned)((int)raw + base_vertex);
+               } else {
+                  vertex = first + idx[vi];
+               }
+               refs[out_tri * 3 + vi].vertex = vertex;
+               /* Zero-based, matching load_instance_id. The first instance
+                * offset belongs to attribute fetch, not to the shader's
+                * instance id. */
+               refs[out_tri * 3 + vi].instance = inst;
+            }
+            out_tri++;
+         }
+      }
+   }
+
+   return refs;
+}
+
+/* 0 = keep everything, 1 = drop positive-area triangles, 2 = drop negative. */
+uint32_t
+cp_cull_mode(const struct cp_raster_state *rs)
+{
+   bool cull_back = (rs->cull_face & CP_FACE_BACK) != 0;
+   bool cull_front = (rs->cull_face & CP_FACE_FRONT) != 0;
+
+   if (!cull_back && !cull_front)
+      return 0;
+   if (cull_back && cull_front)
+      return 0;   /* handled by skipping the draw */
+
+   /* After the viewport transform a front face has positive area when the
+    * front is counter-clockwise, since Vulkan's clip space already has y
+    * running downward and the viewport scale does not flip it again. */
+   if (cull_back)
+      return rs->front_ccw ? 2 : 1;
+   return rs->front_ccw ? 1 : 2;
+}
+
+/*
+ * The draw's blend equation, in the form both kernels that evaluate it read.
+ *
+ * Split out for the same reason the struct is shared: the peel path's
+ * writeback and the A-buffer's composite have to be blending the same draw the
+ * same way, and a second place that turns a pipe_rt_blend_state into one is a
+ * second place that can forget a field.
+ */
+struct cp_blend_desc
+cp_blend_desc_for(const struct cp_context *cp)
+{
+   /* Resolved once when the state was bound; see cp_bind_blend_state. */
+   return cp->blend_desc;
+}
