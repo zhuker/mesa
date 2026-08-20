@@ -4769,3 +4769,25 @@ The older capture is at parity -- 0.4%, well inside the ~5% run-to-run spread.
 Crossroads is 1.09x, from 1.23x.
 
 18/18 samples run, 17/18 pixel-correct, fourteen unit tests pass.
+
+### Two separators that did not work, recorded so they are not retried
+
+**Remembered depth complexity.** The triangle count is a proxy for how deep the
+blended geometry is, which is the thing that actually decides whether a build
+pays. So the last build's fragments-per-covered-pixel was cached per fragment
+shader and used to decide the next one. It changed nothing at any threshold
+from 2 to 64 layers, because on this capture the builds take the *bounded*
+path, which never syncs to read the count -- that is the point of it. The depth
+is not cheaply knowable here, and making it knowable costs the sync the fast
+path exists to avoid.
+
+**A band rather than a floor.** If particlesystem's batches were small and deep
+and the capture's large and shallow, peeling above a ceiling as well as below a
+floor would separate them. It does not: `CPVK_ABUF_MAX_TRIS` at 65536, 32768
+and 16384 gives 7.85, 7.85 and 7.76 ms against 7.83 with no ceiling at all. The
+gain at `MIN_TRIS=65536` was never a band -- it is simply most of the way to
+peeling everything, which is what breaks particlesystem.
+
+Both are reverted. `CPVK_ABUF_MIN_TRIS=256` gets the part of the win that costs
+nothing on the samples, and the rest of it is not separable by anything
+available before the build.
