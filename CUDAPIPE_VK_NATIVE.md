@@ -1917,3 +1917,35 @@ That is three findings in three turns overturned by re-measuring: the
 multisample resolve that already worked, the format decode that could not have
 zeroed anything, and now this. All three shared a shape -- a number read from a
 run that was not what it appeared to be.
+
+### What the last two samples actually are, measured
+
+**multisampling, 0.553.** Sample positions are not the cause: cudapipe's four
+are `(0.375,0.125) (0.875,0.375) (0.125,0.625) (0.625,0.875)`, which is
+`lp_sample_pos_4x` exactly. The difference is edge coverage and nothing else:
+
+    max-channel diff > 1    2.285% of pixels
+                     > 16   1.448%
+                     > 64   0.080%
+                     > 128  0.008%
+
+    mean reference gradient where the diff exceeds 16 ... 129.1
+    mean reference gradient over the whole frame .........  5.1
+
+A twenty-five-fold concentration on high-gradient pixels. Every substantial
+difference sits on a silhouette, mostly the spacecraft's thin boom, where
+native has slightly less coverage. This is a fill-rule difference on
+sub-pixel geometry, not a structural fault.
+
+**texturemipmapgen, 0.456.** The opposite signature. The differences are
+*not* on edges -- gradient 15.0 where they exceed 16, against 13.0 over the
+frame -- and native is systematically **brighter** there, 51.8 against 44.0.
+That is a filtering or level-selection difference spread across a minified
+region, which matches the earlier reading that the chain is built correctly
+and the wrong level is read.
+
+    max-channel diff > 16   0.882% of pixels
+                     > 64   0.004%
+
+Both are now bounded and characterised rather than merely nonzero, and the two
+have different causes, which the single mean-error number had hidden.
