@@ -6715,6 +6715,36 @@ cp_pass_record_segment(struct cp_context *cp,
    cp->pass.next_prim += rast_num_triangles;
 }
 
+
+/*
+ * The triangle count cp_draw_execute will size its grids for, computed here so
+ * the A-buffer's size test can be applied before the vertex work rather than
+ * after it.
+ *
+ * This is the pre-clip count -- the same worst case the rasterizer grid uses --
+ * so the two tests agree by construction.
+ */
+static unsigned
+cp_batch_total_triangles(const struct cp_draw_call *info,
+                         const struct cp_draw_range *draws,
+                         unsigned batch_draws,
+                         const uint32_t *instance_counts)
+{
+   unsigned instance_count = MAX2(info->instance_count, 1u);
+   if (batch_draws <= 1)
+      return cp_triangles_for_draw(info->mode, draws[0].count) *
+             instance_count;
+
+   unsigned total = 0;
+   for (unsigned d = 0; d < batch_draws; d++) {
+      unsigned draw_instances = instance_counts
+         ? MAX2(instance_counts[d], 1u) : instance_count;
+      total += cp_triangles_for_draw(info->mode, draws[d].count) *
+               draw_instances;
+   }
+   return total;
+}
+
 /* Append the pending batch to the episode as a segment; on a refusal deep
  * enough that only cp_draw_execute could see it, finish the episode and
  * render the batch the classic way — its draws came after every segment's. */
@@ -6726,6 +6756,28 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
 
    if (cp->pass.nsegs && cp->pass.opaque)
       cp_pass_finish(cp);
+
+   /*
+    * A batch too small for the A-buffer, decided before the vertex work.
+    *
+    * cp_draw_execute reaches the same conclusion, but only after fetching and
+    * clipping -- and an append that backs out there is re-executed whole, so
+    * the vertex work happens twice. The trace showed it: cp_vertex_fetch ran
+    * 32.6 times a frame against 24.3 rasterizations, where the Gallium
+    * driver's two are equal.
+    */
+   if (cp_abuf_min_tris() &&
+       cp_batch_total_triangles(&cp->batch.info, cp->batch.draws, ndraws,
+                                cp->batch.instance_counts)
+          < cp_abuf_min_tris()) {
+      cp_pass_finish(cp);
+      cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
+                      cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
+                      cp->batch.fs_ubos, cp->batch.draw_ids,
+                      cp->batch.instance_counts, cp->batch.vb_bases,
+                      cp->batch.scissors);
+      return;
+   }
 
    /*
     * Episode start: size the per-pixel arrays for this framebuffer and clear

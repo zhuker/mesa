@@ -4791,3 +4791,38 @@ peeling everything, which is what breaks particlesystem.
 Both are reverted. `CPVK_ABUF_MIN_TRIS=256` gets the part of the win that costs
 nothing on the samples, and the rest of it is not separable by anything
 available before the build.
+
+### The size test was being applied after the vertex work, and the draw redone
+
+The trace after `MIN_TRIS` landed showed something that should not happen:
+
+    cp_vertex_fetch      32.6 per frame     cp_rasterize_stage1   20.2
+    (gallium)            17.8                                      7.5
+
+Native fetched vertices 32.6 times a frame and rasterized 24.3; the Gallium
+driver's two are equal. Draws were doing their vertex work and being thrown
+away.
+
+`cp_pass_append` calls `cp_draw_execute`, and an append that backs out *inside*
+it sets `append_failed`, which finishes the episode and calls `cp_draw_execute`
+**again** for the same batch. The size test set `abuf = false` after the fetch
+and the clip, so every batch it rejected paid for its vertex work twice. The
+test I added created the very waste it was meant to remove.
+
+`cp_batch_total_triangles()` computes the same pre-clip count at the caller, so
+the decision happens before anything is spent, next to the framebuffer
+early-out that was already doing exactly this:
+
+    capture        before    after
+    Crossroads     7.85 ms   7.59 ms
+    older         25.32     23.45
+
+18/18 samples run, 17/18 pixel-correct, fourteen unit tests pass, and the
+samples are unmoved -- particlesystem 5.61, vulkanscene 4.93, bloom 7.46.
+
+    capture        native    gallium   recorded    ratio
+    Crossroads     7.59 ms   7.19 ms   7.17 ms     1.059x
+    older         23.45     25.22     25.20        0.930x
+
+**The older capture is now faster than the driver being replaced**, and
+Crossroads is 1.06x, from 1.31x at the start of this session.
