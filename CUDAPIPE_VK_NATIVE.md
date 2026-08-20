@@ -4466,3 +4466,36 @@ that carries state between runs makes every A/B a comparison of the same thing
 with itself, and it does so silently -- the numbers look plausible, they
 reproduce, and they are meaningless. What caught it was an impossible result:
 two code paths that must be identical measuring 2.6x apart.
+
+### The remaining gap, re-measured with a clean environment
+
+    per frame            native   gallium   ratio
+    kernel launches       636.4     246.8    2.58
+    GPU time (ms)         1.910     2.573    0.74
+    wall time (ms)         8.81      7.21    1.22
+
+The native driver uses **26% less GPU time** and takes 22% more wall clock, so
+the gap is still entirely host-side: 6.90 ms a frame of non-kernel time against
+4.64.
+
+Where the excess launches are:
+
+    cp_abuf_scan_block    102.1 against  23.1
+    cp_abuf_scan_add       60.8          13.5
+    main                   63.7          37.5
+    cp_abuf_worklist       21.0           1.8
+    cp_vertex_fetch        39.7          22.3
+    cp_clip_triangles      39.7          22.3
+
+    A-buffer and peel     379.9 against 115.1   68% of the excess
+    everything else       256.5         131.7   32%
+
+So two thirds of what is left is still A-buffer work, and `cp_abuf_scan_block`
+alone -- one launch per block of the framebuffer per episode -- is a fifth of
+it. The Gallium driver runs 23.1 of those a frame and this driver 102.1, which
+is 4.4 episodes for every one of its own.
+
+Blended episodes are on now and worth 2.7x; what remains is that this driver's
+episodes are still shorter. That is the same finding as before the leak was
+found, at a quarter of the magnitude: not "no episodes at all" but "episodes
+about four times too short".
