@@ -1428,6 +1428,30 @@ build_device_call(struct ntl_context *ctx, const char *name,
 
 /* Call an LLVM intrinsic by name, e.g. "llvm.sqrt" — overloaded intrinsics are
  * specialised on the type of their first argument. */
+
+/*
+ * A constant of the same shape as `like` -- a splat when `like` is a vector.
+ *
+ * The conversions and the sign/boolean selects below were written when every
+ * ALU operation was scalar, so they built scalar constants and scalar result
+ * types. With a vector destination that is invalid IR rather than wrong
+ * arithmetic, which is why twelve samples rendered wrong the moment
+ * scalarisation was turned off.
+ */
+static LLVMValueRef
+const_real_like(LLVMTypeRef like, double v)
+{
+   if (LLVMGetTypeKind(like) == LLVMVectorTypeKind) {
+      LLVMTypeRef elem = LLVMGetElementType(like);
+      unsigned n = LLVMGetVectorSize(like);
+      LLVMValueRef vals[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned i = 0; i < n; i++)
+         vals[i] = LLVMConstReal(elem, v);
+      return LLVMConstVector(vals, n);
+   }
+   return LLVMConstReal(like, v);
+}
+
 static LLVMValueRef
 build_intrinsic(struct ntl_context *ctx, const char *name,
                 LLVMValueRef *args, unsigned num_args)
@@ -1672,8 +1696,9 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       LLVMValueRef zero = LLVMConstNull(ft);
       LLVMValueRef gt = LLVMBuildFCmp(ctx->builder, LLVMRealOGT, src[0], zero, "");
       LLVMValueRef lt = LLVMBuildFCmp(ctx->builder, LLVMRealOLT, src[0], zero, "");
-      result = LLVMBuildSelect(ctx->builder, gt, LLVMConstReal(ft, 1.0),
-                 LLVMBuildSelect(ctx->builder, lt, LLVMConstReal(ft, -1.0), zero, ""), "");
+      result = LLVMBuildSelect(ctx->builder, gt, const_real_like(ft, 1.0),
+                 LLVMBuildSelect(ctx->builder, lt, const_real_like(ft, -1.0),
+                                 zero, ""), "");
       break;
    }
    case nir_op_isign: {
@@ -1731,10 +1756,12 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       result = LLVMBuildSIToFP(ctx->builder, src[0], get_float_type(ctx, 32), "");
       break;
    case nir_op_f2i32:
-      result = LLVMBuildFPToSI(ctx->builder, src[0], get_llvm_type(ctx, 32, 1), "");
+      result = LLVMBuildFPToSI(ctx->builder, src[0],
+                               get_llvm_type(ctx, 32, num_comp), "");
       break;
    case nir_op_f2u32:
-      result = LLVMBuildFPToUI(ctx->builder, src[0], get_llvm_type(ctx, 32, 1), "");
+      result = LLVMBuildFPToUI(ctx->builder, src[0],
+                               get_llvm_type(ctx, 32, num_comp), "");
       break;
    case nir_op_f2f32: {
       LLVMTypeRef st = LLVMTypeOf(src[0]);
@@ -1765,14 +1792,17 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       break;
    }
    case nir_op_i2i64:
-      result = LLVMBuildSExt(ctx->builder, src[0], get_llvm_type(ctx, 64, 1), "");
+      result = LLVMBuildSExt(ctx->builder, src[0],
+                             get_llvm_type(ctx, 64, num_comp), "");
       break;
    case nir_op_u2u64:
-      result = LLVMBuildZExt(ctx->builder, src[0], get_llvm_type(ctx, 64, 1), "");
+      result = LLVMBuildZExt(ctx->builder, src[0],
+                             get_llvm_type(ctx, 64, num_comp), "");
       break;
    case nir_op_i2i32:
    case nir_op_u2u32:
-      result = LLVMBuildTrunc(ctx->builder, src[0], get_llvm_type(ctx, 32, 1), "");
+      result = LLVMBuildTrunc(ctx->builder, src[0],
+                              get_llvm_type(ctx, 32, num_comp), "");
       break;
    case nir_op_mov:
       result = src[0];
@@ -1807,9 +1837,15 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
          cond_val = LLVMBuildICmp(ctx->builder, LLVMIntNE, cond_val,
             LLVMConstNull(LLVMTypeOf(cond_val)), "");
       }
-      result = LLVMBuildSelect(ctx->builder, cond_val,
-         LLVMConstReal(LLVMFloatTypeInContext(ctx->llvm_ctx), 1.0),
-         LLVMConstReal(LLVMFloatTypeInContext(ctx->llvm_ctx), 0.0), "");
+      {
+         /* Float, not the integer get_llvm_type() gives for a 32-bit value:
+          * LLVMConstReal on an integer type is invalid and segfaulted pbribl. */
+         LLVMTypeRef f = LLVMFloatTypeInContext(ctx->llvm_ctx);
+         if (num_comp > 1)
+            f = LLVMVectorType(f, num_comp);
+         result = LLVMBuildSelect(ctx->builder, cond_val,
+            const_real_like(f, 1.0), const_real_like(f, 0.0), "");
+      }
       break;
    }
    case nir_op_b2i32: {

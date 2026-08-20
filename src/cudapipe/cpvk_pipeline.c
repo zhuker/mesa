@@ -58,6 +58,46 @@ static const struct spirv_to_nir_options cpvk_spirv_options = {
  * descriptor intrinsics need this driver's own descriptor model and are the
  * next milestone, so they still warn rather than silently computing on undef.
  */
+
+/*
+ * Which ALU operations still have to be scalarised.
+ *
+ * emit_alu() now applies the swizzle at any width, so in principle none do.
+ * In practice twelve samples render wrong without scalarisation while all
+ * fourteen unit tests pass, so something narrower than "vectors" is broken.
+ * CPVK_SCALARIZE selects what to keep scalarising, to find out which:
+ *
+ *   (unset) everything, which is the behaviour before this existed
+ *   none    nothing
+ *   alu     the arithmetic (fadd/fmul/ffma/...) only
+ *   sel     bcsel and the comparisons only
+ *   move    mov and the vecN constructors only
+ */
+static bool
+cpvk_scalarize_filter(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   const char *which = data;
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   if (!strcmp(which, "none"))
+      return false;
+
+   switch (alu->op) {
+   case nir_op_bcsel:
+   case nir_op_flt: case nir_op_fge: case nir_op_feq: case nir_op_fneu:
+   case nir_op_ilt: case nir_op_ige: case nir_op_ieq: case nir_op_ine:
+      return !strcmp(which, "sel");
+   case nir_op_mov:
+   case nir_op_vec2: case nir_op_vec3: case nir_op_vec4:
+      return !strcmp(which, "move");
+   default:
+      return !strcmp(which, "alu");
+   }
+}
+
 static void
 cpvk_lower_nir(nir_shader *nir)
 {
@@ -106,8 +146,14 @@ cpvk_lower_nir(nir_shader *nir)
     * cudapipe ever sees a shader. The capture's shaders use mix(). */
    NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, true);
 
-   if (!getenv("CPVK_NO_SCALARIZE"))
-      NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+   {
+      const char *which = getenv("CPVK_SCALARIZE");
+      if (!which)
+         NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+      else
+         NIR_PASS(_, nir, nir_lower_alu_to_scalar, cpvk_scalarize_filter,
+                  (void *)which);
+   }
 
    NIR_PASS(_, nir, nir_opt_dce);
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));

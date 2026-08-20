@@ -5029,3 +5029,37 @@ Scalarisation stays on until the texture paths follow, because until then
 turning it off renders twelve samples wrong.
 
 `CPVK_NO_SCALARIZE=1` is kept as the switch that measures the next step.
+
+### Which operations still need scalarising, and one segfault of my own making
+
+`CPVK_SCALARIZE` scalarises only a named class, which turns "vectors are
+broken" into a question with an answer:
+
+    (unset)  everything            18/18 run, 17/18 correct
+    none     nothing               16/18 run,  6/18 correct
+    alu      the arithmetic only   18/18 run, 17/18 correct
+    sel      bcsel/compares only   16/18 run,  6/18 correct
+    move     mov/vecN only         16/18 run,  6/18 correct
+
+`alu` matches the default exactly. So **`mov`, the `vecN` constructors, `bcsel`
+and the comparisons are already correct at full width** -- the swizzle fix
+covers them -- and what remains broken is the *arithmetic*, which is also where
+the register pressure is. All fourteen unit tests pass with no scalarisation at
+all, so whatever it is, none of them exercises it.
+
+Three conversions (`f2i32`, `f2u32`, `i2i64`, `u2u64`, `u2u32`) and two
+constant-building selects (`fsign`, `b2f`) hardcoded a one-component result
+type, which is invalid IR rather than wrong arithmetic at any wider width.
+Those are fixed. They did not change the `none` result -- still 6/18 -- so the
+arithmetic defect is none of them.
+
+**And one of those fixes segfaulted pbribl on the default path.**
+`get_llvm_type(ctx, 32, n)` returns an *integer* type, so building
+`LLVMConstReal` on it is invalid; `b2f` needs an explicit float. It was caught
+only by re-running the default sweep after a change whose whole point was that
+it could not affect the default path. Every claim in this document that a
+change is "correctness-neutral by construction" is worth exactly the sweep that
+followed it.
+
+    default now   18/18 run, 17/18 pixel-correct, fourteen unit tests
+    replays       7.36 and 22.80 ms
