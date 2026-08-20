@@ -3708,3 +3708,34 @@ minified centre. Every component tests clean in isolation, which after today
 suggests the next step is not another component but a substitution inside the
 sample itself -- the technique that resolved pbribl after the same kind of
 impasse.
+
+### texturemipmapgen solved: dynamic indexing into a sampler array resolves to element 0
+
+The shader uses a separate texture and a sampler *array*, indexed by a uniform:
+
+    layout (set = 0, binding = 1) uniform texture2D textureColor;
+    layout (set = 0, binding = 2) uniform sampler samplers[3];
+    color = texture(sampler2D(textureColor, samplers[ubo.samplerIndex]), inUV,
+                    inLodBias);
+
+Substituting a constant index for the dynamic one, on both drivers:
+
+    index      native (vs reference)   gallium (vs its own render)
+    samplers[0]        0.456                    0.456
+    samplers[1]        0.456                    2.908
+    samplers[2]        0.456                    0.000
+
+Gallium's dynamic index resolves to sampler 2 and its output changes with the
+index. **Native's output is identical for all three**, and identical to what it
+renders with the dynamic index -- and 0.456 is exactly the distance between
+sampler 0 and sampler 2 on the reference.
+
+So this driver always uses element 0 of the array. Sampler 0 is the one built
+with `lod=0.0..0.0`: no mipmapping. Every fragment therefore samples the base
+level, which is sharper and brighter than the mip chain would be, off the
+edges, concentrated where minification is strongest -- the exact signature
+measured and re-measured for this sample across many turns.
+
+It also explains why every component tested clean: the chain, the blit filter,
+implicit LOD selection and the sampler code are all correct, and the driver
+simply never asks them to use the sampler the shader named.
