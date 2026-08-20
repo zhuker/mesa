@@ -597,6 +597,10 @@ enum cp_tile_census_cut_kind {
    CP_TILE_CUT_MAP, CP_TILE_CUT_COPY, CP_TILE_CUT_FLUSH, CP_TILE_CUT_COMPUTE
 };
 void cp_tile_census_end_pass(struct cp_context *cp);
+
+/* Bring a renderer up on a device, and tear it down. No pipe_screen and no
+ * pipe_context are involved: this is the entry point a Vulkan front end uses. */
+bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 void cp_tile_census_cut(struct cp_context *cp, enum cp_tile_census_cut_kind k);
 
 /*

@@ -28,6 +28,7 @@
 #include "cp_nir_to_llvm.h"
 #include "cp_kernels.h"
 #include "cp_debug.h"
+#include "cp_device.h"
 #include "vk_buffer.h"
 #include "vk_image.h"
 #include "vk_descriptor_set_layout.h"
@@ -60,6 +61,10 @@ struct cpvk_device {
    CUcontext cu_ctx;
    CUstream stream;
    struct vk_queue queue;
+
+   /* The device the renderer will run on. cp_context itself is still declared
+    * in a header that pulls Gallium in; splitting that is the next slice. */
+   struct cp_device cp_dev;
 };
 
 /*
