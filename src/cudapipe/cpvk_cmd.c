@@ -1054,6 +1054,7 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
    cp->num_vs_ubos = cp->num_fs_ubos = CP_MAX_CONST_BUFFERS;
 
 
+
    cp_context_publish_state(cp);
 
    /* The single-draw call: every batch table NULL, which is the convention

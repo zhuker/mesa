@@ -831,3 +831,31 @@ sufficient to break the driver by a route pbribl does not take.
 Worth keeping straight: the test earned its place twice over, once by
 exonerating the vertex path and once by finding this, and it still has not
 explained the thing it was written for.
+
+### pbribl: everything cheap is now excluded, and it is being parked
+
+Under `compute-sanitizer`, pbribl reports **0 errors**. Nothing faults. The
+spheres are simply not producing coverage.
+
+Excluded, each by measurement:
+
+- the vertex layout, the offsets, the matrix and the push constant -- by
+  `cpvk_mesh`, which reproduces all of them and is byte-identical to lavapipe
+- the matrices themselves -- read out of the descriptor at the draw:
+  projection `0.974, 1.732`, model and view both sane
+- depth test and write, culling, winding -- each forced off, no change
+- a stale depth buffer -- clearing `cp->depthbuf` at every
+  `vkCmdBeginRendering` regardless of loadOp, no change
+- memory errors of any kind -- none reported
+
+Seven turns have gone into this sample. The remaining hypotheses all require
+reading the vertex shader's output, and the renderer's dump for that still
+crashes on a 1280x720 frame.
+
+**Parked deliberately.** The objective names replay time as well as
+correctness, and the native driver replays both captures at 78.90 ms and
+24.27 ms against recorded medians of 25.20 and 7.17 -- a measured regression
+with known, structural causes: no draw batching at all, a `cuStreamSynchronize`
+per submit, and host loops for resolves and scaling blits. That is tractable
+engineering against a number the objective actually names, and it is where the
+next turns should go.
