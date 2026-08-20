@@ -2165,3 +2165,41 @@ Everything behind the manifest is ready and stays: the twelve mandatory 1.3
 features are declared, the event API exists, and `vkCreateDevice` with
 `VkPhysicalDeviceVulkan13Features` succeeds. One line in `meson.build` turns it
 on the day those paths are as cheap as the ones they replace.
+
+### Where the native driver's 3.4x on replay actually is
+
+Not the host. Sampling GPU utilisation during the Crossroads replay, with both
+processes confirmed still running at the end of the window:
+
+    native   63.2% busy (median 64%)
+    gallium  47.7% busy (median 61%)
+
+A first attempt at this compared 0.5% against 65.8% and meant nothing: the
+Gallium replay had already *finished* inside the sampling window, because it is
+3.4x faster. Checking the process was alive is what made the second reading
+usable.
+
+Comparable occupancy over 3.4x the wall clock means the native driver is
+issuing roughly 3.4x the GPU work, not waiting on the host for it. And the
+thing the Gallium driver does that this one does not is merge draws.
+
+Batching, measured on the capture rather than argued about:
+
+    CPVK_BATCH off                     24.36 ms
+    CPVK_BATCH=1                       24.19 ms
+    CPVK_BATCH=1 CPVK_NO_DESC_KEY=1    24.21 ms
+
+Nothing, either way, because the descriptor-content key stops the merges.
+
+**And the key should not be needed.** `cp_batch_record` already snapshots each
+draw's vertex- and fragment-stage constant buffers into its own row of the
+batch table, and says so in a comment that calls them "the bindings the key
+stopped comparing". Per-draw uniforms are exactly what the table exists to
+carry. So the recorded fact that dropping the key renders `gltfscenerendering`
+wrong -- 20.768 against 0.000, three runs each way -- contradicts the design of
+the code it sits next to.
+
+That contradiction, not the batching front end, is the whole remaining
+performance gap. It is now the sharpest open question in this driver: something
+differs per draw, is read through the fragment stage, and is *not* in the row
+that `cp_batch_record` writes.
