@@ -197,15 +197,21 @@ struct cpvk_descriptor_pool {
 
 #define CPVK_MAX_DISPATCHES 64
 
+/* Buffer slot 0 is the push constant block; descriptors start after it. */
+#define CPVK_UBO_PUSH_SLOT  0
+#define CPVK_MAX_PUSH_BYTES 256
+
 struct cpvk_dispatch {
    struct cpvk_pipeline *pipeline;
    uint32_t grid[3];
    CUdeviceptr addrs[16];
+   /* Slot 0 is the push constant block for a compute shader exactly as it is
+    * for a graphics one. Leaving it empty is an address of zero, which is
+    * what a capture's dispatch was reading 128 bytes into. */
+   unsigned char push[CPVK_MAX_PUSH_BYTES];
+   unsigned push_size;
 };
 
-/* Buffer slot 0 is the push constant block; descriptors start after it. */
-#define CPVK_UBO_PUSH_SLOT  0
-#define CPVK_MAX_PUSH_BYTES 256
 #define CPVK_DESCRIPTOR_SIZE 64
 
 struct cpvk_draw {

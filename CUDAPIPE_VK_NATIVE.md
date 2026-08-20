@@ -477,3 +477,30 @@ This was attempted and reverted: with the `vec3` fix it still aborts inside
 `nir_lower_explicit_io`, so something else in the chain is still handing it a
 two-component address. The next attempt should find that before rewriting the
 numbering, because the numbering itself is not in doubt.
+
+## The replay's remaining fault, narrowed
+
+`compute-sanitizer` on the capture:
+
+    Invalid __global__ read of size 8 bytes
+      by thread (0,0,0) in block (0,0,0)
+      Address 0x80 is out of bounds
+
+An 8-byte read at 0x80 is `emit_buffer_base`'s 64-bit path reading a
+descriptor pointer at `const_buf_base(slot) + 128` where the slot resolved to
+zero. The driver now prints the dispatch's slots when a launch fails:
+
+    compute dispatch 5x3x1 failed: CUDA_ERROR_ILLEGAL_ADDRESS (700)
+      push=0 bytes, buffer slots: [1]=0x71db04032200 [2]=0x71db040322c0
+
+So slots 1 and 2 hold valid descriptor-set snapshots, no push constants were
+recorded, and something reads slot 0 -- the push constant slot -- 128 bytes
+in. Either the shader declares a push constant block the capture never
+pushes to before this dispatch, or it reads a descriptor set the app binds at
+a set index this layout maps to a slot nothing filled.
+
+The next step is to dump the compute shader's NIR at that pipeline and read
+which slot it loads, rather than reason about which one it ought to be.
+`CUDAPIPE_DUMP_NIR=1` prints it, but the capture builds many pipelines and the
+one that faults has to be identified first -- printing the pipeline pointer
+beside the dispatch would do it.

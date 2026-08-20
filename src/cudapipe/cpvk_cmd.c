@@ -410,8 +410,16 @@ cpvk_arena_retire(struct cpvk_cmd_buffer *cmd, CUdeviceptr arena)
 static CUdeviceptr
 cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
 {
-   if (!set->host || !set->layout->num_descriptors)
+   if (!set->host || !set->layout->num_descriptors) {
+      /* Returning zero here is an address of zero in a shader, which is the
+       * fault compute-sanitizer reports as a read at 0x80 -- descriptor two
+       * of a set that is not there. Say so at the point it happens. */
+      fprintf(stderr, "cudapipe: descriptor set has no buffer (%u descriptors, "
+              "host=%p); shaders reading it will fault\n",
+              set->layout ? set->layout->num_descriptors : 0,
+              (void *)set->host);
       return 0;
+   }
 
    size_t bytes = (size_t)set->layout->num_descriptors *
                   sizeof(struct cpvk_descriptor);
@@ -514,6 +522,8 @@ cpvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
    d->grid[1] = groupCountY;
    d->grid[2] = groupCountZ;
    memcpy(d->addrs, cmd->addrs, sizeof(d->addrs));
+   memcpy(d->push, cmd->push, sizeof(d->push));
+   d->push_size = cmd->push_size;
 }
 
 /* ------------------------------------------------------------- execution */
@@ -543,6 +553,22 @@ cpvk_execute_cmd_buffer(struct cpvk_device *dev, struct cpvk_cmd_buffer *cmd)
       for (unsigned s = 0; s < CPVK_MAX_ARG_BUFS; s++)
          slots[CPVK_ARG_UBO_BASE + s] = (void *)(uintptr_t)d->addrs[s];
 
+      /*
+       * The push constant block, in slot 0, which the graphics path staged
+       * and this one did not. A compute shader reading push constants
+       * therefore read address zero: compute-sanitizer reported an 8-byte
+       * read at 0x80, which is 128 bytes into a block that was not there.
+       */
+      CUdeviceptr push_block = 0;
+      if (d->push_size) {
+         if (cuMemAllocManaged(&push_block, d->push_size,
+                               CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
+            memcpy((void *)(uintptr_t)push_block, d->push, d->push_size);
+            slots[CPVK_ARG_UBO_BASE + CPVK_UBO_PUSH_SLOT] =
+               (void *)(uintptr_t)push_block;
+         }
+      }
+
       uint32_t *grid = (uint32_t *)((char *)slots + args_bytes);
       grid[0] = d->grid[0];
       grid[1] = d->grid[1];
@@ -562,16 +588,23 @@ cpvk_execute_cmd_buffer(struct cpvk_device *dev, struct cpvk_cmd_buffer *cmd)
          cuGetErrorName(err, &name);
          fprintf(stderr, "cudapipe: compute dispatch %ux%ux%u failed: %s (%d)\n",
                  d->grid[0], d->grid[1], d->grid[2], name ? name : "?", err);
+         fprintf(stderr, "cudapipe:   push=%u bytes, buffer slots:", d->push_size);
+         for (unsigned s = 0; s < CPVK_MAX_ARG_BUFS; s++)
+            if (d->addrs[s])
+               fprintf(stderr, " [%u]=%p", s, (void *)(uintptr_t)d->addrs[s]);
+         fprintf(stderr, "\n");
          cuMemFree(block);
          return vk_error(dev, VK_ERROR_DEVICE_LOST);
       }
 
-      /* The block is read by the kernel, so it cannot be released until the
-       * launch has run. One sync per dispatch is the wrong answer and is
+      /* The blocks are read by the kernel, so they cannot be released until
+       * the launch has run. One sync per dispatch is the wrong answer and is
        * replaced by the upload arena when there is a frame to amortise it
        * over; at one dispatch it is honest and obvious. */
       cuStreamSynchronize(dev->stream);
       cuMemFree(block);
+      if (push_block)
+         cuMemFree(push_block);
    }
    return VK_SUCCESS;
 }
