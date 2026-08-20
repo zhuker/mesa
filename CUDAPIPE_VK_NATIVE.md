@@ -663,3 +663,31 @@ At 0.456 mean this is the *smallest* difference of the ten wrong samples, and
 three turns have now gone into it on the strength of that inference. The band
 in `pbribl` at 4.325, which covers one horizontal strip and therefore one
 object or one pass, is a better-shaped signal and has had none.
+
+## pbribl: the spheres are missing, and the vertices are why
+
+Not a shading difference. The row of ten PBR spheres does not appear at all;
+the skybox behind them is pixel-perfect. That is what the "horizontal band"
+was.
+
+The draws happen -- ten of them, 4,512 triangles each, with the right
+framebuffer, viewport and vertex elements -- and `CUDAPIPE_DEBUG_WORK` reports
+`shaded=0` for every one. No fragment survives, so the triangles have no
+coverage: the vertices are wrong, not the shading.
+
+Excluded by disabling each and re-running, rather than by argument:
+
+- **Depth.** Forcing `depth_enabled` and `depth_writemask` off changes nothing.
+- **Culling.** Forcing `cull_face` to none changes nothing.
+- **Winding.** Inverting `front_ccw` changes nothing.
+
+So the vertex stage produces positions with no coverage. The draws use a
+96-byte vertex stride with three attributes at offsets 0, 12 and 24, which is
+a glTF model sharing one buffer between meshes -- so `vkCmdDrawIndexed`'s
+`vertexOffset`, which this driver maps to `cp_draw_range.index_bias`, is the
+first thing to check, followed by the push constant the sample uses to place
+each sphere.
+
+The way to see it is to print the first few vertex positions for one of those
+draws. The renderer prints them for small draws already; the flag needs to
+reach these.
