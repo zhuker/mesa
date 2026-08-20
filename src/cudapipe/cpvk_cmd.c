@@ -118,6 +118,76 @@ cpvk_ResetDescriptorPool(VkDevice _device, VkDescriptorPool pool,
    return VK_SUCCESS;
 }
 
+/*
+ * One descriptor written, shared by vkUpdateDescriptorSets and the template
+ * path. They differ only in where the VkDescriptorImageInfo and
+ * VkDescriptorBufferInfo come from -- an array, or a stride into a blob of
+ * application memory -- and a second copy of this switch would be a second
+ * thing to be right about a descriptor the first one is wrong about.
+ */
+static void
+cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
+                      VkDescriptorType type,
+                      const VkDescriptorImageInfo *ii,
+                      const VkDescriptorBufferInfo *bi)
+{
+   if (flat >= CPVK_MAX_BINDINGS)
+      return;
+
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: {
+      if (!bi)
+         break;
+      VK_FROM_HANDLE(cpvk_buffer, buffer, bi->buffer);
+      set->addrs[flat] = buffer && buffer->mem
+         ? buffer->mem->dev_ptr + buffer->offset + bi->offset : 0;
+      if (set->host)
+         set->host[flat].base = set->addrs[flat];
+      break;
+   }
+
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+   case VK_DESCRIPTOR_TYPE_SAMPLER: {
+      if (!set->host || !ii)
+         break;
+      if (ii->imageView) {
+         VK_FROM_HANDLE(cpvk_image_view, view, ii->imageView);
+         set->host[flat].texture_info = view ? view->tex_info : 0;
+      }
+      if (ii->sampler) {
+         VK_FROM_HANDLE(cpvk_sampler, samp, ii->sampler);
+         set->host[flat].sampler_index_or_img_stride = samp ? samp->index : 0;
+      }
+
+      /*
+       * A storage image is addressed directly by the shader rather than
+       * sampled, so it needs the four fields the backend's
+       * bindless_image_load and _store read out of the descriptor.
+       */
+      if (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && ii->imageView) {
+         VK_FROM_HANDLE(cpvk_image_view, view, ii->imageView);
+         struct cpvk_image *img = view ? view->image : NULL;
+         if (img && img->mem) {
+            unsigned level = view->vk.base_mip_level;
+            set->host[flat].base = img->mem->dev_ptr + img->offset;
+            set->host[flat].row_stride = img->row_stride[level];
+            set->host[flat].sampler_index_or_img_stride = img->level_size[level];
+            set->host[flat].base_offset = img->level_offset[level];
+         }
+      }
+      break;
+   }
+
+   default:
+      break;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
                           const VkWriteDescriptorSet *pWrites,
@@ -127,75 +197,80 @@ cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
    for (uint32_t w = 0; w < writeCount; w++) {
       const VkWriteDescriptorSet *write = &pWrites[w];
       VK_FROM_HANDLE(cpvk_descriptor_set, set, write->dstSet);
-      if (!set)
+      if (!set || write->dstBinding >= CPVK_MAX_BINDINGS)
          continue;
 
       for (uint32_t e = 0; e < write->descriptorCount; e++) {
-         unsigned binding = write->dstBinding;
-         if (binding >= CPVK_MAX_BINDINGS)
-            continue;
-         unsigned flat = set->layout->bindings[binding].flat +
+         unsigned flat = set->layout->bindings[write->dstBinding].flat +
                          write->dstArrayElement + e;
-         if (flat >= CPVK_MAX_BINDINGS)
-            continue;
+         cpvk_write_descriptor(set, flat, write->descriptorType,
+                               write->pImageInfo ? &write->pImageInfo[e] : NULL,
+                               write->pBufferInfo ? &write->pBufferInfo[e] : NULL);
+      }
+   }
+}
 
-         switch (write->descriptorType) {
-         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
-         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: {
-            VK_FROM_HANDLE(cpvk_buffer, buffer, write->pBufferInfo[e].buffer);
-            set->addrs[flat] = buffer && buffer->mem
-               ? buffer->mem->dev_ptr + buffer->offset +
-                 write->pBufferInfo[e].offset
-               : 0;
-            if (set->host)
-               set->host[flat].base = set->addrs[flat];
-            break;
-         }
+/* ------------------------------------------------- update templates */
 
-         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-         case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-         case VK_DESCRIPTOR_TYPE_SAMPLER: {
-            if (!set->host)
-               break;
-            const VkDescriptorImageInfo *ii = &write->pImageInfo[e];
-            if (ii->imageView) {
-               VK_FROM_HANDLE(cpvk_image_view, view, ii->imageView);
-               set->host[flat].texture_info = view ? view->tex_info : 0;
-            }
-            if (ii->sampler) {
-               VK_FROM_HANDLE(cpvk_sampler, samp, ii->sampler);
-               set->host[flat].sampler_index_or_img_stride =
-                  samp ? samp->index : 0;
-            }
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_CreateDescriptorUpdateTemplate(
+   VkDevice _device, const VkDescriptorUpdateTemplateCreateInfo *pCreateInfo,
+   const VkAllocationCallbacks *pAllocator,
+   VkDescriptorUpdateTemplate *pTemplate)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
 
-            /*
-             * A storage image is addressed directly by the shader rather
-             * than sampled, so it needs the four fields the backend's
-             * bindless_image_load and _store read out of the descriptor:
-             * base, row stride, layer stride and base offset.
-             */
-            if (write->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
-                ii->imageView) {
-               VK_FROM_HANDLE(cpvk_image_view, view, ii->imageView);
-               struct cpvk_image *img = view ? view->image : NULL;
-               if (img && img->mem) {
-                  unsigned level = view->vk.base_mip_level;
-                  set->host[flat].base = img->mem->dev_ptr + img->offset;
-                  set->host[flat].row_stride = img->row_stride[level];
-                  set->host[flat].sampler_index_or_img_stride =
-                     img->level_size[level];
-                  set->host[flat].base_offset = img->level_offset[level];
-               }
-            }
-            break;
-         }
+   struct cpvk_descriptor_update_template *tmpl =
+      vk_object_zalloc(&dev->vk, pAllocator,
+                       sizeof(*tmpl) + pCreateInfo->descriptorUpdateEntryCount *
+                                       sizeof(*tmpl->entries),
+                       VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE);
+   if (!tmpl)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-         default:
-            break;
-         }
+   tmpl->entry_count = pCreateInfo->descriptorUpdateEntryCount;
+   memcpy(tmpl->entries, pCreateInfo->pDescriptorUpdateEntries,
+          tmpl->entry_count * sizeof(*tmpl->entries));
+
+   *pTemplate = cpvk_descriptor_update_template_to_handle(tmpl);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_DestroyDescriptorUpdateTemplate(VkDevice _device,
+                                     VkDescriptorUpdateTemplate _tmpl,
+                                     const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+   VK_FROM_HANDLE(cpvk_descriptor_update_template, tmpl, _tmpl);
+
+   if (tmpl)
+      vk_object_free(&dev->vk, pAllocator, tmpl);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_UpdateDescriptorSetWithTemplate(VkDevice _device, VkDescriptorSet _set,
+                                     VkDescriptorUpdateTemplate _tmpl,
+                                     const void *pData)
+{
+   VK_FROM_HANDLE(cpvk_descriptor_set, set, _set);
+   VK_FROM_HANDLE(cpvk_descriptor_update_template, tmpl, _tmpl);
+
+   if (!set || !tmpl)
+      return;
+
+   for (uint32_t i = 0; i < tmpl->entry_count; i++) {
+      const VkDescriptorUpdateTemplateEntry *e = &tmpl->entries[i];
+      if (e->dstBinding >= CPVK_MAX_BINDINGS)
+         continue;
+
+      for (uint32_t j = 0; j < e->descriptorCount; j++) {
+         const char *src = (const char *)pData + e->offset + j * e->stride;
+         unsigned flat = set->layout->bindings[e->dstBinding].flat +
+                         e->dstArrayElement + j;
+         cpvk_write_descriptor(set, flat, e->descriptorType,
+                               (const VkDescriptorImageInfo *)src,
+                               (const VkDescriptorBufferInfo *)src);
       }
    }
 }

@@ -446,3 +446,34 @@ One constraint that is easy to miss: the sampler-variant optimisation in
 `cp_renderer.c` reads the descriptor **on the host** to decide whether a
 shader can be specialised, so descriptor memory has to be host-readable.
 Managed memory, not device-local.
+
+## The constant-buffer slot numbering, and why it has to be lavapipe's
+
+The native driver numbers a slot per push-constant block, then one per
+descriptor *binding*, then one per set. A real capture's pipeline layouts want
+17, 18, 22 and 23 slots and there are `CP_MAX_CONST_BUFFERS` = 16. The
+bindings past the limit reach the shader as an address of zero, and the replay
+dies on a 5x3x1 compute dispatch with `CUDA_ERROR_ILLEGAL_ADDRESS`.
+
+lavapipe's scheme, which is the one the backend was written against:
+
+- `vulkan_resource_index(set, binding, index)` becomes
+  `vec3(set + 1, index * stride + binding_offset, 0)` — component 0 is the
+  constant-buffer slot, **one per set**, with slot 0 the push constants.
+- The address format is `nir_address_format_vec2_index_32bit_offset`, whose
+  address is **three** components despite the name. Returning a `vec2` trips
+  `addr_to_index`'s assertion in `nir_lower_explicit_io`.
+- Afterwards, every `load_ubo`/`load_ssbo`/`ssbo_atomic` whose source is still
+  the pair becomes `load_const_buf_base_addr_lvp(slot) + offset`, a 64-bit
+  descriptor address. `emit_buffer_base` dereferences that and reads the
+  buffer pointer out of the descriptor's first field, which is where
+  `cpvk_descriptor` already keeps it.
+
+A binding is then an offset inside its set's buffer rather than a slot of its
+own, so the slot count depends on the number of sets and not on how many
+bindings they hold.
+
+This was attempted and reverted: with the `vec3` fix it still aborts inside
+`nir_lower_explicit_io`, so something else in the chain is still handing it a
+two-component address. The next attempt should find that before rewriting the
+numbering, because the numbering itself is not in doubt.

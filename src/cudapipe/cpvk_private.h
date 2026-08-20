@@ -180,6 +180,12 @@ struct cpvk_query_pool {
    bool *available;
 };
 
+struct cpvk_descriptor_update_template {
+   struct vk_object_base base;
+   uint32_t entry_count;
+   VkDescriptorUpdateTemplateEntry entries[];
+};
+
 struct cpvk_sampler {
    struct vk_object_base base;
    unsigned index;                    /* into cp_sampler_table */
@@ -394,6 +400,9 @@ VK_DEFINE_HANDLE_CASTS(cpvk_instance, vk.base, VkInstance,
 VK_DEFINE_HANDLE_CASTS(cpvk_physical_device, vk.base, VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 VK_DEFINE_HANDLE_CASTS(cpvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_descriptor_update_template, base,
+                               VkDescriptorUpdateTemplate,
+                               VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE)
 VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_query_pool, base, VkQueryPool,
                                VK_OBJECT_TYPE_QUERY_POOL)
 VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_sampler, base, VkSampler,
