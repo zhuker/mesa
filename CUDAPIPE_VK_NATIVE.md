@@ -3773,3 +3773,35 @@ present. That it changes nothing here is recorded rather than assumed.
 
 What is left is the one link not yet observed directly: which address the
 shader actually passes as `samp_handle`. Every other step has been printed.
+
+### The sampler handle is element 0, printed from the device
+
+A `printf` in the sampler, on texturemipmapgen:
+
+    samp_handle=74614a115280  tex_handle=74614a115240
+
+They differ by 0x40, one descriptor. The sampled image is at flat 1, so the
+sampler is at flat 2 -- `samplers[0]`, the one with `lod=0.0..0.0`. The array
+index never reaches the handle.
+
+Two more gaps found and closed while looking, neither of them this one:
+
+- `nir_tex_src_sampler_offset` and `nir_tex_src_texture_offset` were not
+  handled at all. They are the standard way an array element reaches a texture
+  instruction, and a shader using them would have been silently wrong. Now
+  applied to the handle in descriptors. texturemipmapgen is unchanged, so its
+  NIR does not use that form either.
+- `vulkan_resource_reindex`, closed last turn, likewise.
+
+So three plausible mechanisms for carrying the index -- reindex, tex src
+offsets, and a dynamic `vulkan_resource_index` -- are implemented, and the
+handle is still element 0.
+
+The remaining possibility that has not been tested is the simplest: that the
+index the shader computes *is* zero, because `ubo.samplerIndex` reads as zero.
+The uniform block puts it at offset 228, behind three mat4s, a vec4 and a
+float. Against that stands the earlier substitution where an explicit constant
+index also produced element 0 -- but that test compared images, not handles,
+and the handle is now printable. Re-running the printf against the
+constant-index shader distinguishes the two in one step, and should have been
+the test rather than the image comparison.

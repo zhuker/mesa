@@ -1943,6 +1943,11 @@ cp_tex_flags(const nir_tex_instr *tex)
  * written in CUDA C (cp_sampler.cu). Its relocatable PTX is linked with this
  * shader's PTX at module-load time, so this is just an external call.
  */
+/* One descriptor, matching cpvk_private.h's struct cpvk_descriptor. The
+ * backend cannot include the Vulkan driver's header, so the size is asserted
+ * against the layout the descriptor lowering uses. */
+#define CPVK_DESCRIPTOR_SIZE 64
+
 static void
 emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
 {
@@ -1954,6 +1959,7 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
 
    LLVMValueRef tex_handle = NULL, samp_handle = NULL, coord = NULL;
    LLVMValueRef explicit_lod = NULL;
+   LLVMValueRef sampler_offset = NULL, texture_offset = NULL;
    for (unsigned i = 0; i < tex->num_srcs; i++) {
       switch (tex->src[i].src_type) {
       case nir_tex_src_texture_handle:
@@ -1964,6 +1970,19 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
          break;
       case nir_tex_src_coord:
          coord = get_src(ctx, &tex->src[i].src);
+         break;
+      case nir_tex_src_sampler_offset:
+         /*
+          * The element of a sampler array, which arrives as an offset in
+          * descriptors rather than folded into the handle. Dropping it put
+          * every access on element 0: texturemipmapgen selects among three
+          * samplers with a uniform and always got the first, the one with no
+          * mip levels.
+          */
+         sampler_offset = get_src(ctx, &tex->src[i].src);
+         break;
+      case nir_tex_src_texture_offset:
+         texture_offset = get_src(ctx, &tex->src[i].src);
          break;
       case nir_tex_src_lod:
          explicit_lod = get_src(ctx, &tex->src[i].src);
@@ -2043,6 +2062,20 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
 
    if (!samp_handle)
       samp_handle = LLVMConstInt(i64, 0, false);
+
+   /* Array elements, in descriptors, applied to the handles they index. */
+   if (sampler_offset) {
+      LLVMValueRef off = LLVMBuildZExt(ctx->builder, sampler_offset, i64, "");
+      samp_handle = LLVMBuildAdd(ctx->builder, samp_handle,
+         LLVMBuildMul(ctx->builder, off,
+                      LLVMConstInt(i64, CPVK_DESCRIPTOR_SIZE, false), ""), "");
+   }
+   if (texture_offset) {
+      LLVMValueRef off = LLVMBuildZExt(ctx->builder, texture_offset, i64, "");
+      tex_handle = LLVMBuildAdd(ctx->builder, tex_handle,
+         LLVMBuildMul(ctx->builder, off,
+                      LLVMConstInt(i64, CPVK_DESCRIPTOR_SIZE, false), ""), "");
+   }
 
    /* Pull out up to three coordinate components as floats. Texel fetches carry
     * integer coordinates, which convert numerically; sampled coordinates are
