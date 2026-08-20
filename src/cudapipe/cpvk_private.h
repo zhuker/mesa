@@ -306,6 +306,14 @@ struct cpvk_clear {
    uint64_t offset;
    unsigned width, height, stride, pixel_size;
    uint32_t value[4];
+   /*
+    * Every sample, not just the first. A multisampled image keeps its samples
+    * as planes, and clearing only plane zero left the other three black: the
+    * resolve then averaged one cleared sample with three that were not, and
+    * multisampling's white background came out 64, which is 255/4 rounded.
+    */
+   unsigned samples;
+   uint64_t sample_stride;
 };
 
 /*

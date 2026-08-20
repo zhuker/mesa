@@ -827,6 +827,8 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          .height = fb.height,
          .stride = cimg->row_stride[0],
          .pixel_size = util_format_get_blocksize(pfmt),
+         .samples = cmd->fb_samples,
+         .sample_stride = fb.color_sample_stride,
       };
       /* Packed here rather than in the kernel: cp_clear_rect takes the value
        * already packed, and packing it twice produces a plausible wrong
@@ -1040,8 +1042,11 @@ cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c)
       return;
    }
 
-   cp_clear_rect(cp, c->data, c->offset, c->width, c->height, c->stride,
-                 c->pixel_size, c->value, false);
+   /* Once per sample plane. */
+   for (unsigned s = 0; s < MAX2(c->samples, 1u); s++)
+      cp_clear_rect(cp, (char *)c->data + s * c->sample_stride, c->offset,
+                    c->width, c->height, c->stride, c->pixel_size, c->value,
+                    false);
 }
 
 /* ------------------------------------------------------------- batching */

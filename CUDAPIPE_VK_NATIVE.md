@@ -1624,3 +1624,34 @@ evidence says it is not.
 94.3% of bytes differ, every row and every column, max 254. This is not a
 filtering or precision difference and there is no point measuring it further
 until the driver resolves a multisampled attachment at all, which it does not.
+
+### multisampling: the resolve worked; the clear did not
+
+The model renders correctly and antialiased in both images, so the resolve
+this driver added earlier is doing its job. The background is the difference,
+and it is exact: white in the reference, **64 in every channel** in the native
+frame, over 843,184 pixels.
+
+64 is 255/4 rounded. The attachment has four samples, the clear wrote one of
+them, and the resolve averaged 255 + 0 + 0 + 0.
+
+A multisampled image keeps its samples as planes, and `cp_clear_rect` was
+called once, on plane zero. Calling it once per plane:
+
+    multisampling  176.291 -> 0.553
+
+What is left is 0.553, and it is edge antialiasing rather than background:
+sample positions, which this driver chooses itself. That is a different kind
+of difference from the one just fixed and may be the point at which "identical
+to lavapipe" stops being the right target for this sample.
+
+Three samples remain, all now numerically close and none of them blank or
+flat:
+
+    pbribl            1.472   reflections
+    multisampling     0.553   sample positions
+    texturemipmapgen  0.456   LOD selection
+
+The lesson from this turn is the same as the last one: the diagnosis was
+"there is no resolve", written down twice in earlier sessions, and it was
+wrong. One pixel value falsified it in a minute.
