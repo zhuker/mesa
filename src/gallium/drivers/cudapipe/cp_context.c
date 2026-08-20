@@ -1594,7 +1594,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
                    unsigned reject_pass, CUdeviceptr seg_ranges,
                    unsigned num_seg_ranges)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    struct cp_shader_binary *fs = cp->fs_shader;
 
    if (!fs || !fs->kernel || !vs_output_buf || !cp->vs_shader ||
@@ -2733,7 +2733,7 @@ cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
  * sums[0] of the top level on the device. Used over the pixels for the
  * fragment lists and over the 2x2 blocks for the quads. */
 static void
-cp_abuf_scan_n(struct cp_context *cp, struct cp_screen *screen,
+cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen,
                CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x,
                CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3,
                unsigned n, unsigned nb1, unsigned nb2, unsigned nb3,
@@ -2784,7 +2784,7 @@ cp_abuf_scan_n(struct cp_context *cp, struct cp_screen *screen,
 }
 
 static void
-cp_abuf_scan(struct cp_context *cp, struct cp_screen *screen,
+cp_abuf_scan(struct cp_context *cp, struct cp_device *screen,
              struct cp_abuf *ab, unsigned n)
 {
    cp_abuf_scan_n(cp, screen, ab->counts, ab->offsets, ab->sum1, ab->sum1x,
@@ -3163,7 +3163,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
               float *t_shade, float *t_composite,
               struct cp_abuf_seg_shade *seg)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    struct cp_shader_binary *fs = cp->fs_shader;
 
    *t_interp = 0.0f;
@@ -3514,7 +3514,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                 const uint64_t *vb_table,
                 const struct cp_rect *scissors)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    const struct cp_fb_desc *fb = &cp->fb;
 
    /*
@@ -5730,7 +5730,7 @@ cp_batch_order_free(struct cp_context *cp)
 static bool
 cp_batch_abuf_ok(struct cp_context *cp)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    const struct cp_fb_desc *fb = &cp->fb;
 
    if (!cp_abuf_enabled() || cp_abuf.disabled)
@@ -5863,7 +5863,7 @@ cp_batch_record(struct cp_context *cp,
 static bool
 cp_pass_appendable(struct cp_context *cp)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    struct cp_abuf *ab = &cp_abuf;
 
    if (cp_debug->no_pass_episode || cp_debug->no_abuf_batch)
@@ -6061,7 +6061,7 @@ static bool
 cp_opaque_tile_visibility(struct cp_context *cp, struct cp_pass_seg *segs,
                           unsigned nsegs, unsigned w, unsigned h)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    if (!cp_debug->tiled_opaque || !screen->kernels.opaque_tile_count ||
        !screen->kernels.opaque_tile_fill ||
        !screen->kernels.opaque_tile_raster)
@@ -6376,7 +6376,7 @@ cp_tile_census_shader_index(struct cp_context *cp, struct cp_shader_binary *fs)
 static bool
 cp_tile_census_begin(struct cp_context *cp, unsigned w, unsigned h)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    unsigned tile = cp_debug->tile_census;
 
    if (!tile || !w || !h || !screen->kernels.tile_census_mark ||
@@ -6514,7 +6514,7 @@ static void
 cp_tile_census_quads(struct cp_context *cp, struct cp_pass_seg *segs,
                      unsigned nsegs, unsigned w, unsigned h)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    struct cp_abuf *ab = &cp_abuf;
    struct cp_tile_census_args ca;
 
@@ -6540,7 +6540,7 @@ static void
 cp_tile_census_visbuf(struct cp_context *cp, struct cp_pass_seg *segs,
                       unsigned nsegs, unsigned w, unsigned h)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    struct cp_tile_census_args ca;
 
    if (!cp->visbuf || !screen->kernels.tile_census_mark_vis ||
@@ -6561,7 +6561,7 @@ cp_tile_census_visbuf(struct cp_context *cp, struct cp_pass_seg *segs,
 static void
 cp_tile_census_reduce_pass(struct cp_context *cp)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
 
    if (!cp->tile_census_open)
       return;
@@ -6961,7 +6961,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
 void
 cp_pass_finish(struct cp_context *cp)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    struct cp_abuf *ab = &cp_abuf;
    unsigned nsegs = cp->pass.nsegs;
 
@@ -7671,7 +7671,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *gallium_info,
 {
    struct cp_gallium *g = (struct cp_gallium *)ctx;
    struct cp_context *cp = cp_ctx(ctx);
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
 
    /*
     * The Gallium adapter, and the only place in the driver that sees
@@ -9007,7 +9007,7 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
       return NULL;
    struct cp_context *ctx = &g->cp;
 
-   ctx->screen = cp_screen(screen);
+   ctx->screen = &cp_screen(screen)->dev;
    g->base.screen = screen;
    g->base.priv = priv;
 

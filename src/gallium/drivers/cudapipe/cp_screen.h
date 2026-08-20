@@ -17,17 +17,28 @@ struct cp_fence {
    int32_t refcount;
 };
 
-struct cp_screen {
-   struct pipe_screen base;
-
-   struct sw_winsys *winsys;
-
+/*
+ * The device the renderer runs on: a CUDA context, the compiled kernels and
+ * the compute capability, and nothing else. This is everything the draw
+ * pipeline ever wanted from the screen -- it reads exactly these four things
+ * across 118 sites -- so it is what a Vulkan front end supplies instead of a
+ * pipe_screen.
+ */
+struct cp_device {
    CUdevice cuda_device;
    CUcontext cuda_ctx;
    int sm_major;
    int sm_minor;
 
    struct cp_kernels kernels;
+};
+
+struct cp_screen {
+   struct pipe_screen base;
+
+   struct sw_winsys *winsys;
+
+   struct cp_device dev;
 
    char renderer_string[128];
 };

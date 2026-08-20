@@ -103,7 +103,9 @@ struct cp_gallium;
 
 struct cp_context {
 
-   struct cp_screen *screen;
+   /* The device, not the screen: four fields the pipeline reads, and no
+    * pipe_screen behind them. A Vulkan front end supplies one directly. */
+   struct cp_device *screen;
 
    /*
     * Draws held back for merging. `pending` means one or more draws have been

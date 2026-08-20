@@ -281,8 +281,8 @@ static void
 cp_destroy_screen(struct pipe_screen *screen)
 {
    struct cp_screen *cp = cp_screen(screen);
-   cp_kernels_destroy(&cp->kernels);
-   cuCtxDestroy(cp->cuda_ctx);
+   cp_kernels_destroy(&cp->dev.kernels);
+   cuCtxDestroy(cp->dev.cuda_ctx);
    FREE(cp);
 }
 
@@ -303,7 +303,7 @@ cp_fence_reference(struct pipe_screen *screen,
       p_atomic_inc(&s->refcount);
    if (d && p_atomic_dec_zero(&d->refcount)) {
       struct cp_screen *cp = (struct cp_screen *)screen;
-      cuCtxSetCurrent(cp->cuda_ctx);
+      cuCtxSetCurrent(cp->dev.cuda_ctx);
       cuEventDestroy(d->event);
       free(d);
    }
@@ -317,7 +317,7 @@ cp_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
    if (!fence)
       return true;
    struct cp_screen *cp = (struct cp_screen *)screen;
-   cuCtxSetCurrent(cp->cuda_ctx);
+   cuCtxSetCurrent(cp->dev.cuda_ctx);
    /* The event was recorded on the context's main stream after every side
     * stream joined it (see cp_flush), so waiting it means everything queued
     * before the flush has retired — without also draining work queued since,
@@ -375,7 +375,7 @@ cudapipe_create_screen(struct sw_winsys *winsys)
       return NULL;
    }
 
-   if (cuDeviceGet(&screen->cuda_device, 0) != CUDA_SUCCESS) {
+   if (cuDeviceGet(&screen->dev.cuda_device, 0) != CUDA_SUCCESS) {
       fprintf(stderr, "cudapipe: cuDeviceGet failed\n");
       FREE(screen);
       return NULL;
@@ -383,7 +383,7 @@ cudapipe_create_screen(struct sw_winsys *winsys)
 
    {
       /* CUDA 13 added a ctx-params argument; 12.x takes (ctx, flags, dev). */
-      CUresult err = cuCtxCreate(&screen->cuda_ctx, 0, screen->cuda_device);
+      CUresult err = cuCtxCreate(&screen->dev.cuda_ctx, 0, screen->dev.cuda_device);
       if (err != CUDA_SUCCESS) {
          fprintf(stderr, "cudapipe: cuCtxCreate failed (%d)\n", err);
          FREE(screen);
@@ -391,18 +391,18 @@ cudapipe_create_screen(struct sw_winsys *winsys)
       }
    }
 
-   cuDeviceGetAttribute(&screen->sm_major,
+   cuDeviceGetAttribute(&screen->dev.sm_major,
                         CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                        screen->cuda_device);
-   cuDeviceGetAttribute(&screen->sm_minor,
+                        screen->dev.cuda_device);
+   cuDeviceGetAttribute(&screen->dev.sm_minor,
                         CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                        screen->cuda_device);
+                        screen->dev.cuda_device);
 
    snprintf(screen->renderer_string, sizeof(screen->renderer_string),
-            "cudapipe (sm_%d%d)", screen->sm_major, screen->sm_minor);
+            "cudapipe (sm_%d%d)", screen->dev.sm_major, screen->dev.sm_minor);
 
-   if (!cp_kernels_init(&screen->kernels, screen->sm_major,
-                        screen->sm_minor)) {
+   if (!cp_kernels_init(&screen->dev.kernels, screen->dev.sm_major,
+                        screen->dev.sm_minor)) {
       fprintf(stderr, "cudapipe: warning: rasterization kernels failed to compile\n");
       /* Non-fatal — compute still works, just no draw support */
    }

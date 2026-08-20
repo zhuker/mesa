@@ -839,7 +839,7 @@ cp_clear_rect_kernel(struct cp_context *cp, struct cp_resource *res,
                      unsigned stride, unsigned pixel_size,
                      const uint32_t value[4], bool depth)
 {
-   struct cp_screen *screen = cp->screen;
+   struct cp_device *screen = cp->screen;
    CUfunction fn = depth ? screen->kernels.clear_depth_kernel
                          : screen->kernels.clear_kernel;
    void *data = cp_resource_data(res);
@@ -1027,7 +1027,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
          unsigned stencil)
 {
    struct cp_context *cpc = cp_ctx(ctx);
-   struct cp_screen *screen = cpc->screen;
+   struct cp_device *screen = cpc->screen;
    struct pipe_framebuffer_state *fb = &cp_gallium_of(cpc)->framebuffer;
 
    cuCtxSetCurrent(screen->cuda_ctx);
@@ -1494,7 +1494,7 @@ cp_arena_grow(struct cp_screen *cp, int cls, enum cp_arena_mode mode)
          cuMemAdvise(dev, CP_ARENA_BLOCK_SIZE,
                      CU_MEM_ADVISE_SET_PREFERRED_LOCATION, CU_DEVICE_CPU);
          cuMemAdvise(dev, CP_ARENA_BLOCK_SIZE,
-                     CU_MEM_ADVISE_SET_ACCESSED_BY, cp->cuda_device);
+                     CU_MEM_ADVISE_SET_ACCESSED_BY, cp->dev.cuda_device);
       }
    }
 
@@ -1601,7 +1601,7 @@ cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
    CUdeviceptr dev = 0;
    int cls;
 
-   cuCtxSetCurrent(cp->cuda_ctx);
+   cuCtxSetCurrent(cp->dev.cuda_ctx);
 
    if (mode != CP_ARENA_OFF && (cls = cp_arena_class(size)) >= 0 &&
        p_atomic_inc_return(&cp_arena_seen) > cp_arena_warmup()) {
@@ -1655,7 +1655,7 @@ cp_allocate_memory_device(struct pipe_screen *screen, uint64_t size)
    struct cp_device_memory *mem = CALLOC_STRUCT(cp_device_memory);
    if (!mem)
       return NULL;
-   cuCtxSetCurrent(cp->cuda_ctx);
+   cuCtxSetCurrent(cp->dev.cuda_ctx);
    CUresult err = cuMemAlloc(&mem->dev, size);
    if (err != CUDA_SUCCESS) {
       CP_CU_WARN(err, "cuMemAlloc for device-local VkDeviceMemory");
@@ -1680,7 +1680,7 @@ cp_clear_memory(struct pipe_screen *screen,
    simple_mtx_unlock(&cp_arena.lock);
    if (!device_mem)
       return;
-   cuCtxSetCurrent(cp->cuda_ctx);
+   cuCtxSetCurrent(cp->dev.cuda_ctx);
    CUresult err = cuMemsetD8(device_mem->dev, 0, size);
    CP_CU_WARN(err, "cuMemsetD8 for zero-initialized VkDeviceMemory");
 }
@@ -1702,7 +1702,7 @@ cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
       *link = device_mem->next;
    simple_mtx_unlock(&cp_arena.lock);
    if (device_mem) {
-      cuCtxSetCurrent(cp->cuda_ctx);
+      cuCtxSetCurrent(cp->dev.cuda_ctx);
       cuMemFree(device_mem->dev);
       FREE(device_mem);
       return;
@@ -1714,7 +1714,7 @@ cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
    if (cp_managed_cache_put((CUdeviceptr)(uintptr_t)mem))
       return;
 
-   cuCtxSetCurrent(cp->cuda_ctx);
+   cuCtxSetCurrent(cp->dev.cuda_ctx);
    cuMemFree((CUdeviceptr)(uintptr_t)mem);
 }
 
