@@ -975,6 +975,9 @@ cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c)
 {
    struct cp_context *cp = &dev->renderer;
 
+   /* So does a clear. */
+   cp_batch_flush(cp);
+
    if (c->depth) {
       cp_clear_depthbuf(cp, c->depth_value);
       return;
@@ -982,6 +985,194 @@ cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c)
 
    cp_clear_rect(cp, c->data, c->offset, c->width, c->height, c->stride,
                  c->pixel_size, c->value, false);
+}
+
+/* ------------------------------------------------------------- batching */
+
+/*
+ * The pipeline state two draws must share to merge, in the form this front
+ * end has it.
+ *
+ * A VkPipeline is immutable and holds the rasterizer, depth, blend, vertex
+ * layout and topology, so its address covers all of them at once -- which is
+ * the shape cp_draw_types.h anticipated for this driver. Only what a command
+ * buffer can change without a new pipeline goes beside it.
+ */
+struct cpvk_batch_state {
+   const void *pipeline;
+   struct cp_viewport_state viewport;
+   unsigned fb_samples;
+   /*
+    * The fragment stage's bindings, by address.
+    *
+    * cp_batch_key deliberately omits the *vertex* stage's, because a batch
+    * carries one row of them per draw. It says nothing about the fragment
+    * stage's, and a batch carries only one set of those -- so two draws that
+    * sample different textures must not merge, and leaving these out shaded a
+    * whole batch with whichever descriptor arrived last. computeshader went
+    * from 4.4 to 83.5 and multithreading from exact to wrong before this was
+    * here.
+    */
+   uint64_t fs_ubos[CP_MAX_CONST_BUFFERS];
+};
+
+static const struct cp_batch_state_field cpvk_batch_state_field_table[] = {
+   { "pipeline",   offsetof(struct cpvk_batch_state, pipeline),
+                   sizeof(((struct cpvk_batch_state *)0)->pipeline) },
+   { "viewport",   offsetof(struct cpvk_batch_state, viewport),
+                   sizeof(((struct cpvk_batch_state *)0)->viewport) },
+   { "fb_samples", offsetof(struct cpvk_batch_state, fb_samples),
+                   sizeof(((struct cpvk_batch_state *)0)->fb_samples) },
+   { "fs_ubos",    offsetof(struct cpvk_batch_state, fs_ubos),
+                   sizeof(((struct cpvk_batch_state *)0)->fs_ubos) },
+};
+
+const struct cp_batch_state_field *
+cp_batch_state_fields(unsigned *count)
+{
+   *count = ARRAY_SIZE(cpvk_batch_state_field_table);
+   return cpvk_batch_state_field_table;
+}
+
+static_assert(sizeof(struct cpvk_batch_state) <= CP_BATCH_STATE_BYTES,
+              "the batch key's state blob is too small for this front end");
+
+/*
+ * Everything that has to match for two draws to merge, filled from the
+ * context the draw was just staged into. Compared with memcmp and nothing
+ * else, so a field left out is simply not a merge condition -- which is why
+ * this fills a zeroed struct and copies whole values rather than deriving
+ * any of them.
+ */
+static void
+cpvk_build_batch_key(struct cpvk_device *dev, const struct cpvk_draw *d,
+                     struct cp_batch_key *key, bool blended)
+{
+   struct cp_context *cp = &dev->renderer;
+
+   memset(key, 0, sizeof(*key));
+
+   key->vs = cp->vs_shader;
+   key->fs = cp->fs_shader;
+
+   /* The colour target's identity. Natively an image view names it, and its
+    * memory is what the kernels write, so both go in. */
+   key->cbuf_texture = d->fb.color;
+   key->color_data = d->fb.color;
+   key->zs_texture = d->fb.has_zs ? (const void *)(uintptr_t)1 : NULL;
+   key->visbuf = cp->visbuf;
+   key->depthbuf = cp->depthbuf;
+   key->fb_w = d->fb.width;
+   key->fb_h = d->fb.height;
+   key->fb_nr_cbufs = d->fb.nr_cbufs;
+   key->fb_samples = cp->fb_samples;
+   key->cbuf_format = (uint32_t)d->fb.color_encoding;
+
+   key->mode = d->call.mode;
+   key->index_size = d->call.index_size;
+   key->start_instance = d->call.start_instance;
+   key->index_resource = d->call.index_ptr;
+
+   key->scissor = d->scissor;
+   key->blend_enabled = blended;
+
+   struct cpvk_batch_state state;
+   memset(&state, 0, sizeof(state));
+   state.pipeline = d->pipeline;
+   state.viewport = d->viewport;
+   state.fb_samples = cp->fb_samples;
+   for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++)
+      state.fs_ubos[i] = (uint64_t)(uintptr_t)cp->fs_ubos[i].buffer;
+   memcpy(key->state, &state, sizeof(state));
+
+   key->num_vertex_elements = cp->num_vertex_elements;
+   key->vertex_stride = cp->vertex_stride;
+   key->num_vertex_buffers = cp->num_vertex_buffers;
+   key->num_fs_ubos = cp->num_fs_ubos;
+   key->num_vs_ubos = cp->num_vs_ubos;
+   key->sampler_table = cp->sampler_table;
+   key->num_samplers = cp->num_samplers;
+}
+
+/*
+ * Whether this draw may be held back at all: a property of the draw and the
+ * state bound for it, never of what came before. Mirrors cp_batch_structural
+ * in the Gallium adapter, which is the worked example.
+ */
+static bool
+cpvk_batch_structural(struct cpvk_device *dev, const struct cpvk_draw *d)
+{
+   struct cp_context *cp = &dev->renderer;
+
+   if (!cp->vs_shader || !cp->vs_shader->kernel ||
+       !cp->fs_shader || !cp->fs_shader->kernel)
+      return false;
+   if (d->call.mode != MESA_PRIM_TRIANGLES)
+      return false;
+   if (d->call.index_size && !d->call.index_ptr)
+      return false;
+
+   /* A batch replays vertex buffers; a shader building positions from
+    * gl_VertexIndex has nothing to gain and stays on the single-draw path. */
+   if (!cp->num_vertex_buffers || !cp->vb_base[0])
+      return false;
+
+   if (!cp->fb.nr_cbufs || !cp->fb.color || !cp->visbuf || !cp->depthbuf)
+      return false;
+
+   uint64_t tris = (uint64_t)cp_triangles_for_draw(d->call.mode,
+                                                   d->range.count) *
+                   MAX2(d->call.instance_count, 1u);
+   if (tris == 0 || tris > CP_MAX_BATCH_TRIS)
+      return false;
+
+   return true;
+}
+
+static bool
+cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw *d,
+                    bool *blended)
+{
+   /*
+    * Off, and measured rather than abandoned.
+    *
+    * Batching is worth a great deal here: with it the Crossroads capture
+    * replays at 5.63 ms against 24.28 without, and the old capture at 12.71
+    * against 78.90 -- both faster than the Gallium-hosted driver's 7.13 and
+    * 25.20. The machinery is the renderer's and already linked in.
+    *
+    * But this front end's key is not yet a complete statement of what has to
+    * match. With it on, computeshader goes from 4.427 to 83.474 against the
+    * Gallium driver, bloom from 17.386 to 26.071 and instancing from 11.851
+    * to 14.467, while particlesystem improves from 41.036 to 6.785. Adding
+    * the fragment stage's bindings to the state blob fixed multithreading
+    * (0.641 to 0.012) and moved none of the others, and the blended path is
+    * not implicated: disabling it changes nothing, so the fault is in the
+    * opaque half.
+    *
+    * Something a draw carries and this key does not is still varying inside a
+    * batch. Finding it is the remaining work, and CUDAPIPE_DEBUG_BATCHDIFF
+    * against the Gallium driver's key on the same sample is the way in.
+    */
+   return false;
+
+   if (cp_debug->no_batch)
+      return false;
+   if (!cpvk_batch_structural(dev, d))
+      return false;
+
+   if (cp_batch_order_free(&dev->renderer)) {
+      *blended = false;
+      return true;
+   }
+   /*
+    * The blended path merges through the A-buffer, where the order fragments
+    * are composited in is decided per pixel rather than by submission order.
+    * The opaque half is enough to be worth having and is the half whose
+    * correctness this front end can currently argue for; the blended half is
+    * left to the single-draw path until there is a test that shows it right.
+    */
+   return false;
 }
 
 /* Run one recorded draw through the renderer. */
@@ -1057,9 +1248,50 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
 
    cp_context_publish_state(cp);
 
-   /* The single-draw call: every batch table NULL, which is the convention
-    * cp_draw_vbo uses when a draw is not merged. Batching on the native side
-    * comes later, and until it does this is the path that has to be right. */
+   /*
+    * Hold the draw back if it can join the one before it. The machinery is
+    * the renderer's -- cp_batch_record, the key, the flush discipline -- and
+    * what this front end supplies is the key and the decision, exactly as
+    * cp_draw_vbo does for Gallium.
+    *
+    * Measured worth: with batching off the Gallium driver replays Crossroads
+    * at 27.88 ms and with it at 7.13, and this driver had no batching at all.
+    */
+   bool blended = false;
+   if (cpvk_batch_eligible(dev, d, &blended)) {
+      struct cp_batch_key key;
+      cpvk_build_batch_key(dev, d, &key, blended);
+
+      unsigned tris = cp_triangles_for_draw(d->call.mode, d->range.count) *
+                      MAX2(d->call.instance_count, 1u);
+      const unsigned cap = cp_debug->batch_max;
+
+      if (cp->batch.pending) {
+         const char *why = NULL;
+         if (memcmp(&key, &cp->batch.key, sizeof(key)))
+            why = "the next draw differs in state or geometry";
+         else if (cp->batch.ndraws >= (unsigned)cap)
+            why = "the draw cap";
+         else if (cp->batch.tris + tris > CP_MAX_BATCH_TRIS)
+            why = "the triangle cap";
+
+         if (!why) {
+            cp_batch_record(cp, &d->range, tris, 0, d->call.instance_count);
+            return;
+         }
+         cp_batch_flush_defer_why(cp, why);
+      }
+
+      cp->batch.key = key;
+      cp->batch.info = d->call;
+      cp->batch.drawid_offset = 0;
+      cp->batch.pending = true;
+      cp->batch.blended = blended;
+      cp_batch_record(cp, &d->range, tris, 0, d->call.instance_count);
+      return;
+   }
+
+   cp_batch_flush_why(cp, "the next draw cannot be batched");
    cp_draw_execute(cp, &d->call, 0, &d->range, 1, 1, NULL, NULL, NULL, NULL,
                    NULL, NULL);
 }
@@ -1487,6 +1719,9 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
 {
    struct cp_context *cp = &dev->renderer;
 
+   /* A copy observes rendering, so whatever is held back has to run first. */
+   cp_batch_flush(cp);
+
    cuCtxSetCurrent(dev->cu_ctx);
 
    /*
@@ -1876,3 +2111,5 @@ cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q)
    pool->results[q->first] = value;
    pool->available[q->first] = true;
 }
+
+

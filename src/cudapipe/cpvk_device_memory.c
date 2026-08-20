@@ -63,6 +63,10 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * flag, whose device-side printing forced the synchronisation the driver
     * had failed to ask for, and produced an empty frame without it.
     */
+   /* Nothing may be left pending across a submit: the fence the caller
+    * waits on has to mean the draws have run. */
+   cp_batch_flush(&dev->renderer);
+
    cuStreamSynchronize(dev->stream);
    cuStreamSynchronize(dev->renderer.stream);
    return VK_SUCCESS;
