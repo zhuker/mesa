@@ -59,6 +59,12 @@ cpvk_lower_nir(nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_explicit_io,
             nir_var_mem_shared, nir_address_format_32bit_offset);
 
+   /* Push constants become load_push_constant here and a read of buffer slot
+    * zero in cpvk_lower_descriptors; left as derefs they reached the backend
+    * intact, which said so and computed on undef. */
+   NIR_PASS(_, nir, nir_lower_explicit_io,
+            nir_var_mem_push_const, nir_address_format_32bit_offset);
+
    /* gl_GlobalInvocationID lowers into a base plus workgroup arithmetic, and
     * the base is only nonzero for a based dispatch, which this driver does not
     * expose. Saying so explicitly folds it away; leaving it to the default
@@ -118,6 +124,21 @@ lower_descriptors(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       b->cursor = nir_before_instr(&intr->instr);
       nir_def_replace(&intr->def, intr->src[0].ssa);
       return true;
+
+   case nir_intrinsic_load_push_constant: {
+      /* A read of the push constant block is a read of buffer slot 0 at the
+       * same offset. The backend has no push-constant case and does not need
+       * one; this is the form lavapipe hands it. */
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *val = nir_load_ubo(b, intr->def.num_components,
+                                  intr->def.bit_size,
+                                  nir_imm_int(b, CPVK_UBO_PUSH_SLOT),
+                                  intr->src[0].ssa,
+                                  .align_mul = 4, .align_offset = 0,
+                                  .range = ~0);
+      nir_def_replace(&intr->def, val);
+      return true;
+   }
    default:
       return false;
    }
@@ -184,7 +205,14 @@ cpvk_CreatePipelineLayout(VkDevice _device,
    if (!layout)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   unsigned flat = 0;
+   /*
+    * Slot 0 is the push constant block, always, whether or not the pipeline
+    * has one. That is where the backend already looks: emit_const_buf_base's
+    * index form is what push constants arrive as, with index 0. Descriptors
+    * therefore start at 1, and a layout that numbered them from 0 would have
+    * every set's first binding shadowed by the push constants.
+    */
+   unsigned flat = CPVK_UBO_PUSH_SLOT + 1;
    for (uint32_t s = 0; s < layout->vk.set_count; s++) {
       layout->set_base[s] = flat;
       struct cpvk_descriptor_set_layout *set =

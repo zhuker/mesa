@@ -164,6 +164,7 @@ cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
    cmd->has_fb = false;
    cmd->index_ptr = NULL;
    cmd->index_size = 0;
+   cmd->push_size = 0;
 }
 
 static void
@@ -220,6 +221,7 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->has_fb = false;
    cmd->index_ptr = NULL;
    cmd->index_size = 0;
+   cmd->push_size = 0;
    return VK_SUCCESS;
 }
 
@@ -369,6 +371,23 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    cmd->fb = fb;
    cmd->has_fb = true;
 
+   /*
+    * Bind the framebuffer here, as its own op, and not at the first draw.
+    *
+    * cp_context_set_framebuffer is what allocates the renderer's depth
+    * buffer, and cp_clear_depthbuf clears whatever is allocated now. Doing
+    * the bind at draw time meant the depth clear ran against the previous
+    * framebuffer's buffer and the new one arrived uncleared, so every
+    * fragment failed the depth test: renderheadless rendered its clear colour
+    * and all three triangles vanished, with the rasterizer reporting them
+    * shaded.
+    */
+   if (cmd->num_ops < CPVK_MAX_DISPATCHES) {
+      struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
+      *op = (struct cpvk_op) { .kind = CPVK_OP_BEGIN_RENDER };
+      op->fb = fb;
+   }
+
    /* LOAD_OP_CLEAR, recorded in order with the draws that follow it. */
    if (cat && cimg && cat->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
        cmd->num_ops < CPVK_MAX_DISPATCHES) {
@@ -424,6 +443,33 @@ cpvk_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
          ? buf->mem->dev_ptr + buf->offset + pOffsets[i] : 0;
       cmd->num_vb = MAX2(cmd->num_vb, b + 1);
    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdPushConstants2(VkCommandBuffer commandBuffer,
+                       const VkPushConstantsInfo *pInfo)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+
+   if (pInfo->offset + pInfo->size > CPVK_MAX_PUSH_BYTES)
+      return;
+
+   memcpy(cmd->push + pInfo->offset, pInfo->pValues, pInfo->size);
+   if (pInfo->offset + pInfo->size > cmd->push_size)
+      cmd->push_size = pInfo->offset + pInfo->size;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
+                      VkShaderStageFlags stageFlags, uint32_t offset,
+                      uint32_t size, const void *pValues)
+{
+   VkPushConstantsInfo info = {
+      .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
+      .layout = layout, .stageFlags = stageFlags,
+      .offset = offset, .size = size, .pValues = pValues,
+   };
+   cpvk_CmdPushConstants2(commandBuffer, &info);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -531,6 +577,8 @@ cpvk_record_draw(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first,
    memcpy(d->vb_base, cmd->vb_base, sizeof(d->vb_base));
    d->num_vb = cmd->num_vb;
    memcpy(d->addrs, cmd->addrs, sizeof(d->addrs));
+   memcpy(d->push, cmd->push, sizeof(d->push));
+   d->push_size = cmd->push_size;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -575,8 +623,6 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
    struct cp_context *cp = &dev->renderer;
    struct cpvk_pipeline *p = d->pipeline;
 
-   cp_context_set_framebuffer(cp, &d->fb, 1);
-
    cp->viewport = d->viewport;
    cp->scissor = d->scissor;
    cp->rasterizer = p->raster;
@@ -602,6 +648,20 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
     * out of `buffer`; filling the other field left the table full of nulls
     * and the vertex shader read address zero.
     */
+   /* Slot 0 is the push constant block, staged into the upload arena so the
+    * kernels read it from device memory like any other binding. */
+   CUdeviceptr push_dev = 0;
+   if (d->push_size) {
+      void *host = NULL;
+      push_dev = cp_upload_begin(cp, d->push_size, &host);
+      if (push_dev) {
+         memcpy(host, d->push, d->push_size);
+         /* Reserving the block does not send it. Without this the shaders read
+          * whatever the arena held. */
+         cp_upload_end(cp, push_dev, host, d->push_size);
+      }
+   }
+
    for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
       cp->vs_ubos[i].buffer = (void *)(uintptr_t)d->addrs[i];
       cp->vs_ubos[i].managed_copy = 0;
@@ -610,6 +670,8 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
       cp->fs_ubos[i].managed_copy = 0;
       cp->fs_ubos[i].user_copy = false;
    }
+   cp->vs_ubos[CPVK_UBO_PUSH_SLOT].buffer = (void *)(uintptr_t)push_dev;
+   cp->fs_ubos[CPVK_UBO_PUSH_SLOT].buffer = (void *)(uintptr_t)push_dev;
    cp->num_vs_ubos = cp->num_fs_ubos = CP_MAX_CONST_BUFFERS;
 
    cp_context_publish_state(cp);
@@ -619,4 +681,130 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
     * comes later, and until it does this is the path that has to be right. */
    cp_draw_execute(cp, &d->call, 0, &d->range, 1, 1, NULL, NULL, NULL, NULL,
                    NULL, NULL);
+}
+
+/* ----------------------------------------------------------- transfers */
+
+static struct cpvk_copy *
+cpvk_record_copy(struct cpvk_cmd_buffer *cmd)
+{
+   if (cmd->num_ops >= CPVK_MAX_DISPATCHES)
+      return NULL;
+   struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
+   *op = (struct cpvk_op) { .kind = CPVK_OP_COPY };
+   return &op->copy;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
+                    const VkCopyBufferInfo2 *pInfo)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_buffer, src, pInfo->srcBuffer);
+   VK_FROM_HANDLE(cpvk_buffer, dst, pInfo->dstBuffer);
+
+   if (!src || !dst || !src->mem || !dst->mem)
+      return;
+
+   for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+      const VkBufferCopy2 *r = &pInfo->pRegions[i];
+      struct cpvk_copy *c = cpvk_record_copy(cmd);
+      if (!c)
+         return;
+      *c = (struct cpvk_copy) {
+         .src = src->mem->dev_ptr + src->offset + r->srcOffset,
+         .dst = dst->mem->dev_ptr + dst->offset + r->dstOffset,
+         .width_bytes = r->size,
+         .rows = 1,
+      };
+   }
+}
+
+/* The byte offset of one level of an image, and its row pitch. */
+static bool
+cpvk_image_plane(const struct cpvk_image *img, unsigned level,
+                 CUdeviceptr *base, size_t *pitch, unsigned *bpp)
+{
+   if (!img || !img->mem || level >= CPVK_MAX_MIP_LEVELS)
+      return false;
+   *base = img->mem->dev_ptr + img->offset + img->level_offset[level];
+   *pitch = img->row_stride[level];
+   *bpp = util_format_get_blocksize(vk_format_to_pipe_format(img->vk.format));
+   return true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
+                   const VkCopyImageInfo2 *pInfo)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_image, src, pInfo->srcImage);
+   VK_FROM_HANDLE(cpvk_image, dst, pInfo->dstImage);
+
+   for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+      const VkImageCopy2 *r = &pInfo->pRegions[i];
+      CUdeviceptr sb, db;
+      size_t sp, dp;
+      unsigned sbpp, dbpp;
+      if (!cpvk_image_plane(src, r->srcSubresource.mipLevel, &sb, &sp, &sbpp) ||
+          !cpvk_image_plane(dst, r->dstSubresource.mipLevel, &db, &dp, &dbpp))
+         return;
+
+      struct cpvk_copy *c = cpvk_record_copy(cmd);
+      if (!c)
+         return;
+      *c = (struct cpvk_copy) {
+         .src = sb + (size_t)r->srcOffset.y * sp + (size_t)r->srcOffset.x * sbpp,
+         .dst = db + (size_t)r->dstOffset.y * dp + (size_t)r->dstOffset.x * dbpp,
+         .src_pitch = sp,
+         .dst_pitch = dp,
+         .width_bytes = (size_t)r->extent.width * sbpp,
+         .rows = r->extent.height,
+      };
+   }
+}
+
+/*
+ * Barriers are recorded and ignored, deliberately.
+ *
+ * Everything this driver submits runs on one CUDA stream, and stream order is
+ * program order, so the dependency a barrier expresses already holds. This is
+ * not a stub to fill in later: it is the same reasoning that lets the Gallium
+ * driver launch a clear on cp->stream instead of synchronising.
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+                         const VkDependencyInfo *pDependencyInfo)
+{
+}
+
+void
+cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb)
+{
+   cp_context_set_framebuffer(&dev->renderer, fb, 1);
+}
+
+void
+cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
+{
+   struct cp_context *cp = &dev->renderer;
+
+   cuCtxSetCurrent(dev->cu_ctx);
+
+   if (c->rows <= 1 && !c->src_pitch && !c->dst_pitch) {
+      cuMemcpyDtoDAsync(c->dst, c->src, c->width_bytes, cp->stream);
+      return;
+   }
+
+   CUDA_MEMCPY2D m = {
+      .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+      .srcDevice = c->src,
+      .srcPitch = c->src_pitch ? c->src_pitch : c->width_bytes,
+      .dstMemoryType = CU_MEMORYTYPE_DEVICE,
+      .dstDevice = c->dst,
+      .dstPitch = c->dst_pitch ? c->dst_pitch : c->width_bytes,
+      .WidthInBytes = c->width_bytes,
+      .Height = c->rows,
+   };
+   cuMemcpy2DAsync(&m, cp->stream);
 }

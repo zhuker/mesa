@@ -135,6 +135,10 @@ struct cpvk_dispatch {
    CUdeviceptr addrs[16];
 };
 
+/* Buffer slot 0 is the push constant block; descriptors start after it. */
+#define CPVK_UBO_PUSH_SLOT  0
+#define CPVK_MAX_PUSH_BYTES 256
+
 struct cpvk_draw {
    struct cpvk_pipeline *pipeline;
    struct cp_fb_desc fb;
@@ -145,6 +149,8 @@ struct cpvk_draw {
    uint64_t vb_base[16];
    unsigned num_vb;
    CUdeviceptr addrs[16];
+   unsigned char push[CPVK_MAX_PUSH_BYTES];
+   unsigned push_size;
 };
 
 /* A recorded attachment clear. The colour one is a fill of the image itself;
@@ -165,9 +171,20 @@ struct cpvk_clear {
  * Ordering is the whole point: a clear recorded after a draw must not run
  * before it, which a pair of separate arrays cannot express.
  */
+/* A recorded transfer. Buffers and linear images are both flat device memory
+ * here, so one 2D copy covers every case: a buffer is the degenerate one with
+ * a single row. */
+struct cpvk_copy {
+   CUdeviceptr src, dst;
+   size_t src_pitch, dst_pitch;
+   size_t width_bytes, rows;
+};
+
 enum cpvk_op_kind {
+   CPVK_OP_BEGIN_RENDER,
    CPVK_OP_DRAW,
    CPVK_OP_CLEAR,
+   CPVK_OP_COPY,
 };
 
 struct cpvk_op {
@@ -175,6 +192,8 @@ struct cpvk_op {
    union {
       struct cpvk_draw draw;
       struct cpvk_clear clear;
+      struct cpvk_copy copy;
+      struct cp_fb_desc fb;
    };
 };
 
@@ -194,12 +213,16 @@ struct cpvk_cmd_buffer {
    unsigned num_vb;
    const void *index_ptr;
    unsigned index_size;
+   unsigned char push[CPVK_MAX_PUSH_BYTES];
+   unsigned push_size;
    struct cpvk_op ops[CPVK_MAX_DISPATCHES];
    unsigned num_ops;
 };
 
 void cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d);
 void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
+void cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
+void cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb);
 
 extern const struct vk_command_buffer_ops cpvk_cmd_buffer_ops;
 extern const struct vk_sync_type *const cpvk_sync_types[];

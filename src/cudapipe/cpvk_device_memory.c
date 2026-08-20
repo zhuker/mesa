@@ -34,10 +34,20 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
       /* In record order: a clear after a draw must not run before it. */
       for (unsigned o = 0; o < cmd->num_ops; o++) {
-         if (cmd->ops[o].kind == CPVK_OP_CLEAR)
+         switch (cmd->ops[o].kind) {
+         case CPVK_OP_BEGIN_RENDER:
+            cpvk_execute_begin_render(dev, &cmd->ops[o].fb);
+            break;
+         case CPVK_OP_CLEAR:
             cpvk_execute_clear(dev, &cmd->ops[o].clear);
-         else
+            break;
+         case CPVK_OP_COPY:
+            cpvk_execute_copy(dev, &cmd->ops[o].copy);
+            break;
+         case CPVK_OP_DRAW:
             cpvk_execute_draw(dev, &cmd->ops[o].draw);
+            break;
+         }
       }
    }
 
@@ -326,6 +336,13 @@ cpvk_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
 
       buffer->mem = mem;
       buffer->offset = pBindInfos[i].memoryOffset;
+
+      /* The runtime's own vk_buffer_address() asserts on this, and every
+       * common entrypoint that takes a buffer goes through it. A CUDA device
+       * pointer is a flat address, so the buffer's address is simply where it
+       * was bound -- there is nothing to opt into. */
+      buffer->vk.device_address = mem ?
+         mem->dev_ptr + pBindInfos[i].memoryOffset : 0;
    }
    return VK_SUCCESS;
 }
