@@ -126,13 +126,20 @@ before layering behaviour on it — is the whole plan:
    from `pipe_rt_blend_state` per draw. It is built once at bind time now, and
    the only other reader of the Gallium type was a debug print.
 
+   **Fifth slice: the attachments.** The draw path asked a
+   `pipe_framebuffer_state` the same four questions on every draw — is there a
+   colour buffer, where is its memory, what encoding does the writeback use,
+   what is its sample stride — and answered them by unwrapping a
+   `pipe_resource` and calling `cp_color_encoding_from_format` each time, in
+   eight places. `cp_fb_desc` answers them once at bind time.
+
    What is shared today: the NIR→PTX compiler, the kernel suite, the flag
    registry, the NIR options, the kernel ABI header, the draw description, and
-   four of the seven state structs. What is not: the framebuffer and the
-   vertex input — the two that carry a resource, and the last before a native
-   draw can call in.
+   five of the seven state structs. What is not: the vertex input — elements
+   and buffers — which is the last, and the one that needs care because the
+   pass-segment snapshot saves a copy of it and the batch key compares it.
 
-   Gallium references in `cp_context.c`: **334 → 288**.
+   Gallium references in `cp_context.c`: **334 → 275**.
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
