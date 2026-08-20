@@ -130,6 +130,11 @@ endif
 if with_gallium_or_lvp
   subdir('gallium')
 endif
+# The native Vulkan cudapipe driver: independent of Gallium, built beside the
+# Gallium-hosted one so the two can be diffed against each other.
+if with_gallium_cudapipe
+  subdir('cudapipe')
+endif
 # These require libgallium (shared_glapi_lib)
 if with_gallium and (with_glx != 'disabled' or with_egl)
   if with_gles1 and not with_glvnd
