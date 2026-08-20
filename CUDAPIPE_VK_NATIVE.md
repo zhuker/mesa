@@ -4194,3 +4194,30 @@ and they were there before this work started.
 **What remains is performance alone.** Replays at 9.4 and 34.4 ms against 7.2
 and 25.2 are a real regression against what is recorded, and no choice of
 reference changes that.
+
+### Five attempts at episode accumulation, priced
+
+    attempt                                   result
+    1  defer every unmergeable draw           4 samples wrong
+    2  defer per-segment binds only           replay OOM at frame 8
+    3  the same, bounded to 8 segments        replay OOM at frames 25 and 5
+    4  bounded by arena use, RECLAIM/4        one capture 9.13 ms, the other
+                                              OOM at frame 9
+    5  bounded by arena use, RECLAIM/16       both captures complete,
+                                              9.48 and 34.41 ms
+
+Attempt 5 is correct -- 18/18 run, 17/18 pixel-correct, both captures all
+1,496 and 1,510 frames -- and worth **nothing**: 9.48 against a 9.44 baseline
+and 34.41 against 34.42, inside the 5% run-to-run spread of this measurement.
+
+The two ends of that are the whole story. A budget loose enough to defer often
+enough to matter (attempt 4, 9.13 ms, a 3% gain) exhausts device memory on the
+other capture; a budget tight enough for both to survive defers so rarely that
+nothing changes. There is no setting between them that is both safe and worth
+having, because the arena grows per deferral and the gain grows per deferral
+too.
+
+Reverted. Five attempts is enough to say this with numbers rather than as an
+impression: **episode accumulation is not the lever for the remaining 1.3x**,
+and the launch-count gap it was aimed at -- 757 a frame against 245 -- has to
+come down some other way.
