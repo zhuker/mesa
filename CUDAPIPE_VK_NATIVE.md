@@ -132,3 +132,55 @@ Known gaps at this milestone, recorded rather than discovered later:
   multisampling sample already demonstrated that here.
 - Limits are the capture's requirements, not the backend's measured maxima.
   They should be raised as features land, not ahead of them.
+
+## The end state: shared Mesa back to upstream
+
+The native driver is finished when nothing outside `src/cudapipe/` differs from
+upstream. Measured against `upstream/main` (merge base `0d82e6c4072`), the
+current divergence in shared code is **12 files, 258 insertions** — this is the
+retirement checklist, and every line of it is a thing the native driver owns
+instead:
+
+| shared file | what it is | what replaces it |
+|---|---|---|
+| `src/gallium/include/pipe/p_screen.h` (+10) | `allocate_memory_device` and `clear_memory` hooks added for session 13's memory split | `vkAllocateMemory` in the driver; no hook |
+| `src/gallium/frontends/lavapipe/lvp_device.c` (+167) | three memory types when the screen supplies a device allocator; sample-count limits derived from `is_format_supported` | `cpvk_GetPhysicalDeviceMemoryProperties` (already written at milestone 1) and a real format table |
+| `lvp_execute.c` (+65) | routes byte-identical copies through Gallium's `image_copy_buffer` (session 16); **and a `strstr(screen->get_name(), "cudapipe")` test** that flushes a pipeline barrier without finishing (session 10) | `vkCmdCopyBufferToImage` implemented directly; barriers handled from their real stage/access masks |
+| `lvp_private.h` (+13), `lvp_device_generated_commands.c` (+4) | supporting fields | gone |
+| `src/gallium/auxiliary/driver_trace/tr_screen.c` (+36) | trace wrappers for the two new screen hooks | gone with the hooks |
+| `src/gallium/auxiliary/target-helpers/sw_helper.h` (+9) | selects the cudapipe gallium driver | gone |
+| `src/gallium/meson.build` (+9), `meson.build`, `meson.options`, `.gitignore` | the gallium driver and target | a `vulkan-drivers` entry for `cudapipe` |
+| `src/gallium/drivers/cudapipe`, `src/gallium/targets/cudapipe` | the driver itself, ~15,500 lines | `src/cudapipe/` |
+
+The `strstr(get_name(), "cudapipe")` in `lvp_execute.c` is worth singling out:
+a driver-name sniff inside a shared frontend, added because Gallium has no way
+to say "this driver's barriers are already ordered". It is the clearest single
+argument in the tree for the move.
+
+A side effect worth having: once lavapipe is untouched, `TESTING.md`'s standing
+warning — that a change under `frontends/lavapipe` moves llvmpipe too and can
+invalidate the comparison set without cudapipe changing at all — stops
+applying. llvmpipe becomes a fixed reference again.
+
+## Standing gate
+
+Every milestone is measured against the recorded numbers, not against intent.
+The gate is the objective of this work: **both gfxr captures replay to the last
+frame, and the 18-sample sweep shows no verdict worse than the standing two.**
+
+Recorded state at the time this branch was cut (Gallium-hosted driver, census
+flags off, tiling prototype present but disabled):
+
+| | recorded | measured on this branch |
+|---|---|---|
+| old capture, 10-frame dump vs release llvmpipe | 0.441% > 32/255, 0.002% > 96/255 | **0.429% / 0.001%** |
+| old capture median | ~25.20 ms | 25.18 / 25.29 / 25.30 / 25.32 ms |
+| Crossroads median | ~7.10-7.21 ms | 7.16 / 7.21 / 7.22 / 7.24 ms |
+| 18-sample sweep total | 35.85 ms (`buffer-image-device`) | **35.91 ms**, +0.17% |
+| sweep verdicts | `gltfscenerendering`, `texture3d` standing; `renderheadless` vacuous | unchanged, all 18 exit 0 |
+
+Iteration record: `~/git/Vulkan/build/iter/census-vk-native`.
+
+When the native driver renders, it takes the same table, and additionally has
+to match the Gallium-hosted build frame for frame — which is why both targets
+are built from one tree.
