@@ -1015,7 +1015,14 @@ static struct {
 static struct cp_blend_desc
 cp_blend_desc_for(const struct cp_context *cp)
 {
-   const struct pipe_rt_blend_state *rt = &cp->blend_state.rt[0];
+   /* Resolved once when the state was bound; see cp_bind_blend_state. */
+   return cp->blend_desc;
+}
+
+/* The one place a pipe_rt_blend_state becomes the driver's own description. */
+static struct cp_blend_desc
+cp_blend_desc_from_gallium(const struct pipe_rt_blend_state *rt)
+{
    struct cp_blend_desc b = {
       .enable = rt->blend_enable,
       .rgb_src_factor = rt->rgb_src_factor,
@@ -1732,7 +1739,6 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
                      0, cp->stream, p, NULL);
    }
 
-   const struct pipe_rt_blend_state *rt = &cp->blend_state.rt[0];
    struct cp_fs_writeback_args wb = {
       .pixel_list = pixel_list,
       .fs_out = fs_out,
@@ -1823,8 +1829,8 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
       fprintf(stderr, "  shaded %u pixels (%u fs inputs, %u tris) "
               "blend=%u src=%u dst=%u mask=0x%x\n",
               num_pixels, num_fs_inputs, num_triangles,
-              rt->blend_enable, rt->rgb_src_factor, rt->rgb_dst_factor,
-              wb.blend.colormask);
+              wb.blend.enable, wb.blend.rgb_src_factor,
+              wb.blend.rgb_dst_factor, wb.blend.colormask);
 
    if (cp_debug->debug_fs) {
       /*
@@ -7945,6 +7951,7 @@ cp_bind_blend_state(struct pipe_context *ctx, void *state)
 
    if (state) {
       cp->blend_state = next;
+      cp->blend_desc = cp_blend_desc_from_gallium(&next.rt[0]);
       cp->blend_enabled = cp->blend_state.rt[0].blend_enable;
       if (cp->gpu_state) {
          const struct pipe_rt_blend_state *rt = &cp->blend_state.rt[0];
@@ -7959,6 +7966,7 @@ cp_bind_blend_state(struct pipe_context *ctx, void *state)
       }
    } else {
       memset(&cp->blend_state, 0, sizeof(cp->blend_state));
+      memset(&cp->blend_desc, 0, sizeof(cp->blend_desc));
       cp->blend_enabled = false;
       if (cp->gpu_state) {
          cp->gpu_state->blend_enable = 0;

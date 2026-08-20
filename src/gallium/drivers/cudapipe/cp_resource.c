@@ -194,6 +194,7 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
     * being held back for merging have to be submitted before the sync below
     * — otherwise the readback waits for a queue they were never put on. */
    cp_batch_flush(cp);
+   cp_tile_census_cut(cp, CP_TILE_CUT_MAP);
 
    /* If reading GPU-written data, ensure all kernels have finished. */
    if (!(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) &&
@@ -285,6 +286,7 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
    struct cp_resource *src_res = cp_resource(src);
    struct cp_resource *dst_res = cp_resource(dst);
    cp_batch_flush(cp);
+   cp_tile_census_cut(cp, CP_TILE_CUT_COPY);
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
 
@@ -464,6 +466,7 @@ cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
    struct cp_resource *src_res = cp_resource(info->src.resource);
    struct cp_resource *dst_res = cp_resource(info->dst.resource);
    cp_batch_flush(cp);
+   cp_tile_census_cut(cp, CP_TILE_CUT_COPY);
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
    if (cp_debug->debug_draw)

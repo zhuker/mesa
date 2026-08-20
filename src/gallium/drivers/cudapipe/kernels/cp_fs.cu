@@ -374,9 +374,11 @@ cp_abuf_interpolate_lane(const struct cp_fs_interp_args *source, uint32_t slot)
    if (iq >= nq)
       return 0;
 
+   uint32_t list_base = args.quad_list_base_dev
+      ? *(const uint32_t *)(uintptr_t)args.quad_list_base_dev
+      : args.quad_list_base;
    uint32_t q = args.quad_list
-      ? ((const uint32_t *)(uintptr_t)args.quad_list)[args.quad_list_base + iq]
-      : iq;
+      ? ((const uint32_t *)(uintptr_t)args.quad_list)[list_base + iq] : iq;
    uint32_t block = ((const uint32_t *)(uintptr_t)args.abuf_quad_block)[q];
    uint32_t gprim = ((const uint32_t *)(uintptr_t)args.abuf_quad_prim)[q];
    if (!cp_resolve_seg_range(&args, gprim))
@@ -456,9 +458,11 @@ cp_abuf_interpolate_body(struct cp_fs_interp_args args)
     * slots 4i..4i+3; outside an episode the list is null and q == i. The
     * quad stream's primitive ids are episode-global, so the segment's base
     * is subtracted before its own vertex stream and slices are addressed. */
+   uint32_t list_base = args.quad_list_base_dev
+      ? *(const uint32_t *)(uintptr_t)args.quad_list_base_dev
+      : args.quad_list_base;
    uint32_t q = args.quad_list
-      ? ((const uint32_t *)(uintptr_t)args.quad_list)[args.quad_list_base + iq]
-      : iq;
+      ? ((const uint32_t *)(uintptr_t)args.quad_list)[list_base + iq] : iq;
 
    uint32_t b = ((const uint32_t *)(uintptr_t)args.abuf_quad_block)[q];
    uint32_t gprim = ((const uint32_t *)(uintptr_t)args.abuf_quad_prim)[q];

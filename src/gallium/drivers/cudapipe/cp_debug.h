@@ -117,6 +117,12 @@ struct cp_debug {
    bool flush_drain;
    bool no_seg_merge;
    bool no_abuf_append;
+   bool no_fused_abuf_interp;
+   unsigned tile_census;
+   unsigned tile_census_every;
+   bool tiled_opaque;
+   bool tiled_opaque_census;
+   bool unsafe_no_overflow;
    bool no_batch;
    bool no_bincache;
    bool no_regcap;

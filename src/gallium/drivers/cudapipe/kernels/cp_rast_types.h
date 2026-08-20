@@ -52,6 +52,12 @@ struct cp_vertex_args {
 };
 
 struct cp_rasterize_args {
+   /* Optional device-side launch predicate. Zero leaves the ordinary path
+    * unchanged; otherwise every raster stage returns unless *path_flag equals
+    * path_value. Opaque tiled episodes use this to run classic rasterization
+    * only when device-side binning reports overflow. */
+   uint64_t path_flag;
+   uint32_t path_value;
    uint64_t positions;      /* Input: screen-space positions (float4 per vertex) */
    uint64_t varyings;       /* Input: varyings from VS */
    uint64_t framebuffer;    /* Output: visibility buffer (uint64 per pixel) */
@@ -576,6 +582,7 @@ struct cp_fs_interp_args {
    uint64_t seg_ranges;
    uint32_t num_seg_ranges;
    uint32_t row_base;
+   uint64_t quad_list_base_dev;
 };
 
 struct cp_fs_writeback_args {
@@ -703,6 +710,116 @@ struct cp_abuf_seg_args {
    uint64_t seg_base;       /* uint32 per segment: dense base (scatter) */
    uint64_t grouped;        /* uint32 per quad: quad indices by segment */
    uint64_t quad_dense;     /* uint32 per quad: dense position in segment */
+   uint64_t seg_group;      /* uint8 per segment, optional */
+   uint64_t group_base;     /* uint32 per group, optional */
+};
+
+/*
+ * Tile shader census: how many distinct fragment shaders would land in one
+ * tile's bin, and whether they arrive in contiguous runs of submission order.
+ *
+ * This changes no rendering. It reads the A-buffer's own quad stream, which
+ * already carries every depth-passing fragment's 2x2 block and its
+ * episode-global primitive id, so the answer is exact coverage rather than a
+ * bounding-box estimate. A tile renderer's bin for this episode is exactly
+ * the set of primitives whose quads land in that tile.
+ *
+ * Two numbers per tile, because they decide different halves of the design:
+ * the distinct shader count says whether one kernel would have to be able to
+ * call many shaders, and the disjointness of each shader's [min, max]
+ * primitive range says whether the tile could instead be split into that many
+ * ordered passes without breaking blend order.
+ */
+#define CP_TILE_CENSUS_MAX_SHADERS 64
+#define CP_TILE_CENSUS_BINS        65   /* 0..63 shaders, 64 = more */
+#define CP_TILE_CENSUS_LOG         32   /* log2 buckets for the two spreads */
+/*
+ * Histogram layout, all unsigned long long, all accumulated on the device:
+ *   [0]                      shaders-per-tile, four words per bin
+ *   [SHADED]                 log2(shaded fragments per tile), tiles
+ *   [REFS]                   log2(primitive references per tile), tiles
+ *   [GLOBALS + 0..5]         max refs/tile, max shaded/tile, total refs,
+ *                            total shaded, tiles with refs, tiles shaded
+ */
+#define CP_TILE_CENSUS_SHADED  (CP_TILE_CENSUS_BINS * 4)
+#define CP_TILE_CENSUS_REFS    (CP_TILE_CENSUS_SHADED + CP_TILE_CENSUS_LOG)
+#define CP_TILE_CENSUS_GLOBALS (CP_TILE_CENSUS_REFS + CP_TILE_CENSUS_LOG)
+#define CP_TILE_CENSUS_WORDS   (CP_TILE_CENSUS_GLOBALS + 8)
+
+struct cp_tile_census_args {
+   uint64_t quad_prim;      /* uint32 per quad: episode-global primitive */
+   uint64_t quad_block;     /* uint32 per quad: 2x2 block index */
+   uint64_t num_quads_dev;  /* uint32*: the exact quad total */
+   uint64_t seg_prim_base;  /* uint32 per segment: first primitive slot */
+   uint64_t seg_shader;     /* uint8 per segment: distinct-fs index */
+   uint64_t tile_mask;      /* uint64 per tile: shaders present */
+   uint64_t tile_quads;     /* uint32 per tile */
+   uint64_t tile_smin;      /* uint32 per (tile, shader): lowest primitive */
+   uint64_t tile_smax;      /* uint32 per (tile, shader): highest */
+   uint64_t tile_refs;      /* uint32 per tile: primitive references binned */
+   uint64_t hist;           /* unsigned long long[CP_TILE_CENSUS_WORDS] */
+   uint64_t seg_seq;        /* uint32 per segment: pass-global draw order */
+   uint64_t visbuf;         /* the opaque source: one winner per pixel */
+   uint32_t width;
+   uint32_t height;
+   uint32_t num_quads;      /* bound on the quad array */
+   uint32_t nsegs;
+   uint32_t quad_width;     /* 2x2 blocks per framebuffer row */
+   uint32_t tile;           /* tile edge in pixels */
+   uint32_t tiles_x;
+   uint32_t tiles_y;
+   uint32_t nshaders;
+   uint32_t pad;
+};
+
+struct cp_abuf_seg_prefix_args {
+   uint64_t seg_counts;
+   uint64_t seg_group;
+   uint64_t seg_base;
+   uint64_t group_base;
+   uint64_t group_counts;
+   uint32_t nsegs;
+   uint32_t ngroups;
+};
+
+struct cp_abuf_shade_count_args {
+   uint64_t count;
+   uint64_t slots;
+};
+
+#define CP_OPAQUE_TILE_SIZE 32u
+#define CP_MAX_OPAQUE_TILE_REFS 2000000u
+
+struct cp_opaque_tile_ref {
+   uint32_t global_prim;
+   uint16_t segment;
+   uint16_t flags;
+};
+
+struct cp_opaque_tile_build_args {
+   struct cp_rasterize_args rast;
+   uint64_t tile_counts;
+   uint64_t tile_offsets;
+   uint64_t tile_cursors;
+   uint64_t tile_refs;
+   uint64_t overflow;
+   uint32_t tiles_x;
+   uint32_t tiles_y;
+   uint32_t segment;
+   uint32_t capacity;
+};
+
+struct cp_opaque_tile_raster_args {
+   uint64_t rast_args;
+   uint64_t tile_counts;
+   uint64_t tile_offsets;
+   uint64_t tile_refs;
+   uint64_t overflow;
+   uint32_t num_segments;
+   uint32_t tiles_x;
+   uint32_t tiles_y;
+   uint32_t width;
+   uint32_t height;
 };
 
 /*

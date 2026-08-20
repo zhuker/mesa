@@ -370,7 +370,11 @@ struct cp_context {
    struct cp_shader_binary *fs_shader;
 
    /* Blend state */
-   struct pipe_blend_state blend_state;
+   struct pipe_blend_state blend_state;   /* adapter-only: the flush
+                                           * comparison and the batch key */
+   /* What both kernels that evaluate a blend actually read, resolved once
+    * when the state was bound rather than rebuilt per draw. */
+   struct cp_blend_desc blend_desc;
    bool blend_enabled;
 
    /* Texture state for FS */
