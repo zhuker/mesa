@@ -3427,3 +3427,35 @@ which makes both worth checking rather than assuming.
 That is the next substitution, and it is one line in the test: build the big
 cube's sampler with clamp-to-edge and `maxLod = 10`, and see whether
 `cpvk_cubebig` starts returning zero.
+
+### The sampler is eliminated too
+
+`cpvk_cubebig` rebuilt with pbribl's sampler state -- `CLAMP_TO_EDGE` on all
+three axes and `maxLod = 10.0` on a cube whose levels are 0..9 -- is still
+byte-identical to lavapipe, eleven distinct colours, nothing zeroed.
+
+The elimination list for pbribl's cube read is now:
+
+    the cube's content        warm at every level, read back from device memory
+    the cube's memory         copies land exactly at the view's base
+    the level offsets         copy and sampler compute the same ones
+    the direction R           identical to the Gallium driver per pixel
+    the format                R16G16B16A16_SFLOAT, covered
+    the size and levels       512x512, ten levels, covered
+    the varying direction     covered, including seams
+    the sampler               clamp-to-edge and maxLod 10, covered
+    the descriptor            binding 4 resolves to the right texture handle
+    the sampler table         five entries when the spheres draw
+
+Every one checked against a test that passes or a print that agrees, and the
+read still returns exactly zero in the sample.
+
+What has *not* been reproduced is the shape of pbribl's descriptor set: five
+bindings in one set -- two uniform buffers then three combined image samplers,
+the cube at binding 4 -- against this test's two sets of one binding each. The
+driver writes that descriptor at flat index 4 and the debug confirms the handle
+there is right, but what the *shader* computes as the offset of binding 4 has
+never been compared against it.
+
+That is the next substitution: put the cube at binding 4 of a five-binding set
+in the test, behind two uniform buffers, and see whether the read goes to zero.
