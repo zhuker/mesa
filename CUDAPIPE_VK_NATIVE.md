@@ -963,3 +963,27 @@ gltfscenerendering. Something about the per-draw fragment rows is not reaching
 the shader the way it does under Gallium, and that is the next thing to find:
 it is worth a 4x replay, since the Gallium driver's own numbers say batching
 is the difference between 27.88 ms and 7.13.
+
+### The per-draw rows are fine; something else breaks the merged frame
+
+`CUDAPIPE_DEBUG_DRAW` prints the batch's vertex-stage rows at flush, and with
+the descriptor comparison removed gltfscenerendering merges nine draws whose
+rows are genuinely distinct:
+
+    batch of 9 draws
+      row 0: 0x...800 0x...e000 0x...e0c0 ...
+      row 1: 0x...900 0x...e000 0x...e140 ...
+      row 2: 0x...a00 0x...e000 0x...e1c0 ...
+
+Slot 0 (push constants) and slot 2 (the material's set) differ per row, slot 1
+is shared. So the per-draw binding tables are filled correctly and the shader
+has what it needs to index its own row. The mechanism is not the problem.
+
+The frame is still wrong when those nine merge, so something else that a batch
+does not carry is varying across them. The fragment rows are not printed by
+that debug path -- only the vertex ones -- so printing them is the obvious
+next step, and after that the sampler-variant specialisation, which resolves
+one sampler state for a whole batch and falls back only if every row agrees.
+
+Until then the descriptor hash stays in the comparison: it is conservative,
+it is correct, and it costs the merges the capture would want.
