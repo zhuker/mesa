@@ -142,6 +142,24 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
 
    util_copy_framebuffer_state(&cp->framebuffer, state);
 
+   /*
+    * Resolve the attachments once. The draw path used to unwrap the colour
+    * resource and call cp_color_encoding_from_format on every draw to answer
+    * the same four questions.
+    */
+   struct cp_resource *cres = (state->nr_cbufs && state->cbufs[0].texture)
+      ? cp_resource(state->cbufs[0].texture) : NULL;
+   cp->fb = (struct cp_fb_desc) {
+      .width = state->width,
+      .height = state->height,
+      .nr_cbufs = state->nr_cbufs,
+      .color = cres ? cp_resource_data(cres) : NULL,
+      .color_encoding = state->nr_cbufs
+         ? cp_color_encoding_from_format(state->cbufs[0].format) : -1,
+      .color_sample_stride = cres ? (unsigned)cres->lpr.sample_stride : 0,
+      .has_zs = state->zsbuf.texture != NULL,
+   };
+
    /* Coverage and depth are per sample, so the buffers scale with the sample
     * count and it has to force a reallocation the same way the size does. */
    unsigned samples = 1;
@@ -1759,15 +1777,11 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
       .width = w,
       .fs_out_stride = fs_out_stride,
       .num_pixels = num_pixels,
-      .color_encoding = (uint32_t)MAX2(
-         cp_color_encoding_from_format(cp->framebuffer.cbufs[0].format), 0),
+      .color_encoding = (uint32_t)MAX2(cp->fb.color_encoding, 0),
       .blend = cp_blend_desc_for(cp),
       .num_samples = MAX2(cp->fb_samples, 1u),
       .height = h,
-      .sample_stride = cp->framebuffer.nr_cbufs &&
-                       cp->framebuffer.cbufs[0].texture
-         ? (uint32_t)cp_resource(cp->framebuffer.cbufs[0].texture)->lpr.sample_stride
-         : 0,
+      .sample_stride = cp->fb.color_sample_stride,
    };
 
    /*
@@ -3341,7 +3355,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
          .num_slots = num_slots,
          .capacity = ab->capacity,
          .color_encoding = (uint32_t)MAX2(
-            cp_color_encoding_from_format(cp->framebuffer.cbufs[0].format), 0),
+            cp->fb.color_encoding, 0),
          .max_layers = cp_abuf.max_layers,
          .blend = cp_blend_desc_for(cp),
       };
@@ -3494,7 +3508,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                 const struct pipe_scissor_state *scissors)
 {
    struct cp_screen *screen = cp->screen;
-   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+   const struct cp_fb_desc *fb = &cp->fb;
 
    /*
     * The fragment stage's per-draw uniform bindings.
@@ -3528,7 +3542,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
     * further down, which carries the same condition through the rest of the
     * function.
     */
-   if (!fb->nr_cbufs && !fb->zsbuf.texture &&
+   if (!fb->nr_cbufs && !fb->has_zs &&
        !(cp->fs_shader && cp->fs_shader->writes_memory))
       do { if (cp_debug->debug_draw)
             fprintf(stderr, "  skipped: no colour or depth attachment\n");
@@ -3580,17 +3594,10 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
     * for the post-clip worst case while the count itself lives on the GPU. */
    unsigned rast_num_triangles = total_triangles;
 
-   /* Get the color output surface (may be NULL for depth-only passes) */
-   void *color_data = NULL;
-   if (fb->nr_cbufs && fb->cbufs[0].texture) {
-      struct cp_resource *color_res = cp_resource(fb->cbufs[0].texture);
-      color_data = cp_resource_data(color_res);
-   }
+   /* Resolved when the framebuffer was bound; NULL for a depth-only pass. */
+   void *color_data = fb->color;
    if (cp_debug->debug_draw && !color_data)
-      fprintf(stderr, "  color=(nil) reason: nr_cbufs=%u tex=%p data=%p\n",
-              fb->nr_cbufs, fb->nr_cbufs ? (void*)fb->cbufs[0].texture : NULL,
-              fb->nr_cbufs && fb->cbufs[0].texture ?
-                 cp_resource_data(cp_resource(fb->cbufs[0].texture)) : NULL);
+      fprintf(stderr, "  color=(nil) reason: nr_cbufs=%u\n", fb->nr_cbufs);
 
    unsigned w = fb->width;
    unsigned h = fb->height;
@@ -4632,10 +4639,10 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
          if (!said++)
             fprintf(stderr, "abuffer: %u colour attachments; one only — "
                     "skipped\n", fb->nr_cbufs);
-      } else if (cp_color_encoding_from_format(fb->cbufs[0].format) < 0) {
+      } else if (fb->color_encoding < 0) {
          if (!said++)
-            fprintf(stderr, "abuffer: colour format %u has no encoding — "
-                    "skipped\n", fb->cbufs[0].format);
+            fprintf(stderr, "abuffer: the colour format has no encoding — "
+                    "skipped\n");
       } else {
          abuf = cp_abuf_setup(ab, w, h);
       }
@@ -5610,7 +5617,7 @@ cp_batch_structural(struct cp_context *cp, const struct cp_draw_call *info,
       return false;
 
    /* Framebuffer and the buffers the stages need. */
-   if (!cp->framebuffer.nr_cbufs || !cp->framebuffer.cbufs[0].texture ||
+   if (!cp->fb.nr_cbufs || !cp->fb.color ||
        !cp->visbuf || !cp->depthbuf)
       return false;
 
@@ -5683,7 +5690,7 @@ static bool
 cp_batch_abuf_ok(struct cp_context *cp)
 {
    struct cp_screen *screen = cp->screen;
-   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+   const struct cp_fb_desc *fb = &cp->fb;
 
    if (!cp_abuf_enabled() || cp_abuf.disabled)
       return false;
@@ -5700,8 +5707,7 @@ cp_batch_abuf_ok(struct cp_context *cp)
    /* The A-buffer's own gate. */
    if (MAX2(cp->fb_samples, 1u) != 1 || cp->depth_stencil.depth_writemask)
       return false;
-   if (fb->nr_cbufs != 1 || !fb->cbufs[0].texture ||
-       cp_color_encoding_from_format(fb->cbufs[0].format) < 0)
+   if (fb->nr_cbufs != 1 || !fb->color || fb->color_encoding < 0)
       return false;
 
    /*
@@ -5877,12 +5883,11 @@ cp_pass_appendable(struct cp_context *cp)
 static bool
 cp_opaque_appendable(struct cp_context *cp)
 {
-   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+   const struct cp_fb_desc *fb = &cp->fb;
    if (cp_debug->no_opaque_episode || !cp_batch_order_free(cp) ||
        !cp->fs_shader || cp->fs_shader->writes_memory ||
        MAX2(cp->fb_samples, 1u) != 1 || fb->nr_cbufs != 1 ||
-       !fb->cbufs[0].texture ||
-       cp_color_encoding_from_format(fb->cbufs[0].format) < 0)
+       !fb->color || fb->color_encoding < 0)
       return false;
    if (cp->pass.opaque &&
        (cp->pass.nsegs >= CP_PASS_MAX_SEGS ||
@@ -6231,9 +6236,8 @@ cp_opaque_finish(struct cp_context *cp)
       return;
    }
 
-   struct pipe_framebuffer_state *fb = &cp->framebuffer;
-   void *color_data = fb->nr_cbufs && fb->cbufs[0].texture
-      ? cp_resource_data(cp_resource(fb->cbufs[0].texture)) : NULL;
+   const struct cp_fb_desc *fb = &cp->fb;
+   void *color_data = fb->color;
    if (!color_data) {
       cp_pass_fallback(cp, segs, nsegs);
       return;
@@ -6867,9 +6871,8 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
    if (!shaded)
       return false;
 
-   struct pipe_framebuffer_state *fb = &cp->framebuffer;
-   void *color_data = (fb->nr_cbufs && fb->cbufs[0].texture)
-      ? cp_resource_data(cp_resource(fb->cbufs[0].texture)) : NULL;
+   const struct cp_fb_desc *fb = &cp->fb;
+   void *color_data = fb->color;
    CUdeviceptr descs_dev = ngroups > 1
       ? cp_upload(cp, descs, (size_t)nsegs * sizeof(descs[0])) : 0;
    if (!color_data || (ngroups > 1 && !descs_dev))
@@ -6890,7 +6893,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       .num_slots = ngroups == 1 ? direct->num_slots : 0,
       .capacity = ab->capacity,
       .color_encoding = (uint32_t)MAX2(
-         cp_color_encoding_from_format(fb->cbufs[0].format), 0),
+         fb->color_encoding, 0),
       .max_layers = cp_abuf.max_layers,
       .blend = cp_blend_desc_for(cp),
       .quad_seg = ngroups > 1 ? quad_seg : 0,
@@ -7310,9 +7313,8 @@ cp_pass_finish(struct cp_context *cp)
    }
 
    /* --- one composite for the whole episode --- */
-   struct pipe_framebuffer_state *fb = &cp->framebuffer;
-   void *color_data = (fb->nr_cbufs && fb->cbufs[0].texture)
-      ? cp_resource_data(cp_resource(fb->cbufs[0].texture)) : NULL;
+   const struct cp_fb_desc *fb = &cp->fb;
+   void *color_data = fb->color;
    CUdeviceptr descs_dev = cp_upload(cp, descs,
                                      (size_t)nsegs * sizeof(descs[0]));
    if (!color_data || !descs_dev) {
@@ -7328,7 +7330,7 @@ cp_pass_finish(struct cp_context *cp)
       .list_count = ab->clist_count,
       .capacity = ab->capacity,
       .color_encoding = (uint32_t)MAX2(
-         cp_color_encoding_from_format(fb->cbufs[0].format), 0),
+         fb->color_encoding, 0),
       .max_layers = cp_abuf.max_layers,
       .blend = cp_blend_desc_for(cp),
       .quad_seg = quad_seg,
@@ -7423,7 +7425,7 @@ static void
 cp_pass_append(struct cp_context *cp, unsigned ndraws)
 {
    struct cp_abuf *ab = &cp_abuf;
-   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+   const struct cp_fb_desc *fb = &cp->fb;
 
    if (cp->pass.nsegs && cp->pass.opaque)
       cp_pass_finish(cp);
@@ -7498,7 +7500,7 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    }
 
    if (!cp->pass.nsegs) {
-      struct pipe_framebuffer_state *fb = &cp->framebuffer;
+      const struct cp_fb_desc *fb = &cp->fb;
       cp->pass.opaque = true;
       cp->pass.w = fb->width;
       cp->pass.h = fb->height;

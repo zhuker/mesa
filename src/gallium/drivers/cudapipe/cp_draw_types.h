@@ -74,4 +74,26 @@ struct cp_viewport_state {
    float translate[3];
 };
 
+/*
+ * The attachments, resolved when the framebuffer was bound.
+ *
+ * The pipeline asked four separate questions of a pipe_framebuffer_state on
+ * every draw -- is there a colour buffer, where is its memory, what encoding
+ * does the writeback use, what is its sample stride -- and answered them by
+ * unwrapping a pipe_resource and calling cp_color_encoding_from_format each
+ * time. They are answered once here instead.
+ *
+ * The Gallium state stays beside this for the batch key, which compares
+ * texture identity and format: see cp_draw_types.h's note on why the key did
+ * not move with the fields.
+ */
+struct cp_fb_desc {
+   unsigned width, height;
+   unsigned nr_cbufs;
+   void *color;                     /* base address, NULL for depth-only */
+   int color_encoding;              /* enum cp_color_encoding, -1 = unsupported */
+   unsigned color_sample_stride;
+   bool has_zs;
+};
+
 #endif /* CP_DRAW_TYPES_H */

@@ -299,7 +299,10 @@ struct cp_context {
       unsigned  num, cap;
    } timer;
 
-   struct pipe_framebuffer_state framebuffer;
+   struct pipe_framebuffer_state framebuffer;   /* adapter: the key, the
+                                                 * clears and the blits */
+   /* What the draw path reads, resolved when the framebuffer was bound. */
+   struct cp_fb_desc fb;
    struct pipe_scissor_state scissor;
    /*
     * What the pipeline reads, in the driver's own types: the viewport's scale
