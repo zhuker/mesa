@@ -2582,3 +2582,37 @@ What survives correct measurement:
 
 That is a real and much smaller target than the one that was being chased, and
 it is now measured in a state that reproduces.
+
+### What CPVK_BATCH_BLEND is actually worth, and where the launches really go
+
+Warm traces of the same capture, launches per frame:
+
+    kernel                no flags   blended   gallium
+    cp_abuf_scan_block       106.6     102.2      22.9
+    main                      86.7      82.9      37.2
+    cp_abuf_worklist          22.6      21.7       1.8
+    cp_peel_advance           11.3      10.9       0.1
+    cp_abuf_seg_count          9.2       8.8       3.0
+    cp_abuf_seg_scatter        0.0       0.0       2.4
+    TOTAL                    756.9     724.5     244.7
+
+The blended-episode flag is worth **4%** of the launches and nothing at all in
+wall time, which agrees with the median that did not move. `cp_peel_advance`
+barely shifts, so the blended draws in this capture are not consecutive and
+mergeable in the way the flag needs. The three defects it fixed were real; the
+merge it enables is byte-identical in `cpvk_batchblend`; and on this workload
+it does not pay.
+
+The dominant number is `cp_abuf_scan_block`: 106.6 a frame against 22.9, which
+is the A-buffer prefix scan and runs once per episode. **The native driver
+builds about 4.7x as many A-buffer episodes as the Gallium driver** -- not
+fewer, and not none, but many more and each much smaller.
+
+That points at where episodes end rather than where they begin.
+`cp_pass_finish` is called from `cpvk_execute_begin_render`, so every
+`vkCmdBeginRendering` cuts the current episode, and it is called again from
+every batch flush. An episode that ends early cannot amortise anything, and
+the scan, the sort and the drain are paid again for the next one.
+
+That is the next thing to measure: how many episodes a frame each driver
+opens, and what ends them.
