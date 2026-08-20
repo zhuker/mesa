@@ -106,12 +106,25 @@ before layering behaviour on it — is the whole plan:
    straight through. **`cp_draw_vbo` is the only function left in the driver
    that sees a Gallium draw type.**
 
+   **Third slice: pipeline state.** The pipeline reads eighteen fields across
+   seven Gallium state structs; three of those are pure scalars and are now
+   `cp_viewport_state`, `cp_raster_state` and `cp_depth_state`, field names
+   kept.
+
+   What deliberately did **not** move: the comparison that decides whether a
+   held-back batch must be flushed, and the batch key. Both still carry the
+   whole Gallium structs, because narrowing them to the fields the pipeline
+   reads would let batches merge that do not merge today — and batch size is
+   exactly what makes the clipper's unstable primitive order visible (gaps 15
+   and 16: `bloom` went from bit-identical against itself to differing on 4
+   frames of 60 once its draws merged). **A factoring must not change what
+   merges.**
+
    What is shared today: the NIR→PTX compiler, the kernel suite, the flag
-   registry, the NIR options, the kernel ABI header and the draw description.
-   What is not: the *state* the pipeline reads off `struct cp_context` —
-   framebuffer, vertex buffers and elements, depth/stencil, viewport,
-   rasterizer — which is the next slice and the last one before a native draw
-   can call in.
+   registry, the NIR options, the kernel ABI header, the draw description and
+   three of the seven state structs. What is not: the framebuffer, the vertex
+   input, and blend — the three that carry a resource or a `pipe_format`, and
+   the last ones before a native draw can call in.
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
