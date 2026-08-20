@@ -6756,3 +6756,122 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
    cp_batch_flush_defer_why(cp, why);
    cp_pass_finish(cp);
 }
+
+/*
+ * Bind a framebuffer: the resolved attachments, the sample count, and the five
+ * framebuffer-sized buffers that scale with them.
+ *
+ * Grow-only, and that is the point: a real capture alternates 1280x720 with a
+ * 160x90 bloom pyramid many times a frame, and an equality test threw all five
+ * buffers away and rebuilt them in both directions 9.5 times a frame -- 356 GB
+ * of allocation churn over a replay, 3.4 ms a frame, with the device idle for
+ * every microsecond of it.
+ */
+void
+cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
+                           unsigned samples)
+{
+   cp->fb = *fb;
+
+   /* Coverage and depth are per sample, so the buffers scale with the sample
+    * count and it has to force a reallocation the same way the size does. */
+   if (samples > CP_MAX_SAMPLES)
+      samples = CP_MAX_SAMPLES;
+   cp->fb_samples = samples;
+
+   /*
+    * Size the five framebuffer-sized buffers, growing only.
+    *
+    * These used to be reallocated whenever the bound size differed from the
+    * last one, which is fine for a workload that renders one size and
+    * pathological for one that does not: a real capture alternates 1280x720
+    * with a 160x90 bloom pyramid many times a frame, so an equality test threw
+    * all five away and rebuilt them in both directions 9.5 times a frame. That
+    * measured 356 GB of allocation churn over a replay and 3.4 ms a frame,
+    * with the device idle for every microsecond of it.
+    *
+    * Keeping the largest is safe because nothing here is addressed by capacity:
+    * every kernel that reads these is bounded by the width and height passed at
+    * launch, and the depth clear below uses the bound size, so a buffer sized
+    * for 921,600 pixels serves a 14,400-pixel pass and clears only the part in
+    * use. The two counts are tracked separately because visbuf and depthbuf
+    * scale with samples and the other three do not.
+    */
+   unsigned w = cp->fb.width, h = cp->fb.height;
+   size_t px = (size_t)w * h;
+   size_t px_samples = px * samples;
+
+   /*
+    * A different size means the depth contents at these addresses belong to
+    * some other framebuffer, whether or not the buffer was big enough to keep.
+    * The reallocation used to imply this; now that it no longer happens on
+    * every change, say it directly.
+    */
+   if (w != cp->visbuf_w || h != cp->visbuf_h || samples != cp->visbuf_samples)
+      cp->depthbuf_cleared = false;
+
+   cp->visbuf_w = cp->depthbuf_w = w;
+   cp->visbuf_h = cp->depthbuf_h = h;
+   cp->visbuf_samples = samples;
+
+   if (px > 0 && (px > cp->fb_cap_px || px_samples > cp->fb_cap_px_samples)) {
+      /* Grow both to the new high-water mark, so a later pass that is wider
+       * but has fewer samples does not come back here. */
+      cp->fb_cap_px = MAX2(cp->fb_cap_px, px);
+      cp->fb_cap_px_samples = MAX2(cp->fb_cap_px_samples, px_samples);
+
+      if (cp->visbuf)
+         cuMemFree(cp->visbuf);
+      if (cp->depthbuf)
+         cuMemFree(cp->depthbuf);
+      if (cp->reject)
+         cuMemFree(cp->reject);
+      if (cp->resolved)
+         cuMemFree(cp->resolved);
+      if (cp->peel_next)
+         cuMemFree(cp->peel_next);
+      cp->visbuf = 0;
+      cp->depthbuf = 0;
+      cp->reject = 0;
+      cp->resolved = 0;
+      cp->peel_next = 0;
+
+      cuCtxSetCurrent(cp->screen->cuda_ctx);
+      CUresult e1 = cuMemAlloc(&cp->visbuf,
+                               cp->fb_cap_px_samples * sizeof(uint64_t));
+      CUresult e2 = cuMemAlloc(&cp->depthbuf,
+                               cp->fb_cap_px_samples * sizeof(uint32_t));
+      CP_CU_WARN(cuMemAlloc(&cp->reject,
+                            cp->fb_cap_px * CP_DISCARD_LAYERS * sizeof(uint32_t)),
+                 "cuMemAlloc(reject)");
+      CP_CU_WARN(cuMemAlloc(&cp->resolved, cp->fb_cap_px), "cuMemAlloc(resolved)");
+      CP_CU_WARN(cuMemAlloc(&cp->peel_next, cp->fb_cap_px * sizeof(uint32_t)),
+                 "cuMemAlloc(peel_next)");
+      /* Managed, because the host reads it between passes to decide
+       * whether another one is worth launching. */
+      if (!cp->peel_any)
+         cuMemAllocManaged(&cp->peel_any, sizeof(uint32_t),
+                           CU_MEM_ATTACH_GLOBAL);
+      if (e1 != CUDA_SUCCESS || e2 != CUDA_SUCCESS)
+         fprintf(stderr, "cudapipe: visbuf/depthbuf alloc %zu px x %u samples "
+                 "failed (%d, %d)\n", cp->fb_cap_px, samples, e1, e2);
+
+      /* Contents are new, whatever was cleared before is gone. */
+      cp->depthbuf_cleared = false;
+   }
+
+   if (cp->gpu_state) {
+      cp->gpu_state->visbuf = cp->visbuf;
+      cp->gpu_state->depthbuf = cp->depthbuf;
+      cp->gpu_state->fb_width = w;
+      cp->gpu_state->fb_height = h;
+      if (cp->fb.color) {
+         cp->gpu_state->color_attachment = (uint64_t)(uintptr_t)cp->fb.color;
+         cp->gpu_state->color_encoding =
+            (uint32_t)MAX2(cp->fb.color_encoding, 0);
+      } else {
+         cp->gpu_state->color_attachment = 0;
+      }
+   }
+}
+

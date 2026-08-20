@@ -31,6 +31,9 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       VkResult result = cpvk_execute_cmd_buffer(dev, cmd);
       if (result != VK_SUCCESS)
          return result;
+
+      for (unsigned d = 0; d < cmd->num_draws; d++)
+         cpvk_execute_draw(dev, &cmd->draws[d]);
    }
 
    /* Ordering is the stream's; a submit promises only that everything it

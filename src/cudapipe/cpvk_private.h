@@ -135,13 +135,37 @@ struct cpvk_dispatch {
    CUdeviceptr addrs[16];
 };
 
+struct cpvk_draw {
+   struct cpvk_pipeline *pipeline;
+   struct cp_fb_desc fb;
+   struct cp_viewport_state viewport;
+   struct cp_rect scissor;
+   struct cp_draw_call call;
+   struct cp_draw_range range;
+   uint64_t vb_base[16];
+   unsigned num_vb;
+   CUdeviceptr addrs[16];
+};
+
 struct cpvk_cmd_buffer {
    struct vk_command_buffer vk;
    struct cpvk_pipeline *pipeline;
    CUdeviceptr addrs[16];
    struct cpvk_dispatch dispatches[CPVK_MAX_DISPATCHES];
    unsigned num_dispatches;
+
+   /* Graphics: the state the command buffer has accumulated, and the draws. */
+   struct cp_fb_desc fb;
+   bool has_fb;
+   struct cp_viewport_state viewport;
+   struct cp_rect scissor;
+   uint64_t vb_base[16];
+   unsigned num_vb;
+   struct cpvk_draw draws[CPVK_MAX_DISPATCHES];
+   unsigned num_draws;
 };
+
+void cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d);
 
 extern const struct vk_command_buffer_ops cpvk_cmd_buffer_ops;
 extern const struct vk_sync_type *const cpvk_sync_types[];
@@ -153,6 +177,16 @@ struct cpvk_pipeline {
    struct vk_object_base base;
    VkPipelineBindPoint bind_point;
    struct cp_shader_binary *bin;   /* the compiled CUDA kernel */
+   struct cp_shader_binary *vs;    /* graphics: the two stages */
+   struct cp_shader_binary *fs;
+   /* The pipeline state the renderer reads, resolved at creation, which is
+    * where Vulkan puts it and where the Gallium adapter could never have it. */
+   struct cp_raster_state raster;
+   struct cp_depth_state depth;
+   struct cp_blend_desc blend;
+   struct cp_vertex_elem velem[16];
+   unsigned num_velem, vertex_stride;
+   enum mesa_prim topology;
    /* The block size. Under Gallium this arrived per dispatch from lavapipe,
     * which had read it out of the shader; natively the pipeline is where it
     * belongs, since it is fixed at compile time for anything but

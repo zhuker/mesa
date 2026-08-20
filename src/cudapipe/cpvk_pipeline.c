@@ -271,3 +271,147 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
 
    return first_error;
 }
+
+/*
+ * The graphics pipeline, and a draw.
+ *
+ * Vulkan hands the whole pipeline state at creation, which is where the
+ * renderer wants it: the Gallium adapter had to reconstruct this from a
+ * stream of state setters and hold a batch back to see the next draw's state
+ * before it could execute the previous one. Here it is one struct, resolved
+ * once, and vkCmdDraw fills a cp_draw_call and calls the same
+ * cp_draw_execute the Gallium-hosted driver runs.
+ */
+
+static enum mesa_prim
+cpvk_prim(VkPrimitiveTopology t)
+{
+   switch (t) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:     return MESA_PRIM_POINTS;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: return MESA_PRIM_TRIANGLE_STRIP;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:   return MESA_PRIM_TRIANGLE_FAN;
+   default:                                   return MESA_PRIM_TRIANGLES;
+   }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
+                             uint32_t count,
+                             const VkGraphicsPipelineCreateInfo *pCreateInfos,
+                             const VkAllocationCallbacks *pAllocator,
+                             VkPipeline *pPipelines)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+   VkResult first_error = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < count; i++)
+      pPipelines[i] = VK_NULL_HANDLE;
+
+   for (uint32_t i = 0; i < count; i++) {
+      const VkGraphicsPipelineCreateInfo *info = &pCreateInfos[i];
+      struct cpvk_pipeline *pipeline =
+         vk_object_zalloc(&dev->vk, pAllocator, sizeof(*pipeline),
+                          VK_OBJECT_TYPE_PIPELINE);
+      if (!pipeline) {
+         first_error = VK_ERROR_OUT_OF_HOST_MEMORY;
+         break;
+      }
+      pipeline->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
+
+      /* Both stages through the shared compiler. */
+      VkResult result = VK_SUCCESS;
+      for (uint32_t s = 0; s < info->stageCount; s++) {
+         const VkPipelineShaderStageCreateInfo *stage = &info->pStages[s];
+         void *mem_ctx = ralloc_context(NULL);
+         nir_shader *nir = NULL;
+         result = vk_pipeline_shader_stage_to_nir(&dev->vk, info->flags, stage,
+                                                  &cpvk_spirv_options,
+                                                  &cp_nir_options, mem_ctx,
+                                                  &nir);
+         if (result != VK_SUCCESS) {
+            ralloc_free(mem_ctx);
+            break;
+         }
+         cpvk_lower_nir(nir);
+         cpvk_lower_descriptors(nir, cpvk_pipeline_layout_from_handle(info->layout));
+
+         cuCtxSetCurrent(dev->cu_ctx);
+         struct cp_shader_binary *bin =
+            cp_compile_nir_to_ptx(nir, dev->pdev->sm_major, dev->pdev->sm_minor,
+                                  dev->cp_dev.kernels.sampler_ptx, NULL);
+         ralloc_free(mem_ctx);
+         if (!bin || !bin->kernel) {
+            result = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+         }
+         if (stage->stage == VK_SHADER_STAGE_VERTEX_BIT)
+            pipeline->vs = bin;
+         else
+            pipeline->fs = bin;
+      }
+      if (result != VK_SUCCESS || !pipeline->vs || !pipeline->fs) {
+         cpvk_pipeline_destroy(dev, pipeline, pAllocator);
+         if (first_error == VK_SUCCESS)
+            first_error = vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
+         continue;
+      }
+
+      /* The fixed-function state the renderer reads. */
+      const VkPipelineRasterizationStateCreateInfo *rs = info->pRasterizationState;
+      pipeline->raster = (struct cp_raster_state) {
+         .cull_face = rs ? (unsigned)rs->cullMode : 0,
+         .front_ccw = rs && rs->frontFace == VK_FRONT_FACE_COUNTER_CLOCKWISE,
+         .scissor = true,
+      };
+      const VkPipelineDepthStencilStateCreateInfo *ds = info->pDepthStencilState;
+      pipeline->depth = (struct cp_depth_state) {
+         .depth_enabled = ds && ds->depthTestEnable,
+         .depth_writemask = ds && ds->depthWriteEnable,
+         /* VkCompareOp and cp_compare_func agree; the values are Gallium's
+          * and Vulkan's alike. */
+         .depth_func = ds ? (unsigned)ds->depthCompareOp : CP_FUNC_ALWAYS,
+      };
+      const VkPipelineColorBlendStateCreateInfo *cb = info->pColorBlendState;
+      if (cb && cb->attachmentCount) {
+         const VkPipelineColorBlendAttachmentState *at = &cb->pAttachments[0];
+         pipeline->blend = (struct cp_blend_desc) {
+            .enable = at->blendEnable,
+            .colormask = at->colorWriteMask ? at->colorWriteMask : 0xF,
+         };
+      } else {
+         pipeline->blend.colormask = 0xF;
+      }
+
+      const VkPipelineInputAssemblyStateCreateInfo *ia = info->pInputAssemblyState;
+      pipeline->topology = ia ? cpvk_prim(ia->topology) : MESA_PRIM_TRIANGLES;
+
+      const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
+      if (vi) {
+         for (uint32_t a = 0; a < vi->vertexAttributeDescriptionCount && a < 16; a++) {
+            const VkVertexInputAttributeDescription *ad =
+               &vi->pVertexAttributeDescriptions[a];
+            unsigned stride = 0;
+            for (uint32_t b = 0; b < vi->vertexBindingDescriptionCount; b++)
+               if (vi->pVertexBindingDescriptions[b].binding == ad->binding)
+                  stride = vi->pVertexBindingDescriptions[b].stride;
+            pipeline->velem[ad->location] = (struct cp_vertex_elem) {
+               .vertex_buffer_index = ad->binding,
+               .src_offset = ad->offset,
+               .src_stride = stride,
+               .attr_size = 16,
+               .nr_chan = 4,
+               .chan_bytes = 4,
+               .conv = CP_VF_CONV_COPY32,
+               .fill_w = 1,
+            };
+            if (ad->location + 1 > pipeline->num_velem)
+               pipeline->num_velem = ad->location + 1;
+            pipeline->vertex_stride = stride;
+         }
+      }
+
+      pPipelines[i] = cpvk_pipeline_to_handle(pipeline);
+   }
+
+   return first_error;
+}

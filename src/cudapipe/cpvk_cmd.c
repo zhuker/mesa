@@ -154,8 +154,12 @@ cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
 
    vk_command_buffer_reset(&cmd->vk);
    cmd->num_dispatches = 0;
+   cmd->num_draws = 0;
    cmd->pipeline = NULL;
    memset(cmd->addrs, 0, sizeof(cmd->addrs));
+   memset(cmd->vb_base, 0, sizeof(cmd->vb_base));
+   cmd->num_vb = 0;
+   cmd->has_fb = false;
 }
 
 static void
@@ -204,8 +208,12 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
    cmd->num_dispatches = 0;
+   cmd->num_draws = 0;
    cmd->pipeline = NULL;
    memset(cmd->addrs, 0, sizeof(cmd->addrs));
+   memset(cmd->vb_base, 0, sizeof(cmd->vb_base));
+   cmd->num_vb = 0;
+   cmd->has_fb = false;
    return VK_SUCCESS;
 }
 
@@ -317,4 +325,157 @@ cpvk_execute_cmd_buffer(struct cpvk_device *dev, struct cpvk_cmd_buffer *cmd)
       cuMemFree(block);
    }
    return VK_SUCCESS;
+}
+
+/* ------------------------------------------------------- rendering + draw */
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                       const VkRenderingInfo *pRenderingInfo)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+
+   struct cp_fb_desc fb = {
+      .width = pRenderingInfo->renderArea.offset.x +
+               pRenderingInfo->renderArea.extent.width,
+      .height = pRenderingInfo->renderArea.offset.y +
+                pRenderingInfo->renderArea.extent.height,
+      .nr_cbufs = pRenderingInfo->colorAttachmentCount,
+      .color_encoding = -1,
+      .has_zs = pRenderingInfo->pDepthAttachment != NULL,
+   };
+
+   if (pRenderingInfo->colorAttachmentCount) {
+      VK_FROM_HANDLE(cpvk_image_view, view,
+                     pRenderingInfo->pColorAttachments[0].imageView);
+      if (view && view->image && view->image->mem) {
+         fb.color = (void *)(uintptr_t)(view->image->mem->dev_ptr +
+                                        view->image->offset);
+         fb.color_encoding = view->image->color;
+      }
+   }
+
+   cmd->fb = fb;
+   cmd->has_fb = true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdEndRendering(VkCommandBuffer commandBuffer)
+{
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
+                           uint32_t bindingCount, const VkBuffer *pBuffers,
+                           const VkDeviceSize *pOffsets,
+                           const VkDeviceSize *pSizes,
+                           const VkDeviceSize *pStrides)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+
+   for (uint32_t i = 0; i < bindingCount; i++) {
+      unsigned b = firstBinding + i;
+      if (b >= 16)
+         continue;
+      VK_FROM_HANDLE(cpvk_buffer, buf, pBuffers[i]);
+      cmd->vb_base[b] = (buf && buf->mem)
+         ? buf->mem->dev_ptr + buf->offset + pOffsets[i] : 0;
+      cmd->num_vb = MAX2(cmd->num_vb, b + 1);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t count,
+                             const VkViewport *pViewports)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+
+   if (!count)
+      return;
+   /* Vulkan's clip space already has y running downward, which is why the
+    * scale is not flipped again here; see cp_cull_mode's note on winding. */
+   cmd->viewport.scale[0] = pViewports[0].width * 0.5f;
+   cmd->viewport.scale[1] = pViewports[0].height * 0.5f;
+   cmd->viewport.scale[2] = pViewports[0].maxDepth - pViewports[0].minDepth;
+   cmd->viewport.translate[0] = pViewports[0].x + pViewports[0].width * 0.5f;
+   cmd->viewport.translate[1] = pViewports[0].y + pViewports[0].height * 0.5f;
+   cmd->viewport.translate[2] = pViewports[0].minDepth;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t count,
+                            const VkRect2D *pScissors)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+
+   if (!count)
+      return;
+   cmd->scissor = (struct cp_rect) {
+      .minx = pScissors[0].offset.x,
+      .miny = pScissors[0].offset.y,
+      .maxx = pScissors[0].offset.x + pScissors[0].extent.width,
+      .maxy = pScissors[0].offset.y + pScissors[0].extent.height,
+   };
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
+             uint32_t instanceCount, uint32_t firstVertex,
+             uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+
+   if (cmd->num_draws >= CPVK_MAX_DISPATCHES || !cmd->pipeline)
+      return;
+
+   struct cpvk_draw *d = &cmd->draws[cmd->num_draws++];
+   d->pipeline = cmd->pipeline;
+   d->fb = cmd->fb;
+   d->viewport = cmd->viewport;
+   d->scissor = cmd->scissor;
+   d->range = (struct cp_draw_range) { .start = firstVertex,
+                                       .count = vertexCount };
+   d->call = (struct cp_draw_call) {
+      .mode = cmd->pipeline->topology,
+      .instance_count = MAX2(instanceCount, 1u),
+      .start_instance = firstInstance,
+   };
+   memcpy(d->vb_base, cmd->vb_base, sizeof(d->vb_base));
+   d->num_vb = cmd->num_vb;
+   memcpy(d->addrs, cmd->addrs, sizeof(d->addrs));
+}
+
+/* Run one recorded draw through the renderer. */
+void
+cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
+{
+   struct cp_context *cp = &dev->renderer;
+   struct cpvk_pipeline *p = d->pipeline;
+
+   cp_context_set_framebuffer(cp, &d->fb, 1);
+
+   cp->viewport = d->viewport;
+   cp->scissor = d->scissor;
+   cp->rasterizer = p->raster;
+   cp->depth_stencil = p->depth;
+   cp->blend_desc = p->blend;
+   cp->blend_enabled = p->blend.enable;
+   cp->vs_shader = p->vs;
+   cp->fs_shader = p->fs;
+   memcpy(cp->velem, p->velem, sizeof(cp->velem));
+   cp->num_vertex_elements = p->num_velem;
+   cp->vertex_stride = p->vertex_stride;
+   memcpy(cp->vb_base, d->vb_base, sizeof(cp->vb_base));
+   cp->num_vertex_buffers = d->num_vb;
+
+   /* The uniform rows the shaders read: one row, the descriptor addresses the
+    * command buffer resolved. Same slots the Gallium adapter fills. */
+   uint64_t ubo_row[CP_ARG_UBO_STRIDE] = { 0 };
+   for (unsigned i = 0; i < CP_ARG_UBO_STRIDE && i < 16; i++)
+      ubo_row[i] = d->addrs[i];
+   cp->num_vs_ubos = cp->num_fs_ubos = 16;
+
+   uint32_t draw_id = 0, instances = d->call.instance_count;
+   cp_draw_execute(cp, &d->call, 0, &d->range, 1, 1, ubo_row, ubo_row,
+                   &draw_id, &instances, NULL, &d->scissor);
 }
