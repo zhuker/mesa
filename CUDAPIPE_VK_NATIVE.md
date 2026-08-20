@@ -151,9 +151,21 @@ before layering behaviour on it — is the whole plan:
    allocation freed after a synchronise, which is what the upload arena
    replaces once there is a frame to amortise over.
 
-   **Next: images, image views and the format table, then the graphics
-   pipeline and render pass — the point at which a sample can be pointed at
-   the native ICD.**
+6. **Milestone 5 — images, views, format table.** ✅ done. Linear layout with
+   every level at its own offset (checked in the smoke test by offsets and
+   pitches, not by a return code: 64×64 with four mips at 0/16384/20480/21504,
+   pitches 256/128/64/64, no overlap). Format support is derived from the same
+   `CP_TEXEL_*` and `CP_COLOR_*` encodings the kernels decode and encode, so
+   what the driver advertises and what its kernels can read cannot drift; a
+   format outside the table is refused rather than clamped.
+
+   **Next: the graphics pipeline and render pass — the point at which a sample
+   can be pointed at the native ICD and the first frame can be diffed against
+   the Gallium-hosted build.** That means vertex input state, the rasterizer
+   and A-buffer entry points from `cp_context.c` behind a Vulkan-shaped call,
+   and `vk_render_pass`'s attachment info driving the framebuffer. It is the
+   largest remaining piece and the one that milestone 0's factoring exists to
+   make possible.
 6. **Milestone 5 — parity.** triangle → the 18 samples → both captures,
    **diffed against the Gallium-hosted build, not against NVIDIA.** Both
    targets are built from one tree precisely so this comparison exists.
