@@ -176,7 +176,17 @@ struct cpvk_pipeline_layout {
  */
 struct cpvk_descriptor {
    uint64_t base;                     /* +0  buffer base, or image base */
-   uint8_t  pad0[16];
+   /*
+    * The extent, which the storage-image path clamps against before it
+    * touches memory. Leaving it zero is not a missing optimisation: every
+    * coordinate then reads as out of bounds and robustness returns zero for
+    * the whole image, so computeshader's emboss convolved a constant and its
+    * half of the frame came out flat grey, 128 in every channel.
+    */
+   uint32_t width;                    /* +8  storage image only */
+   uint16_t height;                   /* +12 */
+   uint16_t depth;                    /* +14 */
+   uint8_t  pad0[8];
    uint32_t row_stride;               /* +24 storage image only */
    /*
     * +28 is two things, because a descriptor is one kind or the other and

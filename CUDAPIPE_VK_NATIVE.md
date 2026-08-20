@@ -1568,3 +1568,30 @@ Two structural fixes in a row have now cost a turn each and moved no number.
 Both were real bugs and both are worth keeping, but the pattern is worth
 naming: reading the image first and the code second is what found the four
 samples that did move today.
+
+### computeshader: a storage image with no extent reads as entirely zero
+
+The compute half of the frame was flat grey, and exactly grey: 128 in every
+channel, everywhere. That is the answer written down. The sample's emboss
+kernel sums to zero and the shader adds 0.5, so a convolution of *any*
+constant image is 0.5 -- and a constant is what `imageLoad` returned.
+
+The backend clamps a storage-image coordinate against the extent before
+touching memory, reading width at descriptor offset 8 and height at 12, and
+returns zero for a texel outside it, which is what `robustImageAccess`
+requires. `struct cpvk_descriptor` had `pad0[16]` across exactly those bytes
+and the driver never filled them. Width zero puts *every* coordinate out of
+bounds, so robustness returned zero for the entire image.
+
+Filling width, height and depth at the view's mip level:
+
+    computeshader  4.427 -> 0.000
+
+**Fifteen of eighteen.** Three remain: `pbribl` 1.472 with correct spheres and
+no reflections, `texturemipmapgen` 0.456, `multisampling` 176.291 for want of
+a resolve.
+
+Worth comparing with the previous two turns, which fixed two real structural
+bugs -- array layers in rendering and copies, dispatch ordering -- and moved
+no number at all. This one came from reading a pixel value and asking what
+produces exactly 128.

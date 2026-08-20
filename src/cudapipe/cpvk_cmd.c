@@ -187,6 +187,14 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
          if (img && img->mem) {
             unsigned level = view->vk.base_mip_level;
             set->host[flat].base = img->mem->dev_ptr + img->offset;
+            /*
+             * The extent at this level, which the load and store paths clamp
+             * against. Without it width read zero, every coordinate was out
+             * of bounds, and robustness returned zero for the whole image.
+             */
+            set->host[flat].width = MAX2(img->vk.extent.width >> level, 1u);
+            set->host[flat].height = MAX2(img->vk.extent.height >> level, 1u);
+            set->host[flat].depth = MAX2(img->vk.extent.depth >> level, 1u);
             set->host[flat].row_stride = img->row_stride[level];
             set->host[flat].sampler_index_or_img_stride = img->level_size[level];
             set->host[flat].base_offset = img->level_offset[level];
