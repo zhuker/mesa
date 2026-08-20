@@ -1302,3 +1302,28 @@ layout exactly and renders correctly, so it is not the layout -- but
 `cpvk_mesh` draws one triangle from nine vertices, and these draw thousands.
 Raising its vertex and triangle count toward a real mesh is the obvious next
 step and the test already parameterises both.
+
+### Render-to-texture then sample works
+
+`tests/cpvk_rtt.c` renders into a sampled image -- clearing it to a colour by
+`loadOp` in its own render pass -- and then samples it in the next pass. Both
+drivers produce the rendered colour, byte-identical. So an image used as a
+colour attachment and then read by a sampler is not the problem, which is what
+`bloom`'s missing glow most looked like.
+
+The suite is nine tests now and every one of them passes:
+
+    cpvk_smoke     compute, memory, images
+    cpvk_tri       a Gouraud triangle
+    cpvk_draw      indexed, depth, clears, vertex formats
+    cpvk_ubo       uniforms in both stages
+    cpvk_tex       texture sampling
+    cpvk_mesh      a glTF vertex layout, two render passes
+    cpvk_batch     three draws, three descriptor sets
+    cpvk_batchtex  nine draws, two set layouts, textures, overlap, discard,
+                   six varyings, 1280x720, 800 triangles a draw, 60-byte stride
+    cpvk_rtt       render to a texture, then sample it
+
+Each was written to answer one question and each still answers it in about a
+second. Between them they have cleared more than a dozen hypotheses that would
+each have cost a turn of argument.
