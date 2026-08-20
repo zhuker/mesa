@@ -226,6 +226,21 @@ cpvk_GetImageSubresourceLayout(VkDevice _device, VkImage _image,
    };
 }
 
+/* The kernel's texture targets; cp_rast_types.h names them. */
+static uint32_t
+cpvk_tex_target(VkImageViewType t)
+{
+   switch (t) {
+   case VK_IMAGE_VIEW_TYPE_1D:         return CP_TEX_1D;
+   case VK_IMAGE_VIEW_TYPE_1D_ARRAY:   return CP_TEX_1D_ARRAY;
+   case VK_IMAGE_VIEW_TYPE_2D_ARRAY:   return CP_TEX_2D_ARRAY;
+   case VK_IMAGE_VIEW_TYPE_3D:         return CP_TEX_3D;
+   case VK_IMAGE_VIEW_TYPE_CUBE:       return CP_TEX_CUBE;
+   case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: return CP_TEX_CUBE_ARRAY;
+   default:                            return CP_TEX_2D;
+   }
+}
+
 /* ------------------------------------------------------------------- views */
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -242,6 +257,58 @@ cpvk_CreateImageView(VkDevice _device,
 
    view->image = cpvk_image_from_handle(pCreateInfo->image);
 
+   /*
+    * The sampler reaches a texture through one of these and nothing else: a
+    * descriptor holds a pointer to it at CP_DESC_IMAGE_FUNCTIONS_OFFSET, and
+    * that is the whole interface. Managed, because the host reads descriptors
+    * when it specialises a shader on its sampler state.
+    */
+   struct cpvk_image *img = view->image;
+   if (img) {
+      cuCtxSetCurrent(dev->cu_ctx);
+      if (cuMemAllocManaged(&view->tex_info, sizeof(struct cp_texture_info),
+                            CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
+         view->tex_info_host = (struct cp_texture_info *)(uintptr_t)view->tex_info;
+         memset(view->tex_info_host, 0, sizeof(*view->tex_info_host));
+
+         const VkImageSubresourceRange *r = &pCreateInfo->subresourceRange;
+         enum pipe_format pfmt = vk_format_to_pipe_format(pCreateInfo->format);
+         unsigned levels = MIN2(img->vk.mip_levels, CP_MAX_TEXTURE_LEVELS);
+
+         *view->tex_info_host = (struct cp_texture_info) {
+            .base = img->mem ? img->mem->dev_ptr + img->offset : 0,
+            .width = img->vk.extent.width,
+            .height = img->vk.extent.height,
+            .depth = MAX2(img->vk.extent.depth, img->vk.array_layers),
+            .format = pfmt,
+            .target = cpvk_tex_target(pCreateInfo->viewType),
+            .first_level = r->baseMipLevel,
+            .last_level = r->baseMipLevel +
+                          (r->levelCount == VK_REMAINING_MIP_LEVELS ?
+                           img->vk.mip_levels - r->baseMipLevel :
+                           r->levelCount) - 1,
+            .first_layer = r->baseArrayLayer,
+            .encoding = img->texel,
+            .blocksize = util_format_get_blocksize(pfmt),
+            .is_srgb = util_format_is_srgb(pfmt),
+         };
+         for (unsigned l = 0; l < levels; l++) {
+            view->tex_info_host->row_stride[l] = img->row_stride[l];
+            view->tex_info_host->img_stride[l] = img->level_size[l];
+            view->tex_info_host->mip_offset[l] = img->level_offset[l];
+         }
+
+         if (cp_debug->debug_tex) {
+            const struct cp_texture_info *ti = view->tex_info_host;
+            fprintf(stderr, "cudapipe: texture handle %ux%u fmt=%u enc=%u "
+                    "target=%u levels=%u..%u stride=%u base=%p\n",
+                    ti->width, ti->height, ti->format, ti->encoding,
+                    ti->target, ti->first_level, ti->last_level,
+                    ti->row_stride[0], (void *)(uintptr_t)ti->base);
+         }
+      }
+   }
+
    *pView = cpvk_image_view_to_handle(view);
    return VK_SUCCESS;
 }
@@ -255,4 +322,126 @@ cpvk_DestroyImageView(VkDevice _device, VkImageView _view,
 
    if (view)
       vk_image_view_destroy(&dev->vk, pAllocator, &view->vk);
+}
+
+
+/* ------------------------------------------------------------- samplers */
+
+/*
+ * The sampler kernel's own constants, which live in cp_sampler.cu because
+ * NVRTC compiles that file from a stringified copy and it cannot include
+ * anything. The values are pipe_tex_wrap's and pipe_tex_filter's, which is
+ * why the Gallium adapter never needed a conversion and this does.
+ * cp_sampler.cu is the source of truth; these mirror it.
+ */
+enum {
+   CP_WRAP_REPEAT = 0,
+   CP_WRAP_CLAMP,
+   CP_WRAP_CLAMP_TO_EDGE,
+   CP_WRAP_CLAMP_TO_BORDER,
+   CP_WRAP_MIRROR_REPEAT,
+   CP_WRAP_MIRROR_CLAMP,
+   CP_WRAP_MIRROR_CLAMP_TO_EDGE,
+   CP_WRAP_MIRROR_CLAMP_TO_BORDER,
+};
+enum { CP_FILTER_NEAREST = 0, CP_FILTER_LINEAR };
+enum { CP_MIPFILTER_NEAREST = 0, CP_MIPFILTER_LINEAR, CP_MIPFILTER_NONE };
+
+static uint32_t
+cpvk_wrap(VkSamplerAddressMode m)
+{
+   switch (m) {
+   case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:        return CP_WRAP_CLAMP_TO_EDGE;
+   case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER:      return CP_WRAP_CLAMP_TO_BORDER;
+   case VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT:      return CP_WRAP_MIRROR_REPEAT;
+   case VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE: return CP_WRAP_MIRROR_CLAMP_TO_EDGE;
+   default:                                           return CP_WRAP_REPEAT;
+   }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
+                   const VkAllocationCallbacks *pAllocator,
+                   VkSampler *pSampler)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+   struct cp_context *cp = &dev->renderer;
+
+   struct cpvk_sampler *sampler =
+      vk_object_zalloc(&dev->vk, pAllocator, sizeof(*sampler),
+                       VK_OBJECT_TYPE_SAMPLER);
+   if (!sampler)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   struct cp_sampler_info info = {
+      .wrap_s = cpvk_wrap(pCreateInfo->addressModeU),
+      .wrap_t = cpvk_wrap(pCreateInfo->addressModeV),
+      .wrap_r = cpvk_wrap(pCreateInfo->addressModeW),
+      .min_img_filter = pCreateInfo->minFilter == VK_FILTER_LINEAR ?
+                        CP_FILTER_LINEAR : CP_FILTER_NEAREST,
+      .mag_img_filter = pCreateInfo->magFilter == VK_FILTER_LINEAR ?
+                        CP_FILTER_LINEAR : CP_FILTER_NEAREST,
+      .min_mip_filter = pCreateInfo->mipmapMode ==
+                        VK_SAMPLER_MIPMAP_MODE_LINEAR ?
+                        CP_MIPFILTER_LINEAR : CP_MIPFILTER_NEAREST,
+      .unnormalized_coords = pCreateInfo->unnormalizedCoordinates,
+      .min_lod = pCreateInfo->minLod,
+      .max_lod = pCreateInfo->maxLod,
+      .lod_bias = pCreateInfo->mipLodBias,
+      .max_anisotropy = pCreateInfo->anisotropyEnable ?
+                        pCreateInfo->maxAnisotropy : 0.0f,
+   };
+   if (pCreateInfo->borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE ||
+       pCreateInfo->borderColor == VK_BORDER_COLOR_INT_OPAQUE_WHITE) {
+      for (int i = 0; i < 4; i++)
+         info.border_color[i] = 1.0f;
+   } else if (pCreateInfo->borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK ||
+              pCreateInfo->borderColor == VK_BORDER_COLOR_INT_OPAQUE_BLACK) {
+      info.border_color[3] = 1.0f;
+   }
+
+   /* Deduplicated, like the Gallium adapter's table: descriptors refer to
+    * entries by index and identical states must land on one entry, because
+    * the shader specialisation compares the state and not the index. */
+   unsigned index = cp->num_samplers;
+   for (unsigned i = 0; i < cp->num_samplers; i++) {
+      if (!memcmp(&cp->sampler_table_host[i], &info, sizeof(info))) {
+         index = i;
+         break;
+      }
+   }
+   if (index == cp->num_samplers) {
+      if (cp->num_samplers >= CP_MAX_SAMPLERS) {
+         vk_object_free(&dev->vk, pAllocator, sampler);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      cuCtxSetCurrent(dev->cu_ctx);
+      if (!cp->sampler_table &&
+          cuMemAllocManaged(&cp->sampler_table,
+                            CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info),
+                            CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
+         vk_object_free(&dev->vk, pAllocator, sampler);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      cp->sampler_table_host[index] = info;
+      ((struct cp_sampler_info *)(uintptr_t)cp->sampler_table)[index] = info;
+      cp->num_samplers++;
+   }
+
+   sampler->index = index;
+   *pSampler = cpvk_sampler_to_handle(sampler);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_DestroySampler(VkDevice _device, VkSampler _sampler,
+                    const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+   VK_FROM_HANDLE(cpvk_sampler, sampler, _sampler);
+
+   /* The table entry stays: descriptors already written refer to it by index
+    * and nothing renumbers them. The table is bounded and per device. */
+   if (sampler)
+      vk_object_free(&dev->vk, pAllocator, sampler);
 }

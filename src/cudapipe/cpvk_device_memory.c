@@ -51,9 +51,17 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       }
    }
 
-   /* Ordering is the stream's; a submit promises only that everything it
-    * recorded has run before any signal is observed. */
+   /*
+    * Both streams. The compute path launches on dev->stream; every graphics
+    * op -- draws, clears and transfers alike -- launches on the renderer's
+    * cp->stream, and waiting only on the first left the whole graphics path
+    * unsynchronised. It raced and usually won, which is the worst way for
+    * this to be wrong: the textured test rendered correctly under a debug
+    * flag, whose device-side printing forced the synchronisation the driver
+    * had failed to ask for, and produced an empty frame without it.
+    */
    cuStreamSynchronize(dev->stream);
+   cuStreamSynchronize(dev->renderer.stream);
    return VK_SUCCESS;
 }
 

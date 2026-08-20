@@ -144,11 +144,72 @@ lower_descriptors(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 }
 
+/*
+ * Texture and sampler derefs become the handles the backend expects.
+ *
+ * A handle is `set_base + binding * sizeof(struct cpvk_descriptor)`, computed
+ * here and never loaded: the kernel dereferences it to reach the
+ * cp_texture_info and the sampler index. load_const_buf_base_addr_lvp is the
+ * intrinsic the backend already implements for exactly this -- it resolves to
+ * the same constant-buffer slot lookup a uniform read uses -- so the set's
+ * buffer address goes in its own slot and the offset is added on top.
+ */
+static bool
+lower_tex(nir_builder *b, nir_instr *instr, void *data)
+{
+   const struct cpvk_pipeline_layout *layout = data;
+
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+
+   b->cursor = nir_before_instr(instr);
+
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      nir_tex_src_type want;
+      switch (tex->src[i].src_type) {
+      case nir_tex_src_texture_deref: want = nir_tex_src_texture_handle; break;
+      case nir_tex_src_sampler_deref: want = nir_tex_src_sampler_handle; break;
+      default: continue;
+      }
+
+      nir_deref_instr *deref = nir_src_as_deref(tex->src[i].src);
+      nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+      if (!var)
+         continue;
+
+      unsigned set = var->data.descriptor_set;
+      unsigned binding = var->data.binding;
+      if (set >= MESA_VK_MAX_DESCRIPTOR_SETS)
+         continue;
+
+      const struct cpvk_descriptor_set_layout *sl =
+         (const struct cpvk_descriptor_set_layout *)layout->vk.set_layouts[set];
+      unsigned flat = (sl && binding < sl->num_bindings)
+         ? sl->bindings[binding].flat : binding;
+
+      nir_def *base =
+         nir_load_const_buf_base_addr_lvp(b,
+                                          nir_imm_int(b, layout->set_slot[set]));
+      nir_def *handle =
+         nir_iadd_imm(b, base,
+                      (uint64_t)flat * CPVK_DESCRIPTOR_SIZE);
+
+      nir_tex_instr_remove_src(tex, i);
+      nir_tex_instr_add_src(tex, want, handle);
+      i = -1;   /* sources shifted; rescan */
+   }
+
+   return true;
+}
+
 static void
 cpvk_lower_descriptors(nir_shader *nir,
                        const struct cpvk_pipeline_layout *layout)
 {
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_descriptors,
+            nir_metadata_control_flow, (void *)layout);
+   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_tex,
             nir_metadata_control_flow, (void *)layout);
    NIR_PASS(_, nir, nir_lower_explicit_io,
             nir_var_mem_ubo | nir_var_mem_ssbo,
@@ -220,6 +281,9 @@ cpvk_CreatePipelineLayout(VkDevice _device,
       if (set)
          flat += set->num_descriptors;
    }
+   /* One slot per set for the set's own buffer, after the per-binding ones. */
+   for (uint32_t s = 0; s < layout->vk.set_count; s++)
+      layout->set_slot[s] = flat++;
    layout->num_descriptors = flat;
 
    *pPipelineLayout = cpvk_pipeline_layout_to_handle(layout);

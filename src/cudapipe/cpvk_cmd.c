@@ -78,6 +78,19 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
          return vk_error(dev, VK_ERROR_OUT_OF_POOL_MEMORY);
       }
       set->layout = layout;
+
+      /* The set as one buffer: a texture handle is an offset into it. */
+      if (layout && layout->num_descriptors) {
+         cuCtxSetCurrent(dev->cu_ctx);
+         size_t size = (size_t)layout->num_descriptors *
+                       sizeof(struct cpvk_descriptor);
+         if (cuMemAllocManaged(&set->buf, size, CU_MEM_ATTACH_GLOBAL) ==
+             CUDA_SUCCESS) {
+            set->host = (struct cpvk_descriptor *)(uintptr_t)set->buf;
+            memset(set->host, 0, size);
+         }
+      }
+
       pDescriptorSets[i] = cpvk_descriptor_set_to_handle(set);
    }
    return VK_SUCCESS;
@@ -135,10 +148,30 @@ cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
                ? buffer->mem->dev_ptr + buffer->offset +
                  write->pBufferInfo[e].offset
                : 0;
+            if (set->host)
+               set->host[flat].buffer_base = set->addrs[flat];
             break;
          }
+
+         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+         case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+         case VK_DESCRIPTOR_TYPE_SAMPLER: {
+            if (!set->host)
+               break;
+            const VkDescriptorImageInfo *ii = &write->pImageInfo[e];
+            if (ii->imageView) {
+               VK_FROM_HANDLE(cpvk_image_view, view, ii->imageView);
+               set->host[flat].texture_info = view ? view->tex_info : 0;
+            }
+            if (ii->sampler) {
+               VK_FROM_HANDLE(cpvk_sampler, samp, ii->sampler);
+               set->host[flat].sampler_index = samp ? samp->index : 0;
+            }
+            break;
+         }
+
          default:
-            /* Images arrive with the image milestone. */
             break;
          }
       }
@@ -259,6 +292,12 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
          if (base + d < CPVK_MAX_ARG_BUFS)
             cmd->addrs[base + d] = set->addrs[d];
       }
+
+      /* And the set itself, which is what a texture handle is an offset
+       * into. Buffers keep their own slot; this one is for images. */
+      unsigned slot = layout->set_slot[pInfo->firstSet + i];
+      if (slot < CPVK_MAX_ARG_BUFS)
+         cmd->addrs[slot] = set->buf;
    }
 }
 

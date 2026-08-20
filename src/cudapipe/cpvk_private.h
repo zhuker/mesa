@@ -114,13 +114,48 @@ struct cpvk_descriptor_set_layout {
 struct cpvk_pipeline_layout {
    struct vk_pipeline_layout vk;
    unsigned set_base[MESA_VK_MAX_DESCRIPTOR_SETS];  /* flat base per set */
+   /* The buffer slot holding this set's descriptor buffer address. Textures
+    * need the set, not the binding; buffers keep using their own slot. */
+   unsigned set_slot[MESA_VK_MAX_DESCRIPTOR_SETS];
    unsigned num_descriptors;
+};
+
+/*
+ * One descriptor, laid out so the kernels find what they read where they read
+ * it. Only three offsets are fixed and they are fixed by the kernels, not by
+ * this struct: the buffer base at 0, the sampler index at
+ * CP_DESC_SAMPLER_INDEX_OFFSET, the texture info pointer at
+ * CP_DESC_IMAGE_FUNCTIONS_OFFSET. Everything between them is padding this
+ * driver owns.
+ */
+struct cpvk_descriptor {
+   uint64_t buffer_base;              /* +0  read by emit_buffer_base */
+   uint8_t  pad0[20];
+   uint32_t sampler_index;            /* +28 index into cp_sampler_table */
+   uint8_t  pad1[16];
+   uint64_t texture_info;             /* +48 struct cp_texture_info * */
+   uint8_t  pad2[8];
 };
 
 struct cpvk_descriptor_set {
    struct vk_object_base base;
    struct cpvk_descriptor_set_layout *layout;
    CUdeviceptr addrs[CPVK_MAX_BINDINGS];
+
+   /*
+    * The set as one buffer, which is what a texture handle points into: the
+    * shader computes `set_base + binding * sizeof(struct cpvk_descriptor)`
+    * and never loads it, so there is nowhere to put a per-binding address.
+    * Managed, because cp_renderer.c's sampler-variant specialisation reads
+    * these on the host.
+    */
+   CUdeviceptr buf;
+   struct cpvk_descriptor *host;
+};
+
+struct cpvk_sampler {
+   struct vk_object_base base;
+   unsigned index;                    /* into cp_sampler_table */
 };
 
 struct cpvk_descriptor_pool {
@@ -138,6 +173,7 @@ struct cpvk_dispatch {
 /* Buffer slot 0 is the push constant block; descriptors start after it. */
 #define CPVK_UBO_PUSH_SLOT  0
 #define CPVK_MAX_PUSH_BYTES 256
+#define CPVK_DESCRIPTOR_SIZE 64
 
 struct cpvk_draw {
    struct cpvk_pipeline *pipeline;
@@ -277,6 +313,9 @@ struct cpvk_image {
 struct cpvk_image_view {
    struct vk_image_view vk;
    struct cpvk_image *image;
+   /* Managed cp_texture_info: what a texture handle ultimately points at. */
+   CUdeviceptr tex_info;
+   struct cp_texture_info *tex_info_host;
 };
 
 VK_DEFINE_HANDLE_CASTS(cpvk_instance, vk.base, VkInstance,
@@ -284,6 +323,8 @@ VK_DEFINE_HANDLE_CASTS(cpvk_instance, vk.base, VkInstance,
 VK_DEFINE_HANDLE_CASTS(cpvk_physical_device, vk.base, VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 VK_DEFINE_HANDLE_CASTS(cpvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_sampler, base, VkSampler,
+                               VK_OBJECT_TYPE_SAMPLER)
 VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_device_memory, vk.base, VkDeviceMemory,
                                VK_OBJECT_TYPE_DEVICE_MEMORY)
 VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_buffer, vk.base, VkBuffer,
