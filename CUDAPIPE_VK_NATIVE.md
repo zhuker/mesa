@@ -4574,3 +4574,37 @@ batch cap, and relaxing the merge conditions the renderer's own key omits. What
 remains is why blended draws in particular merge into smaller groups here, and
 that is a question about the merge key applied to blended draws rather than
 about episodes.
+
+### The blended refusals are a fragment-shader change, which an episode is built to absorb
+
+Splitting the capture's merge refusals by whether the draw is blended:
+
+    blended  fragment shader   12,068     62% of blended refusals
+    blended  vertex shader      3,898
+    blended  scissor            3,339
+    blended  index buffer          92
+    opaque   vertex shader      4,849
+
+A fragment-shader change ends a batch, and for a blended draw that batch is the
+whole A-buffer build. But an episode is explicitly designed to hold segments
+with *different* shaders: `cp_pass_finish` groups segments and "shades each
+segment densely over its own quads", which is what `group_first`,
+`seg_group` and `pass_group_ubos` are for, and the renderer names the
+fragment-shader bind as one of the three changes that may use the deferring
+flush.
+
+So the intended shape is: a fragment-shader change closes the *batch* and opens
+a new *segment* inside the same episode, and one A-buffer serves them all. That
+is how the Gallium driver gets 4.4x fewer builds from the same draws.
+
+This driver instead takes the full flush on that change, which closes the
+episode too, so every fragment shader costs an A-buffer. Seven attempts to use
+the deferring flush there failed on memory, and now the reason those attempts
+mattered is precise rather than inferred: **62% of blended refusals are exactly
+the case the deferring flush exists for.**
+
+The blocker is unchanged and now fully motivated -- an open episode pins the
+scratch arena, because `cp_draw_execute` reclaims only for a segment that opens
+one. Giving segments storage the episode owns is what makes the deferring flush
+usable, and the measurement says it is worth up to 4.4x of the A-buffer work,
+which is two thirds of the remaining launch gap.
