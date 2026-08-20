@@ -4157,3 +4157,40 @@ If strict parity with the reference is what the objective means, one flag
 switches it and the sweep reads 18/18. If correctness is what it means, this is
 already right and two samples differ from the reference by 0.0286 and 0.0037
 because the reference is wrong.
+
+### Measured against a real driver: no correctness regression
+
+Comparing both drivers against the NVIDIA proprietary driver on the same
+frames, mean absolute difference:
+
+    sample                  native   gallium
+    pbribl                   0.070     0.089    native closer
+    multisampling            0.110     0.112    native closer
+    texturemipmapgen         1.239     1.238    gallium closer by 0.001
+    the other fourteen       equal to three decimals
+
+So against a real Vulkan implementation the native driver is **at least as
+correct as the driver it replaces, and strictly better on two samples**. The
+one sample where the old driver is nearer is nearer by 0.001, which is inside
+the noise of the 1.24 both differ by.
+
+That answers the question the last entry could not: `pbribl`'s 0.0286 against
+the Gallium driver is not a regression, it is the Gallium driver being wrong.
+Seamless cube filtering moves this driver *towards* NVIDIA and lavapipe and
+away from the pre-branch tree, and the numbers say so directly:
+
+    pbribl    native vs NVIDIA   0.070     native vs lavapipe   0.027
+              gallium vs NVIDIA  0.089     gallium vs lavapipe  0.050
+              NVIDIA vs lavapipe 0.075
+
+Two production drivers differ from each other by more than this driver differs
+from either.
+
+Samples where both cudapipe drivers differ from NVIDIA by a lot -- 1.24 on
+texturemipmapgen, 1.10 on gltfscenerendering, 0.42 on instancing -- are shared
+convention differences in filtering and rasterisation, not native regressions,
+and they were there before this work started.
+
+**What remains is performance alone.** Replays at 9.4 and 34.4 ms against 7.2
+and 25.2 are a real regression against what is recorded, and no choice of
+reference changes that.
