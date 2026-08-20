@@ -778,3 +778,31 @@ not:
 
 The first of those is the only one that explains why the draws arrive with
 correct-looking state and shade nothing, and it is where to look next.
+
+### The missing spheres reproduce in one second
+
+Adding a second render pass to `cpvk_mesh` -- a 4x4 pass into a 64x64 image
+before the main one -- makes the main pass fault:
+
+    cuLaunchKernel failed at cp_draw_execute:4558
+      CUDA_ERROR_ILLEGAL_ADDRESS (700)
+
+which is the rasterizer's stage-2 launch. lavapipe renders the same sequence
+correctly. pbribl runs exactly this pattern three times over before it draws
+its spheres, and its sphere draws shade nothing.
+
+So the bug is not in the draw, which this test already exonerated with one
+pass. It is in what a *second* `vkCmdBeginRendering` leaves behind. The obvious
+suspects, in order of how cheap they are to test:
+
+- `cp_context_set_framebuffer` is grow-only, so a 4x4 pass allocates
+  16-pixel framebuffer buffers and the 64x64 pass that follows grows them.
+  Growing frees the old allocations; if anything still refers to them, that is
+  the illegal address.
+- The renderer takes no row stride for the colour target -- `cp_fb_desc` has
+  `color_sample_stride` and no `color_row_stride` -- so a render area smaller
+  than its image is addressed as if the image were the render area's width.
+  4x4 into a 64x64 image is exactly that case.
+
+`tests/cpvk_mesh.c` fails against lavapipe on purpose now and is the shortest
+path to it.

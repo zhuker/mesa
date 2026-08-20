@@ -15,8 +15,19 @@
  *   - a matrix from a uniform buffer and a position from a push constant,
  *     multiplied the way the sample's vertex shader multiplies them
  *
- * If this renders and pbribl does not, the difference is in something pbribl
- * does that this does not, which is a far shorter list than a whole frame.
+ * The draw itself was exonerated by this test: with one render pass it is
+ * byte-identical to lavapipe, so the stride, the offsets, the matrix and the
+ * push constant all work.
+ *
+ * IT THEN REPRODUCES THE BUG. Adding a small render pass before the main one
+ * -- which is what pbribl does three times, for an irradiance cube, a
+ * prefiltered environment map and a BRDF LUT -- makes the main pass fault:
+ *
+ *   cuLaunchKernel failed at cp_draw_execute:4558 CUDA_ERROR_ILLEGAL_ADDRESS
+ *
+ * That is the rasterizer's stage-2 launch, and the pass before it is 4x4 in a
+ * 64x64 image. So this test currently FAILS against lavapipe on purpose, and
+ * it is the shortest path to the missing spheres.
  */
 
 #include <stdio.h>
@@ -415,6 +426,39 @@ main(int argc, char **argv)
    }
 
    VkDeviceSize zero = 0;
+
+   /*
+    * An offscreen pass first, into the texture image, at a different size.
+    * pbribl runs three of these -- an irradiance cube, a prefiltered
+    * environment map and a BRDF LUT -- before it draws anything visible, and
+    * the spheres that follow them shade nothing. If a small pass followed by
+    * a large one is enough to break the large one, it breaks here too.
+    */
+   VkRenderingAttachmentInfo pre_at = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .imageView = view,
+      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      .clearValue.color.float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+   VkRenderingInfo pre_ri = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = { { 0, 0 }, { 4, 4 } }, .layerCount = 1,
+      .colorAttachmentCount = 1, .pColorAttachments = &pre_at };
+
+   beginRendering(cmd, &pre_ri);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+   VkViewport pre_vp = { 0, 0, 4, 4, 0.0f, 1.0f };
+   VkRect2D pre_sc = { { 0, 0 }, { 4, 4 } };
+   vkCmdSetViewport(cmd, 0, 1, &pre_vp);
+   vkCmdSetScissor(cmd, 0, 1, &pre_sc);
+   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
+                           &dset, 0, NULL);
+   vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &zero);
+   vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT16);
+   vkCmdDrawIndexed(cmd, 3, 1, 3, 6, 0);
+   endRendering(cmd);
+
    beginRendering(cmd, &ri);
    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
    vkCmdSetViewport(cmd, 0, 1, &vp);
