@@ -3212,3 +3212,34 @@ What is still solid, and worth keeping separate from all of this:
 Those three stand on substitutions and direct comparison, not on decoding a
 face from a colour. The face-decoding work does not, and is retracted as a
 diagnosis.
+
+### Bisecting the cube failure by substitution
+
+No oracle, just native against lavapipe on the same shader:
+
+    direction varying per fragment, always +X dominant      IDENTICAL
+    three faces by band, direction varying inside each      IDENTICAL
+    hemisphere of directions, quads straddling everywhere   DIFFER
+                                                            (70 colours vs 2)
+
+So per-fragment variation is fine, and several faces in one draw are fine. What
+fails is quads straddling a face boundary *pervasively*, which is what a sphere
+does and what a band does only on its two edges.
+
+The colour counts point at the mechanism. With flat per-face colours, a driver
+that filters **seamlessly across a cube seam** produces blends of two faces --
+lavapipe's seventy distinct colours -- and one that clamps within the face
+produces flat colours only, which is what this driver gives. Vulkan requires
+seamless cube filtering, and `cp_sample_level_layer` clamps `u` and `v` inside
+the level with `cp_wrap_texel`, which knows nothing about adjacent faces.
+
+That also explains why every earlier cube test passed: `cpvk_cubelod` and the
+band test choose directions that land near face *centres*, where a bilinear
+footprint never reaches the edge, so seamless and clamped filtering agree
+exactly.
+
+It does not yet explain pbribl's spheres being uniformly neutral rather than
+merely wrong at seams, so this is a mechanism with evidence behind it rather
+than a finished diagnosis -- and the way to test it is a substitution again:
+sample with `VK_FILTER_NEAREST`, where seam blending cannot occur, and see
+whether the two drivers agree on the sphere.
