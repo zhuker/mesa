@@ -715,11 +715,26 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
           */
          const struct cpvk_format_info *vf = cpvk_format_info(view->vk.format);
          fb.color_encoding = vf ? vf->color : cimg->color;
+         /* How far apart the samples are, which the renderer needs in order
+          * to write them and the resolve needs in order to find them. */
+         fb.color_sample_stride = (unsigned)cimg->sample_stride;
       }
    }
 
    cmd->fb = fb;
    cmd->has_fb = true;
+
+   cmd->resolve_src = NULL;
+   cmd->resolve_dst = NULL;
+   if (cat && cimg && cat->resolveImageView != VK_NULL_HANDLE &&
+       cat->resolveMode != VK_RESOLVE_MODE_NONE) {
+      VK_FROM_HANDLE(cpvk_image_view, rview, cat->resolveImageView);
+      if (rview && rview->image && rview->image->mem) {
+         cmd->resolve_src = cimg;
+         cmd->resolve_dst = rview->image;
+         cmd->resolve_area = pRenderingInfo->renderArea;
+      }
+   }
 
    /*
     * Bind the framebuffer here, as its own op, and not at the first draw.
@@ -776,10 +791,6 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    }
 }
 
-VKAPI_ATTR void VKAPI_CALL
-cpvk_CmdEndRendering(VkCommandBuffer commandBuffer)
-{
-}
 
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
@@ -1316,15 +1327,50 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
    }
 }
 
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdEndRendering(VkCommandBuffer commandBuffer)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+
+   /* The render pass's own resolve, recorded where it happens: at the end of
+    * the rendering, after the draws and before whatever reads the result. */
+   struct cpvk_image *src = cmd->resolve_src, *dst = cmd->resolve_dst;
+   if (!src || !dst)
+      return;
+
+   CUdeviceptr sb, db;
+   size_t sp, dp;
+   unsigned sbpp, dbpp;
+   if (!cpvk_image_plane(src, 0, &sb, &sp, &sbpp) ||
+       !cpvk_image_plane(dst, 0, &db, &dp, &dbpp) || sbpp != dbpp || sbpp != 4)
+      return;
+
+   struct cpvk_copy *c = cpvk_record_copy(cmd);
+   if (!c)
+      return;
+   *c = (struct cpvk_copy) {
+      .src = sb,
+      .dst = db,
+      .src_pitch = sp,
+      .dst_pitch = dp,
+      .width_bytes = (size_t)cmd->resolve_area.extent.width * sbpp,
+      .rows = cmd->resolve_area.extent.height,
+      .src_end = cpvk_image_end(src),
+      .dst_end = cpvk_image_end(dst),
+      .samples = MAX2(src->vk.samples, 1u),
+      .sample_stride = src->sample_stride,
+   };
+
+   cmd->resolve_src = NULL;
+   cmd->resolve_dst = NULL;
+}
+
 /*
- * A multisample resolve, taking sample zero rather than averaging.
+ * A multisample resolve: the average of the samples, which are planes
+ * cpvk_image::sample_stride apart.
  *
- * This is wrong and says so out loud, once, because a silent approximation is
- * the failure this driver's history is made of. A correct resolve averages the
- * samples, and the renderer keeps them at cp_fb_desc::color_sample_stride
- * apart; cpvk_image does not allocate for them yet, so there is nothing to
- * average. Taking sample zero is what an unresolved image already contains,
- * and it lets everything after the resolve run and be looked at.
+ * It took sample zero and said so out loud until images were sized for their
+ * samples, because until then there was nothing else in memory to average.
  */
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
@@ -1334,23 +1380,6 @@ cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_image, src, pInfo->srcImage);
    VK_FROM_HANDLE(cpvk_image, dst, pInfo->dstImage);
 
-   static bool said;
-   if (!said) {
-      said = true;
-      fprintf(stderr, "cudapipe: vkCmdResolveImage takes sample zero and does "
-              "not average; multisampled images resolve wrong\n");
-      fprintf(stderr, "cudapipe:   src %ux%u samples=%u size=%llu mem=%p, "
-              "dst %ux%u samples=%u size=%llu mem=%p\n",
-              src ? src->vk.extent.width : 0, src ? src->vk.extent.height : 0,
-              src ? src->vk.samples : 0,
-              src ? (unsigned long long)src->size : 0ull,
-              (void *)(src ? src->mem : NULL),
-              dst ? dst->vk.extent.width : 0, dst ? dst->vk.extent.height : 0,
-              dst ? dst->vk.samples : 0,
-              dst ? (unsigned long long)dst->size : 0ull,
-              (void *)(dst ? dst->mem : NULL));
-   }
-
    for (uint32_t i = 0; i < pInfo->regionCount; i++) {
       const VkImageResolve2 *r = &pInfo->pRegions[i];
       CUdeviceptr sb, db;
@@ -1359,8 +1388,11 @@ cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
       if (!cpvk_image_plane(src, r->srcSubresource.mipLevel, &sb, &sp, &sbpp) ||
           !cpvk_image_plane(dst, r->dstSubresource.mipLevel, &db, &dp, &dbpp))
          return;
-      if (sbpp != dbpp)
+      if (sbpp != dbpp || sbpp != 4) {
+         fprintf(stderr, "cudapipe: vkCmdResolveImage of a %u-byte texel is "
+                 "not implemented\n", sbpp);
          return;
+      }
 
       struct cpvk_copy *c = cpvk_record_copy(cmd);
       if (!c)
@@ -1374,6 +1406,8 @@ cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
          .rows = r->extent.height,
          .src_end = cpvk_image_end(src),
          .dst_end = cpvk_image_end(dst),
+         .samples = MAX2(src->vk.samples, 1u),
+         .sample_stride = src->sample_stride,
       };
    }
 }
@@ -1441,6 +1475,52 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
 
    if (c->rows <= 1 && !c->src_pitch && !c->dst_pitch) {
       cuMemcpyDtoDAsync(c->dst, c->src, c->width_bytes, cp->stream);
+      return;
+   }
+
+   if (c->samples > 1) {
+      /*
+       * Resolve on the host, once per render pass. Every sample plane is read
+       * and averaged into the destination; this is not on a frame's critical
+       * path and a kernel can replace it when something resolves per draw.
+       */
+      size_t bytes = c->width_bytes * c->rows;
+      uint8_t *acc_src = malloc(bytes);
+      uint32_t *acc = calloc(bytes / 4 * 4, sizeof(uint32_t));
+      uint8_t *out = malloc(bytes);
+      if (!acc_src || !acc || !out) {
+         free(acc_src); free(acc); free(out);
+         return;
+      }
+
+      cuStreamSynchronize(cp->stream);
+      for (unsigned s = 0; s < c->samples; s++) {
+         CUDA_MEMCPY2D d2h = {
+            .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+            .srcDevice = c->src + s * c->sample_stride,
+            .srcPitch = c->src_pitch,
+            .dstMemoryType = CU_MEMORYTYPE_HOST, .dstHost = acc_src,
+            .dstPitch = c->width_bytes,
+            .WidthInBytes = c->width_bytes, .Height = c->rows,
+         };
+         if (cuMemcpy2D(&d2h) != CUDA_SUCCESS)
+            break;
+         for (size_t i = 0; i < bytes; i++)
+            acc[i] += acc_src[i];
+      }
+
+      for (size_t i = 0; i < bytes; i++)
+         out[i] = (uint8_t)((acc[i] + c->samples / 2) / c->samples);
+
+      CUDA_MEMCPY2D h2d = {
+         .srcMemoryType = CU_MEMORYTYPE_HOST, .srcHost = out,
+         .srcPitch = c->width_bytes,
+         .dstMemoryType = CU_MEMORYTYPE_DEVICE, .dstDevice = c->dst,
+         .dstPitch = c->dst_pitch,
+         .WidthInBytes = c->width_bytes, .Height = c->rows,
+      };
+      cuMemcpy2D(&h2d);
+      free(acc_src); free(acc); free(out);
       return;
    }
 

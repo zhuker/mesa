@@ -126,6 +126,17 @@ cpvk_image_layout(struct cpvk_image *image)
    unsigned bpp = vk_format_get_blocksize(vk->format);
    uint64_t offset = 0;
 
+   /*
+    * Samples are planes: sample n of the whole image follows sample n-1, and
+    * sample_stride is how far apart they are. That is the layout the renderer
+    * already assumes -- cp_fb_desc carries exactly one number for it -- and
+    * it is the layout a resolve needs in order to find the samples it is
+    * averaging.
+    *
+    * The sample count was ignored entirely until now, so a four-sample image
+    * asked for a quarter of the memory it needs and everything that wrote to
+    * it wrote past the end of what the application had allocated.
+    */
    for (unsigned l = 0; l < vk->mip_levels; l++) {
       unsigned w = u_minify(vk->extent.width, l);
       unsigned h = u_minify(vk->extent.height, l);
@@ -136,7 +147,9 @@ cpvk_image_layout(struct cpvk_image *image)
       image->level_size[l] = (uint64_t)image->row_stride[l] * h * d;
       offset += image->level_size[l] * vk->array_layers;
    }
-   image->size = MAX2(offset, 1);
+
+   image->sample_stride = offset;
+   image->size = MAX2(offset * MAX2(vk->samples, 1u), 1);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

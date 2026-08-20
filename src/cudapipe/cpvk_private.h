@@ -293,6 +293,10 @@ struct cpvk_copy {
     * rather than returning an error.
     */
    uint64_t src_end, dst_end;
+
+   /* A multisample resolve: average `samples` planes `sample_stride` apart. */
+   unsigned samples;
+   uint64_t sample_stride;
 };
 
 struct cpvk_query_op {
@@ -333,6 +337,14 @@ struct cpvk_cmd_buffer {
    /* Graphics: the state the command buffer has accumulated, and the draws. */
    struct cp_fb_desc fb;
    bool has_fb;
+   /*
+    * A render pass can name a single-sample attachment to resolve into when
+    * it ends, and the runtime's render-pass emulation passes it through as
+    * VkRenderingAttachmentInfo::resolveImageView. Ignoring it is why
+    * multisampling drew 20,000 triangles into an image nothing ever read.
+    */
+   struct cpvk_image *resolve_src, *resolve_dst;
+   VkRect2D resolve_area;
    struct cp_viewport_state viewport;
    struct cp_rect scissor;
    uint64_t vb_base[16];
@@ -423,6 +435,8 @@ struct cpvk_image {
    uint64_t level_size[CPVK_MAX_MIP_LEVELS];
    uint32_t row_stride[CPVK_MAX_MIP_LEVELS];
    uint64_t size;
+   /* One sample plane's worth; sample n lives at n * sample_stride. */
+   uint64_t sample_stride;
    uint32_t texel;                 /* enum cp_texel_format */
    int color;                      /* enum cp_color_encoding, -1 if none */
 };
