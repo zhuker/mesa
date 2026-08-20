@@ -1773,3 +1773,22 @@ The next step is the one named last turn and not taken: a unit test that
 samples a known cube at an explicit deep LOD and compares against lavapipe.
 Reading more of the sampler is what the last four turns did, and the write
 side being provably correct is what makes the test worth writing now.
+
+### A tenth test: explicit level of detail
+
+`cpvk_lod` samples a four-level texture -- red, green, blue, white, one flat
+colour per level -- with `textureLod` at a level each fragment picks from its
+own x coordinate, so a wrong level shows as a wrong colour rather than a
+blend. Native output is **byte-identical to lavapipe**.
+
+That eliminates explicit-LOD sampling of a 2D texture, which is what pbribl's
+`textureLod(prefilteredMap, R, lodf)` was suspected of. Whatever is wrong there
+is specific to a **cube**, where the deepest levels are one and two texels per
+face and the face selection runs before the level fetch.
+
+Ten tests now pass: smoke, tri, draw, ubo, tex, mesh, batch, batchtex, rtt,
+lod.
+
+The value of the test is not only the answer. It runs in under a second
+against either driver, where the same question asked through pbribl costs a
+minute and a sample's worth of confounds.
