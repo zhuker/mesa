@@ -338,6 +338,75 @@ cp_scratch_begin(struct cp_context *cp)
    }
 }
 
+/*
+ * Whether an episode allocates its segments' surviving buffers itself.
+ *
+ * Off by default: the change it enables is that cp_draw_execute may reclaim
+ * scratch on every draw rather than only on the segment that opens an
+ * episode, which is a lifetime change in the hot path and wants its own
+ * measurement before it becomes the default.
+ */
+bool
+cp_pass_arena_enabled(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("CPVK_PASS_ARENA") ? 1 : 0;
+   return on != 0;
+}
+
+/*
+ * Bump-allocate from the episode's own device arena.
+ *
+ * Grows by replacing the block and keeping the old one until cp_pass_finish(),
+ * because a segment already recorded is still pointing into it. Returns 0 on
+ * failure, and every caller falls back to the shared arena, so a refusal costs
+ * a longer episode rather than a wrong frame.
+ */
+CUdeviceptr
+cp_pass_alloc_device(struct cp_context *cp, size_t bytes)
+{
+   bytes = (bytes + 255) & ~(size_t)255;
+   if (!bytes)
+      return 0;
+
+   if (cp->pass_arena.used + bytes > cp->pass_arena.size) {
+      size_t want = MAX2(cp->pass_arena.size * 2,
+                         cp->pass_arena.used + bytes);
+      want = MAX2(want, (size_t)16 << 20);
+      CUdeviceptr nb = 0;
+      if (cuMemAlloc(&nb, want) != CUDA_SUCCESS)
+         return 0;
+      if (cp->pass_arena.base) {
+         if (cp->pass_arena.num_overflow >= ARRAY_SIZE(cp->pass_arena.overflow)) {
+            cuMemFree(nb);
+            return 0;
+         }
+         cp->pass_arena.overflow[cp->pass_arena.num_overflow++] =
+            cp->pass_arena.base;
+      }
+      cp->pass_arena.base = nb;
+      cp->pass_arena.size = want;
+      cp->pass_arena.used = 0;
+   }
+
+   CUdeviceptr p = cp->pass_arena.base + cp->pass_arena.used;
+   cp->pass_arena.used += bytes;
+   if (cp->pass_arena.used > cp->pass_arena.peak)
+      cp->pass_arena.peak = cp->pass_arena.used;
+   return p;
+}
+
+/* Release what the finished episode was holding. */
+static void
+cp_pass_arena_reset(struct cp_context *cp)
+{
+   for (unsigned i = 0; i < cp->pass_arena.num_overflow; i++)
+      cuMemFree(cp->pass_arena.overflow[i]);
+   cp->pass_arena.num_overflow = 0;
+   cp->pass_arena.used = 0;
+}
+
 /* Reset scratch after all GPU work is done. Frees overflow arenas (old
  * arenas that were replaced during growth) and resets the bump pointer.
  * The current arena is kept at its grown size. */
@@ -3183,7 +3252,13 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
     * episode owns the epoch instead: every segment's clipped stream has to
     * survive until the episode's shading has read it, so only the first
     * segment reclaims and the rest allocate beyond. */
-   if (!cp->pass.appending || cp->pass.nsegs == 0)
+   /*
+    * With the episode owning its segments' surviving buffers, scratch may be
+    * reclaimed on every draw as it is outside an episode; without it, only
+    * the segment that opens one may reclaim, and the arena grows for the
+    * episode's whole length.
+    */
+   if (cp_pass_arena_enabled() || !cp->pass.appending || cp->pass.nsegs == 0)
       cp_scratch_begin(cp);
 
    /* A shader with no declared inputs needs no vertex buffer: it builds its
@@ -3437,8 +3512,18 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                slices[d].verts_per_instance = inst > 1 ? dverts : 0;
                vbegin += dverts * inst;
             }
-            slices_dev = cp_upload(cp, slices,
-                                   (size_t)batch_draws * sizeof(slices[0]));
+            /* The slice table outlives the draw for the same reason the
+             * clipped stream does: cp_write_batch_rows() searches it when the
+             * episode shades. */
+            size_t slice_bytes = (size_t)batch_draws * sizeof(slices[0]);
+            if (cp->pass.appending && cp_pass_arena_enabled()) {
+               slices_dev = cp_pass_alloc_device(cp, slice_bytes);
+               if (slices_dev)
+                  cuMemcpyHtoDAsync(slices_dev, slices, slice_bytes,
+                                    cp->stream);
+            }
+            if (!slices_dev)
+               slices_dev = cp_upload(cp, slices, slice_bytes);
             if (!slices_dev) { FREE(refs); return; }
 
             /* One row per assembled vertex, for the shader to pick its
@@ -3726,9 +3811,24 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
             if (screen->kernels.clip_triangles &&
                 num_vs_outputs <= CP_MAX_CLIP_SLOTS) {
                unsigned max_clipped = num_triangles * CP_CLIP_MAX_OUT;
-               CUdeviceptr clipped = cp_scratch_alloc_device(
-                  cp, (size_t)max_clipped * 3 * out_stride);
-               CUdeviceptr clip_count = cp_scratch_alloc_device(cp, 4);
+               /*
+                * From the episode's own arena while one is open, so that
+                * scratch may be reclaimed on every draw: this stream and its
+                * count are read again when cp_pass_finish() shades the
+                * segment, long after the draw that produced them. A refusal
+                * falls back to scratch, which is correct and merely keeps the
+                * episode short.
+                */
+               bool pass_owned = cp->pass.appending && cp_pass_arena_enabled();
+               size_t clip_bytes = (size_t)max_clipped * 3 * out_stride;
+               CUdeviceptr clipped = pass_owned
+                  ? cp_pass_alloc_device(cp, clip_bytes) : 0;
+               CUdeviceptr clip_count = clipped
+                  ? cp_pass_alloc_device(cp, 4) : 0;
+               if (!clipped || !clip_count) {
+                  clipped = cp_scratch_alloc_device(cp, clip_bytes);
+                  clip_count = cp_scratch_alloc_device(cp, 4);
+               }
 
                /*
                 * Falling through here does not draw nothing, it draws wrong:
@@ -6162,6 +6262,7 @@ cp_pass_finish(struct cp_context *cp)
    /* Cleared first: nothing below may see the episode as still open. */
    cp->pass.nsegs = 0;
    cp->pass.next_prim = 0;
+   bool pass_arena_live = cp_pass_arena_enabled();
 
    struct cp_pass_seg *segs = cp->pass_segs;
    unsigned w = cp->pass.w, h = cp->pass.h;
@@ -6597,6 +6698,9 @@ cp_pass_finish(struct cp_context *cp)
               "re-rendering segment by segment\n", ce);
       cp_pass_fallback(cp, segs, nsegs);
    }
+
+   if (pass_arena_live)
+      cp_pass_arena_reset(cp);
 }
 
 /* Record the segment cp_draw_execute has just counted; called from inside

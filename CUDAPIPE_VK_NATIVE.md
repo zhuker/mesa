@@ -4677,3 +4677,38 @@ The proper fix is to move these into the `cp_debug.c` registry, where
 `CUDAPIPE_HELP=1` and the generated `FLAGS.md` would cover them by
 construction. That belongs with the rest of the front end's consolidation and
 is written down rather than done here.
+
+### An episode-owned arena: implemented, correct, and slower on its own
+
+`cp_pass_alloc_device()` bump-allocates from a device arena the episode owns,
+and `cp_pass_finish()` releases it. With `CPVK_PASS_ARENA=1` the three things a
+segment must keep -- its clipped stream, its triangle count and its slice
+table -- come from there instead of the shared scratch, which lets
+`cp_draw_execute` call `cp_scratch_begin()` on every draw rather than only on
+the segment that opens an episode.
+
+That is the lifetime change seven earlier attempts needed and none of them
+made. It works:
+
+    sweep with CPVK_PASS_ARENA=1   18/18 run, 17/18 pixel-correct
+    both captures                  every frame, exit 0
+
+**And on its own it costs 48%:**
+
+    Crossroads     13.02 ms with the arena, 8.81 without
+    old capture    42.10 ms with,          31.28 without
+
+Which is not surprising in hindsight: it pays for a second device arena, a
+`cuMemcpyHtoDAsync` for the slice table where the upload ring batched it, and a
+`cp_scratch_begin()` on every draw -- all to remove a constraint that only pays
+once episodes actually lengthen, which needs the deferring flush this does not
+enable by itself.
+
+It is kept, off by default, because it is the piece the next attempt needs and
+building it again from the analysis would cost more than reading it. The
+default path is unchanged and measured so: 8.81 and 31.28 ms, the same as
+before it existed.
+
+The honest summary is that the mechanism is now available and unproven. What
+would prove it is the combination -- arena on, deferring flush on -- and that
+is one experiment rather than a design question.

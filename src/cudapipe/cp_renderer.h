@@ -533,6 +533,26 @@ struct cp_context {
       CUdeviceptr overflow[64];
       unsigned num_overflow;
    } dscratch;
+
+   /*
+    * Device storage an episode owns.
+    *
+    * A segment's clipped stream, its triangle count and its slice table have
+    * to survive until cp_pass_finish() shades them, which is why
+    * cp_draw_execute skips cp_scratch_begin() for every segment after the
+    * first -- and why an open episode's arena only grows. Putting those three
+    * here instead lets scratch reclaim every draw as it does outside an
+    * episode, so an episode's length is bounded by its own storage rather
+    * than by the shared arena.
+    *
+    * Reset by cp_pass_finish(). CPVK_PASS_ARENA=1 turns it on.
+    */
+   struct {
+      CUdeviceptr base;
+      size_t size, used, peak;
+      CUdeviceptr overflow[32];
+      unsigned num_overflow;
+   } pass_arena;
 };
 
 
@@ -889,6 +909,8 @@ enum cp_stage {
 /* The scratch and upload arenas, and the per-stage timing they share. Used
  * by every stage of the pipeline, so they moved to the renderer first. */
 void *cp_scratch_alloc(struct cp_context *cp, size_t size);
+CUdeviceptr cp_pass_alloc_device(struct cp_context *cp, size_t bytes);
+bool cp_pass_arena_enabled(void);
 CUdeviceptr cp_scratch_alloc_device(struct cp_context *cp, size_t size);
 CUdeviceptr cp_upload_begin(struct cp_context *cp, size_t size, void **host);
 void cp_upload_end(struct cp_context *cp, CUdeviceptr dst, const void *host,
