@@ -3048,3 +3048,34 @@ environment, and the result is a flat neutral tint rather than a reflection.
 The test runs in a second, needs no sample, and prints which face was chosen
 rather than a mean error. Whatever the fix turns out to be in the sampler's
 cube path, this is what will show it working.
+
+### The direction is right; the face selection is not
+
+`cpvk_cubedir` is `cpvk_cubesph` with one line changed -- it writes the
+direction as colour instead of sampling with it. Native and lavapipe are
+**byte-identical**: 1,459 distinct colours each, maximum difference 0.
+
+So the shader computes a correct, smoothly varying, per-fragment direction, and
+the sampler receives it. Sampling with that same direction returns face 0 for
+every fragment, where lavapipe returns faces 0, 1 and 2.
+
+That places the fault squarely inside the sampler's cube path -- between
+receiving a correct direction and choosing a face -- and rules out the shader,
+the interpolation, the backend's coordinate handling and every host-side
+structure already eliminated.
+
+Two tests now bracket it exactly:
+
+    cpvk_cubelod    direction is one of six constants, chosen by branch
+                    -> identical to lavapipe, faces 0..5 all correct
+    cpvk_cubesph    direction computed per fragment
+                    -> face 0 everywhere, 2 distinct colours against 70
+    cpvk_cubedir    the same direction written out instead of sampled
+                    -> identical to lavapipe
+
+A note on method: the first run of `cpvk_cubedir` printed DIFFER and both
+drivers had in fact trapped, because the vertex shader had been passed where
+the fragment shader belonged and neither run wrote a file. `cmp` on two
+absent files reports a difference. The exit statuses were in the output and
+said 133; checking them is what turned a false result into the real one, and
+that is now the third time this session that rule has paid.
