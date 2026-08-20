@@ -485,8 +485,23 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
        */
       unsigned slot = layout->set_slot[pInfo->firstSet + i];
       CUdeviceptr snap_addr = cpvk_snapshot_set(cmd, set);
-      if (slot < CPVK_MAX_ARG_BUFS)
+      if (slot < CPVK_MAX_ARG_BUFS) {
          cmd->addrs[slot] = snap_addr;
+
+         /* What the set contains, so two draws binding equal descriptors can
+          * merge even though each bind has its own copy. FNV-1a over the
+          * snapshot; a batch key is a merge decision, not a security
+          * boundary. */
+         uint64_t h = 0xcbf29ce484222325ull;
+         const uint8_t *bytes = (const uint8_t *)(uintptr_t)snap_addr;
+         size_t n = (size_t)set->layout->num_descriptors *
+                    sizeof(struct cpvk_descriptor);
+         for (size_t b = 0; bytes && b < n; b++) {
+            h ^= bytes[b];
+            h *= 0x100000001b3ull;
+         }
+         cmd->desc_hash[slot] = h;
+      }
 
       /*
        * Dynamic offsets: a dynamic uniform buffer binding names one buffer
@@ -945,6 +960,7 @@ cpvk_record_draw(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first,
    memcpy(d->vb_base, cmd->vb_base, sizeof(d->vb_base));
    d->num_vb = cmd->num_vb;
    memcpy(d->addrs, cmd->addrs, sizeof(d->addrs));
+   memcpy(d->desc_hash, cmd->desc_hash, sizeof(d->desc_hash));
    memcpy(d->push, cmd->push, sizeof(d->push));
    d->push_size = cmd->push_size;
 }
@@ -1185,13 +1201,9 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
    CPVK_DIFF(a->call.index_ptr != b->call.index_ptr, "index buffer");
    CPVK_DIFF(a->call.start_instance != b->call.start_instance, "start instance");
    CPVK_DIFF(a->call.instance_count != b->call.instance_count, "instance count");
-   /*
-    * The descriptor addresses are deliberately absent. cp_batch_record
-    * snapshots both stages' binding rows per draw, so they are what a batch
-    * is allowed to differ in -- and this driver snapshots each bind into
-    * fresh memory, so two draws binding the identical set never share an
-    * address. Comparing them made every batch one draw long.
-    */
+   /* What the descriptors contain, not where the snapshot of them lives. */
+   CPVK_DIFF(memcmp(a->desc_hash, b->desc_hash, sizeof(a->desc_hash)),
+             "descriptors");
    CPVK_DIFF(a->num_vb != b->num_vb, "vertex buffer count");
    CPVK_DIFF(memcmp(a->vb_base, b->vb_base, sizeof(a->vb_base)), "vertex buffers");
    CPVK_DIFF(a->push_size != b->push_size, "push constant size");

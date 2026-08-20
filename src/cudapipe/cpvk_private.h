@@ -97,6 +97,22 @@ struct cpvk_device {
    struct cpvk_draw *prev_draw;
    bool prev_draw_valid;
 
+   /*
+    * Compiled shaders, by the hash of the stage that produced them.
+    *
+    * Two pipelines built from the same SPIR-V used to compile it twice and
+    * hold two cp_shader_binary pointers, and the batcher compares those
+    * pointers -- so gltfscenerendering, which builds a pipeline per material,
+    * merged nothing at all. Sharing the binary is also the difference between
+    * compiling a scene's shaders once and once per material.
+    */
+   struct cpvk_shader_cache_entry {
+      unsigned char hash[BLAKE3_OUT_LEN];
+      struct cp_shader_binary *bin;
+   } *shader_cache;
+   unsigned num_shaders, max_shaders;
+   simple_mtx_t shader_cache_lock;
+
 };
 
 /*
@@ -254,6 +270,17 @@ struct cpvk_draw {
    uint64_t vb_base[16];
    unsigned num_vb;
    CUdeviceptr addrs[16];
+   /*
+    * A hash of each bound set's descriptors, taken when it was bound.
+    *
+    * The addresses cannot be compared -- every bind is snapshotted into fresh
+    * memory, so two draws binding the identical set never share one -- and
+    * they cannot be ignored either, because merging draws that sample
+    * different textures shades the batch with one of them. gltfscenerendering
+    * went from exact to 20.768 that way. The contents are what matters and
+    * this is them.
+    */
+   uint64_t desc_hash[16];
    unsigned char push[CPVK_MAX_PUSH_BYTES];
    unsigned push_size;
 };
@@ -361,6 +388,7 @@ struct cpvk_cmd_buffer {
    struct cp_rect scissor;
    uint64_t vb_base[16];
    unsigned num_vb;
+   uint64_t desc_hash[16];
    unsigned fb_samples;
    const void *index_ptr;
    unsigned index_size;

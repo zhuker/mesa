@@ -576,6 +576,111 @@ cpvk_prim(VkPrimitiveTopology t)
    }
 }
 
+/*
+ * A compiled shader for this stage, compiled once.
+ *
+ * Keyed on the runtime's own stage hash, which covers the SPIR-V, the entry
+ * point and the specialisation constants -- everything that decides what the
+ * NIR will be. The descriptor lowering depends on the pipeline layout as
+ * well, so the layout's set numbering goes in beside it.
+ */
+static struct cp_shader_binary *
+cpvk_compile_stage(struct cpvk_device *dev,
+                   VkPipelineCreateFlags2KHR flags,
+                   const VkPipelineShaderStageCreateInfo *stage,
+                   const struct cpvk_pipeline_layout *layout,
+                   VkResult *result)
+{
+   /* Robustness is not implemented here, so the state that feeds the hash is
+    * the disabled one -- zeroed rather than filled from a device that has no
+    * robustness features to report. */
+   struct vk_pipeline_robustness_state rstate = {
+      .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+      .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+      .vertex_inputs   = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+      .images          = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT,
+   };
+
+   unsigned char hash[BLAKE3_OUT_LEN];
+   vk_pipeline_hash_shader_stage(flags, stage, &rstate, hash);
+
+   /* The layout decides which slot each set lands in, so a shader compiled
+    * against one layout cannot be reused for another. */
+   if (layout) {
+      unsigned n = MIN2(layout->vk.set_count, BLAKE3_OUT_LEN / 2);
+      for (unsigned i = 0; i < n; i++)
+         hash[i] ^= (unsigned char)(layout->set_slot[i] + 1);
+   }
+
+   simple_mtx_lock(&dev->shader_cache_lock);
+   for (unsigned i = 0; i < dev->num_shaders; i++) {
+      if (!memcmp(dev->shader_cache[i].hash, hash, sizeof(hash))) {
+         struct cp_shader_binary *bin = dev->shader_cache[i].bin;
+         simple_mtx_unlock(&dev->shader_cache_lock);
+         *result = VK_SUCCESS;
+         return bin;
+      }
+   }
+   simple_mtx_unlock(&dev->shader_cache_lock);
+
+   void *mem_ctx = ralloc_context(NULL);
+   nir_shader *nir = NULL;
+   *result = vk_pipeline_shader_stage_to_nir(&dev->vk, flags, stage,
+                                             &cpvk_spirv_options,
+                                             &cp_nir_options, mem_ctx, &nir);
+   if (*result != VK_SUCCESS) {
+      ralloc_free(mem_ctx);
+      return NULL;
+   }
+
+   if (cp_debug->dump_nir) {
+      fprintf(stderr, "=== %s NIR (native) ===\n",
+              _mesa_shader_stage_to_string(nir->info.stage));
+      nir_print_shader(nir, stderr);
+   }
+
+   cpvk_lower_nir(nir);
+   cpvk_lower_descriptors(nir, layout);
+
+   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+            cp_type_size_vec4, nir_lower_io_lower_64bit_to_32);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+   cuCtxSetCurrent(dev->cu_ctx);
+   bool frag = stage->stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+   struct cp_shader_binary *bin =
+      cp_compile_nir_to_ptx(nir, dev->pdev->sm_major, dev->pdev->sm_minor,
+                            dev->cp_dev.kernels.sampler_ptx,
+                            frag ? dev->cp_dev.kernels.fs_helper_ptx : NULL);
+   ralloc_free(mem_ctx);
+
+   if (!bin || !bin->kernel) {
+      *result = VK_ERROR_INITIALIZATION_FAILED;
+      return NULL;
+   }
+
+   simple_mtx_lock(&dev->shader_cache_lock);
+   if (dev->num_shaders >= dev->max_shaders) {
+      unsigned want = dev->max_shaders ? dev->max_shaders * 2 : 64;
+      void *p = realloc(dev->shader_cache, want * sizeof(*dev->shader_cache));
+      if (p) {
+         dev->shader_cache = p;
+         dev->max_shaders = want;
+      }
+   }
+   if (dev->num_shaders < dev->max_shaders) {
+      memcpy(dev->shader_cache[dev->num_shaders].hash, hash, sizeof(hash));
+      dev->shader_cache[dev->num_shaders].bin = bin;
+      dev->num_shaders++;
+   }
+   simple_mtx_unlock(&dev->shader_cache_lock);
+
+   *result = VK_SUCCESS;
+   return bin;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
                              uint32_t count,
@@ -600,68 +705,23 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
       }
       pipeline->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
 
-      /* Both stages through the shared compiler. */
+      /* Both stages through the cache, so identical SPIR-V compiles once and
+       * two pipelines built from it share one binary -- which is what lets
+       * their draws batch. */
       VkResult result = VK_SUCCESS;
+      const struct cpvk_pipeline_layout *layout =
+         cpvk_pipeline_layout_from_handle(info->layout);
+
       for (uint32_t s = 0; s < info->stageCount; s++) {
          const VkPipelineShaderStageCreateInfo *stage = &info->pStages[s];
-         void *mem_ctx = ralloc_context(NULL);
-         nir_shader *nir = NULL;
-         result = vk_pipeline_shader_stage_to_nir(&dev->vk, info->flags, stage,
-                                                  &cpvk_spirv_options,
-                                                  &cp_nir_options, mem_ctx,
-                                                  &nir);
-         if (result != VK_SUCCESS) {
-            ralloc_free(mem_ctx);
-            break;
-         }
-         if (cp_debug->dump_nir) {
-            fprintf(stderr, "=== %s NIR (native) ===\n",
-                    _mesa_shader_stage_to_string(nir->info.stage));
-            nir_print_shader(nir, stderr);
-         }
-
-         cpvk_lower_nir(nir);
-         cpvk_lower_descriptors(nir, cpvk_pipeline_layout_from_handle(info->layout));
-
-         /*
-          * Slots first, then the lowering that uses them. nir_lower_io reads
-          * var->data.driver_location, which is zero on every variable until
-          * something assigns it -- so the first native draw put the fragment
-          * colour and gl_Position in the same slot and rasterized a triangle
-          * whose position was its colour. The backend's capture_io_locations
-          * reads the same field to match the fragment shader's inputs to the
-          * vertex shader's outputs, so this is what makes the stages agree.
-          */
-         nir_assign_io_var_locations(nir, nir_var_shader_in);
-         nir_assign_io_var_locations(nir, nir_var_shader_out);
-
-         /* The same lowering the Gallium front end does, with the same slot
-          * size function: the two stages agree on where an output lands only
-          * because one function decides it for both. */
-         NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
-                  cp_type_size_vec4, nir_lower_io_lower_64bit_to_32);
-
-         /* Gather after the lowering, not before it: the backend reads the
-          * input and output masks off shader_info, and cpvk_lower_nir's
-          * gather ran while the I/O was still derefs -- which is how a
-          * fragment shader with one input arrived claiming none. */
-         nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-
-         cuCtxSetCurrent(dev->cu_ctx);
-         bool frag = stage->stage == VK_SHADER_STAGE_FRAGMENT_BIT;
          struct cp_shader_binary *bin =
-            cp_compile_nir_to_ptx(nir, dev->pdev->sm_major, dev->pdev->sm_minor,
-                                  dev->cp_dev.kernels.sampler_ptx,
-                                  frag ? dev->cp_dev.kernels.fs_helper_ptx : NULL);
-         ralloc_free(mem_ctx);
-         if (!bin || !bin->kernel) {
-            result = VK_ERROR_INITIALIZATION_FAILED;
+            cpvk_compile_stage(dev, info->flags, stage, layout, &result);
+         if (!bin)
             break;
-         }
-         if (!frag)
-            pipeline->vs = bin;
-         else
+         if (stage->stage == VK_SHADER_STAGE_FRAGMENT_BIT)
             pipeline->fs = bin;
+         else
+            pipeline->vs = bin;
       }
       if (result != VK_SUCCESS || !pipeline->vs || !pipeline->fs) {
          cpvk_pipeline_destroy(dev, pipeline, pAllocator);

@@ -936,3 +936,30 @@ previous batch with this draw's state); the key must not be built from the
 context at that point (or every draw is compared against its predecessor); and
 the descriptor addresses must not be a merge condition (this driver snapshots
 each bind into fresh memory, so they never repeat).
+
+### The shader cache, and the tension that is left
+
+Two pipelines built from identical SPIR-V compiled it twice and held two
+`cp_shader_binary` pointers, so nothing merged. They share one now, keyed on
+the runtime's own `vk_pipeline_hash_shader_stage` -- SPIR-V, entry point and
+specialisation constants -- mixed with the layout's set numbering, because the
+descriptor lowering depends on it. gltfscenerendering's batches go from all
+1 to 1, 2, 6 and 9 draws.
+
+It did not make the capture faster: Crossroads is 24.04 ms against 24.28
+unbatched. And the reason is a real tension rather than another oversight.
+
+Merging draws that bind different descriptors is wrong here --
+gltfscenerendering goes from exact to 20.768 when descriptors are left out of
+the comparison. So the comparison includes a hash of each bound set's
+contents. But the capture rebinds descriptors on nearly every draw, so with
+that hash in the comparison almost nothing merges.
+
+The Gallium driver merges those same draws and does not compare descriptors at
+all, because `cp_batch_record` snapshots a binding row per draw and the shader
+indexes its row. That mechanism is in this driver too and the rows are filled,
+so in principle the hash should not be needed -- and taking it out breaks
+gltfscenerendering. Something about the per-draw fragment rows is not reaching
+the shader the way it does under Gallium, and that is the next thing to find:
+it is worth a 4x replay, since the Gallium driver's own numbers say batching
+is the difference between 27.88 ms and 7.13.

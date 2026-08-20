@@ -140,6 +140,8 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
          d[i].base = dev->null_data;
    }
 
+   simple_mtx_init(&dev->shader_cache_lock, mtx_plain);
+
    if (!cp_context_init(&dev->renderer, &dev->cp_dev)) {
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_stream;
