@@ -97,7 +97,36 @@ before layering behaviour on it — is the whole plan:
    asks. `vulkaninfo --summary` completes against the native ICD.
    **Next: images, then `vkCreateImageView` and the format table.**
 4. **Milestone 3 — pipelines and descriptors**, feeding the existing NIR→PTX
-   compiler.
+   compiler. ✅ done for compute pipelines; descriptors outstanding.
+   `vkCreateComputePipelines` takes SPIR-V through the runtime's
+   `vk_pipeline_shader_stage_to_nir` and straight into `cp_compile_nir_to_ptx`.
+
+   **The compiler is not forked, ported or copied.** `cp_nir_to_llvm.c` (3,277
+   lines) and `cp_debug.c` compile into this target from where they already
+   live: their only `gallium` include is `util/u_memory.h`, which is `src/util`.
+   Measured coupling per file, counting `pipe`/`gallium` references:
+
+   | file | references |
+   |---|---|
+   | `cp_debug.c`, `cp_debug.h`, `cp_kernels.h`, `cp_nir_to_llvm.h` | 0 |
+   | `cp_kernels.c`, `cp_nir_to_llvm.c` | 1 (`util/u_memory.h`) |
+   | `cp_screen.c` | 32 |
+   | `cp_resource.c` | 65 |
+   | `cp_context.c` | 162 |
+
+   So the backend was portable all along and the Gallium coupling is
+   concentrated in exactly the three files that *are* the adapter. The NIR
+   options moved to `cp_nir_options.h`, shared by both drivers rather than
+   duplicated.
+
+   The backend's own unconditional unimplemented-intrinsic warning named the
+   missing lowering on the first run — `load_deref`, `store_deref`,
+   `vulkan_resource_index`, `load_vulkan_descriptor`. Generic lowering is now
+   done here, including telling `nir_lower_compute_system_values` that the
+   dispatch base is always zero, without which `load_base_global_invocation_id`
+   reached a backend with no case for it. What is left is exactly the three
+   descriptor intrinsics, which need this driver's own descriptor model — the
+   next milestone, and the one where the descriptor-set simplification pays.
 5. **Milestone 4 — command buffers**: record, then translate a whole render
    pass at submit. This is where batching and episodes stop existing.
 6. **Milestone 5 — parity.** triangle → the 18 samples → both captures,
@@ -198,7 +227,16 @@ flags off, tiling prototype present but disabled):
 | 18-sample sweep total | 35.85 ms (`buffer-image-device`) | **35.91 ms**, +0.17% |
 | sweep verdicts | `gltfscenerendering`, `texture3d` standing; `renderheadless` vacuous | unchanged, all 18 exit 0 |
 
-Iteration record: `~/git/Vulkan/build/iter/census-vk-native`.
+Iteration records: `~/git/Vulkan/build/iter/census-vk-native`, and
+`nir-options-shared` after the shared-header move — 35.90 ms total, −0.0%, all
+18 exiting 0, the same two standing verdicts, and the capture unchanged at
+0.429% / 0.001% with replays of 25.27 ms and 7.22 ms median.
+
+One thing that measurement established and is worth keeping: **byte-identity
+against itself is not currently a property of this tree.** The same build
+dumped twice differs on 3 of 10 capture frames while the gated percentages are
+identical, so a byte diff between two builds is not evidence of a change. Use
+the >32/255 and >96/255 means, which is what the gate has always been.
 
 When the native driver renders, it takes the same table, and additionally has
 to match the Gallium-hosted build frame for frame — which is why both targets
