@@ -4519,3 +4519,27 @@ baseline, because the arena budget closes them again within a few segments. The
 4.4x episode-count gap is real and this is not the way to close it.
 
 Reverted.
+
+### Batch length is limited by merge refusals, not by either cap
+
+    CUDAPIPE_BATCH_MAX   default 128   8.78 ms
+                         32            9.25
+                         8            11.41
+
+    CP_MAX_BATCH_TRIS    256K          8.81 / 31.29
+                         1M            8.80 / 31.19
+
+The draw cap is already at its maximum and lowering it costs; raising the
+triangle cap fourfold changes nothing. So batches do not end because they are
+full. They end because the next draw cannot merge -- a different fragment
+shader in 32% of cases, a different vertex shader in 21%, a scissor change in
+9% -- and every one of those is in the renderer's own `cp_batch_key`, which the
+Gallium driver honours too.
+
+Both caps reverted.
+
+That closes off the cheap explanations for the batch-length difference. What is
+left is that the Gallium driver averages 6.09 draws per batch against this
+driver's 4.47 while refusing merges for the same reasons, which means its draws
+arrive in a more mergeable order or its shader identities coincide more often
+-- neither of which this front end controls directly.
