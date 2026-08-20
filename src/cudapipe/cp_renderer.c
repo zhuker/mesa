@@ -6742,6 +6742,10 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
 static void
 cp_opaque_append(struct cp_context *cp, unsigned ndraws)
 {
+   if (getenv("CPVK_DEBUG_EPISODE"))
+      fprintf(stderr, "append: nsegs=%u opaque=%d ndraws=%u\n",
+              cp->pass.nsegs, (int)cp->pass.opaque, ndraws);
+
    if (cp->pass.nsegs && !cp->pass.opaque)
       cp_pass_finish(cp);
    if (cp->pass.nsegs >= CP_PASS_MAX_SEGS) {
@@ -6857,6 +6861,9 @@ void
 cp_batch_flush_why(struct cp_context *cp, const char *why)
 {
    cp_batch_flush_defer_why(cp, why);
+   if (getenv("CPVK_DEBUG_EPISODE") && cp->pass.nsegs)
+      fprintf(stderr, "episode-cut: flush_why=%s nsegs=%u\n", why,
+              cp->pass.nsegs);
    cp_pass_finish(cp);
 }
 

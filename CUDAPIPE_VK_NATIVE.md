@@ -2645,3 +2645,44 @@ three code paths that close an episode accounting for more than one of them.
 Worth noting for whoever picks it up: `cp_opaque_append` is only reached from a
 batch flush, and this driver's batching is off by default, so how nine
 episodes are created at all is part of the same question.
+
+### Why every episode holds one segment, and why the obvious fix is wrong
+
+The nine cuts have one source:
+
+    9 x episode-cut: flush_why=the next draw cannot join nsegs=1
+
+`cpvk_execute_draw` calls `cp_batch_flush_why()` whenever a draw cannot join
+the pending batch, and with this driver's batching off by default **no draw
+ever joins**, so every draw takes that line and `cp_batch_flush_why` finishes
+the episode behind it.
+
+The renderer offers a deferring variant for exactly this case, and says so:
+"Only the four per-segment state changes may call this -- a draw whose key
+broke the batch, and the vertex-shader, fragment-shader and vertex-elements
+binds." Switching to it works as advertised: `gltfscenerendering`'s nine
+single-segment episodes become three, of five, three and one.
+
+**And it breaks six samples.** 15/18 pixel-correct falls to 9/18:
+
+    bloom               126.195
+    gltfscenerendering   24.03
+    multithreading        9.777
+    particlesystem        3.655
+    pushconstants         3.428
+    pbribl                2.393
+
+The renderer's rule holds for the Gallium adapter, which flushes on the *other*
+state changes an episode reads episode-wide. This front end has none of those
+flush points, so it relies on this one; keeping the episode open here keeps it
+open across shader and descriptor binds it must not span. Reverted, and 15/18
+restored.
+
+Note that all thirteen unit tests passed in the broken state. They do not model
+a frame with many pipelines and many descriptor sets across several render
+passes, which is what the samples caught. That is worth more than the fix
+would have been.
+
+So the one-segment episode is understood and its cost is quantified, and the
+next move is not this line: it is giving this front end the flush points the
+Gallium adapter has, after which the deferring variant becomes correct.

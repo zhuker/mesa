@@ -1451,8 +1451,30 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
     */
    bool batch_blended = false;
    bool batch_ok = cpvk_batch_can_join(dev, d, &batch_blended);
-   if (!batch_ok)
+   if (!batch_ok) {
+      /*
+       * The full flush, which finishes the pass episode too, and it has to be.
+       *
+       * The deferring variant was tried here on the reasoning the renderer
+       * itself offers -- "a draw whose key broke the batch" is one of the four
+       * per-segment changes allowed to keep an episode open -- and it does
+       * what it promises: gltfscenerendering's nine single-segment episodes
+       * became three of five, three and one.
+       *
+       * It also broke six samples. 15/18 pixel-correct fell to 9/18, with
+       * bloom at 126.195 and gltfscenerendering at 24.03. The renderer's rule
+       * holds for the Gallium adapter, which flushes on the *other* state
+       * changes an episode reads episode-wide; this front end has no such
+       * flush points, so it relies on this one. Keeping the episode open here
+       * keeps it open across shader and descriptor changes it must not span.
+       *
+       * The cost is real and measured: an episode of one segment amortises
+       * nothing, and cp_abuf_scan_block runs once per episode and 4.7x more
+       * often here than on the driver this replaces. Closing that gap means
+       * giving this front end the other flush points first, not this line.
+       */
       cp_batch_flush_why(cp, "the next draw cannot join");
+   }
 
    if (!dev->prev_draw)
       dev->prev_draw = malloc(sizeof(*dev->prev_draw));
