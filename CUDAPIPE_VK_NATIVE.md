@@ -3459,3 +3459,35 @@ never been compared against it.
 
 That is the next substitution: put the cube at binding 4 of a five-binding set
 in the test, behind two uniform buffers, and see whether the read goes to zero.
+
+### In pbribl's fragment shader, 2D reads work and cube reads return zero
+
+Three substitutions in the same shader, same frame, same fragments:
+
+    texture(samplerBRDFLUT, vec2(0.5))   binding 3, 2D    (185, 5, 0)
+    texture(samplerIrradiance, R)        binding 2, cube  (0, 0, 0)
+    texture(prefilteredMap, R)           binding 4, cube  (0, 0, 0)
+
+So it is not the binding index, not the descriptor, not the sampler, and not
+the cube's contents -- a 2D texture in the same set, sampled by the same shader
+on the same fragments, returns a sensible value while both cubes return zero.
+
+And the skybox shader, in the same application, samples a cube correctly and is
+byte-identical to the reference.
+
+What separates them: skybox samples with `inUVW`, an interpolated varying
+straight from the rasterizer, while pbribl computes `R = reflect(-V, N)` from
+two varyings and a uniform. The backend distinguishes exactly this case --
+`emit_tex` sets `coord_slot` only when the coordinate's parent is
+`load_input`, and its comment says "anything computed in the shader leaves the
+sampler on the base level".
+
+That is not yet the explanation, because `cpvk_cubesph` also computes its
+direction and works. But the pair of facts is now sharp: a cube sampled with a
+computed direction works in a test and returns zero in this shader, while a 2D
+texture in that same shader works.
+
+The next substitution follows directly: in pbribl's shader, sample the cube
+with a *varying* -- `texture(prefilteredMap, inNormal)` -- and with a computed
+one, in the same run. If the varying works and the computed does not, the
+`coord_slot` path is implicated with evidence.
