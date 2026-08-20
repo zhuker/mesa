@@ -4499,3 +4499,23 @@ Blended episodes are on now and worth 2.7x; what remains is that this driver's
 episodes are still shorter. That is the same finding as before the leak was
 found, at a quarter of the magnitude: not "no episodes at all" but "episodes
 about four times too short".
+
+### Attempt seven, against an honest baseline: still nothing
+
+With batching and blended episodes on by default and the environment clean,
+deferring the flush on per-segment binds, bounded by arena use:
+
+    Crossroads    8.76 ms against a baseline of 8.81
+    old capture  31.32 ms against 31.29
+
+Both captures complete every frame and the difference is inside the noise. So
+the null result attempt 5 reported is real after all -- it was measured against
+a polluted baseline, and measured again against a clean one it says the same
+thing.
+
+That is worth knowing precisely because the leak invalidated so much else.
+Deferring on shader binds does not lengthen episodes usefully, whatever the
+baseline, because the arena budget closes them again within a few segments. The
+4.4x episode-count gap is real and this is not the way to close it.
+
+Reverted.
