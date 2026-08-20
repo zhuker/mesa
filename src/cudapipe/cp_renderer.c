@@ -2500,20 +2500,34 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
        * and prints eight lines.
        */
       cuCtxSynchronize();
+
+      /*
+       * Only as many pixels as are going to be printed. Fetching all of them
+       * means four allocations scaled by a full frame's pixel count, and on a
+       * 1280x720 draw that is where this path died -- taking the answer with
+       * it, because the draw being investigated was the one that never got
+       * here. The vertex dump below needs no pixels at all, and a draw that
+       * shades nothing is exactly the case worth looking at.
+       */
+      unsigned dump_pixels = MIN2(num_pixels, 4096u);
+
       size_t vs_out_bytes = (size_t)num_triangles * 3 * num_vs_outputs * 16;
       float *vs_out = malloc(vs_out_bytes);
-      uint32_t *plist_buf = malloc((size_t)num_pixels * 4);
-      float *fin_buf = malloc((size_t)num_pixels * fs_in_stride);
-      float *fout_buf = malloc((size_t)num_pixels * fs_out_stride);
-      if (!vs_out || !plist_buf || !fin_buf || !fout_buf) {
+      uint32_t *plist_buf = dump_pixels ? malloc((size_t)dump_pixels * 4) : NULL;
+      float *fin_buf = dump_pixels ? malloc((size_t)dump_pixels * fs_in_stride) : NULL;
+      float *fout_buf = dump_pixels ? malloc((size_t)dump_pixels * fs_out_stride) : NULL;
+      if (!vs_out || (dump_pixels && (!plist_buf || !fin_buf || !fout_buf))) {
          free(vs_out); free(plist_buf); free(fin_buf); free(fout_buf);
          fprintf(stderr, "  (CUDAPIPE_DEBUG_FS: out of memory)\n");
          return;
       }
       cuMemcpyDtoH(vs_out, vs_output_buf, vs_out_bytes);
-      cuMemcpyDtoH(plist_buf, pixel_list, (size_t)num_pixels * 4);
-      cuMemcpyDtoH(fin_buf, fs_in, (size_t)num_pixels * fs_in_stride);
-      cuMemcpyDtoH(fout_buf, fs_out, (size_t)num_pixels * fs_out_stride);
+      if (dump_pixels) {
+         cuMemcpyDtoH(plist_buf, pixel_list, (size_t)dump_pixels * 4);
+         cuMemcpyDtoH(fin_buf, fs_in, (size_t)dump_pixels * fs_in_stride);
+         cuMemcpyDtoH(fout_buf, fs_out, (size_t)dump_pixels * fs_out_stride);
+      }
+      num_pixels = dump_pixels;
 
       unsigned vstep = cp_debug->debug_fs_vstep;   /* registry clamps to >= 1 */
       for (unsigned v = 0; v < num_triangles * 3 && v < 6 * vstep; v += vstep) {

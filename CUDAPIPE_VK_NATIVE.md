@@ -719,3 +719,20 @@ it can answer this.
 
 That is the next piece of work, and it is a change to the debug path rather
 than to the driver.
+
+### The debug path still dies, and a new gap found on the way
+
+`CUDAPIPE_DEBUG_FS` allocated four buffers scaled by a full frame's pixel
+count. They are bounded to 4,096 pixels now, which is more than the eight lines
+it prints and removes an allocation of tens of megabytes per draw. **It did not
+fix the crash**: pbribl still segfaults under that flag and runs fine without
+it, so the fault is elsewhere in the dump -- the vertex fetch sized by
+`num_triangles * 3 * num_vs_outputs * 16` against whatever `vs_output_buf`
+actually holds is the next place to look.
+
+Found while reading that output, and unrelated to the spheres:
+
+    intrinsic 'load_output' is not implemented
+
+A shader in this sample reads its own framebuffer output. That is a real gap in
+the backend and nothing has been done about it.
