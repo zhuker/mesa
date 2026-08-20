@@ -1,7 +1,20 @@
-/* Milestone 1 smoke test: does the native driver enumerate a device? */
+/* Native-driver smoke test.
+ *
+ * Milestone 1: a CUDA device is enumerated as a Vulkan physical device.
+ * Milestone 2: a device, a queue, the three memory types, a mapped write that
+ *              reads back, and a buffer bound to memory.
+ *
+ * Deliberately not a conformance test. It is the cheapest thing that fails
+ * loudly when the object plumbing is wrong, which is what every milestone
+ * here needs before anything larger is pointed at the driver.
+ */
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
+
+#define CHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
+   printf("FAIL %s -> %d\n", #x, _r); return 1; } } while (0)
 
 int main(void)
 {
@@ -10,36 +23,94 @@ int main(void)
    VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                                 .pApplicationInfo = &app };
    VkInstance inst;
-   VkResult r = vkCreateInstance(&ici, NULL, &inst);
-   if (r != VK_SUCCESS) { printf("vkCreateInstance %d\n", r); return 1; }
+   CHECK(vkCreateInstance(&ici, NULL, &inst));
 
    uint32_t n = 0;
-   r = vkEnumeratePhysicalDevices(inst, &n, NULL);
-   printf("vkEnumeratePhysicalDevices -> %d, count %u\n", r, n);
-   if (r != VK_SUCCESS || !n) return 1;
+   CHECK(vkEnumeratePhysicalDevices(inst, &n, NULL));
+   printf("physical devices: %u\n", n);
+   if (!n) return 1;
 
-   VkPhysicalDevice pd[4];
-   n = n > 4 ? 4 : n;
-   vkEnumeratePhysicalDevices(inst, &n, pd);
+   VkPhysicalDevice pd;
+   n = 1;
+   VkResult r = vkEnumeratePhysicalDevices(inst, &n, &pd);
+   if (r != VK_SUCCESS && r != VK_INCOMPLETE) { printf("FAIL enum %d\n", r); return 1; }
 
-   for (uint32_t i = 0; i < n; i++) {
-      VkPhysicalDeviceProperties p;
-      vkGetPhysicalDeviceProperties(pd[i], &p);
-      printf("  [%u] %s  api %u.%u.%u  type %u\n", i, p.deviceName,
-             VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
-             VK_VERSION_PATCH(p.apiVersion), p.deviceType);
+   VkPhysicalDeviceProperties p;
+   vkGetPhysicalDeviceProperties(pd, &p);
+   printf("  %s  api %u.%u.%u\n", p.deviceName, VK_VERSION_MAJOR(p.apiVersion),
+          VK_VERSION_MINOR(p.apiVersion), VK_VERSION_PATCH(p.apiVersion));
 
-      VkPhysicalDeviceMemoryProperties m;
-      vkGetPhysicalDeviceMemoryProperties(pd[i], &m);
-      printf("      %u memory types, %u heaps, heap0 %.1f GiB\n",
-             m.memoryTypeCount, m.memoryHeapCount,
-             m.memoryHeaps[0].size / 1073741824.0);
+   VkPhysicalDeviceMemoryProperties mp;
+   vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+   printf("  %u memory types, %u heaps\n", mp.memoryTypeCount,
+          mp.memoryHeapCount);
 
-      uint32_t q = 0;
-      vkGetPhysicalDeviceQueueFamilyProperties(pd[i], &q, NULL);
-      printf("      %u queue famil%s\n", q, q == 1 ? "y" : "ies");
+   float prio = 1.0f;
+   VkDeviceQueueCreateInfo qci = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueFamilyIndex = 0, .queueCount = 1, .pQueuePriorities = &prio };
+   VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+                              .queueCreateInfoCount = 1,
+                              .pQueueCreateInfos = &qci };
+   VkDevice dev;
+   CHECK(vkCreateDevice(pd, &dci, NULL, &dev));
+   printf("vkCreateDevice ok\n");
+
+   VkQueue queue;
+   vkGetDeviceQueue(dev, 0, 0, &queue);
+   printf("vkGetDeviceQueue ok (%p)\n", (void *)queue);
+
+   /* Each memory type: allocate, and map the ones that claim host visibility.
+    * A device-local allocation must refuse the map rather than stage behind
+    * the caller's back. */
+   for (uint32_t t = 0; t < mp.memoryTypeCount; t++) {
+      const VkDeviceSize size = 64 * 1024;
+      VkMemoryAllocateInfo mai = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = size, .memoryTypeIndex = t };
+      VkDeviceMemory mem;
+      CHECK(vkAllocateMemory(dev, &mai, NULL, &mem));
+
+      bool visible = (mp.memoryTypes[t].propertyFlags &
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+      void *ptr = NULL;
+      VkResult mr = vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &ptr);
+      if (visible) {
+         if (mr != VK_SUCCESS) { printf("FAIL map type %u -> %d\n", t, mr); return 1; }
+         memset(ptr, 0xA5, size);
+         if (((unsigned char *)ptr)[size - 1] != 0xA5) {
+            printf("FAIL readback type %u\n", t); return 1;
+         }
+         vkUnmapMemory(dev, mem);
+      } else if (mr == VK_SUCCESS) {
+         printf("FAIL type %u is device-local and mapped anyway\n", t);
+         return 1;
+      }
+      printf("  memory type %u flags 0x%02x %-14s map %s\n", t,
+             mp.memoryTypes[t].propertyFlags,
+             visible ? "host-visible" : "device-local",
+             visible ? "wrote+read 64 KiB" : "refused, as it should be");
+
+      if (t == 0) {
+         VkBufferCreateInfo bci = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4096,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+         VkBuffer buf;
+         CHECK(vkCreateBuffer(dev, &bci, NULL, &buf));
+         VkMemoryRequirements req;
+         vkGetBufferMemoryRequirements(dev, buf, &req);
+         CHECK(vkBindBufferMemory(dev, buf, mem, 0));
+         printf("  buffer 4096 B: requirements size %llu align %llu types 0x%x, bound\n",
+                (unsigned long long)req.size,
+                (unsigned long long)req.alignment, req.memoryTypeBits);
+         vkDestroyBuffer(dev, buf, NULL);
+      }
+      vkFreeMemory(dev, mem, NULL);
    }
 
+   CHECK(vkDeviceWaitIdle(dev));
+   vkDestroyDevice(dev, NULL);
    vkDestroyInstance(inst, NULL);
    printf("ok\n");
    return 0;

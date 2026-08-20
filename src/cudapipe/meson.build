@@ -28,6 +28,7 @@ cpvk_entrypoints = custom_target(
 
 libcudapipe_vk_files = files(
   'cpvk_device.c',
+  'cpvk_device_memory.c',
 )
 
 libcudapipe_vk = static_library(

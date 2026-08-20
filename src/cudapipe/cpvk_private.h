@@ -24,6 +24,8 @@
 #include "vk_instance.h"
 #include "vk_physical_device.h"
 #include "vk_queue.h"
+#include "vk_buffer.h"
+#include "vk_device_memory.h"
 #include "vk_log.h"
 
 #include <cuda.h>
@@ -48,7 +50,32 @@ struct cpvk_device {
    struct cpvk_physical_device *pdev;
 
    CUcontext cu_ctx;
+   CUstream stream;
    struct vk_queue queue;
+};
+
+/*
+ * A memory type index picks the allocator, and the three of them are the split
+ * session 13 had to negotiate with lavapipe through two new pipe_screen hooks.
+ * Here they are simply what the driver does.
+ */
+enum cpvk_memory_kind {
+   CPVK_MEM_DEVICE = 0,     /* cuMemAlloc: never host-mapped */
+   CPVK_MEM_HOST = 1,       /* cuMemHostAlloc: pinned, host-cached */
+   CPVK_MEM_MANAGED = 2,    /* cuMemAllocManaged: both, and migrating */
+};
+
+struct cpvk_device_memory {
+   struct vk_device_memory vk;
+   enum cpvk_memory_kind kind;
+   CUdeviceptr dev_ptr;     /* what a kernel dereferences */
+   void *host_ptr;          /* what vkMapMemory returns, or NULL */
+};
+
+struct cpvk_buffer {
+   struct vk_buffer vk;
+   struct cpvk_device_memory *mem;
+   VkDeviceSize offset;
 };
 
 VK_DEFINE_HANDLE_CASTS(cpvk_instance, vk.base, VkInstance,
@@ -56,5 +83,9 @@ VK_DEFINE_HANDLE_CASTS(cpvk_instance, vk.base, VkInstance,
 VK_DEFINE_HANDLE_CASTS(cpvk_physical_device, vk.base, VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 VK_DEFINE_HANDLE_CASTS(cpvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_device_memory, vk.base, VkDeviceMemory,
+                               VK_OBJECT_TYPE_DEVICE_MEMORY)
+VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_buffer, vk.base, VkBuffer,
+                               VK_OBJECT_TYPE_BUFFER)
 
 #endif /* CPVK_PRIVATE_H */
