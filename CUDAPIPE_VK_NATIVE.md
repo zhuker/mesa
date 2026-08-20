@@ -2240,3 +2240,36 @@ stage searches by primitive. It is set only when `batch_draws > 1`, and the
 opaque path's version is the one gltfscenerendering takes. A search that
 returns the wrong row for the third and later draws would produce exactly this
 curve.
+
+### Draw count eliminated; clipping is the remaining difference
+
+`cpvk_batchtex` has `#define NDRAW 9` -- nine draws, nine descriptor sets,
+nine textures -- and merges correctly without the descriptor key. The note in
+`cpvk_draws_mergeable` saying the untested case was "nine draws there, three
+here" had it backwards. Batch size is not the discriminator.
+
+Nor is the row search. `cp_write_batch_rows` does a textbook last-slice-not-
+past-this-vertex binary search, correct for any table length, and
+`prim_shift = 3` matches `CP_CLIP_MAX_OUT = 8`. (Two comments describe that as
+"four output slots per input triangle" and a "4x slot array"; the constant is
+8 and the shift agrees with the constant, so the comments are stale and the
+code is right.)
+
+What is left is **clipping**. The condition is explicit:
+
+    bool stable_clip = batch_draws > 1 &&
+       (cp->blend_enabled ||
+        (cp->fs_shader && cp->fs_shader->reads_const_bufs));
+
+and its comment says exactly what is at stake: "the primitive index has to
+name the input triangle, or cp_write_batch_rows() maps fragments to the wrong
+draw's material". `gltfscenerendering` draws a large model that clips;
+`cpvk_batchtex` draws nine small bands that do not. So the test exercises the
+`prim_shift = 0` mapping and the sample exercises the `prim_shift = 3` one,
+and only the sample is wrong.
+
+The experiment that settles it is small: move `cpvk_batchtex`'s geometry so its
+triangles cross the viewport edge and have to be clipped, then run it with
+`CPVK_NO_DESC_KEY=1`. If it fails, the descriptor key has been standing in for
+a stable-clip row-mapping bug all along, and there is a one-second
+reproduction for it instead of a sample.
