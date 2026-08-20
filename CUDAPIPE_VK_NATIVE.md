@@ -120,11 +120,19 @@ before layering behaviour on it — is the whole plan:
    frames of 60 once its draws merged). **A factoring must not change what
    merges.**
 
+   **Fourth slice: blend.** `cp_blend_desc` was already the driver's own type —
+   it lives in the kernel ABI header so the peel writeback and the A-buffer
+   composite cannot describe one draw differently — and it was being rebuilt
+   from `pipe_rt_blend_state` per draw. It is built once at bind time now, and
+   the only other reader of the Gallium type was a debug print.
+
    What is shared today: the NIR→PTX compiler, the kernel suite, the flag
-   registry, the NIR options, the kernel ABI header, the draw description and
-   three of the seven state structs. What is not: the framebuffer, the vertex
-   input, and blend — the three that carry a resource or a `pipe_format`, and
-   the last ones before a native draw can call in.
+   registry, the NIR options, the kernel ABI header, the draw description, and
+   four of the seven state structs. What is not: the framebuffer and the
+   vertex input — the two that carry a resource, and the last before a native
+   draw can call in.
+
+   Gallium references in `cp_context.c`: **334 → 288**.
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
