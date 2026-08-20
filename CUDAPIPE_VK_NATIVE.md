@@ -1414,3 +1414,49 @@ and every vertex output is zero.
 The next step is inside that shader: dump `dump@5143` in full and trace what
 feeds its position output back to a source. Every layer around it has now been
 checked.
+
+## Outputs read back: the bug behind five samples
+
+`pbribl`'s vertex shader does
+
+    outWorldPos = locPos + pushConsts.objPos;
+    gl_Position = projection * view * vec4(outWorldPos, 1.0);
+
+which reads its own output back and leaves a `load_output` in the NIR. The
+backend has no case for it and says so on every run:
+
+    cudapipe: intrinsic 'load_output' is not implemented -- the shader using
+    it computes on undef and will render wrong.
+
+It computed on undef, every matrix multiplied a zero, every vertex landed at
+the origin with w = 0, and every triangle was degenerate.
+`nir_lower_io_vars_to_temporaries` -- which lavapipe runs and this driver did
+not -- fixes it:
+
+    instancing        11.851 -> 0.000
+    texturecubemap    25.684 -> 0.000
+    bloom             17.386 -> 0.000
+    vulkanscene       15.430 -> 0.000
+    particlesystem    41.036 -> 4.075
+    pbribl             4.325 -> 1.472
+
+Thirteen of eighteen samples are pixel-correct, and both replays are unmoved:
+1,496 frames at 24.46 ms and 1,510 at 79.23.
+
+That warning had been in the log since the driver first ran a capture, and I
+read it several turns earlier and wrote it down as unrelated. What found it was
+fixing `CUDAPIPE_DEBUG_FS` so it could print a vertex output on a real sample,
+and then reading the NIR it pointed at.
+
+### What is left
+
+    particlesystem     4.075
+    computeshader      4.427
+    pbribl             1.472   spheres render; they reflect nothing
+    texturemipmapgen   0.456
+    multisampling    176.291   no resolve of a multisampled attachment
+
+`pbribl`'s spheres are neutral grey where the reference is warm copper with
+the plaza reflected in them. `texturecubemap` is exact now, so cube *sampling*
+works and it is the environment cube's *generation* -- rendering into cube
+faces -- that is missing or wrong.
