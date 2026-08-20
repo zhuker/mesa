@@ -1856,3 +1856,33 @@ Those two facts cannot both hold for the same texture, so the next question is
 whether the shader is reading the texture it thinks it is: the fragment stage
 has five sampler table entries, and one wrong index would sample a different
 image with a sampler whose `lod=0.0..0.0` clamps every level to zero.
+
+### pbribl's scene descriptors never reach the driver
+
+Instrumenting `vkUpdateDescriptorSets` at its entry point shows **seven** calls
+in the whole run, every one with `descriptorCount = 1`:
+
+    updsets n=1 -> bind=0 type=6   (five of these, uniform buffers)
+    updsets n=1 -> bind=0 type=1   (two of these, combined image samplers)
+
+But pbribl's `setupDescriptors()` calls it twice with five and three writes,
+binding 0 through 4 of the scene set -- the two uniform buffers and the three
+images the lighting depends on, `samplerIrradiance`, `samplerBRDFLUT` and
+`prefilteredMap`. **Neither call arrives.** The seven that do are the
+single-binding sets the BRDF, irradiance and prefilter passes make for
+themselves.
+
+So the fragment stage's five sampler entries are never pointed at those three
+textures, which explains a reflection term that is neutral no matter how
+correct the cube is -- and it explains it without contradicting either
+`cpvk_cubelod` or the warm bytes in the cube's memory, which is what every
+previous theory failed to do.
+
+What it does not yet explain is how the *vertex* stage gets its matrices,
+since the spheres are positioned correctly and that comes from binding 0 of
+the same set. That inconsistency is the next thread, and it is a much sharper
+one than "the reflections are grey".
+
+Two truncation errors were made getting here, both the same shape: reading
+`head` output as if it were the whole of it. The count that mattered came from
+`wc -l`.

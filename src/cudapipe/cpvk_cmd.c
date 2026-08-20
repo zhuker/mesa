@@ -143,6 +143,10 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
                       const VkDescriptorImageInfo *ii,
                       const VkDescriptorBufferInfo *bi)
 {
+   if (getenv("CPVK_DEBUG_RT"))
+      fprintf(stderr, "descw flat=%u type=%u ii=%p bi=%p\n", flat, type,
+              (const void *)ii, (const void *)bi);
+
    if (flat >= CPVK_MAX_BINDINGS)
       return;
 
@@ -174,6 +178,16 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
       if (ii->sampler) {
          VK_FROM_HANDLE(cpvk_sampler, samp, ii->sampler);
          set->host[flat].sampler_index_or_img_stride = samp ? samp->index : 0;
+      }
+
+      if (getenv("CPVK_DEBUG_RT")) {
+         VK_FROM_HANDLE(cpvk_image_view, dv, ii->imageView);
+         fprintf(stderr, "desc flat=%u type=%u tex=%p "
+                 "samp=%u img=%ux%u\n", flat, type,
+                 (void *)(uintptr_t)set->host[flat].texture_info,
+                 set->host[flat].sampler_index_or_img_stride,
+                 (dv && dv->image) ? dv->image->vk.extent.width : 0,
+                 (dv && dv->image) ? dv->image->vk.extent.height : 0);
       }
 
       /*
@@ -214,9 +228,16 @@ cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
                           uint32_t copyCount,
                           const VkCopyDescriptorSet *pCopies)
 {
+   if (getenv("CPVK_DEBUG_RT"))
+      fprintf(stderr, "updsets n=%u\n", writeCount);
+
    for (uint32_t w = 0; w < writeCount; w++) {
       const VkWriteDescriptorSet *write = &pWrites[w];
       VK_FROM_HANDLE(cpvk_descriptor_set, set, write->dstSet);
+      if (getenv("CPVK_DEBUG_RT"))
+         fprintf(stderr, "  w=%u bind=%u type=%u set=%p n=%u\n", w,
+                 write->dstBinding, write->descriptorType, (void *)set,
+                 write->descriptorCount);
       if (!set || write->dstBinding >= CPVK_MAX_BINDINGS)
          continue;
 
