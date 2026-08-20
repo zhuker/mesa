@@ -2725,3 +2725,41 @@ somewhere else entirely.
 The `gltfscenerendering` correctness bug behind the descriptor key remains
 open, and is now correctly filed as a correctness bug rather than a
 performance blocker.
+
+### The remaining gap is host-side, not GPU work
+
+The warm traces answer the question the launch counts could not. GPU kernel
+time per frame:
+
+    kernel                 native   gallium    delta
+    cp_abuf_scan_block      0.196     0.040    +0.155
+    cp_vertex_fetch         0.433     0.283    +0.151
+    cp_fs_interpolate       0.232     0.162    +0.071
+    cp_abuf_scan_add        0.073     0.016    +0.057
+    ...
+    TOTAL GPU ms/frame      2.183     2.538    -0.355
+
+**The native driver uses less GPU time per frame than the driver it replaces**
+-- 2.18 ms against 2.54 -- and still takes 9.73 ms of wall clock against 7.15.
+So 7.55 ms a frame of the native driver's time is not kernel execution, against
+4.61 ms for Gallium: about 2.9 ms a frame of extra host-side cost.
+
+Untraced GPU utilisation agrees, both processes confirmed running: native
+57.0%, gallium 58.3%. Near-identical occupancy, and the driver that finishes
+frames faster is the one issuing fewer, larger launches.
+
+That is consistent with 3.09x the launches at roughly the same host cost each.
+It also explains every negative result of the last several turns: batching,
+merging, the descriptor key and blended episodes were all being asked to fix a
+GPU-work problem the driver does not have.
+
+The caveat CLAUDE.md states applies to the traces and is why the untraced
+utilisation check matters: CUPTI charges every `cuLaunchKernel`, and this
+driver issues thousands a frame, so a traced run inflates exactly the
+host-side gap being measured -- and inflates it 3x more for the native driver.
+The kernel *times* above are trustworthy; the traced wall clock is not, and is
+not used.
+
+So the target is the per-frame launch count -- 757 against 245 -- and
+specifically the A-buffer machinery that accounts for most of it, not the
+front end that decides which draws share one.
