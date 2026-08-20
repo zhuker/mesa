@@ -402,6 +402,42 @@ cpvk_execute_cmd_buffer(struct cpvk_device *dev, struct cpvk_cmd_buffer *cmd)
    return VK_SUCCESS;
 }
 
+/*
+ * Secondary command buffers, replayed into the primary.
+ *
+ * A secondary records the same ops a primary does, so executing one is
+ * appending its list. The alternative -- keeping a reference and walking into
+ * it at submit -- would have to answer what happens when the secondary is
+ * reset before the primary is submitted, and the answer would be a
+ * use-after-free.
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t count,
+                        const VkCommandBuffer *pCommandBuffers)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+
+   for (uint32_t i = 0; i < count; i++) {
+      VK_FROM_HANDLE(cpvk_cmd_buffer, sec, pCommandBuffers[i]);
+      if (!sec || !sec->num_ops)
+         continue;
+
+      if (cmd->num_ops + sec->num_ops > cmd->max_ops) {
+         unsigned want = MAX2(cmd->max_ops ? cmd->max_ops * 2 : 64,
+                              cmd->num_ops + sec->num_ops);
+         struct cpvk_op *ops = realloc(cmd->ops, want * sizeof(*ops));
+         if (!ops)
+            return;
+         cmd->ops = ops;
+         cmd->max_ops = want;
+      }
+
+      memcpy(cmd->ops + cmd->num_ops, sec->ops,
+             sec->num_ops * sizeof(*sec->ops));
+      cmd->num_ops += sec->num_ops;
+   }
+}
+
 /* Room for one more operation, or NULL if it cannot be had. */
 static struct cpvk_op *
 cpvk_op_alloc(struct cpvk_cmd_buffer *cmd, enum cpvk_op_kind kind)

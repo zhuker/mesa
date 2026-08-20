@@ -48,6 +48,14 @@ static const struct vk_device_extension_table cpvk_device_extensions = {
    /* Same bargain as KHR_surface above: enabled for the image layout, with
     * no swapchain implementation behind it. */
    .KHR_swapchain = true,
+
+   /*
+    * Negative viewport height, which this driver already does: the viewport
+    * is resolved into a scale and a translate, and a negative height makes
+    * the y scale negative, which is the flip. Advertised because the sample
+    * that uses it is the test of it -- not ahead of it.
+    */
+   .KHR_maintenance1 = true,
 };
 
 static void
