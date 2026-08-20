@@ -95,10 +95,23 @@ before layering behaviour on it — is the whole plan:
    than what the environment asked for. `CUDAPIPE_HELP=1` now prints the same
    table from either ICD.
 
+   **Second slice: the draw description.** Measured before touching anything —
+   `cp_draw_execute()` is 1,973 lines and touches Gallium on **sixteen** of
+   them, reading exactly eight fields of `pipe_draw_info`; across the whole
+   file 54 of 148 functions (2,099 lines, 23%) are already Gallium-free. So
+   `cp_draw_call` and `cp_draw_range` now carry those eight fields, with the
+   field names deliberately those of `pipe_draw_info` so that introducing them
+   changed no line of the pipeline that reads them, and `cp_draw_range` is
+   layout-compatible with `pipe_draw_start_count_bias` so the array passes
+   straight through. **`cp_draw_vbo` is the only function left in the driver
+   that sees a Gallium draw type.**
+
    What is shared today: the NIR→PTX compiler, the kernel suite, the flag
-   registry, the NIR options and the kernel ABI header. What is not: the
-   rasterizer *driving* code in `cp_context.c`, which is the rest of this
-   step.
+   registry, the NIR options, the kernel ABI header and the draw description.
+   What is not: the *state* the pipeline reads off `struct cp_context` —
+   framebuffer, vertex buffers and elements, depth/stencil, viewport,
+   rasterizer — which is the next slice and the last one before a native draw
+   can call in.
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
