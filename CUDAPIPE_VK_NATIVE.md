@@ -1714,3 +1714,31 @@ distinction the evidence now points at: implicit-LOD cube sampling works,
 explicit-LOD cube sampling is unverified, and it is used both to build the
 prefiltered cube and to read it -- which would explain a result that is
 self-consistently grey rather than merely wrong.
+
+### pbribl: four explanations eliminated, and a process error worth recording
+
+Checked and ruled out this turn, each with evidence:
+
+1. **Face placement.** `CPVK_DEBUG_RT` shows 60 copies into the prefiltered
+   cube -- six faces at each of ten mip levels, `128x128 src(l=0 lay=0) ->
+   dst(l=2 lay=3)` into a `512x512 layers=6 mips=10` image -- and every plane
+   lookup succeeds.
+2. **Memory layout.** Images are level-major with layers inside each level,
+   and the copy adds `baseArrayLayer * level_size[level]`, which is the same
+   arithmetic.
+3. **Explicit LOD.** `nir_texop_txl` sets `CP_TEX_LOD`, and the sampler uses
+   `explicit_lod` directly rather than deriving one -- with a comment saying a
+   prefiltered environment map indexed by roughness depends on it.
+4. **Per-level strides in the sampler.** The view fills `row_stride[l]`,
+   `img_stride[l] = level_size[l]` and `mip_offset[l] = level_offset[l]`, and
+   `cp_fetch_texel` indexes all three by level.
+
+So the cube is built where the sampler looks, and read the way the shader
+asked. The remaining candidates are narrower: the R16G16B16A16_SFLOAT decode
+on this path, or the prefilter shader's own output.
+
+**The process error:** an earlier run of this same investigation printed
+"0 copies" and nearly became the finding "the faces are never copied". The
+count was zero because the `str.replace()` that inserted the print had not
+matched anything -- the edit silently did nothing. The rule that caught it is
+to assert that an edit changed the file before believing what it prints.

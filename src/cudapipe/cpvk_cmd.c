@@ -1582,8 +1582,17 @@ cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
       CUdeviceptr sb, db;
       size_t sp, dp;
       unsigned sbpp, dbpp;
-      if (!cpvk_image_plane(src, r->srcSubresource.mipLevel, &sb, &sp, &sbpp) ||
-          !cpvk_image_plane(dst, r->dstSubresource.mipLevel, &db, &dp, &dbpp))
+      bool sok = cpvk_image_plane(src, r->srcSubresource.mipLevel, &sb, &sp, &sbpp);
+      bool dok = cpvk_image_plane(dst, r->dstSubresource.mipLevel, &db, &dp, &dbpp);
+      if (getenv("CPVK_DEBUG_RT"))
+         fprintf(stderr, "copyimg: %ux%u src(l=%u lay=%u ok=%d) dst(l=%u lay=%u "
+                 "ok=%d) dstimg=%ux%u layers=%u mips=%u\n", r->extent.width,
+                 r->extent.height, r->srcSubresource.mipLevel,
+                 r->srcSubresource.baseArrayLayer, sok,
+                 r->dstSubresource.mipLevel, r->dstSubresource.baseArrayLayer,
+                 dok, dst->vk.extent.width, dst->vk.extent.height,
+                 dst->vk.array_layers, dst->vk.mip_levels);
+      if (!sok || !dok)
          return;
 
       struct cpvk_copy *c = cpvk_record_copy(cmd);
