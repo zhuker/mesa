@@ -1142,3 +1142,33 @@ gltfscenerendering still needs the comparison. What has not been reproduced:
 
 Both are small extensions of a test that exists. `CPVK_NO_DESC_KEY=1` disables
 the comparison for whoever bisects it.
+
+### Seven properties reproduced; the sample still differs
+
+`cpvk_batchtex` now draws **nine** overlapping triangles at nine depths,
+through **two descriptor set layouts** -- one for the frame's uniforms, one
+rebound per draw for the material -- each naming its own texture. It is
+byte-identical to lavapipe with the descriptor comparison off, as is the same
+test with a discarding fragment shader.
+
+That is every property of gltfscenerendering's draws I have been able to name:
+
+    draws in the batch          nine, as the sample has
+    descriptor sets in layout   two, as the sample has
+    what changes per draw       a texture, as the sample changes
+    geometry                    overlapping, depth-tested
+    fragment shader             with and without discard
+    vertex offset               now a merge condition either way
+    binding rows                one per draw, both stages
+
+And gltfscenerendering is still 20.768 without the comparison and 0.000 with
+it, re-verified.
+
+So there is a property of those draws that this test does not have and that I
+have not identified. The honest position is that the descriptor comparison is
+required for a reason not yet understood, that it costs batching all of its
+value on captures, and that the search for it should start by diffing the
+sample's draws against this test's rather than by proposing an eighth
+hypothesis: `CUDAPIPE_DEBUG_DRAW` prints the framebuffer, viewport, vertex
+elements and blend state of every draw in both, and the difference will be in
+that output.

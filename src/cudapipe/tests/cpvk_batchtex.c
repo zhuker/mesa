@@ -27,6 +27,9 @@
 #define W 64
 #define H 64
 
+/* Draws in the batch. gltfscenerendering's are nine; three passed. */
+#define NDRAW 9
+
 #define CHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
    fprintf(stderr, "%s failed: %d\n", #x, _r); return 1; } } while (0)
 
@@ -173,20 +176,20 @@ main(int argc, char **argv)
     * from whichever draw was last. A scene of meshes overlaps constantly;
     * three triangles in a row never do.
     */
-   const struct vertex verts[9] = {
-      { -0.8f, -0.6f, 0.7f, 255, 255, 255, 255 },
-      {  0.4f, -0.6f, 0.7f, 255, 255, 255, 255 },
-      { -0.2f,  0.7f, 0.7f, 255, 255, 255, 255 },
-
-      { -0.5f, -0.6f, 0.5f, 255, 255, 255, 255 },
-      {  0.7f, -0.6f, 0.5f, 255, 255, 255, 255 },
-      {  0.1f,  0.7f, 0.5f, 255, 255, 255, 255 },
-
-      { -0.2f, -0.6f, 0.3f, 255, 255, 255, 255 },
-      {  1.0f, -0.6f, 0.3f, 255, 255, 255, 255 },
-      {  0.4f,  0.7f, 0.3f, 255, 255, 255, 255 },
-   };
-   const uint16_t indices[9] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+   /* NDRAW overlapping triangles, each a little further right and nearer. */
+   struct vertex verts[NDRAW * 3];
+   uint16_t indices[NDRAW * 3];
+   memset(verts, 0, sizeof(verts));
+   for (int n = 0; n < NDRAW; n++) {
+      float x = -0.8f + n * 0.12f;
+      float z = 0.8f - n * 0.06f;
+      struct vertex *v = &verts[n * 3];
+      v[0] = (struct vertex){ x,        -0.6f, z, 255, 255, 255, 255 };
+      v[1] = (struct vertex){ x + 0.6f, -0.6f, z, 255, 255, 255, 255 };
+      v[2] = (struct vertex){ x + 0.3f,  0.7f, z, 255, 255, 255, 255 };
+      for (int e = 0; e < 3; e++)
+         indices[n * 3 + e] = (uint16_t)(n * 3 + e);
+   }
 
    VkBuffer vbuf, ibuf;
    VkDeviceMemory vmem, imem;
@@ -256,9 +259,9 @@ main(int argc, char **argv)
     * Two 4x4 textures, one red-ish and one blue-ish. The two draws differ in
     * which one their descriptor set names, and in nothing else.
     */
-   VkImage timg[3];
-   VkDeviceMemory tmem[3];
-   VkImageView tview[3];
+   VkImage timg[NDRAW];
+   VkDeviceMemory tmem[NDRAW];
+   VkImageView tview[NDRAW];
    VkImageCreateInfo timgi = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
@@ -266,7 +269,7 @@ main(int argc, char **argv)
       .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
       .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT };
 
-   for (int n = 0; n < 3; n++) {
+   for (int n = 0; n < NDRAW; n++) {
       CHECK(vkCreateImage(dev, &timgi, NULL, &timg[n]));
       VkMemoryRequirements treq;
       vkGetImageMemoryRequirements(dev, timg[n], &treq);
@@ -287,9 +290,11 @@ main(int argc, char **argv)
       for (int y = 0; y < 4; y++)
          for (int x = 0; x < 4; x++) {
             unsigned char *px = t + y * lay.rowPitch + x * 4;
-            px[0] = n == 0 ? 230 : 40;
-            px[1] = n == 1 ? 230 : 40;
-            px[2] = n == 2 ? 230 : 40;
+            /* A distinct colour per draw, so a batch shaded from one row
+             * shows the wrong count of colours. */
+            px[0] = (unsigned char)(30 + (n % 3) * 100);
+            px[1] = (unsigned char)(30 + ((n / 3) % 3) * 100);
+            px[2] = (unsigned char)(30 + (n * 23) % 200);
             px[3] = 255;
          }
 
@@ -312,63 +317,74 @@ main(int argc, char **argv)
    VkSampler samp;
    CHECK(vkCreateSampler(dev, &sci, NULL, &samp));
 
-   VkDescriptorSetLayoutBinding dslb[2] = {
-      { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT },
-      { .binding = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-   };
-   VkDescriptorSetLayoutCreateInfo dsli = {
+   /*
+    * Two descriptor set layouts, which is what a scene renderer has: set 0
+    * for the frame's uniforms, set 1 for a material. Only set 1 changes
+    * between the draws.
+    */
+   VkDescriptorSetLayoutBinding dslb0 = {
+      .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT };
+   VkDescriptorSetLayoutBinding dslb1 = {
+      .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT };
+   VkDescriptorSetLayoutCreateInfo dsli0 = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 2, .pBindings = dslb };
-   VkDescriptorSetLayout dsl;
-   CHECK(vkCreateDescriptorSetLayout(dev, &dsli, NULL, &dsl));
+      .bindingCount = 1, .pBindings = &dslb0 };
+   VkDescriptorSetLayoutCreateInfo dsli1 = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount = 1, .pBindings = &dslb1 };
+   VkDescriptorSetLayout dsl, dsl_mat;
+   CHECK(vkCreateDescriptorSetLayout(dev, &dsli0, NULL, &dsl));
+   CHECK(vkCreateDescriptorSetLayout(dev, &dsli1, NULL, &dsl_mat));
 
    VkDescriptorPoolSize dps[2] = {
-      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 },
-      { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 } };
+      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NDRAW },
+      { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, NDRAW } };
    VkDescriptorPoolCreateInfo dpi = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-      .maxSets = 3, .poolSizeCount = 2, .pPoolSizes = dps };
+      .maxSets = NDRAW, .poolSizeCount = 2, .pPoolSizes = dps };
    VkDescriptorPool dpool;
    CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &dpool));
    VkDescriptorSetAllocateInfo dsai = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
       .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
-   VkDescriptorSet dset[3];
-   VkDescriptorSetLayout dsls[3] = { dsl, dsl, dsl };
-   dsai.descriptorSetCount = 3;
+   VkDescriptorSet dset[NDRAW], scene_set;
+   VkDescriptorSetLayout dsls[NDRAW];
+   for (int n = 0; n < NDRAW; n++)
+      dsls[n] = dsl_mat;
+   VkDescriptorSetAllocateInfo sai = dsai;
+   sai.descriptorSetCount = 1;
+   sai.pSetLayouts = &dsl;
+   CHECK(vkAllocateDescriptorSets(dev, &sai, &scene_set));
+   dsai.descriptorSetCount = NDRAW;
    dsai.pSetLayouts = dsls;
    CHECK(vkAllocateDescriptorSets(dev, &dsai, dset));
 
    VkDescriptorBufferInfo dbi = { ubuf[0], 0, VK_WHOLE_SIZE };
-   VkDescriptorImageInfo dii[3] = {
-      { .sampler = samp, .imageView = tview[0],
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-      { .sampler = samp, .imageView = tview[1],
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-      { .sampler = samp, .imageView = tview[2],
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-   };
-   VkWriteDescriptorSet writes[6];
-   for (int n = 0; n < 3; n++) {
-      writes[n * 2] = (VkWriteDescriptorSet){
+   VkDescriptorImageInfo dii[NDRAW];
+   VkWriteDescriptorSet writes[NDRAW * 2];
+   for (int n = 0; n < NDRAW; n++) {
+      dii[n] = (VkDescriptorImageInfo){
+         .sampler = samp, .imageView = tview[n],
+         .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+      writes[n] = (VkWriteDescriptorSet){
          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[n],
          .dstBinding = 0, .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-         .pBufferInfo = &dbi };
-      writes[n * 2 + 1] = (VkWriteDescriptorSet){
-         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[n],
-         .dstBinding = 1, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
          .pImageInfo = &dii[n] };
    }
-   vkUpdateDescriptorSets(dev, 6, writes, 0, NULL);
+   writes[NDRAW] = (VkWriteDescriptorSet){
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = scene_set,
+      .dstBinding = 0, .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .pBufferInfo = &dbi };
+   vkUpdateDescriptorSets(dev, NDRAW + 1, writes, 0, NULL);
 
+   VkDescriptorSetLayout both[2] = { dsl, dsl_mat };
    VkPipelineLayoutCreateInfo pli = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-      .setLayoutCount = 1, .pSetLayouts = &dsl };
+      .setLayoutCount = 2, .pSetLayouts = both };
    VkPipelineLayout layout;
    CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &layout));
 
@@ -484,8 +500,10 @@ main(int argc, char **argv)
    vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT16);
 
    /* Two draws, two index ranges, two sets naming two different textures. */
-   for (int n = 0; n < 3; n++) {
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0,
+   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
+                           &scene_set, 0, NULL);
+   for (int n = 0; n < NDRAW; n++) {
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1,
                               1, &dset[n], 0, NULL);
       vkCmdDrawIndexed(cmd, 3, 1, n * 3, 0, 0);
    }
