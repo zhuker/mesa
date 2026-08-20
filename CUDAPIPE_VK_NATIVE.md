@@ -612,3 +612,36 @@ would shift the footprint by one without changing its size.
 
 `pbribl`'s difference is a horizontal band, not the whole image, which says one
 object or one pass rather than a global error.
+
+## The generated mip levels are never sampled
+
+The strongest fact of this investigation, and it was cheap: **deleting mip
+generation entirely does not change the frame.** Skipping every scaling blit
+gives a mean difference of 0.4560, exactly what generating them gives.
+Changing the filter from a box average to a point sample also gives 0.4560.
+The levels are written and never read.
+
+Things that are *not* the cause, each checked rather than assumed:
+
+- **The sampler state.** `texturemipmapgen` creates four samplers and this
+  driver translates all four correctly, including the two with `lod 0..10` and
+  the one with `maxAnisotropy 16`. `CUDAPIPE_DEBUG_TEX` prints them.
+- **The mip filter.** Box average and point sample give identical results, so
+  the filter cannot be what differs.
+- **sRGB.** The format is UNORM.
+- **The texture info.** `texture` and `texture3d` are byte-exact, so the
+  descriptor, the format table and the sampler path are right for a texture
+  whose levels were uploaded rather than generated.
+
+What is left is the sampler's mip selection. `cp_tex_sample_impl` takes a
+`coord_slot` -- the fragment shader input the coordinate came from -- and
+selects the base level when it is -1, and the backend only sets it when the
+coordinate's parent instruction is a `load_input` intrinsic. The native front
+end scalarises every ALU op, so a coordinate arrives as a vector built from
+scalars and no longer as a `load_input`.
+
+Teaching the backend to see through a `vec` of `load_input`s was tried and
+changed nothing, so the pattern is not that either -- there is something else
+between the varying and the coordinate. Dumping the fragment shader's NIR for
+this sample and reading what feeds `nir_tex_src_coord` is the next step, and
+it is a five-minute one now that everything else is excluded.

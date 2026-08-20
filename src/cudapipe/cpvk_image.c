@@ -446,6 +446,13 @@ cpvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
       cp->num_samplers++;
    }
 
+   if (cp_debug->debug_tex)
+      fprintf(stderr, "cudapipe: sampler wrap=%u,%u filt=%u/%u mip=%u "
+              "lod=%.1f..%.1f bias=%.1f aniso=%.1f -> index %u\n",
+              info.wrap_s, info.wrap_t, info.min_img_filter,
+              info.mag_img_filter, info.min_mip_filter, info.min_lod,
+              info.max_lod, info.lod_bias, info.max_anisotropy, index);
+
    sampler->index = index;
    *pSampler = cpvk_sampler_to_handle(sampler);
    return VK_SUCCESS;
