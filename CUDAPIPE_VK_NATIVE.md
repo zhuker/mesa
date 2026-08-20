@@ -4039,3 +4039,38 @@ It is also exactly why the objective names replay as well as the sweep. A change
 that passes eighteen single-frame samples and exhausts device memory on the
 ninth frame of a capture is the failure the second half of that sentence exists
 to catch.
+
+### A third attempt at episode accumulation, with a segment bound, also fatal
+
+The second attempt died of `VK_ERROR_OUT_OF_DEVICE_MEMORY` after eight frames
+because an open episode holds its segments' buffers. The third bounded it:
+defer only while `pass.nsegs < 8`, so an episode closes after eight segments
+whatever the draws do.
+
+    frames completed before the replay dies
+        no bound      8
+        bound of 8    25 and 5
+
+Better and still fatal. So the growth is not per-segment -- it is per
+*deferral*, and bounding how many segments an episode holds only delays it.
+Something the deferring path allocates is released when an episode finishes and
+not before, and this driver's usage defers far more often than the Gallium
+adapter's does.
+
+Reverted; both captures replay all 1,496 and 1,510 frames at 9.47 and 34.42 ms.
+
+**Three attempts, three reverts, and what they establish together:**
+
+    attempt 1  defer every unmergeable draw          4 samples wrong
+    attempt 2  defer only per-segment binds          replay OOM at frame 8
+    attempt 3  the same, bounded to 8 segments       replay OOM at frame 25
+
+The first says the episode must not span episode-wide state changes. The second
+and third say the deferring path leaks per call, independently of how much an
+episode holds. Any fourth attempt has to fix that leak first, and none of these
+three touched it.
+
+The measured prize is still worth it -- 757 launches a frame against the
+Gallium driver's 245, for 1.3x the wall time -- but it is behind a memory bug
+in the shared episode code, not behind the flush rule that three attempts have
+now rewritten.
