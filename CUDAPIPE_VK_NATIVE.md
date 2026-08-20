@@ -2131,3 +2131,37 @@ That leaves the version number ahead of one thing it promises. It is kept
 because every measurement improved or held -- device creation for a 1.3
 application went from failing outright to succeeding -- but the gap is
 recorded here rather than left for someone to discover by faulting.
+
+### The ICD manifest is the version gate, and raising it costs 21-39% of replay
+
+The reason 1.1-and-later core entry points dispatched to NULL was none of the
+things checked: not the entrypoint generation, which is byte-identical to
+lavapipe's, not `vkEnumerateInstanceVersion`, and not the physical device's
+`apiVersion`. It was the **ICD manifest**:
+
+    native   "api_version": "1.0.354"
+    gallium  "api_version": "1.4.354"
+
+The loader reads that and rewrites the application's requested `apiVersion`
+down to it before calling in, so everything above 1.0 resolves to nothing
+however high the driver reports internally. With `--api-version 1.3` in
+`meson.build` the whole set comes alive:
+
+    vkCmdBeginRendering  (nil) -> 0x...bb50   the same pointer as the KHR alias
+    vkCmdBlitImage2      (nil) -> 0x...e030   and the test that faulted now
+                                              produces the 1.0 path's image
+
+**And it costs, measured both ways:**
+
+    manifest 1.3    Crossroads 29.34 ms   old capture 109.76 ms
+    manifest 1.0    Crossroads 24.34 ms   old capture  79.20 ms
+    reverted        Crossroads 24.40 ms   old capture  79.20 ms
+
+21% and 39%, because gfxrecon-replay takes its Vulkan 1.3 paths through the
+driver once the manifest says it may. The objective is no regression, so the
+manifest stays at 1.0 and the reason is written beside it.
+
+Everything behind the manifest is ready and stays: the twelve mandatory 1.3
+features are declared, the event API exists, and `vkCreateDevice` with
+`VkPhysicalDeviceVulkan13Features` succeeds. One line in `meson.build` turns it
+on the day those paths are as cheap as the ones they replace.

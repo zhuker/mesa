@@ -98,6 +98,20 @@ cpvk_devenv_icd = custom_target(
   output : 'cudapipe_native_devenv_icd.@0@.json'.format(host_machine.cpu()),
   command : [
     prog_python, '@INPUT0@',
+    # 1.0, and measured, not assumed.
+    #
+    # The loader reads this and rewrites the application's requested
+    # apiVersion down to it before calling in, so a manifest saying 1.0 makes
+    # every 1.1-and-later core entrypoint dispatch to NULL however high
+    # vkEnumerateInstanceVersion and the physical device report. Raising it to
+    # 1.3 fixes that -- and costs 21% and 39% of replay time, because
+    # gfxrecon-replay then takes its Vulkan 1.3 paths through this driver:
+    # 29.34 ms against 24.34 on Crossroads, 109.76 against 79.20 on the older
+    # capture, both otherwise identical runs.
+    #
+    # The objective is no regression, so it stays at 1.0 until those paths are
+    # as cheap as the ones they replace. What is behind the manifest is ready:
+    # the features are declared and the entry points exist.
     '--api-version', '1.0', '--xml', '@INPUT1@',
     '--sizeof-pointer', sizeof_pointer,
     '--icd-lib-path', meson.current_build_dir(),
