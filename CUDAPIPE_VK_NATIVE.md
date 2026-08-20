@@ -752,3 +752,29 @@ draw of 45,120. Native has no batching, which is known.
 The lesson is narrower than "be careful": **any** debug output compared across
 the two drivers is comparing a current file against a nine-month-old one, and
 only fields that predate the branch can be trusted to mean the same thing.
+
+### The shape of pbribl's draws is exonerated
+
+`tests/cpvk_mesh.c` reproduces those draws in a second instead of a minute: a
+96-byte stride (vkglTF::Vertex) with three attributes declared at 0, 12 and 24
+including an `R32G32_SFLOAT`, an indexed draw with `firstIndex` 3 **and**
+`vertexOffset` 6, a `mat4` from a uniform buffer, and a `vec3` from a push
+constant, multiplied the way the sample's vertex shader multiplies them. Nine
+vertices, of which six are decoys placed off-screen so that a draw ignoring
+either offset renders nothing.
+
+It is byte-identical to lavapipe. Every one of those mechanisms works.
+
+So the missing spheres are not caused by the vertex layout, the offsets, the
+matrix, or the push constant. What is left is what pbribl does that this does
+not:
+
+- several offscreen passes before the spheres -- an irradiance cube, a
+  prefiltered environment map and a BRDF LUT -- any of which could leave state
+  behind, and one of which uses `load_output`, which the backend does not
+  implement
+- a vertex shader that does more than transform a position
+- 4,512 triangles per draw against this test's one
+
+The first of those is the only one that explains why the draws arrive with
+correct-looking state and shade nothing, and it is where to look next.
