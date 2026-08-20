@@ -4101,3 +4101,29 @@ fail.
 
 Recorded rather than attempted, because three reverts in three turns is enough
 evidence that this needs the allocation design settled before the flush rule.
+
+### pbribl's last 135 pixels, characterised
+
+    differing > 4    135
+    differing > 8     24
+    differing > 16     0
+
+The 24 largest are a contiguous vertical run at x = 1275 -- four pixels from
+the frame's right edge -- spanning rows 152 to 165, in the skybox. Native is
+brighter than the reference above row 157 and darker below it, so the two
+drivers place a cube-face seam one row apart and disagree only where the
+crossing happens.
+
+That is the same mechanism as `cpvk_cubesph`'s remaining 13 pixels, whose
+maximum difference is 2: this driver reaches an adjacent face by re-projecting
+the out-of-range texel through a direction, and llvmpipe walks an adjacency
+table. Both are correct implementations of seamless filtering and they choose
+different texels for a position exactly on the boundary. llvmpipe's own comment
+on its corner handling calls it "a bit excessive code for something OpenGL just
+recommends but does not require".
+
+`pbribl` is 0.0286 against a 0.01 threshold, so it still counts as a
+difference. Closing it means replicating llvmpipe's adjacency arithmetic rather
+than computing an equivalent answer, which is a different kind of work from
+everything else in this session: not a defect to find but a convention to
+match.
