@@ -10,6 +10,7 @@
  */
 
 #include "vk_format.h"
+#include "util/blend.h"
 #include "util/format/u_format.h"
 #include "cpvk_private.h"
 
@@ -394,6 +395,47 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
  * cp_draw_execute the Gallium-hosted driver runs.
  */
 
+/*
+ * Blend factors and functions, in the values the kernels read: cp_blend_desc
+ * says "pipe_blend_state factors/functions", so these are Gallium's numbers
+ * and the mapping is written out rather than assumed to coincide with
+ * Vulkan's.
+ */
+static uint32_t
+cpvk_blend_factor(VkBlendFactor f)
+{
+   switch (f) {
+   case VK_BLEND_FACTOR_ZERO:                     return PIPE_BLENDFACTOR_ZERO;
+   case VK_BLEND_FACTOR_ONE:                      return PIPE_BLENDFACTOR_ONE;
+   case VK_BLEND_FACTOR_SRC_COLOR:                return PIPE_BLENDFACTOR_SRC_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR:      return PIPE_BLENDFACTOR_INV_SRC_COLOR;
+   case VK_BLEND_FACTOR_DST_COLOR:                return PIPE_BLENDFACTOR_DST_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR:      return PIPE_BLENDFACTOR_INV_DST_COLOR;
+   case VK_BLEND_FACTOR_SRC_ALPHA:                return PIPE_BLENDFACTOR_SRC_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA:      return PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+   case VK_BLEND_FACTOR_DST_ALPHA:                return PIPE_BLENDFACTOR_DST_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:      return PIPE_BLENDFACTOR_INV_DST_ALPHA;
+   case VK_BLEND_FACTOR_CONSTANT_COLOR:           return PIPE_BLENDFACTOR_CONST_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR: return PIPE_BLENDFACTOR_INV_CONST_COLOR;
+   case VK_BLEND_FACTOR_CONSTANT_ALPHA:           return PIPE_BLENDFACTOR_CONST_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA: return PIPE_BLENDFACTOR_INV_CONST_ALPHA;
+   case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE:       return PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE;
+   default:                                       return PIPE_BLENDFACTOR_ONE;
+   }
+}
+
+static uint32_t
+cpvk_blend_op(VkBlendOp op)
+{
+   switch (op) {
+   case VK_BLEND_OP_SUBTRACT:         return PIPE_BLEND_SUBTRACT;
+   case VK_BLEND_OP_REVERSE_SUBTRACT: return PIPE_BLEND_REVERSE_SUBTRACT;
+   case VK_BLEND_OP_MIN:              return PIPE_BLEND_MIN;
+   case VK_BLEND_OP_MAX:              return PIPE_BLEND_MAX;
+   default:                           return PIPE_BLEND_ADD;
+   }
+}
+
 static enum mesa_prim
 cpvk_prim(VkPrimitiveTopology t)
 {
@@ -520,10 +562,28 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
          pipeline->blend = (struct cp_blend_desc) {
             .enable = at->blendEnable,
             .colormask = at->colorWriteMask ? at->colorWriteMask : 0xF,
+            /*
+             * The equation itself, which was missing: only `enable` and the
+             * write mask were being resolved, so every blended draw combined
+             * its fragments with whatever factors happened to be zero. That
+             * is one line of state and four samples' worth of wrong pixels.
+             */
+            .rgb_src_factor = cpvk_blend_factor(at->srcColorBlendFactor),
+            .rgb_dst_factor = cpvk_blend_factor(at->dstColorBlendFactor),
+            .rgb_func = cpvk_blend_op(at->colorBlendOp),
+            .alpha_src_factor = cpvk_blend_factor(at->srcAlphaBlendFactor),
+            .alpha_dst_factor = cpvk_blend_factor(at->dstAlphaBlendFactor),
+            .alpha_func = cpvk_blend_op(at->alphaBlendOp),
          };
       } else {
          pipeline->blend.colormask = 0xF;
       }
+
+      /* The sample count, which was pinned at one: multisampling rendered
+       * every pixel from one sample and differed from the Gallium driver on
+       * 98% of them. */
+      const VkPipelineMultisampleStateCreateInfo *ms = info->pMultisampleState;
+      pipeline->samples = ms ? MAX2((unsigned)ms->rasterizationSamples, 1u) : 1;
 
       const VkPipelineInputAssemblyStateCreateInfo *ia = info->pInputAssemblyState;
       pipeline->topology = ia ? cpvk_prim(ia->topology) : MESA_PRIM_TRIANGLES;

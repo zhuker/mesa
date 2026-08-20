@@ -282,6 +282,7 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_pipeline_layout, layout, pInfo->layout);
+   unsigned dyn = 0;
 
    for (uint32_t i = 0; i < pInfo->descriptorSetCount; i++) {
       VK_FROM_HANDLE(cpvk_descriptor_set, set, pInfo->pDescriptorSets[i]);
@@ -291,6 +292,32 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
       for (unsigned d = 0; d < set->layout->num_descriptors; d++) {
          if (base + d < CPVK_MAX_ARG_BUFS)
             cmd->addrs[base + d] = set->addrs[d];
+      }
+
+      /*
+       * Dynamic offsets, which were being ignored: a dynamic uniform buffer
+       * binding names one buffer and the draw picks the element out of it
+       * with an offset given at bind time. Ignoring them pointed every draw
+       * at element zero.
+       *
+       * They are consumed in binding order over the dynamic descriptors of
+       * each set, which is what the spec says and what the sample relies on.
+       */
+      for (unsigned b = 0; b < set->layout->num_bindings &&
+                           dyn < pInfo->dynamicOffsetCount; b++) {
+         VkDescriptorType ty = set->layout->bindings[b].type;
+         if (ty != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+             ty != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+            continue;
+         for (unsigned e = 0; e < set->layout->bindings[b].count &&
+                              dyn < pInfo->dynamicOffsetCount; e++) {
+            unsigned flat = set->layout->bindings[b].flat + e;
+            uint32_t off = pInfo->pDynamicOffsets[dyn++];
+            if (base + flat < CPVK_MAX_ARG_BUFS && set->addrs[flat])
+               cmd->addrs[base + flat] = set->addrs[flat] + off;
+            if (set->host)
+               set->host[flat].buffer_base = set->addrs[flat] + off;
+         }
       }
 
       /* And the set itself, which is what a texture handle is an offset
@@ -432,6 +459,11 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
       *op = (struct cpvk_op) { .kind = CPVK_OP_BEGIN_RENDER };
       op->fb = fb;
+      /* The attachment's sample count, taken from the image the rendering
+       * binds rather than from the pipeline, because it is what the
+       * framebuffer-sized buffers have to be sized for. */
+      cmd->fb_samples = cimg ? MAX2(cimg->vk.samples, 1u) : 1;
+      op->fb_samples = cmd->fb_samples;
    }
 
    /* LOAD_OP_CLEAR, recorded in order with the draws that follow it. */
@@ -999,9 +1031,10 @@ cpvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 }
 
 void
-cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb)
+cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb,
+                          unsigned samples)
 {
-   cp_context_set_framebuffer(&dev->renderer, fb, 1);
+   cp_context_set_framebuffer(&dev->renderer, fb, MAX2(samples, 1u));
 }
 
 void

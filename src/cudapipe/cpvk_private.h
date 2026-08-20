@@ -230,6 +230,9 @@ enum cpvk_op_kind {
 
 struct cpvk_op {
    enum cpvk_op_kind kind;
+   /* BEGIN_RENDER only: the attachment's sample count, which cp_fb_desc does
+    * not carry because the Gallium adapter passes it beside the desc. */
+   unsigned fb_samples;
    union {
       struct cpvk_draw draw;
       struct cpvk_clear clear;
@@ -252,6 +255,7 @@ struct cpvk_cmd_buffer {
    struct cp_rect scissor;
    uint64_t vb_base[16];
    unsigned num_vb;
+   unsigned fb_samples;
    const void *index_ptr;
    unsigned index_size;
    unsigned char push[CPVK_MAX_PUSH_BYTES];
@@ -263,7 +267,8 @@ struct cpvk_cmd_buffer {
 void cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d);
 void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
 void cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
-void cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb);
+void cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb,
+                               unsigned samples);
 
 extern const struct vk_command_buffer_ops cpvk_cmd_buffer_ops;
 extern const struct vk_sync_type *const cpvk_sync_types[];
@@ -284,6 +289,7 @@ struct cpvk_pipeline {
    struct cp_blend_desc blend;
    struct cp_vertex_elem velem[16];
    unsigned num_velem, vertex_stride;
+   unsigned samples;
    enum mesa_prim topology;
    /* The block size. Under Gallium this arrived per dispatch from lavapipe,
     * which had read it out of the shader; natively the pipeline is where it

@@ -36,7 +36,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       for (unsigned o = 0; o < cmd->num_ops; o++) {
          switch (cmd->ops[o].kind) {
          case CPVK_OP_BEGIN_RENDER:
-            cpvk_execute_begin_render(dev, &cmd->ops[o].fb);
+            cpvk_execute_begin_render(dev, &cmd->ops[o].fb, cmd->ops[o].fb_samples);
             break;
          case CPVK_OP_CLEAR:
             cpvk_execute_clear(dev, &cmd->ops[o].clear);
