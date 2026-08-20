@@ -1301,7 +1301,18 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
    }
    CPVK_DIFF(memcmp(&a->fb, &b->fb, sizeof(a->fb)), "framebuffer");
    CPVK_DIFF(memcmp(&a->viewport, &b->viewport, sizeof(a->viewport)), "viewport");
-   CPVK_DIFF(memcmp(&a->scissor, &b->scissor, sizeof(a->scissor)), "scissor");
+   /*
+    * The scissor need not match when the renderer will carry one rectangle
+    * per draw. cp_draw_execute does that for a batch of more than one whose
+    * primitives resolve to their draw -- its `rows_stable` condition, which
+    * blending satisfies -- and says so: "draws that disagree on it merge".
+    * The front end was stricter than the renderer, and 3,339 of the
+    * Crossroads capture's blended refusals were this.
+    */
+   if (getenv("CPVK_NO_MERGE_SCISSOR") || !a->pipeline || !b->pipeline ||
+       !a->pipeline->blend.enable || !b->pipeline->blend.enable)
+      CPVK_DIFF(memcmp(&a->scissor, &b->scissor, sizeof(a->scissor)),
+                "scissor");
    CPVK_DIFF(a->call.mode != b->call.mode, "topology");
    CPVK_DIFF(a->call.index_size != b->call.index_size, "index size");
    CPVK_DIFF(a->call.index_ptr != b->call.index_ptr, "index buffer");

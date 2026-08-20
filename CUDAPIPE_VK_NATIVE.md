@@ -4826,3 +4826,37 @@ samples are unmoved -- particlesystem 5.61, vulkanscene 4.93, bloom 7.46.
 
 **The older capture is now faster than the driver being replaced**, and
 Crossroads is 1.06x, from 1.31x at the start of this session.
+
+### The front end was stricter about the scissor than the renderer
+
+3,339 of the capture's blended merge refusals were a scissor change. But
+`cp_draw_execute` already carries one rectangle per draw for a batch whose
+primitives resolve to their draw -- its `rows_stable` condition, which blending
+satisfies -- and the comment there says what it is for: "draws that disagree on
+it merge". The renderer had supported this all along and the front end never
+asked.
+
+Merging blended draws across a scissor change:
+
+    capture        before    after
+    Crossroads     7.62 ms   7.36 ms
+    older         23.44     22.73
+
+`CPVK_NO_MERGE_SCISSOR=1` restores the old behaviour.
+
+The samples are unmoved, A/B over a 400-frame span: bloom 0.980, particlesystem
+1.000, vulkanscene 1.032. Over 300 frames the same comparison read bloom 8.85
+against 7.46 and looked like a regression -- the second time this session that
+a short span invented one.
+
+### Where the driver stands
+
+    capture        native    gallium   recorded    ratio
+    Crossroads     7.37 ms   7.14 ms   7.17 ms     1.028x
+    older         22.76     25.20     25.20        0.903x
+
+The older capture is 10% faster than the driver being replaced. Crossroads is
+2.8% above it, which is inside the ~5% run-to-run spread these replays have,
+and below the threshold this project treats as a result at all.
+
+From the start of this session: 1.31x and 1.36x, to 1.03x and 0.90x.
