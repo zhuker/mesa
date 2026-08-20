@@ -4963,3 +4963,38 @@ question about `cp_nir_to_llvm.c` rather than about the NIR handed to it.
     vulkanscene        1.18      0.87      1.36x   1.38x
     texture            0.13      0.13      1.00x   1.36x
     bloom              1.92      1.65      1.16x   1.16x
+
+### The depot is register spilling, and scalarisation is why
+
+`decl_reg` is the **only** `LLVMBuildAlloca` in `cp_nir_to_llvm.c`, and the
+graphics shaders now reach it with none. So the `__local_depot` is not an
+alloca at all -- it is what the NVPTX backend names a stack frame when it
+spills registers.
+
+Which points at the one pass this driver runs that the Gallium path never
+needed:
+
+    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+
+Its own comment says why it is there -- `emit_alu()` applies an operand's
+swizzle only when the destination is scalar, so a vector destination reaches
+LLVM with its sources at their own widths and the module fails verification.
+Scalarising every ALU operation multiplies live values, and live values are
+what spill.
+
+Removing it confirms the comment rather than the theory: **1 of 18 samples
+runs.** It is load-bearing.
+
+So the shader-quality gap has a named cause and a named repair, and they are
+the ones the comment already identified: **`emit_alu()` should build a shuffle
+for a vector destination**, after which scalarisation becomes optional rather
+than mandatory, and the register pressure that spills goes with it. That is a
+backend change, it is the deepest one this driver has left, and it is what
+stands between the sample sweep and the objective.
+
+### Standing
+
+    replay      Crossroads  7.38 ms vs 7.17 recorded   1.03x
+                older      22.86    vs 25.20           0.907x, faster
+    sweep       correctness 17/18, equal or better than gallium against NVIDIA
+                cost        instancing 1.46x, vulkanscene 1.36x, bloom 1.16x
