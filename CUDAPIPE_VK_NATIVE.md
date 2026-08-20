@@ -4005,3 +4005,37 @@ e2e966953d7` against it is empty, so every recorded result for it stands. The
 native driver is one sample and about a third of a frame away, which is a
 different thing from where it started this session and still not the same thing
 as meeting it.
+
+### Deferring the flush for per-segment binds only: correct on the sweep, fatal on replay
+
+The Gallium adapter defers the flush for exactly three binds -- the two shaders
+and the vertex elements -- and flushes fully for everything else. This front end
+has no bind-time hooks, so the question was asked at draw time instead: if two
+draws differ *only* in those three and agree on framebuffer, viewport, scissor,
+raster, depth, blend, samples and topology, defer; otherwise flush fully.
+
+That is narrower than the earlier attempt which deferred every unmergeable
+draw and cost four samples. It passes the sweep: 18/18 run, 17/18
+pixel-correct, unchanged.
+
+**And it kills the replay.** Both captures stop with
+
+    vkAllocateMemory returned VK_ERROR_OUT_OF_DEVICE_MEMORY ... at index 11848
+
+after eight frames. An episode that stays open holds its segments' buffers, and
+a capture that changes shaders thousands of times a frame never closes one, so
+the arena grows until the device is out of memory. The sweep cannot see this:
+its samples render one frame.
+
+Reverted; both captures replay all 1,496 and 1,510 frames again at 9.44 and
+34.43 ms.
+
+This is the second attempt at episode accumulation and the second revert, and
+between them they say something specific: the episode path needs a bound on how
+much it may hold open as well as a rule for when to close it. Neither attempt
+touched that, which is why one broke correctness and the other broke memory.
+
+It is also exactly why the objective names replay as well as the sweep. A change
+that passes eighteen single-frame samples and exhausts device memory on the
+ninth frame of a capture is the failure the second half of that sentence exists
+to catch.
