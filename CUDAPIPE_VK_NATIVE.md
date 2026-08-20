@@ -3021,3 +3021,30 @@ different faces.
 The test that would pin it is `cpvk_cubelod` with a direction that varies
 smoothly across the frame rather than in bands: a sphere's worth of directions
 in a one-second test.
+
+### A fourteenth test reproduces pbribl in one second
+
+`cpvk_cubesph` samples the same nine-colour cube with a direction that varies
+smoothly per fragment -- a hemisphere's worth of directions -- instead of six
+flat bands. Against lavapipe:
+
+    differing pixels   734 of 4,096      max 80
+    distinct colours   lavapipe 70       native 2
+
+The red channel of each texel encodes its face as `20 + 40 * face`. lavapipe
+returns 100, 60 and 20 across the frame -- faces 2, 1 and 0. **The native
+driver returns 20 everywhere: face 0, for every fragment.**
+
+So cube face selection collapses to face zero when the direction varies per
+fragment, and is correct when it does not. That is exactly the difference
+between `cpvk_cubelod`, which picks one of six constant directions by branching
+on the band, and `pbribl`, whose `R = reflect(-V, N)` is arithmetic on
+interpolated inputs.
+
+It also explains the shape of pbribl's picture precisely: every sphere fragment
+reads face 0 of the prefiltered cube, which is one direction's worth of
+environment, and the result is a flat neutral tint rather than a reflection.
+
+The test runs in a second, needs no sample, and prints which face was chosen
+rather than a mean error. Whatever the fix turns out to be in the sampler's
+cube path, this is what will show it working.
