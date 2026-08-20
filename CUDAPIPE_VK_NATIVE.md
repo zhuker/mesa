@@ -4283,3 +4283,36 @@ both drivers -- so it is a question of what a draw costs. Everything that
 changes how draws are grouped has been measured at zero: batching, the
 descriptor key, blended episodes, the vertex-offset condition, and five
 attempts at episode accumulation.
+
+### Correction: episode accumulation *is* the lever, and the arena blocks it
+
+Counting the A-buffer path directly: **44 to 54% of the capture's draws take
+it** on this driver. `blend_enabled` comes straight from `at->blendEnable` and
+`peel_next` is a device allocation both drivers make identically, so the
+Gallium driver sees the same fraction of blended draws.
+
+It runs `cp_abuf_scan_block` 22.9 times a frame against this driver's 106.6
+anyway. Since the same draws take the same path, the difference is that the
+Gallium driver **amortises many blended draws into one A-buffer build** -- which
+is what a pass episode is for, and what its longer episodes buy it.
+
+So the earlier entry saying "episode accumulation is not the lever for the
+remaining 1.3x" was too strong, and this corrects it. Episodes *are* the
+mechanism; what the five attempts measured is that this driver cannot hold one
+open long enough to matter without exhausting device memory, because the
+scratch arena's reclaim has no knowledge of an open episode. Attempt 4 is the
+proof in both directions: a budget loose enough to defer usefully gave 9.13 ms
+against a 9.44 baseline on one capture and killed the other.
+
+The chain is now complete and consistent:
+
+    45% of draws are blended and build an A-buffer
+    -> the Gallium driver amortises them across long episodes
+    -> this driver cannot, because an open episode pins the scratch arena
+    -> so it issues 757 launches a frame against 245
+    -> and spends 1.3x the wall time while using less GPU time
+
+Fixing it means giving segments an allocation whose lifetime the episode owns,
+so that `cp_scratch_begin` can reclaim without regard to the episode and the
+episode can stay open. That is one change, in the renderer rather than the
+front end, and every measurement in this session points at it.
