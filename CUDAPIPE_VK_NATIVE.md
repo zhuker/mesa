@@ -691,3 +691,31 @@ each sphere.
 The way to see it is to print the first few vertex positions for one of those
 draws. The renderer prints them for small draws already; the flag needs to
 reach these.
+
+### pbribl: what is excluded so far
+
+The ten sphere draws reach the renderer with the right framebuffer, viewport,
+vertex elements (three attributes at 0, 12 and 24 in a 96-byte stride, which is
+the sample suite's glTF vertex exactly) and shade zero fragments.
+
+Excluded by disabling or by reading the actual values, not by argument:
+
+- depth test and write: forced off, no change
+- culling: forced to none, no change
+- winding: inverted, no change
+- the uniform buffer: its first floats read `0.974 0.000 0.000 0.000`, which is
+  a projection matrix's first row, so the matrix reaching the vertex shader is
+  real and not the null page
+- unbound slots: fourteen of sixteen are the null descriptor for *every* draw
+  in this sample including the skybox, which renders correctly, so that is
+  normal and not a signal
+
+So a correct matrix and correct vertex bindings still produce no coverage. What
+has not been looked at is the vertex shader's output itself. The renderer will
+print it -- `CUDAPIPE_DEBUG_FS` dumps the first vertices -- but that path
+allocates per-pixel buffers for a 1280x720 frame and segfaults on this sample
+before reaching the sphere draws, so it needs a smaller window or a cap before
+it can answer this.
+
+That is the next piece of work, and it is a change to the debug path rather
+than to the driver.
