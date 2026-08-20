@@ -3937,3 +3937,28 @@ maximum difference of 2 they are within rounding of the reference rather than
 structurally different. Whether the last of them is worth chasing is a
 judgement about what "identical to lavapipe" should mean for a corner texel
 that neither driver can name.
+
+### multisampling solved: the two drivers were antialiasing at different rates
+
+    native   framebufferColorSampleCounts: 1, 2, 4
+    gallium  framebufferColorSampleCounts: 1, 4, 8
+
+The sample asks for the highest count the device offers, so it ran at 4x here
+and 8x on the reference, and every silhouette differed by the difference
+between four samples and eight. That is why the difference was balanced --
+6,920 pixels darker and 6,422 brighter -- rather than a coverage bias, and why
+sample positions matching `lp_sample_pos_4x` exactly did not help: the
+reference was not using four samples.
+
+The rasteriser's table has entries for one, four and eight, so eight was always
+implemented and merely unadvertised, while two was advertised and is not in the
+table at all.
+
+    multisampling  0.553 -> 0.0048     pixel-correct
+
+**Seventeen of eighteen.** Only `pbribl` remains, at 0.0286, and its residual is
+thirteen corner pixels of a cube seam at a maximum difference of 2.
+
+A capability difference, not a rendering defect -- and it sat behind a
+measurement that had been characterised three times as "edge coverage on
+silhouettes" without anyone asking what the reference was actually rendering.

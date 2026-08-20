@@ -151,12 +151,23 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
       .maxViewports = 1,
       .maxViewportDimensions = { 16384, 16384 },
       .viewportBoundsRange = { -32768.0f, 32768.0f },
+      /*
+       * 1, 4 and 8, which is what the Gallium driver this replaces reports and
+       * what the rasteriser's sample-position table actually holds -- it has
+       * entries for one, four and eight.
+       *
+       * Advertising 2 and withholding 8 made `multisampling` pick 4x where the
+       * reference picks 8x, since the sample asks for the highest count the
+       * device offers. The two images then differ on every silhouette by the
+       * difference between four samples and eight, which is what its 0.553
+       * was.
+       */
       .framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT |
-                                      VK_SAMPLE_COUNT_2_BIT |
-                                      VK_SAMPLE_COUNT_4_BIT,
+                                      VK_SAMPLE_COUNT_4_BIT |
+                                      VK_SAMPLE_COUNT_8_BIT,
       .framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT |
-                                      VK_SAMPLE_COUNT_2_BIT |
-                                      VK_SAMPLE_COUNT_4_BIT,
+                                      VK_SAMPLE_COUNT_4_BIT |
+                                      VK_SAMPLE_COUNT_8_BIT,
       .sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxSamplerAnisotropy = 16.0f,
       .minMemoryMapAlignment = 4096,
