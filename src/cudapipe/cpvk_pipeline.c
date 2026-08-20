@@ -89,18 +89,53 @@ cpvk_scalarize_filter(const nir_instr *instr, const void *data)
    case nir_op_bcsel:
    case nir_op_flt: case nir_op_fge: case nir_op_feq: case nir_op_fneu:
    case nir_op_ilt: case nir_op_ige: case nir_op_ieq: case nir_op_ine:
-      return !strcmp(which, "sel");
+      return !strcmp(which, "sel") || !strcmp(which, "alu");
+
    case nir_op_mov:
    case nir_op_vec2: case nir_op_vec3: case nir_op_vec4:
-      return !strcmp(which, "move");
+      return !strcmp(which, "move") || !strcmp(which, "alu");
+
+   /* Everything that lowers to an LLVM intrinsic, where build_intrinsic()
+    * overloads on the type of the first argument only. */
+   case nir_op_fsqrt: case nir_op_frsq: case nir_op_frcp:
+   case nir_op_fexp2: case nir_op_flog2: case nir_op_fsin: case nir_op_fcos:
+   case nir_op_fpow: case nir_op_ffma: case nir_op_fabs:
+   case nir_op_fmin: case nir_op_fmax: case nir_op_ffloor: case nir_op_fceil:
+   case nir_op_ftrunc: case nir_op_fround_even: case nir_op_ffract:
+      return !strcmp(which, "intr") || !strcmp(which, "alu");
+
+   /* Plain LLVM binary operators. */
+   case nir_op_fadd: case nir_op_fsub: case nir_op_fmul: case nir_op_fneg:
+   case nir_op_fdiv:
+   case nir_op_iadd: case nir_op_isub: case nir_op_imul: case nir_op_ineg:
+   case nir_op_iand: case nir_op_ior: case nir_op_ixor: case nir_op_inot:
+   case nir_op_ishl: case nir_op_ishr: case nir_op_ushr:
+      return !strcmp(which, "basic") || !strcmp(which, "alu");
+
    default:
-      return !strcmp(which, "alu");
+      return !strcmp(which, "rest") || !strcmp(which, "alu");
    }
 }
 
 static void
 cpvk_lower_nir(nir_shader *nir)
 {
+   /*
+    * Registers to SSA first, before anything introduces a phi.
+    *
+    * spirv_to_nir emits a register for a value an if/else assigns and later
+    * code reads. Left alone it becomes an alloca in the LLVM the backend
+    * builds and the NVPTX backend gives the kernel a __local_depot for it --
+    * off-chip memory, in a loop, which the Gallium path never had because
+    * Mesa's common pipeline ran this before lavapipe handed the shader over.
+    *
+    * It has to be here rather than later: nir_lower_reg_intrinsics_to_ssa
+    * finds nothing once the register has been through other passes, and
+    * nir_trivialize_registers, which would restore the form it wants, asserts
+    * that no phi exists yet and aborts seven samples if run after one does.
+    */
+   NIR_PASS(_, nir, nir_lower_reg_intrinsics_to_ssa);
+
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_variable_initializers, ~0);
@@ -423,6 +458,13 @@ cpvk_lower_descriptors(nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_descriptors,
             nir_metadata_control_flow, (void *)layout);
    NIR_PASS(_, nir, nir_opt_dce);
+
+   /* Registers to SSA here as well as before the backend, because both the
+    * graphics and the compute path come through this function and only the
+    * graphics one reaches the later call. A register becomes an alloca, and
+    * the shaders that still carried one were the two <3 x i32> allocas in
+    * instancing's IR that the Gallium path did not have. */
+   NIR_PASS(_, nir, nir_lower_reg_intrinsics_to_ssa);
 
    if (cp_debug->dump_nir) {
       fprintf(stderr, "=== %s NIR after descriptor lowering, pipeline %p ===\n",

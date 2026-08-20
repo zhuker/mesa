@@ -1466,6 +1466,50 @@ build_intrinsic(struct ntl_context *ctx, const char *name,
    return LLVMBuildCall2(ctx->builder, fn_type, fn, args, num_args, "");
 }
 
+
+/*
+ * Call a scalar-only builder once per component.
+ *
+ * The NVVM approximations (ex2.approx.f, lg2.approx.f, rsqrt.approx.f) and the
+ * device functions linked from cp_sampler.cu all take a float and none of them
+ * is overloadable, so handing one a vector produces `call float
+ * @llvm.nvvm.lg2.approx.f(<3 x float>)` and the module fails verification.
+ * Every shader avoided this only because nir_lower_alu_to_scalar had already
+ * made these operations scalar -- and scalarising everything is what puts this
+ * driver's shaders under the register pressure that spills them.
+ */
+static LLVMValueRef
+build_scalar_only(struct ntl_context *ctx,
+                  LLVMValueRef (*build)(struct ntl_context *, const char *,
+                                        LLVMValueRef *, unsigned),
+                  const char *name, LLVMValueRef *args, unsigned num_args)
+{
+   if (LLVMGetTypeKind(LLVMTypeOf(args[0])) != LLVMVectorTypeKind)
+      return build(ctx, name, args, num_args);
+
+   LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
+   unsigned n = LLVMGetVectorSize(LLVMTypeOf(args[0]));
+   LLVMValueRef result = NULL;
+
+   for (unsigned c = 0; c < n; c++) {
+      LLVMValueRef lane[4];
+      for (unsigned a = 0; a < num_args && a < 4; a++) {
+         lane[a] = LLVMGetTypeKind(LLVMTypeOf(args[a])) == LLVMVectorTypeKind
+            ? LLVMBuildExtractElement(ctx->builder, args[a],
+                                      LLVMConstInt(i32, c, false), "")
+            : args[a];
+      }
+      LLVMValueRef v = build(ctx, name, lane, num_args);
+      if (!v)
+         return NULL;
+      if (!result)
+         result = LLVMGetUndef(LLVMVectorType(LLVMTypeOf(v), n));
+      result = LLVMBuildInsertElement(ctx->builder, result, v,
+                                      LLVMConstInt(i32, c, false), "");
+   }
+   return result;
+}
+
 static void
 emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
 {
@@ -1636,7 +1680,7 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       break;
    case nir_op_frsq:
       if (bit_size == 32) {
-         result = build_nvvm_intrinsic(ctx, "llvm.nvvm.rsqrt.approx.f", src, 1);
+         result = build_scalar_only(ctx, build_nvvm_intrinsic, "llvm.nvvm.rsqrt.approx.f", src, 1);
       } else {
          LLVMValueRef root = build_intrinsic(ctx, "llvm.sqrt", src, 1);
          result = LLVMBuildFDiv(ctx->builder,
@@ -1666,12 +1710,12 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    }
    case nir_op_fexp2:
       result = bit_size == 32
-         ? build_nvvm_intrinsic(ctx, "llvm.nvvm.ex2.approx.f", src, 1)
+         ? build_scalar_only(ctx, build_nvvm_intrinsic, "llvm.nvvm.ex2.approx.f", src, 1)
          : build_intrinsic(ctx, "llvm.exp2", src, 1);
       break;
    case nir_op_flog2:
       result = bit_size == 32
-         ? build_nvvm_intrinsic(ctx, "llvm.nvvm.lg2.approx.f", src, 1)
+         ? build_scalar_only(ctx, build_nvvm_intrinsic, "llvm.nvvm.lg2.approx.f", src, 1)
          : build_intrinsic(ctx, "llvm.log2", src, 1);
       break;
    case nir_op_fpow:
@@ -1679,12 +1723,12 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       break;
    case nir_op_fsin:
       result = bit_size == 32
-         ? build_device_call(ctx, "cp_sinf", src, 1)
+         ? build_scalar_only(ctx, build_device_call, "cp_sinf", src, 1)
          : build_intrinsic(ctx, "llvm.sin", src, 1);
       break;
    case nir_op_fcos:
       result = bit_size == 32
-         ? build_device_call(ctx, "cp_cosf", src, 1)
+         ? build_scalar_only(ctx, build_device_call, "cp_cosf", src, 1)
          : build_intrinsic(ctx, "llvm.cos", src, 1);
       break;
    case nir_op_ffma:

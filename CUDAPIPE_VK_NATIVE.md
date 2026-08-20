@@ -5063,3 +5063,44 @@ followed it.
 
     default now   18/18 run, 17/18 pixel-correct, fourteen unit tests
     replays       7.36 and 22.80 ms
+
+### The local memory is real, it matters, and the pass that removes it cannot run here
+
+`CUDAPIPE_DUMP_IR` settles what the PTX only hinted at:
+
+    native   2 x `alloca <3 x i32>`      gallium   none
+
+`decl_reg` is the only `LLVMBuildAlloca` in the backend, so those two allocas
+are two NIR registers, and they become a 16-byte `__local_depot` **inside a
+loop** -- `$L__BB0_6` stores a u64 and a u32 every iteration. Off-chip memory
+in a loop is a good candidate for instancing's `main` costing 1866 ms where the
+Gallium driver's costs 562 at the same grid.
+
+`nir_trivialize_registers` followed by `nir_lower_reg_intrinsics_to_ssa`
+removes them completely -- **0 allocas, 0 local operations, exactly matching
+the Gallium driver** -- and in that build `texture` measured 2.15 ms against
+gallium's 2.23, a ratio of 0.96 where it had been 1.36.
+
+**But that build aborts seven samples.** `nir_trivialize_registers` asserts
+`instr->type != nir_instr_type_phi`: it is meant to run immediately before
+leaving SSA, and by the time this driver has a shader there are phis
+everywhere. Run it early instead and there is nothing to find, because
+`spirv_to_nir` has already produced phis of its own.
+
+So the position is:
+
+- the defect is identified precisely, down to two allocas and the loop they sit in
+- the repair is known and produces byte-comparable output to the reference driver
+- one measurement says it is worth the whole `texture` gap, from 1.36x to 0.96x
+- and the pass that performs it cannot legally run at any point in this pipeline
+
+What that leaves is not a search but a choice between three known options:
+lower these registers by hand where `should_lower_reg` refuses; call
+`nir_trivialize_registers` on a shader that has been taken out of phi form
+first; or find why `nir_foreach_reg_decl` does not see a register that the dump
+shows as the first instruction of the entry block with `num_array_elems=0`,
+which is the condition the pass tests and the one thing here that is not yet
+explained.
+
+Left at the safe state: 18/18 run, 17/18 pixel-correct, fourteen unit tests,
+replays 7.35 and 22.75 ms.
