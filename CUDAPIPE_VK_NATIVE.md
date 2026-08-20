@@ -124,9 +124,20 @@ ok
 
 Known gaps at this milestone, recorded rather than discovered later:
 
-- `vulkaninfo --summary` still segfaults on an entrypoint the driver returns
-  NULL for; the smoke test is the milestone, not vulkaninfo. Finding that
-  entrypoint is the first task of milestone 2.
+- `vulkaninfo --summary` reaches **`vkCreateDevice`** and stops there, which is
+  milestone 2. Getting it that far took two fixes worth recording, because both
+  present as a segfault with no driver frame in the backtrace — a jump to
+  address zero from inside the loader:
+  - `GetPhysicalDeviceImageFormatProperties2` and the external
+    buffer/fence/semaphore queries were unimplemented. Any application walks
+    these for every format, and an unimplemented physical-device entrypoint is
+    a null pointer rather than a clean refusal. They now refuse explicitly.
+  - `KHR_get_physical_device_properties2` was advertised and had to be taken
+    straight back out: an application that enables it calls the KHR *aliases*,
+    and at `apiVersion` 1.0 those are not wired to the runtime's core
+    implementations. It comes back with 1.1, or with the aliases implemented.
+    This is the driver's own "a capability you advertise but clamp is worse
+    than one you refuse" rule, in its sharpest form.
 - `cpvk_GetPhysicalDeviceFormatProperties2` deliberately reports nothing. A
   capability advertised and then clamped is worse than one refused — the
   multisampling sample already demonstrated that here.

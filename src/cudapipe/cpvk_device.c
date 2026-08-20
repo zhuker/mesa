@@ -10,8 +10,17 @@
 #include "vk_util.h"
 #include "util/u_debug.h"
 
+/*
+ * Nothing yet. KHR_get_physical_device_properties2 was advertised first and
+ * taken straight back out: an application that enables it calls the KHR
+ * aliases, and at apiVersion 1.0 those alias entrypoints are not wired to the
+ * runtime's core implementations, so the loader jumps to a null pointer. That
+ * is the "advertised and then clamped is worse than refused" rule in its
+ * sharpest form — the failure was a segfault inside vulkaninfo with no driver
+ * frame in the backtrace. It comes back with apiVersion 1.1, or with the
+ * aliases implemented explicitly.
+ */
 static const struct vk_instance_extension_table cpvk_instance_extensions = {
-   .KHR_get_physical_device_properties2 = true,
 };
 
 static const struct vk_device_extension_table cpvk_device_extensions = {
@@ -289,6 +298,61 @@ cpvk_GetPhysicalDeviceQueueFamilyProperties2(
          .minImageTransferGranularity = { 1, 1, 1 },
       };
    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_GetPhysicalDeviceImageFormatProperties2(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
+   VkImageFormatProperties2 *pImageFormatProperties)
+{
+   /* Refuse everything until the format table is ported. vulkaninfo and any
+    * application walk this for every format, and a NULL entrypoint here is a
+    * jump to zero rather than a clean refusal. */
+   pImageFormatProperties->imageFormatProperties =
+      (VkImageFormatProperties) { 0 };
+   return VK_ERROR_FORMAT_NOT_SUPPORTED;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_GetPhysicalDeviceSparseImageFormatProperties2(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
+   uint32_t *pPropertyCount, VkSparseImageFormatProperties2 *pProperties)
+{
+   *pPropertyCount = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_GetPhysicalDeviceExternalBufferProperties(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceExternalBufferInfo *pExternalBufferInfo,
+   VkExternalBufferProperties *pExternalBufferProperties)
+{
+   pExternalBufferProperties->externalMemoryProperties =
+      (VkExternalMemoryProperties) { 0 };
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_GetPhysicalDeviceExternalFenceProperties(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceExternalFenceInfo *pExternalFenceInfo,
+   VkExternalFenceProperties *pExternalFenceProperties)
+{
+   pExternalFenceProperties->exportFromImportedHandleTypes = 0;
+   pExternalFenceProperties->compatibleHandleTypes = 0;
+   pExternalFenceProperties->externalFenceFeatures = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_GetPhysicalDeviceExternalSemaphoreProperties(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceExternalSemaphoreInfo *pExternalSemaphoreInfo,
+   VkExternalSemaphoreProperties *pExternalSemaphoreProperties)
+{
+   pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;
+   pExternalSemaphoreProperties->compatibleHandleTypes = 0;
+   pExternalSemaphoreProperties->externalSemaphoreFeatures = 0;
 }
 
 VKAPI_ATTR void VKAPI_CALL
