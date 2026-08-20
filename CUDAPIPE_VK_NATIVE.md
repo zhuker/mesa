@@ -170,12 +170,36 @@ before layering behaviour on it — is the whole plan:
    reproduced by a refactor the compiler had no way to catch. Nobody should be
    able to write that cast by hand again.
 
-   What is left in the file is the Gallium entry points and what they hold:
-   the CSO copies the flush comparison and the batch key use, the resource and
-   sampler-view paths, and the two `PIPE_FORMAT` switch tables the native
-   driver replaces with its own. The next structural step is the batch key,
-   which is the one place where going driver-owned genuinely changes what
-   merges, and so has to be measured and accepted rather than assumed.
+   **Ninth slice: the batch key.** The key held five Gallium structs whole.
+   Narrowing it to what the pipeline reads would have let draws merge that do
+   not merge today, so instead it holds an opaque blob the front end fills and
+   the batcher only `memcmp`s — the adapter puts CSO structs in, the native
+   driver will put a pipeline handle and dynamic state in, and neither changes
+   what merges for the other. `CUDAPIPE_DEBUG_BATCHDIFF` still names the piece
+   of state that broke a batch, through a field table the front end supplies.
+
+   **Tenth slice: a bug the gate could not catch.** The segment snapshot was
+   still saving the Gallium element array rather than the resolved one the
+   draw path had started reading, so a segment re-executed by
+   `cp_pass_fallback` would have gathered with whatever layout was live. No
+   sample reaches that path and neither capture's overflow enters it, so
+   `CUDAPIPE_FORCE_PASS_FALLBACK=1` now makes every episode take it: the check
+   is that the forced result equals the *classic* path, and `particlesystem`
+   is bit-identical to `CUDAPIPE_NO_ABUFFER=1`.
+
+   **Eleventh slice: `struct cp_context` contains no Gallium type at all.**
+   The framebuffer state, the CSO copies and the element array moved into
+   `cp_gallium`; two fields turned out to be dead once the resolved forms
+   existed (`vertex_buffers`, an uncounted resource reference nothing read,
+   and `tex_resources[].format`, written once and never read) and were deleted
+   rather than moved.
+
+   **The draw pipeline, its state, its batching and its episode machinery are
+   now a renderer a Vulkan front end can drive without Gallium existing.**
+
+   Gallium references in `cp_context.c`: **334 → 243**, all of them now in the
+   entry points, the resource and sampler-view paths, and the two
+   `PIPE_FORMAT` tables the native driver already replaces.
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
