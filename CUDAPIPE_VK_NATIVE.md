@@ -3491,3 +3491,39 @@ The next substitution follows directly: in pbribl's shader, sample the cube
 with a *varying* -- `texture(prefilteredMap, inNormal)` -- and with a computed
 one, in the same run. If the varying works and the computed does not, the
 `coord_slot` path is implicated with evidence.
+
+### Only face 0 of pbribl's prefiltered cube reads back
+
+Sampling that cube at one constant direction per face, on a sphere fragment:
+
+    +X  (30, 16, 9)
+    -X  (0, 0, 0)
+    +Y  (0, 0, 0)
+    -Y  (0, 0, 0)
+    +Z  (0, 0, 0)
+    -Z  (0, 0, 0)
+
+Layer 0 holds data and layers 1 to 5 read as zero. That explains every
+observation at once: a reflection direction lands on face 0 for a minority of
+fragments, so 36.8% of the sphere band reads non-zero and the rest is black;
+the whole term averages to nothing; and the spheres come out lit by direct
+light alone.
+
+It also explains why the earlier "force R to a constant" test made the spheres
+warm -- the constant chosen, `normalize(vec3(1, 0.2, 0.3))`, is +X dominant.
+
+Every prior elimination stands and none of them touched this: the copies were
+verified to be *issued* for all six faces, and the cube's content was verified
+by reading back what a copy wrote -- but always at the first face. The one
+thing never checked is whether layers 1 to 5 of *this* image contain what was
+copied into them.
+
+`cpvk_cubebig` has the same format, size and level count and reads all six
+faces correctly, and its faces are written by the host through
+`vkGetImageSubresourceLayout` into linear memory. pbribl's are placed by
+`vkCmdCopyImage` into an optimal-tiled image. That is the remaining difference,
+and it is now a narrow one: either the copies do not land where they are
+computed to, or the allocation does not extend to the later layers.
+
+The check is direct -- read back device memory at `base + layer * level_size`
+for each of the six faces after the copies -- and it needs no shader.
