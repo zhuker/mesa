@@ -1224,3 +1224,29 @@ off:
 What remains different between the test and the sample is the vertex layout:
 four elements at a 60-byte stride against two at 16. That is now the whole
 list, and it is two numbers.
+
+### Every property of the draws is cleared; the difference is in the sequence
+
+`cpvk_batchtex` now has gltfscenerendering's vertex layout as well -- four
+attributes at 0, 12, 24 and 32 in a 60-byte stride -- and batched and unbatched
+still agree exactly. Ten properties reproduced, ten cleared:
+
+    nine draws                     two descriptor set layouts
+    a texture rebound per draw     overlapping geometry, nine depths
+    the depth test                 a discarding fragment shader
+    six fragment varyings          a 1280x720 framebuffer
+    800 triangles per draw         four vertex elements, 60-byte stride
+
+The sample still needs the descriptor comparison and this test never does. So
+whatever is left is **not a property of the draws** -- it is something about
+the sequence they sit in: the render passes around them, the draws between
+them, the state changed between batches, or the frames before.
+
+That is a different search from the one this has been, and a more productive
+one to start fresh than to continue: capture the sample's whole command
+stream with CUDAPIPE_DEBUG_DRAW and CUDAPIPE_DEBUG_BATCH and look at what
+happens *around* a batch that renders wrongly, rather than at the batch.
+
+The test that established all this is worth more than the answer would have
+been. It parameterises draw count, triangle count, varying count, framebuffer
+size and vertex layout, and it runs in a second.

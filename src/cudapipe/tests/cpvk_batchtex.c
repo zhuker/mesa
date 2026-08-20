@@ -61,9 +61,17 @@ load_spv(VkDevice dev, const char *path)
    return mod;
 }
 
+/*
+ * gltfscenerendering's vertex: four attributes at 0, 12, 24 and 32 in a
+ * 60-byte stride, which CUDAPIPE_DEBUG_DRAW showed is the last thing this
+ * test did not have.
+ */
 struct vertex {
-   float x, y, z;
-   unsigned char r, g, b, a;
+   float x, y, z;        /* 0  */
+   float nx, ny, nz;     /* 12 */
+   float u, v;           /* 24 */
+   float cr, cg, cb;     /* 32 */
+   float pad[3];         /* 44, to a 60-byte stride */
 };
 
 static uint32_t
@@ -201,9 +209,12 @@ main(int argc, char **argv)
          float fx = x0 + 0.6f * ((float)(k % 40) / 40.0f);
          float fy = -0.6f + 1.3f * ((float)(k / 40) / (float)((TPD + 39) / 40));
          struct vertex *v = &verts[(n * TPD + k) * 3];
-         v[0] = (struct vertex){ fx,         fy,         z, 255,255,255,255 };
-         v[1] = (struct vertex){ fx + 0.02f, fy,         z, 255,255,255,255 };
-         v[2] = (struct vertex){ fx + 0.01f, fy + 0.05f, z, 255,255,255,255 };
+         v[0] = (struct vertex){ fx,         fy,         z,
+                                 0,0,1, 0.0f,0.0f, 1,1,1 };
+         v[1] = (struct vertex){ fx + 0.02f, fy,         z,
+                                 0,0,1, 1.0f,0.0f, 1,1,1 };
+         v[2] = (struct vertex){ fx + 0.01f, fy + 0.05f, z,
+                                 0,0,1, 0.5f,1.0f, 1,1,1 };
          for (int e = 0; e < 3; e++)
             indices[(n * TPD + k) * 3 + e] = (uint32_t)((n * TPD + k) * 3 + e);
       }
@@ -417,16 +428,20 @@ main(int argc, char **argv)
    VkVertexInputBindingDescription vbind = {
       .binding = 0, .stride = sizeof(struct vertex),
       .inputRate = VK_VERTEX_INPUT_RATE_VERTEX };
-   VkVertexInputAttributeDescription vattr[2] = {
+   VkVertexInputAttributeDescription vattr[4] = {
       { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT,
-        .offset = 0 },
-      { .location = 1, .binding = 0, .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .offset = offsetof(struct vertex, r) },
+        .offset = offsetof(struct vertex, x) },
+      { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT,
+        .offset = offsetof(struct vertex, nx) },
+      { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT,
+        .offset = offsetof(struct vertex, u) },
+      { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT,
+        .offset = offsetof(struct vertex, cr) },
    };
    VkPipelineVertexInputStateCreateInfo vi = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
       .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &vbind,
-      .vertexAttributeDescriptionCount = 2,
+      .vertexAttributeDescriptionCount = 4,
       .pVertexAttributeDescriptions = vattr };
    VkPipelineInputAssemblyStateCreateInfo ia = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
