@@ -106,7 +106,8 @@ cpvk_lower_nir(nir_shader *nir)
     * cudapipe ever sees a shader. The capture's shaders use mix(). */
    NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, true);
 
-   NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+   if (!getenv("CPVK_NO_SCALARIZE"))
+      NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
 
    NIR_PASS(_, nir, nir_opt_dce);
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));

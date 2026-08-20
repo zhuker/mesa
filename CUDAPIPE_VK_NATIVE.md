@@ -4998,3 +4998,34 @@ stands between the sample sweep and the objective.
                 older      22.86    vs 25.20           0.907x, faster
     sweep       correctness 17/18, equal or better than gallium against NVIDIA
                 cost        instancing 1.46x, vulkanscene 1.36x, bloom 1.16x
+
+## emit_alu now applies the swizzle at any width, which is the first half of the named repair
+
+`emit_alu()` applied an operand's swizzle only when the destination was scalar
+and passed a vector source through untouched otherwise -- which drops the
+swizzle and hands LLVM two sources at their own widths, `fadd <3 x float>, <4 x
+float>`, failing verification. No shader ever hit it because
+`nir_lower_alu_to_scalar` had already made every operation scalar.
+
+It now applies the swizzle at whatever width the operand is consumed at, using
+`nir_op_infos[].input_sizes[]` to tell a fixed-width operand (fdot, the vecN
+constructors) from one that follows the destination: a shuffle against undef
+for a vector source, elided when the mask is the identity, and a splat for a
+scalar feeding a vector operation.
+
+Measured by what it unblocks. With `CPVK_NO_SCALARIZE=1`:
+
+    before this change    1 of 18 samples run
+    after                16 of 18 run, 6 of 18 pixel-correct
+
+So the ALU half is done and **the texture half is not** -- the failures are
+texture3d, texture, gltfscenerendering, multithreading, instancing, the ones
+that sample most -- which says the texture emit paths make the same assumption
+`emit_alu` used to.
+
+Default behaviour is unchanged and measured so: 18/18 run, 17/18 pixel-correct,
+fourteen unit tests, replays 7.50 and 22.79 ms, instancing 8.73 and bloom 1.99.
+Scalarisation stays on until the texture paths follow, because until then
+turning it off renders twelve samples wrong.
+
+`CPVK_NO_SCALARIZE=1` is kept as the switch that measures the next step.

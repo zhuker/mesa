@@ -1454,10 +1454,59 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    LLVMValueRef src[4] = {0};
    for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
       src[i] = get_src(ctx, &instr->src[i].src);
-      /* Extract component from vector sources when output is scalar */
-      if (LLVMGetTypeKind(LLVMTypeOf(src[i])) == LLVMVectorTypeKind && num_comp == 1) {
-         src[i] = LLVMBuildExtractElement(ctx->builder, src[i],
-            LLVMConstInt(i32, instr->src[i].swizzle[0], false), "");
+      if (!src[i])
+         continue;
+
+      /*
+       * Apply the operand's swizzle, at whatever width this operand is
+       * consumed at.
+       *
+       * This used to do it only for a scalar destination and pass a vector
+       * source through untouched otherwise, which drops the swizzle and hands
+       * LLVM two sources at their own widths -- `fadd <3 x float>, <4 x
+       * float>`, which fails verification. Every shader avoided it only
+       * because nir_lower_alu_to_scalar had already made every operation
+       * scalar, and scalarising everything is what puts this driver's shaders
+       * under the register pressure that spills them to local memory.
+       *
+       * input_sizes[i] is the width this operand is consumed at when the op
+       * fixes it (fdot, the vecN constructors); zero means it follows the
+       * destination.
+       */
+      unsigned isz = nir_op_infos[instr->op].input_sizes[i];
+      unsigned want = isz ? isz : num_comp;
+      bool src_is_vec =
+         LLVMGetTypeKind(LLVMTypeOf(src[i])) == LLVMVectorTypeKind;
+
+      if (want == 1) {
+         if (src_is_vec)
+            src[i] = LLVMBuildExtractElement(ctx->builder, src[i],
+               LLVMConstInt(i32, instr->src[i].swizzle[0], false), "");
+         continue;
+      }
+
+      if (src_is_vec) {
+         /* A shuffle against undef selects exactly the swizzled lanes, and
+          * needs no instruction when the mask is the identity. */
+         LLVMValueRef mask[NIR_MAX_VEC_COMPONENTS];
+         bool identity = LLVMGetVectorSize(LLVMTypeOf(src[i])) == want;
+         for (unsigned c = 0; c < want; c++) {
+            mask[c] = LLVMConstInt(i32, instr->src[i].swizzle[c], false);
+            if (instr->src[i].swizzle[c] != c)
+               identity = false;
+         }
+         if (!identity)
+            src[i] = LLVMBuildShuffleVector(ctx->builder, src[i],
+               LLVMGetUndef(LLVMTypeOf(src[i])),
+               LLVMConstVector(mask, want), "");
+      } else {
+         /* A scalar feeding a vector operation is every lane. */
+         LLVMValueRef v = LLVMGetUndef(
+            LLVMVectorType(LLVMTypeOf(src[i]), want));
+         for (unsigned c = 0; c < want; c++)
+            v = LLVMBuildInsertElement(ctx->builder, v, src[i],
+                                       LLVMConstInt(i32, c, false), "");
+         src[i] = v;
       }
    }
 
