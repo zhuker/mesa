@@ -642,6 +642,24 @@ cpvk_compile_stage(struct cpvk_device *dev,
    cpvk_lower_nir(nir);
    cpvk_lower_descriptors(nir, layout);
 
+   /*
+    * Outputs become temporaries, so nothing reads one back.
+    *
+    * A shader that computes an output and then uses it -- `outWorldPos =
+    * locPos + objPos; gl_Position = proj * view * vec4(outWorldPos, 1)` --
+    * leaves a load_output in the NIR, and the backend has no case for it and
+    * says so. It computed on undef, so every one of pbribl's sphere vertices
+    * came out at the origin with w = 0, every triangle was degenerate, and
+    * the spheres never appeared. lavapipe runs this pass; this driver did
+    * not.
+    */
+   NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
+            nir_shader_get_entrypoint(nir), nir_var_shader_out);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_split_var_copies);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       /*
        * A vertex shader's inputs are numbered by their attribute location,
