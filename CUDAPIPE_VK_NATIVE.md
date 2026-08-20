@@ -1279,3 +1279,26 @@ Found by looking at the two images. The triage that led there -- comparing
 distinct-colour counts between the native and Gallium renders of all ten wrong
 samples -- flagged this one as the odd one out in a single table: 32,040
 colours natively against 17.
+
+### bloom and pbribl fail the same way: draws that shade nothing
+
+`bloom` renders the ship correctly and has no glow at all -- no halo, no light
+cone. The blend state is right (`blend=1 src=1 dst=1`, additive, on the two
+composite draws), so the additive pass is adding an empty texture rather than
+blending wrongly.
+
+Its offscreen chain runs: 79 draws at 1280x720 and 75 at 256x256, which is the
+glow target. But 31 of the 256x256 draws shade **zero** fragments, and so do 32
+of the full-size ones.
+
+That is exactly `pbribl`'s signature -- ten sphere draws, correct state, zero
+fragments -- and it is now two samples with one failure mode rather than two
+separate mysteries. Whatever makes a draw produce no coverage while its
+framebuffer, viewport, matrices and vertex bindings all read correctly is
+worth more than either sample: it is the single largest correctness gap left.
+
+Both draw from a loaded model. `cpvk_mesh` reproduces that model's vertex
+layout exactly and renders correctly, so it is not the layout -- but
+`cpvk_mesh` draws one triangle from nine vertices, and these draw thousands.
+Raising its vertex and triangle count toward a real mesh is the obvious next
+step and the test already parameterises both.
