@@ -70,20 +70,17 @@ struct cp_batch_key {
    uint32_t mode, index_size, start_instance;
    const void *index_resource;
 
-   /* Pipeline state, whole structs: a field added upstream is then covered
-    * without anything here having to name it. */
-   struct pipe_viewport_state viewport;
    struct cp_rect scissor;
-   struct pipe_rasterizer_state rasterizer;
-   struct pipe_depth_stencil_alpha_state depth_stencil;
-   struct pipe_blend_state blend_state;
    uint32_t blend_enabled;
+   /* Pipeline state, as the front end describes it; see cp_draw_types.h.
+    * Whole structs go in here, so a field added upstream is covered without
+    * anything naming it. */
+   uint8_t state[CP_BATCH_STATE_BYTES];
 
    /* Vertex input. The buffer *bindings* are absent: a batch carries one row
     * of resolved per-element base addresses per draw, so draws bound to
-    * different vertex buffers merge. The element layout and the buffer count
-    * stay — they shape the gather itself. */
-   struct pipe_vertex_element vertex_elements[16];
+    * different vertex buffers merge. The element layout is inside `state`;
+    * the counts stay here — they shape the gather itself. */
    uint32_t num_vertex_elements, vertex_stride, num_vertex_buffers;
 
    /* Binding *counts* only: both stages carry their per-draw pointer tables,

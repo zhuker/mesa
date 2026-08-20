@@ -129,4 +129,30 @@ struct cp_vertex_elem {
    unsigned fill_w;
 };
 
+/*
+ * The front end's statement that two draws have identical pipeline state.
+ *
+ * The batcher only ever memcmps this, so what it contains is the front end's
+ * business: the Gallium adapter puts whole CSO structs in, and the native
+ * Vulkan driver will put a pipeline handle and its dynamic state in. Neither
+ * changes what merges for the other, and the comparison stays exactly as wide
+ * as it is today -- which matters, because widening or narrowing it changes
+ * batch sizes, and batch size is what makes the clipper's unstable primitive
+ * order visible (gaps 15 and 16).
+ *
+ * The field table exists so that CUDAPIPE_DEBUG_BATCHDIFF can still name the
+ * piece of state that broke a batch. That report is not a nicety: it is what
+ * turned "why does nothing merge" into "fs_ubos breaks 97% of runs" and then
+ * into the per-draw binding tables.
+ */
+#define CP_BATCH_STATE_BYTES 768
+
+struct cp_batch_state_field {
+   const char *name;
+   unsigned off, size;
+};
+
+/* Implemented by whichever front end is built. */
+const struct cp_batch_state_field *cp_batch_state_fields(unsigned *count);
+
 #endif /* CP_DRAW_TYPES_H */

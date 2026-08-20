@@ -5450,6 +5450,33 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
  *    CP_ARG_DRAW_PARAM_STRIDE row per draw at args[7], by the same row.
  */
 
+/*
+ * What this front end means by "the same pipeline state": the CSO structs
+ * whole. The native driver's answer will be a pipeline handle and its dynamic
+ * state, and the batcher will not know the difference.
+ */
+struct cp_gallium_batch_state {
+   struct pipe_viewport_state viewport;
+   struct pipe_rasterizer_state rasterizer;
+   struct pipe_depth_stencil_alpha_state depth_stencil;
+   struct pipe_blend_state blend_state;
+   struct pipe_vertex_element vertex_elements[16];
+};
+
+const struct cp_batch_state_field *
+cp_batch_state_fields(unsigned *count)
+{
+#define S(name) { #name, offsetof(struct cp_gallium_batch_state, name), \
+                  sizeof(((struct cp_gallium_batch_state *)0)->name) }
+   static const struct cp_batch_state_field fields[] = {
+      S(viewport), S(rasterizer), S(depth_stencil), S(blend_state),
+      S(vertex_elements),
+   };
+#undef S
+   *count = ARRAY_SIZE(fields);
+   return fields;
+}
+
 /* Fill in everything two draws must agree on. See struct cp_batch_key. */
 static void
 cp_batch_build_key(struct cp_context *cp, const struct cp_draw_call *info,
@@ -5488,7 +5515,13 @@ cp_batch_build_key(struct cp_context *cp, const struct cp_draw_call *info,
     * kernel's instance-divisor gather still reads it as one scalar.
     */
 
-   key->viewport = cp->viewport_cso;
+   /*
+    * The state blob. Zeroed whole first so that padding inside the structs
+    * cannot make two identical states compare different.
+    */
+   struct cp_gallium_batch_state gs;
+   memset(&gs, 0, sizeof(gs));
+   gs.viewport = cp->viewport_cso;
    /*
     * The scissor is a merge condition only where a primitive cannot be
     * resolved to its draw: a batch on the stable clipper carries one clip
@@ -5500,13 +5533,15 @@ cp_batch_build_key(struct cp_context *cp, const struct cp_draw_call *info,
    if (cp->rasterizer.scissor &&
        !(blended || (cp->fs_shader && cp->fs_shader->reads_const_bufs)))
       key->scissor = cp->scissor;
-   key->rasterizer = cp->rasterizer_cso;
-   key->depth_stencil = cp->depth_stencil_cso;
-   key->blend_state = cp->blend_state;
+   gs.rasterizer = cp->rasterizer_cso;
+   gs.depth_stencil = cp->depth_stencil_cso;
+   gs.blend_state = cp->blend_state;
    key->blend_enabled = cp->blend_enabled;
 
-   memcpy(key->vertex_elements, cp->vertex_elements,
-          sizeof(key->vertex_elements));
+   memcpy(gs.vertex_elements, cp->vertex_elements, sizeof(gs.vertex_elements));
+   static_assert(sizeof(gs) <= CP_BATCH_STATE_BYTES,
+                 "the adapter's batch state does not fit the key");
+   memcpy(key->state, &gs, sizeof(gs));
    key->num_vertex_elements = cp->num_vertex_elements;
    key->vertex_stride = cp->vertex_stride;
    key->num_vertex_buffers = cp->num_vertex_buffers;
@@ -5549,9 +5584,8 @@ cp_batch_key_report_diff(const struct cp_batch_key *a,
       F(fb_w), F(fb_h), F(fb_nr_cbufs), F(fb_samples), F(cbuf_format),
       F(mode), F(index_size), F(start_instance),
       F(index_resource),
-      F(viewport), F(scissor), F(rasterizer), F(depth_stencil),
-      F(blend_state), F(blend_enabled),
-      F(vertex_elements), F(num_vertex_elements), F(vertex_stride),
+      F(scissor), F(blend_enabled),
+      F(num_vertex_elements), F(vertex_stride),
       F(num_vertex_buffers),
       F(num_fs_ubos), F(num_vs_ubos),
       F(sampler_table), F(num_samplers),
@@ -5559,6 +5593,21 @@ cp_batch_key_report_diff(const struct cp_batch_key *a,
 #undef F
    char line[512];
    size_t n = 0;
+   /* The front end's own state, named piece by piece so the report still says
+    * which one broke the batch rather than just "state". */
+   unsigned num_state_fields;
+   const struct cp_batch_state_field *sf =
+      cp_batch_state_fields(&num_state_fields);
+   for (unsigned i = 0; i < num_state_fields; i++) {
+      const size_t off = offsetof(struct cp_batch_key, state) + sf[i].off;
+      if (!memcmp((const char *)a + off, (const char *)b + off, sf[i].size))
+         continue;
+      int w = snprintf(line + n, sizeof(line) - n, "%s%s",
+                       n ? "," : "", sf[i].name);
+      if (w < 0 || (size_t)w >= sizeof(line) - n)
+         break;
+      n += w;
+   }
    for (unsigned i = 0; i < ARRAY_SIZE(fields); i++) {
       if (!memcmp((const char *)a + fields[i].off,
                   (const char *)b + fields[i].off, fields[i].size))
