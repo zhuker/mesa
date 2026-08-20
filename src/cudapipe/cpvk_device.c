@@ -21,6 +21,18 @@
  * aliases implemented explicitly.
  */
 static const struct vk_instance_extension_table cpvk_instance_extensions = {
+   /*
+    * Advertised without any WSI behind it, which is what lavapipe does and
+    * for the same stated reason: an offscreen app enables this to get the
+    * PRESENT_SRC_KHR image layout, and never creates a surface. The Vulkan
+    * sample suite asks for it unconditionally and asks for a platform
+    * surface extension only when it opens a window, so this is the whole gap
+    * between "cannot create an instance" and "renders".
+    *
+    * If a surface is ever created this is a lie, and the honest fix then is
+    * wsi_common rather than a wider claim here.
+    */
+   .KHR_surface = true,
 };
 
 static const struct vk_device_extension_table cpvk_device_extensions = {
@@ -32,6 +44,10 @@ static const struct vk_device_extension_table cpvk_device_extensions = {
     * it vkGetDeviceProcAddr returns NULL and the caller jumps to zero, which
     * is what it did. */
    .KHR_dynamic_rendering = true,
+
+   /* Same bargain as KHR_surface above: enabled for the image layout, with
+    * no swapchain implementation behind it. */
+   .KHR_swapchain = true,
 };
 
 static void

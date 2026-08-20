@@ -214,6 +214,11 @@ struct cpvk_copy {
    CUdeviceptr src, dst;
    size_t src_pitch, dst_pitch;
    size_t width_bytes, rows;
+   /* A blit between two 32-bit formats of opposite channel order. Vulkan
+    * requires a blit to convert, and an offscreen app relies on it: the
+    * sample suite blits its BGRA render target into an RGBA staging image
+    * precisely so it does not have to swizzle on the CPU. */
+   bool swap_rb;
 };
 
 enum cpvk_op_kind {
@@ -309,6 +314,16 @@ struct cpvk_image {
    uint32_t texel;                 /* enum cp_texel_format */
    int color;                      /* enum cp_color_encoding, -1 if none */
 };
+
+/* The format table's row; cpvk_image.c owns the table. */
+struct cpvk_format_info {
+   VkFormat vk;
+   uint32_t texel;              /* enum cp_texel_format, 0 = not sampleable */
+   int color;                   /* enum cp_color_encoding, -1 = not renderable */
+   bool depth;
+};
+
+const struct cpvk_format_info *cpvk_format_info(VkFormat format);
 
 struct cpvk_image_view {
    struct vk_image_view vk;

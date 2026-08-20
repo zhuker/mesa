@@ -403,7 +403,14 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       if (view && view->image && view->image->mem) {
          cimg = view->image;
          fb.color = (void *)(uintptr_t)(cimg->mem->dev_ptr + cimg->offset);
-         fb.color_encoding = cimg->color;
+         /*
+          * The view's format decides the encoding, not the image's. They are
+          * usually the same and were assumed to be; when they are not, the
+          * difference is a channel order, and the sample suite's triangle came
+          * out with red and blue exchanged and every pixel otherwise exact.
+          */
+         const struct cpvk_format_info *vf = cpvk_format_info(view->vk.format);
+         fb.color_encoding = vf ? vf->color : cimg->color;
       }
    }
 
@@ -804,6 +811,180 @@ cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
 }
 
 /*
+ * Buffer <-> image, which is how every texture in the sample suite is
+ * uploaded: staged into a buffer, then copied in. bufferRowLength of zero
+ * means tightly packed, which is not the same as the image's row pitch and is
+ * the whole reason this cannot be one flat memcpy.
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
+                           const VkCopyBufferToImageInfo2 *pInfo)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_buffer, buf, pInfo->srcBuffer);
+   VK_FROM_HANDLE(cpvk_image, img, pInfo->dstImage);
+
+   if (!buf || !buf->mem)
+      return;
+
+   for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+      const VkBufferImageCopy2 *r = &pInfo->pRegions[i];
+      CUdeviceptr ib;
+      size_t ip;
+      unsigned bpp;
+      if (!cpvk_image_plane(img, r->imageSubresource.mipLevel, &ib, &ip, &bpp))
+         return;
+
+      unsigned row_texels = r->bufferRowLength ? r->bufferRowLength
+                                               : r->imageExtent.width;
+      unsigned img_rows = r->bufferImageHeight ? r->bufferImageHeight
+                                               : r->imageExtent.height;
+      size_t layer_bytes = (size_t)row_texels * img_rows * bpp;
+      unsigned layers = MAX2(r->imageSubresource.layerCount, 1u);
+
+      for (unsigned l = 0; l < layers; l++) {
+         struct cpvk_copy *c = cpvk_record_copy(cmd);
+         if (!c)
+            return;
+         *c = (struct cpvk_copy) {
+            .src = buf->mem->dev_ptr + buf->offset + r->bufferOffset +
+                   l * layer_bytes,
+            .dst = ib + (size_t)(r->imageSubresource.baseArrayLayer + l) *
+                        img->level_size[r->imageSubresource.mipLevel] +
+                   (size_t)r->imageOffset.y * ip +
+                   (size_t)r->imageOffset.x * bpp,
+            .src_pitch = (size_t)row_texels * bpp,
+            .dst_pitch = ip,
+            .width_bytes = (size_t)r->imageExtent.width * bpp,
+            .rows = r->imageExtent.height,
+         };
+      }
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
+                           const VkCopyImageToBufferInfo2 *pInfo)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_image, img, pInfo->srcImage);
+   VK_FROM_HANDLE(cpvk_buffer, buf, pInfo->dstBuffer);
+
+   if (!buf || !buf->mem)
+      return;
+
+   for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+      const VkBufferImageCopy2 *r = &pInfo->pRegions[i];
+      CUdeviceptr ib;
+      size_t ip;
+      unsigned bpp;
+      if (!cpvk_image_plane(img, r->imageSubresource.mipLevel, &ib, &ip, &bpp))
+         return;
+
+      unsigned row_texels = r->bufferRowLength ? r->bufferRowLength
+                                               : r->imageExtent.width;
+      struct cpvk_copy *c = cpvk_record_copy(cmd);
+      if (!c)
+         return;
+      *c = (struct cpvk_copy) {
+         .src = ib + (size_t)r->imageSubresource.baseArrayLayer *
+                     img->level_size[r->imageSubresource.mipLevel] +
+                (size_t)r->imageOffset.y * ip +
+                (size_t)r->imageOffset.x * bpp,
+         .dst = buf->mem->dev_ptr + buf->offset + r->bufferOffset,
+         .src_pitch = ip,
+         .dst_pitch = (size_t)row_texels * bpp,
+         .width_bytes = (size_t)r->imageExtent.width * bpp,
+         .rows = r->imageExtent.height,
+      };
+   }
+}
+
+static bool
+cpvk_is_bgra(VkFormat f)
+{
+   switch (f) {
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+   case VK_FORMAT_B8G8R8A8_SNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/*
+ * A blit, for the case this driver actually sees: same extent, same texel
+ * size, no scaling and no format conversion. That is what an offscreen app
+ * does to get a rendered image into a linear buffer it can save.
+ *
+ * A scaling or converting blit is refused rather than approximated, because a
+ * silently wrong image is the failure this driver's history is made of. It
+ * will be a kernel when something needs it.
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
+                   const VkBlitImageInfo2 *pInfo)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_image, src, pInfo->srcImage);
+   VK_FROM_HANDLE(cpvk_image, dst, pInfo->dstImage);
+
+   for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+      const VkImageBlit2 *r = &pInfo->pRegions[i];
+      CUdeviceptr sb, db;
+      size_t sp, dp;
+      unsigned sbpp, dbpp;
+      if (!cpvk_image_plane(src, r->srcSubresource.mipLevel, &sb, &sp, &sbpp) ||
+          !cpvk_image_plane(dst, r->dstSubresource.mipLevel, &db, &dp, &dbpp))
+         return;
+
+      int sw = r->srcOffsets[1].x - r->srcOffsets[0].x;
+      int sh = r->srcOffsets[1].y - r->srcOffsets[0].y;
+      int dw = r->dstOffsets[1].x - r->dstOffsets[0].x;
+      int dh = r->dstOffsets[1].y - r->dstOffsets[0].y;
+
+      if (sw != dw || sh != dh || sw <= 0 || sh <= 0 || sbpp != dbpp) {
+         fprintf(stderr, "cudapipe: vkCmdBlitImage %dx%d -> %dx%d (%u/%u bpp) "
+                 "scales or changes texel size, which is not implemented\n",
+                 sw, sh, dw, dh, sbpp, dbpp);
+         return;
+      }
+
+      /* Same size and same texel width, so the only conversion a blit can be
+       * asked for here is a channel order. Anything else is refused rather
+       * than approximated. */
+      bool swap_rb = false;
+      if (src->vk.format != dst->vk.format) {
+         if (sbpp == 4 && cpvk_is_bgra(src->vk.format) !=
+                          cpvk_is_bgra(dst->vk.format)) {
+            swap_rb = true;
+         } else {
+            fprintf(stderr, "cudapipe: vkCmdBlitImage %u -> %u is a format "
+                    "conversion that is not implemented\n",
+                    src->vk.format, dst->vk.format);
+            return;
+         }
+      }
+
+      struct cpvk_copy *c = cpvk_record_copy(cmd);
+      if (!c)
+         return;
+      *c = (struct cpvk_copy) {
+         .src = sb + (size_t)r->srcOffsets[0].y * sp +
+                (size_t)r->srcOffsets[0].x * sbpp,
+         .dst = db + (size_t)r->dstOffsets[0].y * dp +
+                (size_t)r->dstOffsets[0].x * dbpp,
+         .src_pitch = sp,
+         .dst_pitch = dp,
+         .width_bytes = (size_t)sw * sbpp,
+         .rows = sh,
+         .swap_rb = swap_rb,
+      };
+   }
+}
+
+/*
  * Barriers are recorded and ignored, deliberately.
  *
  * Everything this driver submits runs on one CUDA stream, and stream order is
@@ -832,6 +1013,48 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
 
    if (c->rows <= 1 && !c->src_pitch && !c->dst_pitch) {
       cuMemcpyDtoDAsync(c->dst, c->src, c->width_bytes, cp->stream);
+      return;
+   }
+
+   if (c->swap_rb) {
+      /*
+       * The converting blit, on the host and synchronously.
+       *
+       * This is the path an offscreen app takes once per saved frame, and it
+       * is not on any frame's critical path. Doing it here rather than as a
+       * kernel keeps the kernel set as it is; if something ever blits per
+       * frame, this is the line that says it needs one.
+       */
+      size_t bytes = c->width_bytes * c->rows;
+      uint32_t *tmp = malloc(bytes);
+      if (!tmp)
+         return;
+
+      CUDA_MEMCPY2D d2h = {
+         .srcMemoryType = CU_MEMORYTYPE_DEVICE, .srcDevice = c->src,
+         .srcPitch = c->src_pitch,
+         .dstMemoryType = CU_MEMORYTYPE_HOST, .dstHost = tmp,
+         .dstPitch = c->width_bytes,
+         .WidthInBytes = c->width_bytes, .Height = c->rows,
+      };
+      cuStreamSynchronize(cp->stream);
+      cuMemcpy2D(&d2h);
+
+      for (size_t i = 0; i < bytes / 4; i++) {
+         uint32_t v = tmp[i];
+         tmp[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) |
+                  ((v & 0x000000FFu) << 16);
+      }
+
+      CUDA_MEMCPY2D h2d = {
+         .srcMemoryType = CU_MEMORYTYPE_HOST, .srcHost = tmp,
+         .srcPitch = c->width_bytes,
+         .dstMemoryType = CU_MEMORYTYPE_DEVICE, .dstDevice = c->dst,
+         .dstPitch = c->dst_pitch,
+         .WidthInBytes = c->width_bytes, .Height = c->rows,
+      };
+      cuMemcpy2D(&h2d);
+      free(tmp);
       return;
    }
 

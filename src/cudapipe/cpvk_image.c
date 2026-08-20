@@ -22,13 +22,6 @@
 
 #include "kernels/cp_rast_types.h"
 
-struct cpvk_format_info {
-   VkFormat vk;
-   uint32_t texel;              /* enum cp_texel_format, 0 = not sampleable */
-   int color;                   /* enum cp_color_encoding, -1 = not renderable */
-   bool depth;
-};
-
 /*
  * What the capture and the sample set actually need, and nothing else. The
  * list grows as kernels grow: advertising a format the writeback cannot encode
@@ -54,7 +47,7 @@ static const struct cpvk_format_info cpvk_formats[] = {
    { VK_FORMAT_D32_SFLOAT_S8_UINT,  0,                           -1,                           true  },
 };
 
-static const struct cpvk_format_info *
+const struct cpvk_format_info *
 cpvk_format_info(VkFormat format)
 {
    for (unsigned i = 0; i < ARRAY_SIZE(cpvk_formats); i++)
