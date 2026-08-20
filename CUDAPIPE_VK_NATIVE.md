@@ -1886,3 +1886,34 @@ one than "the reflections are grey".
 Two truncation errors were made getting here, both the same shape: reading
 `head` output as if it were the whole of it. The count that mattered came from
 `wc -l`.
+
+### Correction: pbribl's descriptors are written correctly
+
+The previous entry -- "pbribl's scene descriptor writes never reach the
+driver" -- **is wrong**, and the way it was wrong matters more than the claim.
+
+The run that produced it **segfaulted**. `rtout`, the instrument added to read
+back a rendered attachment, held a pointer to the previous pass's colour
+buffer and dereferenced it after that buffer was gone. The process died before
+`setupDescriptors()` ran, so the seven single-binding updates it had already
+logged looked like the complete set.
+
+With that instrument removed, the same command exits 0 and logs eleven calls:
+
+    7 x updsets n=1     the filter passes' own sets
+    2 x updsets n=5     the scene set, bindings 0..4
+    2 x updsets n=3     the skybox set, bindings 0..2
+
+and twenty-three descriptor writes landing at exactly the right flat indices,
+binding *n* to flat *n*. `samplerIrradiance`, `samplerBRDFLUT` and
+`prefilteredMap` are all written where the shader looks for them.
+
+`rtout` is deleted. Its one real result -- the BRDF table's contents, logged
+before the crash and still valid -- is recorded above. A debugging tool that
+silently truncates the run it is measuring is worse than no tool, because
+every count taken from that run is quietly a lower bound.
+
+That is three findings in three turns overturned by re-measuring: the
+multisample resolve that already worked, the format decode that could not have
+zeroed anything, and now this. All three shared a shape -- a number read from a
+run that was not what it appeared to be.

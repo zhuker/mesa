@@ -1958,27 +1958,6 @@ cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb,
    cp_batch_flush_why(&dev->renderer, "framebuffer");
    cp_pass_finish(&dev->renderer);
 
-   /*
-    * What the pass that just ended actually produced. A copy can be inspected
-    * on both sides, but an attachment that is rendered and then only sampled
-    * -- pbribl's BRDF lookup table is one -- had nothing watching it at all.
-    */
-   if (getenv("CPVK_DEBUG_RT")) {
-      static const void *prev;
-      static unsigned prev_w, prev_h;
-      if (prev) {
-         uint16_t h[8] = { 0 };
-         cuStreamSynchronize(dev->renderer.stream);
-         if (cuMemcpyDtoH(h, (CUdeviceptr)(uintptr_t)prev, sizeof(h)) ==
-             CUDA_SUCCESS)
-            fprintf(stderr, "rtout %ux%u:  %04x %04x %04x %04x %04x %04x\n",
-                    prev_w, prev_h, h[0], h[1], h[2], h[3], h[4], h[5]);
-      }
-      prev = fb->color;
-      prev_w = fb->width;
-      prev_h = fb->height;
-   }
-
    cp_context_set_framebuffer(&dev->renderer, fb, MAX2(samples, 1u));
 }
 
