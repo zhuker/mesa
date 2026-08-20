@@ -4316,3 +4316,41 @@ Fixing it means giving segments an allocation whose lifetime the episode owns,
 so that `cp_scratch_begin` can reclaim without regard to the episode and the
 episode can stay open. That is one change, in the renderer rather than the
 front end, and every measurement in this session points at it.
+
+### Why bounding the episode by arena bytes is not a mechanism
+
+The renderer states its own contract at the call site:
+
+    /* A pass episode owns the epoch instead: every segment's clipped stream
+     * has to survive until the episode's shading has read it, so only the
+     * first segment reclaims and the rest allocate beyond. */
+    if (!cp->pass.appending || cp->pass.nsegs == 0)
+       cp_scratch_begin(cp);
+
+An open episode is *designed* not to reclaim. It works because a Gallium
+context's episodes are bounded by its natural flush points; deferring on shader
+binds removes that bound, so five attempts tried to restore it by watching the
+arena.
+
+    budget            1818                  2026
+    none              OOM frame 8           --
+    RECLAIM/4         9.13 ms, complete     OOM frame 9
+    RECLAIM/8         OOM frame 32          OOM frame 9
+    RECLAIM/16        9.48 ms, complete     34.41 ms, complete
+
+**RECLAIM/8 fails a capture that RECLAIM/4 completes**, and /4 is the looser of
+the two. The outcome is not monotonic in the budget, which means it depends on
+how much device memory happens to be free at the time rather than on the bound.
+A mechanism whose safety depends on ambient state is not a mechanism.
+
+Reverted; both captures replay all frames at 9.45 and 34.36 ms.
+
+So the fix is the one the contract implies rather than one that works around
+it: a segment's clipped stream must not live in the shared bump arena at all,
+but in storage the episode allocates and `cp_pass_finish` releases. Then
+`cp_scratch_begin` reclaims every draw as it does outside an episode, the
+episode's length is bounded by nothing but its own storage, and the front end
+can defer freely.
+
+That is a renderer change of real size, and it is where this line of work
+stands. Six attempts have established what it must be, and none of them is it.
