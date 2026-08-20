@@ -1359,3 +1359,29 @@ descriptor, so either the shader is not reading it through the slot it was
 compiled for, or the vertex fetch is handing it zeroed attributes. Printing
 the fetched attributes beside the outputs distinguishes those, and the dump is
 now the place to do it.
+
+### pbribl: the fetch is right, the shader outputs zero
+
+`CUDAPIPE_DEBUG_VFETCH` on a sphere draw:
+
+    elem0 vb=0 off=0  stride=96 div=0 sz=12
+    elem1 vb=0 off=12 stride=96 div=0 sz=12
+    elem2 vb=0 off=24 stride=96 div=0 sz=8
+    vfetch v0: e0=[0.130 0.065 -0.989] e1=[0.130 0.065 -0.989] e2=[0.729 0.521 0.000]
+
+A unit-sphere position, the matching normal, and a uv. The vertex fetch is
+correct, the element layout is correct, and `CUDAPIPE_DEBUG_FS` says every
+vertex *output* is zero. So the shader is producing zeros from good inputs.
+
+Its uniform buffer was already verified correct at the descriptor -- the first
+floats read `0.974 1.732`, a projection matrix -- so what is left is how the
+shader addresses it. The NIR dumps show pbribl's vertex shaders use two
+different forms: one has eight `load_ubo` and no
+`load_const_buf_base_addr_lvp` at all, another has nine base-address
+intrinsics and sixteen `load_ubo`. Both forms are meant to work --
+`emit_buffer_base` dispatches on whether the source is 32 or 64 bits -- and
+this driver's own tests only ever produce the first.
+
+Which form the sphere shader uses, and whether the mixed one resolves to the
+right slot, is the next question. The dumps are in hand and the tools all work
+now, which was not true an hour ago.
