@@ -2511,3 +2511,34 @@ So two recorded numbers are wrong and both are mine: the native replay is
 The change is kept because it is correct and because the defects were real, but
 it is behind `CPVK_BATCH_BLEND` and claims nothing. Re-running an A/B in the
 opposite order is what would have caught this immediately, and it is cheap.
+
+### The replay numbers, corrected: the CUDA JIT cache was the variable
+
+`~/.nv/ComputeCache` is 446 MB across 9,172 files. 208 of them were written in
+the three hours of this session and **none** in the last thirty minutes. The
+native driver generates PTX and hands it to `cuModuleLoadData`, which JIT
+compiles to SASS and caches the result on disk; every measurement taken while
+that cache was filling was measuring compilation as well as rendering.
+
+Warm, same session, both drivers, both captures:
+
+    capture      native    gallium   ratio
+    Crossroads    9.73 ms   7.15 ms   1.36
+    old capture  41.73 ms  25.25 ms   1.65
+
+The Gallium figures reproduce what was recorded months ago -- 7.17 and 25.20 --
+so that driver was always measured warm and its numbers stand. The native
+driver's recorded 24.4 and 79.2 do not: they were taken with a partly cold JIT
+cache and are **not** what this driver does.
+
+So the native driver is 1.36x and 1.65x off the driver it replaces, not 3.4x
+and 3.1x. Every performance conclusion drawn this session rested on the larger
+figure, including the entire investigation into batching and A-buffer
+episodes, and the 3,381-launches-per-frame trace was taken in the same
+unwarmed state and needs redoing before it is quoted again.
+
+**What to do about it, for whoever measures next.** Run the thing once before
+timing it. The gate should be a warm-up replay whose result is discarded,
+exactly as `cp_gpu_busy.sh` drops the ramp at each end of its window, and the
+same applies to the sample sweep, whose per-sample means were also first taken
+cold.
