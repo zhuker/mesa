@@ -3565,3 +3565,23 @@ The lesson is not "assert your edits" -- that was already written down twice
 this session after `head` truncations and a crashing instrument. It is that a
 null result from an unverified change is indistinguishable from a null change,
 and this one sat in the record for twenty turns looking like evidence.
+
+### pbribl after the copy fix
+
+    pixels differing > 1    5,027   (0.545%)
+    pixels differing > 4      141   (0.015%)
+    pixels differing > 16       0
+    mean absolute difference  0.030   (was 1.252)
+
+The spheres now match the reference exactly where it matters -- (25,17,10)
+against (25,17,10), (50,45,43) against (50,45,43) -- and no pixel in the frame
+differs by more than 16. What remains above 4 is 141 pixels in one region at
+the right edge, x 1059 to 1277, y 123 to 414.
+
+It sits above the 0.01 threshold this sweep uses, so it still counts as a
+difference, but it is a different kind of difference from the one it was: a
+handful of edge pixels rather than an absent lighting term.
+
+Both replays re-measured after the fix, since it touches every image copy in
+them: native 9.41 ms and 34.33 ms against gallium's 7.14 and 25.35. Unmoved,
+and the ratios hold at 1.32 and 1.35.
