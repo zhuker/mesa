@@ -4929,3 +4929,37 @@ that point, which is a much smaller search than the one this turn ran.
 
 The replay half is met. The sweep half is met on correctness and **not met on
 cost**, and this is the first turn that measured it.
+
+### The register did reach the backend, and lowering it is worth 7%
+
+The previous turn concluded `nir_lower_reg_intrinsics_to_ssa` did nothing. That
+was a measurement error: the count was taken by grepping a dump for
+`decl_reg`, and **the diagnostic lines printing the count contained the word
+`decl_reg` themselves**. Every reading was counting its own output.
+
+Pairing the count with the print in the same block settled it -- six shaders,
+`decl_reg=0` and zero in the text -- and the pass does remove the register.
+
+Placed after `nir_lower_io`, A/B against `CPVK_NO_REG_SSA=1`:
+
+    instancing    8.47 ms  against  9.07     0.933
+    texture       0.13              0.14     0.925
+    vulkanscene   1.18              1.22     0.964
+    bloom         1.92              1.88     1.022
+
+18/18 samples run, 17/18 pixel-correct, fourteen unit tests pass, and the
+replays are unmoved at 7.38 and 22.86 ms.
+
+**The PTX still has its seventeen local operations and two `__local_depot`
+arrays.** So the depot is not the NIR register after all -- the register was
+real, removing it is worth 7% on the worst sample, and something else in what
+the backend builds is still spilling. That is the next thread, and it is now a
+question about `cp_nir_to_llvm.c` rather than about the NIR handed to it.
+
+### Sweep standing
+
+    sample            native    gallium   ratio    was
+    instancing         8.47 ms   5.80 ms   1.46x   1.56x
+    vulkanscene        1.18      0.87      1.36x   1.38x
+    texture            0.13      0.13      1.00x   1.36x
+    bloom              1.92      1.65      1.16x   1.16x

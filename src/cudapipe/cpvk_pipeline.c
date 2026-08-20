@@ -741,6 +741,22 @@ cpvk_compile_stage(struct cpvk_device *dev,
    nir_assign_io_var_locations(nir, nir_var_shader_out);
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             cp_type_size_vec4, nir_lower_io_lower_64bit_to_32);
+
+   /*
+    * Registers back to SSA, immediately before the backend.
+    *
+    * spirv_to_nir emits a register for a value an if/else assigns and later
+    * code reads -- a phi written the old way -- and this driver's fragment
+    * shaders reached the backend still carrying one where the Gallium path's
+    * did not, because Mesa's common pipeline had already run this before
+    * lavapipe handed the shader over. A register becomes an alloca in the
+    * LLVM the backend builds.
+    */
+   if (!getenv("CPVK_NO_REG_SSA")) {
+      NIR_PASS(_, nir, nir_lower_reg_intrinsics_to_ssa);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
    cuCtxSetCurrent(dev->cu_ctx);
