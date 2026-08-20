@@ -2369,3 +2369,31 @@ eight draws that differ only in descriptors merge, and the frame is wrong by
 recorded for each draw of that batch, and the row each fragment resolves to --
 rather than to reason about which stage could be at fault. Every structural
 hypothesis has been eliminated by measurement; what is left is the data.
+
+### The per-draw rows are right, so the fault is on the fragment side
+
+`CPVK_DEBUG_ROWS` prints what `cp_batch_record` stores for each draw of a
+batch. `gltfscenerendering` at `BATCH_MAX=3` without the key:
+
+    row 0: [0]=0x7eeabc000800 [1]=0x7eeacc11e000 [2]=0x7eeacc11e0c0 [3]=0x...100000
+    row 1: [0]=0x7eeabc000900 [1]=0x7eeacc11e000 [2]=0x7eeacc11e140 [3]=0x...100000
+    row 2: [0]=0x7eeabc000a00 [1]=0x7eeacc11e000 [2]=0x7eeacc11e1c0 [3]=0x...100000
+
+Exactly what it should be. Slot 0 is the push-constant block and differs per
+draw; slot 1 is the scene set, correctly identical across the batch; slot 2 is
+the material set and differs per draw, 0x80 apart in the snapshot arena; slot
+3 is shared.
+
+A first version of this print looked only at slot 1, saw one address for every
+draw, and looked exactly like the bug -- every merged draw pointing at one
+material. Slot 1 is the set they legitimately share. Printing four slots
+instead of one turned a false positive into the opposite conclusion.
+
+So the recorded data is correct and distinct, and the batch table is not the
+fault. Combined with everything already eliminated -- batch size, row width,
+binding counts, the row search, `prim_shift`, clipping, triangle count, and
+every flush path passing the table -- what is left is the fragment side: how a
+fragment resolves *which* row it belongs to, and whether the kernel is handed
+`fs_batch.slices` and `ndraws` at all for this batch.
+
+That is one print away and it is the next thing.

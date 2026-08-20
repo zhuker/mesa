@@ -4934,6 +4934,15 @@ cp_batch_record(struct cp_context *cp,
                 const struct cp_draw_range *draw, unsigned tris,
                 unsigned drawid_offset, unsigned instance_count)
 {
+   if (getenv("CPVK_DEBUG_ROWS"))
+   {
+      fprintf(stderr, "row %u: fs slots", cp->batch.ndraws);
+      for (unsigned q = 0; q < 4 && q < cp->num_fs_ubos; q++)
+         fprintf(stderr, " [%u]=%p", q,
+                 (void *)(uintptr_t)cp->fs_ubos[q].buffer);
+      fprintf(stderr, "  start=%u count=%u\n", draw->start, draw->count);
+   }
+
    uint64_t *row = cp->batch.vs_ubos +
       (size_t)cp->batch.ndraws * CP_ARG_UBO_STRIDE;
    memset(row, 0, CP_ARG_UBO_STRIDE * sizeof(*row));
