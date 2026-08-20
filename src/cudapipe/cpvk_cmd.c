@@ -747,6 +747,22 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       }
    }
 
+   /*
+    * Layered rendering is not implemented: every draw goes to one layer, the
+    * one the colour view names. A pass that asks for more silently rendered
+    * its layers on top of each other, which is the failure mode this driver
+    * spends most of its warnings avoiding.
+    */
+   if (pRenderingInfo->layerCount > 1) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "cudapipe: vkCmdBeginRendering with layerCount=%u; "
+                 "layered rendering is not implemented and every layer goes "
+                 "to the first\n", pRenderingInfo->layerCount);
+      }
+   }
+
    cmd->fb = fb;
    cmd->has_fb = true;
 

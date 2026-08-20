@@ -1486,3 +1486,35 @@ and adding one is the way to make them mean something.
 pbribl's environment cube therefore comes from somewhere else again --
 possibly rendered with `layerCount` greater than one in a single pass, which
 this driver does not implement at all and does not warn about.
+
+### gl_PointCoord: the driver named this one too
+
+`particlesystem` draws point sprites and its fragment shader reads
+`gl_PointCoord`. The driver said so on every run:
+
+    cudapipe: intrinsic 'load_point_coord' is not implemented -- the shader
+    using it computes on undef and will render wrong.
+
+The renderer already carries point coordinates as a varying -- the rasteriser
+writes them into the fragment stage's input slots like anything else -- so
+what was missing was the lowering that turns the system value into that
+varying. `nir_lower_sysvals_to_varyings` with `point_coord` set, which is what
+lavapipe runs:
+
+    particlesystem  4.075 -> 0.000
+
+Only `point_coord`. lavapipe also converts `frag_coord`, `layer_id` and
+`primitive_id`, and this backend implements those directly, so converting them
+would be a change with no reason and a way to break three working things.
+
+**Fourteen of eighteen.** That is two samples found by reading warnings the
+driver had been printing since it first ran, after several turns of not
+reading them. The remaining four:
+
+    computeshader      4.427
+    pbribl             1.472   spheres correct, reflections missing
+    texturemipmapgen   0.456
+    multisampling    176.291   no resolve
+
+None of them prints a warning, which after today is worth stating as a
+result rather than a note: the cheap failures are gone.

@@ -643,6 +643,20 @@ cpvk_compile_stage(struct cpvk_device *dev,
    cpvk_lower_descriptors(nir, layout);
 
    /*
+    * gl_PointCoord as a varying, which is how the renderer already carries it:
+    * the rasteriser writes it into the fragment stage's input slots like any
+    * other varying, and the backend has no system value for it. Without this
+    * particlesystem's fragment shader read undef and the driver said so.
+    *
+    * Only point_coord. lavapipe also converts frag_coord, layer_id and
+    * primitive_id, and this backend implements those directly.
+    */
+   {
+      const nir_lower_sysvals_to_varyings_options sv = { .point_coord = true };
+      NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sv);
+   }
+
+   /*
     * Outputs become temporaries, so nothing reads one back.
     *
     * A shader that computes an output and then uses it -- `outWorldPos =
