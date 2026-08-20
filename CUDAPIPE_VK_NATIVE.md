@@ -4248,3 +4248,38 @@ the same draw on the Gallium driver does not -- a path choice per draw rather
 than a grouping decision. That is a different question from the one five
 attempts have answered in the negative, and it is what the numbers have pointed
 at since the first warm trace.
+
+## Verified final state
+
+    working tree     clean, 0 modified tracked files
+    Gallium driver   0 files changed from the branch point
+
+    samples          18/18 run, 17/18 pixel-correct against the Gallium driver
+    unit tests       14/14
+
+    Crossroads       native  9.43 ms   gallium  7.18 ms   1.31x
+    old capture      native 34.40 ms   gallium 25.25 ms   1.36x
+    both             1,496 and 1,510 frames, every frame, exit 0
+
+    correctness vs NVIDIA   native equals gallium on 14 samples and is
+                            strictly closer on pbribl and multisampling
+
+### The objective, in two halves
+
+**Correctness: met.** Measured against a real Vulkan driver rather than against
+the artefact being replaced, this driver has no regression: equal on fourteen
+samples, better on two, worse on none beyond 0.001. The one sample that differs
+from the Gallium driver, `pbribl` at 0.0286, differs because this driver
+implements seamless cube filtering and that one does not -- and against NVIDIA
+and lavapipe the seamless result is the closer of the two.
+
+**Performance: not met.** 9.43 and 34.40 ms against 7.18 and 25.25 is a real
+regression, and no choice of reference changes it. It is host-side: this driver
+uses *less* GPU time per frame, 2.18 ms against 2.54, and issues 757 kernel
+launches a frame against 245.
+
+That gap is per draw, not per batch -- 2.14 draws per flush, the same draws in
+both drivers -- so it is a question of what a draw costs. Everything that
+changes how draws are grouped has been measured at zero: batching, the
+descriptor key, blended episodes, the vertex-offset condition, and five
+attempts at episode accumulation.
