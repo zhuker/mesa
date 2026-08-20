@@ -1040,8 +1040,17 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
       cp->fs_ubos[i].managed_copy = 0;
       cp->fs_ubos[i].user_copy = false;
    }
-   cp->vs_ubos[CPVK_UBO_PUSH_SLOT].buffer = (void *)(uintptr_t)push_dev;
-   cp->fs_ubos[CPVK_UBO_PUSH_SLOT].buffer = (void *)(uintptr_t)push_dev;
+   /*
+    * Slot zero, and never a null. This assignment used to overwrite the null
+    * descriptor the loop above had just put there, so a draw with no push
+    * constants -- or one whose upload came back empty because the arena was
+    * exhausted -- pointed a shader at address zero. compute-sanitizer put it
+    * at `main+0x230 reading 4 bytes at 0x0`, in the second render pass of a
+    * command buffer, which is what stopped pbribl's spheres.
+    */
+   CUdeviceptr push_slot = push_dev ? push_dev : dev->null_desc;
+   cp->vs_ubos[CPVK_UBO_PUSH_SLOT].buffer = (void *)(uintptr_t)push_slot;
+   cp->fs_ubos[CPVK_UBO_PUSH_SLOT].buffer = (void *)(uintptr_t)push_slot;
    cp->num_vs_ubos = cp->num_fs_ubos = CP_MAX_CONST_BUFFERS;
 
 
@@ -1456,6 +1465,19 @@ void
 cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb,
                           unsigned samples)
 {
+   /*
+    * End whatever the previous pass left open before binding the next
+    * framebuffer, which is what the Gallium adapter does at the same point:
+    * "the visibility and depth buffers may be freed below, and the held-back
+    * draws were recorded against the framebuffer that is going away."
+    *
+    * The native path did neither, and a second vkCmdBeginRendering in one
+    * command buffer made the draws after it fault in the rasterizer -- which
+    * is what stopped pbribl's spheres, after three offscreen passes.
+    */
+   cp_batch_flush_why(&dev->renderer, "framebuffer");
+   cp_pass_finish(&dev->renderer);
+
    cp_context_set_framebuffer(&dev->renderer, fb, MAX2(samples, 1u));
 }
 

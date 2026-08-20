@@ -806,3 +806,28 @@ suspects, in order of how cheap they are to test:
 
 `tests/cpvk_mesh.c` fails against lavapipe on purpose now and is the shortest
 path to it.
+
+### A real bug, found by a reproduction that was not faithful
+
+`cpvk_mesh`'s two-pass form faulted with `main+0x230 reading 4 bytes at 0x0`,
+which `compute-sanitizer` named in a second because the test runs in a second.
+The cause was in `cpvk_execute_draw`: after substituting the null descriptor
+for every unbound buffer slot, it then assigned slot zero unconditionally from
+the push-constant upload --
+
+    cp->vs_ubos[CPVK_UBO_PUSH_SLOT].buffer = (void *)(uintptr_t)push_dev;
+
+-- so a draw with no push constants, or one whose upload came back empty,
+overwrote the null descriptor with a null and pointed a shader at address zero.
+Fixed, and the two-pass test is byte-identical to lavapipe with no driver
+errors at all.
+
+**It did not fix pbribl.** The spheres still shade nothing, eleven draws of
+zero, and every sample's difference is unmoved to three decimals. So the
+reproduction reproduced *a* bug and not *the* bug -- it was built from the
+shape of pbribl's draws plus a second render pass, and that combination is
+sufficient to break the driver by a route pbribl does not take.
+
+Worth keeping straight: the test earned its place twice over, once by
+exonerating the vertex path and once by finding this, and it still has not
+explained the thing it was written for.
