@@ -6,7 +6,6 @@
 
 #include <cuda.h>
 #include "cp_kernels.h"
-#include "cp_device.h"
 
 /*
  * What a pipe_fence_handle points at. One queue submit's fence is stored by
@@ -23,7 +22,12 @@ struct cp_screen {
 
    struct sw_winsys *winsys;
 
-   struct cp_device dev;
+   CUdevice cuda_device;
+   CUcontext cuda_ctx;
+   int sm_major;
+   int sm_minor;
+
+   struct cp_kernels kernels;
 
    char renderer_string[128];
 };

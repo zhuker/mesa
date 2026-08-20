@@ -183,7 +183,7 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
               unsigned level, unsigned usage, const struct pipe_box *box,
               struct pipe_transfer **out_transfer)
 {
-   struct cp_context *cp = cp_ctx(ctx);
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *res = cp_resource(resource);
    struct cp_transfer *cp_transfer = CALLOC_STRUCT(cp_transfer);
    if (!cp_transfer)
@@ -194,7 +194,6 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
     * being held back for merging have to be submitted before the sync below
     * — otherwise the readback waits for a queue they were never put on. */
    cp_batch_flush(cp);
-   cp_tile_census_cut(cp, CP_TILE_CUT_MAP);
 
    /* If reading GPU-written data, ensure all kernels have finished. */
    if (!(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) &&
@@ -257,7 +256,7 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
 static void
 cp_buffer_unmap(struct pipe_context *ctx, struct pipe_transfer *transfer)
 {
-   struct cp_context *cp = cp_ctx(ctx);
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_transfer *cp_transfer = (struct cp_transfer *)transfer;
    if (cp_transfer->staging) {
       struct cp_resource *res = cp_resource(transfer->resource);
@@ -282,11 +281,10 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
                         unsigned dstz, struct pipe_resource *src,
                         unsigned src_level, const struct pipe_box *src_box)
 {
-   struct cp_context *cp = cp_ctx(ctx);
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *src_res = cp_resource(src);
    struct cp_resource *dst_res = cp_resource(dst);
    cp_batch_flush(cp);
-   cp_tile_census_cut(cp, CP_TILE_CUT_COPY);
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
 
@@ -374,7 +372,7 @@ cp_image_copy_buffer(struct pipe_context *ctx,
                      unsigned level,
                      const struct pipe_box *box)
 {
-   struct cp_context *cp = cp_ctx(ctx);
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *dst_res = cp_resource(dst);
    struct cp_resource *src_res = cp_resource(src);
 
@@ -462,11 +460,10 @@ cp_resource_device_accessible(const struct cp_resource *res)
 static void
 cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
 {
-   struct cp_context *cp = cp_ctx(ctx);
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *src_res = cp_resource(info->src.resource);
    struct cp_resource *dst_res = cp_resource(info->dst.resource);
    cp_batch_flush(cp);
-   cp_tile_census_cut(cp, CP_TILE_CUT_COPY);
    void *src_data = cp_resource_data(src_res);
    void *dst_data = cp_resource_data(dst_res);
    if (cp_debug->debug_draw)
@@ -787,7 +784,7 @@ cp_clear_buffer(struct pipe_context *ctx, struct pipe_resource *res,
                 unsigned offset, unsigned size,
                 const void *clear_value, int clear_value_size)
 {
-   struct cp_context *cp = cp_ctx(ctx);
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *cp_res = cp_resource(res);
    cp_batch_flush(cp);
    void *data = cp_resource_data(cp_res);
@@ -839,13 +836,45 @@ cp_clear_rect_kernel(struct cp_context *cp, struct cp_resource *res,
                      unsigned stride, unsigned pixel_size,
                      const uint32_t value[4], bool depth)
 {
-   /* The managed-memory requirement is the Gallium resource's, not the
-    * renderer's: a native image is device memory the kernel writes directly. */
-   if (!res->cuda_managed)
+   struct cp_screen *screen = cp->screen;
+   CUfunction fn = depth ? screen->kernels.clear_depth_kernel
+                         : screen->kernels.clear_kernel;
+   void *data = cp_resource_data(res);
+
+   if (!fn || !data || !res->cuda_managed)
       return false;
 
-   return cp_clear_rect(cp, cp_resource_data(res), offset, width, height,
-                        stride, pixel_size, value, depth);
+   /* Both kernels index on the pixel size with no else arm, so a size they do
+    * not name writes nothing rather than something wrong — which is the worse
+    * failure of the two, because nothing looks like "the clear did not run".
+    * Depth is Z16/Z32F/Z24X8 only (cp_screen.c), colour excludes the
+    * three-component formats R8G8B8, R16G16B16 and R32G32B32. */
+   if (depth) {
+      if (pixel_size != 2 && pixel_size != 4)
+         return false;
+   } else if (pixel_size != 1 && pixel_size != 2 && pixel_size != 4 &&
+              pixel_size != 8 && pixel_size != 16) {
+      return false;
+   }
+
+   if (!width || !height)
+      return true;
+
+   struct cp_clear_args args = {
+      .target = (uint64_t)(uintptr_t)data + offset,
+      .width = width, .height = height,
+      .stride = stride,
+      .pixel_size = pixel_size,
+   };
+   memcpy(args.clear_value, value, sizeof(args.clear_value));
+
+   cuCtxSetCurrent(screen->cuda_ctx);
+   void *params[] = { &args };
+   cuLaunchKernel(fn,
+      (width + 15) / 16, (height + 15) / 16, 1,
+      16, 16, 1,
+      0, cp->stream, params, NULL);
+   return true;
 }
 
 static void
@@ -857,7 +886,7 @@ cp_clear_render_target(struct pipe_context *ctx, struct pipe_surface *dst,
 {
    if (!dst || !dst->texture)
       return;
-   struct cp_context *cp = cp_ctx(ctx);
+   struct cp_context *cp = (struct cp_context *)ctx;
    cp_batch_flush(cp);
    struct cp_resource *res = cp_resource(dst->texture);
    void *data = cp_resource_data(res);
@@ -895,7 +924,7 @@ cp_clear_depth_stencil(struct pipe_context *ctx, struct pipe_surface *dst,
                        unsigned width, unsigned height,
                        bool render_condition_enabled)
 {
-   struct cp_context *cp = cp_ctx(ctx);
+   struct cp_context *cp = (struct cp_context *)ctx;
    cp_batch_flush(cp);
    if (!dst || !dst->texture)
       return;
@@ -942,7 +971,7 @@ static void
 cp_clear_texture(struct pipe_context *ctx, struct pipe_resource *res,
                  unsigned level, const struct pipe_box *box, const void *data)
 {
-   struct cp_context *cp = cp_ctx(ctx);
+   struct cp_context *cp = (struct cp_context *)ctx;
    struct cp_resource *cp_res = cp_resource(res);
    cp_batch_flush(cp);
    void *tex_data = cp_resource_data(cp_res);
@@ -994,14 +1023,14 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
          const union pipe_color_union *color, double depth,
          unsigned stencil)
 {
-   struct cp_context *cpc = cp_ctx(ctx);
-   struct cp_device *screen = cpc->screen;
-   struct pipe_framebuffer_state *fb = &cp_gallium_of(cpc)->framebuffer;
+   struct cp_context *cp_ctx = (struct cp_context *)ctx;
+   struct cp_screen *screen = cp_ctx->screen;
+   struct pipe_framebuffer_state *fb = &cp_ctx->framebuffer;
 
    cuCtxSetCurrent(screen->cuda_ctx);
 
    /* A clear overwrites what the held-back draws were going to draw into. */
-   cp_batch_flush(cpc);
+   cp_batch_flush(cp_ctx);
 
    if (cp_debug->debug_draw)
       fprintf(stderr, "cudapipe: clear buffers=0x%x color=[%.2f,%.2f,%.2f,%.2f]\n",
@@ -1049,7 +1078,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
             cuLaunchKernel(screen->kernels.clear_kernel,
                (w + 15) / 16, (h + 15) / 16, 1,
                16, 16, 1,
-               0, cpc->stream, params, NULL);
+               0, cp_ctx->stream, params, NULL);
          }
       }
    }
@@ -1057,7 +1086,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
    /* The rasterizer tests against its own depth buffer, so clear that too —
     * not just the application's depth attachment. */
    if (buffers & PIPE_CLEAR_DEPTH)
-      cp_clear_depthbuf(cpc, (float)depth);
+      cp_clear_depthbuf(cp_ctx, (float)depth);
 
    /* Clear depth */
    if ((buffers & PIPE_CLEAR_DEPTH) && fb->zsbuf.texture && screen->kernels.clear_depth_kernel) {
@@ -1089,7 +1118,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
          cuLaunchKernel(screen->kernels.clear_depth_kernel,
             (w + 15) / 16, (h + 15) / 16, 1,
             16, 16, 1,
-            0, cpc->stream, params, NULL);
+            0, cp_ctx->stream, params, NULL);
       }
    }
 
@@ -1462,7 +1491,7 @@ cp_arena_grow(struct cp_screen *cp, int cls, enum cp_arena_mode mode)
          cuMemAdvise(dev, CP_ARENA_BLOCK_SIZE,
                      CU_MEM_ADVISE_SET_PREFERRED_LOCATION, CU_DEVICE_CPU);
          cuMemAdvise(dev, CP_ARENA_BLOCK_SIZE,
-                     CU_MEM_ADVISE_SET_ACCESSED_BY, cp->dev.cuda_device);
+                     CU_MEM_ADVISE_SET_ACCESSED_BY, cp->cuda_device);
       }
    }
 
@@ -1569,7 +1598,7 @@ cp_allocate_memory(struct pipe_screen *screen, uint64_t size)
    CUdeviceptr dev = 0;
    int cls;
 
-   cuCtxSetCurrent(cp->dev.cuda_ctx);
+   cuCtxSetCurrent(cp->cuda_ctx);
 
    if (mode != CP_ARENA_OFF && (cls = cp_arena_class(size)) >= 0 &&
        p_atomic_inc_return(&cp_arena_seen) > cp_arena_warmup()) {
@@ -1623,7 +1652,7 @@ cp_allocate_memory_device(struct pipe_screen *screen, uint64_t size)
    struct cp_device_memory *mem = CALLOC_STRUCT(cp_device_memory);
    if (!mem)
       return NULL;
-   cuCtxSetCurrent(cp->dev.cuda_ctx);
+   cuCtxSetCurrent(cp->cuda_ctx);
    CUresult err = cuMemAlloc(&mem->dev, size);
    if (err != CUDA_SUCCESS) {
       CP_CU_WARN(err, "cuMemAlloc for device-local VkDeviceMemory");
@@ -1648,7 +1677,7 @@ cp_clear_memory(struct pipe_screen *screen,
    simple_mtx_unlock(&cp_arena.lock);
    if (!device_mem)
       return;
-   cuCtxSetCurrent(cp->dev.cuda_ctx);
+   cuCtxSetCurrent(cp->cuda_ctx);
    CUresult err = cuMemsetD8(device_mem->dev, 0, size);
    CP_CU_WARN(err, "cuMemsetD8 for zero-initialized VkDeviceMemory");
 }
@@ -1670,7 +1699,7 @@ cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
       *link = device_mem->next;
    simple_mtx_unlock(&cp_arena.lock);
    if (device_mem) {
-      cuCtxSetCurrent(cp->dev.cuda_ctx);
+      cuCtxSetCurrent(cp->cuda_ctx);
       cuMemFree(device_mem->dev);
       FREE(device_mem);
       return;
@@ -1682,7 +1711,7 @@ cp_free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *mem)
    if (cp_managed_cache_put((CUdeviceptr)(uintptr_t)mem))
       return;
 
-   cuCtxSetCurrent(cp->dev.cuda_ctx);
+   cuCtxSetCurrent(cp->cuda_ctx);
    cuMemFree((CUdeviceptr)(uintptr_t)mem);
 }
 

@@ -1129,18 +1129,30 @@ cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues qu
 extern "C" __global__ void
 cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
+   if (args.path_flag &&
+       (!!*(const volatile uint32_t *)(uintptr_t)args.path_flag) !=
+          !!args.path_value)
+      return;
    cp_rasterize_stage1_body<false>(args, queues);
 }
 
 extern "C" __global__ void
 cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
+   if (args.path_flag &&
+       (!!*(const volatile uint32_t *)(uintptr_t)args.path_flag) !=
+          !!args.path_value)
+      return;
    cp_rasterize_stage2_body<false>(args, queues);
 }
 
 extern "C" __global__ void
 cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
+   if (args.path_flag &&
+       (!!*(const volatile uint32_t *)(uintptr_t)args.path_flag) !=
+          !!args.path_value)
+      return;
    cp_rasterize_stage3_body<false>(args, queues);
 }
 
@@ -1846,11 +1858,221 @@ cp_abuf_seg_count(struct cp_abuf_seg_args args)
    }
 }
 
+/*
+ * Tile shader census, pass 1: mark which shaders reach which tile.
+ *
+ * One thread per quad. The quad's 2x2 block gives its tile, its primitive
+ * gives its segment by the same search the bucketing uses, and the segment
+ * gives the distinct fragment shader the host resolved. Nothing is written
+ * that any rendering kernel reads.
+ */
+extern "C" __global__ void
+cp_tile_census_mark(struct cp_tile_census_args args)
+{
+   uint32_t total = *(const uint32_t *)(uintptr_t)args.num_quads_dev;
+   if (total > args.num_quads)
+      total = args.num_quads;
+
+   const uint32_t *quad_prim = (const uint32_t *)(uintptr_t)args.quad_prim;
+   const uint32_t *quad_block = (const uint32_t *)(uintptr_t)args.quad_block;
+   const uint8_t *seg_shader = (const uint8_t *)(uintptr_t)args.seg_shader;
+   unsigned long long *tile_mask =
+      (unsigned long long *)(uintptr_t)args.tile_mask;
+   unsigned int *tile_quads = (unsigned int *)(uintptr_t)args.tile_quads;
+   unsigned int *tile_smin = (unsigned int *)(uintptr_t)args.tile_smin;
+   unsigned int *tile_smax = (unsigned int *)(uintptr_t)args.tile_smax;
+
+   for (uint32_t q = blockIdx.x * blockDim.x + threadIdx.x; q < total;
+        q += gridDim.x * blockDim.x) {
+      uint32_t prim = quad_prim[q];
+      uint32_t blk = quad_block[q];
+      uint32_t bx = blk % args.quad_width;
+      uint32_t by = blk / args.quad_width;
+      uint32_t tx = (bx * 2) / args.tile;
+      uint32_t ty = (by * 2) / args.tile;
+      if (tx >= args.tiles_x || ty >= args.tiles_y)
+         continue;
+      uint32_t t = ty * args.tiles_x + tx;
+
+      uint32_t seg = cp_seg_of_prim(
+         (const uint32_t *)(uintptr_t)args.seg_prim_base, args.nsegs, prim);
+      uint32_t s = seg_shader[seg];
+      if (s >= CP_TILE_CENSUS_MAX_SHADERS)
+         s = CP_TILE_CENSUS_MAX_SHADERS - 1;
+      /* Ordered by the pass-global draw sequence: primitive ids restart at
+       * every episode, so they cannot be compared across one. */
+      uint32_t seq = ((const uint32_t *)(uintptr_t)args.seg_seq)[seg];
+
+      atomicOr(&tile_mask[t], 1ull << s);
+      atomicAdd(&tile_quads[t], 1u);
+      uint32_t at = t * CP_TILE_CENSUS_MAX_SHADERS + s;
+      atomicMin(&tile_smin[at], seq);
+      atomicMax(&tile_smax[at], seq);
+   }
+}
+
+/*
+ * The same marking from the opaque side. Opaque draws never enter the
+ * A-buffer's quad stream: their coverage is the shared visibility buffer,
+ * one winner per pixel, carrying the episode-global primitive that won it.
+ * A tile only has to be able to *call* the shader of a fragment it shades,
+ * and for opaque geometry that is the winner — so this is the right set,
+ * not every primitive that touched the tile.
+ */
+extern "C" __global__ void
+cp_tile_census_mark_vis(struct cp_tile_census_args args)
+{
+   uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+   if (x >= args.width || y >= args.height)
+      return;
+
+   uint64_t entry =
+      ((const uint64_t *)(uintptr_t)args.visbuf)[(size_t)y * args.width + x];
+   if (entry == VISBUF_EMPTY)
+      return;
+
+   uint32_t tx = x / args.tile;
+   uint32_t ty = y / args.tile;
+   if (tx >= args.tiles_x || ty >= args.tiles_y)
+      return;
+   uint32_t t = ty * args.tiles_x + tx;
+
+   uint32_t prim = VISBUF_TRIID(entry);
+   uint32_t seg = cp_seg_of_prim(
+      (const uint32_t *)(uintptr_t)args.seg_prim_base, args.nsegs, prim);
+   uint32_t s = ((const uint8_t *)(uintptr_t)args.seg_shader)[seg];
+   if (s >= CP_TILE_CENSUS_MAX_SHADERS)
+      s = CP_TILE_CENSUS_MAX_SHADERS - 1;
+   uint32_t seq = ((const uint32_t *)(uintptr_t)args.seg_seq)[seg];
+
+   atomicOr((unsigned long long *)(uintptr_t)args.tile_mask + t, 1ull << s);
+   atomicAdd((unsigned int *)(uintptr_t)args.tile_quads + t, 1u);
+   uint32_t at = t * CP_TILE_CENSUS_MAX_SHADERS + s;
+   atomicMin((unsigned int *)(uintptr_t)args.tile_smin + at, seq);
+   atomicMax((unsigned int *)(uintptr_t)args.tile_smax + at, seq);
+}
+
+/*
+ * Pass 2: one thread per tile, reducing straight into a persistent histogram
+ * so the host never reads a per-tile array back.
+ *
+ * "Disjoint" means every shader present owns a contiguous stretch of this
+ * tile's primitive order, so the tile could be rendered as that many ordered
+ * passes, each with one statically linked shader. Overlapping ranges mean the
+ * shaders interleave and only a kernel that can dispatch among them would
+ * keep the order.
+ */
+/*
+ * The bin's own size, which is a different quantity from the shaded one: a
+ * triangle spanning twenty tiles costs twenty references and may shade none
+ * of them. This is what sets a tiler's memory ceiling and what the previous
+ * prototype's fixed 2,000,000-reference capacity ran into, so it is measured
+ * rather than assumed. Conservative bounding-box binning, the same rule the
+ * prototype used, so the number is an upper bound on an exact-coverage bin.
+ */
+extern "C" __global__ void
+cp_tile_census_refs(struct cp_rasterize_args rast,
+                    struct cp_tile_census_args args)
+{
+   uint32_t n = cp_num_triangles(&rast);
+   for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x; tri < n;
+        tri += gridDim.x * blockDim.x) {
+      struct tri_setup setup;
+      if (!setup_triangle(&rast, tri, &setup))
+         continue;
+      uint32_t tx0 = (uint32_t)setup.ix_min / args.tile;
+      uint32_t ty0 = (uint32_t)setup.iy_min / args.tile;
+      uint32_t tx1 = (uint32_t)setup.ix_max / args.tile;
+      uint32_t ty1 = (uint32_t)setup.iy_max / args.tile;
+      for (uint32_t ty = ty0; ty <= ty1 && ty < args.tiles_y; ty++)
+         for (uint32_t tx = tx0; tx <= tx1 && tx < args.tiles_x; tx++)
+            atomicAdd((unsigned int *)(uintptr_t)args.tile_refs +
+                         ty * args.tiles_x + tx, 1u);
+   }
+}
+
+static __device__ __forceinline__ uint32_t
+cp_census_log_bucket(uint32_t v)
+{
+   uint32_t b = 32u - (uint32_t)__clz((int)v);   /* 1 -> 1, 2..3 -> 2, ... */
+   return b < CP_TILE_CENSUS_LOG ? b : CP_TILE_CENSUS_LOG - 1;
+}
+
+extern "C" __global__ void
+cp_tile_census_reduce(struct cp_tile_census_args args)
+{
+   uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+   if (t >= args.tiles_x * args.tiles_y)
+      return;
+
+   unsigned long long *hist = (unsigned long long *)(uintptr_t)args.hist;
+
+   /* The bin size is independent of whether anything shaded here: a tile can
+    * hold references and lose every one of them to the depth test. */
+   unsigned int refs = args.tile_refs
+      ? ((const unsigned int *)(uintptr_t)args.tile_refs)[t] : 0u;
+   if (refs) {
+      atomicAdd(&hist[CP_TILE_CENSUS_REFS + cp_census_log_bucket(refs)], 1ull);
+      atomicAdd(&hist[CP_TILE_CENSUS_GLOBALS + 2], (unsigned long long)refs);
+      atomicAdd(&hist[CP_TILE_CENSUS_GLOBALS + 4], 1ull);
+      atomicMax((unsigned long long *)&hist[CP_TILE_CENSUS_GLOBALS + 0],
+                (unsigned long long)refs);
+   }
+
+   unsigned long long mask =
+      ((const unsigned long long *)(uintptr_t)args.tile_mask)[t];
+   if (!mask)
+      return;
+
+   {
+      unsigned int sh = ((const unsigned int *)(uintptr_t)args.tile_quads)[t];
+      if (sh) {
+         atomicAdd(&hist[CP_TILE_CENSUS_SHADED + cp_census_log_bucket(sh)],
+                   1ull);
+         atomicAdd(&hist[CP_TILE_CENSUS_GLOBALS + 3], (unsigned long long)sh);
+         atomicAdd(&hist[CP_TILE_CENSUS_GLOBALS + 5], 1ull);
+         atomicMax((unsigned long long *)&hist[CP_TILE_CENSUS_GLOBALS + 1],
+                   (unsigned long long)sh);
+      }
+   }
+
+   const unsigned int *tile_smin = (const unsigned int *)(uintptr_t)args.tile_smin;
+   const unsigned int *tile_smax = (const unsigned int *)(uintptr_t)args.tile_smax;
+   uint32_t base = t * CP_TILE_CENSUS_MAX_SHADERS;
+
+   uint32_t lo[CP_TILE_CENSUS_MAX_SHADERS];
+   uint32_t hi[CP_TILE_CENSUS_MAX_SHADERS];
+   uint32_t n = 0;
+   for (uint32_t s = 0; s < CP_TILE_CENSUS_MAX_SHADERS; s++) {
+      if (!(mask & (1ull << s)))
+         continue;
+      lo[n] = tile_smin[base + s];
+      hi[n] = tile_smax[base + s];
+      n++;
+   }
+
+   int disjoint = 1;
+   for (uint32_t i = 0; i < n && disjoint; i++)
+      for (uint32_t j = i + 1; j < n; j++)
+         if (lo[i] <= hi[j] && lo[j] <= hi[i]) {
+            disjoint = 0;
+            break;
+         }
+
+   uint32_t bin = n < CP_TILE_CENSUS_BINS ? n : CP_TILE_CENSUS_BINS - 1;
+   unsigned int quads = ((const unsigned int *)(uintptr_t)args.tile_quads)[t];
+   atomicAdd(&hist[bin * 4 + (disjoint ? 0 : 1)], 1ull);
+   atomicAdd(&hist[bin * 4 + (disjoint ? 2 : 3)], (unsigned long long)quads);
+}
+
 extern "C" __global__ void
 cp_abuf_seg_scatter(struct cp_abuf_seg_args args)
 {
    uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-   if (q >= args.num_quads)
+   uint32_t exact = args.num_quads_dev
+      ? *(const uint32_t *)(uintptr_t)args.num_quads_dev : args.num_quads;
+   if (q >= args.num_quads || q >= exact)
       return;
    uint32_t seg = ((const unsigned char *)(uintptr_t)args.quad_seg)[q];
    if (!args.warp_aggregate) {
@@ -1858,7 +2080,12 @@ cp_abuf_seg_scatter(struct cp_abuf_seg_args args)
          (unsigned int *)(uintptr_t)args.seg_cursor + seg, 1u);
       uint32_t at = ((const uint32_t *)(uintptr_t)args.seg_base)[seg] + pos;
       ((uint32_t *)(uintptr_t)args.grouped)[at] = q;
-      ((uint32_t *)(uintptr_t)args.quad_dense)[q] = pos;
+      uint32_t dense = pos;
+      if (args.seg_group && args.group_base) {
+         uint32_t group = ((const uint8_t *)(uintptr_t)args.seg_group)[seg];
+         dense = at - ((const uint32_t *)(uintptr_t)args.group_base)[group];
+      }
+      ((uint32_t *)(uintptr_t)args.quad_dense)[q] = dense;
       return;
    }
    unsigned active = __activemask();
@@ -1873,5 +2100,210 @@ cp_abuf_seg_scatter(struct cp_abuf_seg_args args)
    uint32_t pos = group_pos + (uint32_t)__popc(peers & lane_mask);
    uint32_t at = ((const uint32_t *)(uintptr_t)args.seg_base)[seg] + pos;
    ((uint32_t *)(uintptr_t)args.grouped)[at] = q;
-   ((uint32_t *)(uintptr_t)args.quad_dense)[q] = pos;
+   uint32_t dense = pos;
+   if (args.seg_group && args.group_base) {
+      uint32_t group = ((const uint8_t *)(uintptr_t)args.seg_group)[seg];
+      dense = at - ((const uint32_t *)(uintptr_t)args.group_base)[group];
+   }
+   ((uint32_t *)(uintptr_t)args.quad_dense)[q] = dense;
+}
+
+extern "C" __global__ void
+cp_abuf_seg_prefix(struct cp_abuf_seg_prefix_args args)
+{
+   if (blockIdx.x || threadIdx.x)
+      return;
+   const uint32_t *counts = (const uint32_t *)(uintptr_t)args.seg_counts;
+   const uint8_t *groups = (const uint8_t *)(uintptr_t)args.seg_group;
+   uint32_t *bases = (uint32_t *)(uintptr_t)args.seg_base;
+   uint32_t *group_base = (uint32_t *)(uintptr_t)args.group_base;
+   uint32_t *group_counts = (uint32_t *)(uintptr_t)args.group_counts;
+   uint32_t running = 0;
+   for (uint32_t g = 0; g < args.ngroups; g++) {
+      group_base[g] = running;
+      uint32_t first = running;
+      for (uint32_t s = 0; s < args.nsegs; s++) {
+         if (groups[s] != g)
+            continue;
+         bases[s] = running;
+         running += counts[s];
+      }
+      group_counts[g] = running - first;
+   }
+}
+
+extern "C" __global__ void
+cp_abuf_prepare_shade_count(struct cp_abuf_shade_count_args args)
+{
+   if (blockIdx.x || threadIdx.x)
+      return;
+   *(uint32_t *)(uintptr_t)args.slots =
+      4u * *(const uint32_t *)(uintptr_t)args.count;
+}
+
+extern "C" __global__ void
+cp_opaque_tile_count(struct cp_opaque_tile_build_args args)
+{
+   uint32_t n = cp_num_triangles(&args.rast);
+   for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x; tri < n;
+        tri += gridDim.x * blockDim.x) {
+      struct tri_setup setup;
+      if (!setup_triangle(&args.rast, tri, &setup))
+         continue;
+      uint32_t tx0 = (uint32_t)setup.ix_min / CP_OPAQUE_TILE_SIZE;
+      uint32_t ty0 = (uint32_t)setup.iy_min / CP_OPAQUE_TILE_SIZE;
+      uint32_t tx1 = (uint32_t)setup.ix_max / CP_OPAQUE_TILE_SIZE;
+      uint32_t ty1 = (uint32_t)setup.iy_max / CP_OPAQUE_TILE_SIZE;
+      for (uint32_t ty = ty0; ty <= ty1 && ty < args.tiles_y; ty++)
+         for (uint32_t tx = tx0; tx <= tx1 && tx < args.tiles_x; tx++)
+            atomicAdd((uint32_t *)(uintptr_t)args.tile_counts +
+                         ty * args.tiles_x + tx, 1u);
+   }
+}
+
+extern "C" __global__ void
+cp_opaque_tile_fill(struct cp_opaque_tile_build_args args)
+{
+   uint32_t n = cp_num_triangles(&args.rast);
+   for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x; tri < n;
+        tri += gridDim.x * blockDim.x) {
+      struct tri_setup setup;
+      if (!setup_triangle(&args.rast, tri, &setup))
+         continue;
+      uint32_t tx0 = (uint32_t)setup.ix_min / CP_OPAQUE_TILE_SIZE;
+      uint32_t ty0 = (uint32_t)setup.iy_min / CP_OPAQUE_TILE_SIZE;
+      uint32_t tx1 = (uint32_t)setup.ix_max / CP_OPAQUE_TILE_SIZE;
+      uint32_t ty1 = (uint32_t)setup.iy_max / CP_OPAQUE_TILE_SIZE;
+      for (uint32_t ty = ty0; ty <= ty1 && ty < args.tiles_y; ty++) {
+         for (uint32_t tx = tx0; tx <= tx1 && tx < args.tiles_x; tx++) {
+            uint32_t tile = ty * args.tiles_x + tx;
+            uint32_t pos = atomicAdd(
+               (uint32_t *)(uintptr_t)args.tile_cursors + tile, 1u);
+            uint32_t count = ((const uint32_t *)(uintptr_t)args.tile_counts)[tile];
+            uint32_t at = ((const uint32_t *)(uintptr_t)args.tile_offsets)[tile] + pos;
+            if (pos < count && at < args.capacity) {
+               struct cp_opaque_tile_ref *refs =
+                  (struct cp_opaque_tile_ref *)(uintptr_t)args.tile_refs;
+               refs[at].global_prim = args.rast.abuf_prim_base + tri;
+               refs[at].segment = (uint16_t)args.segment;
+               refs[at].flags = 0;
+            } else {
+               atomicAdd((uint32_t *)(uintptr_t)args.overflow, 1u);
+            }
+         }
+      }
+   }
+}
+
+static __device__ __forceinline__ bool
+cp_opaque_depth_pass(const struct cp_rasterize_args *args, uint32_t at,
+                     uint32_t depth)
+{
+   if (!args->depth_test || !args->depthbuf)
+      return true;
+   uint32_t prev = ((const uint32_t *)(uintptr_t)args->depthbuf)[at];
+   switch (args->depth_func) {
+   case CP_FUNC_NEVER: return false;
+   case CP_FUNC_LESS: return depth < prev;
+   case CP_FUNC_EQUAL: return depth == prev;
+   case CP_FUNC_LEQUAL: return depth <= prev;
+   case CP_FUNC_GREATER: return depth > prev;
+   case CP_FUNC_NOTEQUAL: return depth != prev;
+   case CP_FUNC_GEQUAL: return depth >= prev;
+   default: return true;
+   }
+}
+
+extern "C" __global__ void
+cp_opaque_tile_raster(struct cp_opaque_tile_raster_args args)
+{
+   uint32_t tile = blockIdx.x;
+   uint32_t ntiles = args.tiles_x * args.tiles_y;
+   if (tile >= ntiles || *(const uint32_t *)(uintptr_t)args.overflow)
+      return;
+   uint32_t count = ((const uint32_t *)(uintptr_t)args.tile_counts)[tile];
+   if (!count)
+      return;
+
+   uint32_t tx = tile % args.tiles_x;
+   uint32_t ty = tile / args.tiles_x;
+   uint32_t x0 = tx * CP_OPAQUE_TILE_SIZE;
+   uint32_t y0 = ty * CP_OPAQUE_TILE_SIZE;
+   const struct cp_rasterize_args *rasts =
+      (const struct cp_rasterize_args *)(uintptr_t)args.rast_args;
+   const struct cp_opaque_tile_ref *refs =
+      (const struct cp_opaque_tile_ref *)(uintptr_t)args.tile_refs;
+   uint32_t base = ((const uint32_t *)(uintptr_t)args.tile_offsets)[tile];
+   __shared__ struct tri_setup setup;
+   __shared__ struct cp_rasterize_args rast;
+   __shared__ uint32_t global_prim, local_prim;
+   __shared__ int setup_valid;
+   uint64_t winner[4] = { VISBUF_EMPTY, VISBUF_EMPTY,
+                          VISBUF_EMPTY, VISBUF_EMPTY };
+
+   for (uint32_t i = 0; i < count; i++) {
+      if (threadIdx.x == 0) {
+         struct cp_opaque_tile_ref ref = refs[base + i];
+         setup_valid = 0;
+         if (ref.segment < args.num_segments) {
+            rast = rasts[ref.segment];
+            global_prim = ref.global_prim;
+            local_prim = global_prim - rast.abuf_prim_base;
+            setup_valid = setup_triangle(&rast, local_prim, &setup) ? 1 : 0;
+         }
+      }
+      __syncthreads();
+      if (setup_valid) {
+         for (uint32_t j = 0; j < 4; j++) {
+            uint32_t owned = threadIdx.x + j * blockDim.x;
+            uint32_t px = x0 + owned % CP_OPAQUE_TILE_SIZE;
+            uint32_t py = y0 + owned / CP_OPAQUE_TILE_SIZE;
+            if (px >= args.width || py >= args.height ||
+                px < (uint32_t)setup.ix_min || px > (uint32_t)setup.ix_max ||
+                py < (uint32_t)setup.iy_min || py > (uint32_t)setup.iy_max ||
+                cp_tri_rejected(&rast, local_prim, px, py))
+               continue;
+         float sx = (float)px + 0.5f, sy = (float)py + 0.5f;
+         float ndc_z;
+         if (setup.is_point) {
+            if (sx < setup.pt_x0 || sx >= setup.pt_x1 ||
+                sy < setup.pt_y0 || sy >= setup.pt_y1)
+               continue;
+            ndc_z = setup.ndc_z0;
+         } else {
+            float e0 = edge_function(setup.sx1, setup.sy1, setup.sx2,
+                                     setup.sy2, sx, sy);
+            float e1 = edge_function(setup.sx2, setup.sy2, setup.sx0,
+                                     setup.sy0, sx, sy);
+            float e2 = edge_function(setup.sx0, setup.sy0, setup.sx1,
+                                     setup.sy1, sx, sy);
+            if (!edge_inside(e0, setup.e0_top_left) ||
+                !edge_inside(e1, setup.e1_top_left) ||
+                !edge_inside(e2, setup.e2_top_left))
+               continue;
+            float w0 = e0 * setup.inv_area;
+            float w1 = e1 * setup.inv_area;
+            ndc_z = w0 * setup.ndc_z0 + w1 * setup.ndc_z1 +
+                    (1.0f - w0 - w1) * setup.ndc_z2;
+         }
+         uint32_t depth = float_to_sortable_uint(ndc_z * 0.5f + 0.5f);
+         uint32_t pixel = py * args.width + px;
+         if (!cp_opaque_depth_pass(&rast, pixel, depth))
+            continue;
+         uint32_t key = rast.depth_key_invert ? ~depth : depth;
+            uint64_t packed = PACK_VISBUF(key, global_prim);
+            if (packed < winner[j])
+               winner[j] = packed;
+         }
+      }
+      __syncthreads();
+   }
+   for (uint32_t j = 0; j < 4; j++) {
+      uint32_t owned = threadIdx.x + j * blockDim.x;
+      uint32_t px = x0 + owned % CP_OPAQUE_TILE_SIZE;
+      uint32_t py = y0 + owned / CP_OPAQUE_TILE_SIZE;
+      if (px < args.width && py < args.height)
+         ((uint64_t *)(uintptr_t)rasts[0].framebuffer)
+            [py * args.width + px] = winner[j];
+   }
 }

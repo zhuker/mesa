@@ -1,5 +1,4 @@
 #include "cp_screen.h"
-#include "cp_nir_options.h"
 #include "cp_debug.h"
 #include "cp_context.h"
 #include "cp_resource.h"
@@ -268,8 +267,59 @@ cp_is_format_supported(struct pipe_screen *screen, enum pipe_format format,
    return true;
 }
 
-/* The options themselves live in cp_nir_options.h, shared with the native
- * Vulkan driver so the two cannot drift. */
+static const struct nir_shader_compiler_options cp_nir_options = {
+   .lower_scmp = true,
+   .lower_flrp32 = true,
+   .lower_flrp64 = true,
+   .lower_flrp16 = true,
+   .lower_fsat = true,
+   .lower_bitfield_insert = true,
+   .lower_bitfield_extract = true,
+   .lower_fdph = true,
+   .lower_fmod = true,
+   /* NVPTX has no libcall for pow or the trig functions, so llvm.pow and
+    * llvm.sin fail instruction selection and take the backend down with them.
+    * Let NIR express them in terms of exp2/log2 and the fractional-turn
+    * reductions, which do select. */
+   /* Unlike sincos, pow stays lowered. Routing it to the CUDA library version
+    * was tried and changed the image without moving it closer to the reference,
+    * so the approximation is accurate enough here and is not worth a call. */
+   .lower_fpow = true,
+   /* Keep fsin/fcos: the backend routes them to the CUDA library versions,
+    * which are far more accurate than NIR's lowered polynomial. That accuracy
+    * matters where a shader rotates a position rather than a direction — the
+    * instancing sample's asteroids orbit at radius 7 with vertices spanning
+    * 0.06, an 80x lever that turned the polynomial's error into a visible
+    * displacement of every rock. llvmpipe leaves this off for the same reason. */
+   .lower_sincos = false,
+   .lower_hadd = true,
+   .lower_uadd_sat = true,
+   .lower_usub_sat = true,
+   .lower_iadd_sat = true,
+   .lower_pack_snorm_2x16 = true,
+   .lower_pack_snorm_4x8 = true,
+   .lower_pack_unorm_2x16 = true,
+   .lower_pack_unorm_4x8 = true,
+   .lower_pack_half_2x16 = true,
+   .lower_unpack_snorm_2x16 = true,
+   .lower_unpack_snorm_4x8 = true,
+   .lower_unpack_unorm_2x16 = true,
+   .lower_unpack_unorm_4x8 = true,
+   .lower_unpack_half_2x16 = true,
+   .lower_extract_byte = true,
+   .lower_extract_word = true,
+   .lower_insert_byte = true,
+   .lower_insert_word = true,
+   .lower_uadd_carry = true,
+   .lower_usub_borrow = true,
+   .lower_mul_2x32_64 = true,
+   .lower_ifind_msb = true,
+   .max_unroll_iterations = 32,
+   .lower_to_scalar = true,
+   .lower_uniforms_to_ubo = true,
+   .lower_device_index_to_zero = true,
+   .support_16bit_alu = false,
+};
 
 static void
 cp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir, bool optimize)
@@ -281,8 +331,8 @@ static void
 cp_destroy_screen(struct pipe_screen *screen)
 {
    struct cp_screen *cp = cp_screen(screen);
-   cp_kernels_destroy(&cp->dev.kernels);
-   cuCtxDestroy(cp->dev.cuda_ctx);
+   cp_kernels_destroy(&cp->kernels);
+   cuCtxDestroy(cp->cuda_ctx);
    FREE(cp);
 }
 
@@ -303,7 +353,7 @@ cp_fence_reference(struct pipe_screen *screen,
       p_atomic_inc(&s->refcount);
    if (d && p_atomic_dec_zero(&d->refcount)) {
       struct cp_screen *cp = (struct cp_screen *)screen;
-      cuCtxSetCurrent(cp->dev.cuda_ctx);
+      cuCtxSetCurrent(cp->cuda_ctx);
       cuEventDestroy(d->event);
       free(d);
    }
@@ -317,7 +367,7 @@ cp_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
    if (!fence)
       return true;
    struct cp_screen *cp = (struct cp_screen *)screen;
-   cuCtxSetCurrent(cp->dev.cuda_ctx);
+   cuCtxSetCurrent(cp->cuda_ctx);
    /* The event was recorded on the context's main stream after every side
     * stream joined it (see cp_flush), so waiting it means everything queued
     * before the flush has retired — without also draining work queued since,
@@ -375,7 +425,7 @@ cudapipe_create_screen(struct sw_winsys *winsys)
       return NULL;
    }
 
-   if (cuDeviceGet(&screen->dev.cuda_device, 0) != CUDA_SUCCESS) {
+   if (cuDeviceGet(&screen->cuda_device, 0) != CUDA_SUCCESS) {
       fprintf(stderr, "cudapipe: cuDeviceGet failed\n");
       FREE(screen);
       return NULL;
@@ -383,7 +433,7 @@ cudapipe_create_screen(struct sw_winsys *winsys)
 
    {
       /* CUDA 13 added a ctx-params argument; 12.x takes (ctx, flags, dev). */
-      CUresult err = cuCtxCreate(&screen->dev.cuda_ctx, 0, screen->dev.cuda_device);
+      CUresult err = cuCtxCreate(&screen->cuda_ctx, 0, screen->cuda_device);
       if (err != CUDA_SUCCESS) {
          fprintf(stderr, "cudapipe: cuCtxCreate failed (%d)\n", err);
          FREE(screen);
@@ -391,18 +441,17 @@ cudapipe_create_screen(struct sw_winsys *winsys)
       }
    }
 
-   cuDeviceGetAttribute(&screen->dev.sm_major,
+   cuDeviceGetAttribute(&screen->sm_major,
                         CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                        screen->dev.cuda_device);
-   cuDeviceGetAttribute(&screen->dev.sm_minor,
+                        screen->cuda_device);
+   cuDeviceGetAttribute(&screen->sm_minor,
                         CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                        screen->dev.cuda_device);
+                        screen->cuda_device);
 
    snprintf(screen->renderer_string, sizeof(screen->renderer_string),
-            "cudapipe (sm_%d%d)", screen->dev.sm_major, screen->dev.sm_minor);
+            "cudapipe (sm_%d%d)", screen->sm_major, screen->sm_minor);
 
-   if (!cp_kernels_init(&screen->dev.kernels, screen->dev.sm_major,
-                        screen->dev.sm_minor)) {
+   if (!cp_kernels_init(&screen->kernels, screen)) {
       fprintf(stderr, "cudapipe: warning: rasterization kernels failed to compile\n");
       /* Non-fatal — compute still works, just no draw support */
    }

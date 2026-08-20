@@ -35,26 +35,40 @@ libcudapipe_vk_files = files(
   'cpvk_image.c',
 )
 
-# Reused from the Gallium-hosted driver, unchanged and unforked. These three
-# are already free of Gallium — their only "gallium" include is util/u_memory.h,
-# which is src/util — so the shader compiler and the flag registry cross over
-# as they are. They move into this directory when the Gallium driver is
-# deleted; referencing them by path until then is deliberate, because a copy
-# would drift and the point of the exercise is that the backend is portable.
+# The renderer, the flag registry, the kernel loader and the NIR-to-PTX
+# backend. These were reached across the tree while the Gallium driver was
+# being taken apart; they live here now, and src/gallium/drivers/cudapipe is
+# back to exactly what it was before this branch started. The Gallium driver
+# keeps its own copies of the four files it still needs until it is deleted,
+# which is a duplication with a fixed end date and no editing on the other
+# side of it.
 libcudapipe_vk_shared = files(
-  '../gallium/drivers/cudapipe/cp_debug.c',
-  '../gallium/drivers/cudapipe/cp_kernels.c',
-  '../gallium/drivers/cudapipe/cp_renderer.c',
-  '../gallium/drivers/cudapipe/nir_to_ptx/cp_nir_to_llvm.c',
+  'cp_debug.c',
+  'cp_kernels.c',
+  'cp_renderer.c',
+  'nir_to_ptx/cp_nir_to_llvm.c',
 )
+
+# NVRTC compiles the kernels from source at runtime, so stringify each .cu
+# into a C string the driver can hand it.
+cpvk_kernel_incs = []
+foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_fs.cu',
+                  'cp_vertex_fetch.cu', 'cp_rast_types.h']
+  cpvk_kernel_incs += custom_target(
+    'cpvk_' + kernel + '.inc',
+    input : ['kernels/' + kernel],
+    output : [kernel + '.inc'],
+    command : [prog_python, files('kernels/cu_to_inc.py'), '@INPUT@', '@OUTPUT@'],
+  )
+endforeach
 
 libcudapipe_vk = static_library(
   'cudapipe_vk',
   [libcudapipe_vk_files, libcudapipe_vk_shared, cpvk_entrypoints,
-   cudapipe_kernel_incs],
+   cpvk_kernel_incs],
   include_directories : [inc_include, inc_src, inc_util,
-                         include_directories('../gallium/drivers/cudapipe'),
-                         include_directories('../gallium/drivers/cudapipe/nir_to_ptx'),
+                         include_directories('.'),
+                         include_directories('nir_to_ptx'),
                          include_directories('../compiler/nir')],
   dependencies : [idep_vulkan_runtime, idep_vulkan_util, idep_mesautil,
                   idep_nir, dep_llvm, dep_cuda_vk, dep_nvrtc, dep_nvjitlink],

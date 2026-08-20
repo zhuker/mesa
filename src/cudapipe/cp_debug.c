@@ -141,6 +141,30 @@ static const struct cp_flag_def flags[] = {
    { "CUDAPIPE_NO_ABUF_APPEND", CP_FLAG_BOOL_VALUE, F(no_abuf_append),
      "disable the single-pass A-buffer build: the count pass stops appending "
      "(pixel, prim) records and the fill rasterizes a second time" },
+   { "CUDAPIPE_NO_FUSED_ABUF_INTERP", CP_FLAG_BOOL_VALUE,
+     F(no_fused_abuf_interp),
+     "launch A-buffer interpolation separately instead of calling it from "
+     "the generated fragment shader; performance experiment only" },
+   { "CUDAPIPE_FORCE_PASS_FALLBACK", CP_FLAG_BOOL_VALUE,
+     F(force_pass_fallback),
+     "make every blended episode take the classic re-execution fallback; the "
+     "output must be identical, which is what makes it a test" },
+   { "CUDAPIPE_TILE_CENSUS", CP_FLAG_UINT, F(tile_census),
+     "tile edge in pixels for the blended tile-bin shader census; 0 is off, "
+     "and it changes no rendering", .dflt = 0, .has_range = true,
+     .lo = 0, .hi = 256 },
+   { "CUDAPIPE_TILE_CENSUS_EVERY", CP_FLAG_UINT, F(tile_census_every),
+     "report the tile census this often, in episodes", .dflt = 2000,
+     .has_range = true, .lo = 1, .hi = 1000000 },
+   { "CUDAPIPE_TILED_OPAQUE", CP_FLAG_BOOL_VALUE, F(tiled_opaque),
+     "use the experimental opaque episode sort-middle tile rasterizer" },
+   { "CUDAPIPE_TILED_OPAQUE_CENSUS", CP_FLAG_BOOL_VALUE,
+     F(tiled_opaque_census),
+     "collect opaque tile population statistics without changing rendering" },
+   { "CUDAPIPE_UNSAFE_NO_OVERFLOW", CP_FLAG_BOOL_VALUE,
+     F(unsafe_no_overflow),
+     "skip episode overflow readback and assume fragment/quad arrays fit; "
+     "unsafe diagnostic only" },
    { "CUDAPIPE_NO_BATCH", CP_FLAG_BOOL_PRESENCE, F(no_batch),
      "disable draw batching entirely" },
    { "CUDAPIPE_NO_BINCACHE", CP_FLAG_BOOL_PRESENCE, F(no_bincache),
