@@ -207,6 +207,7 @@ cpvk_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd)
       container_of(vk_cmd, struct cpvk_cmd_buffer, vk);
 
    vk_command_buffer_finish(&cmd->vk);
+   free(cmd->ops);
    vk_free(&cmd->vk.pool->alloc, cmd);
 }
 
@@ -401,6 +402,25 @@ cpvk_execute_cmd_buffer(struct cpvk_device *dev, struct cpvk_cmd_buffer *cmd)
    return VK_SUCCESS;
 }
 
+/* Room for one more operation, or NULL if it cannot be had. */
+static struct cpvk_op *
+cpvk_op_alloc(struct cpvk_cmd_buffer *cmd, enum cpvk_op_kind kind)
+{
+   if (cmd->num_ops >= cmd->max_ops) {
+      unsigned want = cmd->max_ops ? cmd->max_ops * 2 : 64;
+      struct cpvk_op *ops = realloc(cmd->ops, want * sizeof(*ops));
+      if (!ops)
+         return NULL;
+      cmd->ops = ops;
+      cmd->max_ops = want;
+   }
+
+   struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
+   memset(op, 0, sizeof(*op));
+   op->kind = kind;
+   return op;
+}
+
 /* ------------------------------------------------------- rendering + draw */
 
 VKAPI_ATTR void VKAPI_CALL
@@ -455,9 +475,10 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     * and all three triangles vanished, with the rasterizer reporting them
     * shaded.
     */
-   if (cmd->num_ops < CPVK_MAX_DISPATCHES) {
-      struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
-      *op = (struct cpvk_op) { .kind = CPVK_OP_BEGIN_RENDER };
+   {
+      struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_BEGIN_RENDER);
+      if (!op)
+         return;
       op->fb = fb;
       /* The attachment's sample count, taken from the image the rendering
        * binds rather than from the pipeline, because it is what the
@@ -467,11 +488,11 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    }
 
    /* LOAD_OP_CLEAR, recorded in order with the draws that follow it. */
-   if (cat && cimg && cat->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
-       cmd->num_ops < CPVK_MAX_DISPATCHES) {
+   if (cat && cimg && cat->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
       enum pipe_format pfmt = vk_format_to_pipe_format(cimg->vk.format);
-      struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
-      *op = (struct cpvk_op) { .kind = CPVK_OP_CLEAR };
+      struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_CLEAR);
+      if (!op)
+         return;
       op->clear = (struct cpvk_clear) {
          .data = fb.color,
          .width = fb.width,
@@ -487,10 +508,10 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    }
 
    const VkRenderingAttachmentInfo *dat = pRenderingInfo->pDepthAttachment;
-   if (dat && dat->imageView && dat->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
-       cmd->num_ops < CPVK_MAX_DISPATCHES) {
-      struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
-      *op = (struct cpvk_op) { .kind = CPVK_OP_CLEAR };
+   if (dat && dat->imageView && dat->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+      struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_CLEAR);
+      if (!op)
+         return;
       op->clear = (struct cpvk_clear) {
          .depth = true,
          .depth_value = dat->clearValue.depthStencil.depth,
@@ -629,11 +650,12 @@ cpvk_record_draw(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first,
                  unsigned instance_count, unsigned first_instance,
                  int vertex_offset, bool indexed)
 {
-   if (cmd->num_ops >= CPVK_MAX_DISPATCHES || !cmd->pipeline)
+   if (!cmd->pipeline)
       return;
 
-   struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
-   *op = (struct cpvk_op) { .kind = CPVK_OP_DRAW };
+   struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_DRAW);
+   if (!op)
+      return;
    struct cpvk_draw *d = &op->draw;
 
    d->pipeline = cmd->pipeline;
@@ -766,11 +788,8 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
 static struct cpvk_copy *
 cpvk_record_copy(struct cpvk_cmd_buffer *cmd)
 {
-   if (cmd->num_ops >= CPVK_MAX_DISPATCHES)
-      return NULL;
-   struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
-   *op = (struct cpvk_op) { .kind = CPVK_OP_COPY };
-   return &op->copy;
+   struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_COPY);
+   return op ? &op->copy : NULL;
 }
 
 VKAPI_ATTR void VKAPI_CALL

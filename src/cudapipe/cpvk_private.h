@@ -260,8 +260,14 @@ struct cpvk_cmd_buffer {
    unsigned index_size;
    unsigned char push[CPVK_MAX_PUSH_BYTES];
    unsigned push_size;
-   struct cpvk_op ops[CPVK_MAX_DISPATCHES];
-   unsigned num_ops;
+   /*
+    * Grown rather than capped. A fixed array silently dropped everything past
+    * its end, which is the failure that looks like a driver bug in whatever
+    * came after: bloom records well over sixty operations and rendered a
+    * completely black frame.
+    */
+   struct cpvk_op *ops;
+   unsigned num_ops, max_ops;
 };
 
 void cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d);
