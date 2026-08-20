@@ -736,3 +736,19 @@ Found while reading that output, and unrelated to the spheres:
 
 A shader in this sample reads its own framebuffer output. That is a real gap in
 the backend and nothing has been done about it.
+
+### Comparing the two drivers' debug output is not valid any more
+
+`elem[i]: fmt=` prints `velem[e].conv` in this tree. The Gallium driver was
+reverted to the branch point, where that field did not exist and the same
+format string printed `src_format`. So `fmt=0` natively against `fmt=23`
+under Gallium is two different fields with one label, not a difference in the
+vertex elements. Nothing was wrong there.
+
+The one real difference the comparison did show is expected: the native driver
+issues ten draws of 4,512 triangles where the Gallium driver issues one batched
+draw of 45,120. Native has no batching, which is known.
+
+The lesson is narrower than "be careful": **any** debug output compared across
+the two drivers is comparing a current file against a nine-month-old one, and
+only fields that predate the branch can be trusted to mean the same thing.
