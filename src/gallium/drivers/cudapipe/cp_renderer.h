@@ -549,6 +549,236 @@ void cp_pass_finish(struct cp_context *cp);
 
 void cp_tile_census_end_pass(struct cp_context *cp);
 
+/*
+ * Say so when a CUDA call fails, once per site.
+ *
+ * This driver's failure mode is silence, and every expensive bug found in it
+ * so far cost what it did for that reason rather than for its own difficulty.
+ * A NULL from cp_allocate_memory became a segfault inside lavapipe, three
+ * frames from the kernel that actually faulted. A clip pass was skipped
+ * because its scratch allocation returned NULL. The A-buffer switched itself
+ * off. A shader read an intrinsic the backend did not implement and got undef.
+ * In each case the driver knew, and did not say.
+ *
+ * Once per site rather than once per failure, because these sit on paths that
+ * run hundreds of times a frame: a real fault would otherwise bury its own
+ * first line, which is the one worth reading. Nothing here changes behaviour —
+ * a caller that can carry on still carries on.
+ */
+#define CP_CU_WARN(err, what)                                                 \
+   do {                                                                       \
+      CUresult _cp_e = (err);                                                 \
+      if (_cp_e != CUDA_SUCCESS) {                                            \
+         static bool _cp_said;                                                \
+         if (!_cp_said) {                                                     \
+            const char *_cp_n = NULL, *_cp_s = NULL;                          \
+            _cp_said = true;                                                  \
+            cuGetErrorName(_cp_e, &_cp_n);                                    \
+            cuGetErrorString(_cp_e, &_cp_s);                                  \
+            fprintf(stderr, "cudapipe: %s failed at %s:%d — %s (%d)%s%s\n",   \
+                    (what), __func__, __LINE__,                               \
+                    _cp_n ? _cp_n : "unknown", (int)_cp_e,                    \
+                    _cp_s ? ": " : "", _cp_s ? _cp_s : "");                   \
+            if (_cp_e == CUDA_ERROR_ILLEGAL_ADDRESS ||                        \
+                _cp_e == CUDA_ERROR_LAUNCH_FAILED)                            \
+               fprintf(stderr, "cudapipe:   this error is sticky — every "    \
+                       "later CUDA call fails too, so the first report is "   \
+                       "the one that names the cause. Re-run with "           \
+                       "CUDA_LAUNCH_BLOCKING=1, or under compute-sanitizer "  \
+                       "to name the kernel and the address.\n");              \
+         }                                                                    \
+      }                                                                       \
+   } while (0)
+
+/*
+ * A launch that says so when it fails.
+ *
+ * Worth knowing what this can and cannot tell you. A launch is asynchronous,
+ * so the error it returns is rarely its own: it is whatever sticky error a
+ * previous kernel left behind, and the first launch to report is the first one
+ * issued after the fault, not the one that caused it. That is why the driver
+ * reported "VS launch failed: 700" for a fault in vertex fetch.
+ *
+ * What it is good for is the moment of transition — turning "a segfault
+ * somewhere in libc, three frames later" into a line naming a CUDA error and
+ * the tools that find the kernel. Synchronous failures, a bad grid or too much
+ * shared memory, it does report exactly.
+ */
+#define CP_LAUNCH(...) CP_CU_WARN(cuLaunchKernel(__VA_ARGS__), "cuLaunchKernel")
+
+/* Slots the quad stream's own shading pass may use, four per quad. Bounds the
+ * fragment shader's input and output buffers, which at five varyings are about
+ * 90 bytes a slot. */
+#define CP_ABUF_MAX_SHADE_SLOTS (16u * 1024u * 1024u)
+
+/*
+ * A pass episode's per-segment shading: which slice of the grouped quad list
+ * this segment shades, and — filled in on success — the dense arrays its
+ * shader produced, for the episode's one composite to resolve through.
+ */
+struct cp_abuf_seg_shade {
+   CUdeviceptr quad_list;      /* the episode's grouped quad indices */
+   uint32_t quad_list_base;    /* this segment's first entry */
+   CUdeviceptr quad_list_base_dev;
+   CUdeviceptr num_quads_dev;
+   uint32_t prim_base;         /* subtracted from global primitive ids */
+   /* A merged group: the launch spans several segments, each quad resolving
+    * its own vertex stream and slice table through this table; prim_base
+    * above is then only the placeholder the table overrides. */
+   CUdeviceptr ranges;         /* struct cp_seg_range[num_ranges] */
+   uint32_t num_ranges;
+   /* out */
+   CUdeviceptr fs_out, coverage, discard;
+   uint32_t fs_out_stride, num_slots;
+};
+
+/* Deepest pixels first, for the full-depth half of the comparison. */
+struct cp_abuf_deep { uint32_t count, pixel; };
+
+#define CP_ABUF_DEEP_PIXELS 1000
+#define CP_ABUF_MAX_GROWTHS  8u
+#define CP_ABUF_GROW_AT      0.75    /* fraction of capacity that triggers a grow */
+int cp_abuf_cmp_deep(const void *a, const void *b);
+
+/* The A-buffer: its arrays, their sizing, the prefix scans over them, and
+ * the verification the peel loop is compared against. One per process, like
+ * the arrays it owns. */
+struct cp_abuf {
+   int enabled;             /* -1 unknown, 0 off, 1 on */
+   int verify;
+   /* Whether an eligible draw is rendered by this path instead of by the peel
+    * loop, rather than merely having its lists built and checked beside it. */
+   int composite;
+   int timing;              /* print the per-draw event breakdown */
+   int debug;               /* explain on stderr why a draw is not eligible */
+   /* Layers the composite stops after, 0 for all of them. Only for asking what
+    * the peel loop's own CP_BLEND_LAYERS truncation was worth; the path has no
+    * such cap and is not meant to acquire one. */
+   unsigned max_layers;
+   bool ready;              /* per-pixel buffers allocated for w x h */
+   bool disabled;           /* something refused it; do not try again */
+   unsigned w, h;
+   /*
+    * What the framebuffer-sized allocations actually hold, as against what the
+    * current framebuffer needs. Grow-only: a render pass at a smaller size
+    * reuses the larger arrays and only recomputes the derived counts below.
+    * See cp_abuf_setup() for why it is not a realloc on every change.
+    */
+   size_t cap_pixels;       /* pixels the per-pixel arrays are sized for */
+   unsigned cap_blocks;     /* 2x2 blocks the per-block arrays are sized for */
+   size_t cap_log_pixels;   /* pixels the verification's peel log is sized for */
+   unsigned resizes;        /* times the arrays have been grown */
+   bool events_ready;       /* the CUevents are created once, not per size */
+
+   /* Per-pixel, and the scan's per-level partial sums. */
+   CUdeviceptr counts, offsets, cursor;
+   CUdeviceptr sum1, sum1x, sum2, sum2x, sum3;
+   unsigned nb1, nb2, nb3;
+
+   /* The sort's worklist, and the two failure counters the kernels bump. */
+   CUdeviceptr list, list_count, overflow, long_runs;
+
+   /* Pass-episode segment quad counts, carved out of `counters` behind the
+    * six words so the episode's one drain reads everything in one copy. */
+   CUdeviceptr seg_counts;
+
+   /* The composite's own worklist: every pixel with at least one fragment,
+    * where the sort's holds only those with more than one. Separate arrays
+    * rather than one with the looser threshold, so the sort keeps costing what
+    * it was measured to cost. */
+   CUdeviceptr clist, clist_count;
+
+   /* The fragment array itself: sized from the first draw's count with
+    * CP_ABUF_HEADROOM to spare, and grown between draws when a later count
+    * comes within CP_ABUF_GROW_AT of it. See the constants above for why the
+    * growth is bounded the way it is. */
+   CUdeviceptr frags;
+   /*
+    * The single-pass build's records: one (pixel << 32 | prim) uint64 per
+    * fragment, appended by the count pass through rec_cursor (one uint32,
+    * carved out of `counters` past the segment quad counts) and replayed by
+    * cp_abuf_fill_recs in place of the second rasterization. Sized and freed
+    * with `frags`, and the same entry capacity bounds both.
+    */
+   CUdeviceptr recs, rec_cursor;
+   unsigned capacity;
+   unsigned growths;        /* times it has been grown this process */
+   unsigned peak;           /* largest population any draw has counted */
+   bool grow_capped;        /* a growth was refused; do not ask again */
+   /*
+    * A population that wants the arrays bigger, recorded by the draw that
+    * counted it and acted on by the next eligible draw. The count is no longer
+    * read on the host until after the fill has been issued — see the drain
+    * that used to be between them — so by the time a growth is known to be
+    * wanted, this draw's own kernels are already reading the arrays it would
+    * free. The next draw's count pass reads none of them, and is where the
+    * resize is safe.
+    */
+   uint32_t grow_to;
+
+   /* What the peel loop selected: CP_ABUF_LOG_LAYERS for every pixel, and the
+    * full CP_BLEND_LAYERS for the deepest CP_ABUF_DEEP_PIXELS. */
+   CUdeviceptr log, deep_list, deep_log;
+
+   /*
+    * Step 3a: the quad stream. Per 2x2 block, a worklist of the blocks with
+    * any coverage and a count of the distinct primitives in them; per quad,
+    * that primitive and the 4-bit mask of the block's pixels it covers.
+    * bsum3 holds the quad total, the fill's overflow counter and the
+    * interpolator's four debug counters.
+    */
+   CUdeviceptr blk_counts, blk_offsets, blk_list, blk_list_count;
+   CUdeviceptr bsum1, bsum1x, bsum2, bsum2x, bsum3, quad_overflow, dbg;
+   /* The single allocation sum3, bsum3 and clist_count are carved out of,
+    * so that the per-draw readback is one copy rather than three. */
+   CUdeviceptr counters;
+   unsigned bnb1, bnb2, bnb3, nblocks, quad_width;
+   CUdeviceptr quad_prim, quad_mask, peel_mask, quad_block;
+   unsigned quad_capacity;
+
+   /*
+    * Step 4: for each A-buffer slot, the shading slot holding that fragment's
+    * colour. Written by the merge, which is the only place both indices are in
+    * hand at once, and read by the composite as it walks a pixel's run.
+    */
+   CUdeviceptr shade_slot;
+
+   /*
+    * Step 3b: the shaded colours, one slot per (pixel, primitive), written by
+    * both paths and compared element-wise. `writes` counts rather than flags,
+    * so a slot two fragments claimed is visible instead of passing for
+    * agreement.
+    */
+   CUdeviceptr colors_abuf, writes_abuf, colors_peel, writes_peel;
+   bool colors_ready;
+
+   CUevent ev[17];
+
+   uint32_t *h_counts, *h_offsets, *h_cursor, *h_frags, *h_log, *h_deep_log;
+   uint32_t *h_deep_list;
+   uint32_t *h_blk_counts, *h_blk_offsets, *h_quad_prim, *h_peel_mask;
+   unsigned char *h_quad_mask;
+   float *h_colors_abuf, *h_colors_peel;
+   uint32_t *h_writes_abuf, *h_writes_peel;
+
+   unsigned verified, verify_max;
+   unsigned seq;
+};
+extern struct cp_abuf cp_abuf;
+
+bool cp_abuf_batch_enabled(void);
+bool cp_abuf_enabled(void);
+void cp_abuf_mark(CUevent ev, CUstream stream);
+void cp_abuf_report(void);
+void cp_abuf_scan(struct cp_context *cp, struct cp_device *screen, struct cp_abuf *ab, unsigned n);
+void cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen, CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x, CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3, unsigned n, unsigned nb1, unsigned nb2, unsigned nb3, CUdeviceptr clamp_counts, uint32_t clamp_capacity, CUdeviceptr clamp_overflow);
+bool cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h);
+bool cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total);
+void cp_abuf_verify(struct cp_abuf *ab, unsigned w, unsigned h, uint32_t total, unsigned passes_run, unsigned deep_n, uint32_t overflow, uint32_t long_runs);
+void cp_abuf_verify_quads(struct cp_abuf *ab, unsigned w, unsigned h, uint32_t total_frags, uint32_t total_quads, unsigned passes_run, uint32_t quad_overflow, const uint32_t *dbg);
+void cp_census_dump(const char *what, unsigned draw_seq, unsigned peel_seq, unsigned num_triangles, unsigned num_samples, const uint32_t *counts, unsigned w, unsigned h);
+bool cp_census_enabled(void);
+
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 
 /*
