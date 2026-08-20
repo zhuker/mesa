@@ -4678,37 +4678,40 @@ The proper fix is to move these into the `cp_debug.c` registry, where
 construction. That belongs with the rest of the front end's consolidation and
 is written down rather than done here.
 
-### An episode-owned arena: implemented, correct, and slower on its own
+### Attempt eight, and why the episode approach is closed
 
-`cp_pass_alloc_device()` bump-allocates from a device arena the episode owns,
-and `cp_pass_finish()` releases it. With `CPVK_PASS_ARENA=1` the three things a
-segment must keep -- its clipped stream, its triangle count and its slice
-table -- come from there instead of the shared scratch, which lets
-`cp_draw_execute` call `cp_scratch_begin()` on every draw rather than only on
-the segment that opens an episode.
+With the episode-owned arena in place, the deferring flush was tried both with
+and without it:
 
-That is the lifetime change seven earlier attempts needed and none of them
-made. It works:
+    arena + defer   OOM at frame 11
+    defer alone     complete, 1,496 frames, 8.50 ms -- once
+                    then OOM at frames 26, 8, 6 and 9 on repeat
 
-    sweep with CPVK_PASS_ARENA=1   18/18 run, 17/18 pixel-correct
-    both captures                  every frame, exit 0
+The single completing run was a fluke of ambient device memory, exactly the
+non-monotonic behaviour the arena-budget attempts showed. And the arena does
+**not** fix it, because the arena itself grows for the episode's whole length:
+it moves the growth from one allocator to another.
 
-**And on its own it costs 48%:**
+That closes the approach. Making episodes longer needs storage that is
+*bounded and reused* -- a ring with fences, or shading segments incrementally
+as they are recorded -- not storage that is merely owned by the episode. Eight
+attempts have now covered: deferring on every unmergeable draw, deferring on
+per-segment binds, bounding by segment count, bounding by arena bytes at three
+thresholds, giving the episode its own arena, and both together.
 
-    Crossroads     13.02 ms with the arena, 8.81 without
-    old capture    42.10 ms with,          31.28 without
+The arena is reverted with them. It is correct and it is the wrong shape: a
+grow-only allocator freed at the end of an episode has the same unbounded
+behaviour as the one it replaced, and keeping it would suggest the next
+attempt should start from it.
 
-Which is not surprising in hindsight: it pays for a second device arena, a
-`cuMemcpyHtoDAsync` for the slice table where the upload ring batched it, and a
-`cp_scratch_begin()` on every draw -- all to remove a constraint that only pays
-once episodes actually lengthen, which needs the deferring flush this does not
-enable by itself.
+After the revert: 18/18 samples run, 17/18 pixel-correct, both captures every
+frame at 8.84 and 31.27 ms.
 
-It is kept, off by default, because it is the piece the next attempt needs and
-building it again from the analysis would cost more than reading it. The
-default path is unchanged and measured so: 8.81 and 31.28 ms, the same as
-before it existed.
+### What the remaining 1.22x needs
 
-The honest summary is that the mechanism is now available and unproven. What
-would prove it is the combination -- arena on, deferring flush on -- and that
-is one experiment rather than a design question.
+Not a flush rule and not an allocator, but a change to when a segment's
+fragments are shaded. Every one of the eight attempts kept the model where an
+episode records segments and shades them all at the end, which is what makes
+its storage grow without bound. The Gallium driver lives with the same model
+and gets away with it because its episodes end at natural points this front end
+does not have.
