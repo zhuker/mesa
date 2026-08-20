@@ -9,6 +9,8 @@
  * this port rests on, tested here rather than asserted.
  */
 
+#include "vk_format.h"
+#include "util/format/u_format.h"
 #include "cpvk_private.h"
 
 #include "vk_alloc.h"
@@ -416,19 +418,35 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
          for (uint32_t a = 0; a < vi->vertexAttributeDescriptionCount && a < 16; a++) {
             const VkVertexInputAttributeDescription *ad =
                &vi->pVertexAttributeDescriptions[a];
-            unsigned stride = 0;
+            unsigned stride = 0, divisor = 0;
             for (uint32_t b = 0; b < vi->vertexBindingDescriptionCount; b++)
-               if (vi->pVertexBindingDescriptions[b].binding == ad->binding)
+               if (vi->pVertexBindingDescriptions[b].binding == ad->binding) {
                   stride = vi->pVertexBindingDescriptions[b].stride;
+                  /* Per-instance attributes step once per instance. */
+                  divisor = vi->pVertexBindingDescriptions[b].inputRate ==
+                            VK_VERTEX_INPUT_RATE_INSTANCE ? 1 : 0;
+               }
+            /* The format's consequences, worked out by the same function
+             * the Gallium front end calls: every component arrives in its own
+             * 32-bit slot however narrow it is in memory, so anything that is
+             * not already 32 bits per component has to be widened. The
+             * hardcoded four-float attribute this replaces read an R8G8B8A8
+             * as one number up to 2^32. */
+            enum pipe_format pfmt = vk_format_to_pipe_format(ad->format);
+            uint32_t nr_chan, chan_bytes, swizzle;
+            enum cp_vf_conv conv =
+               cp_vertex_format(pfmt, &nr_chan, &chan_bytes, &swizzle);
             pipeline->velem[ad->location] = (struct cp_vertex_elem) {
                .vertex_buffer_index = ad->binding,
                .src_offset = ad->offset,
                .src_stride = stride,
-               .attr_size = 16,
-               .nr_chan = 4,
-               .chan_bytes = 4,
-               .conv = CP_VF_CONV_COPY32,
-               .fill_w = 1,
+               .instance_divisor = divisor,
+               .attr_size = util_format_get_blocksize(pfmt),
+               .nr_chan = nr_chan,
+               .chan_bytes = chan_bytes,
+               .swizzle = swizzle,
+               .conv = conv,
+               .fill_w = cp_vertex_fill_w(pfmt, conv),
             };
             if (ad->location + 1 > pipeline->num_velem)
                pipeline->num_velem = ad->location + 1;

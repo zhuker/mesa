@@ -32,8 +32,13 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       if (result != VK_SUCCESS)
          return result;
 
-      for (unsigned d = 0; d < cmd->num_draws; d++)
-         cpvk_execute_draw(dev, &cmd->draws[d]);
+      /* In record order: a clear after a draw must not run before it. */
+      for (unsigned o = 0; o < cmd->num_ops; o++) {
+         if (cmd->ops[o].kind == CPVK_OP_CLEAR)
+            cpvk_execute_clear(dev, &cmd->ops[o].clear);
+         else
+            cpvk_execute_draw(dev, &cmd->ops[o].draw);
+      }
    }
 
    /* Ordering is the stream's; a submit promises only that everything it

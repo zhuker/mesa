@@ -147,6 +147,37 @@ struct cpvk_draw {
    CUdeviceptr addrs[16];
 };
 
+/* A recorded attachment clear. The colour one is a fill of the image itself;
+ * the depth one clears the renderer's own depth buffer, which is where the
+ * depth test reads from -- the depth image is never written, exactly as under
+ * Gallium, where lavapipe's zsbuf only ever set has_zs. */
+struct cpvk_clear {
+   bool depth;
+   float depth_value;
+   void *data;
+   uint64_t offset;
+   unsigned width, height, stride, pixel_size;
+   uint32_t value[4];
+};
+
+/*
+ * Command buffers record operations in order and replay them at submit.
+ * Ordering is the whole point: a clear recorded after a draw must not run
+ * before it, which a pair of separate arrays cannot express.
+ */
+enum cpvk_op_kind {
+   CPVK_OP_DRAW,
+   CPVK_OP_CLEAR,
+};
+
+struct cpvk_op {
+   enum cpvk_op_kind kind;
+   union {
+      struct cpvk_draw draw;
+      struct cpvk_clear clear;
+   };
+};
+
 struct cpvk_cmd_buffer {
    struct vk_command_buffer vk;
    struct cpvk_pipeline *pipeline;
@@ -161,11 +192,14 @@ struct cpvk_cmd_buffer {
    struct cp_rect scissor;
    uint64_t vb_base[16];
    unsigned num_vb;
-   struct cpvk_draw draws[CPVK_MAX_DISPATCHES];
-   unsigned num_draws;
+   const void *index_ptr;
+   unsigned index_size;
+   struct cpvk_op ops[CPVK_MAX_DISPATCHES];
+   unsigned num_ops;
 };
 
 void cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d);
+void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
 
 extern const struct vk_command_buffer_ops cpvk_cmd_buffer_ops;
 extern const struct vk_sync_type *const cpvk_sync_types[];

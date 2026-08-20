@@ -10,6 +10,8 @@
  * VkDeviceMemory per set, and none of the fault storm that arrangement caused.
  */
 
+#include "vk_format.h"
+#include "util/format/u_format.h"
 #include "cpvk_private.h"
 
 #include "vk_alloc.h"
@@ -154,12 +156,14 @@ cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
 
    vk_command_buffer_reset(&cmd->vk);
    cmd->num_dispatches = 0;
-   cmd->num_draws = 0;
+   cmd->num_ops = 0;
    cmd->pipeline = NULL;
    memset(cmd->addrs, 0, sizeof(cmd->addrs));
    memset(cmd->vb_base, 0, sizeof(cmd->vb_base));
    cmd->num_vb = 0;
    cmd->has_fb = false;
+   cmd->index_ptr = NULL;
+   cmd->index_size = 0;
 }
 
 static void
@@ -208,12 +212,14 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
    cmd->num_dispatches = 0;
-   cmd->num_draws = 0;
+   cmd->num_ops = 0;
    cmd->pipeline = NULL;
    memset(cmd->addrs, 0, sizeof(cmd->addrs));
    memset(cmd->vb_base, 0, sizeof(cmd->vb_base));
    cmd->num_vb = 0;
    cmd->has_fb = false;
+   cmd->index_ptr = NULL;
+   cmd->index_size = 0;
    return VK_SUCCESS;
 }
 
@@ -342,21 +348,57 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                 pRenderingInfo->renderArea.extent.height,
       .nr_cbufs = pRenderingInfo->colorAttachmentCount,
       .color_encoding = -1,
-      .has_zs = pRenderingInfo->pDepthAttachment != NULL,
+      .has_zs = pRenderingInfo->pDepthAttachment != NULL &&
+                pRenderingInfo->pDepthAttachment->imageView != VK_NULL_HANDLE,
    };
 
-   if (pRenderingInfo->colorAttachmentCount) {
-      VK_FROM_HANDLE(cpvk_image_view, view,
-                     pRenderingInfo->pColorAttachments[0].imageView);
+   const VkRenderingAttachmentInfo *cat =
+      pRenderingInfo->colorAttachmentCount ?
+      &pRenderingInfo->pColorAttachments[0] : NULL;
+   struct cpvk_image *cimg = NULL;
+
+   if (cat && cat->imageView) {
+      VK_FROM_HANDLE(cpvk_image_view, view, cat->imageView);
       if (view && view->image && view->image->mem) {
-         fb.color = (void *)(uintptr_t)(view->image->mem->dev_ptr +
-                                        view->image->offset);
-         fb.color_encoding = view->image->color;
+         cimg = view->image;
+         fb.color = (void *)(uintptr_t)(cimg->mem->dev_ptr + cimg->offset);
+         fb.color_encoding = cimg->color;
       }
    }
 
    cmd->fb = fb;
    cmd->has_fb = true;
+
+   /* LOAD_OP_CLEAR, recorded in order with the draws that follow it. */
+   if (cat && cimg && cat->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+       cmd->num_ops < CPVK_MAX_DISPATCHES) {
+      enum pipe_format pfmt = vk_format_to_pipe_format(cimg->vk.format);
+      struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
+      *op = (struct cpvk_op) { .kind = CPVK_OP_CLEAR };
+      op->clear = (struct cpvk_clear) {
+         .data = fb.color,
+         .width = fb.width,
+         .height = fb.height,
+         .stride = cimg->row_stride[0],
+         .pixel_size = util_format_get_blocksize(pfmt),
+      };
+      /* Packed here rather than in the kernel: cp_clear_rect takes the value
+       * already packed, and packing it twice produces a plausible wrong
+       * colour rather than an obvious one. */
+      util_format_pack_rgba(pfmt, op->clear.value,
+                            cat->clearValue.color.float32, 1);
+   }
+
+   const VkRenderingAttachmentInfo *dat = pRenderingInfo->pDepthAttachment;
+   if (dat && dat->imageView && dat->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+       cmd->num_ops < CPVK_MAX_DISPATCHES) {
+      struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
+      *op = (struct cpvk_op) { .kind = CPVK_OP_CLEAR };
+      op->clear = (struct cpvk_clear) {
+         .depth = true,
+         .depth_value = dat->clearValue.depthStencil.depth,
+      };
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -382,6 +424,29 @@ cpvk_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
          ? buf->mem->dev_ptr + buf->offset + pOffsets[i] : 0;
       cmd->num_vb = MAX2(cmd->num_vb, b + 1);
    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdBindIndexBuffer2(VkCommandBuffer commandBuffer, VkBuffer _buffer,
+                         VkDeviceSize offset, VkDeviceSize size,
+                         VkIndexType indexType)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_buffer, buf, _buffer);
+
+   cmd->index_ptr = (buf && buf->mem)
+      ? (const void *)(uintptr_t)(buf->mem->dev_ptr + buf->offset + offset)
+      : NULL;
+   cmd->index_size = indexType == VK_INDEX_TYPE_UINT16 ? 2 :
+                     indexType == VK_INDEX_TYPE_UINT8 ? 1 : 4;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdBindIndexBuffer(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                        VkDeviceSize offset, VkIndexType indexType)
+{
+   cpvk_CmdBindIndexBuffer2(commandBuffer, buffer, offset, VK_WHOLE_SIZE,
+                            indexType);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -434,31 +499,73 @@ cpvk_CmdSetScissor(VkCommandBuffer commandBuffer, uint32_t firstScissor,
       cpvk_CmdSetScissorWithCount(commandBuffer, count, pScissors);
 }
 
+/* One recorded draw, shared by vkCmdDraw and vkCmdDrawIndexed. */
+static void
+cpvk_record_draw(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first,
+                 unsigned instance_count, unsigned first_instance,
+                 int vertex_offset, bool indexed)
+{
+   if (cmd->num_ops >= CPVK_MAX_DISPATCHES || !cmd->pipeline)
+      return;
+
+   struct cpvk_op *op = &cmd->ops[cmd->num_ops++];
+   *op = (struct cpvk_op) { .kind = CPVK_OP_DRAW };
+   struct cpvk_draw *d = &op->draw;
+
+   d->pipeline = cmd->pipeline;
+   d->fb = cmd->fb;
+   d->viewport = cmd->viewport;
+   d->scissor = cmd->scissor;
+   d->range = (struct cp_draw_range) {
+      .start = first,
+      .count = count,
+      .index_bias = vertex_offset,
+   };
+   d->call = (struct cp_draw_call) {
+      .mode = cmd->pipeline->topology,
+      .instance_count = MAX2(instance_count, 1u),
+      .start_instance = first_instance,
+      .index_size = indexed ? cmd->index_size : 0,
+      .index_ptr = indexed ? cmd->index_ptr : NULL,
+   };
+   memcpy(d->vb_base, cmd->vb_base, sizeof(d->vb_base));
+   d->num_vb = cmd->num_vb;
+   memcpy(d->addrs, cmd->addrs, sizeof(d->addrs));
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
              uint32_t instanceCount, uint32_t firstVertex,
              uint32_t firstInstance)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   cpvk_record_draw(cmd, vertexCount, firstVertex, instanceCount,
+                    firstInstance, 0, false);
+}
 
-   if (cmd->num_draws >= CPVK_MAX_DISPATCHES || !cmd->pipeline)
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
+                    uint32_t instanceCount, uint32_t firstIndex,
+                    int32_t vertexOffset, uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   cpvk_record_draw(cmd, indexCount, firstIndex, instanceCount, firstInstance,
+                    vertexOffset, true);
+}
+
+/* A recorded clear, at submit. */
+void
+cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c)
+{
+   struct cp_context *cp = &dev->renderer;
+
+   if (c->depth) {
+      cp_clear_depthbuf(cp, c->depth_value);
       return;
+   }
 
-   struct cpvk_draw *d = &cmd->draws[cmd->num_draws++];
-   d->pipeline = cmd->pipeline;
-   d->fb = cmd->fb;
-   d->viewport = cmd->viewport;
-   d->scissor = cmd->scissor;
-   d->range = (struct cp_draw_range) { .start = firstVertex,
-                                       .count = vertexCount };
-   d->call = (struct cp_draw_call) {
-      .mode = cmd->pipeline->topology,
-      .instance_count = MAX2(instanceCount, 1u),
-      .start_instance = firstInstance,
-   };
-   memcpy(d->vb_base, cmd->vb_base, sizeof(d->vb_base));
-   d->num_vb = cmd->num_vb;
-   memcpy(d->addrs, cmd->addrs, sizeof(d->addrs));
+   cp_clear_rect(cp, c->data, c->offset, c->width, c->height, c->stride,
+                 c->pixel_size, c->value, false);
 }
 
 /* Run one recorded draw through the renderer. */
