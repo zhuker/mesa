@@ -94,8 +94,17 @@ struct cp_batch_key {
    uint32_t num_samplers;
 };
 
+/*
+ * The Gallium object, and the renderer inside it.
+ *
+ * pipe_context comes first because the driver's entry points cast a
+ * pipe_context straight to this. Everything the pipeline itself uses lives in
+ * cp_context beside it, which is what the native Vulkan driver will construct
+ * without a pipe_context existing at all.
+ */
+struct cp_gallium;
+
 struct cp_context {
-   struct pipe_context base;
 
    struct cp_screen *screen;
 
@@ -519,6 +528,26 @@ struct cp_context {
       unsigned num_overflow;
    } dscratch;
 };
+struct cp_gallium {
+   struct pipe_context base;   /* first: entry points cast pipe_context to this */
+   struct cp_context cp;
+};
+
+/*
+ * The one place a pipe_context becomes the renderer.
+ *
+ * Written as a function because the hand-written cast is silently wrong the
+ * moment the layout changes, and a wrong one compiles: making pipe_context a
+ * member rather than the head of cp_context left ten casts in cp_resource.c
+ * pointing at the wrong offset, and every sample still exited 0 while the
+ * capture rendered 28% wrong.
+ */
+static inline struct cp_context *
+cp_ctx(struct pipe_context *ctx)
+{
+   return &((struct cp_gallium *)ctx)->cp;
+}
+
 
 struct pipe_context *
 cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags);

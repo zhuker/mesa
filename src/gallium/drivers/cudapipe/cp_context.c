@@ -72,7 +72,7 @@ void cp_pass_finish(struct cp_context *cp);
 static void
 cp_destroy_context(struct pipe_context *ctx)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    cp_batch_flush(cp);
    cp_abuf_report();
    if (cp->visbuf)
@@ -117,14 +117,14 @@ cp_destroy_context(struct pipe_context *ctx)
          cuEventDestroy(cp->flush_retire[i]);
    if (ctx->stream_uploader)
       u_upload_destroy(ctx->stream_uploader);
-   FREE(cp);
+   FREE((struct cp_gallium *)ctx);
 }
 
 static void
 cp_set_framebuffer_state(struct pipe_context *ctx,
                          const struct pipe_framebuffer_state *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
 
    /* The visibility and depth buffers may be freed below, and the held-back
     * draws were recorded against the framebuffer that is going away. */
@@ -297,7 +297,7 @@ cp_set_viewport_states(struct pipe_context *ctx, unsigned start_slot,
                        unsigned num_viewports,
                        const struct pipe_viewport_state *viewports)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (num_viewports > 0) {
       if (memcmp(&cp->viewport_cso, &viewports[0], sizeof(cp->viewport_cso)))
          cp_batch_flush_why(cp, "viewport");
@@ -319,7 +319,7 @@ cp_set_scissor_states(struct pipe_context *ctx, unsigned start_slot,
                       unsigned num_scissors,
                       const struct pipe_scissor_state *scissors)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (num_scissors > 0) {
       /* A batch on the stable clipper records the scissor per draw, so a
        * pending one survives the change; one that cannot resolve a primitive
@@ -7596,7 +7596,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *gallium_info,
             const struct pipe_draw_start_count_bias *gallium_draws,
             unsigned num_draws)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct cp_screen *screen = cp->screen;
 
    /*
@@ -7735,7 +7735,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *gallium_info,
 static void
 cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct cp_shader_binary *bin = cp->compute_shader;
 
    /* A dispatch may read what the held-back draws were going to write. */
@@ -7852,7 +7852,7 @@ static void
 cp_flush(struct pipe_context *ctx, struct pipe_fence_handle **fence,
          unsigned flags)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    cuCtxSetCurrent(cp->screen->cuda_ctx);
 
    /* Before the fence: a batch still being held back has not been submitted,
@@ -7931,7 +7931,7 @@ cp_create_blend_state(struct pipe_context *ctx,
 static void
 cp_bind_blend_state(struct pipe_context *ctx, void *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct pipe_blend_state next;
    if (state)
       next = *(struct pipe_blend_state *)state;
@@ -7985,7 +7985,7 @@ cp_create_rasterizer_state(struct pipe_context *ctx,
 static void
 cp_bind_rasterizer_state(struct pipe_context *ctx, void *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct pipe_rasterizer_state next;
    if (state)
       next = *(struct pipe_rasterizer_state *)state;
@@ -8021,7 +8021,7 @@ cp_create_depth_stencil_alpha_state(struct pipe_context *ctx,
 static void
 cp_bind_depth_stencil_alpha_state(struct pipe_context *ctx, void *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct pipe_depth_stencil_alpha_state next;
    if (state)
       next = *(struct pipe_depth_stencil_alpha_state *)state;
@@ -8081,7 +8081,7 @@ cp_create_vertex_elements_state(struct pipe_context *ctx, unsigned num_elements,
 static void
 cp_bind_vertex_elements_state(struct pipe_context *ctx, void *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (state) {
       struct cp_vertex_elements_state *ve = (struct cp_vertex_elements_state *)state;
       if (ve->num_elements != cp->num_vertex_elements ||
@@ -8134,7 +8134,7 @@ static void
 cp_delete_vertex_elements_state(struct pipe_context *ctx, void *state)
 {
    /* A pass-episode segment may still name this state; render it first. */
-   cp_batch_flush((struct cp_context *)ctx);
+   cp_batch_flush(cp_ctx(ctx));
    FREE(state);  /* frees cp_vertex_elements_state */
 }
 
@@ -8142,7 +8142,7 @@ static void *
 cp_create_fs_state(struct pipe_context *ctx,
                    const struct pipe_shader_state *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (state->type != PIPE_SHADER_IR_NIR)
       return MALLOC(1);
 
@@ -8170,7 +8170,7 @@ cp_create_fs_state(struct pipe_context *ctx,
 static void
 cp_bind_fs_state(struct pipe_context *ctx, void *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (cp->fs_shader != (struct cp_shader_binary *)state)
       cp_batch_flush_defer_why(cp, "fragment shader");
    cp->fs_shader = (struct cp_shader_binary *)state;
@@ -8180,7 +8180,7 @@ static void
 cp_delete_fs_state(struct pipe_context *ctx, void *state)
 {
    /* A pass-episode segment may still name this shader; render it first. */
-   cp_batch_flush((struct cp_context *)ctx);
+   cp_batch_flush(cp_ctx(ctx));
    cp_shader_binary_destroy((struct cp_shader_binary *)state);
 }
 
@@ -8188,7 +8188,7 @@ static void *
 cp_create_vs_state(struct pipe_context *ctx,
                    const struct pipe_shader_state *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (state->type != PIPE_SHADER_IR_NIR)
       return MALLOC(1);
 
@@ -8216,7 +8216,7 @@ cp_create_vs_state(struct pipe_context *ctx,
 static void
 cp_bind_vs_state(struct pipe_context *ctx, void *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (cp->vs_shader != (struct cp_shader_binary *)state) {
       /* Resolved once: this runs on every draw of every sample. A scene that
        * builds one pipeline per material — gltfscenerendering — rebinds a
@@ -8242,7 +8242,7 @@ static void
 cp_delete_vs_state(struct pipe_context *ctx, void *state)
 {
    /* A pass-episode segment may still name this shader; render it first. */
-   cp_batch_flush((struct cp_context *)ctx);
+   cp_batch_flush(cp_ctx(ctx));
    FREE(state);
 }
 
@@ -8250,7 +8250,7 @@ static void *
 cp_create_compute_state(struct pipe_context *ctx,
                         const struct pipe_compute_state *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (state->ir_type != PIPE_SHADER_IR_NIR)
       return NULL;
 
@@ -8270,7 +8270,7 @@ cp_create_compute_state(struct pipe_context *ctx,
 static void
 cp_bind_compute_state(struct pipe_context *ctx, void *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    cp->compute_shader = (struct cp_shader_binary *)state;
 }
 
@@ -8340,7 +8340,7 @@ cp_set_sampler_views(struct pipe_context *ctx, mesa_shader_stage shader,
                      unsigned start, unsigned count, unsigned unbind_num_trailing_slots,
                      struct pipe_sampler_view **views)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (cp_debug->debug_tex)
       fprintf(stderr, "cudapipe: set_sampler_views stage=%d start=%u count=%u views=%p\n",
               shader, start, count, (void *)views);
@@ -8411,7 +8411,7 @@ cp_set_constant_buffer(struct pipe_context *ctx, mesa_shader_stage shader,
                        uint index,
                        const struct pipe_constant_buffer *buf)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (index >= CP_MAX_CONST_BUFFERS)
       return;
    if (shader != MESA_SHADER_COMPUTE && shader != MESA_SHADER_FRAGMENT &&
@@ -8484,7 +8484,7 @@ static void
 cp_set_vertex_buffers(struct pipe_context *ctx, unsigned count,
                       const struct pipe_vertex_buffer *buffers)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
 
    /* A pending batch survives this: it snapshotted one row of resolved
     * per-element bases per draw at cp_batch_record() time, so nothing it will
@@ -8515,7 +8515,7 @@ cp_set_shader_buffers(struct pipe_context *ctx, mesa_shader_stage shader,
                       const struct pipe_shader_buffer *buffers,
                       unsigned writable_bitmask)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    if (shader != MESA_SHADER_COMPUTE)
       return;
    for (unsigned i = 0; i < count; i++) {
@@ -8810,7 +8810,7 @@ cp_create_texture_handle(struct pipe_context *ctx,
                          struct pipe_sampler_view *view,
                          const struct pipe_sampler_state *state)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct cp_texture_handle *h = CALLOC_STRUCT(cp_texture_handle);
    if (!h)
       return 0;
@@ -8927,58 +8927,59 @@ cp_buffer_subdata(struct pipe_context *ctx, struct pipe_resource *resource,
 struct pipe_context *
 cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 {
-   struct cp_context *ctx = CALLOC_STRUCT(cp_context);
-   if (!ctx)
+   struct cp_gallium *g = CALLOC_STRUCT(cp_gallium);
+   if (!g)
       return NULL;
+   struct cp_context *ctx = &g->cp;
 
    ctx->screen = cp_screen(screen);
-   ctx->base.screen = screen;
-   ctx->base.priv = priv;
+   g->base.screen = screen;
+   g->base.priv = priv;
 
-   ctx->base.destroy = cp_destroy_context;
+   g->base.destroy = cp_destroy_context;
 
-   ctx->base.draw_vbo = cp_draw_vbo;
-   ctx->base.launch_grid = cp_launch_grid;
-   ctx->base.flush = cp_flush;
+   g->base.draw_vbo = cp_draw_vbo;
+   g->base.launch_grid = cp_launch_grid;
+   g->base.flush = cp_flush;
 
-   ctx->base.create_blend_state = cp_create_blend_state;
-   ctx->base.bind_blend_state = cp_bind_blend_state;
-   ctx->base.delete_blend_state = cp_delete_blend_state;
+   g->base.create_blend_state = cp_create_blend_state;
+   g->base.bind_blend_state = cp_bind_blend_state;
+   g->base.delete_blend_state = cp_delete_blend_state;
 
-   ctx->base.create_rasterizer_state = cp_create_rasterizer_state;
-   ctx->base.bind_rasterizer_state = cp_bind_rasterizer_state;
-   ctx->base.delete_rasterizer_state = cp_delete_rasterizer_state;
+   g->base.create_rasterizer_state = cp_create_rasterizer_state;
+   g->base.bind_rasterizer_state = cp_bind_rasterizer_state;
+   g->base.delete_rasterizer_state = cp_delete_rasterizer_state;
 
-   ctx->base.create_depth_stencil_alpha_state = cp_create_depth_stencil_alpha_state;
-   ctx->base.bind_depth_stencil_alpha_state = cp_bind_depth_stencil_alpha_state;
-   ctx->base.delete_depth_stencil_alpha_state = cp_delete_depth_stencil_alpha_state;
+   g->base.create_depth_stencil_alpha_state = cp_create_depth_stencil_alpha_state;
+   g->base.bind_depth_stencil_alpha_state = cp_bind_depth_stencil_alpha_state;
+   g->base.delete_depth_stencil_alpha_state = cp_delete_depth_stencil_alpha_state;
 
-   ctx->base.create_vertex_elements_state = cp_create_vertex_elements_state;
-   ctx->base.bind_vertex_elements_state = cp_bind_vertex_elements_state;
-   ctx->base.delete_vertex_elements_state = cp_delete_vertex_elements_state;
+   g->base.create_vertex_elements_state = cp_create_vertex_elements_state;
+   g->base.bind_vertex_elements_state = cp_bind_vertex_elements_state;
+   g->base.delete_vertex_elements_state = cp_delete_vertex_elements_state;
 
-   ctx->base.create_fs_state = cp_create_fs_state;
-   ctx->base.bind_fs_state = cp_bind_fs_state;
-   ctx->base.delete_fs_state = cp_delete_fs_state;
+   g->base.create_fs_state = cp_create_fs_state;
+   g->base.bind_fs_state = cp_bind_fs_state;
+   g->base.delete_fs_state = cp_delete_fs_state;
 
-   ctx->base.create_vs_state = cp_create_vs_state;
-   ctx->base.bind_vs_state = cp_bind_vs_state;
-   ctx->base.delete_vs_state = cp_delete_vs_state;
-   ctx->base.bind_gs_state = cp_bind_gs_state;
-   ctx->base.bind_tcs_state = cp_bind_tcs_state;
-   ctx->base.bind_tes_state = cp_bind_tes_state;
+   g->base.create_vs_state = cp_create_vs_state;
+   g->base.bind_vs_state = cp_bind_vs_state;
+   g->base.delete_vs_state = cp_delete_vs_state;
+   g->base.bind_gs_state = cp_bind_gs_state;
+   g->base.bind_tcs_state = cp_bind_tcs_state;
+   g->base.bind_tes_state = cp_bind_tes_state;
 
-   ctx->base.create_compute_state = cp_create_compute_state;
-   ctx->base.bind_compute_state = cp_bind_compute_state;
-   ctx->base.delete_compute_state = cp_delete_compute_state;
+   g->base.create_compute_state = cp_create_compute_state;
+   g->base.bind_compute_state = cp_bind_compute_state;
+   g->base.delete_compute_state = cp_delete_compute_state;
 
-   ctx->base.create_sampler_state = cp_create_sampler_state;
-   ctx->base.bind_sampler_states = cp_bind_sampler_states;
-   ctx->base.delete_sampler_state = cp_delete_sampler_state;
+   g->base.create_sampler_state = cp_create_sampler_state;
+   g->base.bind_sampler_states = cp_bind_sampler_states;
+   g->base.delete_sampler_state = cp_delete_sampler_state;
 
-   ctx->base.create_sampler_view = cp_create_sampler_view;
-   ctx->base.sampler_view_destroy = cp_sampler_view_destroy;
-   ctx->base.set_sampler_views = cp_set_sampler_views;
+   g->base.create_sampler_view = cp_create_sampler_view;
+   g->base.sampler_view_destroy = cp_sampler_view_destroy;
+   g->base.set_sampler_views = cp_set_sampler_views;
 
    /*
     * pipe_resource_release() calls this through the context, not the screen,
@@ -8986,38 +8987,38 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
     * lavapipe tears its upload manager down. Four samples were dying there
     * after rendering correctly. llvmpipe uses the same default.
     */
-   ctx->base.resource_release = u_default_resource_release;
-   ctx->base.set_framebuffer_state = cp_set_framebuffer_state;
-   ctx->base.set_viewport_states = cp_set_viewport_states;
-   ctx->base.set_scissor_states = cp_set_scissor_states;
-   ctx->base.set_constant_buffer = cp_set_constant_buffer;
-   ctx->base.set_vertex_buffers = cp_set_vertex_buffers;
-   ctx->base.set_shader_buffers = cp_set_shader_buffers;
-   ctx->base.set_shader_images = cp_set_shader_images;
-   ctx->base.set_blend_color = cp_set_blend_color;
-   ctx->base.set_stencil_ref = cp_set_stencil_ref;
-   ctx->base.set_sample_mask = cp_set_sample_mask;
-   ctx->base.set_clip_state = cp_set_clip_state;
-   ctx->base.set_polygon_stipple = cp_set_polygon_stipple;
-   ctx->base.buffer_subdata = cp_buffer_subdata;
-   ctx->base.set_sample_locations = cp_set_sample_locations;
-   ctx->base.set_min_samples = cp_set_min_samples;
-   ctx->base.render_condition = cp_render_condition;
-   ctx->base.create_query = cp_create_query;
-   ctx->base.destroy_query = cp_destroy_query;
-   ctx->base.begin_query = cp_begin_query;
-   ctx->base.end_query = cp_end_query;
-   ctx->base.get_query_result = cp_get_query_result;
-   ctx->base.get_query_result_resource = cp_get_query_result_resource;
-   ctx->base.create_texture_handle = cp_create_texture_handle;
-   ctx->base.create_image_handle = cp_create_image_handle;
-   ctx->base.delete_texture_handle = cp_delete_texture_handle;
-   ctx->base.delete_image_handle = cp_delete_image_handle;
+   g->base.resource_release = u_default_resource_release;
+   g->base.set_framebuffer_state = cp_set_framebuffer_state;
+   g->base.set_viewport_states = cp_set_viewport_states;
+   g->base.set_scissor_states = cp_set_scissor_states;
+   g->base.set_constant_buffer = cp_set_constant_buffer;
+   g->base.set_vertex_buffers = cp_set_vertex_buffers;
+   g->base.set_shader_buffers = cp_set_shader_buffers;
+   g->base.set_shader_images = cp_set_shader_images;
+   g->base.set_blend_color = cp_set_blend_color;
+   g->base.set_stencil_ref = cp_set_stencil_ref;
+   g->base.set_sample_mask = cp_set_sample_mask;
+   g->base.set_clip_state = cp_set_clip_state;
+   g->base.set_polygon_stipple = cp_set_polygon_stipple;
+   g->base.buffer_subdata = cp_buffer_subdata;
+   g->base.set_sample_locations = cp_set_sample_locations;
+   g->base.set_min_samples = cp_set_min_samples;
+   g->base.render_condition = cp_render_condition;
+   g->base.create_query = cp_create_query;
+   g->base.destroy_query = cp_destroy_query;
+   g->base.begin_query = cp_begin_query;
+   g->base.end_query = cp_end_query;
+   g->base.get_query_result = cp_get_query_result;
+   g->base.get_query_result_resource = cp_get_query_result_resource;
+   g->base.create_texture_handle = cp_create_texture_handle;
+   g->base.create_image_handle = cp_create_image_handle;
+   g->base.delete_texture_handle = cp_delete_texture_handle;
+   g->base.delete_image_handle = cp_delete_image_handle;
 
-   ctx->base.stream_uploader = u_upload_create_default(&ctx->base);
-   ctx->base.const_uploader = ctx->base.stream_uploader;
+   g->base.stream_uploader = u_upload_create_default(&g->base);
+   g->base.const_uploader = g->base.stream_uploader;
 
-   cudapipe_init_context_resource_funcs(&ctx->base);
+   cudapipe_init_context_resource_funcs(&g->base);
 
    /* Allocate persistent GPU state (managed) and device-only arena */
    cuCtxSetCurrent(ctx->screen->cuda_ctx);
@@ -9083,5 +9084,5 @@ cudapipe_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->cur_qset.huge_tiles = ctx->rast_huge_tiles;
    ctx->cur_qset.counts = ctx->rast_counts;
 
-   return &ctx->base;
+   return &g->base;
 }

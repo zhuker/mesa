@@ -183,7 +183,7 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
               unsigned level, unsigned usage, const struct pipe_box *box,
               struct pipe_transfer **out_transfer)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct cp_resource *res = cp_resource(resource);
    struct cp_transfer *cp_transfer = CALLOC_STRUCT(cp_transfer);
    if (!cp_transfer)
@@ -257,7 +257,7 @@ cp_buffer_map(struct pipe_context *ctx, struct pipe_resource *resource,
 static void
 cp_buffer_unmap(struct pipe_context *ctx, struct pipe_transfer *transfer)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct cp_transfer *cp_transfer = (struct cp_transfer *)transfer;
    if (cp_transfer->staging) {
       struct cp_resource *res = cp_resource(transfer->resource);
@@ -282,7 +282,7 @@ cp_resource_copy_region(struct pipe_context *ctx, struct pipe_resource *dst,
                         unsigned dstz, struct pipe_resource *src,
                         unsigned src_level, const struct pipe_box *src_box)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct cp_resource *src_res = cp_resource(src);
    struct cp_resource *dst_res = cp_resource(dst);
    cp_batch_flush(cp);
@@ -374,7 +374,7 @@ cp_image_copy_buffer(struct pipe_context *ctx,
                      unsigned level,
                      const struct pipe_box *box)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct cp_resource *dst_res = cp_resource(dst);
    struct cp_resource *src_res = cp_resource(src);
 
@@ -462,7 +462,7 @@ cp_resource_device_accessible(const struct cp_resource *res)
 static void
 cp_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct cp_resource *src_res = cp_resource(info->src.resource);
    struct cp_resource *dst_res = cp_resource(info->dst.resource);
    cp_batch_flush(cp);
@@ -787,7 +787,7 @@ cp_clear_buffer(struct pipe_context *ctx, struct pipe_resource *res,
                 unsigned offset, unsigned size,
                 const void *clear_value, int clear_value_size)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct cp_resource *cp_res = cp_resource(res);
    cp_batch_flush(cp);
    void *data = cp_resource_data(cp_res);
@@ -889,7 +889,7 @@ cp_clear_render_target(struct pipe_context *ctx, struct pipe_surface *dst,
 {
    if (!dst || !dst->texture)
       return;
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    cp_batch_flush(cp);
    struct cp_resource *res = cp_resource(dst->texture);
    void *data = cp_resource_data(res);
@@ -927,7 +927,7 @@ cp_clear_depth_stencil(struct pipe_context *ctx, struct pipe_surface *dst,
                        unsigned width, unsigned height,
                        bool render_condition_enabled)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    cp_batch_flush(cp);
    if (!dst || !dst->texture)
       return;
@@ -974,7 +974,7 @@ static void
 cp_clear_texture(struct pipe_context *ctx, struct pipe_resource *res,
                  unsigned level, const struct pipe_box *box, const void *data)
 {
-   struct cp_context *cp = (struct cp_context *)ctx;
+   struct cp_context *cp = cp_ctx(ctx);
    struct cp_resource *cp_res = cp_resource(res);
    cp_batch_flush(cp);
    void *tex_data = cp_resource_data(cp_res);
@@ -1026,14 +1026,14 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
          const union pipe_color_union *color, double depth,
          unsigned stencil)
 {
-   struct cp_context *cp_ctx = (struct cp_context *)ctx;
-   struct cp_screen *screen = cp_ctx->screen;
-   struct pipe_framebuffer_state *fb = &cp_ctx->framebuffer;
+   struct cp_context *cpc = cp_ctx(ctx);
+   struct cp_screen *screen = cpc->screen;
+   struct pipe_framebuffer_state *fb = &cpc->framebuffer;
 
    cuCtxSetCurrent(screen->cuda_ctx);
 
    /* A clear overwrites what the held-back draws were going to draw into. */
-   cp_batch_flush(cp_ctx);
+   cp_batch_flush(cpc);
 
    if (cp_debug->debug_draw)
       fprintf(stderr, "cudapipe: clear buffers=0x%x color=[%.2f,%.2f,%.2f,%.2f]\n",
@@ -1081,7 +1081,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
             cuLaunchKernel(screen->kernels.clear_kernel,
                (w + 15) / 16, (h + 15) / 16, 1,
                16, 16, 1,
-               0, cp_ctx->stream, params, NULL);
+               0, cpc->stream, params, NULL);
          }
       }
    }
@@ -1089,7 +1089,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
    /* The rasterizer tests against its own depth buffer, so clear that too —
     * not just the application's depth attachment. */
    if (buffers & PIPE_CLEAR_DEPTH)
-      cp_clear_depthbuf(cp_ctx, (float)depth);
+      cp_clear_depthbuf(cpc, (float)depth);
 
    /* Clear depth */
    if ((buffers & PIPE_CLEAR_DEPTH) && fb->zsbuf.texture && screen->kernels.clear_depth_kernel) {
@@ -1121,7 +1121,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
          cuLaunchKernel(screen->kernels.clear_depth_kernel,
             (w + 15) / 16, (h + 15) / 16, 1,
             16, 16, 1,
-            0, cp_ctx->stream, params, NULL);
+            0, cpc->stream, params, NULL);
       }
    }
 
