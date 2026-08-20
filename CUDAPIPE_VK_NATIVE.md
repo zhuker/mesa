@@ -2339,3 +2339,33 @@ test does not reproduce. The next diagnostic is not another hypothesis but
 `CUDAPIPE_DEBUG_BATCHDIFF` run on the sample twice -- once with the key and
 once without -- to see exactly which draws merge when it is removed. The
 answer is in that difference and nowhere else.
+
+### What the descriptor key is actually preventing, counted
+
+`CUDAPIPE_DEBUG_BATCHDIFF` on `gltfscenerendering` at `BATCH_MAX=3`, the same
+frame each way:
+
+    with the key      20 separations: 10 "the draws differ",
+                                       8 "descriptors",
+                                       2 "fragment shader"
+    without the key    6 separations:  3 "the draws differ",
+                                       3 "fragment shader"
+
+So removing it enables exactly **eight merges**, and one or more of those eight
+is wrong. Everything else about the frame is unchanged.
+
+Those eight draws differ *only* in their descriptor sets -- that is what the
+diagnostic means -- which is precisely the case the per-draw table exists to
+handle, and precisely the case `cpvk_batchtex` merges correctly eight at a
+time with two sets, nine textures and 48,000 triangles.
+
+Checked this turn and not the cause: every one of the six `cp_batch_flush`
+call sites passes `cp->batch.fs_ubos`, the per-draw fragment table, so no
+flush path silently falls back to the live bindings.
+
+The question is now as small as it can be made without new instrumentation:
+eight draws that differ only in descriptors merge, and the frame is wrong by
+5.516. The next step is to print the rows themselves -- the `fs_ubos` values
+recorded for each draw of that batch, and the row each fragment resolves to --
+rather than to reason about which stage could be at fault. Every structural
+hypothesis has been eliminated by measurement; what is left is the data.
