@@ -3527,3 +3527,41 @@ computed to, or the allocation does not extend to the later layers.
 
 The check is direct -- read back device memory at `base + layer * level_size`
 for each of the six faces after the copies -- and it needs no shader.
+
+### vkCmdCopyImage ignored baseArrayLayer, and the fix for it was never in the tree
+
+Reading back the six faces of each cube at the address the sampler uses --
+`base + layer * level_size[0]`, at descriptor-write time so the copies have
+happened -- showed the generated cubes with face 0 populated and faces 1 to 5
+all zero, while the environment cube loaded from a file had all six.
+
+`vkCmdCopyImage` was not adding `baseArrayLayer` to either subresource, so the
+six copies that build a cube all landed on face zero.
+
+**And this was supposedly fixed many turns ago.** The commit
+"honour array layers in rendering and image copies" says so, its message
+explains the reasoning, and it recorded honestly that no sample changed. The
+reason no sample changed is that the change was never applied: `git log -S
+d_layer` on the file returns nothing. The edit was a `str.replace` whose
+pattern did not match, with no assertion behind it, and the "measured, changed
+nothing" note made the absence look like a result.
+
+Applied properly, with the assertion:
+
+    face 0 @0x...ee000000: 294f 284c 277f 3c00
+    face 1 @0x...ee200000: 27db 2811 273b 3c00
+    face 2 @0x...ee400000: 280e 2821 2762 3c00
+    face 3 @0x...ee600000: 305a 3343 362e 3c00
+    face 4 @0x...ee800000: 29ae 2816 265a 3c00
+    face 5 @0x...eea00000: 281a 2825 2707 3c00
+
+    pbribl  1.252 -> 0.030
+
+Forty-fold. The sweep holds at 18/18 running and 15/18 pixel-correct, and
+fourteen unit tests pass. pbribl is not yet under the 0.01 threshold, but its
+reflections are there.
+
+The lesson is not "assert your edits" -- that was already written down twice
+this session after `head` truncations and a crashing instrument. It is that a
+null result from an unverified change is indistinguishable from a null change,
+and this one sat in the record for twenty turns looking like evidence.

@@ -180,6 +180,30 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
          set->host[flat].sampler_index_or_img_stride = samp ? samp->index : 0;
       }
 
+      /*
+       * The six faces of a cube, read back from where the sampler looks:
+       * base + layer * level_size. Done here rather than at view creation
+       * because the view exists before anything has been copied into the
+       * image, so the only honest place to ask is when the descriptor that
+       * will be sampled is written.
+       */
+      if (getenv("CPVK_DEBUG_FACES") && ii->imageView) {
+         VK_FROM_HANDLE(cpvk_image_view, fv, ii->imageView);
+         struct cpvk_image *fi = fv ? fv->image : NULL;
+         if (fi && fi->mem && fi->vk.array_layers == 6) {
+            for (unsigned f = 0; f < 6; f++) {
+               uint16_t h[4] = { 0 };
+               CUdeviceptr a = fi->mem->dev_ptr + fi->offset +
+                               fi->level_offset[0] +
+                               (uint64_t)f * fi->level_size[0];
+               cuMemcpyDtoH(h, a, sizeof(h));
+               fprintf(stderr, "face %u @%p: %04x %04x %04x %04x  (%ux%u)\n",
+                       f, (void *)(uintptr_t)a, h[0], h[1], h[2], h[3],
+                       fi->vk.extent.width, fi->vk.extent.height);
+            }
+         }
+      }
+
       if (getenv("CPVK_DEBUG_RT")) {
          VK_FROM_HANDLE(cpvk_image_view, dv, ii->imageView);
          fprintf(stderr, "desc flat=%u type=%u tex=%p "
@@ -1683,9 +1707,24 @@ cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
       struct cpvk_copy *c = cpvk_record_copy(cmd);
       if (!c)
          return;
+      /*
+       * The array layer. A cube map is built as six copies into
+       * baseArrayLayer 0..5 of one image, and without this every one of them
+       * landed on face zero: pbribl's generated cubes had face 0 populated
+       * and faces 1 to 5 all zero, so its spheres reflected nothing.
+       *
+       * The layer stride inside a level is that level's size, which is how
+       * cpvk_image_layout lays the image out and how the sampler's
+       * img_stride[level] indexes it.
+       */
+      uint64_t s_layer = (uint64_t)r->srcSubresource.baseArrayLayer *
+                         src->level_size[r->srcSubresource.mipLevel];
+      uint64_t d_layer = (uint64_t)r->dstSubresource.baseArrayLayer *
+                         dst->level_size[r->dstSubresource.mipLevel];
+
       *c = (struct cpvk_copy) {
-         .src = sb + (size_t)r->srcOffset.y * sp + (size_t)r->srcOffset.x * sbpp,
-         .dst = db + (size_t)r->dstOffset.y * dp + (size_t)r->dstOffset.x * dbpp,
+         .src = sb + s_layer + (size_t)r->srcOffset.y * sp + (size_t)r->srcOffset.x * sbpp,
+         .dst = db + d_layer + (size_t)r->dstOffset.y * dp + (size_t)r->dstOffset.x * dbpp,
          .src_pitch = sp,
          .dst_pitch = dp,
          .width_bytes = (size_t)r->extent.width * sbpp,
