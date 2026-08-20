@@ -3832,3 +3832,37 @@ handle is keeping the base and discarding the index.
 This is now a precise statement with a one-command check behind it, and the
 three fixes made while finding it are real gaps closed regardless: each would
 have made some other shader silently wrong.
+
+### The exact diagnosis, from the NIR
+
+texturemipmapgen's fragment shader, before the driver's descriptor lowering:
+
+    %6  = @load_deref (&ubo->samplerIndex)
+    %7  = deref_var &samplers (uniform sampler[3])
+    %8  = deref_array &(*%7)[%6]              // samplers[%6]
+    %13 = txb %0 (texture_deref), %8 (sampler_deref), %10 (coord), %12 (bias)
+
+and after it:
+
+    %9  = @load_const_buf_base_addr_lvp (0x1)
+    %10 = load_const (0x0000000000000080)     // 128 = binding 2 * 64
+    %11 = iadd %9, %10
+    %12 = txb %1 (coord), %3 (bias), %7 (texture_handle), %11 (sampler_handle)
+
+**The array deref becomes a constant offset and the index is discarded.** `%6`,
+the load of `samplerIndex`, does not survive into the lowered shader at all.
+The handle is `set_base + 2 * 64` -- binding 2, element 0 -- for every value the
+uniform could hold, which is exactly what the device print showed for all four
+builds of the shader.
+
+That closes the diagnosis: the pass which turns a sampler `deref_array` into a
+handle keeps the base binding and drops the element. Nothing downstream can
+recover it, which is why implementing `vulkan_resource_reindex`, the tex-src
+sampler and texture offsets, and dynamic `vulkan_resource_index` each changed
+nothing -- the index was already gone before any of them ran.
+
+Four turns of implementing plausible mechanisms would have been one turn of
+reading the dump. The same instrument found `load_output` at the start of this
+session, for the same class of bug, and the lesson did not transfer: when a
+value is missing, dump the representation that carries it rather than
+implementing the ways it might have arrived.
