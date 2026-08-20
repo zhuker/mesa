@@ -401,7 +401,8 @@ cudapipe_create_screen(struct sw_winsys *winsys)
    snprintf(screen->renderer_string, sizeof(screen->renderer_string),
             "cudapipe (sm_%d%d)", screen->sm_major, screen->sm_minor);
 
-   if (!cp_kernels_init(&screen->kernels, screen)) {
+   if (!cp_kernels_init(&screen->kernels, screen->sm_major,
+                        screen->sm_minor)) {
       fprintf(stderr, "cudapipe: warning: rasterization kernels failed to compile\n");
       /* Non-fatal — compute still works, just no draw support */
    }

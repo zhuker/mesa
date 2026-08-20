@@ -26,6 +26,8 @@
 #include "vk_queue.h"
 #include "vk_command_buffer.h"
 #include "cp_nir_to_llvm.h"
+#include "cp_kernels.h"
+#include "cp_debug.h"
 #include "vk_buffer.h"
 #include "vk_image.h"
 #include "vk_descriptor_set_layout.h"
@@ -45,6 +47,7 @@ struct cpvk_physical_device {
    struct vk_physical_device vk;
 
    CUdevice cu_dev;
+   struct cp_kernels kernels;      /* built once the device has a context */
    int sm_major, sm_minor;
    char name[256];
    size_t vram;

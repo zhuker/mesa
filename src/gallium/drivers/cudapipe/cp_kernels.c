@@ -1,6 +1,5 @@
 #include "cp_kernels.h"
 #include "cp_debug.h"
-#include "cp_screen.h"
 #include "kernels/cp_rast_types.h"
 #include "util/u_memory.h"
 #include "util/macros.h"
@@ -161,7 +160,7 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
 }
 
 char *
-cp_compile_sampler_variant(struct cp_screen *screen,
+cp_compile_sampler_variant(int sm_major, int sm_minor,
                            const struct cp_sampler_info *info)
 {
    static_assert(sizeof(float) == sizeof(uint32_t), "32-bit float required");
@@ -201,7 +200,7 @@ cp_compile_sampler_variant(struct cp_screen *screen,
    memcpy(source, defines, (size_t)len);
    memcpy(source + len, cp_sampler_src, source_len + 1);
    char *ptx = compile_cuda_source(source, "cp_sampler_variant.cu",
-                                   screen->sm_major, screen->sm_minor, true);
+                                   sm_major, sm_minor, true);
    free(source);
    return ptx;
 }
@@ -209,10 +208,10 @@ cp_compile_sampler_variant(struct cp_screen *screen,
 /* Compile one kernel source and load it as a module. */
 static bool
 build_module(CUmodule *out, const char *src, const char *name,
-             struct cp_screen *screen)
+             int sm_major, int sm_minor)
 {
-   char *ptx = compile_cuda_source(src, name, screen->sm_major,
-                                   screen->sm_minor, false);
+   char *ptx = compile_cuda_source(src, name, sm_major,
+                                   sm_minor, false);
    if (!ptx) {
       fprintf(stderr, "cudapipe: failed to compile %s\n", name);
       return false;
@@ -228,16 +227,16 @@ build_module(CUmodule *out, const char *src, const char *name,
 }
 
 bool
-cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
+cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor)
 {
    memset(k, 0, sizeof(*k));
 
-   if (!build_module(&k->clear_module, cp_clear_src, "cp_clear.cu", screen))
+   if (!build_module(&k->clear_module, cp_clear_src, "cp_clear.cu", sm_major, sm_minor))
       return false;
    cuModuleGetFunction(&k->clear_kernel, k->clear_module, "cp_clear_kernel");
    cuModuleGetFunction(&k->clear_depth_kernel, k->clear_module, "cp_clear_depth_kernel");
 
-   if (!build_module(&k->module, cp_rasterize_src, "cp_rasterize.cu", screen))
+   if (!build_module(&k->module, cp_rasterize_src, "cp_rasterize.cu", sm_major, sm_minor))
       goto fail;
    cuModuleGetFunction(&k->rasterize_stage1, k->module, "cp_rasterize_stage1");
    cuModuleGetFunction(&k->rasterize_stage2, k->module, "cp_rasterize_stage2");
@@ -275,7 +274,22 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
    cuModuleGetFunction(&k->abuf_fill_recs, k->module, "cp_abuf_fill_recs");
    cuModuleGetFunction(&k->abuf_quad_fill, k->module, "cp_abuf_quad_fill");
    cuModuleGetFunction(&k->abuf_seg_count, k->module, "cp_abuf_seg_count");
+   cuModuleGetFunction(&k->tile_census_mark, k->module, "cp_tile_census_mark");
+   cuModuleGetFunction(&k->tile_census_mark_vis, k->module,
+                       "cp_tile_census_mark_vis");
+   cuModuleGetFunction(&k->tile_census_refs, k->module, "cp_tile_census_refs");
+   cuModuleGetFunction(&k->tile_census_reduce, k->module,
+                       "cp_tile_census_reduce");
    cuModuleGetFunction(&k->abuf_seg_scatter, k->module, "cp_abuf_seg_scatter");
+   cuModuleGetFunction(&k->abuf_seg_prefix, k->module, "cp_abuf_seg_prefix");
+   cuModuleGetFunction(&k->abuf_prepare_shade_count, k->module,
+                       "cp_abuf_prepare_shade_count");
+   cuModuleGetFunction(&k->opaque_tile_count, k->module,
+                       "cp_opaque_tile_count");
+   cuModuleGetFunction(&k->opaque_tile_fill, k->module,
+                       "cp_opaque_tile_fill");
+   cuModuleGetFunction(&k->opaque_tile_raster, k->module,
+                       "cp_opaque_tile_raster");
    /* Only present when the instrumentation was compiled in, so only looked
     * up then; the draw path checks the pointers before launching. */
    if (cp_kernels_instrumented()) {
@@ -284,7 +298,7 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
                           "cp_abuf_peel_log_list");
    }
 
-   if (!build_module(&k->fs_module, cp_fs_src, "cp_fs.cu", screen))
+   if (!build_module(&k->fs_module, cp_fs_src, "cp_fs.cu", sm_major, sm_minor))
       goto fail;
    cuModuleGetFunction(&k->fs_interpolate, k->fs_module, "cp_fs_interpolate");
    cuModuleGetFunction(&k->fs_writeback, k->fs_module, "cp_fs_writeback");
@@ -301,20 +315,20 @@ cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen)
       cuModuleGetFunction(&k->abuf_scatter_colors, k->fs_module,
                           "cp_abuf_scatter_colors");
 
-   if (!build_module(&k->vfetch_module, cp_vertex_fetch_src, "cp_vertex_fetch.cu", screen))
+   if (!build_module(&k->vfetch_module, cp_vertex_fetch_src, "cp_vertex_fetch.cu", sm_major, sm_minor))
       goto fail;
    cuModuleGetFunction(&k->vertex_fetch, k->vfetch_module, "cp_vertex_fetch");
 
    /* Kept as relocatable PTX rather than a module: it is linked into each
     * shader that samples textures, not launched on its own. */
    k->sampler_ptx = compile_cuda_source(cp_sampler_src, "cp_sampler.cu",
-                                        screen->sm_major, screen->sm_minor, true);
+                                        sm_major, sm_minor, true);
    if (!k->sampler_ptx) {
       fprintf(stderr, "cudapipe: failed to compile texture sampler\n");
       goto fail;
    }
    k->fs_helper_ptx = compile_cuda_source(cp_fs_src, "cp_fs_helper.cu",
-                                          screen->sm_major, screen->sm_minor,
+                                          sm_major, sm_minor,
                                           true);
    if (!k->fs_helper_ptx) {
       fprintf(stderr, "cudapipe: failed to compile fragment helpers\n");

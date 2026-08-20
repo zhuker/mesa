@@ -43,18 +43,20 @@ libcudapipe_vk_files = files(
 # would drift and the point of the exercise is that the backend is portable.
 libcudapipe_vk_shared = files(
   '../gallium/drivers/cudapipe/cp_debug.c',
+  '../gallium/drivers/cudapipe/cp_kernels.c',
   '../gallium/drivers/cudapipe/nir_to_ptx/cp_nir_to_llvm.c',
 )
 
 libcudapipe_vk = static_library(
   'cudapipe_vk',
-  [libcudapipe_vk_files, libcudapipe_vk_shared, cpvk_entrypoints],
+  [libcudapipe_vk_files, libcudapipe_vk_shared, cpvk_entrypoints,
+   cudapipe_kernel_incs],
   include_directories : [inc_include, inc_src, inc_util,
                          include_directories('../gallium/drivers/cudapipe'),
                          include_directories('../gallium/drivers/cudapipe/nir_to_ptx'),
                          include_directories('../compiler/nir')],
   dependencies : [idep_vulkan_runtime, idep_vulkan_util, idep_mesautil,
-                  idep_nir, dep_llvm, dep_cuda_vk],
+                  idep_nir, dep_llvm, dep_cuda_vk, dep_nvrtc, dep_nvjitlink],
   gnu_symbol_visibility : 'hidden',
 )
 

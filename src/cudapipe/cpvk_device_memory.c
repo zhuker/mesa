@@ -80,6 +80,14 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_ctx;
    }
 
+   /* The fixed-function kernels: the same NVRTC sources, compiled by the same
+    * cp_kernels_init(), which needed nothing of a Gallium screen but the
+    * device's compute capability and now takes exactly that. */
+   if (!cp_kernels_init(&pdev->kernels, pdev->sm_major, pdev->sm_minor)) {
+      result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
+      goto fail_stream;
+   }
+
    result = vk_queue_init(&dev->queue, &dev->vk,
                           &pCreateInfo->pQueueCreateInfos[0], 0);
    if (result != VK_SUCCESS)

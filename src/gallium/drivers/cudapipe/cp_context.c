@@ -129,6 +129,10 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
     * draws were recorded against the framebuffer that is going away. */
    cp_batch_flush_why(cp, "framebuffer");
 
+   /* The bind is the census's accumulation unit: everything drawn to this
+    * framebuffer could have shared one tile's on-chip colour and depth. */
+   cp_tile_census_end_pass(cp);
+
    if (cp_debug->debug_passseq)
       fprintf(stderr, "passseq fb %ux%u cbuf=%p zs=%p\n",
               state->width, state->height,
@@ -1354,7 +1358,8 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
    if (samplers_resolved && !sampler_variant &&
        fs->num_sampler_variants < CP_MAX_SAMPLER_VARIANTS &&
        (!fs->tune_cap || fs->tune_done)) {
-      char *sampler_ptx = cp_compile_sampler_variant(cp->screen,
+      char *sampler_ptx = cp_compile_sampler_variant(cp->screen->sm_major,
+                                                cp->screen->sm_minor,
                                                      resolved_samplers);
       if (sampler_ptx) {
          cp_shader_build_sampler_variant(fs, sampler_ptx, resolved_samplers,
@@ -3103,6 +3108,8 @@ cp_abuf_verify_quads(struct cp_abuf *ab, unsigned w, unsigned h,
 struct cp_abuf_seg_shade {
    CUdeviceptr quad_list;      /* the episode's grouped quad indices */
    uint32_t quad_list_base;    /* this segment's first entry */
+   CUdeviceptr quad_list_base_dev;
+   CUdeviceptr num_quads_dev;
    uint32_t prim_base;         /* subtracted from global primitive ids */
    /* A merged group: the launch spans several segments, each quad resolving
     * its own vertex stream and slice table through this table; prim_base
@@ -3182,7 +3189,17 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
 
    /* The shader reads its extent from the device the way it does on the peel
     * path, where an atomic put it there. */
-   cuMemsetD32Async(counter, (unsigned)want_slots, 1, cp->stream);
+   if (seg && seg->num_quads_dev) {
+      struct cp_abuf_shade_count_args count_args = {
+         .count = seg->num_quads_dev,
+         .slots = counter,
+      };
+      void *count_params[] = { &count_args };
+      CP_LAUNCH(screen->kernels.abuf_prepare_shade_count,
+                1, 1, 1, 1, 1, 1, 0, cp->stream, count_params, NULL);
+   } else {
+      cuMemsetD32Async(counter, (unsigned)want_slots, 1, cp->stream);
+   }
    if (discard_mask)
       cuMemsetD8Async(discard_mask, 0, num_slots, cp->stream);
 
@@ -3217,9 +3234,12 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
    if (seg) {
       interp.quad_list = seg->quad_list;
       interp.quad_list_base = seg->quad_list_base;
+      interp.quad_list_base_dev = seg->quad_list_base_dev;
       interp.abuf_prim_base = seg->prim_base;
       interp.seg_ranges = seg->ranges;
       interp.num_seg_ranges = seg->num_ranges;
+      if (seg->num_quads_dev)
+         interp.num_quads_dev = seg->num_quads_dev;
    }
    cp_fs_interp_setup(cp, info, fs, num_fs_inputs, num_vs_outputs, &interp);
 
@@ -3250,9 +3270,19 @@ cp_abuf_shade(struct cp_context *cp, const struct pipe_draw_info *info,
    if (!interp_dev)
       return false;
 
+   if (cp_debug->no_fused_abuf_interp) {
+      void *interp_params[] = { &interp };
+      CUfunction kernel = seg && seg->ranges
+         ? screen->kernels.abuf_interpolate_ranges
+         : screen->kernels.abuf_interpolate;
+      CP_LAUNCH(kernel, (num_quads + 255) / 256, 1, 1, 256, 1, 1, 0,
+                cp->stream, interp_params, NULL);
+   }
+
    if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
                             frag_coord, discard_mask, front_face, coverage,
-                            interp_dev, num_slots,
+                            cp_debug->no_fused_abuf_interp ? 0 : interp_dev,
+                            num_slots,
                             cp_abuf.timing ? ab->ev[13] : 0, batch_rows))
       return false;
    cp_abuf_mark(ab->ev[14], cp->stream);
@@ -5043,6 +5073,21 @@ cp_draw_execute(struct cp_context *cp, const struct pipe_draw_info *info,
       rast_queues.mode = !cache_queues ? CP_QUEUE_FILL
                        : pass ? CP_QUEUE_REUSE : CP_QUEUE_BUILD;
 
+      /* A tiled opaque episode needs the completed vertex geometry now, but
+       * not the ordinary visibility pass. Save the launch description and
+       * let cp_opaque_finish enqueue mutually exclusive tiled-success and
+       * classic-overflow paths from one device-resident predicate. */
+      if (cp->pass.appending && cp->pass.opaque &&
+          cp_debug->tiled_opaque) {
+         rast_queues.mode = CP_QUEUE_FILL;
+         cp_pass_record_segment(cp, &rast_args, &rast_queues,
+                                rast_num_triangles, num_triangles, info,
+                                drawid_offset, batch_draws, draws,
+                                instance_counts, vs_ubo_table, fs_ubo_table,
+                                draw_ids, vb_table, scissors);
+         return;
+      }
+
       /* TEMPORARY: count the first pass only — it rasterizes the whole draw,
        * and the launch below copies these by value, so later passes see 0. */
       if (census) {
@@ -5950,6 +5995,146 @@ cp_pass_fallback(struct cp_context *cp, struct cp_pass_seg *segs,
    cp_pass_live_restore(cp, &lv);
 }
 
+static bool
+cp_opaque_tile_visibility(struct cp_context *cp, struct cp_pass_seg *segs,
+                          unsigned nsegs, unsigned w, unsigned h)
+{
+   struct cp_screen *screen = cp->screen;
+   if (!cp_debug->tiled_opaque || !screen->kernels.opaque_tile_count ||
+       !screen->kernels.opaque_tile_fill ||
+       !screen->kernels.opaque_tile_raster)
+      return false;
+
+   uint32_t tiles_x = DIV_ROUND_UP(w, CP_OPAQUE_TILE_SIZE);
+   uint32_t tiles_y = DIV_ROUND_UP(h, CP_OPAQUE_TILE_SIZE);
+   uint32_t ntiles = tiles_x * tiles_y;
+   uint32_t nb1 = DIV_ROUND_UP(ntiles, CP_ABUF_SCAN_BLOCK);
+   uint32_t nb2 = DIV_ROUND_UP(nb1, CP_ABUF_SCAN_BLOCK);
+   uint32_t nb3 = DIV_ROUND_UP(nb2, CP_ABUF_SCAN_BLOCK);
+   CUdeviceptr counts = cp_scratch_alloc_device(cp, (size_t)ntiles * 4);
+   CUdeviceptr offsets = cp_scratch_alloc_device(cp, (size_t)ntiles * 4);
+   CUdeviceptr cursors = cp_scratch_alloc_device(cp, (size_t)ntiles * 4);
+   CUdeviceptr refs = cp_scratch_alloc_device(
+      cp, (size_t)CP_MAX_OPAQUE_TILE_REFS * sizeof(struct cp_opaque_tile_ref));
+   CUdeviceptr overflow = cp_scratch_alloc_device(cp, 4);
+   CUdeviceptr s1 = cp_scratch_alloc_device(cp, (size_t)MAX2(nb1, 1u) * 4);
+   CUdeviceptr s1x = cp_scratch_alloc_device(cp, (size_t)MAX2(nb1, 1u) * 4);
+   CUdeviceptr s2 = cp_scratch_alloc_device(cp, (size_t)MAX2(nb2, 1u) * 4);
+   CUdeviceptr s2x = cp_scratch_alloc_device(cp, (size_t)MAX2(nb2, 1u) * 4);
+   CUdeviceptr s3 = cp_scratch_alloc_device(cp, (size_t)MAX2(nb3, 1u) * 4);
+   if (!counts || !offsets || !cursors || !refs || !overflow || !s1 ||
+       !s1x || !s2 || !s2x || !s3)
+      return false;
+
+   cuMemsetD32Async(counts, 0, ntiles, cp->stream);
+   cuMemsetD32Async(cursors, 0, ntiles, cp->stream);
+   cuMemsetD32Async(overflow, 0, 1, cp->stream);
+   for (unsigned s = 0; s < nsegs; s++) {
+      struct cp_opaque_tile_build_args args = {
+         .rast = segs[s].rast,
+         .tile_counts = counts,
+         .tile_offsets = offsets,
+         .tile_cursors = cursors,
+         .tile_refs = refs,
+         .overflow = overflow,
+         .tiles_x = tiles_x,
+         .tiles_y = tiles_y,
+         .segment = s,
+         .capacity = CP_MAX_OPAQUE_TILE_REFS,
+      };
+      void *params[] = { &args };
+      CP_LAUNCH(screen->kernels.opaque_tile_count,
+                MIN2(DIV_ROUND_UP(segs[s].rast_num_triangles, 256), 1024u),
+                1, 1, 256, 1, 1, 0, cp->stream, params, NULL);
+   }
+
+   cp_abuf_scan_n(cp, screen, counts, offsets, s1, s1x, s2, s2x, s3,
+                  ntiles, nb1, nb2, nb3, counts,
+                  CP_MAX_OPAQUE_TILE_REFS, overflow);
+   cuMemsetD32Async(cursors, 0, ntiles, cp->stream);
+   for (unsigned s = 0; s < nsegs; s++) {
+      struct cp_opaque_tile_build_args args = {
+         .rast = segs[s].rast,
+         .tile_counts = counts,
+         .tile_offsets = offsets,
+         .tile_cursors = cursors,
+         .tile_refs = refs,
+         .overflow = overflow,
+         .tiles_x = tiles_x,
+         .tiles_y = tiles_y,
+         .segment = s,
+         .capacity = CP_MAX_OPAQUE_TILE_REFS,
+      };
+      void *params[] = { &args };
+      CP_LAUNCH(screen->kernels.opaque_tile_fill,
+                MIN2(DIV_ROUND_UP(segs[s].rast_num_triangles, 256), 1024u),
+                1, 1, 256, 1, 1, 0, cp->stream, params, NULL);
+   }
+
+   struct cp_rasterize_args rast_args[CP_PASS_MAX_SEGS];
+   for (unsigned s = 0; s < nsegs; s++)
+      rast_args[s] = segs[s].rast;
+   CUdeviceptr rast_dev = cp_upload(cp, rast_args,
+                                    (size_t)nsegs * sizeof(rast_args[0]));
+   if (!rast_dev)
+      return false;
+   struct cp_opaque_tile_raster_args raster = {
+      .rast_args = rast_dev,
+      .tile_counts = counts,
+      .tile_offsets = offsets,
+      .tile_refs = refs,
+      .overflow = overflow,
+      .num_segments = nsegs,
+      .tiles_x = tiles_x,
+      .tiles_y = tiles_y,
+      .width = w,
+      .height = h,
+   };
+   void *raster_params[] = { &raster };
+   CP_LAUNCH(screen->kernels.opaque_tile_raster, ntiles, 1, 1,
+             256, 1, 1, 0, cp->stream, raster_params, NULL);
+
+   /* The tiled kernel returns immediately when overflow is nonzero. Enqueue
+    * the ordinary raster stages behind it with the inverse predicate, so the
+    * GPU executes exactly one visibility path without a host readback. */
+   for (unsigned s = 0; s < nsegs; s++) {
+      struct cp_rasterize_args aa = segs[s].rast;
+      struct cp_rast_queues queues = segs[s].queues;
+      aa.path_flag = overflow;
+      aa.path_value = 1;
+      queues.mode = CP_QUEUE_FILL;
+      cuMemsetD32Async(queues.nontrivial_count, 0, 1, cp->stream);
+      cuMemsetD32Async(queues.huge_count, 0, 1, cp->stream);
+      void *params[] = { &aa, &queues };
+      CP_LAUNCH(screen->kernels.rasterize_stage1,
+                DIV_ROUND_UP(segs[s].rast_num_triangles, 256), 1, 1,
+                256, 1, 1, 0, cp->stream, params, NULL);
+      CP_LAUNCH(screen->kernels.rasterize_stage2,
+                CLAMP(DIV_ROUND_UP(segs[s].rast_num_triangles, 8), 1u, 512u),
+                1, 1, 256, 1, 1, 0, cp->stream, params, NULL);
+      CP_LAUNCH(screen->kernels.rasterize_stage3, 2048, 1, 1,
+                64, 1, 1, 0, cp->stream, params, NULL);
+   }
+
+   if (cp_debug->tiled_opaque_census) {
+      uint32_t host_overflow = 0;
+      cuMemcpyDtoHAsync(&host_overflow, overflow, sizeof(host_overflow),
+                        cp->stream);
+      cuStreamSynchronize(cp->stream);
+      fprintf(stderr, "cudapipe: opaque tiles %ux%u segments=%u overflow=%u\n",
+              tiles_x, tiles_y, nsegs, host_overflow);
+   }
+   return true;
+}
+
+/* Defined with the rest of the census, below. */
+static void cp_tile_census_visbuf(struct cp_context *cp,
+                                  struct cp_pass_seg *segs, unsigned nsegs,
+                                  unsigned w, unsigned h);
+static void cp_tile_census_quads(struct cp_context *cp,
+                                 struct cp_pass_seg *segs, unsigned nsegs,
+                                 unsigned w, unsigned h);
+
 static void
 cp_opaque_finish(struct cp_context *cp)
 {
@@ -5962,6 +6147,14 @@ cp_opaque_finish(struct cp_context *cp)
    cp->pass.nsegs = 0;
    cp->pass.next_prim = 0;
    cp->pass.opaque = false;
+
+   if (cp_debug->tiled_opaque &&
+       !cp_opaque_tile_visibility(cp, segs, nsegs, w, h)) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+
+   cp_tile_census_visbuf(cp, segs, nsegs, w, h);
 
    uint8_t seg_group[CP_PASS_MAX_SEGS];
    unsigned group_first[CP_PASS_MAX_SEGS];
@@ -6074,6 +6267,394 @@ cp_opaque_finish(struct cp_context *cp)
    cp_pass_live_restore(cp, &live);
 }
 
+/*
+ * Tile-bin shader census (CUDAPIPE_TILE_CENSUS=<tile edge>).
+ *
+ * The question it answers decides whether a tile-local rasterizer is
+ * buildable here: when a tile owns its pixels and walks its primitives in
+ * submission order, how many distinct fragment shaders must it be able to
+ * call, and do they arrive in contiguous runs? One shader per tile means the
+ * tile kernel can be specialized and statically linked, exactly as the
+ * sampler already is. Many interleaved shaders mean only an indirect call or
+ * a switch over every shader in the pass would keep the order, and both give
+ * back what tiling is for.
+ *
+ * The accumulation unit is the framebuffer bind, because that is the longest
+ * interval a tile could hold colour and depth on chip. Both sources of
+ * shaded coverage feed it: the A-buffer's finished quad stream for blended
+ * draws, and the shared visibility buffer's winners for opaque ones. A tile
+ * only has to be able to call the shader of a fragment it actually shades,
+ * which is why the opaque side counts winners rather than every primitive
+ * that touched the tile.
+ *
+ * Ordering is keyed on a pass-global draw sequence, not on primitive ids,
+ * which restart at every episode and cannot be compared across one.
+ *
+ * It changes no rendering, and when the flag is unset it is one branch.
+ */
+static void
+cp_tile_census_reduce_pass(struct cp_context *cp);
+
+/* The distinct fragment shader a tile kernel would have to dispatch on is
+ * the compiled binary, not the shading group, so this dedups binaries over
+ * the whole bind. */
+static unsigned
+cp_tile_census_shader_index(struct cp_context *cp, struct cp_shader_binary *fs)
+{
+   for (unsigned i = 0; i < cp->tile_census_nfs; i++)
+      if (cp->tile_census_fs[i] == fs)
+         return i;
+   if (cp->tile_census_nfs == CP_TILE_CENSUS_MAX_SHADERS)
+      return CP_TILE_CENSUS_MAX_SHADERS - 1;
+   cp->tile_census_fs[cp->tile_census_nfs] = fs;
+   return cp->tile_census_nfs++;
+}
+
+/* Open the accumulation for this bind, sizing and clearing the per-tile
+ * arrays. Returns false when the census cannot run at all. */
+static bool
+cp_tile_census_begin(struct cp_context *cp, unsigned w, unsigned h)
+{
+   struct cp_screen *screen = cp->screen;
+   unsigned tile = cp_debug->tile_census;
+
+   if (!tile || !w || !h || !screen->kernels.tile_census_mark ||
+       !screen->kernels.tile_census_reduce)
+      return false;
+
+   if (cp->tile_census_open) {
+      /* A framebuffer of a different size inside one bind is not something
+       * the tile grid can follow; close the run and start another. */
+      if (w == cp->tile_census_w && h == cp->tile_census_h)
+         return true;
+      cp_tile_census_reduce_pass(cp);
+   }
+
+   unsigned tiles_x = (w + tile - 1) / tile;
+   unsigned tiles_y = (h + tile - 1) / tile;
+   unsigned ntiles = tiles_x * tiles_y;
+   if (!ntiles)
+      return false;
+
+   if (!cp->tile_census_hist) {
+      if (cuMemAllocManaged(&cp->tile_census_hist,
+                            CP_TILE_CENSUS_WORDS * sizeof(uint64_t),
+                            CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+         return false;
+      memset((void *)(uintptr_t)cp->tile_census_hist, 0,
+             CP_TILE_CENSUS_WORDS * sizeof(uint64_t));
+   }
+
+   if (ntiles > cp->tile_census_alloc) {
+      if (cp->tile_census_mask) {
+         cuMemFree(cp->tile_census_mask);
+         cuMemFree(cp->tile_census_quads);
+         cuMemFree(cp->tile_census_refs);
+         cuMemFree(cp->tile_census_smin);
+         cuMemFree(cp->tile_census_smax);
+         cp->tile_census_mask = 0;
+      }
+      size_t per = (size_t)ntiles * CP_TILE_CENSUS_MAX_SHADERS * 4;
+      if (cuMemAlloc(&cp->tile_census_mask, (size_t)ntiles * 8) ||
+          cuMemAlloc(&cp->tile_census_quads, (size_t)ntiles * 4) ||
+          cuMemAlloc(&cp->tile_census_refs, (size_t)ntiles * 4) ||
+          cuMemAlloc(&cp->tile_census_smin, per) ||
+          cuMemAlloc(&cp->tile_census_smax, per)) {
+         cp->tile_census_alloc = 0;
+         return false;
+      }
+      cp->tile_census_alloc = ntiles;
+   }
+
+   cuMemsetD32Async(cp->tile_census_mask, 0, (size_t)ntiles * 2, cp->stream);
+   cuMemsetD32Async(cp->tile_census_quads, 0, ntiles, cp->stream);
+   cuMemsetD32Async(cp->tile_census_refs, 0, ntiles, cp->stream);
+   cuMemsetD32Async(cp->tile_census_smin, 0xFFFFFFFFu,
+                    (size_t)ntiles * CP_TILE_CENSUS_MAX_SHADERS, cp->stream);
+   cuMemsetD32Async(cp->tile_census_smax, 0,
+                    (size_t)ntiles * CP_TILE_CENSUS_MAX_SHADERS, cp->stream);
+
+   cp->tile_census_tiles_x = tiles_x;
+   cp->tile_census_tiles_y = tiles_y;
+   cp->tile_census_w = w;
+   cp->tile_census_h = h;
+   cp->tile_census_seq = 0;
+   cp->tile_census_nfs = 0;
+   cp->tile_census_open = true;
+   cp->tile_census_cut = false;
+   return true;
+}
+
+/* Fill in everything both sources share, and take this run's slice of the
+ * pass-global draw order. */
+static bool
+cp_tile_census_common(struct cp_context *cp, struct cp_pass_seg *segs,
+                      unsigned nsegs, struct cp_tile_census_args *ca)
+{
+   uint32_t bases[CP_PASS_MAX_SEGS], seqs[CP_PASS_MAX_SEGS];
+   uint8_t shaders[CP_PASS_MAX_SEGS];
+   unsigned nshaders = 0;
+
+   for (unsigned s = 0; s < nsegs; s++) {
+      bases[s] = segs[s].prim_base;
+      seqs[s] = cp->tile_census_seq + s;
+      unsigned i = cp_tile_census_shader_index(cp, segs[s].fs);
+      shaders[s] = (uint8_t)i;
+      if (i + 1 > nshaders)
+         nshaders = i + 1;
+   }
+   cp->tile_census_seq += nsegs;
+
+   CUdeviceptr bases_dev = cp_upload(cp, bases, (size_t)nsegs * 4);
+   CUdeviceptr seq_dev = cp_upload(cp, seqs, (size_t)nsegs * 4);
+   CUdeviceptr shader_dev = cp_upload(cp, shaders, nsegs);
+   if (!bases_dev || !seq_dev || !shader_dev)
+      return false;
+
+   *ca = (struct cp_tile_census_args) {
+      .seg_prim_base = bases_dev,
+      .seg_seq = seq_dev,
+      .seg_shader = shader_dev,
+      .tile_mask = cp->tile_census_mask,
+      .tile_quads = cp->tile_census_quads,
+      .tile_smin = cp->tile_census_smin,
+      .tile_smax = cp->tile_census_smax,
+      .tile_refs = cp->tile_census_refs,
+      .hist = cp->tile_census_hist,
+      .nsegs = nsegs,
+      .tile = cp_debug->tile_census,
+      .tiles_x = cp->tile_census_tiles_x,
+      .tiles_y = cp->tile_census_tiles_y,
+      .nshaders = nshaders,
+   };
+
+   cp->tile_census_marks++;
+   cp->tile_census_shaders += cp->tile_census_nfs;
+   for (unsigned s = 0; s < nsegs; s++)
+      cp->tile_census_marked_draws += segs[s].ndraws;
+
+   /* How large the bin itself would be, which the shaded counts cannot say. */
+   if (cp->screen->kernels.tile_census_refs) {
+      for (unsigned s = 0; s < nsegs; s++) {
+         unsigned n = segs[s].rast_num_triangles;
+         if (!n)
+            continue;
+         void *p[] = { &segs[s].rast, ca };
+         CP_LAUNCH(cp->screen->kernels.tile_census_refs,
+                   MIN2((n + 255) / 256, 1024u), 1, 1, 256, 1, 1, 0,
+                   cp->stream, p, NULL);
+      }
+   }
+   return true;
+}
+
+/* Blended source: the A-buffer's finished quad stream. */
+static void
+cp_tile_census_quads(struct cp_context *cp, struct cp_pass_seg *segs,
+                     unsigned nsegs, unsigned w, unsigned h)
+{
+   struct cp_screen *screen = cp->screen;
+   struct cp_abuf *ab = &cp_abuf;
+   struct cp_tile_census_args ca;
+
+   if (!ab->quad_prim || !ab->quad_block ||
+       !cp_tile_census_begin(cp, w, h) ||
+       !cp_tile_census_common(cp, segs, nsegs, &ca))
+      return;
+
+   ca.quad_prim = ab->quad_prim;
+   ca.quad_block = ab->quad_block;
+   ca.num_quads_dev = ab->bsum3;
+   ca.num_quads = (uint32_t)ab->quad_capacity;
+   ca.quad_width = (w + 1) / 2;
+
+   void *p[] = { &ca };
+   CP_LAUNCH(screen->kernels.tile_census_mark,
+             MIN2(((unsigned)ab->quad_capacity + 255) / 256, 1024u), 1, 1,
+             256, 1, 1, 0, cp->stream, p, NULL);
+}
+
+/* Opaque source: the shared visibility buffer's winners. */
+static void
+cp_tile_census_visbuf(struct cp_context *cp, struct cp_pass_seg *segs,
+                      unsigned nsegs, unsigned w, unsigned h)
+{
+   struct cp_screen *screen = cp->screen;
+   struct cp_tile_census_args ca;
+
+   if (!cp->visbuf || !screen->kernels.tile_census_mark_vis ||
+       !cp_tile_census_begin(cp, w, h) ||
+       !cp_tile_census_common(cp, segs, nsegs, &ca))
+      return;
+
+   ca.visbuf = cp->visbuf;
+   ca.width = w;
+   ca.height = h;
+
+   void *p[] = { &ca };
+   CP_LAUNCH(screen->kernels.tile_census_mark_vis, (w + 15) / 16,
+             (h + 15) / 16, 1, 16, 16, 1, 0, cp->stream, p, NULL);
+}
+
+/* Close the bind: reduce every tile into the histogram, and report. */
+static void
+cp_tile_census_reduce_pass(struct cp_context *cp)
+{
+   struct cp_screen *screen = cp->screen;
+
+   if (!cp->tile_census_open)
+      return;
+   cp->tile_census_open = false;
+   cp->tile_census_passes++;
+   if (cp->tile_census_cut)
+      cp->tile_census_binds_cut++;
+
+   unsigned ntiles = cp->tile_census_tiles_x * cp->tile_census_tiles_y;
+   struct cp_tile_census_args ca = {
+      .tile_mask = cp->tile_census_mask,
+      .tile_quads = cp->tile_census_quads,
+      .tile_smin = cp->tile_census_smin,
+      .tile_smax = cp->tile_census_smax,
+      .tile_refs = cp->tile_census_refs,
+      .hist = cp->tile_census_hist,
+      .tiles_x = cp->tile_census_tiles_x,
+      .tiles_y = cp->tile_census_tiles_y,
+   };
+   {
+      void *p[] = { &ca };
+      CP_LAUNCH(screen->kernels.tile_census_reduce, (ntiles + 127) / 128, 1, 1,
+                128, 1, 1, 0, cp->stream, p, NULL);
+   }
+
+   if (cp->tile_census_passes % cp_debug->tile_census_every)
+      return;
+
+   cuStreamSynchronize(cp->stream);
+   const uint64_t *hist = (const uint64_t *)(uintptr_t)cp->tile_census_hist;
+   uint64_t tiles_tot = 0, frags_tot = 0, split_tiles = 0, split_frags = 0;
+   for (unsigned b = 1; b < CP_TILE_CENSUS_BINS; b++) {
+      tiles_tot += hist[b * 4 + 0] + hist[b * 4 + 1];
+      frags_tot += hist[b * 4 + 2] + hist[b * 4 + 3];
+      split_tiles += hist[b * 4 + 0];
+      split_frags += hist[b * 4 + 2];
+   }
+   if (!tiles_tot)
+      return;
+
+   fprintf(stderr,
+           "tilecensus tile=%u binds=%llu marked_runs=%llu marked_draws=%llu "
+           "unmarked_draws=%llu (%.2f%%) shaders/bind=%.2f "
+           "nonempty_tiles=%llu shaded=%llu "
+           "splittable_tiles=%.1f%% splittable_shaded=%.1f%%\n",
+           cp_debug->tile_census,
+           (unsigned long long)cp->tile_census_passes,
+           (unsigned long long)cp->tile_census_marks,
+           (unsigned long long)cp->tile_census_marked_draws,
+           (unsigned long long)cp->tile_census_solo,
+           100.0 * (double)cp->tile_census_solo /
+              (double)MAX2(cp->tile_census_solo + cp->tile_census_marked_draws,
+                           (uint64_t)1),
+           (double)cp->tile_census_shaders / (double)cp->tile_census_passes,
+           (unsigned long long)tiles_tot, (unsigned long long)frags_tot,
+           100.0 * (double)split_tiles / (double)tiles_tot,
+           100.0 * (double)split_frags / (double)frags_tot);
+
+   /* (1) the bin's size, (2) how evenly the shading falls, (3) whether the
+    * bind really was the residency interval. */
+   {
+      const uint64_t *gl = hist + CP_TILE_CENSUS_GLOBALS;
+      double mean_refs = gl[4] ? (double)gl[2] / (double)gl[4] : 0.0;
+      double mean_sh = gl[5] ? (double)gl[3] / (double)gl[5] : 0.0;
+      fprintf(stderr,
+              "tilecensus  bin: refs=%llu over %llu tiles, mean=%.1f max=%llu "
+              "-> %.1f MB/bind at 8 B/ref\n",
+              (unsigned long long)gl[2], (unsigned long long)gl[4], mean_refs,
+              (unsigned long long)gl[0],
+              (double)gl[2] * 8.0 / 1048576.0 /
+                 (double)MAX2(cp->tile_census_passes, (uint64_t)1));
+      fprintf(stderr,
+              "tilecensus  load: shaded mean=%.1f max=%llu per tile, "
+              "imbalance=%.1fx\n", mean_sh, (unsigned long long)gl[1],
+              mean_sh > 0.0 ? (double)gl[1] / mean_sh : 0.0);
+      for (int which = 0; which < 2; which++) {
+         const uint64_t *h = hist + (which ? CP_TILE_CENSUS_REFS
+                                           : CP_TILE_CENSUS_SHADED);
+         uint64_t tot = 0;
+         for (unsigned b = 0; b < CP_TILE_CENSUS_LOG; b++)
+            tot += h[b];
+         if (!tot)
+            continue;
+         uint64_t run = 0;
+         unsigned p50 = 0, p90 = 0, p99 = 0;
+         for (unsigned b = 0; b < CP_TILE_CENSUS_LOG; b++) {
+            run += h[b];
+            if (!p50 && run * 2 >= tot)
+               p50 = b;
+            if (!p90 && run * 10 >= tot * 9)
+               p90 = b;
+            if (!p99 && run * 100 >= tot * 99)
+               p99 = b;
+         }
+         fprintf(stderr,
+                 "tilecensus  %s per tile: p50<%u p90<%u p99<%u (powers of 2)\n",
+                 which ? "refs " : "shaded", 1u << p50, 1u << p90, 1u << p99);
+      }
+      fprintf(stderr,
+              "tilecensus  residency: %llu of %llu binds interrupted (%.1f%%) "
+              "map=%llu copy=%llu flush=%llu compute=%llu, draws/bind=%.1f\n",
+              (unsigned long long)cp->tile_census_binds_cut,
+              (unsigned long long)cp->tile_census_passes,
+              100.0 * (double)cp->tile_census_binds_cut /
+                 (double)cp->tile_census_passes,
+              (unsigned long long)cp->tile_census_cut_map,
+              (unsigned long long)cp->tile_census_cut_copy,
+              (unsigned long long)cp->tile_census_cut_flush,
+              (unsigned long long)cp->tile_census_cut_compute,
+              (double)(cp->tile_census_marked_draws + cp->tile_census_solo) /
+                 (double)cp->tile_census_passes);
+   }
+   for (unsigned b = 1; b < CP_TILE_CENSUS_BINS; b++) {
+      uint64_t t = hist[b * 4 + 0] + hist[b * 4 + 1];
+      uint64_t q = hist[b * 4 + 2] + hist[b * 4 + 3];
+      if (!t)
+         continue;
+      fprintf(stderr,
+              "tilecensus   shaders=%2u tiles=%10llu (%5.1f%%) "
+              "shaded=%12llu (%5.1f%%) disjoint_tiles=%5.1f%%\n",
+              b, (unsigned long long)t, 100.0 * (double)t / (double)tiles_tot,
+              (unsigned long long)q, 100.0 * (double)q / (double)frags_tot,
+              100.0 * (double)hist[b * 4 + 0] / (double)t);
+   }
+}
+
+/*
+ * Was the bind really the interval a tile could have stayed resident? These
+ * are the things that read or write the attachment while one is open, which
+ * would force a real tiler to flush and reload the tile mid-pass. Recorded
+ * by kind rather than lumped, because they have different answers: a copy
+ * can often be deferred, a host map cannot.
+ */
+void
+cp_tile_census_cut(struct cp_context *cp, enum cp_tile_census_cut_kind kind)
+{
+   if (!cp_debug->tile_census || !cp->tile_census_open)
+      return;
+   switch (kind) {
+   case CP_TILE_CUT_MAP:     cp->tile_census_cut_map++;     break;
+   case CP_TILE_CUT_COPY:    cp->tile_census_cut_copy++;    break;
+   case CP_TILE_CUT_FLUSH:   cp->tile_census_cut_flush++;   break;
+   case CP_TILE_CUT_COMPUTE: cp->tile_census_cut_compute++; break;
+   }
+   cp->tile_census_cut = true;
+}
+
+void
+cp_tile_census_end_pass(struct cp_context *cp)
+{
+   if (cp_debug->tile_census)
+      cp_tile_census_reduce_pass(cp);
+}
+
 static bool
 cp_pass_finish_bounded_groups(struct cp_context *cp,
                               struct cp_pass_seg *segs,
@@ -6082,12 +6663,17 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
    struct cp_abuf *ab = &cp_abuf;
    size_t quad_bound = 0;
 
-   for (unsigned s = 0; s < nsegs; s++) {
-      if (segs[s].rast_num_triangles > SIZE_MAX / ab->nblocks ||
-          quad_bound > SIZE_MAX -
-             (size_t)segs[s].rast_num_triangles * ab->nblocks)
-         return false;
-      quad_bound += (size_t)segs[s].rast_num_triangles * ab->nblocks;
+   if (cp_debug->unsafe_no_overflow) {
+      quad_bound = MIN3(ab->quad_capacity, ab->capacity / 4u,
+                        (size_t)CP_ABUF_MAX_SHADE_SLOTS / 4u);
+   } else {
+      for (unsigned s = 0; s < nsegs; s++) {
+         if (segs[s].rast_num_triangles > SIZE_MAX / ab->nblocks ||
+             quad_bound > SIZE_MAX -
+                (size_t)segs[s].rast_num_triangles * ab->nblocks)
+            return false;
+         quad_bound += (size_t)segs[s].rast_num_triangles * ab->nblocks;
+      }
    }
 
    if (!quad_bound || quad_bound > ab->quad_capacity ||
@@ -6100,7 +6686,8 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
    unsigned ngroups = 0;
    for (unsigned s = 0; s < nsegs; s++) {
       unsigned group = ngroups;
-      for (unsigned i = 0; i < ngroups; i++) {
+      for (unsigned i = 0; i < ngroups && !cp_debug->no_seg_merge &&
+                           !cp_debug->unsafe_no_overflow; i++) {
          struct cp_pass_seg *first = &segs[group_first[i]];
          if (first->vs == segs[s].vs && first->fs == segs[s].fs &&
              first->num_fs_ubos == segs[s].num_fs_ubos &&
@@ -6114,8 +6701,10 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       seg_group[s] = group;
    }
 
-   CUdeviceptr quad_seg = 0;
-   if (ngroups > 1) {
+   bool compact = cp_debug->unsafe_no_overflow;
+   CUdeviceptr quad_seg = 0, quad_dense = 0, grouped = 0;
+   CUdeviceptr group_base_dev = 0, group_counts_dev = 0;
+   if (ngroups > 1 || compact) {
       quad_seg = cp_scratch_alloc_device(cp, quad_bound);
       uint32_t seg_prims[CP_PASS_MAX_SEGS];
       for (unsigned s = 0; s < nsegs; s++)
@@ -6126,16 +6715,59 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       struct cp_abuf_seg_args bucket = {
          .quad_prim = ab->quad_prim,
          .seg_prim_base = seg_prims_dev,
+         .seg_counts = compact ? ab->seg_counts : 0,
          .quad_seg = quad_seg,
          .num_quads_dev = ab->bsum3,
          .nsegs = nsegs,
          .num_quads = quad_bound,
          .warp_aggregate = false,
       };
+      if (compact)
+         cuMemsetD32Async(ab->seg_counts, 0, CP_PASS_MAX_SEGS, cp->stream);
       void *bucket_params[] = { &bucket };
       CP_LAUNCH(cp->screen->kernels.abuf_seg_count,
                 MIN2(((unsigned)quad_bound + 255) / 256, 1024u),
                 1, 1, 256, 1, 1, 0, cp->stream, bucket_params, NULL);
+
+      if (compact) {
+         CUdeviceptr seg_group_dev = cp_upload(cp, seg_group, nsegs);
+         CUdeviceptr seg_base_dev =
+            cp_scratch_alloc_device(cp, (size_t)nsegs * 4);
+         group_base_dev = cp_scratch_alloc_device(cp, (size_t)ngroups * 4);
+         group_counts_dev = cp_scratch_alloc_device(cp, (size_t)ngroups * 4);
+         CUdeviceptr seg_cursor =
+            cp_scratch_alloc_device(cp, (size_t)nsegs * 4);
+         grouped = cp_scratch_alloc_device(cp, quad_bound * 4);
+         quad_dense = cp_scratch_alloc_device(cp, quad_bound * 4);
+         if (!seg_group_dev || !seg_base_dev || !group_base_dev ||
+             !group_counts_dev || !seg_cursor || !grouped || !quad_dense)
+            return false;
+
+         struct cp_abuf_seg_prefix_args prefix = {
+            .seg_counts = ab->seg_counts,
+            .seg_group = seg_group_dev,
+            .seg_base = seg_base_dev,
+            .group_base = group_base_dev,
+            .group_counts = group_counts_dev,
+            .nsegs = nsegs,
+            .ngroups = ngroups,
+         };
+         void *prefix_params[] = { &prefix };
+         CP_LAUNCH(cp->screen->kernels.abuf_seg_prefix,
+                   1, 1, 1, 1, 1, 1, 0, cp->stream, prefix_params, NULL);
+
+         cuMemsetD32Async(seg_cursor, 0, nsegs, cp->stream);
+         bucket.seg_cursor = seg_cursor;
+         bucket.seg_base = seg_base_dev;
+         bucket.grouped = grouped;
+         bucket.quad_dense = quad_dense;
+         bucket.seg_group = seg_group_dev;
+         bucket.group_base = group_base_dev;
+         void *scatter_params[] = { &bucket };
+         CP_LAUNCH(cp->screen->kernels.abuf_seg_scatter,
+                   ((unsigned)quad_bound + 255) / 256,
+                   1, 1, 256, 1, 1, 0, cp->stream, scatter_params, NULL);
+      }
    }
 
    struct cp_seg_range ranges[CP_PASS_MAX_SEGS];
@@ -6193,6 +6825,9 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       cp->fs_batch.slices = first->slices_dev;
       cp->fs_batch.prim_shift = first->prim_shift;
       struct cp_abuf_seg_shade shade = {
+         .quad_list = compact ? grouped : 0,
+         .quad_list_base_dev = compact ? group_base_dev + group * 4 : 0,
+         .num_quads_dev = compact ? group_counts_dev + group * 4 : 0,
          .prim_base = first->prim_base,
          .ranges = ranges_dev,
          .num_ranges = nranges,
@@ -6215,7 +6850,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
             .discard = shade.discard,
             .fs_out_stride = shade.fs_out_stride,
             .num_slots = shade.num_slots,
-            .global_slots = true,
+            .global_slots = !compact,
          };
       }
    }
@@ -6250,6 +6885,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       .max_layers = cp_abuf.max_layers,
       .blend = cp_blend_desc_for(cp),
       .quad_seg = ngroups > 1 ? quad_seg : 0,
+      .quad_dense = ngroups > 1 ? quad_dense : 0,
       .seg_desc = ngroups > 1 ? descs_dev : 0,
    };
    void *params[] = { &ca };
@@ -6406,6 +7042,8 @@ cp_pass_finish(struct cp_context *cp)
       CP_LAUNCH(screen->kernels.abuf_quad_fill, 1024, 1, 1, 32, 1, 1,
                      0, cp->stream, p, NULL);
    }
+
+   cp_tile_census_quads(cp, segs, nsegs, w, h);
 
    if (cp_pass_finish_bounded_groups(cp, segs, nsegs, w, h))
       return;
@@ -6936,6 +7574,7 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
 
    /* Whatever the episode holds was submitted before these draws. */
    cp_pass_finish(cp);
+   cp->tile_census_solo += ndraws;
    cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
                    cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
                    cp->batch.fs_ubos, cp->batch.draw_ids,
@@ -7080,6 +7719,7 @@ cp_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info *info)
 
    /* A dispatch may read what the held-back draws were going to write. */
    cp_batch_flush_why(cp, "a compute dispatch");
+   cp_tile_census_cut(cp, CP_TILE_CUT_COMPUTE);
 
    if (!bin || !bin->kernel)
       return;
@@ -7198,6 +7838,7 @@ cp_flush(struct pipe_context *ctx, struct pipe_fence_handle **fence,
     * so anything waiting on this would be waiting for work that was never
     * queued. */
    cp_batch_flush(cp);
+   cp_tile_census_cut(cp, CP_TILE_CUT_FLUSH);
 
    /* On cp->stream, after cp_batch_flush: every side stream's episode work
     * has been joined into the main stream by cp_pass_finish, so this event

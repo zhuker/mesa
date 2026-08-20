@@ -5,7 +5,6 @@
 #include <stdbool.h>
 
 struct cp_sampler_info;
-struct cp_screen;
 struct cp_tex_desc_ref;
 
 struct cp_kernels {
@@ -50,6 +49,15 @@ struct cp_kernels {
    CUfunction abuf_quad_fill;
    CUfunction abuf_seg_count;
    CUfunction abuf_seg_scatter;
+   CUfunction tile_census_mark;
+   CUfunction tile_census_mark_vis;
+   CUfunction tile_census_refs;
+   CUfunction tile_census_reduce;
+   CUfunction abuf_seg_prefix;
+   CUfunction abuf_prepare_shade_count;
+   CUfunction opaque_tile_count;
+   CUfunction opaque_tile_fill;
+   CUfunction opaque_tile_raster;
    CUfunction abuf_interpolate;
    CUfunction abuf_interpolate_ranges;
    CUfunction abuf_scatter_colors;
@@ -75,10 +83,13 @@ struct cp_kernels {
  * instrumentation. See cp_kernels.c. */
 bool cp_kernels_instrumented(void);
 
-bool cp_kernels_init(struct cp_kernels *k, struct cp_screen *screen);
+/* The device's compute capability is all this needs of a screen, so it takes
+ * that and not the screen: the kernels are the same kernels whichever Vulkan
+ * front end is above them, and this file is compiled into both drivers. */
+bool cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor);
 void cp_kernels_destroy(struct cp_kernels *k);
 
-char *cp_compile_sampler_variant(struct cp_screen *screen,
+char *cp_compile_sampler_variant(int sm_major, int sm_minor,
                                  const struct cp_sampler_info *info);
 
 #endif

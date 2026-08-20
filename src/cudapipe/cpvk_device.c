@@ -122,6 +122,12 @@ cpvk_enumerate_physical_devices(struct vk_instance *vk_instance)
    struct cpvk_instance *instance =
       container_of(vk_instance, struct cpvk_instance, vk);
 
+   /* Before anything reads cp_debug: the shared registry is the driver's
+    * whole debugging surface, and until this runs every flag reads as its
+    * zero value rather than as what the environment asked for -- which is
+    * silence of exactly the kind this driver's failure modes are made of. */
+   cp_debug_init();
+
    if (cuInit(0) != CUDA_SUCCESS)
       return VK_SUCCESS;          /* no CUDA device: enumerate nothing */
 
