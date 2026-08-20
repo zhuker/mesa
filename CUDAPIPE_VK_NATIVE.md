@@ -4383,3 +4383,43 @@ has never been measured against what the reference actually merges.
 That is the cheaper half to attack and it needs no renderer change -- only a
 merge key that admits what the reference admits, verified by the sweep and both
 replays as everything else in this session has been.
+
+### The front end is not more conservative than the reference
+
+The renderer's `struct cp_batch_key` is the authoritative list of merge
+conditions and deliberately omits three things this front end also checks:
+vertex-buffer bindings, the index range, and the draw parameters, because a
+batch carries per-draw rows for each.
+
+Measured against the capture's own refusals, that difference is nearly nothing:
+
+    the draws differ    38,155
+      vertex offset     13,281   35%   (already removed, and it is in no key)
+      fragment shader   12,068   32%   in the renderer's key
+      vertex shader      7,934   21%   in the renderer's key
+      scissor            3,339    9%   in the renderer's key
+      instance count     1,441    4%   not in the key -- worth relaxing
+      index buffer          92    0%   in the key
+      vertex buffers         0
+      push constants         0
+      descriptors            0
+
+Vertex-buffer bases and push constants separate **nothing** in this capture, so
+relaxing them gains nothing. Instance count is 4%. Everything else is in the
+renderer's key, which means the Gallium driver refuses those merges too.
+
+The descriptor key was re-tested in case it had been a symptom of the
+`vkCmdCopyImage` layer bug: it is not. `gltfscenerendering` is 0.0000 with it
+and 20.7685 without, three runs each, exactly as first recorded.
+
+**So the merge gap is not front-end conservatism.** Both drivers refuse the
+same draws for the same reasons, and the Gallium driver still puts 2.3x as many
+draws in each launch. What is left is that its *shaders* compare equal more
+often -- a batch breaks on a different `vs` or `fs` pointer, and 52% of the
+refusals here are exactly that. If the reference's pipelines share shader
+objects where this driver's do not, it would merge more without any difference
+in policy.
+
+That is the next measurement and it is cheap: count the distinct `vs`/`fs`
+pointers this driver uses across the capture against the number of distinct
+SPIR-V modules it was given.
