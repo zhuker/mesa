@@ -197,7 +197,7 @@ before layering behaviour on it — is the whole plan:
    **The draw pipeline, its state, its batching and its episode machinery are
    now a renderer a Vulkan front end can drive without Gallium existing.**
 
-   Gallium references in `cp_context.c`: **334 → 243**, all of them now in the
+   Gallium references in `cp_context.c`: **334 → 267**, all of them now in the
    entry points, the resource and sampler-view paths, and the two
    `PIPE_FORMAT` tables the native driver already replaces.
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
