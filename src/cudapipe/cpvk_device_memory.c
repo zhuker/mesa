@@ -361,6 +361,12 @@ cpvk_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
 
       buffer->mem = mem;
       buffer->offset = pBindInfos[i].memoryOffset;
+      if (mem && pBindInfos[i].memoryOffset + buffer->vk.size > mem->vk.size)
+         fprintf(stderr, "cudapipe: buffer of %llu bytes bound at %llu into an "
+                 "allocation of %llu -- it does not fit\n",
+                 (unsigned long long)buffer->vk.size,
+                 (unsigned long long)pBindInfos[i].memoryOffset,
+                 (unsigned long long)mem->vk.size);
 
       /* The runtime's own vk_buffer_address() asserts on this, and every
        * common entrypoint that takes a buffer goes through it. A CUDA device

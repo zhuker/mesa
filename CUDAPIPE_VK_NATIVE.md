@@ -556,3 +556,28 @@ and behind `multisampling` rendering black. Two things to fix together:
   writes samples where the resolve later expects to find them.
 
 Then the resolve can average them instead of taking sample zero.
+
+## Three hypotheses about the replay's crash, refuted
+
+Each was cheap to test and each was wrong, which is worth writing down so the
+next attempt does not start here.
+
+1. **Use-after-free of device memory.** `vkFreeMemory` was made to leak
+   instead of freeing. The crash was unchanged, in the same place, with the
+   same 137 draws before it.
+2. **Concurrency.** gfxrecon replays on several threads and the renderer is
+   one shared `cp_context`. Replaying with `--sync` changed nothing.
+   `--serialize-queue-submissions` fails earlier for an unrelated reason and
+   says nothing either way.
+3. **Allocations too small for this driver's layout.** The layout here is its
+   own -- rows aligned to 64, samples as planes -- so an image can be bigger
+   than it was at capture time and be bound to memory that ends before it
+   does. `vkBindImageMemory` and `vkBindBufferMemory` now check and say so;
+   nothing in the capture triggers it.
+
+What remains true: `cuMemcpy2DAsync` faults inside libcuda on a copy whose
+source reaches exactly to the end of its buffer and whose destination is well
+inside its image, with the memory live and the parameters traced. A fault on
+sane arguments points at the CUDA context having been corrupted earlier by a
+device-side access -- which `compute-sanitizer` would name, and which is the
+next thing to run now that the earlier faults it reported are fixed.
