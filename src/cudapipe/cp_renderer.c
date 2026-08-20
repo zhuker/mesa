@@ -5100,8 +5100,17 @@ cp_opaque_appendable(struct cp_context *cp)
    if (cp_debug->no_opaque_episode || !cp_batch_order_free(cp) ||
        !cp->fs_shader || cp->fs_shader->writes_memory ||
        MAX2(cp->fb_samples, 1u) != 1 || fb->nr_cbufs != 1 ||
-       !fb->color || fb->color_encoding < 0)
+       !fb->color || fb->color_encoding < 0) {
+      if (getenv("CPVK_DEBUG_EPISODE"))
+         fprintf(stderr, "no-episode: noflag=%d orderfree=%d fs=%d "
+                 "writes=%d samples=%u cbufs=%u color=%d enc=%d\n",
+                 (int)cp_debug->no_opaque_episode, (int)cp_batch_order_free(cp),
+                 (int)!!cp->fs_shader,
+                 cp->fs_shader ? (int)cp->fs_shader->writes_memory : -1,
+                 MAX2(cp->fb_samples, 1u), fb->nr_cbufs, (int)!!fb->color,
+                 fb->color_encoding);
       return false;
+   }
    if (cp->pass.opaque &&
        (cp->pass.nsegs >= CP_PASS_MAX_SEGS ||
         cp->pass.next_prim > (1u << 30)))
@@ -6139,6 +6148,10 @@ cp_pass_finish(struct cp_context *cp)
    struct cp_abuf *ab = &cp_abuf;
    unsigned nsegs = cp->pass.nsegs;
 
+   if (getenv("CPVK_DEBUG_EPISODE") && nsegs)
+      fprintf(stderr, "episode: nsegs=%u opaque=%d\n", nsegs,
+              (int)cp->pass.opaque);
+
    if (!nsegs)
       return;
    if (cp->pass.opaque) {
@@ -6757,6 +6770,9 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    cp->pass.appending = false;
 
    if (cp->pass.append_failed || cp->pass.nsegs == before) {
+      if (getenv("CPVK_DEBUG_EPISODE"))
+         fprintf(stderr, "episode-cut: append failed=%d nsegs %u->%u\n",
+                 (int)cp->pass.append_failed, before, cp->pass.nsegs);
       cp_pass_finish(cp);
       cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
                       cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,

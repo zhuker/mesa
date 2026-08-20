@@ -2616,3 +2616,32 @@ the scan, the sort and the drain are paid again for the next one.
 
 That is the next thing to measure: how many episodes a frame each driver
 opens, and what ends them.
+
+### Episodes never hold more than one segment
+
+`CPVK_DEBUG_EPISODE` counts what `cp_pass_finish` closes.
+`gltfscenerendering`, one frame:
+
+    9 x episode: nsegs=1 opaque=1
+    1 x episode-cut: begin_render
+    0 x episode-cut: append failed
+    2 x no-episode: orderfree=0        (blending on; every other test passes)
+
+So every episode in the frame contains exactly **one** segment, which is why
+`cp_abuf_scan_block` runs 4.7 times more often here than on the Gallium
+driver: the scan is per episode, and an episode of one segment amortises
+nothing.
+
+What does *not* explain it: `vkCmdBeginRendering` cuts an episode once in the
+frame, not nine times; no append ever fails; and `cp_opaque_appendable`
+refuses only twice, both times because the draw is blended so ordering is not
+free. Every other draw is eligible.
+
+So episodes are eligible and being created, and something closes each one
+after a single segment anyway. That contradiction is where this stops, and it
+is a narrow one: nine creations, nine single-segment closes, and none of the
+three code paths that close an episode accounting for more than one of them.
+
+Worth noting for whoever picks it up: `cp_opaque_append` is only reached from a
+batch flush, and this driver's batching is off by default, so how nine
+episodes are created at all is part of the same question.

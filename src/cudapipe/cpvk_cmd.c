@@ -2069,6 +2069,8 @@ cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb,
     * is what stopped pbribl's spheres, after three offscreen passes.
     */
    cp_batch_flush_why(&dev->renderer, "framebuffer");
+   if (getenv("CPVK_DEBUG_EPISODE"))
+      fprintf(stderr, "episode-cut: begin_render\n");
    cp_pass_finish(&dev->renderer);
 
    cp_context_set_framebuffer(&dev->renderer, fb, MAX2(samples, 1u));
