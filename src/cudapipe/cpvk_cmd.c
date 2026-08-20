@@ -880,6 +880,14 @@ cpvk_CmdPushConstants2(VkCommandBuffer commandBuffer,
       return;
 
    memcpy(cmd->push + pInfo->offset, pInfo->pValues, pInfo->size);
+   if (getenv("CPVK_DEBUG_PUSH")) {
+      const float *f = (const float *)(const void *)cmd->push;
+      fprintf(stderr, "push off=%u size=%u -> now %u: ", pInfo->offset,
+              pInfo->size, cmd->push_size);
+      for (unsigned k = 0; k < 9; k++)
+         fprintf(stderr, "%.3f ", f[k]);
+      fprintf(stderr, "\n");
+   }
    if (pInfo->offset + pInfo->size > cmd->push_size)
       cmd->push_size = pInfo->offset + pInfo->size;
 }

@@ -1655,3 +1655,30 @@ flat:
 The lesson from this turn is the same as the last one: the diagnosis was
 "there is no resolve", written down twice in earlier sessions, and it was
 wrong. One pixel value falsified it in a minute.
+
+### pbribl: the albedo really is black, and the colour is the environment
+
+The spheres' material colour is not missing. `CPVK_DEBUG_PUSH` shows what the
+application pushes for each sphere:
+
+    push off=0  size=12 -> -10.750 0 0                    objPos
+    push off=12 size=24 ->  0.995 0.005 0.000 0 0 0       roughness, metallic,
+                                                          specular, r, g, b
+
+`r`, `g` and `b` are zero, and `#define ALBEDO vec3(material.r, material.g,
+material.b)` -- so albedo is black in both drivers and always was. Every warm
+tone in the reference image comes from the image-based lighting term, the
+prefiltered environment cube multiplied by the BRDF lookup.
+
+The native spheres are *exactly* neutral -- 40/40/40, 58/58/58, 106/106/106 --
+so that cube reads grey. And the skybox behind them is byte-identical, which
+says the raw environment cube samples correctly. What differs is the
+**prefiltered** cube: a separate image the sample generates by rendering the
+environment into each face at each mip level.
+
+So the earlier guess was right for the wrong reason. It is not cube sampling
+and not the material; it is the render-to-cube-face generation, which is also
+where the array-layer fix two turns ago was aimed without moving the number.
+The next question is narrow: whether those passes render into the face and
+level their view names, and `CPVK_DEBUG_PUSH` shows they at least run, 72
+bytes of matrix at a time.
