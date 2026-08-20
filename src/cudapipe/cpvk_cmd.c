@@ -1289,7 +1289,19 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
     * vertexOffset differs must not merge -- which is what gltfscenerendering's
     * per-primitive offsets are.
     */
-   CPVK_DIFF(a->range.index_bias != b->range.index_bias, "vertex offset");
+   /*
+    * The vertex offset. `cp_draw_execute` builds a single draw's fetch with
+    * `first_vertex = draws[0].index_bias`, but a *batch* builds a slice table
+    * and sets `slices[d].first_vertex = draws[d].index_bias` per draw, so the
+    * batched path already honours it and this condition costs merges for
+    * nothing.
+    *
+    * It is the single largest merge blocker in the Crossroads capture: 13,281
+    * separations of 38,155, ahead of the fragment shader's 12,068.
+    * CPVK_KEEP_VOFF restores it.
+    */
+   if (getenv("CPVK_KEEP_VOFF"))
+      CPVK_DIFF(a->range.index_bias != b->range.index_bias, "vertex offset");
    CPVK_DIFF(a->call.instance_count != b->call.instance_count, "instance count");
    /*
     * The descriptors, by content.

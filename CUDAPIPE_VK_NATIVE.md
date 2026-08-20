@@ -2763,3 +2763,39 @@ not used.
 So the target is the per-frame launch count -- 757 against 245 -- and
 specifically the A-buffer machinery that accounts for most of it, not the
 front end that decides which draws share one.
+
+### The largest merge blocker removed, correctness held, time unchanged
+
+`CUDAPIPE_DEBUG_BATCHDIFF` over 25 seconds of the Crossroads replay -- the
+workload itself rather than a sample -- gives 38,155 refusals:
+
+    vertex offset    13,281   35%
+    fragment shader  12,068   32%
+    vertex shader     7,934   21%
+    scissor           3,339    9%
+    instance count    1,441    4%
+    descriptors           0    -
+
+**Descriptors do not appear at all.** The condition that consumed several turns
+of this session separates nothing in the capture, which is why dropping it
+moved the replay by half a percent.
+
+The largest blocker, the vertex offset, was marked in its own comment as
+provisional -- "until the batched path stops taking it from the first draw" --
+and that has already happened: a batch builds a slice table and sets
+`slices[d].first_vertex = draws[d].index_bias` per draw. Only the single-draw
+path uses `draws[0]`. Removing the condition keeps 18/18 running and 15/18
+pixel-correct with batching on.
+
+    off                          9.41   9.42
+    batch, offset merged         9.38   9.44
+    batch, offset still blocking 9.77   9.78
+
+So the condition costs about 3.5% when batching is on, and removing it brings
+batching back to parity with not batching at all. **Not a win** -- one more
+mechanism priced at zero.
+
+The change is kept because the condition is unnecessary by construction and was
+documented as temporary, not because it made anything faster. And the run-to-run
+spread here is 9.38 to 9.80 across the session, so nothing under about 5% in
+this measurement means anything.
