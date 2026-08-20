@@ -2542,3 +2542,43 @@ timing it. The gate should be a warm-up replay whose result is discarded,
 exactly as `cp_gpu_busy.sh` drops the ramp at each end of its window, and the
 same applies to the sample sweep, whose per-sample means were also first taken
 cold.
+
+### The launch trace, re-taken warm
+
+Same 20-second CUDA trace, both drivers, with the JIT cache full. Frames
+completed in the window: native 2,055, gallium 2,797.
+
+    kernel                  native/fr  gallium/fr  ratio
+    cp_abuf_scan_block          106.6        22.9    4.7
+    main                         86.7        37.2    2.3
+    cp_abuf_scan_add             63.6        13.4    4.7
+    cp_vertex_fetch              51.2        22.1    2.3
+    cp_clip_triangles            51.2        22.1    2.3
+    cp_fs_interpolate            33.8         9.3    3.6
+    cp_abuf_worklist             22.6         1.8   12.5
+    cp_peel_advance              11.3         0.1  169.4
+    cp_abuf_seg_count             9.2         3.0    3.1
+    cp_abuf_sort_short           10.2         3.9    2.7
+    cp_abuf_seg_scatter           0.0         2.4      -
+    TOTAL                       756.9       244.7   3.09
+
+**757 launches a frame against 245, not 3,381 against 245.** The cold trace
+overstated the difference by four and a half times, and two of its headline
+numbers were artefacts: `cp_abuf_seg_count` and `cp_abuf_sort_short` read
+exactly zero cold and are 9.2 and 10.2 warm, so the claim that the native
+driver "never runs the pass episode kernels" was false. It runs them, about
+three times as often as the Gallium driver does, which is the opposite kind of
+finding -- more, smaller episodes rather than none.
+
+What survives correct measurement:
+
+- 3.09x the launches per frame for 1.36x the wall time, so the driver is
+  issuing more and smaller work rather than stalling.
+- `cp_peel_advance` at 11.3 against 0.1 is still the sharpest single
+  difference, and `cp_abuf_worklist` at 12.5x behind it. Both are A-buffer
+  drain work, which is what an episode amortises.
+- `cp_abuf_seg_scatter` is the one kernel genuinely absent from the native
+  trace.
+
+That is a real and much smaller target than the one that was being chased, and
+it is now measured in a state that reproduces.
