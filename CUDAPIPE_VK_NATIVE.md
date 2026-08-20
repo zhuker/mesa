@@ -3172,3 +3172,43 @@ face out on this driver and three on lavapipe, with the sampler demonstrably
 computing a non-zero face for at least some threads. The next instrument has
 to tie a thread to its pixel -- printing the fragment's coordinates beside the
 face -- because every reading that has not done so has been ambiguous.
+
+### The cube test's oracle does not hold up, and that invalidates the reading built on it
+
+Computing the face in the shader by Vulkan's dominant-axis rule and encoding it
+the same way the cube's texels do, then comparing against what sampling
+returns:
+
+    expected (shader)   [0, 145, 49, 38, 1227, 0]     mostly +Z
+    native sampled      [1459, 0, 0, 0, 0, 0]
+    lavapipe sampled    [725, 35, 490, 0, 0, 0]
+
+    agreement, native    0.0%
+    agreement, lavapipe  4.4%
+
+**Neither driver's sampling matches the face the direction implies.** lavapipe
+is a reference implementation, so a 4.4% agreement means the oracle is wrong,
+not that lavapipe is: either the test's colour-to-face encoding, the uv
+mapping, or the dominant-axis rule as applied here does not correspond to what
+the cube's layers actually contain.
+
+The expected-face render also differs between the two drivers on 8 of 4,096
+pixels, which is fine on its own -- floating-point ties at face boundaries --
+but it means even that image is not exactly reproducible.
+
+So the reading from the previous entry, "native reads one face where lavapipe
+reads three", survives only as a **difference between the drivers**, which is
+real and per-pixel. It does not survive as "native picks the wrong face",
+because there is no working oracle here for which face is right.
+
+What is still solid, and worth keeping separate from all of this:
+
+- `pbribl`'s reflections come from `prefilteredReflection()` and nothing else,
+  proved by forcing that term to a constant and watching the spheres go warm.
+- Forcing the direction to a constant also makes them warm, so the failure
+  depends on the direction varying per fragment.
+- `cpvk_cubesph` reproduces a per-pixel difference from lavapipe in a second.
+
+Those three stand on substitutions and direct comparison, not on decoding a
+face from a colour. The face-decoding work does not, and is retracted as a
+diagnosis.
