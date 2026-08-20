@@ -87,7 +87,15 @@ before layering behaviour on it — is the whole plan:
 2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
-3. **Milestone 2 — device, queue, memory, buffers, images.**
+3. **Milestone 2 — device, queue, memory, buffers.** ✅ done for buffers;
+   images outstanding. `vkCreateDevice` builds the CUDA context and a
+   non-blocking stream; one queue, whose submit drains the stream because
+   nothing records work yet; the three memory types are three branches over
+   `cuMemAlloc`, `cuMemHostAlloc` and `cuMemAllocManaged`; a device-local
+   allocation refuses `vkMapMemory` instead of staging behind the caller;
+   allocations are not zeroed unless `VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT`
+   asks. `vulkaninfo --summary` completes against the native ICD.
+   **Next: images, then `vkCreateImageView` and the format table.**
 4. **Milestone 3 — pipelines and descriptors**, feeding the existing NIR→PTX
    compiler.
 5. **Milestone 4 — command buffers**: record, then translate a whole render
