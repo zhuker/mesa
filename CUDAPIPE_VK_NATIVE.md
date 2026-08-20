@@ -2273,3 +2273,34 @@ triangles cross the viewport edge and have to be clipped, then run it with
 `CPVK_NO_DESC_KEY=1`. If it fails, the descriptor key has been standing in for
 a stable-clip row-mapping bug all along, and there is a one-second
 reproduction for it instead of a sample.
+
+### Clipping eliminated too -- the test already exercised it
+
+The experiment was to make `cpvk_batchtex`'s geometry clip and see whether the
+descriptor key became necessary. Instrumenting the decision first, which is
+what the last few turns have taught:
+
+    clipped variant   clip: tris=6400 batch_draws=8 stable=1 reads_cb=1
+    original test     clip: tris=6400 batch_draws=8 stable=1 reads_cb=1
+
+The **original** test already takes the stable clip path, with eight draws
+merged, and passes without the key. So clipping is not the discriminator, and
+the variant was unnecessary -- both are byte-identical to their unbatched
+output with and without the key.
+
+Had the variant been run without checking, its passing would have been read as
+"clipping is not it" for the right reason by luck; the instrument shows the
+premise was wrong from the start.
+
+    gltfscenerendering  clip: tris=45184 batch_draws=3 stable=1 reads_cb=1
+
+Same path, same flags, three draws. What differs now is **scale**: 45,184
+triangles in one batch against 6,400 in the test, and the stable path
+rasterizes `num_triangles * CP_CLIP_MAX_OUT` slots -- 361,472 against 51,200.
+`CP_MAX_BATCH_TRIS` is 262,144, so the batch itself is under the limit while
+the slot array it expands into is not.
+
+That is the next thing to check and the first candidate that explains the
+"three draws" boundary without hand-waving: three of gltfscenerendering's
+draws are the point where the expanded slot array crosses something the test's
+never approaches.

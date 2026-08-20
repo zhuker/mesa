@@ -3762,6 +3762,12 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                      (cp->blend_enabled ||
                       (cp->fs_shader && cp->fs_shader->reads_const_bufs));
 
+                  if (getenv("CPVK_DEBUG_CLIP"))
+                     fprintf(stderr, "clip: tris=%u batch_draws=%u stable=%d "
+                             "reads_cb=%d\n", num_triangles, batch_draws,
+                             (int)stable_clip,
+                             cp->fs_shader ? (int)cp->fs_shader->reads_const_bufs : -1);
+
                   cuMemsetD32Async(clip_count,
                                    stable_clip ? max_clipped : 0, 1,
                                    cp->stream);
