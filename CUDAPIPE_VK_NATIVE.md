@@ -4127,3 +4127,33 @@ difference. Closing it means replicating llvmpipe's adjacency arithmetic rather
 than computing an equivalent answer, which is a different kind of work from
 everything else in this session: not a defect to find but a convention to
 match.
+
+### pbribl's residual is my own correctness fix, measured
+
+The reference driver -- `src/gallium/drivers/cudapipe`, the pre-branch tree --
+has no seamless cube filtering. `cp_fetch_cube_texel` does not exist there; it
+clamps each bilinear footprint inside the face it started on. This driver now
+filters seamlessly, because Vulkan requires it.
+
+Switching it off and remeasuring against that reference:
+
+    seamless off   pbribl 0.0000   texturecubemap 0.0000
+    seamless on    pbribl 0.0286   texturecubemap 0.0037
+
+**So the sweep's last difference is a deliberate improvement over the thing it
+is being compared to.** Turning it off would make the sweep read 18/18 and make
+the driver less correct. Against lavapipe -- a reference implementation that
+does filter seamlessly -- `cpvk_cubesph` measures 734 differing pixels without
+it and 13 with it.
+
+The feature is kept and the number is left standing, because the alternative is
+to remove a spec-required behaviour to make a metric read better. That is worth
+stating plainly rather than quietly choosing either way:
+
+    against the Gallium driver   17/18, pbribl 0.0286, texturecubemap 0.0037
+    against Vulkan               seamless filtering is required and implemented
+
+If strict parity with the reference is what the objective means, one flag
+switches it and the sweep reads 18/18. If correctness is what it means, this is
+already right and two samples differ from the reference by 0.0286 and 0.0037
+because the reference is wrong.
