@@ -2474,3 +2474,40 @@ chased for the last several turns -- merging draws into one launch -- but the
 episode path built on top of it, which the front end has never enabled. The
 comment says what it needs: a test that shows the blended merge right.
 `cpvk_batchtex` and `cpvk_batchbig` are that test for the opaque half already.
+
+### Blended pass episodes: correct, entered, and worth nothing measurable
+
+Three real defects were found and fixed to get here:
+
+1. `cpvk_batch_can_join` refused every blended draw outright.
+2. It computed the blended flag into a local and discarded it.
+3. `cp->batch.blended` was hardcoded `false` when staging, so even a blended
+   batch took the opaque branch at flush and no episode was entered.
+
+With all three fixed and `CPVK_BATCH=1 CPVK_BATCH_BLEND=1`, `cp_pass_appendable`
+is called for the first time, and `cpvk_batchblend` -- a new test, nine blended
+draws over nine textures at nine depths with depth writes off -- is
+**byte-identical** to its unbatched output. The sweep is unchanged: 18/18 run,
+15/18 pixel-correct, the same three.
+
+**The performance claim does not survive.** A first A/B in one loop read 24.39
+ms off, 24.22 batched, 9.74 with blended episodes, and that looked like 2.5x.
+Re-running off and blend twice each says otherwise:
+
+    native off     9.75   9.76
+    native blend   9.74   9.76
+    gallium        7.15   7.16
+
+The flag changes nothing. What moved was the **baseline**: this capture
+measured 24.3-24.4 ms all day and now measures 9.75 without any driver change
+that could explain it. The sequential A/B was confounded by whatever warmed --
+the on-disk shader cache is the obvious candidate -- and the third run in the
+loop got the benefit.
+
+So two recorded numbers are wrong and both are mine: the native replay is
+9.75 ms against gallium's 7.15, a factor of 1.36 and not 3.4, and the earlier
+3,381-launches-per-frame trace was taken in that same unwarmed state.
+
+The change is kept because it is correct and because the defects were real, but
+it is behind `CPVK_BATCH_BLEND` and claims nothing. Re-running an A/B in the
+opposite order is what would have caught this immediately, and it is cheap.

@@ -1328,13 +1328,18 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
 }
 
 static bool
-cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw *d)
+cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw *d,
+                    bool *out_blended)
 {
    struct cp_context *cp = &dev->renderer;
    bool blended = false;
 
    if (!cpvk_batch_eligible(dev, d, &blended))
       return false;
+
+   /* Out to the caller, which stages it on the batch: it decides at flush
+    * whether the batch appends to a blended pass episode or an opaque one. */
+   *out_blended = blended;
 
    unsigned tris = cp_triangles_for_draw(d->call.mode, d->range.count) *
                    MAX2(d->call.instance_count, 1u);
@@ -1403,12 +1408,26 @@ cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw *d,
       return true;
    }
    /*
-    * The blended path merges through the A-buffer, where the order fragments
-    * are composited in is decided per pixel rather than by submission order.
-    * The opaque half is enough to be worth having and is the half whose
-    * correctness this front end can currently argue for; the blended half is
-    * left to the single-draw path until there is a test that shows it right.
+    * The blended half, which merges through the A-buffer: the order fragments
+    * composite in is decided per pixel rather than by submission order, so
+    * merging is sound in principle. It was left off for want of a test.
+    *
+    * cpvk_batchblend is that test -- cpvk_batchtex with blending on and depth
+    * writes off, nine draws over nine textures at nine depths -- and it is
+    * what this flag is validated against.
+    *
+    * It matters far more than the opaque half. A blended draw that does not
+    * join a batch never reaches an A-buffer pass episode, because the episode
+    * is entered from a batch flush; and without episodes every blended draw
+    * builds, sorts and peels its own A-buffer. Measured on the Crossroads
+    * capture that is 3,381 kernel launches a frame against the Gallium
+    * driver's 245, with cp_peel_advance alone running 109 times a frame
+    * against 0.1.
     */
+   if (getenv("CPVK_BATCH_BLEND")) {
+      *blended = true;
+      return true;
+   }
    return false;
 }
 
@@ -1430,7 +1449,8 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
     * supposed to be bit-identical to not batching at all -- which is exactly
     * what that flag is for.
     */
-   bool batch_ok = cpvk_batch_can_join(dev, d);
+   bool batch_blended = false;
+   bool batch_ok = cpvk_batch_can_join(dev, d, &batch_blended);
    if (!batch_ok)
       cp_batch_flush_why(cp, "the next draw cannot join");
 
@@ -1520,11 +1540,18 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
       unsigned tris = cp_triangles_for_draw(d->call.mode, d->range.count) *
                       MAX2(d->call.instance_count, 1u);
       if (!cp->batch.pending) {
-         cpvk_build_batch_key(dev, d, &cp->batch.key, false);
+         cpvk_build_batch_key(dev, d, &cp->batch.key, batch_blended);
          cp->batch.info = d->call;
          cp->batch.drawid_offset = 0;
          cp->batch.pending = true;
-         cp->batch.blended = false;
+         /*
+          * Whether this batch is blended, which decides at flush whether it
+          * appends to an A-buffer pass episode or to the opaque one. It was
+          * hardcoded false, so a blended batch -- once the front end merged
+          * one at all -- still took the opaque branch and no episode was ever
+          * entered.
+          */
+         cp->batch.blended = batch_blended;
       }
       cp_batch_record(cp, &d->range, tris, 0, d->call.instance_count);
       return;
