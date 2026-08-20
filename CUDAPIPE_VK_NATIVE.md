@@ -4860,3 +4860,72 @@ The older capture is 10% faster than the driver being replaced. Crossroads is
 and below the threshold this project treats as a result at all.
 
 From the start of this session: 1.31x and 1.36x, to 1.03x and 0.90x.
+
+## The audit found a regression nobody had measured: the sample sweep is slower
+
+Every sweep number in this document until now was correctness or wall-clock for
+a one-frame run. Per-frame cost against the driver being replaced had never
+been taken. It should have been, because the objective names the sweep:
+
+    sample            native    gallium   ratio
+    instancing         9.08 ms   5.81 ms   1.56x
+    vulkanscene        1.20      0.87      1.38x
+    texture            0.22      0.16      1.36x
+    bloom              1.92      1.65      1.16x
+    particlesystem     3.64      3.21      1.13x
+
+Measured in `--benchmark` mode, differencing 100 and 500 frames so neither
+startup nor the per-frame image save is in the number. The first attempt used
+`--offscreenframes` with `-ofn`, which saves every frame and reported bloom at
+2.48x -- that path runs a host-side channel swizzle per saved frame and is a
+property of the harness, not the driver.
+
+### It is not the front end, and it is not launch count
+
+instancing issues **38.0 launches a frame against the Gallium driver's 40.4**.
+Same work, slightly fewer calls. But:
+
+    kernel  grid   launches   native      gallium
+    main    4096   1628/1672  1866.4 ms   562.2 ms
+
+The same kernel, at the same grid, the same number of times, taking **3.3x as
+long**. That is generated code, and nothing in the front end can explain it.
+
+### The PTX says what it is
+
+    native   17 ld.local/st.local, two __local_depot arrays
+    gallium   0
+
+A CUDA kernel's local memory is off-chip. And the NIR shows where the depot
+comes from: this driver's fragment shader carries a `decl_reg` -- a NIR
+register -- that the Gallium path's does not, and a register becomes an alloca
+the NVPTX backend spills.
+
+Hosted under lavapipe, shaders arrived already through Mesa's common NIR
+pipeline. This front end translates SPIR-V itself and runs `nir_opt_dce` and
+nothing else.
+
+### What was tried and did not work
+
+A standard optimisation loop (copy-prop, CSE, algebraic, constant folding,
+dead-cf, loop opt and unroll, to fixpoint) at both lowering sites and again
+after `nir_lower_io`; `nir_lower_indirect_derefs_to_if_else_trees`; and
+`nir_lower_reg_intrinsics_to_ssa` both after the temporaries pass and inside
+the loop. The local operations stayed at 17 and the timings did not move --
+instancing 1.021, vulkanscene 1.008 against the same build with the loop
+disabled. All reverted: correct, unmeasurable, and not worth carrying.
+
+The register survives every one of those passes, which means it is not what
+those passes are for. The next step is to find which pass introduces it -- the
+NIR dump at descriptor-lowering time already contains it, so it arrives before
+that point, which is a much smaller search than the one this turn ran.
+
+### Where this leaves the objective
+
+    gfxr replay    Crossroads 7.35 ms vs 7.17 recorded   1.025x, inside the spread
+                   older     22.78 vs 25.20              0.904x, faster
+    sample sweep   correctness 17/18, equal or better than gallium against NVIDIA
+                   per-frame cost 1.13x to 1.56x         REGRESSION
+
+The replay half is met. The sweep half is met on correctness and **not met on
+cost**, and this is the first turn that measured it.
