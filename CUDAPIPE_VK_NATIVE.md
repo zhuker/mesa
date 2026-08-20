@@ -645,3 +645,21 @@ changed nothing, so the pattern is not that either -- there is something else
 between the varying and the coordinate. Dumping the fragment shader's NIR for
 this sample and reading what feeds `nir_tex_src_coord` is the next step, and
 it is a five-minute one now that everything else is excluded.
+
+### Correction: the centre is not minification
+
+`texturemipmapgen`'s mipmapped texture reaches the sampler as
+`512x512 levels=0..9`, which is correct, alongside four correctly translated
+samplers. Texture info, sampler state and level count are all right, and
+deleting mip generation still changes nothing.
+
+So the earlier inference -- that a difference in the centre of the frame meant
+a difference in the deepest mip levels -- was an inference and not a
+measurement, and it was wrong. The centre of this frame is the vanishing point
+of the geometry, which is where any small shading difference concentrates
+whatever its cause.
+
+At 0.456 mean this is the *smallest* difference of the ten wrong samples, and
+three turns have now gone into it on the strength of that inference. The band
+in `pbribl` at 4.325, which covers one horizontal strip and therefore one
+object or one pass, is a better-shaped signal and has had none.
