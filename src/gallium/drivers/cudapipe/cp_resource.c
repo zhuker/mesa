@@ -1028,7 +1028,7 @@ cp_clear(struct pipe_context *ctx, unsigned buffers,
 {
    struct cp_context *cpc = cp_ctx(ctx);
    struct cp_screen *screen = cpc->screen;
-   struct pipe_framebuffer_state *fb = &cpc->framebuffer;
+   struct pipe_framebuffer_state *fb = &cp_gallium_of(cpc)->framebuffer;
 
    cuCtxSetCurrent(screen->cuda_ctx);
 

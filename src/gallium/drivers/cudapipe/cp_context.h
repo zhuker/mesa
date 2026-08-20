@@ -185,11 +185,10 @@ struct cp_context {
       uint64_t vs_ubos[CP_MAX_BATCH_DRAWS * CP_ARG_UBO_STRIDE];
       uint64_t fs_ubos[CP_MAX_BATCH_DRAWS * CP_ARG_UBO_STRIDE];
       uint64_t vb_bases[CP_MAX_BATCH_DRAWS * CP_VB_TABLE_STRIDE];
-      /* Live state the fallback restores before re-executing. */
-      struct pipe_vertex_element vertex_elements[16];
-      /* And the resolved form, which is what cp_draw_execute actually reads:
-       * restoring only the Gallium array leaves a re-executed segment using
-       * whatever element layout happens to be live. */
+      /* Live state the fallback restores before re-executing: the resolved
+       * vertex input, which is what cp_draw_execute reads. The Gallium array
+       * is deliberately not saved — nothing in a re-execution looks at it,
+       * and leaving the live copy alone keeps the next batch key correct. */
       struct cp_vertex_elem velem[16];
       uint64_t vb_base[16];
       unsigned num_vertex_buffers;
@@ -311,8 +310,6 @@ struct cp_context {
       unsigned  num, cap;
    } timer;
 
-   struct pipe_framebuffer_state framebuffer;   /* adapter: the key, the
-                                                 * clears and the blits */
    /* What the draw path reads, resolved when the framebuffer was bound. */
    struct cp_fb_desc fb;
    struct cp_rect scissor;
@@ -332,9 +329,6 @@ struct cp_context {
     * larger than they are today, and batch size is what makes the clipper's
     * unstable primitive order visible (gaps 15 and 16).
     */
-   struct pipe_viewport_state viewport_cso;
-   struct pipe_rasterizer_state rasterizer_cso;
-   struct pipe_depth_stencil_alpha_state depth_stencil_cso;
 
    /* Visibility buffer, rebuilt per draw: it resolves which triangle of the
     * current draw wins each pixel. */
@@ -385,8 +379,6 @@ struct cp_context {
    struct cp_shader_binary *fs_shader;
 
    /* Blend state */
-   struct pipe_blend_state blend_state;   /* adapter-only: the flush
-                                           * comparison and the batch key */
    /* What both kernels that evaluate a blend actually read, resolved once
     * when the state was bound rather than rebuilt per draw. */
    struct cp_blend_desc blend_desc;
@@ -400,11 +392,12 @@ struct cp_context {
       unsigned width, height;
       unsigned row_stride;
       unsigned pixel_size;
-      enum pipe_format format;
    } tex_resources[32];
 
    /* Vertex buffers and elements */
-   struct pipe_vertex_buffer vertex_buffers[16];
+   /* The bindings themselves are not kept: nothing reads them once
+    * vb_base has the resolved address, and a stale pipe_vertex_buffer is a
+    * resource reference nobody counts. */
    /* Resolved when the buffers were bound: base address plus offset, which
     * is all the draw path ever wanted from them. */
    uint64_t vb_base[16];
@@ -414,7 +407,6 @@ struct cp_context {
    struct cp_vertex_elem velem[16];
    unsigned num_vertex_buffers;
 
-   struct pipe_vertex_element vertex_elements[16];
    unsigned num_vertex_elements;
    unsigned vertex_stride;
 
@@ -534,7 +526,27 @@ struct cp_context {
 struct cp_gallium {
    struct pipe_context base;   /* first: entry points cast pipe_context to this */
    struct cp_context cp;
+
+   /*
+    * State this front end keeps for itself. None of it is read by the
+    * pipeline: the framebuffer, the CSO copies and the element array exist to
+    * decide whether a held-back batch must be flushed and to fill the batch
+    * key's state blob, which is the front end's business by construction.
+    */
+   struct pipe_framebuffer_state framebuffer;
+   struct pipe_viewport_state viewport_cso;
+   struct pipe_rasterizer_state rasterizer_cso;
+   struct pipe_depth_stencil_alpha_state depth_stencil_cso;
+   struct pipe_blend_state blend_state;
+   struct pipe_vertex_element vertex_elements[16];
 };
+
+/* The Gallium object around a renderer, for the adapter's own state. */
+static inline struct cp_gallium *
+cp_gallium_of(struct cp_context *cp)
+{
+   return (struct cp_gallium *)((char *)cp - offsetof(struct cp_gallium, cp));
+}
 
 /*
  * The one place a pipe_context becomes the renderer.

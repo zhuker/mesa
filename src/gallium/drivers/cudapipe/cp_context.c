@@ -124,6 +124,7 @@ static void
 cp_set_framebuffer_state(struct pipe_context *ctx,
                          const struct pipe_framebuffer_state *state)
 {
+   struct cp_gallium *g = (struct cp_gallium *)ctx;
    struct cp_context *cp = cp_ctx(ctx);
 
    /* The visibility and depth buffers may be freed below, and the held-back
@@ -140,7 +141,7 @@ cp_set_framebuffer_state(struct pipe_context *ctx,
               state->nr_cbufs ? (void *)state->cbufs[0].texture : NULL,
               (void *)state->zsbuf.texture);
 
-   util_copy_framebuffer_state(&cp->framebuffer, state);
+   util_copy_framebuffer_state(&g->framebuffer, state);
 
    /*
     * Resolve the attachments once. The draw path used to unwrap the colour
@@ -297,11 +298,12 @@ cp_set_viewport_states(struct pipe_context *ctx, unsigned start_slot,
                        unsigned num_viewports,
                        const struct pipe_viewport_state *viewports)
 {
+   struct cp_gallium *g = (struct cp_gallium *)ctx;
    struct cp_context *cp = cp_ctx(ctx);
    if (num_viewports > 0) {
-      if (memcmp(&cp->viewport_cso, &viewports[0], sizeof(cp->viewport_cso)))
+      if (memcmp(&g->viewport_cso, &viewports[0], sizeof(g->viewport_cso)))
          cp_batch_flush_why(cp, "viewport");
-      cp->viewport_cso = viewports[0];
+      g->viewport_cso = viewports[0];
       memcpy(cp->viewport.scale, viewports[0].scale, sizeof(cp->viewport.scale));
       memcpy(cp->viewport.translate, viewports[0].translate,
              sizeof(cp->viewport.translate));
@@ -4119,10 +4121,10 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                cuMemcpyDtoH(in, vs_input_buf, (size_t)nfetch * vs_in_stride);
             for (unsigned e = 0; e < cp->num_vertex_elements && e < 8; e++)
                fprintf(stderr, "  elem%u vb=%u off=%u stride=%u div=%u sz=%u\n",
-                       e, cp->vertex_elements[e].vertex_buffer_index,
-                       cp->vertex_elements[e].src_offset,
-                       cp->vertex_elements[e].src_stride,
-                       cp->vertex_elements[e].instance_divisor,
+                       e, cp->velem[e].vertex_buffer_index,
+                       cp->velem[e].src_offset,
+                       cp->velem[e].src_stride,
+                       cp->velem[e].instance_divisor,
                        vf_args.elem_attr_size[e]);
             for (unsigned v = 0; in && v < nfetch; v++) {
                fprintf(stderr, "  vfetch v%u:", v);
@@ -4370,8 +4372,8 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
               cp->viewport.scale[0], cp->viewport.scale[1], color_data);
       for (unsigned e = 0; e < cp->num_vertex_elements && e < 4; e++)
          fprintf(stderr, "  elem[%u]: offset=%u fmt=%u vb=%u\n", e,
-                 cp->vertex_elements[e].src_offset, cp->vertex_elements[e].src_format,
-                 cp->vertex_elements[e].vertex_buffer_index);
+                 cp->velem[e].src_offset, cp->velem[e].conv,
+                 cp->velem[e].vertex_buffer_index);
    }
 
    /* 3-stage adaptive rasterize. The queue counters are zeroed inside the pass
@@ -5479,11 +5481,12 @@ cp_batch_state_fields(unsigned *count)
 
 /* Fill in everything two draws must agree on. See struct cp_batch_key. */
 static void
-cp_batch_build_key(struct cp_context *cp, const struct cp_draw_call *info,
+cp_batch_build_key(struct cp_gallium *g, const struct cp_draw_call *info,
                    const struct cp_draw_range *draws,
                    struct cp_batch_key *key, bool blended)
 {
-   struct pipe_framebuffer_state *fb = &cp->framebuffer;
+   struct cp_context *cp = &g->cp;
+   struct pipe_framebuffer_state *fb = &g->framebuffer;
 
    memset(key, 0, sizeof(*key));
 
@@ -5521,7 +5524,7 @@ cp_batch_build_key(struct cp_context *cp, const struct cp_draw_call *info,
     */
    struct cp_gallium_batch_state gs;
    memset(&gs, 0, sizeof(gs));
-   gs.viewport = cp->viewport_cso;
+   gs.viewport = g->viewport_cso;
    /*
     * The scissor is a merge condition only where a primitive cannot be
     * resolved to its draw: a batch on the stable clipper carries one clip
@@ -5533,12 +5536,12 @@ cp_batch_build_key(struct cp_context *cp, const struct cp_draw_call *info,
    if (cp->rasterizer.scissor &&
        !(blended || (cp->fs_shader && cp->fs_shader->reads_const_bufs)))
       key->scissor = cp->scissor;
-   gs.rasterizer = cp->rasterizer_cso;
-   gs.depth_stencil = cp->depth_stencil_cso;
-   gs.blend_state = cp->blend_state;
+   gs.rasterizer = g->rasterizer_cso;
+   gs.depth_stencil = g->depth_stencil_cso;
+   gs.blend_state = g->blend_state;
    key->blend_enabled = cp->blend_enabled;
 
-   memcpy(gs.vertex_elements, cp->vertex_elements, sizeof(gs.vertex_elements));
+   memcpy(gs.vertex_elements, g->vertex_elements, sizeof(gs.vertex_elements));
    static_assert(sizeof(gs) <= CP_BATCH_STATE_BYTES,
                  "the adapter's batch state does not fit the key");
    memcpy(key->state, &gs, sizeof(gs));
@@ -5651,7 +5654,7 @@ cp_batch_structural(struct cp_context *cp, const struct cp_draw_call *info,
    /* A vertex buffer is what the batch replays; a shader building its
     * positions from gl_VertexIndex alone has nothing to gain and is left on
     * the single-draw path. */
-   if (!cp->num_vertex_buffers || !cp->vertex_buffers[0].buffer.resource)
+   if (!cp->num_vertex_buffers || !cp->vb_base[0])
       return false;
 
    /* Framebuffer and the buffers the stages need. */
@@ -5818,14 +5821,12 @@ cp_batch_record(struct cp_context *cp,
       memset(vrow, 0, CP_VB_TABLE_STRIDE * sizeof(*vrow));
       for (unsigned e = 0; e < cp->num_vertex_elements &&
                            e < CP_VB_TABLE_STRIDE; e++) {
-         unsigned vb_idx = cp->vertex_elements[e].vertex_buffer_index;
+         unsigned vb_idx = cp->velem[e].vertex_buffer_index;
          if (vb_idx < cp->num_vertex_buffers && vb_idx < 16 &&
-             cp->vertex_buffers[vb_idx].buffer.resource) {
-            void *data = cp_resource_data(
-               cp_resource(cp->vertex_buffers[vb_idx].buffer.resource));
-            if (data)
-               vrow[e] = (uint64_t)(uintptr_t)data +
-                  cp->vertex_buffers[vb_idx].buffer_offset;
+             cp->vb_base[vb_idx]) {
+            /* Base and offset were folded together when the buffer was
+             * bound, which is the same value this computed for itself. */
+            vrow[e] = cp->vb_base[vb_idx];
          }
       }
    }
@@ -5977,10 +5978,10 @@ cp_pass_broadcast(struct cp_context *cp, unsigned nsegs)
  * segment, saved and restored around the fallback and the shading loop. */
 struct cp_pass_live {
    struct cp_shader_binary *vs, *fs;
-   struct pipe_vertex_element vertex_elements[16];
-   /* The resolved vertex input as well, because that is what the draw path
-    * reads. Saving only the Gallium array would leave a segment re-executed
-    * by the fallback gathering with whatever layout is live at the time. */
+   /* The resolved vertex input, which is what the draw path reads. The
+    * Gallium array is not saved: nothing during a fallback re-execution
+    * looks at it, and leaving the live copy alone is what keeps the next
+    * batch key correct. */
    struct cp_vertex_elem velem[16];
    uint64_t vb_base[16];
    unsigned num_vertex_buffers;
@@ -5994,8 +5995,6 @@ cp_pass_live_save(struct cp_context *cp, struct cp_pass_live *lv)
 {
    lv->vs = cp->vs_shader;
    lv->fs = cp->fs_shader;
-   memcpy(lv->vertex_elements, cp->vertex_elements,
-          sizeof(lv->vertex_elements));
    memcpy(lv->velem, cp->velem, sizeof(lv->velem));
    memcpy(lv->vb_base, cp->vb_base, sizeof(lv->vb_base));
    lv->num_vertex_buffers = cp->num_vertex_buffers;
@@ -6011,8 +6010,6 @@ cp_pass_live_restore(struct cp_context *cp, const struct cp_pass_live *lv)
 {
    cp->vs_shader = lv->vs;
    cp->fs_shader = lv->fs;
-   memcpy(cp->vertex_elements, lv->vertex_elements,
-          sizeof(lv->vertex_elements));
    memcpy(cp->velem, lv->velem, sizeof(lv->velem));
    memcpy(cp->vb_base, lv->vb_base, sizeof(lv->vb_base));
    cp->num_vertex_buffers = lv->num_vertex_buffers;
@@ -6028,8 +6025,6 @@ cp_pass_seg_restore(struct cp_context *cp, const struct cp_pass_seg *sg)
 {
    cp->vs_shader = sg->vs;
    cp->fs_shader = sg->fs;
-   memcpy(cp->vertex_elements, sg->vertex_elements,
-          sizeof(sg->vertex_elements));
    memcpy(cp->velem, sg->velem, sizeof(sg->velem));
    memcpy(cp->vb_base, sg->vb_base, sizeof(sg->vb_base));
    cp->num_vertex_buffers = sg->num_vertex_buffers;
@@ -7469,8 +7464,6 @@ cp_pass_record_segment(struct cp_context *cp,
    if (vb_table)
       memcpy(sg->vb_bases, vb_table,
              (size_t)ndraws * CP_VB_TABLE_STRIDE * sizeof(uint64_t));
-   memcpy(sg->vertex_elements, cp->vertex_elements,
-          sizeof(sg->vertex_elements));
    memcpy(sg->velem, cp->velem, sizeof(sg->velem));
    memcpy(sg->vb_base, cp->vb_base, sizeof(sg->vb_base));
    sg->num_vertex_buffers = cp->num_vertex_buffers;
@@ -7676,6 +7669,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *gallium_info,
             const struct pipe_draw_start_count_bias *gallium_draws,
             unsigned num_draws)
 {
+   struct cp_gallium *g = (struct cp_gallium *)ctx;
    struct cp_context *cp = cp_ctx(ctx);
    struct cp_screen *screen = cp->screen;
 
@@ -7737,9 +7731,9 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *gallium_info,
          else if (MAX2(info->instance_count, 1u) != 1) why = ":instanced";
          else if (info->has_user_indices) why = ":userindex";
          else if (!cp->num_vertex_buffers ||
-                  !cp->vertex_buffers[0].buffer.resource) why = ":novb";
-         else if (!cp->framebuffer.nr_cbufs ||
-                  !cp->framebuffer.cbufs[0].texture ||
+                  !cp->vb_base[0]) why = ":novb";
+         else if (!g->framebuffer.nr_cbufs ||
+                  !g->framebuffer.cbufs[0].texture ||
                   !cp->visbuf || !cp->depthbuf) why = ":nofb";
          else if (t == 0 || t > CP_MAX_BATCH_TRIS) why = ":toobig";
          else if (!cp->blend_enabled) {
@@ -7760,7 +7754,7 @@ cp_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *gallium_info,
 
    if (eligible) {
       struct cp_batch_key key;
-      cp_batch_build_key(cp, info, draws, &key, blended);
+      cp_batch_build_key(cp_gallium_of(cp), info, draws, &key, blended);
 
       /* Instances included: this is what accumulates into batch.tris, which
        * the triangle cap and every grid downstream are sized from. The
@@ -8011,21 +8005,22 @@ cp_create_blend_state(struct pipe_context *ctx,
 static void
 cp_bind_blend_state(struct pipe_context *ctx, void *state)
 {
+   struct cp_gallium *g = (struct cp_gallium *)ctx;
    struct cp_context *cp = cp_ctx(ctx);
    struct pipe_blend_state next;
    if (state)
       next = *(struct pipe_blend_state *)state;
    else
       memset(&next, 0, sizeof(next));
-   if (memcmp(&cp->blend_state, &next, sizeof(next)))
+   if (memcmp(&g->blend_state, &next, sizeof(next)))
       cp_batch_flush_why(cp, "blend state");
 
    if (state) {
-      cp->blend_state = next;
+      g->blend_state = next;
       cp->blend_desc = cp_blend_desc_from_gallium(&next.rt[0]);
-      cp->blend_enabled = cp->blend_state.rt[0].blend_enable;
+      cp->blend_enabled = g->blend_state.rt[0].blend_enable;
       if (cp->gpu_state) {
-         const struct pipe_rt_blend_state *rt = &cp->blend_state.rt[0];
+         const struct pipe_rt_blend_state *rt = &g->blend_state.rt[0];
          cp->gpu_state->blend_enable = rt->blend_enable;
          cp->gpu_state->rgb_src_factor = rt->rgb_src_factor;
          cp->gpu_state->rgb_dst_factor = rt->rgb_dst_factor;
@@ -8036,7 +8031,7 @@ cp_bind_blend_state(struct pipe_context *ctx, void *state)
          cp->gpu_state->colormask = rt->colormask ? rt->colormask : 0xF;
       }
    } else {
-      memset(&cp->blend_state, 0, sizeof(cp->blend_state));
+      memset(&g->blend_state, 0, sizeof(g->blend_state));
       memset(&cp->blend_desc, 0, sizeof(cp->blend_desc));
       cp->blend_enabled = false;
       if (cp->gpu_state) {
@@ -8065,15 +8060,16 @@ cp_create_rasterizer_state(struct pipe_context *ctx,
 static void
 cp_bind_rasterizer_state(struct pipe_context *ctx, void *state)
 {
+   struct cp_gallium *g = (struct cp_gallium *)ctx;
    struct cp_context *cp = cp_ctx(ctx);
    struct pipe_rasterizer_state next;
    if (state)
       next = *(struct pipe_rasterizer_state *)state;
    else
       memset(&next, 0, sizeof(next));
-   if (memcmp(&cp->rasterizer_cso, &next, sizeof(next)))
+   if (memcmp(&g->rasterizer_cso, &next, sizeof(next)))
       cp_batch_flush_why(cp, "rasterizer state");
-   cp->rasterizer_cso = next;
+   g->rasterizer_cso = next;
    cp->rasterizer = (struct cp_raster_state) {
       .cull_face = next.cull_face,
       .front_ccw = next.front_ccw,
@@ -8101,17 +8097,18 @@ cp_create_depth_stencil_alpha_state(struct pipe_context *ctx,
 static void
 cp_bind_depth_stencil_alpha_state(struct pipe_context *ctx, void *state)
 {
+   struct cp_gallium *g = (struct cp_gallium *)ctx;
    struct cp_context *cp = cp_ctx(ctx);
    struct pipe_depth_stencil_alpha_state next;
    if (state)
       next = *(struct pipe_depth_stencil_alpha_state *)state;
    else
       memset(&next, 0, sizeof(next));
-   if (memcmp(&cp->depth_stencil_cso, &next, sizeof(next)))
+   if (memcmp(&g->depth_stencil_cso, &next, sizeof(next)))
       cp_batch_flush_why(cp, "depth/stencil state");
 
    if (state) {
-      cp->depth_stencil_cso = next;
+      g->depth_stencil_cso = next;
       cp->depth_stencil = (struct cp_depth_state) {
          .depth_enabled = next.depth_enabled,
          .depth_writemask = next.depth_writemask,
@@ -8161,15 +8158,16 @@ cp_create_vertex_elements_state(struct pipe_context *ctx, unsigned num_elements,
 static void
 cp_bind_vertex_elements_state(struct pipe_context *ctx, void *state)
 {
+   struct cp_gallium *g = (struct cp_gallium *)ctx;
    struct cp_context *cp = cp_ctx(ctx);
    if (state) {
       struct cp_vertex_elements_state *ve = (struct cp_vertex_elements_state *)state;
       if (ve->num_elements != cp->num_vertex_elements ||
           ve->stride != cp->vertex_stride ||
-          memcmp(cp->vertex_elements, ve->elements,
+          memcmp(g->vertex_elements, ve->elements,
                  ve->num_elements * sizeof(struct pipe_vertex_element)))
          cp_batch_flush_defer_why(cp, "vertex elements");
-      memcpy(cp->vertex_elements, ve->elements, ve->num_elements * sizeof(struct pipe_vertex_element));
+      memcpy(g->vertex_elements, ve->elements, ve->num_elements * sizeof(struct pipe_vertex_element));
       cp->num_vertex_elements = ve->num_elements;
       cp->vertex_stride = ve->stride;
 
@@ -8479,7 +8477,6 @@ cp_set_sampler_views(struct pipe_context *ctx, mesa_shader_stage shader,
       cp->tex_resources[idx].height = h;
       cp->tex_resources[idx].row_stride = row_stride;
       cp->tex_resources[idx].pixel_size = pixel_size;
-      cp->tex_resources[idx].format = res->format;
    }
 
    if (start + count > cp->num_tex_objects)
@@ -8572,7 +8569,6 @@ cp_set_vertex_buffers(struct pipe_context *ctx, unsigned count,
 
    for (unsigned i = 0; i < count; i++) {
       if (buffers) {
-         cp->vertex_buffers[i] = buffers[i];
          void *data = buffers[i].buffer.resource
             ? cp_resource_data(cp_resource(buffers[i].buffer.resource)) : NULL;
          cp->vb_base[i] = data
@@ -8580,7 +8576,6 @@ cp_set_vertex_buffers(struct pipe_context *ctx, unsigned count,
          if (cp->gpu_state)
             cp->gpu_state->vb_bases[i] = cp->vb_base[i];
       } else {
-         memset(&cp->vertex_buffers[i], 0, sizeof(cp->vertex_buffers[i]));
          cp->vb_base[i] = 0;
          if (cp->gpu_state)
             cp->gpu_state->vb_bases[i] = 0;
