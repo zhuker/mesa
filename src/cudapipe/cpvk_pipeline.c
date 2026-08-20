@@ -139,6 +139,31 @@ lower_descriptors(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return true;
    }
 
+   case nir_intrinsic_vulkan_resource_reindex: {
+      /*
+       * The array index, applied to an address this pass already built.
+       *
+       * NIR emits vulkan_resource_index for the binding and then a reindex
+       * for each step through a descriptor array, so a shader indexing
+       * `sampler samplers[3]` arrives here with the element in src[1].
+       * Dropping it left every access on element 0: texturemipmapgen chose
+       * between three samplers with a uniform and always got the first, which
+       * is the one built with lod 0.0..0.0, so nothing it drew ever used a
+       * mip level.
+       *
+       * The address is (slot, byte offset, 0), so the step is on the second
+       * component and is the same descriptor stride the index above uses.
+       */
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *addr = intr->src[0].ssa;
+      nir_def *step = nir_imul_imm(b, intr->src[1].ssa, CPVK_DESCRIPTOR_SIZE);
+      nir_def *out = nir_vec3(b, nir_channel(b, addr, 0),
+                              nir_iadd(b, nir_channel(b, addr, 1), step),
+                              nir_channel(b, addr, 2));
+      nir_def_replace(&intr->def, out);
+      return true;
+   }
+
    /*
     * A buffer access still carrying the (slot, offset) pair becomes one
     * against the descriptor: the set's buffer base plus the offset. The

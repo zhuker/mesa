@@ -3739,3 +3739,37 @@ measured and re-measured for this sample across many turns.
 It also explains why every component tested clean: the chain, the blit filter,
 implicit LOD selection and the sampler code are all correct, and the driver
 simply never asks them to use the sampler the shader named.
+
+### texturemipmapgen: the descriptors are right and the element is still 0
+
+The sampler array is written correctly. `CPVK_DEBUG_RT`:
+
+    desc flat=1 type=2 samp=0 img=512x512     the sampled image
+    desc flat=2 type=0 samp=1                 samplers[0], lod 0.0..0.0
+    desc flat=3 type=0 samp=2                 samplers[1], lod 0.0..10.0
+    desc flat=4 type=0 samp=3                 samplers[2], aniso 16
+
+Three sampler descriptors at consecutive flat indices carrying three different
+driver samplers, exactly as they should be. And the shader's address for
+binding 2 element *i* is `(flat + i) * CPVK_DESCRIPTOR_SIZE`, which lands on
+2, 3 and 4.
+
+Two candidates tested and eliminated:
+
+- **Specialisation.** `CUDAPIPE_NO_SAMPLER_VARIANT=1`, which stops the driver
+  baking sampler state into a compiled variant, leaves the sample at 0.456.
+- **`vulkan_resource_reindex`.** It was not handled at all -- NIR emits it for
+  each step through a descriptor array -- and implementing it changes nothing,
+  so this shader does not use that form.
+
+So the descriptors are right, the addressing arithmetic is right, no state is
+baked in, and the sample still behaves exactly as though it used
+`samplers[0]` -- the sampler with no mip levels, which is why native renders
+sharper and brighter in the distance.
+
+`vulkan_resource_reindex` is kept: it was genuinely missing, a shader that uses
+it would have been silently wrong, and it is now implemented and verified
+present. That it changes nothing here is recorded rather than assumed.
+
+What is left is the one link not yet observed directly: which address the
+shader actually passes as `samp_handle`. Every other step has been printed.
