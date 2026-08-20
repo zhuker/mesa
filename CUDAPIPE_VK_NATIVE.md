@@ -408,3 +408,41 @@ the >32/255 and >96/255 means, which is what the gate has always been.
 When the native driver renders, it takes the same table, and additionally has
 to match the Gallium-hosted build frame for frame — which is why both targets
 are built from one tree.
+
+## Textures: the contract the backend already has
+
+Dumped from the Gallium path (`CUDAPIPE_DUMP_NIR=1` on the `texture` sample),
+because the backend's expectations are not written down anywhere else. The
+fragment shader reaches the sampler like this:
+
+    64 %12 = @load_const_buf_base_addr_lvp (%11 (0x1))
+    64 %14 = iadd %12, 0x10
+    64 %16 = iadd %12, 0x50
+    32x4 %17 = txb %14 (texture_handle), %16 (sampler_handle), ...
+
+So:
+
+- A descriptor **set** is one flat buffer of descriptors, and its address is a
+  constant-buffer slot. `load_const_buf_base_addr_lvp(slot)` yields it; the
+  backend implements that intrinsic as `emit_const_buf_base()`, the same path
+  a UBO read takes.
+- A handle is `set_base + binding_offset`, computed in the shader. It is not
+  loaded from memory, so the native driver's current one-address-per-binding
+  scheme cannot express it: the slot must hold the *set*, and the binding
+  offset must be added in NIR.
+- The kernel reads two fields out of a handle and nothing else:
+  `*(cp_texture_info **)(tex_handle + 48)` and
+  `*(unsigned *)(samp_handle + 28)`, an index into `cp_sampler_table`. See
+  `CP_DESC_IMAGE_FUNCTIONS_OFFSET` and `CP_DESC_SAMPLER_INDEX_OFFSET`. The
+  descriptor layout between those offsets is the driver's to choose.
+
+That makes the work concrete: descriptor sets become managed buffers with a
+64-byte stride, `vkCreateImageView` gets a device-resident `cp_texture_info`,
+`vkCreateSampler` gets an entry in `cp_sampler_table`, and the descriptor
+lowering emits the base-address intrinsic plus an offset instead of a
+per-binding address.
+
+One constraint that is easy to miss: the sampler-variant optimisation in
+`cp_renderer.c` reads the descriptor **on the host** to decide whether a
+shader can be specialised, so descriptor memory has to be host-readable.
+Managed memory, not device-local.
