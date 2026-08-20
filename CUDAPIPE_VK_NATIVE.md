@@ -1327,3 +1327,35 @@ The suite is nine tests now and every one of them passes:
 Each was written to answer one question and each still answers it in about a
 second. Between them they have cleared more than a dozen hypotheses that would
 each have cost a turn of argument.
+
+### pbribl's vertex shader outputs all zeros
+
+The fragment dump works on a sample now and says it in one line:
+
+    vtx0: slot0=[0.000 0.000 0.000 0.000] slot1=[0.000 ...] slot2=[0.000 ...]
+
+Every output slot of every vertex is zero, so `gl_Position` is (0,0,0,0), w is
+zero, every triangle is degenerate and nothing is covered. That is why the
+spheres shade nothing, and it is a much narrower statement than "the draws
+produce no coverage": the vertex stage produces nothing, and everything
+downstream is behaving correctly given that.
+
+Two things had to be fixed in the instrument before it could say so, and both
+were bugs in the debug path rather than the driver:
+
+- it fetched the whole vertex-output buffer of a 4,512-triangle draw to print
+  six vertices
+- it dereferenced `color_data` **on the host**, which is a device address. That
+  works only when the colour target happens to be host-visible, which it is in
+  every test here and is not in any sample. It is fetched with a
+  `cuMemcpyDtoH` now.
+
+An instrument that dies on exactly the cases worth investigating is worse than
+no instrument, and this one had been dying since the first attempt to use it
+several turns ago.
+
+Next: the uniform buffer the shader reads was verified correct at the
+descriptor, so either the shader is not reading it through the slot it was
+compiled for, or the vertex fetch is handing it zeroed attributes. Printing
+the fetched attributes beside the outputs distinguishes those, and the dump is
+now the place to do it.

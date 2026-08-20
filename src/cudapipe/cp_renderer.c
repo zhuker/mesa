@@ -2511,17 +2511,29 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
        */
       unsigned dump_pixels = MIN2(num_pixels, 4096u);
 
-      size_t vs_out_bytes = (size_t)num_triangles * 3 * num_vs_outputs * 16;
-      float *vs_out = malloc(vs_out_bytes);
+      /*
+       * Only the vertices that will be printed. The loop below stops at
+       * 6 * vstep, and fetching the whole stream instead read the entire
+       * vertex-output buffer of a 4,512-triangle draw -- which is where this
+       * path crashed on pbribl and bloom, taking with it the answer to why
+       * their draws shade nothing. An instrument that dies on the case being
+       * investigated is worse than none.
+       */
+      unsigned dump_verts = MIN2(num_triangles * 3,
+                                 6 * MAX2(cp_debug->debug_fs_vstep, 1u));
+      size_t vs_out_bytes = (size_t)dump_verts * num_vs_outputs * 16;
+      float *vs_out = vs_out_bytes ? malloc(vs_out_bytes) : NULL;
       uint32_t *plist_buf = dump_pixels ? malloc((size_t)dump_pixels * 4) : NULL;
       float *fin_buf = dump_pixels ? malloc((size_t)dump_pixels * fs_in_stride) : NULL;
       float *fout_buf = dump_pixels ? malloc((size_t)dump_pixels * fs_out_stride) : NULL;
-      if (!vs_out || (dump_pixels && (!plist_buf || !fin_buf || !fout_buf))) {
+      if ((vs_out_bytes && !vs_out) ||
+          (dump_pixels && (!plist_buf || !fin_buf || !fout_buf))) {
          free(vs_out); free(plist_buf); free(fin_buf); free(fout_buf);
          fprintf(stderr, "  (CUDAPIPE_DEBUG_FS: out of memory)\n");
          return;
       }
-      cuMemcpyDtoH(vs_out, vs_output_buf, vs_out_bytes);
+      if (vs_out_bytes)
+         cuMemcpyDtoH(vs_out, vs_output_buf, vs_out_bytes);
       if (dump_pixels) {
          cuMemcpyDtoH(plist_buf, pixel_list, (size_t)dump_pixels * 4);
          cuMemcpyDtoH(fin_buf, fs_in, (size_t)dump_pixels * fs_in_stride);
@@ -2530,7 +2542,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
       num_pixels = dump_pixels;
 
       unsigned vstep = cp_debug->debug_fs_vstep;   /* registry clamps to >= 1 */
-      for (unsigned v = 0; v < num_triangles * 3 && v < 6 * vstep; v += vstep) {
+      for (unsigned v = 0; v < dump_verts; v += vstep) {
          fprintf(stderr, "  vtx%u:", v);
          for (unsigned s = 0; s < num_vs_outputs; s++)
             fprintf(stderr, " slot%u=[%.3f %.3f %.3f %.3f]", s,
@@ -2553,14 +2565,25 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
          if (want_row >= 0 && (int)(px / w) != want_row)
             continue;
          shown++;
-         const uint32_t *cb = (const uint32_t *)color_data;
+         /*
+          * The framebuffer word, fetched rather than dereferenced.
+          * color_data is a device address, and reading it on the host works
+          * only when the colour target happens to be host-visible -- which it
+          * is in a small test and is not in a sample. This path segfaulted on
+          * pbribl and bloom for that reason, which is why neither could be
+          * looked at with it.
+          */
+         uint32_t fb_word = 0;
+         if (color_data)
+            cuMemcpyDtoH(&fb_word, (CUdeviceptr)(uintptr_t)color_data +
+                         (size_t)px * 4, sizeof(fb_word));
          fprintf(stderr, "  px(%u,%u) in=[%.9f %.9f] out=[%.3f %.3f %.3f %.3f] "
                  "fb=0x%08x\n",
                  px % w, px / w,
                  fin[i * (fs_in_stride / 4) + 0], fin[i * (fs_in_stride / 4) + 1],
                  fout[i * (fs_out_stride / 4) + 0], fout[i * (fs_out_stride / 4) + 1],
                  fout[i * (fs_out_stride / 4) + 2], fout[i * (fs_out_stride / 4) + 3],
-                 cb ? cb[px] : 0u);
+                 fb_word);
       }
       free(vs_out); free(plist_buf); free(fin_buf); free(fout_buf);
    }
