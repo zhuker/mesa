@@ -3400,3 +3400,30 @@ the substitution measured.
 
 That is the next check and it is one print: the copy's destination pointer
 beside the view's base.
+
+### Everything into the read is correct, and the read returns zero
+
+    the cube's memory      copies land at dstmem=0x7db3c2000000
+    the view's base        base=0x7db3c2000000, target=3, enc=9, levels 0..9
+    the direction R        identical to the Gallium driver on every sphere pixel
+    textureLod(cube,R,0)   (0,0,0) here, (225,93,29) there
+
+And `cpvk_cubebig` -- the same format, the same 512x512, the same ten levels,
+the same six faces, the same per-fragment varying direction -- is
+byte-identical to lavapipe.
+
+So the inputs to the read are all correct, an equivalent cube reads correctly,
+and this one returns zero. The difference has to be in state neither the cube
+nor the direction carries.
+
+The candidate that remains is the **sampler**. pbribl's prefiltered cube uses
+sampler index 4 with `wrap=2,2` -- clamp to edge -- `filt=1/1`, `mip=1` and
+`lod=0.0..10.0`, while every test here uses `VK_SAMPLER_ADDRESS_MODE_REPEAT`
+and a `maxLod` matching the level count exactly. A `maxLod` of 10 on a cube
+whose levels are 0..9 is legal and should clamp, and the wrap mode should not
+matter at all now that the cube path is seamless and no longer consults it --
+which makes both worth checking rather than assuming.
+
+That is the next substitution, and it is one line in the test: build the big
+cube's sampler with clamp-to-edge and `maxLod = 10`, and see whether
+`cpvk_cubebig` starts returning zero.
