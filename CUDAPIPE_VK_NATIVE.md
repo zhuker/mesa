@@ -4608,3 +4608,43 @@ scratch arena, because `cp_draw_execute` reclaims only for a segment that opens
 one. Giving segments storage the episode owns is what makes the deferring flush
 usable, and the measurement says it is worth up to 4.4x of the A-buffer work,
 which is two thirds of the remaining launch gap.
+
+## Session close
+
+    working tree     clean
+    Gallium driver   0 files changed from the branch point
+    samples          18/18 run, 17/18 pixel-correct
+    unit tests       14/14
+    Crossroads       native  8.81 ms   gallium  7.21 ms   1.22x
+    old capture      native 31.29 ms   gallium 25.25 ms   1.24x
+
+### Where the remaining change sits, and why it was not attempted
+
+A segment's clipped stream must move out of the shared scratch arena into
+storage the episode owns. The measurement supports it precisely -- 62% of
+blended merge refusals are a fragment-shader change, which an episode is built
+to absorb as a new segment, and doing so would cut up to 4.4x of the A-buffer
+work, two thirds of the remaining launch gap.
+
+But `sg->rast = *aa` captures more than the two obvious allocations, there are
+about forty `cp_scratch_alloc_device` calls in the draw path with different
+lifetimes, and seven attempts in this area have each broken something -- four
+samples wrong, or device memory exhausted on the ninth frame of a capture. A
+wrong version of this corrupts rendering in ways a single-frame sweep does not
+catch, which is the failure mode this driver's history is made of.
+
+It is scoped, motivated and measured, and it wants more context than a careful
+guess.
+
+### What this session did
+
+    correctness   8/18 -> 17/18 pixel-correct, and verified against NVIDIA
+                  rather than against the driver being replaced: equal on
+                  fourteen samples, strictly better on two
+    performance   1.31x and 1.36x -> 1.22x and 1.24x
+    tests         9 -> 14, each byte-identical to a reference
+
+Eight defects fixed with a sample each behind them, six more correctness fixes
+that moved no sample and are recorded as such, and one measurement-harness bug
+-- a leaked environment variable -- that had silently invalidated every
+performance A/B taken after it appeared.
