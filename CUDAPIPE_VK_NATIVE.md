@@ -4543,3 +4543,34 @@ left is that the Gallium driver averages 6.09 draws per batch against this
 driver's 4.47 while refusing merges for the same reasons, which means its draws
 arrive in a more mergeable order or its shader identities coincide more often
 -- neither of which this front end controls directly.
+
+### Episodes still hold one segment; the win came from batching blended draws
+
+With everything on, over 40 seconds of the capture:
+
+    22,994 episodes  nsegs=1  blended
+     1,771 episodes  nsegs=1  opaque
+    mean 1.00 segments, maximum 1
+
+So blended pass episodes are created constantly and never accumulate. The 2.7x
+that enabling them bought is not episode accumulation at all -- it is that a
+blended *batch* of N draws becomes one segment and therefore one A-buffer
+build, where before every blended draw was its own. The batch does the
+amortising; the episode is just the container it lands in.
+
+That reframes the remaining gap. `cp_abuf_scan_block` runs once per episode and
+this driver runs 102.1 a frame against the Gallium driver's 23.1, so it builds
+4.4 times as many A-buffers. Since every episode here holds exactly one batch,
+that is 4.4 times as many *blended batches* -- its blended draws merge into
+groups about a quarter the size.
+
+Overall this driver averages 4.47 draws per batch and the Gallium driver 6.09,
+which is only 1.36x, so the difference must be concentrated in the blended
+draws specifically rather than spread across all of them.
+
+Seven attempts have now established what does not close it: deferring the flush
+(four ways), bounding episodes by segments or by arena bytes, raising either
+batch cap, and relaxing the merge conditions the renderer's own key omits. What
+remains is why blended draws in particular merge into smaller groups here, and
+that is a question about the merge key applied to blended draws rather than
+about episodes.
