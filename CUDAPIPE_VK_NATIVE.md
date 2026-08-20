@@ -4423,3 +4423,46 @@ in policy.
 That is the next measurement and it is cheap: count the distinct `vs`/`fs`
 pointers this driver uses across the capture against the number of distinct
 SPIR-V modules it was given.
+
+### A leaked environment variable invalidated the performance analysis
+
+`CPVK_BATCH=1` and `CPVK_BATCH_BLEND=1` were set in the driving shell's
+environment by a cell that raised before its cleanup ran, and every process
+launched afterwards inherited them. Every replay measurement taken after that
+point had batching **and** blended pass episodes enabled, including the ones
+labelled "baseline" and "off".
+
+That is why several comparisons came out at zero: both arms had the feature on.
+The conclusions built on them are wrong and are corrected here.
+
+Measured with a clean environment, Crossroads:
+
+    no batching                        24.50 ms
+    batching only                      23.49 ms
+    batching + blended episodes         8.79 ms
+    blended episodes without batching  24.48 ms
+
+**Blended pass episodes are worth 2.7x**, and they need batching to reach
+them -- a blended draw that does not join a batch never reaches an episode, so
+every one builds, sorts and peels its own A-buffer. This is the change
+committed many turns ago as "worth 4% of launches and nothing in time"; that
+measurement had it enabled on both sides.
+
+Both are now on by default, with `CPVK_NO_BATCH` and `CPVK_NO_BATCH_BLEND` to
+turn them off, together with the instance-count relaxation that lets draws
+merge at all -- the renderer's `cp_batch_key` never had it and a batch carries
+an `instance_counts[]` row per draw.
+
+    sweep        18/18 run, 17/18 pixel-correct
+    unit tests   14/14
+    Crossroads   native  8.81 ms   gallium  7.21 ms   1.22x
+    old capture  native 31.29 ms   gallium 25.25 ms   1.24x
+
+From 1.31x and 1.36x. The remaining gap is a fifth of what the objective's
+reference achieves rather than a third.
+
+**The lesson is about the harness, not the driver.** A measurement environment
+that carries state between runs makes every A/B a comparison of the same thing
+with itself, and it does so silently -- the numbers look plausible, they
+reproduce, and they are meaningless. What caught it was an impossible result:
+two code paths that must be identical measuring 2.6x apart.

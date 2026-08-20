@@ -1326,7 +1326,18 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
     */
    if (getenv("CPVK_KEEP_VOFF"))
       CPVK_DIFF(a->range.index_bias != b->range.index_bias, "vertex offset");
-   CPVK_DIFF(a->call.instance_count != b->call.instance_count, "instance count");
+   /*
+    * The instance count is *not* a merge condition. The renderer's own
+    * cp_batch_key omits it and cp_draw_execute is handed an instance_counts[]
+    * row per draw, which the vertex fetch reads -- "slices[d].verts_per_instance
+    * = inst > 1 ? dverts : 0" -- so a batch of draws with different instance
+    * counts is what that table exists for.
+    *
+    * It was the second largest refusal in the Crossroads capture once the
+    * vertex-offset condition stopped masking it: 9,168 of 32,668.
+    */
+   if (getenv("CPVK_KEEP_INSTKEY"))
+      CPVK_DIFF(a->call.instance_count != b->call.instance_count, "instance count");
    /*
     * The descriptors, by content.
     *
@@ -1431,7 +1442,20 @@ cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw *d,
     * would make this pay, and until then an always-false batcher is honest
     * about what it does.
     */
-   if (!getenv("CPVK_BATCH"))
+   /*
+    * On by default.
+    *
+    * It was off because it was measured worth nothing: almost nothing merged,
+    * and the note here said so. What it was actually blocked on was the
+    * instance count, which this front end made a merge condition and the
+    * renderer's own cp_batch_key does not -- a batch is handed an
+    * instance_counts[] row per draw. With that removed the same capture
+    * replays at 8.81 ms against 9.45 and the heavier one at 31.2 against 34.5,
+    * two runs each way, and 17/18 samples stay pixel-correct.
+    *
+    * CPVK_NO_BATCH=1 turns it off again.
+    */
+   if (getenv("CPVK_NO_BATCH"))
       return false;
 
    if (cp_debug->no_batch)
@@ -1460,7 +1484,23 @@ cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw *d,
     * driver's 245, with cp_peel_advance alone running 109 times a frame
     * against 0.1.
     */
-   if (getenv("CPVK_BATCH_BLEND")) {
+   /*
+    * The blended half, on by default.
+    *
+    * A blended draw merges through the A-buffer, where the order fragments
+    * composite in is decided per pixel rather than by submission order, so
+    * merging is sound; `cpvk_batchblend` shows nine blended draws over nine
+    * textures at nine depths byte-identical to their unbatched output.
+    *
+    * It is also where the time is. Measured on the Crossroads capture with a
+    * clean environment: batching alone 23.49 ms, batching with this 8.79 ms,
+    * neither 24.50. A blended draw that does not join a batch never reaches an
+    * A-buffer pass episode, and without episodes every one of them builds,
+    * sorts and peels its own A-buffer.
+    *
+    * CPVK_NO_BATCH_BLEND=1 turns it off.
+    */
+   if (!getenv("CPVK_NO_BATCH_BLEND")) {
       *blended = true;
       return true;
    }
