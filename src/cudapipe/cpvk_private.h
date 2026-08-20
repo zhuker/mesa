@@ -29,6 +29,7 @@
 #include "cp_kernels.h"
 #include "cp_debug.h"
 #include "cp_device.h"
+#include "cp_renderer.h"
 #include "vk_buffer.h"
 #include "vk_image.h"
 #include "vk_descriptor_set_layout.h"
@@ -48,7 +49,6 @@ struct cpvk_physical_device {
    struct vk_physical_device vk;
 
    CUdevice cu_dev;
-   struct cp_kernels kernels;      /* built once the device has a context */
    int sm_major, sm_minor;
    char name[256];
    size_t vram;
@@ -62,9 +62,11 @@ struct cpvk_device {
    CUstream stream;
    struct vk_queue queue;
 
-   /* The device the renderer will run on. cp_context itself is still declared
-    * in a header that pulls Gallium in; splitting that is the next slice. */
+   /* The renderer, and the device it runs on: the same CUDA draw pipeline the
+    * Gallium-hosted driver uses, reached through a header with no Gallium in
+    * it. Brought up by cp_context_init(). */
    struct cp_device cp_dev;
+   struct cp_context renderer;
 };
 
 /*

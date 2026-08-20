@@ -303,7 +303,7 @@ int main(void)
                               .pQueueCreateInfos = &qci };
    VkDevice dev;
    CHECK(vkCreateDevice(pd, &dci, NULL, &dev));
-   printf("vkCreateDevice ok\n");
+   printf("vkCreateDevice ok (renderer brought up: stream, arenas, raster queues)\n");
 
    VkQueue queue;
    vkGetDeviceQueue(dev, 0, 0, &queue);

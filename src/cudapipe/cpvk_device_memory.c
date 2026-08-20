@@ -80,10 +80,20 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_ctx;
    }
 
-   /* The fixed-function kernels: the same NVRTC sources, compiled by the same
-    * cp_kernels_init(), which needed nothing of a Gallium screen but the
-    * device's compute capability and now takes exactly that. */
-   if (!cp_kernels_init(&pdev->kernels, pdev->sm_major, pdev->sm_minor)) {
+   /*
+    * The device the renderer runs on, and then the renderer: the same
+    * NVRTC-compiled kernels and the same cp_context_init() the Gallium-hosted
+    * driver uses, neither of which needs a pipe_screen or a pipe_context.
+    */
+   dev->cp_dev.cuda_device = pdev->cu_dev;
+   dev->cp_dev.cuda_ctx = dev->cu_ctx;
+   dev->cp_dev.sm_major = pdev->sm_major;
+   dev->cp_dev.sm_minor = pdev->sm_minor;
+   if (!cp_kernels_init(&dev->cp_dev.kernels, pdev->sm_major, pdev->sm_minor)) {
+      result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
+      goto fail_stream;
+   }
+   if (!cp_context_init(&dev->renderer, &dev->cp_dev)) {
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_stream;
    }

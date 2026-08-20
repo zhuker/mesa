@@ -44,6 +44,7 @@ libcudapipe_vk_files = files(
 libcudapipe_vk_shared = files(
   '../gallium/drivers/cudapipe/cp_debug.c',
   '../gallium/drivers/cudapipe/cp_kernels.c',
+  '../gallium/drivers/cudapipe/cp_renderer.c',
   '../gallium/drivers/cudapipe/nir_to_ptx/cp_nir_to_llvm.c',
 )
 
