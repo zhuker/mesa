@@ -129,6 +129,31 @@ before layering behaviour on it — is the whole plan:
    next milestone, and the one where the descriptor-set simplification pays.
 5. **Milestone 4 — command buffers**: record, then translate a whole render
    pass at submit. This is where batching and episodes stop existing.
+   ✅ done for compute. Descriptor set layouts, pipeline layouts, pools, sets,
+   command buffers and a queue submit that launches; `cpvk_smoke` dispatches
+   256 threads of `data[i] = i * 2` and checks the values, 256 of 256.
+
+   The descriptor model is the simplification arriving in code. The generated
+   kernel's argument block already *is* an array of pointers whose slot
+   `18 + i` the backend dereferences for a 32-bit-index `load_ubo` or
+   `load_ssbo`, so **a descriptor set is an array of device addresses**,
+   binding one is filling in argument slots, and `vulkan_resource_index`
+   lowers to a compile-time flat index. No descriptor memory exists — no
+   `VkDeviceMemory` per set, therefore none of the page-granular managed
+   allocation that cost 22.4 ms of a 122.6 ms frame under lavapipe and two
+   optimisation passes to claw back.
+
+   Two placeholders, marked as such in the code: the sync type is
+   always-signalled, which is correct *only* because every submit drains the
+   stream (`cp_fence` shows the shape it becomes — refcounted, because one
+   submit's fence lands in several `vk_sync`s and a bare destroy double-freed
+   under the first triangle); and the per-dispatch argument block is a managed
+   allocation freed after a synchronise, which is what the upload arena
+   replaces once there is a frame to amortise over.
+
+   **Next: images, image views and the format table, then the graphics
+   pipeline and render pass — the point at which a sample can be pointed at
+   the native ICD.**
 6. **Milestone 5 — parity.** triangle → the 18 samples → both captures,
    **diffed against the Gallium-hosted build, not against NVIDIA.** Both
    targets are built from one tree precisely so this comparison exists.
