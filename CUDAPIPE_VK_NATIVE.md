@@ -2984,3 +2984,40 @@ The instrument for that is a shader edit -- replace the term with a constant
 and see which one moves the picture -- rather than another read of the driver.
 That is where this stops, with every layer around the shader eliminated by
 measurement.
+
+### pbribl solved to its cause: cube sampling with a per-fragment varying direction
+
+Three shader edits, each a one-line substitution compiled over the sample's own
+SPIR-V and then restored, separate three terms that no amount of driver-side
+reading had separated.
+
+    reflection = vec3(1.0, 0.4, 0.1)          spheres go WARM  (27,18,9)
+    lod        = 0.0                          spheres stay grey
+    R          = normalize(vec3(1, 0.2, 0.3)) spheres go WARM  (10,8,6)
+
+The first says the shader's arithmetic is right and `brdf` and `F` are fine --
+force the reflection and the picture is warm, close to the reference's
+(25,17,10). So `prefilteredReflection()` is what returns neutral.
+
+The second rules out the mip level: forcing lod to 0, where the cube's content
+is provably warm, still gives grey.
+
+The third is the answer. **`textureLod` on that cube returns correct colour
+when the direction is uniform across the quad and neutral when it varies per
+fragment.** `R = reflect(-V, N)` varies per fragment; a constant does not.
+
+That fits everything else that has been measured and could not be reconciled
+before: the cube's memory is warm, `cpvk_cubelod` samples it exactly, the
+descriptors and samplers are right -- and `cpvk_cubelod` picks its direction
+from six horizontal bands, so a quad in it almost never straddles two faces,
+while every quad on a sphere does.
+
+The suspect in the sampler is face selection. `cp_cube_face()` picks a face per
+fragment, and the cube arm of the derivative path shuffles across the quad with
+`__shfl_xor_sync(0xFFFFFFFF, ...)`, which is undefined when lanes diverge --
+and lanes on a sphere diverge exactly when neighbouring fragments choose
+different faces.
+
+The test that would pin it is `cpvk_cubelod` with a direction that varies
+smoothly across the frame rather than in bands: a sphere's worth of directions
+in a one-second test.
