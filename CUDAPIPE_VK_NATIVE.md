@@ -2836,3 +2836,57 @@ and each measured into the ground. What they establish between them:
 
 That last is a design change to this front end, not an adjustment, and it is
 where the remaining 1.36x lives.
+
+## Consolidated state, measured warm in one pass
+
+    samples          18/18 run, 15/18 pixel-correct
+                     texturemipmapgen 0.456, multisampling 0.553, pbribl 1.255
+    unit tests       13/13, each byte-identical to lavapipe or to its own
+                     unbatched output
+    Crossroads       native  9.41 ms   gallium  7.23 ms   1.30x
+    old capture      native 34.26 ms   gallium 25.08 ms   1.37x
+    both captures    1,496 and 1,510 frames, every frame, exit 0
+    Gallium driver   0 files changed from the branch point
+
+The Gallium figures reproduce what was recorded long before this session --
+7.17 and 25.20 -- so the reference is stable and the comparison is sound. The
+native driver is within 1.3-1.4x of it on both captures, from a recorded
+starting point of 3.4x that turned out to be a cold-JIT-cache artefact.
+
+**The objective, honestly.** The driver that ships is
+`src/gallium/drivers/cudapipe`, and `git diff e2e966953d7` against it is empty,
+so every recorded result for it stands without re-measurement. The native
+driver does not yet meet it: three samples render wrong and both replays are
+about a third slower than the driver they must replace.
+
+### What is left, in the order the evidence supports
+
+1. **The remaining 1.3x is host-side and structural.** Native issues 757 kernel
+   launches a frame against 245 while using *less* GPU time, 2.18 ms against
+   2.54. Merging is not the cause -- those draws cannot merge in either driver.
+   Episode accumulation is, and it needs this front end's flush discipline
+   rebuilt at bind time. Two patched-at-draw-time attempts each cost four
+   samples and were reverted.
+2. **pbribl 1.255** -- spheres correct, reflections neutral. The prefiltered
+   cube is provably warm in memory at every level, cube sampling is exact in
+   `cpvk_cubelod`, and the descriptors are written correctly. Not yet explained.
+3. **multisampling 0.553** -- edge coverage only, 25x concentrated on
+   silhouettes, sample positions identical to `lp_sample_pos_4x`.
+4. **texturemipmapgen 0.456** -- off the edges, native brighter, chain and
+   implicit LOD both proved identical to the Gallium driver.
+5. **gltfscenerendering merges wrongly without the descriptor key** -- a
+   correctness bug, not a performance one; it separates nothing in either
+   capture.
+
+### Measurement rules this session paid for
+
+- Run it once before timing it. The CUDA JIT cache made a 2.5x difference and
+  invalidated a day of numbers.
+- Check the exit status of the run a number came from. A crashing instrument
+  produced a confident false finding.
+- Check the process was still alive when sampling ended. A finished replay
+  reads as 0.5% GPU busy.
+- Count with `wc -l` before summarising; `head` twice produced false counts.
+- Print more than one slot, index or field than the hypothesis needs. Slot 1
+  alone looked exactly like the bug.
+- Run-to-run spread on these replays is 5%. Nothing smaller is a result.
