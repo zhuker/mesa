@@ -1201,3 +1201,26 @@ tested here. Whether that instability accounts for a mean of 20.768, which is
 far larger than the four-frames-in-sixty it usually shows as, is the question
 to answer next, and the way in is to raise this test's triangle count until it
 either reproduces or does not.
+
+### Triangle count cleared too; only the vertex layout is left
+
+`cpvk_batchtex` takes a triangles-per-draw count now and was run at 800, which
+is the low end of gltfscenerendering's 796..67,763. Batched and unbatched agree
+**exactly** -- both 1.108 against lavapipe -- so batching introduces no
+difference at that scale. (The 1.108 itself is a pre-existing divergence from
+lavapipe at high triangle counts, present with batching off, and is a separate
+question.)
+
+That clears the last property I had named. The full list, every one reproduced
+in this test and every one merging correctly with the descriptor comparison
+off:
+
+    nine draws                    two descriptor set layouts
+    a texture rebound per draw    overlapping geometry, nine depths
+    the depth test                a discarding fragment shader
+    six fragment varyings         a 1280x720 framebuffer
+    800 triangles per draw
+
+What remains different between the test and the sample is the vertex layout:
+four elements at a 60-byte stride against two at 16. That is now the whole
+list, and it is two numbers.

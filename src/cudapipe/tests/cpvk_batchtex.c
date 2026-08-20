@@ -29,6 +29,15 @@
 
 /* Draws in the batch. gltfscenerendering's are nine; three passed. */
 #define NDRAW 9
+/*
+ * Triangles per draw. The sample's draws carry 796 to 67,763 of them and this
+ * test carried one, which is the last difference between them that has not
+ * been ruled out -- and the one this driver already documents as making the
+ * clipper's primitive order visible.
+ */
+#ifndef TPD
+#define TPD 800
+#endif
 
 #define CHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
    fprintf(stderr, "%s failed: %d\n", #x, _r); return 1; } } while (0)
@@ -176,27 +185,38 @@ main(int argc, char **argv)
     * from whichever draw was last. A scene of meshes overlaps constantly;
     * three triangles in a row never do.
     */
-   /* NDRAW overlapping triangles, each a little further right and nearer. */
-   struct vertex verts[NDRAW * 3];
-   uint16_t indices[NDRAW * 3];
-   memset(verts, 0, sizeof(verts));
+   /*
+    * NDRAW overlapping bands, each of TPD small triangles, so a batch carries
+    * the triangle counts a scene's draws do.
+    */
+   const int nvert = NDRAW * TPD * 3;
+   struct vertex *verts = calloc(nvert, sizeof(*verts));
+   uint32_t *indices = calloc(nvert, sizeof(*indices));
+   if (!verts || !indices)
+      return 1;
    for (int n = 0; n < NDRAW; n++) {
-      float x = -0.8f + n * 0.12f;
+      float x0 = -0.8f + n * 0.12f;
       float z = 0.8f - n * 0.06f;
-      struct vertex *v = &verts[n * 3];
-      v[0] = (struct vertex){ x,        -0.6f, z, 255, 255, 255, 255 };
-      v[1] = (struct vertex){ x + 0.6f, -0.6f, z, 255, 255, 255, 255 };
-      v[2] = (struct vertex){ x + 0.3f,  0.7f, z, 255, 255, 255, 255 };
-      for (int e = 0; e < 3; e++)
-         indices[n * 3 + e] = (uint16_t)(n * 3 + e);
+      for (int k = 0; k < TPD; k++) {
+         float fx = x0 + 0.6f * ((float)(k % 40) / 40.0f);
+         float fy = -0.6f + 1.3f * ((float)(k / 40) / (float)((TPD + 39) / 40));
+         struct vertex *v = &verts[(n * TPD + k) * 3];
+         v[0] = (struct vertex){ fx,         fy,         z, 255,255,255,255 };
+         v[1] = (struct vertex){ fx + 0.02f, fy,         z, 255,255,255,255 };
+         v[2] = (struct vertex){ fx + 0.01f, fy + 0.05f, z, 255,255,255,255 };
+         for (int e = 0; e < 3; e++)
+            indices[(n * TPD + k) * 3 + e] = (uint32_t)((n * TPD + k) * 3 + e);
+      }
    }
+   const size_t verts_bytes = (size_t)nvert * sizeof(*verts);
+   const size_t indices_bytes = (size_t)nvert * sizeof(*indices);
 
    VkBuffer vbuf, ibuf;
    VkDeviceMemory vmem, imem;
    {
       VkBufferCreateInfo bi = {
          .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-         .size = sizeof(verts),
+         .size = verts_bytes,
          .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT };
       CHECK(vkCreateBuffer(dev, &bi, NULL, &vbuf));
       VkMemoryRequirements br;
@@ -210,9 +230,9 @@ main(int argc, char **argv)
       CHECK(vkBindBufferMemory(dev, vbuf, vmem, 0));
       void *p;
       CHECK(vkMapMemory(dev, vmem, 0, VK_WHOLE_SIZE, 0, &p));
-      memcpy(p, verts, sizeof(verts));
+      memcpy(p, verts, verts_bytes);
 
-      bi.size = sizeof(indices);
+      bi.size = indices_bytes;
       bi.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
       CHECK(vkCreateBuffer(dev, &bi, NULL, &ibuf));
       vkGetBufferMemoryRequirements(dev, ibuf, &br);
@@ -222,7 +242,7 @@ main(int argc, char **argv)
       CHECK(vkAllocateMemory(dev, &bmai, NULL, &imem));
       CHECK(vkBindBufferMemory(dev, ibuf, imem, 0));
       CHECK(vkMapMemory(dev, imem, 0, VK_WHOLE_SIZE, 0, &p));
-      memcpy(p, indices, sizeof(indices));
+      memcpy(p, indices, indices_bytes);
    }
 
    VkShaderModule vs = load_spv(dev, vs_path), fs = load_spv(dev, fs_path);
@@ -497,7 +517,7 @@ main(int argc, char **argv)
    vkCmdSetViewport(cmd, 0, 1, &vp);
    vkCmdSetScissor(cmd, 0, 1, &sc);
    vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &zero);
-   vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT16);
+   vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT32);
 
    /* Two draws, two index ranges, two sets naming two different textures. */
    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
@@ -505,7 +525,7 @@ main(int argc, char **argv)
    for (int n = 0; n < NDRAW; n++) {
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1,
                               1, &dset[n], 0, NULL);
-      vkCmdDrawIndexed(cmd, 3, 1, n * 3, 0, 0);
+      vkCmdDrawIndexed(cmd, TPD * 3, 1, n * TPD * 3, 0, 0);
    }
    endRendering(cmd);
    CHECK(vkEndCommandBuffer(cmd));
