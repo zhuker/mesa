@@ -3373,3 +3373,30 @@ large enough to have ten levels, sampled with a per-fragment varying direction.
 If that reads zero, pbribl is reproduced in a second and the seam work, which
 was real and is kept, will have been a detour taken because the bisect that
 found it was aimed at the wrong sample.
+
+### pbribl's cube: format, size and varying direction all eliminated
+
+`cpvk_cubebig` is pbribl's cube in a test -- R16G16B16A16_SFLOAT, 512x512, ten
+mip levels, six faces, sampled with the same per-fragment varying direction
+that makes `cpvk_cubesph` exercise seams. Against lavapipe: **IDENTICAL**.
+
+So the combination that looked like the last uncovered one is not the cause
+either. What remains unique to pbribl's cube is how it is *filled*: every test
+cube is written by the host through `vkGetImageSubresourceLayout` into linear
+memory, while pbribl's is rendered to an offscreen and placed with sixty
+`vkCmdCopyImage` calls.
+
+The debug output confirms those copies happen and target the right subresources
+-- `dst(l=0 lay=0)`, `lay=1`, `lay=2`, all `ok=1`, into a `512x512 layers=6
+mips=10` image -- and the view that samples it reports
+`base=0x7cb146000000`, `target=3`, `enc=9`, `levels=0..9`.
+
+What has never been checked in one run is whether those two addresses are the
+same memory: the copy computes its destination from `img->mem` at record time
+and the view captured `base` from `img->mem` at view-creation time. If the view
+was created before `vkBindImageMemory`, the two differ and the sample reads
+memory nothing ever wrote -- which returns exactly zero, which is exactly what
+the substitution measured.
+
+That is the next check and it is one print: the copy's destination pointer
+beside the view's base.
