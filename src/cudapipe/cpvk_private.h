@@ -69,19 +69,22 @@ struct cpvk_device {
    struct cp_context renderer;
 
    /*
-    * A zeroed page that points at itself, used for any buffer slot nothing
-    * bound.
+    * Two pages for reads that have nowhere to land: a descriptor-shaped one
+    * whose base points at a data one, and the data one, which is all zeroes.
     *
-    * A shader that reads an unbound slot used to read address zero and take
-    * the device down, and a lost device stops a replay dead with no way to
-    * see what else is wrong. Pointing the slot here instead means the
-    * descriptor it finds has a base pointer -- this page -- and the buffer
-    * read that follows lands in zeroes. The shader computes on zeroes, which
-    * is wrong, and the frame is wrong, and everything after it still runs and
-    * can be looked at. It is a bring-up aid, not a fix: the slot being
-    * unbound is the bug.
+    * They must be two. The first attempt was a single page filled with its
+    * own address so that a descriptor read out of it yielded a valid
+    * pointer -- and every *integer* read out of it then yielded about ten to
+    * the fourteen. A compute shader took its loop bound from one and ran
+    * until the replay was killed at forty minutes, 100% of it inside
+    * cuStreamSynchronize waiting for a kernel that was never going to end.
+    * A wrong frame is a useful failure; a hang is not.
+    *
+    * This is a bring-up aid, not a fix: the slot being unbound, or the
+    * descriptor unwritten, is the bug.
     */
-   CUdeviceptr null_page;
+   CUdeviceptr null_desc;
+   CUdeviceptr null_data;
 };
 
 /*

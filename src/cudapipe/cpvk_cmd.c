@@ -100,7 +100,7 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
              * never written, read eight bytes at 0x80.
              */
             for (unsigned d = 0; d < layout->num_descriptors; d++)
-               set->host[d].base = dev->null_page;
+               set->host[d].base = dev->null_data;
          }
       }
 
@@ -564,7 +564,7 @@ cpvk_execute_cmd_buffer(struct cpvk_device *dev, struct cpvk_cmd_buffer *cmd)
       slots[0] = (void *)(uintptr_t)(block + args_bytes);
       for (unsigned s = 0; s < CPVK_MAX_ARG_BUFS; s++)
          slots[CPVK_ARG_UBO_BASE + s] = (void *)(uintptr_t)
-            (d->addrs[s] ? d->addrs[s] : dev->null_page);
+            (d->addrs[s] ? d->addrs[s] : dev->null_desc);
 
       /*
        * The push constant block, in slot 0, which the graphics path staged
@@ -1021,11 +1021,11 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
 
    for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
       cp->vs_ubos[i].buffer = (void *)(uintptr_t)
-         (d->addrs[i] ? d->addrs[i] : dev->null_page);
+         (d->addrs[i] ? d->addrs[i] : dev->null_desc);
       cp->vs_ubos[i].managed_copy = 0;
       cp->vs_ubos[i].user_copy = false;
       cp->fs_ubos[i].buffer = (void *)(uintptr_t)
-         (d->addrs[i] ? d->addrs[i] : dev->null_page);
+         (d->addrs[i] ? d->addrs[i] : dev->null_desc);
       cp->fs_ubos[i].managed_copy = 0;
       cp->fs_ubos[i].user_copy = false;
    }
@@ -1303,6 +1303,56 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
          .dst_h = scaling ? (unsigned)dh : 0,
          .bpp = sbpp,
          .filter_linear = pInfo->filter == VK_FILTER_LINEAR,
+      };
+   }
+}
+
+/*
+ * A multisample resolve, taking sample zero rather than averaging.
+ *
+ * This is wrong and says so out loud, once, because a silent approximation is
+ * the failure this driver's history is made of. A correct resolve averages the
+ * samples, and the renderer keeps them at cp_fb_desc::color_sample_stride
+ * apart; cpvk_image does not allocate for them yet, so there is nothing to
+ * average. Taking sample zero is what an unresolved image already contains,
+ * and it lets everything after the resolve run and be looked at.
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
+                      const VkResolveImageInfo2 *pInfo)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_image, src, pInfo->srcImage);
+   VK_FROM_HANDLE(cpvk_image, dst, pInfo->dstImage);
+
+   static bool said;
+   if (!said) {
+      said = true;
+      fprintf(stderr, "cudapipe: vkCmdResolveImage takes sample zero and does "
+              "not average; multisampled images resolve wrong\n");
+   }
+
+   for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+      const VkImageResolve2 *r = &pInfo->pRegions[i];
+      CUdeviceptr sb, db;
+      size_t sp, dp;
+      unsigned sbpp, dbpp;
+      if (!cpvk_image_plane(src, r->srcSubresource.mipLevel, &sb, &sp, &sbpp) ||
+          !cpvk_image_plane(dst, r->dstSubresource.mipLevel, &db, &dp, &dbpp))
+         return;
+      if (sbpp != dbpp)
+         return;
+
+      struct cpvk_copy *c = cpvk_record_copy(cmd);
+      if (!c)
+         return;
+      *c = (struct cpvk_copy) {
+         .src = sb + (size_t)r->srcOffset.y * sp + (size_t)r->srcOffset.x * sbpp,
+         .dst = db + (size_t)r->dstOffset.y * dp + (size_t)r->dstOffset.x * dbpp,
+         .src_pitch = sp,
+         .dst_pitch = dp,
+         .width_bytes = (size_t)r->extent.width * sbpp,
+         .rows = r->extent.height,
       };
    }
 }

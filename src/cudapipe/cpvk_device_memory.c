@@ -122,13 +122,18 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_stream;
    }
-   /* The null page: zeroed, and its first word is its own address, so a
-    * descriptor read out of it has a base pointer that is also this page. */
-   if (cuMemAllocManaged(&dev->null_page, 64 * 1024, CU_MEM_ATTACH_GLOBAL) ==
-       CUDA_SUCCESS) {
-      memset((void *)(uintptr_t)dev->null_page, 0, 64 * 1024);
-      for (unsigned i = 0; i < 64 * 1024 / sizeof(uint64_t); i++)
-         ((uint64_t *)(uintptr_t)dev->null_page)[i] = dev->null_page;
+   /* Zeroed data, and a descriptor page whose every descriptor's base points
+    * at it. Only the base fields are pointers; everything a shader reads as a
+    * number reads as zero, so a loop bounded by one terminates. */
+   if (cuMemAllocManaged(&dev->null_data, 1024 * 1024, CU_MEM_ATTACH_GLOBAL) ==
+          CUDA_SUCCESS &&
+       cuMemAllocManaged(&dev->null_desc, 64 * 1024, CU_MEM_ATTACH_GLOBAL) ==
+          CUDA_SUCCESS) {
+      memset((void *)(uintptr_t)dev->null_data, 0, 1024 * 1024);
+      memset((void *)(uintptr_t)dev->null_desc, 0, 64 * 1024);
+      struct cpvk_descriptor *d = (struct cpvk_descriptor *)(uintptr_t)dev->null_desc;
+      for (unsigned i = 0; i < 64 * 1024 / sizeof(*d); i++)
+         d[i].base = dev->null_data;
    }
 
    if (!cp_context_init(&dev->renderer, &dev->cp_dev)) {
