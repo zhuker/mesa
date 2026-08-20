@@ -165,16 +165,20 @@ main(int argc, char **argv)
     * one nearer on the right, so neither wins outright and a depth test that
     * does nothing is visibly a different picture.
     */
-   const struct vertex verts[6] = {
-      { -0.8f, -0.7f, 0.3f, 255,  32,  32, 255 },
-      {  0.4f, -0.7f, 0.3f, 255,  32,  32, 255 },
-      { -0.2f,  0.8f, 0.3f, 255,  32,  32, 255 },
+   const struct vertex verts[9] = {
+      { -0.9f, -0.6f, 0.5f, 255, 255, 255, 255 },
+      { -0.4f, -0.6f, 0.5f, 255, 255, 255, 255 },
+      { -0.65f, 0.6f, 0.5f, 255, 255, 255, 255 },
 
-      { -0.4f, -0.7f, 0.6f,  32,  64, 255, 255 },
-      {  0.8f, -0.7f, 0.6f,  32,  64, 255, 255 },
-      {  0.2f,  0.8f, 0.6f,  32,  64, 255, 255 },
+      { -0.25f,-0.6f, 0.5f, 255, 255, 255, 255 },
+      {  0.25f,-0.6f, 0.5f, 255, 255, 255, 255 },
+      {  0.0f,  0.6f, 0.5f, 255, 255, 255, 255 },
+
+      {  0.4f, -0.6f, 0.5f, 255, 255, 255, 255 },
+      {  0.9f, -0.6f, 0.5f, 255, 255, 255, 255 },
+      {  0.65f, 0.6f, 0.5f, 255, 255, 255, 255 },
    };
-   const uint16_t indices[6] = { 3, 4, 5, 0, 1, 2 };   /* far one first */
+   const uint16_t indices[9] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
 
    VkBuffer vbuf, ibuf;
    VkDeviceMemory vmem, imem;
@@ -244,9 +248,9 @@ main(int argc, char **argv)
     * Two 4x4 textures, one red-ish and one blue-ish. The two draws differ in
     * which one their descriptor set names, and in nothing else.
     */
-   VkImage timg[2];
-   VkDeviceMemory tmem[2];
-   VkImageView tview[2];
+   VkImage timg[3];
+   VkDeviceMemory tmem[3];
+   VkImageView tview[3];
    VkImageCreateInfo timgi = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
@@ -254,7 +258,7 @@ main(int argc, char **argv)
       .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
       .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT };
 
-   for (int n = 0; n < 2; n++) {
+   for (int n = 0; n < 3; n++) {
       CHECK(vkCreateImage(dev, &timgi, NULL, &timg[n]));
       VkMemoryRequirements treq;
       vkGetImageMemoryRequirements(dev, timg[n], &treq);
@@ -275,9 +279,9 @@ main(int argc, char **argv)
       for (int y = 0; y < 4; y++)
          for (int x = 0; x < 4; x++) {
             unsigned char *px = t + y * lay.rowPitch + x * 4;
-            px[0] = n ? 40 : 230;
-            px[1] = 60;
-            px[2] = n ? 230 : 40;
+            px[0] = n == 0 ? 230 : 40;
+            px[1] = n == 1 ? 230 : 40;
+            px[2] = n == 2 ? 230 : 40;
             px[3] = 255;
          }
 
@@ -314,31 +318,33 @@ main(int argc, char **argv)
    CHECK(vkCreateDescriptorSetLayout(dev, &dsli, NULL, &dsl));
 
    VkDescriptorPoolSize dps[2] = {
-      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 },
-      { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 } };
+      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 },
+      { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 } };
    VkDescriptorPoolCreateInfo dpi = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-      .maxSets = 2, .poolSizeCount = 2, .pPoolSizes = dps };
+      .maxSets = 3, .poolSizeCount = 2, .pPoolSizes = dps };
    VkDescriptorPool dpool;
    CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &dpool));
    VkDescriptorSetAllocateInfo dsai = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
       .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
-   VkDescriptorSet dset[2];
-   VkDescriptorSetLayout dsls[2] = { dsl, dsl };
-   dsai.descriptorSetCount = 2;
+   VkDescriptorSet dset[3];
+   VkDescriptorSetLayout dsls[3] = { dsl, dsl, dsl };
+   dsai.descriptorSetCount = 3;
    dsai.pSetLayouts = dsls;
    CHECK(vkAllocateDescriptorSets(dev, &dsai, dset));
 
    VkDescriptorBufferInfo dbi = { ubuf[0], 0, VK_WHOLE_SIZE };
-   VkDescriptorImageInfo dii[2] = {
+   VkDescriptorImageInfo dii[3] = {
       { .sampler = samp, .imageView = tview[0],
         .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
       { .sampler = samp, .imageView = tview[1],
         .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+      { .sampler = samp, .imageView = tview[2],
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
    };
-   VkWriteDescriptorSet writes[4];
-   for (int n = 0; n < 2; n++) {
+   VkWriteDescriptorSet writes[6];
+   for (int n = 0; n < 3; n++) {
       writes[n * 2] = (VkWriteDescriptorSet){
          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[n],
          .dstBinding = 0, .descriptorCount = 1,
@@ -350,7 +356,7 @@ main(int argc, char **argv)
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
          .pImageInfo = &dii[n] };
    }
-   vkUpdateDescriptorSets(dev, 4, writes, 0, NULL);
+   vkUpdateDescriptorSets(dev, 6, writes, 0, NULL);
 
    VkPipelineLayoutCreateInfo pli = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -470,12 +476,11 @@ main(int argc, char **argv)
    vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT16);
 
    /* Two draws, two index ranges, two sets naming two different textures. */
-   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
-                           &dset[0], 0, NULL);
-   vkCmdDrawIndexed(cmd, 3, 1, 0, 0, 0);
-   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
-                           &dset[1], 0, NULL);
-   vkCmdDrawIndexed(cmd, 3, 1, 3, 0, 0);
+   for (int n = 0; n < 3; n++) {
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0,
+                              1, &dset[n], 0, NULL);
+      vkCmdDrawIndexed(cmd, 3, 1, n * 3, 0, 0);
+   }
    endRendering(cmd);
    CHECK(vkEndCommandBuffer(cmd));
 

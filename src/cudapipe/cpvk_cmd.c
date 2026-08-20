@@ -1220,8 +1220,9 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
     * vertex offset now a merge condition, and one measurement to the contrary
     * in the same turn did not reproduce. It stays until that is settled.
     */
-   CPVK_DIFF(memcmp(a->desc_hash, b->desc_hash, sizeof(a->desc_hash)),
-             "descriptors");
+   if (!getenv("CPVK_NO_DESC_KEY"))
+      CPVK_DIFF(memcmp(a->desc_hash, b->desc_hash, sizeof(a->desc_hash)),
+                "descriptors");
    CPVK_DIFF(a->num_vb != b->num_vb, "vertex buffer count");
    CPVK_DIFF(memcmp(a->vb_base, b->vb_base, sizeof(a->vb_base)), "vertex buffers");
    CPVK_DIFF(a->push_size != b->push_size, "push constant size");

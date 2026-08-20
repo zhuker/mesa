@@ -1088,3 +1088,34 @@ express those draws today. Making it express them -- the slice table already
 carries a per-draw range, so it is the natural place for a per-draw bias -- is
 what would let a scene of meshes out of one buffer merge, which is the case
 batching exists for.
+
+### Settled: the descriptor comparison is required, and the reason is still open
+
+A clean A/B on one binary, three runs each way:
+
+    desc key ON   0.000  0.000  0.000
+    desc key OFF  20.768 20.768 20.768
+
+So the single 0.000 measured with the key off last turn was an artefact, and
+the comparison is genuinely required. It is also what makes batching worthless
+on a capture: with it, Crossroads is 24.26 ms against 24.38 unbatched -- a
+tenth of a millisecond.
+
+What the requirement is *not*, each proven by a test that passes byte-identically
+to lavapipe with the key off:
+
+- two draws differing in a uniform buffer (`cpvk_batch`)
+- three draws differing in three uniform buffers (`cpvk_batch`)
+- two draws differing in a texture (`cpvk_batchtex`)
+- three draws differing in three textures (`cpvk_batchtex`)
+
+So merged draws index their own binding rows correctly for buffers and
+textures alike, at two and three draws.
+
+The remaining difference between those tests and gltfscenerendering is what
+its materials do: alpha masking, which is `discard` in the fragment shader.
+The Gallium adapter's own eligibility test names discard as a reason to refuse
+a batch on the blended path, and the opaque path resolves visibility through a
+depth-keyed buffer that a discarding shader participates in differently. That
+is the next thing to test, and the test is a one-line shader change to
+`cpvk_batchtex`.
