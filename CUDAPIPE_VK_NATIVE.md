@@ -2686,3 +2686,42 @@ would have been.
 So the one-segment episode is understood and its cost is quantified, and the
 next move is not this line: it is giving this front end the flush points the
 Gallium adapter has, after which the deferring variant becomes correct.
+
+### The episode mechanism, priced: it works, and it is not the replay gap
+
+Three measurements close this line of work.
+
+**The flush point is not wrong.** The Gallium adapter uses the full,
+episode-finishing flush for "the next draw cannot be batched" exactly as this
+driver does. Its flush table:
+
+    full      framebuffer, viewport, scissor, readback/clear/flush,
+              draw-cannot-batch, compute dispatch, blend, rasterizer,
+              depth/stencil
+    deferring vertex elements, fragment shader, vertex shader
+
+This driver matches it. What differs is that Gallium's draws *join* batches, so
+that line is rare; here no draw joins, so it fires every time.
+
+**Merges do amortise episodes.** With `CPVK_NO_DESC_KEY=1`,
+`gltfscenerendering` goes from nine episodes to **one**. The mechanism works
+exactly as designed once draws merge.
+
+**And it buys nothing on the replay.** Warm, same session:
+
+    baseline                          9.80 ms
+    CPVK_BATCH=1 CPVK_NO_DESC_KEY=1   9.75 ms
+
+Half a percent. Together with the earlier measurements -- batching alone 0.7%,
+blended episodes 4% of launches and nothing in time -- every mechanism in the
+batching and episode machinery has now been priced on this capture and none of
+them is the 1.36x.
+
+That is a negative result and a large one: it removes batching, merging,
+descriptor keys, blended episodes and episode accumulation from the search for
+the remaining replay gap. The gap is real (9.73 against 7.15 warm) and it is
+somewhere else entirely.
+
+The `gltfscenerendering` correctness bug behind the descriptor key remains
+open, and is now correctly filed as a correctness bug rather than a
+performance blocker.
