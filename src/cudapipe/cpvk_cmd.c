@@ -1923,10 +1923,20 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
       struct cpvk_copy *c = cpvk_record_copy(cmd);
       if (!c)
          return;
+      /*
+       * The array layer, as in vkCmdCopyImage. A blit into a cube face or an
+       * array slice names it in the subresource, and without this every one
+       * of them lands on layer zero.
+       */
+      uint64_t bs_layer = (uint64_t)r->srcSubresource.baseArrayLayer *
+                          src->level_size[r->srcSubresource.mipLevel];
+      uint64_t bd_layer = (uint64_t)r->dstSubresource.baseArrayLayer *
+                          dst->level_size[r->dstSubresource.mipLevel];
+
       *c = (struct cpvk_copy) {
-         .src = sb + (size_t)r->srcOffsets[0].y * sp +
+         .src = sb + bs_layer + (size_t)r->srcOffsets[0].y * sp +
                 (size_t)r->srcOffsets[0].x * sbpp,
-         .dst = db + (size_t)r->dstOffsets[0].y * dp +
+         .dst = db + bd_layer + (size_t)r->dstOffsets[0].y * dp +
                 (size_t)r->dstOffsets[0].x * dbpp,
          .src_pitch = sp,
          .dst_pitch = dp,

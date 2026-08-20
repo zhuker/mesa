@@ -3622,3 +3622,34 @@ is unchanged.
 
 Grepping for the code rather than trusting the log found one absent change out
 of fifteen. The one that was absent had cost twenty turns.
+
+### vkCmdBlitImage had the same layer bug, and texturemipmapgen is unchanged by it
+
+`vkCmdBlitImage` was not adding `baseArrayLayer` either -- the same defect as
+the copy, found by checking rather than by a symptom. Fixed, asserted, and
+verified present in the file before building. No sample changes: 18/18 run,
+15/18 pixel-correct, fourteen tests pass. Every sample that blits does so on a
+single-layer image, so nothing exercised it, and this time that null result is
+recorded next to a grep proving the code is there.
+
+`texturemipmapgen` is unchanged by all of today's work and its
+characterisation still holds exactly:
+
+    diff > 1     6.963%
+    diff > 4     4.087%
+    diff > 16    0.882%
+    diff > 64    0.004%
+    mean gradient where diff > 16   15.0, against 13.0 over the frame
+    native brightness there          51.8, against 44.0
+    bbox                             y 212-507, x 471-806
+
+Not on edges, native brighter, confined to the minified centre.
+
+A candidate that has not been tested: the two drivers may not share a blit at
+all. This driver box-filters the source footprint on the host; the Gallium
+driver reaches the renderer through `pipe_context::blit`, which for a scaling
+blit may go through lavapipe's own path rather than cudapipe's. If so the mip
+chains genuinely differ and every measurement here is consistent with it --
+including `cpvk_lodblit`, which builds a chain by blit and compares native
+against **Gallium**, and passes, because both go through the same code in that
+test's configuration.
