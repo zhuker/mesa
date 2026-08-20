@@ -4221,3 +4221,30 @@ Reverted. Five attempts is enough to say this with numbers rather than as an
 impression: **episode accumulation is not the lever for the remaining 1.3x**,
 and the launch-count gap it was aimed at -- 757 a frame against 245 -- has to
 come down some other way.
+
+### The launch gap is per draw, not per batch
+
+`CUDAPIPE_DEBUG_DRAW` over a window of the Crossroads replay: 106729 draws
+against 49862 batch flushes, 2.14 draws per
+flush. Both drivers replay the same capture and therefore the same draws, so
+757 launches a frame against 245 is a difference in **what each draw costs**,
+not in how many draws share one launch.
+
+That is consistent with everything measured: batching on changes the launch
+count by half a percent, the descriptor key separates nothing in this capture,
+and five attempts at episode accumulation moved the median by nothing at a
+memory budget both captures survive. Every one of those changes how draws are
+*grouped*. None changes what a draw issues.
+
+The trace says where a draw's kernels go:
+
+    cp_abuf_scan_block   106.6 a frame here,  22.9 there
+    cp_abuf_scan_add      63.6                13.4
+    main                  86.7                37.2
+    cp_vertex_fetch       51.2                22.1
+
+So the open question is why a draw on this driver runs the A-buffer build where
+the same draw on the Gallium driver does not -- a path choice per draw rather
+than a grouping decision. That is a different question from the one five
+attempts have answered in the negative, and it is what the numbers have pointed
+at since the first warm trace.
