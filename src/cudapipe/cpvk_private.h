@@ -72,6 +72,12 @@ struct cpvk_device_memory {
    void *host_ptr;          /* what vkMapMemory returns, or NULL */
 };
 
+struct cpvk_pipeline {
+   struct vk_object_base base;
+   VkPipelineBindPoint bind_point;
+   struct cp_shader_binary *bin;   /* the compiled CUDA kernel */
+};
+
 struct cpvk_buffer {
    struct vk_buffer vk;
    struct cpvk_device_memory *mem;
@@ -87,5 +93,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_device_memory, vk.base, VkDeviceMemory,
                                VK_OBJECT_TYPE_DEVICE_MEMORY)
 VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_buffer, vk.base, VkBuffer,
                                VK_OBJECT_TYPE_BUFFER)
+VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_pipeline, base, VkPipeline,
+                               VK_OBJECT_TYPE_PIPELINE)
 
 #endif /* CPVK_PRIVATE_H */

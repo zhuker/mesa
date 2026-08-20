@@ -29,14 +29,29 @@ cpvk_entrypoints = custom_target(
 libcudapipe_vk_files = files(
   'cpvk_device.c',
   'cpvk_device_memory.c',
+  'cpvk_pipeline.c',
+)
+
+# Reused from the Gallium-hosted driver, unchanged and unforked. These three
+# are already free of Gallium — their only "gallium" include is util/u_memory.h,
+# which is src/util — so the shader compiler and the flag registry cross over
+# as they are. They move into this directory when the Gallium driver is
+# deleted; referencing them by path until then is deliberate, because a copy
+# would drift and the point of the exercise is that the backend is portable.
+libcudapipe_vk_shared = files(
+  '../gallium/drivers/cudapipe/cp_debug.c',
+  '../gallium/drivers/cudapipe/nir_to_ptx/cp_nir_to_llvm.c',
 )
 
 libcudapipe_vk = static_library(
   'cudapipe_vk',
-  [libcudapipe_vk_files, cpvk_entrypoints],
-  include_directories : [inc_include, inc_src, inc_util],
+  [libcudapipe_vk_files, libcudapipe_vk_shared, cpvk_entrypoints],
+  include_directories : [inc_include, inc_src, inc_util,
+                         include_directories('../gallium/drivers/cudapipe'),
+                         include_directories('../gallium/drivers/cudapipe/nir_to_ptx'),
+                         include_directories('../compiler/nir')],
   dependencies : [idep_vulkan_runtime, idep_vulkan_util, idep_mesautil,
-                  dep_cuda_vk],
+                  idep_nir, dep_llvm, dep_cuda_vk],
   gnu_symbol_visibility : 'hidden',
 )
 
