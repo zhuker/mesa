@@ -2096,3 +2096,38 @@ same trap that took `KHR_get_physical_device_properties2` out at 1.0.
 So it stays at 1.1, which is honest and which fixed a real null dispatch. The
 gap to the Gallium driver's 1.4 closes by implementing those features, not by
 editing the number -- and that is now written where the number is.
+
+### Vulkan 1.3: events stubbed, features declared, and one thing still broken
+
+Per instruction, entry points the sweep and the replays do not need are
+implemented as empty. The event API is the case in point: `vkCreateEvent`,
+`vkSetEvent`, `vkResetEvent` and `vkGetEventStatus` are real, because they are
+questions with answers, and `vkCmdSetEvent2`, `vkCmdResetEvent2` and
+`vkCmdWaitEvents2` are empty, because one in-order stream already satisfies
+them -- the same reasoning that makes `vkCmdPipelineBarrier2` a no-op here.
+
+With those present, the twelve features Vulkan 1.3 makes mandatory are
+declared, and both version numbers raised. Two were needed, not one: the
+physical device's `apiVersion` **and** `vkEnumerateInstanceVersion`, since the
+instance version caps what the loader will dispatch above it.
+
+Measured at 1.3:
+
+    vkCreateDevice with VkPhysicalDeviceVulkan13Features   VK_SUCCESS (was -8)
+    samples          18/18 run, 15/18 pixel-correct, same three remaining
+    unit tests       13/13
+    Crossroads       1,496 frames, 24.34 ms
+    old capture      1,510 frames, 79.20 ms
+
+**Still broken, and stated plainly:** `vkGetDeviceProcAddr` returns NULL for
+`vkCmdBlitImage2`, `vkCmdBeginRendering` and `vkCmdPipelineBarrier2`, and a
+test that requests apiVersion 1.3 in its `VkApplicationInfo` and calls
+`vkCmdBlitImage2` still faults at address zero. The driver implements all
+three under their core names. So this is a dispatch-gating problem in how the
+runtime tables are built, not a missing implementation, and it is not yet
+found.
+
+That leaves the version number ahead of one thing it promises. It is kept
+because every measurement improved or held -- device creation for a 1.3
+application went from failing outright to succeeding -- but the gap is
+recorded here rather than left for someone to discover by faulting.

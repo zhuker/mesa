@@ -1927,6 +1927,92 @@ cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
    }
 }
 
+
+/* ------------------------------------------------------------------ events
+ *
+ * The device-side half is empty on purpose. One stream, program order: a
+ * vkCmdWaitEvents2 recorded after the vkCmdSetEvent2 that satisfies it is
+ * already ordered behind it, and a wait on an event set by the host cannot be
+ * reached until that host call has happened. The host-side half is real,
+ * because vkSetEvent and vkGetEventStatus are questions with answers.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_CreateEvent(VkDevice _device, const VkEventCreateInfo *pCreateInfo,
+                 const VkAllocationCallbacks *pAllocator, VkEvent *pEvent)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+
+   struct cpvk_event *event =
+      vk_object_zalloc(&dev->vk, pAllocator, sizeof(*event),
+                       VK_OBJECT_TYPE_EVENT);
+   if (!event)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   *pEvent = cpvk_event_to_handle(event);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_DestroyEvent(VkDevice _device, VkEvent _event,
+                  const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+   VK_FROM_HANDLE(cpvk_event, event, _event);
+
+   if (event)
+      vk_object_free(&dev->vk, pAllocator, event);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_GetEventStatus(VkDevice _device, VkEvent _event)
+{
+   VK_FROM_HANDLE(cpvk_event, event, _event);
+   return (event && event->signaled) ? VK_EVENT_SET : VK_EVENT_RESET;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_SetEvent(VkDevice _device, VkEvent _event)
+{
+   VK_FROM_HANDLE(cpvk_event, event, _event);
+   if (event)
+      event->signaled = true;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_ResetEvent(VkDevice _device, VkEvent _event)
+{
+   VK_FROM_HANDLE(cpvk_event, event, _event);
+   if (event)
+      event->signaled = false;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
+                  const VkDependencyInfo *pDependencyInfo)
+{
+   VK_FROM_HANDLE(cpvk_event, event, _event);
+   if (event)
+      event->signaled = true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
+                    VkPipelineStageFlags2 stageMask)
+{
+   VK_FROM_HANDLE(cpvk_event, event, _event);
+   if (event)
+      event->signaled = false;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
+                    const VkEvent *pEvents,
+                    const VkDependencyInfo *pDependencyInfos)
+{
+}
+
 /*
  * Barriers are recorded and ignored, deliberately.
  *

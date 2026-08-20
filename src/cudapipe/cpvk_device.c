@@ -70,8 +70,26 @@ cpvk_get_features(struct vk_features *features)
       .shaderClipDistance = false,
       .samplerAnisotropy = true,
 
-      /* Vulkan 1.3 / KHR_dynamic_rendering */
+      /*
+       * Vulkan 1.3 makes all of these mandatory, so reporting 1.3 means
+       * declaring them. Where the driver has nothing to do for one, it has
+       * nothing to do: a barrier is already satisfied by one in-order stream,
+       * an event is a boolean, and private data and cache control are the
+       * runtime's. They are declared because the version number promises
+       * them, and the entry points behind them exist and return.
+       */
       .dynamicRendering = true,
+      .synchronization2 = true,
+      .maintenance4 = true,
+      .privateData = true,
+      .pipelineCreationCacheControl = true,
+      .shaderTerminateInvocation = true,
+      .shaderDemoteToHelperInvocation = true,
+      .shaderZeroInitializeWorkgroupMemory = true,
+      .shaderIntegerDotProduct = true,
+      .subgroupSizeControl = true,
+      .computeFullSubgroups = true,
+      .inlineUniformBlock = true,
    };
 }
 
@@ -101,7 +119,7 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
        * gap; closing it means implementing those features, not editing this
        * number.
        */
-      .apiVersion = VK_MAKE_VERSION(1, 1, VK_HEADER_VERSION),
+      .apiVersion = VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION),
       .driverVersion = 1,
       .vendorID = 0x10de,          /* NVIDIA: the device really is one */
       .deviceID = 0,
@@ -306,7 +324,14 @@ cpvk_EnumerateInstanceExtensionProperties(const char *pLayerName,
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_EnumerateInstanceVersion(uint32_t *pApiVersion)
 {
-   *pApiVersion = VK_MAKE_VERSION(1, 0, VK_HEADER_VERSION);
+   /*
+    * The instance version caps everything above it. With this at 1.0 the
+    * physical device could report 1.3 and vkGetDeviceProcAddr would still
+    * hand back a null pointer for every 1.1-and-later core entry point,
+    * because the loader will not dispatch past the version the instance
+    * claims.
+    */
+   *pApiVersion = VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION);
    return VK_SUCCESS;
 }
 

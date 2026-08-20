@@ -251,6 +251,22 @@ struct cpvk_descriptor_pool {
    struct vk_object_base base;
 };
 
+/*
+ * An event, which on this driver is a boolean and nothing else.
+ *
+ * Everything submitted runs on one CUDA stream and stream order is program
+ * order, so by the time a waiter could observe an event the work that sets it
+ * has already run. That is the same reasoning that makes
+ * vkCmdPipelineBarrier2 a no-op here, and it is why the device-side half of
+ * the event API is empty rather than unimplemented. The host-side half is
+ * real, because vkSetEvent and vkGetEventStatus are asked a question and must
+ * answer it.
+ */
+struct cpvk_event {
+   struct vk_object_base base;
+   bool signaled;
+};
+
 #define CPVK_MAX_DISPATCHES 64
 
 /* Buffer slot 0 is the push constant block; descriptors start after it. */
@@ -537,6 +553,8 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_descriptor_update_template, base,
                                VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE)
 VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_query_pool, base, VkQueryPool,
                                VK_OBJECT_TYPE_QUERY_POOL)
+VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_event, base, VkEvent,
+                               VK_OBJECT_TYPE_EVENT)
 VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_sampler, base, VkSampler,
                                VK_OBJECT_TYPE_SAMPLER)
 VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_device_memory, vk.base, VkDeviceMemory,
