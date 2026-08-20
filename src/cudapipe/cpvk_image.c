@@ -137,9 +137,21 @@ cpvk_image_layout(struct cpvk_image *image)
     * asked for a quarter of the memory it needs and everything that wrote to
     * it wrote past the end of what the application had allocated.
     */
+   /*
+    * In blocks, like the copies that fill these levels. `bpp` is the size of
+    * a block, and for a block-compressed format a row is width/4 blocks, not
+    * width of them -- computing it in texels made every stride and every
+    * level sixteen times too large. The allocation was merely wasteful; the
+    * stride was not, because it reached cuMemcpy2DAsync as a pitch far larger
+    * than the memory behind it and came back as CUDA_ERROR_INVALID_VALUE.
+    *
+    * For an uncompressed format a block is one texel and this is unchanged.
+    */
+   enum pipe_format pfmt = vk_format_to_pipe_format(vk->format);
+
    for (unsigned l = 0; l < vk->mip_levels; l++) {
-      unsigned w = u_minify(vk->extent.width, l);
-      unsigned h = u_minify(vk->extent.height, l);
+      unsigned w = util_format_get_nblocksx(pfmt, u_minify(vk->extent.width, l));
+      unsigned h = util_format_get_nblocksy(pfmt, u_minify(vk->extent.height, l));
       unsigned d = u_minify(vk->extent.depth, l);
 
       image->row_stride[l] = align(w * bpp, 64);
