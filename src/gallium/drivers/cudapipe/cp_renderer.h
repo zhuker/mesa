@@ -817,7 +817,11 @@ extern struct cp_abuf_dbg_state cp_abuf_dbg;
 void cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info, unsigned drawid_offset, const struct cp_draw_range *draws, unsigned num_draws, unsigned batch_draws, const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table, const uint32_t *draw_ids, const uint32_t *instance_counts, const uint64_t *vb_table, const struct cp_rect *scissors);
 void cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info, CUdeviceptr visbuf, CUdeviceptr positions, CUdeviceptr vs_output_buf, unsigned num_triangles, unsigned w, unsigned h, void *color_data, float vp_scale_x, float vp_scale_y, float vp_trans_x, float vp_trans_y, CUdeviceptr reject, CUdeviceptr resolved, unsigned reject_pass, CUdeviceptr seg_ranges, unsigned num_seg_ranges);
 
-/* Defined in cp_context.c until the pass machinery follows. */
+
+bool cp_batch_abuf_ok(struct cp_context *cp);
+bool cp_batch_order_free(struct cp_context *cp);
+
+void cp_batch_record(struct cp_context *cp, const struct cp_draw_range *draw, unsigned tris, unsigned drawid_offset, unsigned instance_count);
 void cp_pass_record_segment(struct cp_context *cp, const struct cp_rasterize_args *aa, const struct cp_rast_queues *queues, unsigned rast_num_triangles, unsigned num_triangles, const struct cp_draw_call *info, unsigned drawid_offset, unsigned ndraws, const struct cp_draw_range *draws, const uint32_t *instance_counts, const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table, const uint32_t *draw_ids, const uint64_t *vb_table, const struct cp_rect *scissors);
 
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
