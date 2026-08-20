@@ -1682,3 +1682,35 @@ where the array-layer fix two turns ago was aimed without moving the number.
 The next question is narrow: whether those passes render into the face and
 level their view names, and `CPVK_DEBUG_PUSH` shows they at least run, 72
 bytes of matrix at a time.
+
+### pbribl: the faces are placed correctly; explicit-LOD cube sampling is the suspect
+
+`CPVK_DEBUG_RT`, added here, prints every render target the driver binds. For
+pbribl:
+
+    1 x 1280x720  layer=0 level=0    the frame
+   61 x 512x512   layer=0 level=0    prefiltered environment
+   42 x 64x64     layer=0 level=0    irradiance
+
+Every one of them is a **plain 2D offscreen**, never a cube face. The sample
+renders each face into that offscreen and then places it with
+`vkCmdCopyImage`. So the array-layer fix in `vkCmdBeginRendering` two turns ago
+is correct and, for this sample, unused -- and the copy path, fixed in the same
+commit, is what does the placement.
+
+That placement matches the layout. Images are laid out level-major with the
+layers inside each level -- `offset += level_size[l] * array_layers` -- and the
+copy adds exactly `baseArrayLayer * level_size[level]`. So the faces land where
+the sampler looks, and the memory-layout explanation is eliminated.
+
+What is left is how the cube is *read*. Both remaining users take an explicit
+level:
+
+    pbribl.frag:85       textureLod(prefilteredMap, R, lodf)
+    prefilterenvmap:92   textureLod(samplerEnv, L, mipLevel)
+
+and the skybox, which is byte-identical, uses plain `texture()`. That is the
+distinction the evidence now points at: implicit-LOD cube sampling works,
+explicit-LOD cube sampling is unverified, and it is used both to build the
+prefiltered cube and to read it -- which would explain a result that is
+self-consistently grey rather than merely wrong.

@@ -758,6 +758,13 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          /* How far apart the samples are, which the renderer needs in order
           * to write them and the resolve needs in order to find them. */
          fb.color_sample_stride = (unsigned)cimg->sample_stride;
+
+         if (getenv("CPVK_DEBUG_RT"))
+            fprintf(stderr, "rt: %ux%u layer=%u level=%u layers=%u img=%ux%u "
+                    "fmt=%u base=%p\n", fb.width, fb.height,
+                    view->vk.base_array_layer, view->vk.base_mip_level,
+                    pRenderingInfo->layerCount, cimg->vk.extent.width,
+                    cimg->vk.extent.height, view->vk.format, fb.color);
       }
    }
 
