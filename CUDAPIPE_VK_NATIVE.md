@@ -1172,3 +1172,32 @@ sample's draws against this test's rather than by proposing an eighth
 hypothesis: `CUDAPIPE_DEBUG_DRAW` prints the framebuffer, viewport, vertex
 elements and blend state of every draw in both, and the difference will be in
 that output.
+
+### Eight properties reproduced, none of them explains it
+
+`cpvk_batchtex` now covers, in one test, every property of
+gltfscenerendering's draws I have been able to name:
+
+    nine draws in a batch          two descriptor set layouts
+    a texture rebound per draw     overlapping geometry at nine depths
+    the depth test on              a discarding fragment shader
+    six fragment varyings          a 1280x720 framebuffer
+
+All of it is byte-identical to lavapipe **with the descriptor comparison
+off**. The sample is 20.768 without it and 0.000 with it.
+
+What is still different, from `CUDAPIPE_DEBUG_DRAW` on both:
+
+    property             cpvk_batchtex     gltfscenerendering
+    triangles per draw   1                 796 .. 67,763
+    vertex elements      2                 4
+    vertex stride        16                60
+
+The triangle count is the interesting one, because this driver already
+documents that batch size is what makes the clipper's unstable primitive order
+visible -- gaps 15 and 16, and the reason "a factoring must not change what
+merges". A batch of 67,763 triangles is four orders of magnitude past anything
+tested here. Whether that instability accounts for a mean of 20.768, which is
+far larger than the four-frames-in-sixty it usually shows as, is the question
+to answer next, and the way in is to raise this test's triangle count until it
+either reproduces or does not.
