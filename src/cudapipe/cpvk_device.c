@@ -80,7 +80,15 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
                     struct vk_properties *props)
 {
    *props = (struct vk_properties) {
-      .apiVersion = VK_MAKE_VERSION(1, 0, VK_HEADER_VERSION),
+      /*
+       * 1.1, not 1.0. At 1.0 the runtime does not wire the KHR alias
+       * entrypoints to its core implementations, so an application that
+       * enables KHR_get_physical_device_properties2 -- or calls any 1.1-and-
+       * later core entry point such as vkCmdBlitImage2 -- jumps through a
+       * null pointer in the loader. The Gallium driver this one replaces
+       * reports 1.4.
+       */
+      .apiVersion = VK_MAKE_VERSION(1, 1, VK_HEADER_VERSION),
       .driverVersion = 1,
       .vendorID = 0x10de,          /* NVIDIA: the device really is one */
       .deviceID = 0,

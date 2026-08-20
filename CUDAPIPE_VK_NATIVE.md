@@ -2049,3 +2049,24 @@ So mip generation is not `texturemipmapgen`'s cause either -- which was this
 turn's hypothesis, and is now the fourth eliminated for that sample. Both
 drivers share the blit implementation as well as the sampler, so the surviving
 explanation has to be something they do not share.
+
+### apiVersion raised to 1.1
+
+The note in `cpvk_device.c` said the withdrawn extension "comes back with
+apiVersion 1.1, or with the aliases implemented explicitly". Raising it is the
+one-line half of that, and it works: `vkGetPhysicalDeviceProperties2`, a 1.1
+core entry point that was a null pointer before, now returns
+`cudapipe (NVIDIA GeForce RTX 5090), api 1.1`.
+
+Nothing moved:
+
+    samples          18/18 run, 15/18 pixel-correct, the same three remaining
+    unit tests       13/13
+    Crossroads       1,496 frames, 24.35 ms   (24.33 before)
+    old capture      1,510 frames, 79.11 ms   (79.08 before)
+
+This does not close the gap -- the driver it replaces reports 1.4, and 1.2 and
+1.3 core entry points such as `vkCmdBlitImage2` are still not dispatched at
+1.1. It does remove the specific trap the file documented, and
+`KHR_get_physical_device_properties2` can now be advertised without the
+segfault that took it out.
