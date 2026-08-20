@@ -169,6 +169,8 @@ cpvk_enumerate_physical_devices(struct vk_instance *vk_instance)
       return result;
    }
 
+   pdev->vk.supported_sync_types = cpvk_sync_types;
+
    list_addtail(&pdev->vk.link, &instance->vk.physical_devices.list);
    return VK_SUCCESS;
 }

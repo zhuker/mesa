@@ -65,7 +65,14 @@ static const uint32_t comp_spv[] = {
    0x00000019, 0x00000017, 0x000100fd, 0x00010038
 };
 
-static int test_compute_pipeline(VkDevice dev)
+/*
+ * Milestone 4: record a dispatch and run it.
+ *
+ * The shader writes data[i] = i * 2 into a storage buffer, so the check is on
+ * the values, not on an API return code -- a dispatch that silently does
+ * nothing is exactly the failure this driver's history is made of.
+ */
+static int test_dispatch(VkDevice dev, VkQueue queue, uint32_t memtype)
 {
    VkDescriptorSetLayoutBinding b = {
       .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -88,6 +95,43 @@ static int test_compute_pipeline(VkDevice dev)
    VkShaderModule sm;
    CHECK(vkCreateShaderModule(dev, &smci, NULL, &sm));
 
+   const uint32_t N = 256;
+   VkBufferCreateInfo bci = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = N * 4,
+      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT };
+   VkBuffer buf;
+   CHECK(vkCreateBuffer(dev, &bci, NULL, &buf));
+   VkMemoryAllocateInfo mai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = N * 4, .memoryTypeIndex = memtype };
+   VkDeviceMemory mem;
+   CHECK(vkAllocateMemory(dev, &mai, NULL, &mem));
+   CHECK(vkBindBufferMemory(dev, buf, mem, 0));
+   uint32_t *data;
+   CHECK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, (void **)&data));
+   memset(data, 0xff, N * 4);
+
+   VkDescriptorPoolSize psz = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                .descriptorCount = 1 };
+   VkDescriptorPoolCreateInfo dpci = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &psz };
+   VkDescriptorPool pool;
+   CHECK(vkCreateDescriptorPool(dev, &dpci, NULL, &pool));
+   VkDescriptorSetAllocateInfo dsai = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
+   VkDescriptorSet dset;
+   CHECK(vkAllocateDescriptorSets(dev, &dsai, &dset));
+   VkDescriptorBufferInfo dbi = { .buffer = buf, .offset = 0,
+                                  .range = VK_WHOLE_SIZE };
+   VkWriteDescriptorSet wds = {
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset,
+      .dstBinding = 0, .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      .pBufferInfo = &dbi };
+   vkUpdateDescriptorSets(dev, 1, &wds, 0, NULL);
+
    VkComputePipelineCreateInfo cpci = {
       .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
       .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -97,6 +141,49 @@ static int test_compute_pipeline(VkDevice dev)
    VkPipeline pipe;
    CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe));
    printf("compute pipeline: SPIR-V -> NIR -> PTX -> CUmodule ok\n");
+
+   VkCommandPoolCreateInfo cpci2 = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .queueFamilyIndex = 0 };
+   VkCommandPool cpool;
+   CHECK(vkCreateCommandPool(dev, &cpci2, NULL, &cpool));
+   VkCommandBufferAllocateInfo cbai = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1 };
+   VkCommandBuffer cb;
+   CHECK(vkAllocateCommandBuffers(dev, &cbai, &cb));
+
+   VkCommandBufferBeginInfo cbbi = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+   CHECK(vkBeginCommandBuffer(cb, &cbbi));
+   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+   vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1,
+                           &dset, 0, NULL);
+   vkCmdDispatch(cb, N / 64, 1, 1);
+   CHECK(vkEndCommandBuffer(cb));
+
+   VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                       .commandBufferCount = 1, .pCommandBuffers = &cb };
+   CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+   CHECK(vkQueueWaitIdle(queue));
+
+   unsigned wrong = 0;
+   for (uint32_t i = 0; i < N; i++)
+      if (data[i] != i * 2) wrong++;
+   printf("dispatch %u threads: data[i] == i*2 on %u of %u\n", N, N - wrong, N);
+   if (wrong) {
+      printf("FAIL first few: %u %u %u %u\n", data[0], data[1], data[2], data[3]);
+      return 1;
+   }
+
+   vkFreeCommandBuffers(dev, cpool, 1, &cb);
+   vkDestroyCommandPool(dev, cpool, NULL);
+   vkUnmapMemory(dev, mem);
+   vkDestroyDescriptorPool(dev, pool, NULL);
+   vkDestroyBuffer(dev, buf, NULL);
+   vkFreeMemory(dev, mem, NULL);
 
    vkDestroyPipeline(dev, pipe, NULL);
    vkDestroyShaderModule(dev, sm, NULL);
@@ -198,7 +285,7 @@ int main(void)
       vkFreeMemory(dev, mem, NULL);
    }
 
-   if (test_compute_pipeline(dev))
+   if (test_dispatch(dev, queue, 2))
       return 1;
 
    CHECK(vkDeviceWaitIdle(dev));

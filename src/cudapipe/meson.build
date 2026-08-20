@@ -30,6 +30,8 @@ libcudapipe_vk_files = files(
   'cpvk_device.c',
   'cpvk_device_memory.c',
   'cpvk_pipeline.c',
+  'cpvk_cmd.c',
+  'cpvk_sync.c',
 )
 
 # Reused from the Gallium-hosted driver, unchanged and unforked. These three

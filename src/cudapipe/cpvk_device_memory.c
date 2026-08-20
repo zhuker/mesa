@@ -23,9 +23,18 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    struct cpvk_device *dev =
       container_of(vk_queue->base.device, struct cpvk_device, vk);
 
-   /* Nothing records work yet. Ordering is the stream's, and the only thing
-    * a submit can promise at this milestone is that the stream is drained
-    * before any signal is observed. */
+   cuCtxSetCurrent(dev->cu_ctx);
+
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      struct cpvk_cmd_buffer *cmd =
+         container_of(submit->command_buffers[i], struct cpvk_cmd_buffer, vk);
+      VkResult result = cpvk_execute_cmd_buffer(dev, cmd);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   /* Ordering is the stream's; a submit promises only that everything it
+    * recorded has run before any signal is observed. */
    cuStreamSynchronize(dev->stream);
    return VK_SUCCESS;
 }
@@ -55,6 +64,9 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_alloc;
 
+   /* After vk_device_init, which zeroes the device: the common command pool
+    * dereferences this the moment a pool is created. */
+   dev->vk.command_buffer_ops = &cpvk_cmd_buffer_ops;
    dev->pdev = pdev;
 
    /* CUDA 12.8: cuCtxCreate takes three arguments. Code written against

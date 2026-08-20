@@ -22,6 +22,7 @@
 #include "cp_nir_to_llvm.h"
 
 #include "nir.h"
+#include "nir_builder.h"
 #include "compiler/spirv/nir_spirv.h"
 
 static const struct spirv_to_nir_options cpvk_spirv_options = {
@@ -72,6 +73,49 @@ cpvk_lower_nir(nir_shader *nir)
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 }
 
+static bool
+lower_descriptors(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct cpvk_pipeline_layout *layout = data;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_vulkan_resource_index: {
+      unsigned set = nir_intrinsic_desc_set(intr);
+      unsigned binding = nir_intrinsic_binding(intr);
+      unsigned base = layout->set_base[set];
+      const struct cpvk_descriptor_set_layout *sl =
+         (const struct cpvk_descriptor_set_layout *)layout->vk.set_layouts[set];
+      if (sl && binding < sl->num_bindings)
+         base += sl->bindings[binding].flat;
+
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *index = nir_iadd_imm(b, intr->src[0].ssa, base);
+      /* (index, offset) is the 32bit_index_offset address format. */
+      nir_def *addr = nir_vec2(b, index, nir_imm_int(b, 0));
+      nir_def_replace(&intr->def, addr);
+      return true;
+   }
+   case nir_intrinsic_load_vulkan_descriptor:
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def_replace(&intr->def, intr->src[0].ssa);
+      return true;
+   default:
+      return false;
+   }
+}
+
+static void
+cpvk_lower_descriptors(nir_shader *nir,
+                       const struct cpvk_pipeline_layout *layout)
+{
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_descriptors,
+            nir_metadata_control_flow, (void *)layout);
+   NIR_PASS(_, nir, nir_lower_explicit_io,
+            nir_var_mem_ubo | nir_var_mem_ssbo,
+            nir_address_format_32bit_index_offset);
+   NIR_PASS(_, nir, nir_opt_dce);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_CreateDescriptorSetLayout(
    VkDevice _device, const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
@@ -79,13 +123,32 @@ cpvk_CreateDescriptorSetLayout(
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
 
-   struct vk_descriptor_set_layout *layout =
-      vk_descriptor_set_layout_zalloc(&dev->vk, sizeof(*layout),
-                                      pCreateInfo);
+   struct cpvk_descriptor_set_layout *layout =
+      vk_descriptor_set_layout_zalloc(&dev->vk, sizeof(*layout), pCreateInfo);
    if (!layout)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   *pSetLayout = vk_descriptor_set_layout_to_handle(layout);
+   /* Bindings are stored in binding-number order, so the flat index a shader
+    * ends up using is stable and computable at compile time. */
+   unsigned flat = 0;
+   for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
+      const VkDescriptorSetLayoutBinding *b = &pCreateInfo->pBindings[i];
+      if (b->binding >= CPVK_MAX_BINDINGS) {
+         vk_descriptor_set_layout_destroy(&dev->vk, &layout->vk);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      layout->bindings[b->binding].type = b->descriptorType;
+      layout->bindings[b->binding].count = MAX2(b->descriptorCount, 1u);
+      if (b->binding + 1 > layout->num_bindings)
+         layout->num_bindings = b->binding + 1;
+   }
+   for (unsigned b = 0; b < layout->num_bindings; b++) {
+      layout->bindings[b].flat = flat;
+      flat += layout->bindings[b].count;
+   }
+   layout->num_descriptors = flat;
+
+   *pSetLayout = cpvk_descriptor_set_layout_to_handle(layout);
    return VK_SUCCESS;
 }
 
@@ -97,14 +160,35 @@ cpvk_CreatePipelineLayout(VkDevice _device,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
 
-   struct vk_pipeline_layout *layout =
+   struct cpvk_pipeline_layout *layout =
       vk_pipeline_layout_zalloc(&dev->vk, sizeof(*layout), pCreateInfo);
    if (!layout)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   *pPipelineLayout = vk_pipeline_layout_to_handle(layout);
+   unsigned flat = 0;
+   for (uint32_t s = 0; s < layout->vk.set_count; s++) {
+      layout->set_base[s] = flat;
+      struct cpvk_descriptor_set_layout *set =
+         (struct cpvk_descriptor_set_layout *)layout->vk.set_layouts[s];
+      if (set)
+         flat += set->num_descriptors;
+   }
+   layout->num_descriptors = flat;
+
+   *pPipelineLayout = cpvk_pipeline_layout_to_handle(layout);
    return VK_SUCCESS;
 }
+
+/*
+ * vulkan_resource_index -> the flat buffer index the backend expects.
+ *
+ * The backend's emit_buffer_base() takes a 32-bit source as an index into
+ * args[18..], which is exactly the ABI a compute dispatch wants and needs no
+ * descriptor memory at all: the host resolves the set at bind time and writes
+ * the addresses into the argument block. A 64-bit source would instead be a
+ * pointer to a descriptor struct, which is the lavapipe shape and the one
+ * that made every descriptor set its own allocation.
+ */
 
 static void
 cpvk_pipeline_destroy(struct cpvk_device *dev, struct cpvk_pipeline *pipeline,
@@ -163,6 +247,12 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       }
 
       cpvk_lower_nir(nir);
+      cpvk_lower_descriptors(nir, cpvk_pipeline_layout_from_handle(
+                                     pCreateInfos[i].layout));
+
+      pipeline->local_size[0] = nir->info.workgroup_size[0];
+      pipeline->local_size[1] = nir->info.workgroup_size[1];
+      pipeline->local_size[2] = nir->info.workgroup_size[2];
 
       cuCtxSetCurrent(dev->cu_ctx);
       pipeline->bin = cp_compile_nir_to_ptx(nir, dev->pdev->sm_major,
