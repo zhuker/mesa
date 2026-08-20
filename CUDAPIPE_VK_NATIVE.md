@@ -1595,3 +1595,32 @@ Worth comparing with the previous two turns, which fixed two real structural
 bugs -- array layers in rendering and copies, dispatch ordering -- and moved
 no number at all. This one came from reading a pixel value and asking what
 produces exactly 128.
+
+### texturemipmapgen: the chain is built; the level chosen differs
+
+The frame differs on 7.4% of its bytes and only in the middle -- rows 212 to
+507, columns 470 to 809 -- which is the distance where minification is
+strongest and the deepest mip levels are sampled. Everything nearer the camera
+is exact.
+
+The chain itself is fine. No blit was refused: the driver warns on every blit
+it cannot do and the sample produces none of those warnings. The scaling blit
+box-filters the source footprint, and for the exact halving a mip generator
+asks for, a box filter and a bilinear tap at the destination texel's centre
+compute the same average, so the generated levels should agree.
+
+What differs is which level is read. The native image is *blurrier* in that
+region than the reference, which is a shader choosing a higher LOD, not a
+level containing the wrong pixels. That points at the sampler's LOD
+computation -- derivatives across the fragment quad -- and not at
+`vkCmdBlitImage` at all.
+
+That is worth stating precisely because the obvious reading of "the mipmap
+generation sample is wrong" is that mipmap generation is wrong, and the
+evidence says it is not.
+
+### multisampling: not a detail
+
+94.3% of bytes differ, every row and every column, max 254. This is not a
+filtering or precision difference and there is no point measuring it further
+until the driver resolves a multisampled attachment at all, which it does not.
