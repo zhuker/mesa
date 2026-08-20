@@ -621,6 +621,7 @@ cp_sample_level_layer(const struct cp_texture_info *tex,
       float av = fv - (float)y0;
 
       float acc_r = 0.0f, acc_g = 0.0f, acc_b = 0.0f, acc_a = 0.0f;
+      float acc_w = 0.0f;
       for (int j = 0; j < 2; j++) {
          for (int i = 0; i < 2; i++) {
             int x = x0 + i;
@@ -628,8 +629,18 @@ cp_sample_level_layer(const struct cp_texture_info *tex,
             float weight = (i ? au : 1.0f - au) * (j ? av : 1.0f - av);
             struct cp_rgba t;
             if (cube) {
-               /* Seamless: the footprint continues onto the adjacent face
-                * instead of being wrapped back into this one. */
+               /*
+                * Seamless: the footprint continues onto the adjacent face
+                * instead of being wrapped back into this one.
+                *
+                * At a corner, where three faces meet, a tap that is outside
+                * in *both* axes names a texel that does not exist on any
+                * face. The spec's answer is to drop it and renormalise over
+                * the three that do, which is what skipping it here amounts
+                * to: the weights are accumulated and divided below.
+                */
+               if ((x < 0 || x >= w) && (y < 0 || y >= h))
+                  continue;
                t = cp_fetch_cube_texel(tex, level, x, y, layer, w, h);
             } else if (cp_wrap_texel(&x, w, samp->wrap_s) &&
                 cp_wrap_texel(&y, h, samp->wrap_t)) {
@@ -640,9 +651,14 @@ cp_sample_level_layer(const struct cp_texture_info *tex,
             }
             acc_r += t.r * weight; acc_g += t.g * weight;
             acc_b += t.b * weight; acc_a += t.a * weight;
+            acc_w += weight;
          }
       }
-      c.r = acc_r; c.g = acc_g; c.b = acc_b; c.a = acc_a;
+      /* Renormalise, which matters only when a corner tap was dropped; the
+       * four weights sum to one everywhere else. */
+      float inv_w = acc_w > 0.0f ? 1.0f / acc_w : 0.0f;
+      c.r = acc_r * inv_w; c.g = acc_g * inv_w;
+      c.b = acc_b * inv_w; c.a = acc_a * inv_w;
    } else {
       int x = (int)floorf(su);
       int y = (int)floorf(sv);

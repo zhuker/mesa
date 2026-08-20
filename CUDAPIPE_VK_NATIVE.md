@@ -3918,3 +3918,22 @@ Neither is a missing feature or an absent term any more. Both are small,
 bounded, edge-localised numerical differences with a measured shape, which is a
 different position from the start of this session, when eight samples rendered
 wrong and three of them rendered nothing recognisable.
+
+### Seamless filtering at the corners
+
+Where three faces meet, a bilinear tap that is outside the face in *both* axes
+names a texel that exists on no face. The spec drops it and renormalises over
+the three that remain, which is what skipping it and dividing by the
+accumulated weight does.
+
+    cpvk_cubesph   differing pixels 18 -> 13, maximum 13 -> 2
+    pbribl         0.0300 -> 0.0286
+
+Nothing else moved: 18/18 samples run, 16/18 pixel-correct, fourteen unit tests
+pass.
+
+The remaining thirteen pixels are a smaller residual of the same kind, and at a
+maximum difference of 2 they are within rounding of the reference rather than
+structurally different. Whether the last of them is worth chasing is a
+judgement about what "identical to lavapipe" should mean for a corner texel
+that neither driver can name.
