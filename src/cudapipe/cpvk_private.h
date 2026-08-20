@@ -27,6 +27,7 @@
 #include "vk_command_buffer.h"
 #include "cp_nir_to_llvm.h"
 #include "vk_buffer.h"
+#include "vk_image.h"
 #include "vk_descriptor_set_layout.h"
 #include "vk_device_memory.h"
 #include "vk_pipeline_layout.h"
@@ -155,6 +156,28 @@ struct cpvk_buffer {
    VkDeviceSize offset;
 };
 
+#define CPVK_MAX_MIP_LEVELS 16
+
+struct cpvk_image {
+   struct vk_image vk;
+   struct cpvk_device_memory *mem;
+   VkDeviceSize offset;
+   /* Every level at its own offset. Folding that into one base is the bug
+    * that wrote level 0 over and over while the rest stayed untouched, and
+    * stayed invisible until textureLod was honoured. */
+   uint64_t level_offset[CPVK_MAX_MIP_LEVELS];
+   uint64_t level_size[CPVK_MAX_MIP_LEVELS];
+   uint32_t row_stride[CPVK_MAX_MIP_LEVELS];
+   uint64_t size;
+   uint32_t texel;                 /* enum cp_texel_format */
+   int color;                      /* enum cp_color_encoding, -1 if none */
+};
+
+struct cpvk_image_view {
+   struct vk_image_view vk;
+   struct cpvk_image *image;
+};
+
 VK_DEFINE_HANDLE_CASTS(cpvk_instance, vk.base, VkInstance,
                        VK_OBJECT_TYPE_INSTANCE)
 VK_DEFINE_HANDLE_CASTS(cpvk_physical_device, vk.base, VkPhysicalDevice,
@@ -177,5 +200,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_descriptor_pool, base, VkDescriptorPool,
                                VK_OBJECT_TYPE_DESCRIPTOR_POOL)
 VK_DEFINE_HANDLE_CASTS(cpvk_cmd_buffer, vk.base, VkCommandBuffer,
                        VK_OBJECT_TYPE_COMMAND_BUFFER)
+VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_image, vk.base, VkImage,
+                               VK_OBJECT_TYPE_IMAGE)
+VK_DEFINE_NONDISP_HANDLE_CASTS(cpvk_image_view, vk.base, VkImageView,
+                               VK_OBJECT_TYPE_IMAGE_VIEW)
 
 #endif /* CPVK_PRIVATE_H */

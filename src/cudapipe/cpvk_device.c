@@ -302,20 +302,6 @@ cpvk_GetPhysicalDeviceQueueFamilyProperties2(
    }
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL
-cpvk_GetPhysicalDeviceImageFormatProperties2(
-   VkPhysicalDevice physicalDevice,
-   const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
-   VkImageFormatProperties2 *pImageFormatProperties)
-{
-   /* Refuse everything until the format table is ported. vulkaninfo and any
-    * application walk this for every format, and a NULL entrypoint here is a
-    * jump to zero rather than a clean refusal. */
-   pImageFormatProperties->imageFormatProperties =
-      (VkImageFormatProperties) { 0 };
-   return VK_ERROR_FORMAT_NOT_SUPPORTED;
-}
-
 VKAPI_ATTR void VKAPI_CALL
 cpvk_GetPhysicalDeviceSparseImageFormatProperties2(
    VkPhysicalDevice physicalDevice,
@@ -357,13 +343,4 @@ cpvk_GetPhysicalDeviceExternalSemaphoreProperties(
    pExternalSemaphoreProperties->externalSemaphoreFeatures = 0;
 }
 
-VKAPI_ATTR void VKAPI_CALL
-cpvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
-                                        VkFormat format,
-                                        VkFormatProperties2 *pFormatProperties)
-{
-   /* Deliberately empty until the format table is ported: refusing a format
-    * is correct, advertising one that is then clamped is the failure mode
-    * the multisampling sample already demonstrated. */
-   pFormatProperties->formatProperties = (VkFormatProperties) { 0 };
-}
+/* The format table lives in cpvk_image.c, beside the layout it describes. */

@@ -192,6 +192,79 @@ static int test_dispatch(VkDevice dev, VkQueue queue, uint32_t memtype)
    return 0;
 }
 
+/*
+ * Milestone 5: images. Layout, memory requirements, binding, a view, and the
+ * format table -- which reports what the kernels can actually decode, so a
+ * format is refused rather than advertised and then clamped.
+ */
+static int test_image(VkPhysicalDevice pd, VkDevice dev)
+{
+   static const struct { VkFormat f; const char *name; bool want; } fmts[] = {
+      { VK_FORMAT_B8G8R8A8_UNORM,      "B8G8R8A8_UNORM",  true  },
+      { VK_FORMAT_R8G8B8A8_SRGB,       "R8G8B8A8_SRGB",   true  },
+      { VK_FORMAT_D32_SFLOAT,          "D32_SFLOAT",      true  },
+      { VK_FORMAT_R64G64B64A64_SFLOAT, "R64G64B64A64",    false },
+   };
+   for (unsigned i = 0; i < sizeof(fmts) / sizeof(fmts[0]); i++) {
+      VkFormatProperties p;
+      vkGetPhysicalDeviceFormatProperties(pd, fmts[i].f, &p);
+      bool got = p.optimalTilingFeatures != 0;
+      printf("  format %-16s features 0x%08x %s\n", fmts[i].name,
+             p.optimalTilingFeatures, got == fmts[i].want ? "" : "UNEXPECTED");
+      if (got != fmts[i].want) return 1;
+   }
+
+   VkImageCreateInfo ici = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
+      .extent = { 64, 64, 1 }, .mipLevels = 4, .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+   VkImage img;
+   CHECK(vkCreateImage(dev, &ici, NULL, &img));
+
+   VkMemoryRequirements req;
+   vkGetImageMemoryRequirements(dev, img, &req);
+   printf("  image 64x64 4 mips: size %llu align %llu\n",
+          (unsigned long long)req.size, (unsigned long long)req.alignment);
+
+   /* Each level at its own offset, and none of them overlapping. */
+   uint64_t prev_end = 0;
+   for (uint32_t l = 0; l < 4; l++) {
+      VkImageSubresource sub = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                 .mipLevel = l };
+      VkSubresourceLayout sl;
+      vkGetImageSubresourceLayout(dev, img, &sub, &sl);
+      printf("    level %u offset %6llu pitch %4llu size %6llu\n", l,
+             (unsigned long long)sl.offset, (unsigned long long)sl.rowPitch,
+             (unsigned long long)sl.size);
+      if (sl.offset < prev_end) { printf("FAIL level %u overlaps\n", l); return 1; }
+      prev_end = sl.offset + sl.size;
+   }
+
+   VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                .allocationSize = req.size,
+                                .memoryTypeIndex = 0 };
+   VkDeviceMemory mem;
+   CHECK(vkAllocateMemory(dev, &mai, NULL, &mem));
+   CHECK(vkBindImageMemory(dev, img, mem, 0));
+
+   VkImageViewCreateInfo ivci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
+      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 4, 0, 1 } };
+   VkImageView view;
+   CHECK(vkCreateImageView(dev, &ivci, NULL, &view));
+   printf("  image view created and bound\n");
+
+   vkDestroyImageView(dev, view, NULL);
+   vkFreeMemory(dev, mem, NULL);
+   vkDestroyImage(dev, img, NULL);
+   return 0;
+}
+
 int main(void)
 {
    VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -286,6 +359,8 @@ int main(void)
    }
 
    if (test_dispatch(dev, queue, 2))
+      return 1;
+   if (test_image(pd, dev))
       return 1;
 
    CHECK(vkDeviceWaitIdle(dev));
