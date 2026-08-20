@@ -2976,6 +2976,11 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
    cp->fs_batch.slices = 0;
    cp->fs_batch.prim_shift = 0;
 
+   if (getenv("CPVK_DEBUG_ROWS"))
+      fprintf(stderr, "exec: batch_draws=%u num_draws=%u fs_tbl=%d "
+              "fs_ndraws=%u\n", batch_draws, num_draws, fs_ubo_table ? 1 : 0,
+              cp->fs_batch.ndraws);
+
    if (!screen->kernels.initialized || !screen->kernels.rasterize_triangles)
       return;
    /*
@@ -3449,6 +3454,12 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
              * rather than from the vertex; see cp_fs_interp_args. */
             if (fs_ubo_table)
                cp->fs_batch.slices = slices_dev;
+
+            if (getenv("CPVK_DEBUG_ROWS"))
+               fprintf(stderr, "slices: n=%u set=%d verts=[%u %u %u]\n",
+                       batch_draws, slices_dev ? 1 : 0, slices[0].vert_begin,
+                       batch_draws > 1 ? slices[1].vert_begin : 0,
+                       batch_draws > 2 ? slices[2].vert_begin : 0);
 
             /*
              * The per-draw clip rectangles, when the batch's draws may

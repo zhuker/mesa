@@ -2397,3 +2397,36 @@ fragment resolves *which* row it belongs to, and whether the kernel is handed
 `fs_batch.slices` and `ndraws` at all for this batch.
 
 That is one print away and it is the next thing.
+
+### The slice table is correct too -- and a correction about why any of this matters
+
+`CPVK_DEBUG_ROWS` at the launch that shades the batch:
+
+    exec:   batch_draws=3 num_draws=1 fs_tbl=1 fs_ndraws=3
+    slices: n=3 set=1 verts=[0 30504 48132]
+
+The table is handed to the kernel, the row count is right, and the vertex
+spans are the exact cumulative sums of the three draws' index counts -- 30504,
+then 30504+17628 = 48132. `prim_shift` is 3 and `CP_CLIP_MAX_OUT` is 8, so
+`(prim >> 3) * 3` lands in the same units the spans are in.
+
+So the fragment side is correct as well, and the list of things eliminated by
+measurement now covers every structural element of the batched path.
+
+**The correction.** This mattered because merging was supposed to close the
+3.4x replay gap. It does not, and the measurement that says so is two turns
+old and was under-weighted at the time:
+
+    CPVK_BATCH off                     24.36 ms
+    CPVK_BATCH=1                       24.19 ms
+    CPVK_BATCH=1 CPVK_NO_DESC_KEY=1    24.21 ms
+
+Dropping the descriptor key moves the Crossroads replay by 0.02 ms against a
+7.17 ms target. Whatever makes the native driver 3.4x slower than the Gallium
+one on that capture, it is **not** the descriptor key and not the merges the
+key prevents. The `gltfscenerendering` correctness bug is real and still open,
+but it was being chased as a performance blocker and it is not one.
+
+Two turns went into it after the number that ruled it out had already been
+recorded. The rule that would have caught it: before chasing a blocker, check
+that removing it changes the thing it is supposed to be blocking.
