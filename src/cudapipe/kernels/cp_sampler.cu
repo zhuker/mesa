@@ -473,6 +473,50 @@ cp_cube_face(float x, float y, float z, float *out_u, float *out_v)
    return face;
 }
 
+
+/*
+ * A texel of a cube map, addressed across face boundaries.
+ *
+ * Vulkan's cube filtering is seamless: a bilinear footprint that runs off the
+ * edge of a face continues onto the face adjacent to that edge, rather than
+ * clamping or wrapping inside the face it started on. Doing that with an
+ * adjacency table means twenty-four cases and their rotations; going back
+ * through the direction vector is the same answer in one case.
+ *
+ * The out-of-range texel is turned into the continuous face coordinate it
+ * denotes, that coordinate is projected back into a direction with the inverse
+ * of cp_cube_face()'s conventions, and cp_cube_face() then names the face and
+ * position it really belongs to. In range, this is the plain fetch.
+ */
+static __device__ __forceinline__ struct cp_rgba
+cp_fetch_cube_texel(const struct cp_texture_info *tex, unsigned level,
+                    int x, int y, int face, int w, int h)
+{
+   if (x >= 0 && y >= 0 && x < w && y < h)
+      return cp_fetch_texel(tex, level, x, y, face);
+
+   float uc = 2.0f * (((float)x + 0.5f) / (float)w) - 1.0f;
+   float vc = 2.0f * (((float)y + 0.5f) / (float)h) - 1.0f;
+
+   float dx, dy, dz;
+   switch (face) {
+   case 0:  dx =  1.0f; dy = -vc;   dz = -uc;   break;
+   case 1:  dx = -1.0f; dy = -vc;   dz =  uc;   break;
+   case 2:  dx =  uc;   dy =  1.0f; dz =  vc;   break;
+   case 3:  dx =  uc;   dy = -1.0f; dz = -vc;   break;
+   case 4:  dx =  uc;   dy = -vc;   dz =  1.0f; break;
+   default: dx = -uc;   dy = -vc;   dz = -1.0f; break;
+   }
+
+   float nu, nv;
+   unsigned nface = cp_cube_face(dx, dy, dz, &nu, &nv);
+   int nx = (int)floorf(nu * (float)w);
+   int ny = (int)floorf(nv * (float)h);
+   nx = nx < 0 ? 0 : (nx >= w ? w - 1 : nx);
+   ny = ny < 0 ? 0 : (ny >= h ? h - 1 : ny);
+   return cp_fetch_texel(tex, level, nx, ny, (int)nface);
+}
+
 /*
  * Screen-space derivative of a cube face's u and v, from the derivative of the
  * direction vector. The face selection and the sign conventions have to match
@@ -532,7 +576,8 @@ static __device__ struct cp_rgba
 cp_sample_level_layer(const struct cp_texture_info *tex,
                       const struct cp_sampler_info *samp, unsigned level,
                       float u, float v, int layer, unsigned filter,
-                      bool layer_is_normalized, float layer_coord)
+                      bool layer_is_normalized, float layer_coord,
+                      bool cube = false)
 {
    struct cp_rgba c;
 
@@ -582,7 +627,11 @@ cp_sample_level_layer(const struct cp_texture_info *tex,
             int y = y0 + j;
             float weight = (i ? au : 1.0f - au) * (j ? av : 1.0f - av);
             struct cp_rgba t;
-            if (cp_wrap_texel(&x, w, samp->wrap_s) &&
+            if (cube) {
+               /* Seamless: the footprint continues onto the adjacent face
+                * instead of being wrapped back into this one. */
+               t = cp_fetch_cube_texel(tex, level, x, y, layer, w, h);
+            } else if (cp_wrap_texel(&x, w, samp->wrap_s) &&
                 cp_wrap_texel(&y, h, samp->wrap_t)) {
                t = cp_fetch_texel(tex, level, x, y, layer);
             } else {
@@ -939,7 +988,9 @@ cp_tex_sample_impl(unsigned long long tex_handle,
    if (!minifying || samp.min_mip_filter == CP_MIPFILTER_NONE) {
       struct cp_rgba c =
          cp_sample_level_layer(tex, &samp, base_level, u, v, layer, filter,
-                               target == CP_TEX_3D, c2);
+                               target == CP_TEX_3D, c2,
+                               target == CP_TEX_CUBE ||
+                               target == CP_TEX_CUBE_ARRAY);
       return make_float4(c.r, c.g, c.b, c.a);
    }
 
@@ -963,7 +1014,9 @@ cp_tex_sample_impl(unsigned long long tex_handle,
          struct cp_rgba c =
             cp_sample_level_layer(tex, &samp, level, u + aniso_du * off,
                                   v + aniso_dv * off, layer, filter,
-                                  target == CP_TEX_3D, c2);
+                                  target == CP_TEX_3D, c2,
+                               target == CP_TEX_CUBE ||
+                               target == CP_TEX_CUBE_ARRAY);
          acc.r += c.r; acc.g += c.g; acc.b += c.b; acc.a += c.a;
       }
       float inv = 1.0f / (float)aniso_taps;
@@ -982,9 +1035,13 @@ cp_tex_sample_impl(unsigned long long tex_handle,
       float off = tap_base + (float)t * tap_scale;
       float tu = u + aniso_du * off, tv = v + aniso_dv * off;
       struct cp_rgba a = cp_sample_level_layer(tex, &samp, lo, tu, tv, layer,
-                                               filter, target == CP_TEX_3D, c2);
+                                               filter, target == CP_TEX_3D, c2,
+                               target == CP_TEX_CUBE ||
+                               target == CP_TEX_CUBE_ARRAY);
       struct cp_rgba b = cp_sample_level_layer(tex, &samp, hi, tu, tv, layer,
-                                               filter, target == CP_TEX_3D, c2);
+                                               filter, target == CP_TEX_3D, c2,
+                               target == CP_TEX_CUBE ||
+                               target == CP_TEX_CUBE_ARRAY);
       acc.r += a.r + (b.r - a.r) * frac;
       acc.g += a.g + (b.g - a.g) * frac;
       acc.b += a.b + (b.b - a.b) * frac;

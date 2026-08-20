@@ -3312,3 +3312,35 @@ compare an image produced by one binary against a number produced by another.
 So `pbribl` is: a prefiltered environment cube sampled with `VK_FILTER_LINEAR`
 over a sphere, where every quad's footprint crosses a seam, on a driver that
 clamps each footprint inside one face.
+
+### Seamless cube filtering implemented
+
+`cp_fetch_cube_texel()` addresses a cube texel across face boundaries. Rather
+than an adjacency table -- twenty-four cases and their rotations -- an
+out-of-range texel is turned back into the continuous face coordinate it
+denotes, projected into a direction with the inverse of `cp_cube_face()`'s
+conventions, and handed to `cp_cube_face()` to name the face and position it
+really belongs to. In range it is the plain fetch, so the common path is
+unchanged.
+
+Measured on `cpvk_cubesph`, the test written for exactly this:
+
+    native distinct colours   6 -> 111        (lavapipe 112)
+    differing pixels        734 -> 18         (max 80 -> 13)
+
+The residual eighteen pixels are at the corners, where three faces meet and the
+footprint has no fourth texel; that is a documented special case and not
+addressed here.
+
+Nothing regressed. 18/18 samples run, 15/18 pixel-correct, thirteen unit tests
+pass, and both replays are unmoved at 9.40 ms and 34.28 ms.
+
+**And it is not pbribl's bug.** That sample moves 1.255 to 1.252. The defect was
+real, is fixed, and was found by the bisect that pbribl motivated -- but
+pbribl's spheres are neutral for another reason, exactly as the earlier note
+that they are "uniformly neutral rather than wrong only near seams" warned.
+
+Which is worth stating plainly: the substitution bisect found a genuine bug in
+the driver and did not find the one it was aimed at. The three tests that
+disagree with lavapipe are unchanged, and pbribl needs its own next
+substitution.
