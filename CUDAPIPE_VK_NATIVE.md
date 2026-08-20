@@ -3111,3 +3111,32 @@ chose for a handful of threads. This session's record on reading versus
 instrumenting is one-sided: `load_output`, `gl_PointCoord`, the storage-image
 extent, the multisample clear and the ICD manifest were all found by printing
 something, and every hypothesis reached by reading code has been wrong.
+
+### The device print overturns the face-selection finding
+
+A `printf` in the sampler's cube arm, printing the direction it received and
+the face it chose:
+
+    cubesph:  dir=[-0.678 -0.497 0.541] face=1 uv=[0.899 0.867] depth=6
+              dir=[-0.668 -0.486 0.564] face=1 uv=[0.922 0.864] depth=6
+    cubelod:  dir=[-1.000  0.000 0.000] face=1 uv=[0.500 0.500] depth=6
+
+**Face selection is correct in the failing test.** A direction dominated by -X
+gives face 1, the uv is sensible, and `tex->depth` is 6, so the layer will not
+be clamped. The previous entry inferred "face 0 for every fragment" from the
+red channel of the output image, and that inference was wrong: the sampler
+picks the right face and something after it returns face 0's texel.
+
+What is left between the face and the pixel is `cp_fetch_texel`, which offsets
+by `layer * img_stride[level]` -- and, on the write side,
+`vkGetImageSubresourceLayout`, which the test uses to place each face's colour
+and which must account for `arrayLayer`. If it ignores the layer, every face
+was written to the same offset and the cube holds one face's data, which would
+look exactly like this from the sampler's side while the sampler is innocent.
+
+That is checkable directly and cheaply: print the offsets the driver returns
+for the six faces of level 0.
+
+Two inferences from images have now been overturned by printing the value
+itself -- this one and the "prefiltered cube never copied" reading earlier.
+Both times the image was consistent with the wrong explanation.
