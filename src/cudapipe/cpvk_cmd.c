@@ -150,7 +150,7 @@ cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
                  write->pBufferInfo[e].offset
                : 0;
             if (set->host)
-               set->host[flat].buffer_base = set->addrs[flat];
+               set->host[flat].base = set->addrs[flat];
             break;
          }
 
@@ -167,7 +167,28 @@ cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
             }
             if (ii->sampler) {
                VK_FROM_HANDLE(cpvk_sampler, samp, ii->sampler);
-               set->host[flat].sampler_index = samp ? samp->index : 0;
+               set->host[flat].sampler_index_or_img_stride =
+                  samp ? samp->index : 0;
+            }
+
+            /*
+             * A storage image is addressed directly by the shader rather
+             * than sampled, so it needs the four fields the backend's
+             * bindless_image_load and _store read out of the descriptor:
+             * base, row stride, layer stride and base offset.
+             */
+            if (write->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+                ii->imageView) {
+               VK_FROM_HANDLE(cpvk_image_view, view, ii->imageView);
+               struct cpvk_image *img = view ? view->image : NULL;
+               if (img && img->mem) {
+                  unsigned level = view->vk.base_mip_level;
+                  set->host[flat].base = img->mem->dev_ptr + img->offset;
+                  set->host[flat].row_stride = img->row_stride[level];
+                  set->host[flat].sampler_index_or_img_stride =
+                     img->level_size[level];
+                  set->host[flat].base_offset = img->level_offset[level];
+               }
             }
             break;
          }
@@ -318,7 +339,7 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
             if (base + flat < CPVK_MAX_ARG_BUFS && set->addrs[flat])
                cmd->addrs[base + flat] = set->addrs[flat] + off;
             if (set->host)
-               set->host[flat].buffer_base = set->addrs[flat] + off;
+               set->host[flat].base = set->addrs[flat] + off;
          }
       }
 
@@ -389,6 +410,12 @@ cpvk_execute_cmd_buffer(struct cpvk_device *dev, struct cpvk_cmd_buffer *cmd)
                                     d->grid[2], bx, by, bz, 0, dev->stream,
                                     kernel_args, NULL);
       if (err != CUDA_SUCCESS) {
+         /* Name it. A submit that returns DEVICE_LOST and says nothing else
+          * is indistinguishable from every other way a replay can stop. */
+         const char *name = NULL;
+         cuGetErrorName(err, &name);
+         fprintf(stderr, "cudapipe: compute dispatch %ux%ux%u failed: %s (%d)\n",
+                 d->grid[0], d->grid[1], d->grid[2], name ? name : "?", err);
          cuMemFree(block);
          return vk_error(dev, VK_ERROR_DEVICE_LOST);
       }
@@ -1032,10 +1059,17 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
       int dw = r->dstOffsets[1].x - r->dstOffsets[0].x;
       int dh = r->dstOffsets[1].y - r->dstOffsets[0].y;
 
-      if (sw != dw || sh != dh || sw <= 0 || sh <= 0 || sbpp != dbpp) {
+      if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 || sbpp != dbpp) {
          fprintf(stderr, "cudapipe: vkCmdBlitImage %dx%d -> %dx%d (%u/%u bpp) "
-                 "scales or changes texel size, which is not implemented\n",
+                 "changes texel size or inverts, which is not implemented\n",
                  sw, sh, dw, dh, sbpp, dbpp);
+         return;
+      }
+
+      bool scaling = (sw != dw || sh != dh);
+      if (scaling && sbpp != 4) {
+         fprintf(stderr, "cudapipe: vkCmdBlitImage scales a %u-byte texel, "
+                 "which is not implemented\n", sbpp);
          return;
       }
 
@@ -1068,6 +1102,12 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
          .width_bytes = (size_t)sw * sbpp,
          .rows = sh,
          .swap_rb = swap_rb,
+         .src_w = scaling ? (unsigned)sw : 0,
+         .src_h = scaling ? (unsigned)sh : 0,
+         .dst_w = scaling ? (unsigned)dw : 0,
+         .dst_h = scaling ? (unsigned)dh : 0,
+         .bpp = sbpp,
+         .filter_linear = pInfo->filter == VK_FILTER_LINEAR,
       };
    }
 }
@@ -1102,6 +1142,80 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
 
    if (c->rows <= 1 && !c->src_pitch && !c->dst_pitch) {
       cuMemcpyDtoDAsync(c->dst, c->src, c->width_bytes, cp->stream);
+      return;
+   }
+
+   if (c->src_w) {
+      /*
+       * A scaling blit, on the host and synchronously, for the same reason
+       * the converting one is: this builds a mip chain at load time and is
+       * not on a frame's critical path. Box-filtered when the caller asked
+       * for LINEAR, which is what a downscale by two wants and what every
+       * mip generator asks for; point-sampled otherwise.
+       */
+      size_t src_bytes = (size_t)c->src_w * c->src_h * 4;
+      size_t dst_bytes = (size_t)c->dst_w * c->dst_h * 4;
+      uint8_t *src = malloc(src_bytes), *dst = malloc(dst_bytes);
+      if (!src || !dst) {
+         free(src); free(dst);
+         return;
+      }
+
+      CUDA_MEMCPY2D d2h = {
+         .srcMemoryType = CU_MEMORYTYPE_DEVICE, .srcDevice = c->src,
+         .srcPitch = c->src_pitch,
+         .dstMemoryType = CU_MEMORYTYPE_HOST, .dstHost = src,
+         .dstPitch = (size_t)c->src_w * 4,
+         .WidthInBytes = (size_t)c->src_w * 4, .Height = c->src_h,
+      };
+      cuStreamSynchronize(cp->stream);
+      cuMemcpy2D(&d2h);
+
+      for (unsigned y = 0; y < c->dst_h; y++) {
+         for (unsigned x = 0; x < c->dst_w; x++) {
+            uint8_t *o = dst + ((size_t)y * c->dst_w + x) * 4;
+            if (c->filter_linear) {
+               /* The source footprint of this destination texel, averaged.
+                * Exact for the power-of-two halving a mip chain does. */
+               unsigned x0 = x * c->src_w / c->dst_w;
+               unsigned x1 = MAX2((x + 1) * c->src_w / c->dst_w, x0 + 1);
+               unsigned y0 = y * c->src_h / c->dst_h;
+               unsigned y1 = MAX2((y + 1) * c->src_h / c->dst_h, y0 + 1);
+               unsigned acc[4] = { 0, 0, 0, 0 }, n = 0;
+               for (unsigned sy = y0; sy < y1 && sy < c->src_h; sy++)
+                  for (unsigned sx = x0; sx < x1 && sx < c->src_w; sx++) {
+                     const uint8_t *s =
+                        src + ((size_t)sy * c->src_w + sx) * 4;
+                     for (int k = 0; k < 4; k++)
+                        acc[k] += s[k];
+                     n++;
+                  }
+               for (int k = 0; k < 4; k++)
+                  o[k] = n ? (uint8_t)((acc[k] + n / 2) / n) : 0;
+            } else {
+               unsigned sx = x * c->src_w / c->dst_w;
+               unsigned sy = y * c->src_h / c->dst_h;
+               memcpy(o, src + ((size_t)sy * c->src_w + sx) * 4, 4);
+            }
+
+            if (c->swap_rb) {
+               uint8_t r = o[0];
+               o[0] = o[2];
+               o[2] = r;
+            }
+         }
+      }
+
+      CUDA_MEMCPY2D h2d = {
+         .srcMemoryType = CU_MEMORYTYPE_HOST, .srcHost = dst,
+         .srcPitch = (size_t)c->dst_w * 4,
+         .dstMemoryType = CU_MEMORYTYPE_DEVICE, .dstDevice = c->dst,
+         .dstPitch = c->dst_pitch,
+         .WidthInBytes = (size_t)c->dst_w * 4, .Height = c->dst_h,
+      };
+      cuMemcpy2D(&h2d);
+      free(src);
+      free(dst);
       return;
    }
 

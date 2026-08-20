@@ -129,13 +129,23 @@ struct cpvk_pipeline_layout {
  * driver owns.
  */
 struct cpvk_descriptor {
-   uint64_t buffer_base;              /* +0  read by emit_buffer_base */
-   uint8_t  pad0[20];
-   uint32_t sampler_index;            /* +28 index into cp_sampler_table */
-   uint8_t  pad1[16];
+   uint64_t base;                     /* +0  buffer base, or image base */
+   uint8_t  pad0[16];
+   uint32_t row_stride;               /* +24 storage image only */
+   /*
+    * +28 is two things, because a descriptor is one kind or the other and
+    * lavapipe's lp_descriptor overlaps them the same way: a sampler's table
+    * index, or a storage image's layer stride.
+    */
+   uint32_t sampler_index_or_img_stride;
+   uint8_t  pad1[8];
+   uint32_t base_offset;              /* +40 storage image only */
+   uint8_t  pad2[4];
    uint64_t texture_info;             /* +48 struct cp_texture_info * */
-   uint8_t  pad2[8];
+   uint8_t  pad3[8];
 };
+static_assert(sizeof(struct cpvk_descriptor) == 64,
+              "the kernels read fixed offsets into this");
 
 struct cpvk_descriptor_set {
    struct vk_object_base base;
@@ -236,6 +246,14 @@ struct cpvk_copy {
     * sample suite blits its BGRA render target into an RGBA staging image
     * precisely so it does not have to swizzle on the CPU. */
    bool swap_rb;
+
+   /*
+    * A scaling blit, which is how every mip chain in a capture is built:
+    * level n-1 blitted down to level n. Zero means no scaling and the fast
+    * device-to-device path applies.
+    */
+   unsigned src_w, src_h, dst_w, dst_h, bpp;
+   bool filter_linear;
 };
 
 struct cpvk_query_op {
