@@ -1465,17 +1465,6 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
 
    cuCtxSetCurrent(dev->cu_ctx);
 
-   if (getenv("CPVK_TRACE_COPY")) {
-      fprintf(stderr, "copy src=%p dst=%p %zux%zu pitch %zu->%zu "
-              "scale %ux%u->%ux%u samples=%u stride=%llu ends %p/%p\n",
-              (void *)(uintptr_t)c->src, (void *)(uintptr_t)c->dst,
-              c->width_bytes, c->rows, c->src_pitch, c->dst_pitch,
-              c->src_w, c->src_h, c->dst_w, c->dst_h, c->samples,
-              (unsigned long long)c->sample_stride,
-              (void *)(uintptr_t)c->src_end, (void *)(uintptr_t)c->dst_end);
-      fflush(stderr);
-   }
-
    /*
     * Refuse a copy that cannot be one. A zero endpoint is an image or buffer
     * whose memory was never bound, and a pitch narrower than the row is a

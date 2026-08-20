@@ -581,3 +581,34 @@ inside its image, with the memory live and the parameters traced. A fault on
 sane arguments points at the CUDA context having been corrupted earlier by a
 device-side access -- which `compute-sanitizer` would name, and which is the
 next thing to run now that the earlier faults it reported are fixed.
+
+## Where the ten wrong samples differ
+
+Localised rather than guessed at, by counting which pixels differ from the
+Gallium-hosted driver by more than 16/255:
+
+    texturemipmapgen   0.9% of pixels, rows 212..507, cols 471..806
+    pbribl             9.1% of pixels, rows 311..414, cols 98..1240
+    pushconstants      5.6% of pixels, rows 108..611, cols 388..891
+
+`texturemipmapgen` differs only in the centre of the image, which is where the
+texture is minified hardest and the generated mip levels are used. So the
+difference is in mip generation, which this driver does on the host.
+
+Two explanations tested and refuted:
+
+- **sRGB.** Averaging sRGB bytes without decoding would be wrong in exactly
+  this way. The format is `VK_FORMAT_R8G8B8A8_UNORM` and the trace says
+  `srgb=0`, so it is not that.
+- **Rounding.** Every blit is an exact halving with LINEAR filtering, where a
+  2x2 box average is the correct answer and only the rounding can differ.
+  Round-half-to-even instead of round-half-up changed the mean by nothing at
+  all: 0.4560 either way.
+
+So the box filter agrees with llvmpipe's blit on value and rounding, and
+something else about it does not. The next thing to look at is which texels it
+takes: llvmpipe samples at destination texel centres, and a half-texel offset
+would shift the footprint by one without changing its size.
+
+`pbribl`'s difference is a horizontal band, not the whole image, which says one
+object or one pass rather than a global error.
