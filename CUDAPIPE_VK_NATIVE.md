@@ -3079,3 +3079,35 @@ the fragment shader belonged and neither run wrote a file. `cmp` on two
 absent files reports a difference. The exit statuses were in the output and
 said 133; checking them is what turned a false result into the real one, and
 that is now the third time this session that rule has paid.
+
+### cp_cube_face is correct, so the face is lost after it
+
+The function is the standard one: dominant axis by `fabsf`, face from the
+sign, `uc`/`vc` with the usual conventions, divide by `ma`, map to [0,1]. There
+is nothing in it that returns 0 for a direction whose dominant axis is -X or
++Y, and `cpvk_cubelod` proves it selects all six faces correctly when the
+direction is quad-uniform.
+
+So the face is computed and then lost. The path after it is short:
+
+    layer = (int)face
+    -> cp_sample_level_layer(tex, samp, level, u, v, layer, filter,
+                             target == CP_TEX_3D, c2)
+    -> layer clamped against tex->depth
+    -> cp_fetch_texel(tex, level, x, y, layer)
+
+`tex->depth` is `MAX2(extent.depth, array_layers)` = 6 for these views, and the
+same views serve `cpvk_cubelod`, so the clamp is not it either.
+
+What is genuinely different between the passing and failing tests is only the
+fragment shader: constants selected by branches against arithmetic on
+interpolated inputs. Everything else -- image, view, sampler, test harness --
+is shared, because `cpvk_cubesph` is a copy of `cpvk_cubelod` with one shader
+swapped.
+
+That is as far as reading gets. The next step is a device-side `printf` in the
+cube arm of the sampler, printing the direction it received and the face it
+chose for a handful of threads. This session's record on reading versus
+instrumenting is one-sided: `load_output`, `gl_PointCoord`, the storage-image
+extent, the multisample clear and the ICD manifest were all found by printing
+something, and every hypothesis reached by reading code has been wrong.
