@@ -122,6 +122,15 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_stream;
    }
+   /* The null page: zeroed, and its first word is its own address, so a
+    * descriptor read out of it has a base pointer that is also this page. */
+   if (cuMemAllocManaged(&dev->null_page, 64 * 1024, CU_MEM_ATTACH_GLOBAL) ==
+       CUDA_SUCCESS) {
+      memset((void *)(uintptr_t)dev->null_page, 0, 64 * 1024);
+      for (unsigned i = 0; i < 64 * 1024 / sizeof(uint64_t); i++)
+         ((uint64_t *)(uintptr_t)dev->null_page)[i] = dev->null_page;
+   }
+
    if (!cp_context_init(&dev->renderer, &dev->cp_dev)) {
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_stream;

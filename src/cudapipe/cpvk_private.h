@@ -67,6 +67,21 @@ struct cpvk_device {
     * it. Brought up by cp_context_init(). */
    struct cp_device cp_dev;
    struct cp_context renderer;
+
+   /*
+    * A zeroed page that points at itself, used for any buffer slot nothing
+    * bound.
+    *
+    * A shader that reads an unbound slot used to read address zero and take
+    * the device down, and a lost device stops a replay dead with no way to
+    * see what else is wrong. Pointing the slot here instead means the
+    * descriptor it finds has a base pointer -- this page -- and the buffer
+    * read that follows lands in zeroes. The shader computes on zeroes, which
+    * is wrong, and the frame is wrong, and everything after it still runs and
+    * can be looked at. It is a bring-up aid, not a fix: the slot being
+    * unbound is the bug.
+    */
+   CUdeviceptr null_page;
 };
 
 /*

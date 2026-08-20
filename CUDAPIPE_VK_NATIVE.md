@@ -504,3 +504,31 @@ which slot it loads, rather than reason about which one it ought to be.
 `CUDAPIPE_DUMP_NIR=1` prints it, but the capture builds many pipelines and the
 one that faults has to be identified first -- printing the pipeline pointer
 beside the dispatch would do it.
+
+## The replay stops losing the device, and starts not finishing
+
+Two fixes, one after the other, both about reads that had nowhere to land.
+
+`compute-sanitizer` put the first fault at `main+0xa0` — a compiled shader,
+since every one of them is named `main` — reading eight bytes at `0x80`,
+*before frame 1 begins*, so during the replayer's resource-init phase. Dumping
+the faulting pipeline's NIR (matched by the pointer the failing dispatch now
+prints) showed it reads only slots 1 and 2, both bound to valid snapshots. So
+the null was not a slot: it was a **descriptor** inside a bound set that
+nothing ever wrote, whose base was zero. `0x80` is 128, which is descriptor
+two.
+
+Both now point at a 64 KB zeroed page whose every word is the page's own
+address, so a read of an unbound slot or an unwritten descriptor finds a base
+pointer, follows it, and lands in zeroes. **This is a bring-up aid and not a
+fix**: a shader reading an unwritten descriptor is a bug in the application or
+in this driver's descriptor handling, and the page only changes a lost device
+into a wrong frame. It is worth having because a lost device stops a replay
+dead and a wrong frame does not.
+
+With it, the capture replays with no driver errors at all where it used to die
+in seconds — and does not finish in forty minutes, against roughly thirty-eight
+seconds for the Gallium-hosted driver. No frame markers reach the fps plugin
+in five minutes, so it is not merely slow by a constant: something is either
+looping or making no frame progress. That is the next thing to look at, and the
+first question is whether frame 1 ever completes.

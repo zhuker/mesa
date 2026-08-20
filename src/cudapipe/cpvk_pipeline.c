@@ -308,6 +308,11 @@ lower_tex(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+/* Which pipeline is being lowered, so a dump can be matched to the one a
+ * failing dispatch names. Set immediately before the call; nothing else
+ * reads it. */
+static const void *cpvk_lower_descriptors_dump;
+
 static void
 cpvk_lower_descriptors(nir_shader *nir,
                        const struct cpvk_pipeline_layout *layout)
@@ -324,6 +329,14 @@ cpvk_lower_descriptors(nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_descriptors,
             nir_metadata_control_flow, (void *)layout);
    NIR_PASS(_, nir, nir_opt_dce);
+
+   if (cp_debug->dump_nir) {
+      fprintf(stderr, "=== %s NIR after descriptor lowering, pipeline %p ===\n",
+              _mesa_shader_stage_to_string(nir->info.stage),
+              cpvk_lower_descriptors_dump);
+      nir_print_shader(nir, stderr);
+   }
+   cpvk_lower_descriptors_dump = NULL;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -474,6 +487,7 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       }
 
       cpvk_lower_nir(nir);
+      cpvk_lower_descriptors_dump = pipeline;
       cpvk_lower_descriptors(nir, cpvk_pipeline_layout_from_handle(
                                      pCreateInfos[i].layout));
 

@@ -89,6 +89,18 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
              CUDA_SUCCESS) {
             set->host = (struct cpvk_descriptor *)(uintptr_t)set->buf;
             memset(set->host, 0, size);
+
+            /*
+             * A descriptor nothing ever writes still gets read, by a shader
+             * that declares a binding the application does not use on this
+             * path. Its base pointed at zero and took the device down; it
+             * points at the null page instead, so the read lands in zeroes
+             * and the frame is merely wrong. The capture's first compute
+             * dispatch died on exactly this: descriptor two of a bound set,
+             * never written, read eight bytes at 0x80.
+             */
+            for (unsigned d = 0; d < layout->num_descriptors; d++)
+               set->host[d].base = dev->null_page;
          }
       }
 
@@ -551,7 +563,8 @@ cpvk_execute_cmd_buffer(struct cpvk_device *dev, struct cpvk_cmd_buffer *cmd)
       memset(slots, 0, total);
       slots[0] = (void *)(uintptr_t)(block + args_bytes);
       for (unsigned s = 0; s < CPVK_MAX_ARG_BUFS; s++)
-         slots[CPVK_ARG_UBO_BASE + s] = (void *)(uintptr_t)d->addrs[s];
+         slots[CPVK_ARG_UBO_BASE + s] = (void *)(uintptr_t)
+            (d->addrs[s] ? d->addrs[s] : dev->null_page);
 
       /*
        * The push constant block, in slot 0, which the graphics path staged
@@ -588,7 +601,8 @@ cpvk_execute_cmd_buffer(struct cpvk_device *dev, struct cpvk_cmd_buffer *cmd)
          cuGetErrorName(err, &name);
          fprintf(stderr, "cudapipe: compute dispatch %ux%ux%u failed: %s (%d)\n",
                  d->grid[0], d->grid[1], d->grid[2], name ? name : "?", err);
-         fprintf(stderr, "cudapipe:   push=%u bytes, buffer slots:", d->push_size);
+         fprintf(stderr, "cudapipe:   pipeline %p, push=%u bytes, buffer slots:",
+                 (void *)d->pipeline, d->push_size);
          for (unsigned s = 0; s < CPVK_MAX_ARG_BUFS; s++)
             if (d->addrs[s])
                fprintf(stderr, " [%u]=%p", s, (void *)(uintptr_t)d->addrs[s]);
@@ -1006,10 +1020,12 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
    }
 
    for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
-      cp->vs_ubos[i].buffer = (void *)(uintptr_t)d->addrs[i];
+      cp->vs_ubos[i].buffer = (void *)(uintptr_t)
+         (d->addrs[i] ? d->addrs[i] : dev->null_page);
       cp->vs_ubos[i].managed_copy = 0;
       cp->vs_ubos[i].user_copy = false;
-      cp->fs_ubos[i].buffer = (void *)(uintptr_t)d->addrs[i];
+      cp->fs_ubos[i].buffer = (void *)(uintptr_t)
+         (d->addrs[i] ? d->addrs[i] : dev->null_page);
       cp->fs_ubos[i].managed_copy = 0;
       cp->fs_ubos[i].user_copy = false;
    }
