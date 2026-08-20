@@ -3866,3 +3866,29 @@ reading the dump. The same instrument found `load_output` at the start of this
 session, for the same class of bug, and the lesson did not transfer: when a
 value is missing, dump the representation that carries it rather than
 implementing the ways it might have arrived.
+
+### Sampler array indexing implemented: texturemipmapgen is correct
+
+`lower_tex` turned a texture or sampler deref into
+`set_base + binding * sizeof(descriptor)` and ignored the deref chain above it,
+so `uniform sampler samplers[3]` indexed by anything resolved to element 0. The
+element is now folded in:
+
+    if (deref->deref_type == nir_deref_type_array) {
+       nir_def *step = nir_imul_imm(b, deref->arr.index.ssa,
+                                    CPVK_DESCRIPTOR_SIZE);
+       handle = nir_iadd(b, handle, nir_u2u64(b, step));
+    }
+
+    texturemipmapgen  0.456 -> 0.0028      pixel-correct
+
+**Sixteen of eighteen.** Only `multisampling` at 0.553 and `pbribl` at 0.030
+remain, and both are characterised: edge coverage on silhouettes, and 141 edge
+pixels respectively.
+
+One detail worth keeping. Computing the step in 64 bits let NIR fold the
+multiply into `shl i64 %x, i32 6`, whose operands differ in width, and the
+module failed LLVM verification -- the driver said so plainly and the shader
+never compiled. Doing the multiply in 32 bits and widening the result avoids
+it. The failure was loud, immediate and named its own cause, which is what the
+verifier is for.

@@ -325,6 +325,28 @@ lower_tex(nir_builder *b, nir_instr *instr, void *data)
       if (!handle)
          continue;
 
+      /*
+       * The array element, which the deref carries and the handle did not.
+       *
+       * `uniform sampler samplers[3]` indexed by anything -- a constant or a
+       * uniform -- reaches here as a deref_array over the variable, and only
+       * the variable's binding was being used. Every element therefore
+       * resolved to the first: texturemipmapgen chose among three samplers
+       * and always got samplers[0], the one built with lod 0.0..0.0, so
+       * nothing it drew ever read a mip level.
+       *
+       * The index steps by one descriptor, the same stride
+       * cpvk_descriptor_handle uses for the binding.
+       */
+      if (deref->deref_type == nir_deref_type_array) {
+         /* The multiply stays in 32 bits and the result widens. Doing it in
+          * 64 let NIR fold it to `shl i64 %x, i32 6`, whose operands differ in
+          * width, and the module failed LLVM verification. */
+         nir_def *step = nir_imul_imm(b, deref->arr.index.ssa,
+                                      CPVK_DESCRIPTOR_SIZE);
+         handle = nir_iadd(b, handle, nir_u2u64(b, step));
+      }
+
       nir_tex_instr_remove_src(tex, i);
       nir_tex_instr_add_src(tex, want, handle);
       i = -1;   /* sources shifted; rescan */
