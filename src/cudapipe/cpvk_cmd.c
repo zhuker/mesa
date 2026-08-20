@@ -1220,6 +1220,20 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
     * vertex offset now a merge condition, and one measurement to the contrary
     * in the same turn did not reproduce. It stays until that is settled.
     */
+   /*
+    * The descriptors, by content.
+    *
+    * Required, measured three runs each way: gltfscenerendering is 0.000 with
+    * this and 20.768 without. Why is still open -- every property of those
+    * draws that could plausibly need it has been reproduced in cpvk_batch and
+    * cpvk_batchtex and merges correctly without it: three draws, three
+    * descriptor sets, three textures, overlapping geometry at three depths
+    * with the depth test on, and a discarding fragment shader.
+    *
+    * What is left untested is the size of the batch (nine draws there, three
+    * here) and a layout with more than one descriptor set. CPVK_NO_DESC_KEY
+    * turns it off for the next person who wants to bisect that.
+    */
    if (!getenv("CPVK_NO_DESC_KEY"))
       CPVK_DIFF(memcmp(a->desc_hash, b->desc_hash, sizeof(a->desc_hash)),
                 "descriptors");

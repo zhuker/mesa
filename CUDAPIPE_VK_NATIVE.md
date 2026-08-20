@@ -1119,3 +1119,26 @@ a batch on the blended path, and the opaque path resolves visibility through a
 depth-keyed buffer that a discarding shader participates in differently. That
 is the next thing to test, and the test is a one-line shader change to
 `cpvk_batchtex`.
+
+### Five properties tested, none reproduces it
+
+`cpvk_batchtex` now draws three overlapping triangles at three depths through
+three descriptor sets naming three textures, and passes byte-identically to
+lavapipe with the descriptor comparison off. So does the same test with a
+discarding fragment shader. Together with `cpvk_batch`, the following all
+merge correctly:
+
+- draws differing in a uniform buffer, two and three of them
+- draws differing in a texture, two and three of them
+- overlapping geometry where the depth-keyed visibility buffer must pick a
+  winner across draws, and shade it from its own draw's binding row
+- a fragment shader that discards, which is what alpha masking is
+
+gltfscenerendering still needs the comparison. What has not been reproduced:
+
+- **batch size**: nine draws there against three here
+- **more than one descriptor set** in the pipeline layout, which its scene and
+  material sets would be
+
+Both are small extensions of a test that exists. `CPVK_NO_DESC_KEY=1` disables
+the comparison for whoever bisects it.

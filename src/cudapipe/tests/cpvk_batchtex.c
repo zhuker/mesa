@@ -165,18 +165,26 @@ main(int argc, char **argv)
     * one nearer on the right, so neither wins outright and a depth test that
     * does nothing is visibly a different picture.
     */
+   /*
+    * Three overlapping triangles at three depths, which is the one thing the
+    * side-by-side version never tested: within a batch the depth-keyed
+    * visibility buffer has to pick a winner *across* draws, and the winning
+    * fragment has to be shaded from its own draw's binding row rather than
+    * from whichever draw was last. A scene of meshes overlaps constantly;
+    * three triangles in a row never do.
+    */
    const struct vertex verts[9] = {
-      { -0.9f, -0.6f, 0.5f, 255, 255, 255, 255 },
-      { -0.4f, -0.6f, 0.5f, 255, 255, 255, 255 },
-      { -0.65f, 0.6f, 0.5f, 255, 255, 255, 255 },
+      { -0.8f, -0.6f, 0.7f, 255, 255, 255, 255 },
+      {  0.4f, -0.6f, 0.7f, 255, 255, 255, 255 },
+      { -0.2f,  0.7f, 0.7f, 255, 255, 255, 255 },
 
-      { -0.25f,-0.6f, 0.5f, 255, 255, 255, 255 },
-      {  0.25f,-0.6f, 0.5f, 255, 255, 255, 255 },
-      {  0.0f,  0.6f, 0.5f, 255, 255, 255, 255 },
+      { -0.5f, -0.6f, 0.5f, 255, 255, 255, 255 },
+      {  0.7f, -0.6f, 0.5f, 255, 255, 255, 255 },
+      {  0.1f,  0.7f, 0.5f, 255, 255, 255, 255 },
 
-      {  0.4f, -0.6f, 0.5f, 255, 255, 255, 255 },
-      {  0.9f, -0.6f, 0.5f, 255, 255, 255, 255 },
-      {  0.65f, 0.6f, 0.5f, 255, 255, 255, 255 },
+      { -0.2f, -0.6f, 0.3f, 255, 255, 255, 255 },
+      {  1.0f, -0.6f, 0.3f, 255, 255, 255, 255 },
+      {  0.4f,  0.7f, 0.3f, 255, 255, 255, 255 },
    };
    const uint16_t indices[9] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
 
