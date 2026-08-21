@@ -2038,6 +2038,7 @@ cpvk_CmdEndRendering(VkCommandBuffer commandBuffer)
       .dst_end = cpvk_image_end(dst),
       .samples = MAX2(src->vk.samples, 1u),
       .sample_stride = src->sample_stride,
+      .encoding = src->color,
    };
 
    cmd->resolve_src = NULL;
@@ -2087,6 +2088,7 @@ cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
          .dst_end = cpvk_image_end(dst),
          .samples = MAX2(src->vk.samples, 1u),
          .sample_stride = src->sample_stride,
+         .encoding = src->color,
       };
    }
 }
@@ -2261,6 +2263,37 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
    if (c->rows <= 1 && !c->src_pitch && !c->dst_pitch) {
       cuMemcpyDtoDAsync(c->dst, c->src, c->width_bytes, cp->stream);
       return;
+   }
+
+   if (c->samples > 1 && cp->screen->kernels.resolve_samples &&
+       c->encoding >= 0 && c->width_bytes && c->rows) {
+      /*
+       * Resolve on the device, with the kernel that already exists.
+       *
+       * The host path below reads every sample plane back, averages it on the
+       * CPU and writes the result out again, once per render pass -- and its
+       * comment said that was not on a frame's critical path. It is: the
+       * sweep harness measures multisampling at 13.29 ms a frame against the
+       * Gallium driver's 1.49, and that driver launches this same kernel from
+       * cp_resource.c rather than draining the stream three times a frame.
+       */
+      struct cp_resolve_msaa_args ra = {
+         .src = c->src,
+         .dst = c->dst,
+         .width = (uint32_t)(c->width_bytes / 4),
+         .height = (uint32_t)c->rows,
+         .src_stride = (uint32_t)(c->src_pitch ? c->src_pitch : c->width_bytes),
+         .dst_stride = (uint32_t)(c->dst_pitch ? c->dst_pitch : c->width_bytes),
+         .sample_stride = (uint32_t)c->sample_stride,
+         .num_samples = c->samples,
+         .encoding = c->encoding,
+      };
+      void *params[] = { &ra };
+      if (cuLaunchKernel(cp->screen->kernels.resolve_samples,
+                         (ra.width + 15) / 16, (ra.height + 15) / 16, 1,
+                         16, 16, 1, 0, cp->stream, params, NULL) == CUDA_SUCCESS)
+         return;
+      /* Fall through to the host path if the launch was refused. */
    }
 
    if (c->samples > 1) {

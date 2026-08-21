@@ -367,9 +367,13 @@ struct cpvk_copy {
     */
    uint64_t src_end, dst_end;
 
-   /* A multisample resolve: average `samples` planes `sample_stride` apart. */
+   /* A multisample resolve: average `samples` planes `sample_stride` apart.
+    * `encoding` is the source's cp_color_encoding, which the resolve kernel
+    * needs to decode and re-encode the texels; -1 when it is not known and
+    * the host path has to run. */
    unsigned samples;
    uint64_t sample_stride;
+   int encoding;
 };
 
 struct cpvk_query_op {
