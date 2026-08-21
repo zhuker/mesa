@@ -5660,3 +5660,20 @@ So what remains of the sweep gap is not yet attributed. The honest position:
 the median is 1.20x of the driver being replaced, down from 1.56x at the start
 of this session, and the mechanism behind the rest is unknown rather than
 understood.
+
+### Pass episodes are a real trade, and not the difference
+
+    sample             default  no-opaque-ep  no-pass-ep  gallium   ratios
+    instancing            8.61      9.05         9.23      5.84   1.47/1.55/1.58
+    vulkanscene           1.24      1.21         1.16      0.89   1.40/1.37/1.31
+    texturemipmapgen      0.95      0.85         0.88      0.56   1.68/1.50/1.56
+    computeshader         0.59      0.53         0.52      0.41   1.44/1.30/1.29
+
+Turning episodes off helps three of the four and hurts the fourth, which makes
+it a tuning question rather than a defect -- and `CUDAPIPE_NO_PASS_EPISODE` and
+`CUDAPIPE_NO_OPAQUE_EPISODE` are read by the shared renderer, so the Gallium
+driver runs with the same defaults and is faster anyway. Episodes are not what
+separates them.
+
+Nothing is changed on the strength of this: three samples want one setting, one
+wants the other, and the differences are 5-10% against a gap of 40-70%.
