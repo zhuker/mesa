@@ -5326,3 +5326,37 @@ comment describes this failure is not responsible. The next thing to check is
 whether the *vertex* stage gets its `batch_rows` at all -- it is allocated only
 when `cp->vs_shader->reads_const_bufs`, and nothing has yet confirmed that flag
 is set for these two shaders.
+
+### The vertex stage's per-draw uniform row has never been exercised
+
+Every link in the chain checks out:
+
+    vsrows: draws=15 vs_reads_cb=1 vs_reads_dp=0 rows=1 slices=1
+
+the rows are allocated, `cp_vertex_fetch` writes each vertex's row by binary
+search over the slice table, `cp_batch_record` snapshots fifteen distinct push
+blocks 0x100 apart, and `cp_draw_execute` builds one uniform table row per
+draw. The fragment shader reads no constant buffer at all (`reads_cb=0`), so
+none of the fragment-side machinery is involved.
+
+And the result is still wrong. Counting what lands on screen:
+
+    correct        16 coarse colours, 51,880 lit pixels
+    merged push     4 coarse colours, 12,961 lit pixels
+
+Not wrong colours -- **missing geometry**. Every sphere is drawn at the first
+draw's `pushConsts.position`, on top of the others. The vertex stage is reading
+row zero for every vertex.
+
+Which explains why this has never been seen: the merge key compares
+`descriptors`, so a batch's draws have always shared their vertex-stage
+bindings. The fragment stage's per-draw row is used constantly -- it is what
+"the bindings the key stopped comparing" refers to -- but **the vertex stage's
+equivalent has no user today**, and push constants would be its first.
+
+So the fix is in the generated code rather than in the front end: the vertex
+shader resolves its constant-buffer base once instead of once per vertex, which
+`emit_const_buf_base()` and the grid-stride loop in `emit_function_body()` are
+where to look. The front-end change is a one-line deletion waiting on it, and
+it is worth `multithreading` at 4.90x and `pushconstants` at 3.26x -- between
+them, most of the remaining sweep gap.
