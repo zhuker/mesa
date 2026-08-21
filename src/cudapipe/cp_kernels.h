@@ -74,6 +74,7 @@ struct cp_kernels {
    /* Relocatable PTX for the texture sampler, linked into each shader that
     * samples textures. Owned here; see cp_compile_nir_to_ptx(). */
    char *sampler_ptx;
+   char *sampler_3d_ptx;
    char *fs_helper_ptx;
 
    bool initialized;
@@ -89,7 +90,9 @@ bool cp_kernels_instrumented(void);
 bool cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor);
 void cp_kernels_destroy(struct cp_kernels *k);
 
+char *cp_compile_sampler_3d(int sm_major, int sm_minor);
 char *cp_compile_sampler_variant(int sm_major, int sm_minor,
-                                 const struct cp_sampler_info *info);
+                                 const struct cp_sampler_info *info,
+                                 bool enable_3d);
 
 #endif

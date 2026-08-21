@@ -432,6 +432,7 @@ enum cp_color_encoding {
    CP_COLOR_R16_SFLOAT,
    CP_COLOR_R16G16_SFLOAT,
    CP_COLOR_R8_UNORM,
+   CP_COLOR_R8G8_UNORM,
 };
 
 /*

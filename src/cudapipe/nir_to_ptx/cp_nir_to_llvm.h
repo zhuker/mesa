@@ -122,6 +122,7 @@ struct cp_shader_binary {
     * links nothing. */
    const char *sampler_ptx;
    const char *fs_helper_ptx;
+   bool uses_tex_3d;
 
    /* Whether the shader reads gl_VertexIndex. Only then does a non-indexed
     * draw have to materialise the vertex id array the shader reads from. */

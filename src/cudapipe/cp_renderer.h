@@ -121,7 +121,21 @@ struct cp_host_map {
 };
 #define CP_MAX_HOST_MAPS 1024
 
+struct cp_abuf_dbg_state {
+   CUdeviceptr blk_offsets, blk_counts, quad_prim, peel_mask, counters;
+   /*
+    * Step 3b: where the peel path deposits its shaded colours. One slot per
+    * (pixel, primitive) — the A-buffer's own indexing — so the two paths can
+    * be compared without either of them agreeing on an order.
+    */
+   CUdeviceptr frags, offsets, counts, colors, writes;
+   uint32_t capacity;
+};
+
+
 struct cp_context {
+
+   struct cp_abuf_dbg_state abuf_dbg;
 
    /* The device, not the screen: four fields the pipeline reads, and no
     * pipe_screen behind them. A Vulkan front end supplies one directly. */
@@ -796,6 +810,7 @@ bool cp_abuf_batch_enabled(void);
 bool cp_abuf_enabled(void);
 void cp_abuf_mark(CUevent ev, CUstream stream);
 void cp_abuf_report(void);
+void cp_abuf_cleanup(void);
 void cp_abuf_scan(struct cp_context *cp, struct cp_device *screen, struct cp_abuf *ab, unsigned n);
 void cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen, CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x, CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3, unsigned n, unsigned nb1, unsigned nb2, unsigned nb3, CUdeviceptr clamp_counts, uint32_t clamp_capacity, CUdeviceptr clamp_overflow);
 bool cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h);
@@ -829,17 +844,6 @@ bool cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info, struc
  * every draw once the verification budget is spent, so the instrumented
  * interpolator is not carried by frames that are only being timed.
  */
-struct cp_abuf_dbg_state {
-   CUdeviceptr blk_offsets, blk_counts, quad_prim, peel_mask, counters;
-   /*
-    * Step 3b: where the peel path deposits its shaded colours. One slot per
-    * (pixel, primitive) — the A-buffer's own indexing — so the two paths can
-    * be compared without either of them agreeing on an order.
-    */
-   CUdeviceptr frags, offsets, counts, colors, writes;
-   uint32_t capacity;
-};
-extern struct cp_abuf_dbg_state cp_abuf_dbg;
 
 
 void cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info, unsigned drawid_offset, const struct cp_draw_range *draws, unsigned num_draws, unsigned batch_draws, const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table, const uint32_t *draw_ids, const uint32_t *instance_counts, const uint64_t *vb_table, const struct cp_rect *scissors);
@@ -872,6 +876,7 @@ bool cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
                    unsigned pixel_size, const uint32_t value[4], bool depth);
 
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
+void cp_context_cleanup(struct cp_context *cp);
 
 /*
  * A backstop, not a budget. The arena accumulates across the draws of a frame

@@ -882,6 +882,7 @@ cp_bytes_per_pixel(uint32_t encoding)
    case CP_COLOR_R16G16B16A16_FLOAT: return 8;
    case CP_COLOR_R16G16_SFLOAT:      return 4;
    case CP_COLOR_R16_SFLOAT:         return 2;
+   case CP_COLOR_R8G8_UNORM:         return 2;
    case CP_COLOR_R8_UNORM:           return 1;
    default:                          return 4;
    }
@@ -932,6 +933,13 @@ cp_load_dst(const void *ptr, uint32_t encoding, float *out)
    case CP_COLOR_R8_UNORM: {
       out[0] = cp_unorm8_to_float(*(const uint8_t *)ptr);
       out[1] = 0.0f; out[2] = 0.0f; out[3] = 1.0f;
+      break;
+   }
+   case CP_COLOR_R8G8_UNORM: {
+      const uint8_t *v = (const uint8_t *)ptr;
+      out[0] = cp_unorm8_to_float(v[0]);
+      out[1] = cp_unorm8_to_float(v[1]);
+      out[2] = 0.0f; out[3] = 1.0f;
       break;
    }
    default: {
@@ -1018,6 +1026,12 @@ cp_store_dst(void *ptr, uint32_t encoding, const float *c)
    }
    case CP_COLOR_R8_UNORM: {
       *(uint8_t *)ptr = (uint8_t)cp_float_to_unorm8(c[0]);
+      break;
+   }
+   case CP_COLOR_R8G8_UNORM: {
+      uint8_t *v = (uint8_t *)ptr;
+      v[0] = (uint8_t)cp_float_to_unorm8(c[0]);
+      v[1] = (uint8_t)cp_float_to_unorm8(c[1]);
       break;
    }
    default: {

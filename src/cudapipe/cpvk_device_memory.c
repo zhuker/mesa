@@ -116,6 +116,25 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    return VK_SUCCESS;
 }
 
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+cpvk_GetDeviceProcAddr(VkDevice device, const char *name)
+{
+   /* GFXReconstruct normalizes the KHR descriptor-template commands to their
+    * promoted core names, but creates an application-less Vulkan 1.0 instance
+    * and does not enable KHR_descriptor_update_template on the replay device.
+    * Mesa's common lookup therefore returns NULL and GFXReconstruct calls
+    * through it.  Bridge just this promoted trio unconditionally.  This is a
+    * deliberate compatibility exception to normal version/extension gating;
+    * gating it was tested and made both supported captures crash at startup. */
+   if (!strcmp(name, "vkCreateDescriptorUpdateTemplate"))
+      return (PFN_vkVoidFunction)cpvk_CreateDescriptorUpdateTemplateKHR;
+   if (!strcmp(name, "vkDestroyDescriptorUpdateTemplate"))
+      return (PFN_vkVoidFunction)cpvk_DestroyDescriptorUpdateTemplateKHR;
+   if (!strcmp(name, "vkUpdateDescriptorSetWithTemplate"))
+      return (PFN_vkVoidFunction)cpvk_UpdateDescriptorSetWithTemplateKHR;
+   return vk_common_GetDeviceProcAddr(device, name);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
                   const VkDeviceCreateInfo *pCreateInfo,
@@ -130,9 +149,16 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (!dev)
       return vk_error(pdev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   struct vk_device_dispatch_table dispatch_table;
+   bool kernels_initialized = false;
+   bool renderer_initialized = false;
+   bool shader_lock_initialized = false;
+
+   struct vk_device_dispatch_table dispatch_table = { 0 };
+   /* Core and promoted KHR aliases compact to the same dispatch slot. The
+    * non-overwrite path coalesces them; the strict path asserts when a driver
+    * implements both names. */
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
-                                             &cpvk_device_entrypoints, true);
+                                             &cpvk_device_entrypoints, false);
    vk_device_dispatch_table_from_entrypoints(
       &dispatch_table, &vk_common_device_entrypoints, false);
 
@@ -170,6 +196,7 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_stream;
    }
+   kernels_initialized = true;
    /* Zeroed data, and a descriptor page whose every descriptor's base points
     * at it. Only the base fields are pointers; everything a shader reads as a
     * number reads as zero, so a loop bounded by one terminates. */
@@ -185,11 +212,13 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    simple_mtx_init(&dev->shader_cache_lock, mtx_plain);
+   shader_lock_initialized = true;
 
    if (!cp_context_init(&dev->renderer, &dev->cp_dev)) {
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_stream;
    }
+   renderer_initialized = true;
 
    result = vk_queue_init(&dev->queue, &dev->vk,
                           &pCreateInfo->pQueueCreateInfos[0], 0);
@@ -201,6 +230,17 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    return VK_SUCCESS;
 
 fail_stream:
+   if (renderer_initialized)
+      cp_context_cleanup(&dev->renderer);
+   if (shader_lock_initialized)
+      simple_mtx_destroy(&dev->shader_cache_lock);
+   if (kernels_initialized)
+      cp_kernels_destroy(&dev->cp_dev.kernels);
+   if (dev->null_desc)
+      cuMemFree(dev->null_desc);
+   if (dev->null_data)
+      cuMemFree(dev->null_data);
+   free(dev->prev_draw);
    cuStreamDestroy(dev->stream);
 fail_ctx:
    cuCtxDestroy(dev->cu_ctx);
@@ -220,6 +260,21 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       return;
 
    vk_queue_finish(&dev->queue);
+
+   cuCtxSetCurrent(dev->cu_ctx);
+   cuCtxSynchronize();
+   cp_context_cleanup(&dev->renderer);
+   for (unsigned i = 0; i < dev->num_shaders; i++)
+      cp_shader_binary_destroy(dev->shader_cache[i].bin);
+   free(dev->shader_cache);
+   cp_kernels_destroy(&dev->cp_dev.kernels);
+   if (dev->null_desc)
+      cuMemFree(dev->null_desc);
+   if (dev->null_data)
+      cuMemFree(dev->null_data);
+   free(dev->prev_draw);
+   simple_mtx_destroy(&dev->shader_cache_lock);
+
    cuStreamDestroy(dev->stream);
    cuCtxDestroy(dev->cu_ctx);
 

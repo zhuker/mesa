@@ -17,13 +17,12 @@
  * every draw once the verification budget is spent, so the instrumented
  * interpolator is not carried by frames that are only being timed.
  */
-struct cp_abuf_dbg_state cp_abuf_dbg;
-
 #include "nir_to_ptx/cp_nir_to_llvm.h"
 
 #include <inttypes.h>
 
 #include "util/u_memory.h"
+#include "util/simple_mtx.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -341,16 +340,10 @@ cp_scratch_begin(struct cp_context *cp)
 
 /*
  * Triangles a blended batch must have before the A-buffer's fixed cost is
- * worth paying.
- *
- * 256 is measured, not chosen: on the two captures the whole benefit of
- * peeling small batches is already there at 256, and the samples are
- * unaffected -- particlesystem is 5.55 ms against 5.56, vulkanscene 4.51
- * against 4.52, bloom 7.46 against 7.44. Above about 4096 particlesystem
- * starts peeling batches that should not, and by 16384 it costs six times
- * what it should.
- *
- * CPVK_ABUF_MIN_TRIS=0 disables the test, which is the behaviour before it.
+ * worth paying.  The default is zero: after the bootstrap scan was fixed,
+ * Crossroads measured 10.9 ms at zero versus 33.0 ms at 256, while repeated
+ * 600-frame sample runs were unchanged within noise.  Keep the override for
+ * controlled threshold experiments.
  */
 static unsigned
 cp_abuf_min_tris(void)
@@ -358,7 +351,7 @@ cp_abuf_min_tris(void)
    static int v = -1;
    if (v < 0) {
       const char *s = getenv("CPVK_ABUF_MIN_TRIS");
-      v = s ? atoi(s) : 256;
+      v = s ? atoi(s) : 0;
       if (v < 0)
          v = 0;
    }
@@ -417,6 +410,43 @@ cp_scratch_destroy(struct cp_context *cp)
    if (cp->dscratch.base)
       cuMemFree(cp->dscratch.base);
    memset(&cp->dscratch, 0, sizeof(cp->dscratch));
+}
+
+void
+cp_context_cleanup(struct cp_context *cp)
+{
+   if (!cp || !cp->screen)
+      return;
+
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   cuCtxSynchronize();
+   cp_abuf_cleanup();
+   cp_scratch_destroy(cp);
+
+   for (unsigned i = 0; i < cp->timer.cap; i++)
+      if (cp->timer.events && cp->timer.events[i])
+         cuEventDestroy(cp->timer.events[i]);
+   free(cp->timer.events);
+   free(cp->timer.stages);
+
+   for (unsigned i = 0; i < CP_FLUSH_GENS; i++)
+      if (cp->flush_retire[i])
+         cuEventDestroy(cp->flush_retire[i]);
+   for (unsigned i = 0; i < CP_PASS_STREAMS; i++) {
+      if (cp->seg_ev[i])
+         cuEventDestroy(cp->seg_ev[i]);
+      if (cp->seg_streams[i])
+         cuStreamDestroy(cp->seg_streams[i]);
+   }
+   if (cp->pass_gate)
+      cuEventDestroy(cp->pass_gate);
+   if (cp->stream)
+      cuStreamDestroy(cp->stream);
+   if (cp->upload_host)
+      cuMemFreeHost(cp->upload_host);
+
+   free(cp->pass_segs);
+   free(cp->pass_group_ubos);
 }
 
 /* Per-stage timing for a draw, printed under CUDAPIPE_DEBUG_TIME. See
@@ -642,6 +672,8 @@ cp_census_dump(const char *what, unsigned draw_seq, unsigned peel_seq,
 
 
 struct cp_abuf cp_abuf = { .enabled = -1 };
+static simple_mtx_t cp_abuf_mutex = SIMPLE_MTX_INITIALIZER;
+static CUcontext cp_abuf_owner;
 
 /*
  * Record an A-buffer stage boundary, but only when someone is going to read
@@ -663,6 +695,18 @@ cp_abuf_mark(CUevent ev, CUstream stream)
 bool
 cp_abuf_enabled(void)
 {
+   CUcontext current = NULL;
+   if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || !current)
+      return false;
+
+   simple_mtx_lock(&cp_abuf_mutex);
+   if (cp_abuf_owner && cp_abuf_owner != current) {
+      simple_mtx_unlock(&cp_abuf_mutex);
+      return false;
+   }
+   if (!cp_abuf_owner)
+      cp_abuf_owner = current;
+
    if (cp_abuf.enabled < 0) {
       /* On by default, off with CUDAPIPE_NO_ABUFFER=1 — the same shape as
        * CUDAPIPE_NO_BATCH and CUDAPIPE_NO_BINCACHE. CUDAPIPE_ABUFFER=1 still
@@ -695,7 +739,9 @@ cp_abuf_enabled(void)
       cp_abuf.debug = cp_debug->abuffer_debug;
       cp_abuf.max_layers = cp_debug->abuffer_layers;
    }
-   return cp_abuf.enabled == 1;
+   bool enabled = cp_abuf.enabled == 1;
+   simple_mtx_unlock(&cp_abuf_mutex);
+   return enabled;
 }
 
 /*
@@ -768,6 +814,8 @@ cp_abuf_alloc(struct cp_abuf *ab, CUdeviceptr *p, size_t bytes,
 bool
 cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
 {
+   if (!cp_abuf_enabled())
+      return false;
    if (ab->disabled)
       return false;
    if (ab->ready && ab->w == w && ab->h == h)
@@ -981,6 +1029,64 @@ cp_abuf_report(void)
            "of %u (%.1f%%), %u growth%s\n", ab->peak, ab->capacity,
            ab->capacity ? 100.0 * ab->peak / ab->capacity : 0.0,
            ab->growths, ab->growths == 1 ? "" : "s");
+}
+
+void
+cp_abuf_cleanup(void)
+{
+   CUcontext current = NULL;
+   if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || !current)
+      return;
+
+   simple_mtx_lock(&cp_abuf_mutex);
+   if (cp_abuf_owner != current) {
+      simple_mtx_unlock(&cp_abuf_mutex);
+      return;
+   }
+
+   struct cp_abuf *ab = &cp_abuf;
+   cp_abuf_report();
+
+   CUdeviceptr *device_allocs[] = {
+      &ab->counts, &ab->offsets, &ab->cursor,
+      &ab->sum1, &ab->sum1x, &ab->sum2, &ab->sum2x,
+      &ab->list, &ab->list_count, &ab->clist, &ab->counters,
+      &ab->blk_counts, &ab->blk_offsets, &ab->blk_list,
+      &ab->blk_list_count, &ab->bsum1, &ab->bsum1x,
+      &ab->bsum2, &ab->bsum2x, &ab->dbg,
+      &ab->frags, &ab->recs, &ab->quad_prim, &ab->quad_mask,
+      &ab->quad_block, &ab->shade_slot, &ab->peel_mask,
+      &ab->log, &ab->deep_list, &ab->deep_log,
+      &ab->colors_abuf, &ab->writes_abuf,
+      &ab->colors_peel, &ab->writes_peel,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(device_allocs); i++)
+      cp_abuf_free(device_allocs[i]);
+   for (unsigned i = 0; i < ARRAY_SIZE(ab->ev); i++)
+      if (ab->ev[i])
+         cuEventDestroy(ab->ev[i]);
+
+   free(ab->h_counts);
+   free(ab->h_offsets);
+   free(ab->h_cursor);
+   free(ab->h_frags);
+   free(ab->h_log);
+   free(ab->h_deep_log);
+   free(ab->h_deep_list);
+   free(ab->h_blk_counts);
+   free(ab->h_blk_offsets);
+   free(ab->h_quad_prim);
+   free(ab->h_quad_mask);
+   free(ab->h_peel_mask);
+   free(ab->h_colors_abuf);
+   free(ab->h_colors_peel);
+   free(ab->h_writes_abuf);
+   free(ab->h_writes_peel);
+
+   memset(ab, 0, sizeof(*ab));
+   ab->enabled = -1;
+   cp_abuf_owner = NULL;
+   simple_mtx_unlock(&cp_abuf_mutex);
 }
 
 /*
@@ -1208,9 +1314,14 @@ void
 cp_abuf_scan(struct cp_context *cp, struct cp_device *screen,
              struct cp_abuf *ab, unsigned n)
 {
+   /* The bootstrap count runs before the fragment array exists.  Preserve its
+    * counts and offsets so that, after sizing the array from the total, the
+    * fill can consume the same scan.  A zero capacity would clamp every run
+    * to zero and make the first eligible draw fall back forever. */
+   unsigned capacity = ab->frags ? ab->capacity : ~0u;
    cp_abuf_scan_n(cp, screen, ab->counts, ab->offsets, ab->sum1, ab->sum1x,
                   ab->sum2, ab->sum2x, ab->sum3, n, ab->nb1, ab->nb2, ab->nb3,
-                  ab->counts, ab->capacity, ab->overflow);
+                  ab->counts, capacity, ab->overflow);
 }
 
 
@@ -2085,8 +2196,9 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
        fs->num_sampler_variants < CP_MAX_SAMPLER_VARIANTS &&
        (!fs->tune_cap || fs->tune_done)) {
       char *sampler_ptx = cp_compile_sampler_variant(cp->screen->sm_major,
-                                                cp->screen->sm_minor,
-                                                     resolved_samplers);
+                                                     cp->screen->sm_minor,
+                                                     resolved_samplers,
+                                                     fs->uses_tex_3d);
       if (sampler_ptx) {
          cp_shader_build_sampler_variant(fs, sampler_ptx, resolved_samplers,
                                          fs->num_tex_descs);
@@ -2366,12 +2478,12 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
       .quad_width = (w + 1) / 2,
       .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
       .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
-      /* TEMPORARY: see cp_abuf_dbg above. */
-      .dbg_blk_offsets = cp_abuf_dbg.blk_offsets,
-      .dbg_blk_counts = cp_abuf_dbg.blk_counts,
-      .dbg_quad_prim = cp_abuf_dbg.quad_prim,
-      .dbg_peel_mask = cp_abuf_dbg.peel_mask,
-      .dbg_counters = cp_abuf_dbg.counters,
+      /* TEMPORARY: see cp->abuf_dbg above. */
+      .dbg_blk_offsets = cp->abuf_dbg.blk_offsets,
+      .dbg_blk_counts = cp->abuf_dbg.blk_counts,
+      .dbg_quad_prim = cp->abuf_dbg.quad_prim,
+      .dbg_peel_mask = cp->abuf_dbg.peel_mask,
+      .dbg_counters = cp->abuf_dbg.counters,
       .seg_ranges = seg_ranges,
       .num_seg_ranges = num_seg_ranges,
    };
@@ -2404,13 +2516,13 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
     * is not being verified.
     */
    CUdeviceptr dbg_slot = 0;
-   if (cp_abuf_dbg.colors) {
+   if (cp->abuf_dbg.colors) {
       dbg_slot = cp_scratch_alloc_device(cp, (size_t)max_pixels * 4);
       if (dbg_slot) {
          interp.dbg_slot = dbg_slot;
-         interp.abuf_frags = cp_abuf_dbg.frags;
-         interp.abuf_offsets = cp_abuf_dbg.offsets;
-         interp.abuf_counts = cp_abuf_dbg.counts;
+         interp.abuf_frags = cp->abuf_dbg.frags;
+         interp.abuf_offsets = cp->abuf_dbg.offsets;
+         interp.abuf_counts = cp->abuf_dbg.counts;
       }
    }
 
@@ -2447,8 +2559,8 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
     * A-buffer slots the interpolation just resolved. */
    if (dbg_slot && screen->kernels.abuf_scatter_colors) {
       void *p[] = { &fs_out, &fs_out_stride, &dbg_slot, &counter, &num_pixels,
-                    &cp_abuf_dbg.capacity, &cp_abuf_dbg.colors,
-                    &cp_abuf_dbg.writes, &cp_abuf_dbg.counters };
+                    &cp->abuf_dbg.capacity, &cp->abuf_dbg.colors,
+                    &cp->abuf_dbg.writes, &cp->abuf_dbg.counters };
       CP_LAUNCH(screen->kernels.abuf_scatter_colors,
                      (num_pixels + 255) / 256, 1, 1, 256, 1, 1,
                      0, cp->stream, p, NULL);
@@ -3319,7 +3431,6 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
 
    CUdeviceptr packed_positions = 0;
    CUdeviceptr vs_output_buf = 0;
-   bool vs_ran = false;
 
    /* If no VS will run, pack positions from VB directly (passthrough).
     * When a VS is present, skip this — VS output provides positions. */
@@ -3767,7 +3878,6 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
             0, cp->stream, vs_params, NULL);
 
          if (vs_err == CUDA_SUCCESS) {
-            vs_ran = true;
             /* The rasterizer reads positions directly from VS output */
             rast_args.positions = vs_output_buf;
             rast_args.num_varyings = num_vs_outputs - 1;
@@ -3807,15 +3917,15 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
 
                if (clipped && clip_count) {
                   /*
-                   * A batch of blended draws is composited in primitive
-                   * order, so its primitives have to *be* in submission order
-                   * — which compaction by atomicAdd does not promise. Stable
-                   * mode gives every input triangle a fixed slot range and
-                   * retires the ones it does not fill, so the count is the
-                   * whole array and the rasterizer skips the holes on their
-                   * zero area. Only for a batch: a single draw keeps the
-                   * compacting path, so CUDAPIPE_BATCH_MAX=1 stays
-                   * bit-identical to a build without any of this.
+                   * A blended draw is composited in primitive order, so its
+                   * primitives have to *be* in submission order — which
+                   * compaction by atomicAdd does not promise. This applies to
+                   * one draw too: the older GFXR capture draws each text label
+                   * as black outline primitives followed by coloured fill
+                   * primitives, and compaction randomly put the outline on top.
+                   * Stable mode gives every input triangle a fixed slot range
+                   * and retires the ones it does not fill, so the rasterizer
+                   * skips holes without changing primitive order.
                    *
                    * An opaque batch whose fragment shader reads a constant
                    * buffer needs it too: the primitive index has to name the
@@ -3825,9 +3935,9 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                    * rasterizes the whole 4x slot array, holes and all, and
                    * multithreading paid 72% for ordering nothing consumes.
                    */
-                  bool stable_clip = batch_draws > 1 &&
-                     (cp->blend_enabled ||
-                      (cp->fs_shader && cp->fs_shader->reads_const_bufs));
+                  bool stable_clip = cp->blend_enabled ||
+                     (batch_draws > 1 && cp->fs_shader &&
+                      cp->fs_shader->reads_const_bufs);
 
                   if (getenv("CPVK_DEBUG_CLIP"))
                      fprintf(stderr, "clip: tris=%u batch_draws=%u stable=%d "
@@ -4536,13 +4646,17 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
          const uint32_t *q = &ctr[3];
          abuf_covered = ctr[5];
          abuf_quads = q[0];
-         abuf_prod = q[0] != 0 && q[1] == 0 && c3[1] == 0;
+         /* An empty draw is a successful no-op, not a reason to rerun the
+          * peel loop.  A nonempty fragment list with no quads still indicates
+          * a broken/incomplete merge and must fall back. */
+         abuf_prod = q[1] == 0 && c3[1] == 0 && (q[0] != 0 || c3[0] == 0);
          if (!abuf_prod) {
             static int said_prod = 0;
             if (!said_prod++)
-               fprintf(stderr, "abuffer: quads=%u quad-overflow=%u "
-                       "fragment-overflow=%u — this draw falls back to the "
-                       "peel loop\n", q[0], q[1], c3[1]);
+               fprintf(stderr, "abuffer: fragments=%u/%u quads=%u/%u "
+                       "quad-overflow=%u fragment-overflow=%u — this draw "
+                       "falls back to the peel loop\n", c3[0], ab->capacity,
+                       q[0], ab->quad_capacity, q[1], c3[1]);
          }
 
          /*
@@ -4567,11 +4681,11 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
        * verification to do: a frame that is only being timed must not carry
        * the instrumented interpolator. */
       if (cp_abuf.verify && ab->verified < cp_abuf.verify_max) {
-         cp_abuf_dbg.blk_offsets = ab->blk_offsets;
-         cp_abuf_dbg.blk_counts = ab->blk_counts;
-         cp_abuf_dbg.quad_prim = ab->quad_prim;
-         cp_abuf_dbg.peel_mask = ab->peel_mask;
-         cp_abuf_dbg.counters = ab->dbg;
+         cp->abuf_dbg.blk_offsets = ab->blk_offsets;
+         cp->abuf_dbg.blk_counts = ab->blk_counts;
+         cp->abuf_dbg.quad_prim = ab->quad_prim;
+         cp->abuf_dbg.peel_mask = ab->peel_mask;
+         cp->abuf_dbg.counters = ab->dbg;
 
          /* Step 3b: and where to deposit each pass's shaded colours. The
           * write counts start at zero every draw; the colours themselves need
@@ -4579,12 +4693,12 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
          if (ab->colors_ready) {
             cuMemsetD32Async(ab->writes_peel, 0, ab->capacity, cp->stream);
             cuMemsetD32Async(ab->writes_abuf, 0, ab->capacity, cp->stream);
-            cp_abuf_dbg.frags = ab->frags;
-            cp_abuf_dbg.offsets = ab->offsets;
-            cp_abuf_dbg.counts = ab->counts;
-            cp_abuf_dbg.colors = ab->colors_peel;
-            cp_abuf_dbg.writes = ab->writes_peel;
-            cp_abuf_dbg.capacity = ab->capacity;
+            cp->abuf_dbg.frags = ab->frags;
+            cp->abuf_dbg.offsets = ab->offsets;
+            cp->abuf_dbg.counts = ab->counts;
+            cp->abuf_dbg.colors = ab->colors_peel;
+            cp->abuf_dbg.writes = ab->writes_peel;
+            cp->abuf_dbg.capacity = ab->capacity;
          }
       }
    }
@@ -4811,7 +4925,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                                 vs_output_buf, w, h, vp_scale_x, vp_scale_y,
                                 vp_trans_x, vp_trans_y, qcounters[0],
                                 abuf_covered,
-                                ab->colors_ready && cp_abuf_dbg.colors,
+                                ab->colors_ready && cp->abuf_dbg.colors,
                                 color_data, abuf_prod,
                                 &t_qinterp, &t_qshade, &t_composite, NULL);
          /*
@@ -4861,7 +4975,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
 
       /* Nothing downstream may see the debug pointers; the next draw's
        * interpolation must be the ordinary one. */
-      memset(&cp_abuf_dbg, 0, sizeof(cp_abuf_dbg));
+      memset(&cp->abuf_dbg, 0, sizeof(cp->abuf_dbg));
 
       if (abuf_log && ab->verified < cp_abuf.verify_max) {
          size_t n = (size_t)w * h;

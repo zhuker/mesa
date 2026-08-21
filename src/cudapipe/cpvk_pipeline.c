@@ -12,6 +12,7 @@
 #include "vk_format.h"
 #include "util/blend.h"
 #include "util/format/u_format.h"
+#include "util/mesa-blake3.h"
 #include "cpvk_private.h"
 
 #include "vk_alloc.h"
@@ -117,6 +118,90 @@ cpvk_scalarize_filter(const nir_instr *instr, const void *data)
    }
 }
 
+static bool
+cpvk_cf_has_loop(struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop)
+         return true;
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (cpvk_cf_has_loop(&nif->then_list) ||
+             cpvk_cf_has_loop(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+cpvk_nir_has_loop(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      if (cpvk_cf_has_loop(&impl->body))
+         return true;
+   }
+   return false;
+}
+
+static void
+cpvk_optimize_nir(nir_shader *nir)
+{
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, nir_lower_flrp, 16 | 32 | 64, true);
+      NIR_PASS(progress, nir, nir_split_array_vars, nir_var_function_temp);
+      NIR_PASS(progress, nir, nir_shrink_vec_array_vars, nir_var_function_temp);
+      NIR_PASS(progress, nir, nir_opt_deref);
+      NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(progress, nir, nir_opt_memcpy);
+      NIR_PASS(progress, nir, nir_opt_copy_prop_vars);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      nir_opt_peephole_select_options ps = {
+         .limit = 8, .indirect_load_ok = true, .expensive_alu_ok = true,
+      };
+      NIR_PASS(progress, nir, nir_opt_peephole_select, &ps);
+      NIR_PASS(progress, nir, nir_opt_algebraic);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_remove_phis);
+      bool loop = false;
+      NIR_PASS(loop, nir, nir_opt_loop);
+      progress |= loop;
+      if (loop) {
+         NIR_PASS(progress, nir, nir_opt_copy_prop);
+         NIR_PASS(progress, nir, nir_opt_dce);
+         NIR_PASS(progress, nir, nir_opt_remove_phis);
+      }
+      NIR_PASS(progress, nir, nir_opt_if,
+               nir_opt_if_optimize_phi_true_false);
+      NIR_PASS(progress, nir, nir_opt_dead_cf);
+      nir_opt_peephole_select_options discard = {
+         .limit = 0, .discard_ok = true,
+      };
+      NIR_PASS(progress, nir, nir_opt_peephole_select, &discard);
+      NIR_PASS(progress, nir, nir_opt_remove_phis);
+      NIR_PASS(progress, nir, nir_opt_cse);
+      NIR_PASS(progress, nir, nir_opt_undef);
+      NIR_PASS(progress, nir, nir_opt_deref);
+      const char *which = getenv("CPVK_SCALARIZE");
+      if (!which)
+         NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
+      else
+         NIR_PASS(progress, nir, nir_lower_alu_to_scalar,
+                  cpvk_scalarize_filter, (void *)which);
+      NIR_PASS(progress, nir, nir_opt_loop_unroll);
+   } while (progress);
+
+   NIR_PASS(_, nir, nir_opt_algebraic_late);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
+   NIR_PASS(_, nir, nir_opt_dce);
+   nir_sweep(nir);
+}
+
 static void
 cpvk_lower_nir(nir_shader *nir)
 {
@@ -135,6 +220,16 @@ cpvk_lower_nir(nir_shader *nir)
     * that no phi exists yet and aborts seven samples if run after one does.
     */
    NIR_PASS(_, nir, nir_lower_reg_intrinsics_to_ssa);
+
+   /* Use the same fixed-point optimization sequence that prepares lavapipe's
+    * loop NIR before it reaches this backend.  Unoptimized structured loops
+    * made pbribl's irradiance shader take 33 seconds instead of 26 ms.  Keep
+    * straight-line shaders on their established path: running the loop
+    * optimizer over them regressed negativeviewportheight by 32%.  Native
+    * descriptor handles are lowered below, so lavapipe's indirect-texture
+    * fixup does not apply. */
+   if (cpvk_nir_has_loop(nir))
+      cpvk_optimize_nir(nir);
 
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
@@ -586,6 +681,71 @@ cpvk_DestroyPipeline(VkDevice _device, VkPipeline _pipeline,
       cpvk_pipeline_destroy(dev, pipeline, pAllocator);
 }
 
+static bool
+cpvk_nir_uses_tex(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+cpvk_nir_uses_tex_3d(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (tex->sampler_dim == GLSL_SAMPLER_DIM_3D &&
+                (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
+                 tex->op == nir_texop_txb))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static const char *
+cpvk_sampler_ptx(struct cpvk_device *dev, bool enable_3d)
+{
+   struct cp_kernels *kernels = &dev->cp_dev.kernels;
+   if (!enable_3d)
+      return kernels->sampler_ptx;
+
+   /* The z-filtering entry point nearly doubles the sampler module and costs
+    * about two seconds of NVRTC/JIT work. Compile it only for a pipeline that
+    * actually contains a 3D texture instruction, rather than charging every
+    * Vulkan process at device creation. */
+   simple_mtx_lock(&dev->shader_cache_lock);
+   const char *ptx = kernels->sampler_3d_ptx;
+   simple_mtx_unlock(&dev->shader_cache_lock);
+   if (ptx)
+      return ptx;
+
+   /* NVRTC is slow; do not serialize unrelated pipeline-cache operations
+    * behind it. Two racing first users may compile the same source, but only
+    * one result is retained. */
+   char *compiled = cp_compile_sampler_3d(dev->pdev->sm_major,
+                                          dev->pdev->sm_minor);
+   simple_mtx_lock(&dev->shader_cache_lock);
+   if (!kernels->sampler_3d_ptx)
+      kernels->sampler_3d_ptx = compiled;
+   else
+      free(compiled);
+   ptx = kernels->sampler_3d_ptx;
+   simple_mtx_unlock(&dev->shader_cache_lock);
+   return ptx;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
                             uint32_t count,
@@ -631,9 +791,15 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       pipeline->local_size[1] = nir->info.workgroup_size[1];
       pipeline->local_size[2] = nir->info.workgroup_size[2];
 
+      bool uses_tex = cpvk_nir_uses_tex(nir);
+      bool uses_tex_3d = cpvk_nir_uses_tex_3d(nir);
+      const char *sampler_ptx = cpvk_sampler_ptx(dev, uses_tex_3d);
       cuCtxSetCurrent(dev->cu_ctx);
-      pipeline->bin = cp_compile_nir_to_ptx(nir, dev->pdev->sm_major,
-                                            dev->pdev->sm_minor, NULL, NULL);
+      pipeline->bin = cp_compile_nir_to_ptx(
+         nir, dev->pdev->sm_major, dev->pdev->sm_minor,
+         uses_tex ? sampler_ptx : NULL, NULL);
+      if (pipeline->bin)
+         pipeline->bin->uses_tex_3d = uses_tex_3d;
       ralloc_free(mem_ctx);
 
       if (!pipeline->bin || !pipeline->bin->kernel) {
@@ -740,25 +906,6 @@ cpvk_compile_stage(struct cpvk_device *dev,
    unsigned char hash[BLAKE3_OUT_LEN];
    vk_pipeline_hash_shader_stage(flags, stage, &rstate, hash);
 
-   /* The layout decides which slot each set lands in, so a shader compiled
-    * against one layout cannot be reused for another. */
-   if (layout) {
-      unsigned n = MIN2(layout->vk.set_count, BLAKE3_OUT_LEN / 2);
-      for (unsigned i = 0; i < n; i++)
-         hash[i] ^= (unsigned char)(layout->set_slot[i] + 1);
-   }
-
-   simple_mtx_lock(&dev->shader_cache_lock);
-   for (unsigned i = 0; i < dev->num_shaders; i++) {
-      if (!memcmp(dev->shader_cache[i].hash, hash, sizeof(hash))) {
-         struct cp_shader_binary *bin = dev->shader_cache[i].bin;
-         simple_mtx_unlock(&dev->shader_cache_lock);
-         *result = VK_SUCCESS;
-         return bin;
-      }
-   }
-   simple_mtx_unlock(&dev->shader_cache_lock);
-
    void *mem_ctx = ralloc_context(NULL);
    nir_shader *nir = NULL;
    *result = vk_pipeline_shader_stage_to_nir(&dev->vk, flags, stage,
@@ -768,6 +915,56 @@ cpvk_compile_stage(struct cpvk_device *dev,
       ralloc_free(mem_ctx);
       return NULL;
    }
+
+   /* Descriptor lowering bakes the constant-buffer slot and flat descriptor
+    * offset of every resource the shader uses into NIR.  Include exactly those
+    * mappings in the cache key.  Hashing only set slots reused a sky shader
+    * compiled with binding 1 at flat offset 0 where it was at offset 1; hashing
+    * whole layouts fixed that but made pbribl compile the same shader for many
+    * layouts that differed only in unused bindings. */
+   if (layout) {
+      bool used[MESA_VK_MAX_DESCRIPTOR_SETS][CPVK_MAX_BINDINGS] = {{ false }};
+      nir_foreach_variable_with_modes(var, nir,
+                                      nir_var_uniform | nir_var_mem_ubo |
+                                      nir_var_mem_ssbo | nir_var_image) {
+         if (var->data.descriptor_set < MESA_VK_MAX_DESCRIPTOR_SETS &&
+             var->data.binding < CPVK_MAX_BINDINGS)
+            used[var->data.descriptor_set][var->data.binding] = true;
+      }
+
+      struct mesa_blake3 ctx;
+      _mesa_blake3_init(&ctx);
+      _mesa_blake3_update(&ctx, hash, sizeof(hash));
+      for (unsigned s = 0; s < layout->vk.set_count; s++) {
+         const struct cpvk_descriptor_set_layout *sl =
+            (const struct cpvk_descriptor_set_layout *)
+            layout->vk.set_layouts[s];
+         for (unsigned b = 0; b < CPVK_MAX_BINDINGS; b++) {
+            if (!used[s][b])
+               continue;
+            unsigned flat = sl && b < sl->num_bindings
+               ? sl->bindings[b].flat : b;
+            _mesa_blake3_update(&ctx, &s, sizeof(s));
+            _mesa_blake3_update(&ctx, &b, sizeof(b));
+            _mesa_blake3_update(&ctx, &layout->set_slot[s],
+                                sizeof(layout->set_slot[s]));
+            _mesa_blake3_update(&ctx, &flat, sizeof(flat));
+         }
+      }
+      _mesa_blake3_final(&ctx, hash);
+   }
+
+   simple_mtx_lock(&dev->shader_cache_lock);
+   for (unsigned i = 0; i < dev->num_shaders; i++) {
+      if (!memcmp(dev->shader_cache[i].hash, hash, sizeof(hash))) {
+         struct cp_shader_binary *bin = dev->shader_cache[i].bin;
+         simple_mtx_unlock(&dev->shader_cache_lock);
+         ralloc_free(mem_ctx);
+         *result = VK_SUCCESS;
+         return bin;
+      }
+   }
+   simple_mtx_unlock(&dev->shader_cache_lock);
 
    if (cp_debug->dump_nir) {
       fprintf(stderr, "=== %s NIR (native) ===\n",
@@ -784,11 +981,16 @@ cpvk_compile_stage(struct cpvk_device *dev,
     * other varying, and the backend has no system value for it. Without this
     * particlesystem's fragment shader read undef and the driver said so.
     *
-    * Only point_coord. lavapipe also converts frag_coord, layer_id and
-    * primitive_id, and this backend implements those directly.
+    * The renderer supplies point coordinates and window-space fragment
+    * coordinates as ordinary fragment inputs. Leaving frag_coord as a system
+    * value reaches the backend as an unimplemented load_frag_coord and makes
+    * screen-space effects compute on undef.
     */
    {
-      const nir_lower_sysvals_to_varyings_options sv = { .point_coord = true };
+      const nir_lower_sysvals_to_varyings_options sv = {
+         .point_coord = true,
+         .frag_coord = true,
+      };
       NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sv);
    }
 
@@ -861,33 +1063,62 @@ cpvk_compile_stage(struct cpvk_device *dev,
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
+   bool uses_tex_3d = cpvk_nir_uses_tex_3d(nir);
+   const char *sampler_ptx = cpvk_sampler_ptx(dev, uses_tex_3d);
    cuCtxSetCurrent(dev->cu_ctx);
    bool frag = stage->stage == VK_SHADER_STAGE_FRAGMENT_BIT;
    struct cp_shader_binary *bin =
       cp_compile_nir_to_ptx(nir, dev->pdev->sm_major, dev->pdev->sm_minor,
-                            dev->cp_dev.kernels.sampler_ptx,
+                            sampler_ptx,
                             frag ? dev->cp_dev.kernels.fs_helper_ptx : NULL);
+   if (bin)
+      bin->uses_tex_3d = uses_tex_3d;
    ralloc_free(mem_ctx);
 
+   /* A small shader which calls the dynamic sampler helper cannot amortise a
+    * capped build's spills. The warm-up tuner sees one fixed camera position
+    * and chooses the cap there, then texturemipmapgen's orbit makes it 2x
+    * slower. Keep larger dynamic shaders eligible: multisampling crosses this
+    * boundary and benefits from the extra resident block. */
+   if (bin && frag && !getenv("CPVK_KEEP_SMALL_DYNAMIC_REGCAP") &&
+       bin->tune_cap && bin->tex_descs_dynamic && !bin->num_tex_descs &&
+       bin->ptx_size < 6 * 1024)
+      bin->tune_cap = 0;
+
    if (!bin || !bin->kernel) {
+      cp_shader_binary_destroy(bin);
       *result = VK_ERROR_INITIALIZATION_FAILED;
       return NULL;
    }
 
    simple_mtx_lock(&dev->shader_cache_lock);
+   /* Another thread may have compiled the same stage while this one was
+    * outside the lock. Preserve the cache's pointer-identity invariant and
+    * discard the duplicate build. */
+   for (unsigned i = 0; i < dev->num_shaders; i++) {
+      if (!memcmp(dev->shader_cache[i].hash, hash, sizeof(hash))) {
+         struct cp_shader_binary *cached = dev->shader_cache[i].bin;
+         simple_mtx_unlock(&dev->shader_cache_lock);
+         cp_shader_binary_destroy(bin);
+         *result = VK_SUCCESS;
+         return cached;
+      }
+   }
    if (dev->num_shaders >= dev->max_shaders) {
       unsigned want = dev->max_shaders ? dev->max_shaders * 2 : 64;
       void *p = realloc(dev->shader_cache, want * sizeof(*dev->shader_cache));
-      if (p) {
-         dev->shader_cache = p;
-         dev->max_shaders = want;
+      if (!p) {
+         simple_mtx_unlock(&dev->shader_cache_lock);
+         cp_shader_binary_destroy(bin);
+         *result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         return NULL;
       }
+      dev->shader_cache = p;
+      dev->max_shaders = want;
    }
-   if (dev->num_shaders < dev->max_shaders) {
-      memcpy(dev->shader_cache[dev->num_shaders].hash, hash, sizeof(hash));
-      dev->shader_cache[dev->num_shaders].bin = bin;
-      dev->num_shaders++;
-   }
+   memcpy(dev->shader_cache[dev->num_shaders].hash, hash, sizeof(hash));
+   dev->shader_cache[dev->num_shaders].bin = bin;
+   dev->num_shaders++;
    simple_mtx_unlock(&dev->shader_cache_lock);
 
    *result = VK_SUCCESS;
@@ -938,8 +1169,11 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
       }
       if (result != VK_SUCCESS || !pipeline->vs || !pipeline->fs) {
          cpvk_pipeline_destroy(dev, pipeline, pAllocator);
-         if (first_error == VK_SUCCESS)
-            first_error = vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
+         if (first_error == VK_SUCCESS) {
+            VkResult error = result != VK_SUCCESS
+               ? result : VK_ERROR_INITIALIZATION_FAILED;
+            first_error = vk_error(dev, error);
+         }
          continue;
       }
 
@@ -989,7 +1223,6 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
 
       const VkPipelineInputAssemblyStateCreateInfo *ia = info->pInputAssemblyState;
       pipeline->topology = ia ? cpvk_prim(ia->topology) : MESA_PRIM_TRIANGLES;
-
       const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
       if (vi) {
          for (uint32_t a = 0; a < vi->vertexAttributeDescriptionCount && a < 16; a++) {

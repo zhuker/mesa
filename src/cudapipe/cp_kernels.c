@@ -159,9 +159,37 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
    return ptx;
 }
 
+static char *
+compile_sampler_source(const char *name, int sm_major, int sm_minor,
+                       bool enable_3d)
+{
+   if (!enable_3d)
+      return compile_cuda_source(cp_sampler_src, name, sm_major, sm_minor,
+                                 true);
+
+   static const char define[] = "#define CP_ENABLE_3D_SAMPLER 1\n";
+   size_t source_len = strlen(cp_sampler_src);
+   char *source = malloc(sizeof(define) - 1 + source_len + 1);
+   if (!source)
+      return NULL;
+   memcpy(source, define, sizeof(define) - 1);
+   memcpy(source + sizeof(define) - 1, cp_sampler_src, source_len + 1);
+   char *ptx = compile_cuda_source(source, name, sm_major, sm_minor, true);
+   free(source);
+   return ptx;
+}
+
+char *
+cp_compile_sampler_3d(int sm_major, int sm_minor)
+{
+   return compile_sampler_source("cp_sampler_3d.cu", sm_major, sm_minor,
+                                 true);
+}
+
 char *
 cp_compile_sampler_variant(int sm_major, int sm_minor,
-                           const struct cp_sampler_info *info)
+                           const struct cp_sampler_info *info,
+                           bool enable_3d)
 {
    static_assert(sizeof(float) == sizeof(uint32_t), "32-bit float required");
    uint32_t bits[8];
@@ -174,7 +202,7 @@ cp_compile_sampler_variant(int sm_major, int sm_minor,
 
    char defines[2048];
    int len = snprintf(defines, sizeof(defines),
-      "#define CP_SPECIALIZED_SAMPLER 1\n"
+      "%s#define CP_SPECIALIZED_SAMPLER 1\n"
       "#define CP_SPEC_WRAP_S %u\n#define CP_SPEC_WRAP_T %u\n"
       "#define CP_SPEC_WRAP_R %u\n#define CP_SPEC_MIN_IMG %u\n"
       "#define CP_SPEC_MAG_IMG %u\n#define CP_SPEC_MIP %u\n"
@@ -187,6 +215,7 @@ cp_compile_sampler_variant(int sm_major, int sm_minor,
       "#define CP_SPEC_BORDER_G (__int_as_float((int)0x%08xU))\n"
       "#define CP_SPEC_BORDER_B (__int_as_float((int)0x%08xU))\n"
       "#define CP_SPEC_BORDER_A (__int_as_float((int)0x%08xU))\n",
+      enable_3d ? "#define CP_ENABLE_3D_SAMPLER 1\n" : "",
       info->wrap_s, info->wrap_t, info->wrap_r, info->min_img_filter,
       info->mag_img_filter, info->min_mip_filter, info->unnormalized_coords,
       bits[0], bits[1], bits[2], bits[3], bits[4], bits[5], bits[6], bits[7]);
@@ -321,8 +350,8 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor)
 
    /* Kept as relocatable PTX rather than a module: it is linked into each
     * shader that samples textures, not launched on its own. */
-   k->sampler_ptx = compile_cuda_source(cp_sampler_src, "cp_sampler.cu",
-                                        sm_major, sm_minor, true);
+   k->sampler_ptx = compile_sampler_source("cp_sampler.cu", sm_major,
+                                           sm_minor, false);
    if (!k->sampler_ptx) {
       fprintf(stderr, "cudapipe: failed to compile texture sampler\n");
       goto fail;
@@ -352,7 +381,10 @@ cp_kernels_destroy(struct cp_kernels *k)
       cuModuleUnload(k->clear_module);
    if (k->fs_module)
       cuModuleUnload(k->fs_module);
+   if (k->vfetch_module)
+      cuModuleUnload(k->vfetch_module);
    free(k->sampler_ptx);
+   free(k->sampler_3d_ptx);
    free(k->fs_helper_ptx);
    memset(k, 0, sizeof(*k));
 }

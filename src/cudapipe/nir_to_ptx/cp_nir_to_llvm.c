@@ -2278,9 +2278,12 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
    LLVMTypeRef param_types[] = { i64, i64, f32, f32, f32, f32, i32, i32 };
    LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, 8, false);
 
-   LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, "cp_tex_sample");
+   const char *sample_name =
+      (flags & CP_TEX_TARGET_MASK) == CP_TEX_3D &&
+      !(flags & CP_TEX_FETCH) ? "cp_tex_sample_3d" : "cp_tex_sample";
+   LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, sample_name);
    if (!fn)
-      fn = LLVMAddFunction(ctx->module, "cp_tex_sample", fn_type);
+      fn = LLVMAddFunction(ctx->module, sample_name, fn_type);
 
    LLVMValueRef args[] = { tex_handle, samp_handle, c[0], c[1], c[2], lod_arg,
                            LLVMConstInt(i32, (unsigned)coord_slot, true),
@@ -3398,6 +3401,10 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
       nir_print_shader(nir, stderr);
 
    struct cp_shader_binary *bin = CALLOC_STRUCT(cp_shader_binary);
+   if (!bin) {
+      free(ptx);
+      return NULL;
+   }
    bin->ptx_text = ptx;
    bin->ptx_size = ptx_size;
    bin->sm_major = sm_major;

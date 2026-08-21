@@ -570,8 +570,106 @@ cp_cube_derivs(float x, float y, float z, float dx, float dy, float dz,
    *out_dv = 0.5f * (dvc - vc * dma * ima) * ima;
 }
 
+/* Bilinear filtering within one 2D slice. Keeping this as a force-inlined
+ * fast path avoids imposing a z-tap loop on every ordinary 2D/cube sample. */
+static __device__ __forceinline__ struct cp_rgba
+cp_sample_linear_slice(const struct cp_texture_info *tex,
+                       const struct cp_sampler_info *samp, unsigned level,
+                       float su, float sv, int layer, int w, int h, bool cube)
+{
+   float fu = su - 0.5f;
+   float fv = sv - 0.5f;
+   int x0 = (int)floorf(fu);
+   int y0 = (int)floorf(fv);
+   float au = fu - (float)x0;
+   float av = fv - (float)y0;
+   float acc_r = 0.0f, acc_g = 0.0f, acc_b = 0.0f, acc_a = 0.0f;
+   float acc_w = 0.0f;
+
+   for (int j = 0; j < 2; j++) {
+      for (int i = 0; i < 2; i++) {
+         int x = x0 + i;
+         int y = y0 + j;
+         float weight = (i ? au : 1.0f - au) * (j ? av : 1.0f - av);
+         struct cp_rgba t;
+         if (cube) {
+            /* A tap outside both axes at a cube corner belongs to no face;
+             * drop it and renormalise over the three taps that do. */
+            if ((x < 0 || x >= w) && (y < 0 || y >= h))
+               continue;
+            t = cp_fetch_cube_texel(tex, level, x, y, layer, w, h);
+         } else if (cp_wrap_texel(&x, w, samp->wrap_s) &&
+                    cp_wrap_texel(&y, h, samp->wrap_t)) {
+            t = cp_fetch_texel(tex, level, x, y, layer);
+         } else {
+            t.r = samp->border_color[0]; t.g = samp->border_color[1];
+            t.b = samp->border_color[2]; t.a = samp->border_color[3];
+         }
+         acc_r += t.r * weight; acc_g += t.g * weight;
+         acc_b += t.b * weight; acc_a += t.a * weight;
+         acc_w += weight;
+      }
+   }
+
+   float inv_w = acc_w > 0.0f ? 1.0f / acc_w : 0.0f;
+   struct cp_rgba c = {
+      acc_r * inv_w, acc_g * inv_w, acc_b * inv_w, acc_a * inv_w,
+   };
+   return c;
+}
+
+/* Keep the additional z footprint out of the common 2D sampler's register
+ * allocation. This is deliberately not inlined and is reached only through
+ * the 3D-specific sampler entrypoint below. */
+static __device__ __noinline__ struct cp_rgba
+cp_sample_linear_3d(const struct cp_texture_info *tex,
+                    const struct cp_sampler_info *samp, unsigned level,
+                    float su, float sv, float z_coord, int w, int h, int depth)
+{
+   float fu = su - 0.5f, fv = sv - 0.5f;
+   int x0 = (int)floorf(fu), y0 = (int)floorf(fv);
+   float au = fu - (float)x0, av = fv - (float)y0;
+   float fw = z_coord * (float)depth - 0.5f;
+   float fz = floorf(fw);
+   int z[2] = { (int)fz, (int)fz + 1 };
+   float az = fw - fz;
+   bool z_valid[2] = {
+      cp_wrap_texel(&z[0], depth, samp->wrap_r),
+      cp_wrap_texel(&z[1], depth, samp->wrap_r),
+   };
+   struct cp_rgba acc = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+   /* Resolve x/y and their weight once, then interpolate the two z fetches,
+    * rather than repeating the coordinate and wrap work for each slice. */
+   for (int j = 0; j < 2; j++) {
+      for (int i = 0; i < 2; i++) {
+         int x = x0 + i, y = y0 + j;
+         bool xy_valid = cp_wrap_texel(&x, w, samp->wrap_s) &&
+                         cp_wrap_texel(&y, h, samp->wrap_t);
+         struct cp_rgba t[2];
+         for (int k = 0; k < 2; k++) {
+            if (xy_valid && z_valid[k]) {
+               t[k] = cp_fetch_texel(tex, level, x, y, z[k]);
+            } else {
+               t[k].r = samp->border_color[0];
+               t[k].g = samp->border_color[1];
+               t[k].b = samp->border_color[2];
+               t[k].a = samp->border_color[3];
+            }
+         }
+         float weight = (i ? au : 1.0f - au) * (j ? av : 1.0f - av);
+         acc.r += (t[0].r + (t[1].r - t[0].r) * az) * weight;
+         acc.g += (t[0].g + (t[1].g - t[0].g) * az) * weight;
+         acc.b += (t[0].b + (t[1].b - t[0].b) * az) * weight;
+         acc.a += (t[0].a + (t[1].a - t[0].a) * az) * weight;
+      }
+   }
+   return acc;
+}
+
 /* Sample one mip level with the given in-level filter. `layer` selects the
  * array slice or cube face, or the 3D slice. */
+template <bool filter_3d>
 static __device__ struct cp_rgba
 cp_sample_level_layer(const struct cp_texture_info *tex,
                       const struct cp_sampler_info *samp, unsigned level,
@@ -586,14 +684,20 @@ cp_sample_level_layer(const struct cp_texture_info *tex,
    w = w < 1 ? 1 : w;
    h = h < 1 ? 1 : h;
 
-   /* A 3D texture's slices shrink with the mip level, so the slice has to be
-    * derived from the normalized coordinate at the level being sampled —
-    * unlike array layers, which are the same at every level. */
+   /* Texel-space coordinates; normalized coords scale by the level size. */
+   float su = samp->unnormalized_coords ? u : u * (float)w;
+   float sv = samp->unnormalized_coords ? v : v * (float)h;
+
+   /* A 3D texture's slices shrink with the mip level, so z selection has to
+    * use this level's depth. Array layers remain constant across levels. */
    int depth = (int)tex->depth;
    if (layer_is_normalized) {
       depth = depth >> level;
       if (depth < 1)
          depth = 1;
+      if (filter_3d && filter == CP_FILTER_LINEAR)
+         return cp_sample_linear_3d(tex, samp, level, su, sv, layer_coord,
+                                    w, h, depth);
       layer = (int)floorf(layer_coord * (float)depth);
       if (!cp_wrap_texel(&layer, depth, samp->wrap_r)) {
          c.r = samp->border_color[0]; c.g = samp->border_color[1];
@@ -606,59 +710,8 @@ cp_sample_level_layer(const struct cp_texture_info *tex,
       layer = layer < 0 ? 0 : (layer >= depth ? depth - 1 : layer);
    }
 
-   /* Texel-space coordinates; normalized coords scale by the level size. */
-   float su = samp->unnormalized_coords ? u : u * (float)w;
-   float sv = samp->unnormalized_coords ? v : v * (float)h;
-
    if (filter == CP_FILTER_LINEAR) {
-      /* Bilinear: sample the four texels around the sample point, which sits
-       * half a texel in from the texel centre. */
-      float fu = su - 0.5f;
-      float fv = sv - 0.5f;
-      int x0 = (int)floorf(fu);
-      int y0 = (int)floorf(fv);
-      float au = fu - (float)x0;
-      float av = fv - (float)y0;
-
-      float acc_r = 0.0f, acc_g = 0.0f, acc_b = 0.0f, acc_a = 0.0f;
-      float acc_w = 0.0f;
-      for (int j = 0; j < 2; j++) {
-         for (int i = 0; i < 2; i++) {
-            int x = x0 + i;
-            int y = y0 + j;
-            float weight = (i ? au : 1.0f - au) * (j ? av : 1.0f - av);
-            struct cp_rgba t;
-            if (cube) {
-               /*
-                * Seamless: the footprint continues onto the adjacent face
-                * instead of being wrapped back into this one.
-                *
-                * At a corner, where three faces meet, a tap that is outside
-                * in *both* axes names a texel that does not exist on any
-                * face. The spec's answer is to drop it and renormalise over
-                * the three that do, which is what skipping it here amounts
-                * to: the weights are accumulated and divided below.
-                */
-               if ((x < 0 || x >= w) && (y < 0 || y >= h))
-                  continue;
-               t = cp_fetch_cube_texel(tex, level, x, y, layer, w, h);
-            } else if (cp_wrap_texel(&x, w, samp->wrap_s) &&
-                cp_wrap_texel(&y, h, samp->wrap_t)) {
-               t = cp_fetch_texel(tex, level, x, y, layer);
-            } else {
-               t.r = samp->border_color[0]; t.g = samp->border_color[1];
-               t.b = samp->border_color[2]; t.a = samp->border_color[3];
-            }
-            acc_r += t.r * weight; acc_g += t.g * weight;
-            acc_b += t.b * weight; acc_a += t.a * weight;
-            acc_w += weight;
-         }
-      }
-      /* Renormalise, which matters only when a corner tap was dropped; the
-       * four weights sum to one everywhere else. */
-      float inv_w = acc_w > 0.0f ? 1.0f / acc_w : 0.0f;
-      c.r = acc_r * inv_w; c.g = acc_g * inv_w;
-      c.b = acc_b * inv_w; c.a = acc_a * inv_w;
+      c = cp_sample_linear_slice(tex, samp, level, su, sv, layer, w, h, cube);
    } else {
       int x = (int)floorf(su);
       int y = (int)floorf(sv);
@@ -744,6 +797,7 @@ cp_load_sampler(unsigned long long samp_handle)
    return samp;
 }
 
+template <bool filter_3d>
 static __device__ __forceinline__ float4
 cp_tex_sample_impl(unsigned long long tex_handle,
                    struct cp_sampler_info samp,
@@ -789,8 +843,9 @@ cp_tex_sample_impl(unsigned long long tex_handle,
       layer = (int)(c2 + 0.5f);
       break;
    case CP_TEX_3D:
-      /* Slice resolved per mip level inside cp_sample_level_layer(); filtering
-       * between slices is not implemented. */
+      /* Slice selection and z filtering are resolved per mip level inside
+       * cp_sample_level_layer<filter_3d>(), because depth shrinks with the
+       * mip chain. */
       break;
    default:
       break;
@@ -1002,11 +1057,10 @@ cp_tex_sample_impl(unsigned long long tex_handle,
    unsigned filter = minifying ? samp.min_img_filter : samp.mag_img_filter;
 
    if (!minifying || samp.min_mip_filter == CP_MIPFILTER_NONE) {
-      struct cp_rgba c =
-         cp_sample_level_layer(tex, &samp, base_level, u, v, layer, filter,
-                               target == CP_TEX_3D, c2,
-                               target == CP_TEX_CUBE ||
-                               target == CP_TEX_CUBE_ARRAY);
+      struct cp_rgba c = cp_sample_level_layer<filter_3d>(
+         tex, &samp, base_level, u, v, layer, filter,
+         target == CP_TEX_3D, c2,
+         target == CP_TEX_CUBE || target == CP_TEX_CUBE_ARRAY);
       return make_float4(c.r, c.g, c.b, c.a);
    }
 
@@ -1027,12 +1081,10 @@ cp_tex_sample_impl(unsigned long long tex_handle,
       struct cp_rgba acc = { 0.0f, 0.0f, 0.0f, 0.0f };
       for (int t = 0; t < aniso_taps; t++) {
          float off = tap_base + (float)t * tap_scale;
-         struct cp_rgba c =
-            cp_sample_level_layer(tex, &samp, level, u + aniso_du * off,
-                                  v + aniso_dv * off, layer, filter,
-                                  target == CP_TEX_3D, c2,
-                               target == CP_TEX_CUBE ||
-                               target == CP_TEX_CUBE_ARRAY);
+         struct cp_rgba c = cp_sample_level_layer<filter_3d>(
+            tex, &samp, level, u + aniso_du * off, v + aniso_dv * off,
+            layer, filter, target == CP_TEX_3D, c2,
+            target == CP_TEX_CUBE || target == CP_TEX_CUBE_ARRAY);
          acc.r += c.r; acc.g += c.g; acc.b += c.b; acc.a += c.a;
       }
       float inv = 1.0f / (float)aniso_taps;
@@ -1050,14 +1102,12 @@ cp_tex_sample_impl(unsigned long long tex_handle,
    for (int t = 0; t < aniso_taps; t++) {
       float off = tap_base + (float)t * tap_scale;
       float tu = u + aniso_du * off, tv = v + aniso_dv * off;
-      struct cp_rgba a = cp_sample_level_layer(tex, &samp, lo, tu, tv, layer,
-                                               filter, target == CP_TEX_3D, c2,
-                               target == CP_TEX_CUBE ||
-                               target == CP_TEX_CUBE_ARRAY);
-      struct cp_rgba b = cp_sample_level_layer(tex, &samp, hi, tu, tv, layer,
-                                               filter, target == CP_TEX_3D, c2,
-                               target == CP_TEX_CUBE ||
-                               target == CP_TEX_CUBE_ARRAY);
+      struct cp_rgba a = cp_sample_level_layer<filter_3d>(
+         tex, &samp, lo, tu, tv, layer, filter, target == CP_TEX_3D, c2,
+         target == CP_TEX_CUBE || target == CP_TEX_CUBE_ARRAY);
+      struct cp_rgba b = cp_sample_level_layer<filter_3d>(
+         tex, &samp, hi, tu, tv, layer, filter, target == CP_TEX_3D, c2,
+         target == CP_TEX_CUBE || target == CP_TEX_CUBE_ARRAY);
       acc.r += a.r + (b.r - a.r) * frac;
       acc.g += a.g + (b.g - a.g) * frac;
       acc.b += a.b + (b.b - a.b) * frac;
@@ -1067,10 +1117,12 @@ cp_tex_sample_impl(unsigned long long tex_handle,
    return make_float4(acc.r * inv, acc.g * inv, acc.b * inv, acc.a * inv);
 }
 
-extern "C" __device__ float4
-cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
-              float c0, float c1, float c2, float explicit_lod,
-              int coord_slot, int flags)
+template <bool filter_3d>
+static __device__ __forceinline__ float4
+cp_tex_sample_entry(unsigned long long tex_handle,
+                    unsigned long long samp_handle,
+                    float c0, float c1, float c2, float explicit_lod,
+                    int coord_slot, int flags)
 {
    struct cp_sampler_info samp;
 #ifdef CP_SPECIALIZED_SAMPLER
@@ -1092,9 +1144,32 @@ cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
 #else
    samp = cp_load_sampler(samp_handle);
 #endif
-   return cp_tex_sample_impl(tex_handle, samp,
-                             c0, c1, c2, explicit_lod, coord_slot, flags);
+   return cp_tex_sample_impl<filter_3d>(tex_handle, samp,
+                                        c0, c1, c2, explicit_lod,
+                                        coord_slot, flags);
 }
+
+extern "C" __device__ float4
+cp_tex_sample(unsigned long long tex_handle, unsigned long long samp_handle,
+              float c0, float c1, float c2, float explicit_lod,
+              int coord_slot, int flags)
+{
+   return cp_tex_sample_entry<false>(tex_handle, samp_handle,
+                                     c0, c1, c2, explicit_lod,
+                                     coord_slot, flags);
+}
+
+#ifdef CP_ENABLE_3D_SAMPLER
+extern "C" __device__ float4
+cp_tex_sample_3d(unsigned long long tex_handle, unsigned long long samp_handle,
+                 float c0, float c1, float c2, float explicit_lod,
+                 int coord_slot, int flags)
+{
+   return cp_tex_sample_entry<true>(tex_handle, samp_handle,
+                                    c0, c1, c2, explicit_lod,
+                                    coord_slot, flags);
+}
+#endif
 
 /*
  * Precise transcendentals for shaders.

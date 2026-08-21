@@ -340,6 +340,31 @@ cpvk_UpdateDescriptorSetWithTemplate(VkDevice _device, VkDescriptorSet _set,
    }
 }
 
+/* Vulkan 1.0 captures may enable the extension and use its aliases. */
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_CreateDescriptorUpdateTemplateKHR(
+   VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *info,
+   const VkAllocationCallbacks *alloc, VkDescriptorUpdateTemplate *tmpl)
+{
+   return cpvk_CreateDescriptorUpdateTemplate(device, info, alloc, tmpl);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_DestroyDescriptorUpdateTemplateKHR(
+   VkDevice device, VkDescriptorUpdateTemplate tmpl,
+   const VkAllocationCallbacks *alloc)
+{
+   cpvk_DestroyDescriptorUpdateTemplate(device, tmpl, alloc);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_UpdateDescriptorSetWithTemplateKHR(
+   VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate tmpl,
+   const void *data)
+{
+   cpvk_UpdateDescriptorSetWithTemplate(device, set, tmpl, data);
+}
+
 /* -------------------------------------------------------- command buffers */
 
 static void
@@ -650,9 +675,45 @@ VkResult
 cpvk_execute_dispatch(struct cpvk_device *dev,
                        const struct cpvk_dispatch *d)
 {
-   const struct cp_shader_binary *bin = d->pipeline->bin;
+   struct cp_shader_binary *bin = d->pipeline->bin;
    if (!bin || !bin->kernel)
       return VK_SUCCESS;
+
+   /* A linked sampler reads its state table through module globals. Graphics
+    * publishes both globals before shading; compute has no quads, but must
+    * publish the same table and explicitly leave derivatives disabled. Do not
+    * query an untextured module: cuModuleGetGlobal triggers its lazy JIT and
+    * moved a one-second cost into the first measured compute frame. */
+   if (bin->sampler_ptx) {
+      if (!bin->globals_resolved) {
+         CUdeviceptr sym;
+         size_t sym_size;
+         if (cuModuleGetGlobal(&sym, &sym_size, bin->module,
+                               "cp_sampler_table") == CUDA_SUCCESS)
+            bin->sym_sampler_table = sym;
+         if (cuModuleGetGlobal(&sym, &sym_size, bin->module,
+                               "cp_quad_derivs") == CUDA_SUCCESS)
+            bin->sym_quad_derivs = sym;
+         bin->last_sampler_table = ~(uint64_t)0;
+         bin->last_quad_derivs = -1;
+         bin->globals_resolved = true;
+      }
+      if (dev->renderer.sampler_table && bin->sym_sampler_table &&
+          bin->last_sampler_table != (uint64_t)dev->renderer.sampler_table) {
+         uint64_t addr = (uint64_t)dev->renderer.sampler_table;
+         if (cuMemcpyHtoD(bin->sym_sampler_table, &addr, sizeof(addr)) !=
+             CUDA_SUCCESS)
+            return vk_error(dev, VK_ERROR_DEVICE_LOST);
+         bin->last_sampler_table = addr;
+      }
+      if (bin->sym_quad_derivs && bin->last_quad_derivs != 0) {
+         int off = 0;
+         if (cuMemcpyHtoD(bin->sym_quad_derivs, &off, sizeof(off)) !=
+             CUDA_SUCCESS)
+            return vk_error(dev, VK_ERROR_DEVICE_LOST);
+         bin->last_quad_derivs = 0;
+      }
+   }
 
    /* The argument block: an array of pointers, with the grid behind it,
     * exactly as cp_launch_grid() builds it. */
@@ -1434,6 +1495,25 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
 #undef CPVK_DIFF
 }
 
+/* State the renderer reads once for a whole pass episode.  Shader,
+ * descriptor, vertex-layout, vertex-buffer, push-constant, scissor and draw
+ * changes are captured per segment; these are not. */
+static bool
+cpvk_draws_episode_compatible(const struct cpvk_draw *a,
+                              const struct cpvk_draw *b)
+{
+   const struct cpvk_pipeline *pa = a->pipeline, *pb = b->pipeline;
+   if (!pa || !pb)
+      return false;
+
+   return !memcmp(&a->fb, &b->fb, sizeof(a->fb)) &&
+          !memcmp(&a->viewport, &b->viewport, sizeof(a->viewport)) &&
+          !memcmp(&pa->raster, &pb->raster, sizeof(pa->raster)) &&
+          !memcmp(&pa->depth, &pb->depth, sizeof(pa->depth)) &&
+          !memcmp(&pa->blend, &pb->blend, sizeof(pa->blend)) &&
+          pa->samples == pb->samples;
+}
+
 static bool
 cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw *d,
                     bool *out_blended)
@@ -1589,27 +1669,28 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
    bool batch_ok = cpvk_batch_can_join(dev, d, &batch_blended);
    if (!batch_ok) {
       /*
-       * The full flush, which finishes the pass episode too, and it has to be.
-       *
-       * The deferring variant was tried here on the reasoning the renderer
-       * itself offers -- "a draw whose key broke the batch" is one of the four
-       * per-segment changes allowed to keep an episode open -- and it does
-       * what it promises: gltfscenerendering's nine single-segment episodes
-       * became three of five, three and one.
-       *
-       * It also broke six samples. 15/18 pixel-correct fell to 9/18, with
-       * bloom at 126.195 and gltfscenerendering at 24.03. The renderer's rule
-       * holds for the Gallium adapter, which flushes on the *other* state
-       * changes an episode reads episode-wide; this front end has no such
-       * flush points, so it relies on this one. Keeping the episode open here
-       * keeps it open across shader and descriptor changes it must not span.
-       *
-       * The cost is real and measured: an episode of one segment amortises
-       * nothing, and cp_abuf_scan_block runs once per episode and 4.7x more
-       * often here than on the driver this replaces. Closing that gap means
-       * giving this front end the other flush points first, not this line.
+       * A batch-key break is a per-segment change, but only while the state
+       * read once for the whole episode is unchanged.  The old unconditional
+       * full flush made every native episode one segment (and Crossroads
+       * 4.7x slower); unconditionally deferring crossed viewport/depth/blend
+       * changes and broke six samples.  Compare the episode-wide state first,
+       * then let an eligible new draw begin the next segment.
        */
-      cp_batch_flush_why(cp, "the next draw cannot join");
+      bool can_defer = cp->batch.pending && dev->prev_draw_valid &&
+                       dev->prev_draw &&
+                       cpvk_draws_episode_compatible(d, dev->prev_draw);
+      bool eligible = false;
+      if (can_defer)
+         eligible = cpvk_batch_eligible(dev, d, &batch_blended);
+
+      if (can_defer && eligible)
+         cp_batch_flush_defer_why(cp, "the next draw starts a segment");
+      else
+         cp_batch_flush_why(cp, "the next draw cannot join");
+
+      /* With the previous batch submitted, an eligible draw starts a fresh
+       * batch which can become the next segment. */
+      batch_ok = cpvk_batch_can_join(dev, d, &batch_blended);
    }
 
    if (!dev->prev_draw)
@@ -1788,48 +1869,74 @@ cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
       CUdeviceptr sb, db;
       size_t sp, dp;
       unsigned sbpp, dbpp;
-      bool sok = cpvk_image_plane(src, r->srcSubresource.mipLevel, &sb, &sp, &sbpp);
-      bool dok = cpvk_image_plane(dst, r->dstSubresource.mipLevel, &db, &dp, &dbpp);
-      if (getenv("CPVK_DEBUG_RT"))
-         fprintf(stderr, "copyimg: dstbase=%p dstmem=%p %ux%u src(l=%u lay=%u ok=%d) "
-                 "dst(l=%u lay=%u ok=%d) dstimg=%ux%u layers=%u mips=%u\n",
-                 (void *)(uintptr_t)db,
-                 (void *)(uintptr_t)(dst->mem ? dst->mem->dev_ptr : 0),
-                 r->extent.width,
-                 r->extent.height, r->srcSubresource.mipLevel,
-                 r->srcSubresource.baseArrayLayer, sok,
-                 r->dstSubresource.mipLevel, r->dstSubresource.baseArrayLayer,
-                 dok, dst->vk.extent.width, dst->vk.extent.height,
-                 dst->vk.array_layers, dst->vk.mip_levels);
+      bool sok = cpvk_image_plane(src, r->srcSubresource.mipLevel,
+                                  &sb, &sp, &sbpp);
+      bool dok = cpvk_image_plane(dst, r->dstSubresource.mipLevel,
+                                  &db, &dp, &dbpp);
       if (!sok || !dok)
          return;
 
-      struct cpvk_copy *c = cpvk_record_copy(cmd);
-      if (!c)
-         return;
-      /*
-       * The array layer. A cube map is built as six copies into
-       * baseArrayLayer 0..5 of one image, and without this every one of them
-       * landed on face zero: pbribl's generated cubes had face 0 populated
-       * and faces 1 to 5 all zero, so its spheres reflected nothing.
-       *
-       * The layer stride inside a level is that level's size, which is how
-       * cpvk_image_layout lays the image out and how the sampler's
-       * img_stride[level] indexes it.
-       */
-      uint64_t s_layer = (uint64_t)r->srcSubresource.baseArrayLayer *
-                         src->level_size[r->srcSubresource.mipLevel];
-      uint64_t d_layer = (uint64_t)r->dstSubresource.baseArrayLayer *
-                         dst->level_size[r->dstSubresource.mipLevel];
+      enum pipe_format sfmt = vk_format_to_pipe_format(src->vk.format);
+      enum pipe_format dfmt = vk_format_to_pipe_format(dst->vk.format);
+      /* VkImageCopy expresses the extent in source texels. Convert it to
+       * source-format elements once and copy that many equally sized raw
+       * elements on both sides. This is what makes a valid BC1 -> 8-byte
+       * uncompressed copy 1 block -> 1 texel rather than 1 block -> 4 texels.
+       * Vulkan format compatibility guarantees equal element sizes. */
+      size_t copy_row = (size_t)util_format_get_nblocksx(
+         sfmt, r->extent.width) * sbpp;
+      unsigned copy_rows = util_format_get_nblocksy(sfmt, r->extent.height);
+      if (sbpp != dbpp) {
+         fprintf(stderr, "cudapipe: refusing incompatible image-copy "
+                 "element sizes %u -> %u bytes\n", sbpp, dbpp);
+         continue;
+      }
 
-      *c = (struct cpvk_copy) {
-         .src = sb + s_layer + (size_t)r->srcOffset.y * sp + (size_t)r->srcOffset.x * sbpp,
-         .dst = db + d_layer + (size_t)r->dstOffset.y * dp + (size_t)r->dstOffset.x * dbpp,
-         .src_pitch = sp,
-         .dst_pitch = dp,
-         .width_bytes = (size_t)r->extent.width * sbpp,
-         .rows = r->extent.height,
-      };
+      unsigned sl = r->srcSubresource.mipLevel;
+      unsigned dl = r->dstSubresource.mipLevel;
+      unsigned sh = MAX2(src->vk.extent.height >> sl, 1u);
+      unsigned dh = MAX2(dst->vk.extent.height >> dl, 1u);
+      size_t src_slice = sp * util_format_get_nblocksy(sfmt, sh);
+      size_t dst_slice = dp * util_format_get_nblocksy(dfmt, dh);
+      bool src_3d = src->vk.image_type == VK_IMAGE_TYPE_3D;
+      bool dst_3d = dst->vk.image_type == VK_IMAGE_TYPE_3D;
+      unsigned slices = src_3d ? MAX2(r->extent.depth, 1u) :
+                                 MAX2(r->srcSubresource.layerCount, 1u);
+      size_t src_xy = (size_t)util_format_get_nblocksy(
+                         sfmt, r->srcOffset.y) * sp +
+                      (size_t)util_format_get_nblocksx(
+                         sfmt, r->srcOffset.x) * sbpp;
+      size_t dst_xy = (size_t)util_format_get_nblocksy(
+                         dfmt, r->dstOffset.y) * dp +
+                      (size_t)util_format_get_nblocksx(
+                         dfmt, r->dstOffset.x) * dbpp;
+
+      /* A copy has one sequence of slices. A slice is a z plane for a 3D
+       * image and an array layer otherwise; multiplying layerCount by depth
+       * would turn a valid 2D-array <-> 3D copy into N squared copies. */
+      for (unsigned s = 0; s < slices; s++) {
+         uint64_t src_plane = src_3d
+            ? (uint64_t)(r->srcOffset.z + (int32_t)s) * src_slice
+            : (uint64_t)(r->srcSubresource.baseArrayLayer + s) *
+                 src->level_size[sl];
+         uint64_t dst_plane = dst_3d
+            ? (uint64_t)(r->dstOffset.z + (int32_t)s) * dst_slice
+            : (uint64_t)(r->dstSubresource.baseArrayLayer + s) *
+                 dst->level_size[dl];
+         struct cpvk_copy *c = cpvk_record_copy(cmd);
+         if (!c)
+            return;
+         *c = (struct cpvk_copy) {
+            .src = sb + src_plane + src_xy,
+            .dst = db + dst_plane + dst_xy,
+            .src_pitch = sp,
+            .dst_pitch = dp,
+            .width_bytes = copy_row,
+            .rows = copy_rows,
+            .src_end = cpvk_image_end(src),
+            .dst_end = cpvk_image_end(dst),
+         };
+      }
    }
 }
 
@@ -1875,31 +1982,43 @@ cpvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
       size_t copy_row = (size_t)util_format_get_nblocksx(pfmt,
                                                         r->imageExtent.width) * bpp;
       unsigned copy_rows = util_format_get_nblocksy(pfmt, r->imageExtent.height);
-      size_t layer_bytes = src_row *
-                           util_format_get_nblocksy(pfmt, img_rows);
+      size_t src_slice = src_row *
+                         util_format_get_nblocksy(pfmt, img_rows);
+      unsigned level = r->imageSubresource.mipLevel;
+      unsigned mip_h = MAX2(img->vk.extent.height >> level, 1u);
+      size_t dst_slice = ip * util_format_get_nblocksy(pfmt, mip_h);
       unsigned layers = MAX2(r->imageSubresource.layerCount, 1u);
+      unsigned depth = MAX2(r->imageExtent.depth, 1u);
 
+      /* Array layers and 3D depth slices are consecutive buffer images.  The
+       * old 2D-only loop copied slice zero of a 3D upload and the sampler then
+       * read uninitialised slices as its z coordinate changed. */
       for (unsigned l = 0; l < layers; l++) {
-         struct cpvk_copy *c = cpvk_record_copy(cmd);
-         if (!c)
-            return;
-         *c = (struct cpvk_copy) {
-            .src = buf->mem->dev_ptr + buf->offset + r->bufferOffset +
-                   l * layer_bytes,
-            .dst = ib + (size_t)(r->imageSubresource.baseArrayLayer + l) *
-                        img->level_size[r->imageSubresource.mipLevel] +
-                   (size_t)r->imageOffset.y * ip +
-                   (size_t)r->imageOffset.x * bpp,
-            .src_pitch = src_row,
-            .dst_pitch = ip,
-            .width_bytes = copy_row,
-            .rows = copy_rows,
-            /* Both ends bounded: this is the path that uploads every texture
-             * and every mip level in a capture, and it was the one with no
-             * limits on it. */
-            .src_end = buf->mem->dev_ptr + buf->offset + buf->vk.size,
-            .dst_end = cpvk_image_end(img),
-         };
+         for (unsigned z = 0; z < depth; z++) {
+            struct cpvk_copy *c = cpvk_record_copy(cmd);
+            if (!c)
+               return;
+            *c = (struct cpvk_copy) {
+               .src = buf->mem->dev_ptr + buf->offset + r->bufferOffset +
+                      ((size_t)l * depth + z) * src_slice,
+               .dst = ib +
+                      (size_t)(r->imageSubresource.baseArrayLayer + l) *
+                         img->level_size[level] +
+                      (size_t)(r->imageOffset.z + (int32_t)z) * dst_slice +
+                      (size_t)util_format_get_nblocksy(
+                         pfmt, r->imageOffset.y) * ip +
+                      (size_t)util_format_get_nblocksx(
+                         pfmt, r->imageOffset.x) * bpp,
+               .src_pitch = src_row,
+               .dst_pitch = ip,
+               .width_bytes = copy_row,
+               .rows = copy_rows,
+               /* Both ends bounded: this is the path that uploads every
+                * texture and every mip level in a capture. */
+               .src_end = buf->mem->dev_ptr + buf->offset + buf->vk.size,
+               .dst_end = cpvk_image_end(img),
+            };
+         }
       }
    }
 }
@@ -1926,23 +2045,42 @@ cpvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
       enum pipe_format pfmt = vk_format_to_pipe_format(img->vk.format);
       unsigned row_texels = r->bufferRowLength ? r->bufferRowLength
                                                : r->imageExtent.width;
-      struct cpvk_copy *c = cpvk_record_copy(cmd);
-      if (!c)
-         return;
-      *c = (struct cpvk_copy) {
-         .src = ib + (size_t)r->imageSubresource.baseArrayLayer *
-                     img->level_size[r->imageSubresource.mipLevel] +
-                (size_t)r->imageOffset.y * ip +
-                (size_t)r->imageOffset.x * bpp,
-         .dst = buf->mem->dev_ptr + buf->offset + r->bufferOffset,
-         .src_pitch = ip,
-         .dst_pitch = (size_t)util_format_get_nblocksx(pfmt, row_texels) * bpp,
-         .width_bytes = (size_t)util_format_get_nblocksx(pfmt,
-                                                        r->imageExtent.width) * bpp,
-         .rows = util_format_get_nblocksy(pfmt, r->imageExtent.height),
-         .src_end = cpvk_image_end(img),
-         .dst_end = buf->mem->dev_ptr + buf->offset + buf->vk.size,
-      };
+      unsigned img_rows = r->bufferImageHeight ? r->bufferImageHeight
+                                               : r->imageExtent.height;
+      size_t dst_row = (size_t)util_format_get_nblocksx(pfmt, row_texels) * bpp;
+      size_t dst_slice = dst_row * util_format_get_nblocksy(pfmt, img_rows);
+      unsigned level = r->imageSubresource.mipLevel;
+      unsigned mip_h = MAX2(img->vk.extent.height >> level, 1u);
+      size_t src_slice = ip * util_format_get_nblocksy(pfmt, mip_h);
+      unsigned layers = MAX2(r->imageSubresource.layerCount, 1u);
+      unsigned depth = MAX2(r->imageExtent.depth, 1u);
+
+      for (unsigned l = 0; l < layers; l++) {
+         for (unsigned z = 0; z < depth; z++) {
+            struct cpvk_copy *c = cpvk_record_copy(cmd);
+            if (!c)
+               return;
+            *c = (struct cpvk_copy) {
+               .src = ib +
+                      (size_t)(r->imageSubresource.baseArrayLayer + l) *
+                         img->level_size[level] +
+                      (size_t)(r->imageOffset.z + (int32_t)z) * src_slice +
+                      (size_t)util_format_get_nblocksy(
+                         pfmt, r->imageOffset.y) * ip +
+                      (size_t)util_format_get_nblocksx(
+                         pfmt, r->imageOffset.x) * bpp,
+               .dst = buf->mem->dev_ptr + buf->offset + r->bufferOffset +
+                      ((size_t)l * depth + z) * dst_slice,
+               .src_pitch = ip,
+               .dst_pitch = dst_row,
+               .width_bytes = (size_t)util_format_get_nblocksx(
+                  pfmt, r->imageExtent.width) * bpp,
+               .rows = util_format_get_nblocksy(pfmt, r->imageExtent.height),
+               .src_end = cpvk_image_end(img),
+               .dst_end = buf->mem->dev_ptr + buf->offset + buf->vk.size,
+            };
+         }
+      }
    }
 }
 

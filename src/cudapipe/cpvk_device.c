@@ -56,6 +56,10 @@ static const struct vk_device_extension_table cpvk_device_extensions = {
     * that uses it is the test of it -- not ahead of it.
     */
    .KHR_maintenance1 = true,
+
+   /* The capture uses the KHR aliases even though these commands are core in
+    * 1.1. The implementation below is shared with the core entrypoints. */
+   .KHR_descriptor_update_template = true,
 };
 
 static void
@@ -354,7 +358,8 @@ cpvk_report_env(void)
       "CPVK_DEBUG_RT", "CPVK_DEBUG_PUSH", "CPVK_DEBUG_FACES",
       "CPVK_DEBUG_EPISODE", "CPVK_DEBUG_PASS", "CPVK_DEBUG_ROWS",
       "CPVK_ABUF_MIN_TRIS", "CPVK_NO_MERGE_SCISSOR", "CPVK_KEEP_PUSHKEY",
-      "CPVK_DEBUG_CLIP", "CPVK_NO_HOIST_INPUTS",
+      "CPVK_DEBUG_CLIP", "CPVK_NO_HOIST_INPUTS", "CPVK_NO_REG_SSA",
+      "CPVK_SCALARIZE", "CPVK_KEEP_SMALL_DYNAMIC_REGCAP",
       /* Names this driver no longer reads, reported so that a script or a
        * shell still carrying one is not silently ignored. */
       "CPVK_BATCH", "CPVK_BATCH_BLEND",

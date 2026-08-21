@@ -32,7 +32,7 @@ static const struct cpvk_format_info cpvk_formats[] = {
    { VK_FORMAT_R8G8B8A8_SRGB,       CP_TEXEL_R8G8B8A8_UNORM,     CP_COLOR_R8G8B8A8_SRGB,       false },
    { VK_FORMAT_B8G8R8A8_UNORM,      CP_TEXEL_B8G8R8A8_UNORM,     CP_COLOR_B8G8R8A8_UNORM,      false },
    { VK_FORMAT_B8G8R8A8_SRGB,       CP_TEXEL_B8G8R8A8_UNORM,     CP_COLOR_B8G8R8A8_SRGB,       false },
-   { VK_FORMAT_R8G8_UNORM,          CP_TEXEL_R8G8_UNORM,         -1,                           false },
+   { VK_FORMAT_R8G8_UNORM,          CP_TEXEL_R8G8_UNORM,         CP_COLOR_R8G8_UNORM,          false },
    { VK_FORMAT_R8_UNORM,            CP_TEXEL_R8_UNORM,           CP_COLOR_R8_UNORM,            false },
    { VK_FORMAT_R16G16B16A16_SFLOAT, CP_TEXEL_R16G16B16A16_FLOAT, CP_COLOR_R16G16B16A16_FLOAT,  false },
    { VK_FORMAT_R32G32B32A32_SFLOAT, CP_TEXEL_R32G32B32A32_FLOAT, CP_COLOR_R32G32B32A32_FLOAT,  false },
@@ -49,10 +49,21 @@ static const struct cpvk_format_info cpvk_formats[] = {
     */
    { VK_FORMAT_R16G16_SFLOAT,       CP_TEXEL_R16G16_SFLOAT,      CP_COLOR_R16G16_SFLOAT,       false },
    { VK_FORMAT_R16_SFLOAT,          CP_TEXEL_R16_SFLOAT,         CP_COLOR_R16_SFLOAT,          false },
+   { VK_FORMAT_R16G16_UNORM,        CP_TEXEL_R16G16_UNORM,       -1,                           false },
+   { VK_FORMAT_R32_SINT,            CP_TEXEL_R32_SINT,           -1,                           false },
+   { VK_FORMAT_R16_SINT,            CP_TEXEL_R16_SINT,           -1,                           false },
    { VK_FORMAT_B10G11R11_UFLOAT_PACK32, CP_TEXEL_R11G11B10_FLOAT, CP_COLOR_R11G11B10_FLOAT,    false },
    { VK_FORMAT_A2B10G10R10_UNORM_PACK32, CP_TEXEL_A2B10G10R10_UNORM, CP_COLOR_A2B10G10R10_UNORM, false },
    { VK_FORMAT_R5G6B5_UNORM_PACK16, CP_TEXEL_R5G6B5_UNORM,       -1,                           false },
-   { VK_FORMAT_D32_SFLOAT,          0,                           -1,                           true  },
+   { VK_FORMAT_BC1_RGB_UNORM_BLOCK,  CP_TEXEL_DXT1_RGB,           -1,                           false },
+   { VK_FORMAT_BC1_RGB_SRGB_BLOCK,   CP_TEXEL_DXT1_RGB,           -1,                           false },
+   { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, CP_TEXEL_DXT1_RGBA,          -1,                           false },
+   { VK_FORMAT_BC1_RGBA_SRGB_BLOCK,  CP_TEXEL_DXT1_RGBA,          -1,                           false },
+   { VK_FORMAT_BC2_UNORM_BLOCK,      CP_TEXEL_DXT3_RGBA,          -1,                           false },
+   { VK_FORMAT_BC2_SRGB_BLOCK,       CP_TEXEL_DXT3_RGBA,          -1,                           false },
+   { VK_FORMAT_BC3_UNORM_BLOCK,      CP_TEXEL_DXT5_RGBA,          -1,                           false },
+   { VK_FORMAT_BC3_SRGB_BLOCK,       CP_TEXEL_DXT5_RGBA,          -1,                           false },
+   { VK_FORMAT_D32_SFLOAT,          CP_TEXEL_R32_FLOAT,           -1,                           true  },
    { VK_FORMAT_D32_SFLOAT_S8_UINT,  0,                           -1,                           true  },
 };
 
@@ -74,12 +85,26 @@ cpvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    VkFormatFeatureFlags linear = 0, buffer = 0;
 
    if (info) {
-      if (info->texel)
+      if (info->texel) {
+         enum pipe_format pfmt = vk_format_to_pipe_format(format);
          linear |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-                   VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
-                   VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
-                   VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+                   VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+         /* Integer payloads are bitcast by the sampler and cannot be
+          * interpolated as floats. */
+         if (!util_format_is_pure_integer(pfmt))
+            linear |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+         /* Format feature bits make every advertised source/destination pair
+          * legal. The implementation handles scaled same-format RGBA8 UNORM
+          * and the RGBA/BGRA channel-order conversion between that pair. Keep
+          * the advertised set to exactly that closed family; SRGB and packed
+          * formats would require cross-format decode/encode the copy kernel
+          * does not yet have. */
+         if (format == VK_FORMAT_R8G8B8A8_UNORM ||
+             format == VK_FORMAT_B8G8R8A8_UNORM)
+            linear |= VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                      VK_FORMAT_FEATURE_BLIT_DST_BIT;
+      }
       if (info->color >= 0)
          linear |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
                    VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
@@ -163,7 +188,13 @@ cpvk_image_layout(struct cpvk_image *image)
       unsigned h = util_format_get_nblocksy(pfmt, u_minify(vk->extent.height, l));
       unsigned d = u_minify(vk->extent.depth, l);
 
-      image->row_stride[l] = align(w * bpp, 64);
+      /* The shared renderer addresses colour attachments as packed
+       * pixel_index * blocksize.  Padding a native image row here made its
+       * writes walk a different layout from copies and sampling: a 916-wide
+       * atlas was rendered at 3664 bytes per row and read back at 3712,
+       * shearing every row diagonally.  CUDA copies accept an arbitrary
+       * tightly packed pitch, so keep the image and renderer layouts equal. */
+      image->row_stride[l] = w * bpp;
       image->level_offset[l] = offset;
       image->level_size[l] = (uint64_t)image->row_stride[l] * h * d;
       offset += image->level_size[l] * vk->array_layers;
@@ -242,6 +273,9 @@ cpvk_GetImageSubresourceLayout(VkDevice _device, VkImage _image,
 {
    VK_FROM_HANDLE(cpvk_image, image, _image);
    unsigned l = pSubresource->mipLevel;
+   enum pipe_format pfmt = vk_format_to_pipe_format(image->vk.format);
+   unsigned h = util_format_get_nblocksy(
+      pfmt, MAX2(image->vk.extent.height >> l, 1u));
 
    *pLayout = (VkSubresourceLayout) {
       .offset = image->level_offset[l] +
@@ -249,7 +283,7 @@ cpvk_GetImageSubresourceLayout(VkDevice _device, VkImage _image,
       .size = image->level_size[l],
       .rowPitch = image->row_stride[l],
       .arrayPitch = image->level_size[l],
-      .depthPitch = image->level_size[l],
+      .depthPitch = (uint64_t)image->row_stride[l] * h,
    };
 }
 
@@ -321,7 +355,12 @@ cpvk_CreateImageView(VkDevice _device,
          };
          for (unsigned l = 0; l < levels; l++) {
             view->tex_info_host->row_stride[l] = img->row_stride[l];
-            view->tex_info_host->img_stride[l] = img->level_size[l];
+            /* A sampler's z coordinate advances one depth slice, not one
+             * whole mip level.  They are equal for 2D arrays (depth is one),
+             * but a 3D level contains every z slice. */
+            unsigned h = util_format_get_nblocksy(
+               pfmt, MAX2(img->vk.extent.height >> l, 1u));
+            view->tex_info_host->img_stride[l] = img->row_stride[l] * h;
             view->tex_info_host->mip_offset[l] = img->level_offset[l];
          }
 
