@@ -5179,3 +5179,43 @@ compared the scalar type kinds only, so a vector pair never matched and
 `select <4 x i1>, <4 x i32>, <4 x float>` reached the verifier. That is a real
 defect on any path that produces a vector `bcsel`, and it is what let the
 flattening experiment run at all.
+
+## The sweep gap is host-bound, and the shader is not slow
+
+The tool order in `CLAUDE.md` exists to prevent exactly the three turns that
+preceded this one. Asked in the right order:
+
+**Is the frame host-bound or kernel-bound?** `nvidia-smi` utilisation with no
+profiler attached:
+
+    instancing    native 89.7% busy    gallium 99.0%
+    vulkanscene   native 68.9%         gallium 77.7%
+
+Host-bound, and more so than the driver being replaced.
+
+**Why is that kernel slow?** It is not. Under `ncu`, instancing's fragment
+`main` at grid 4096 takes **235,680 ns in this driver and 236,992 ns in the
+Gallium one**, at the same 126 registers per thread and the same occupancy.
+The 3.2x that `nsys` reports for the same kernel is inflation from concurrency
+and from clocks that drop while the device waits -- not from the code.
+
+That retires the whole shader-quality line: the PTX instruction counts match
+within a few percent, the local memory is gone as a theory, and the kernels are
+measurably the same speed.
+
+**Where the host time goes.** `cuStreamSynchronize`: **9.6 calls a frame in
+this driver, zero in the Gallium one**, 3,653 ms of a 3,949 ms total API time
+over 300 frames. `cpvk_queue_submit()` drains both streams at the end of every
+submit.
+
+**And removing that does not help.** `CPVK_ASYNC_SUBMIT=1` leaves the fence
+wait to drain instead -- 18/18 run, 17/18 pixel-correct, so the semantics hold
+-- and instancing goes from 1.48x to 1.59x of the reference while nothing else
+moves. The samples wait on a fence immediately after submitting, so the drain
+only moves from one call to the other and there was never any overlap to
+recover.
+
+So the gap is host-side, it is not the submit drain, and it is not the shader.
+What has not been looked at is the host work *between* launches: 38 launches a
+frame against the Gallium driver's 40.5, at 8.50 ms a frame against 5.75, is
+about 70 microseconds per launch of host time that driver does not spend.
