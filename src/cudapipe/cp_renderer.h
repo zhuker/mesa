@@ -110,6 +110,17 @@ struct cp_batch_key {
  */
 struct cp_gallium;
 
+/* A native frontend may stage CPU-written descriptor snapshots separately
+ * from the device addresses stored in shader UBO rows.  The fragment sampler
+ * specializer is the only renderer code which dereferences such an address
+ * on the CPU, so queue submission publishes the active mappings here. */
+struct cp_host_map {
+   CUdeviceptr dev;
+   const void *host;
+   size_t size;
+};
+#define CP_MAX_HOST_MAPS 1024
+
 struct cp_context {
 
    /* The device, not the screen: four fields the pipeline reads, and no
@@ -284,6 +295,9 @@ struct cp_context {
     * cp_fs_launch_shader() — which both shading paths go through, and which is
     * three call frames below where the batch is known.
     */
+   struct cp_host_map host_maps[CP_MAX_HOST_MAPS];
+   unsigned num_host_maps;
+
    struct cp_fs_batch {
       const uint64_t *ubos;   /* rows of CP_ARG_UBO_STRIDE, or NULL */
       unsigned ndraws;

@@ -360,10 +360,13 @@ cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
    cmd->index_ptr = NULL;
    cmd->index_size = 0;
    cmd->push_size = 0;
-   for (unsigned i = 0; i < cmd->num_desc_retired; i++)
-      cuMemFree(cmd->desc_retired[i]);
+   for (unsigned i = 0; i < cmd->num_desc_retired; i++) {
+      cuMemFree(cmd->desc_retired[i].dev);
+      cuMemFreeHost(cmd->desc_retired[i].host);
+   }
    cmd->num_desc_retired = 0;
    cmd->desc_arena_used = 0;
+   cmd->desc_arena_dirty = false;
 }
 
 static void
@@ -373,11 +376,15 @@ cpvk_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd)
       container_of(vk_cmd, struct cpvk_cmd_buffer, vk);
 
    vk_command_buffer_finish(&cmd->vk);
-   for (unsigned i = 0; i < cmd->num_desc_retired; i++)
-      cuMemFree(cmd->desc_retired[i]);
+   for (unsigned i = 0; i < cmd->num_desc_retired; i++) {
+      cuMemFree(cmd->desc_retired[i].dev);
+      cuMemFreeHost(cmd->desc_retired[i].host);
+   }
    free(cmd->desc_retired);
    if (cmd->desc_arena)
       cuMemFree(cmd->desc_arena);
+   if (cmd->desc_arena_host)
+      cuMemFreeHost(cmd->desc_arena_host);
    free(cmd->ops);
    vk_free(&cmd->vk.pool->alloc, cmd);
 }
@@ -427,10 +434,13 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->index_ptr = NULL;
    cmd->index_size = 0;
    cmd->push_size = 0;
-   for (unsigned i = 0; i < cmd->num_desc_retired; i++)
-      cuMemFree(cmd->desc_retired[i]);
+   for (unsigned i = 0; i < cmd->num_desc_retired; i++) {
+      cuMemFree(cmd->desc_retired[i].dev);
+      cuMemFreeHost(cmd->desc_retired[i].host);
+   }
    cmd->num_desc_retired = 0;
    cmd->desc_arena_used = 0;
+   cmd->desc_arena_dirty = false;
    return VK_SUCCESS;
 }
 
@@ -453,24 +463,30 @@ cpvk_CmdBindPipeline(VkCommandBuffer commandBuffer,
 }
 
 /* Keep an outgrown arena alive until the command buffer is reset. */
-static void
-cpvk_arena_retire(struct cpvk_cmd_buffer *cmd, CUdeviceptr arena)
+static bool
+cpvk_arena_retire(struct cpvk_cmd_buffer *cmd, CUdeviceptr arena,
+                  void *host, size_t used)
 {
    if (cmd->num_desc_retired >= cmd->max_desc_retired) {
       unsigned want = cmd->max_desc_retired ? cmd->max_desc_retired * 2 : 8;
-      CUdeviceptr *p = realloc(cmd->desc_retired, want * sizeof(*p));
+      void *p = realloc(cmd->desc_retired,
+                        want * sizeof(*cmd->desc_retired));
       if (!p)
-         return;   /* leaked until the device goes away; better than a crash */
+         return false;
       cmd->desc_retired = p;
       cmd->max_desc_retired = want;
    }
-   cmd->desc_retired[cmd->num_desc_retired++] = arena;
+   unsigned i = cmd->num_desc_retired++;
+   cmd->desc_retired[i].dev = arena;
+   cmd->desc_retired[i].host = host;
+   cmd->desc_retired[i].used = used;
+   return true;
 }
 
 /*
  * Copy a descriptor set into memory this command buffer owns and return its
- * device address. Managed, because the renderer reads descriptors on the host
- * when it specialises a shader on its sampler state.
+ * device address. The host mirror remains available for sampler specialization;
+ * queue submission uploads it once before either CUDA stream can consume it.
  */
 static CUdeviceptr
 cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
@@ -493,17 +509,27 @@ cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
       size_t want = MAX2(cmd->desc_arena_size * 2,
                          cmd->desc_arena_used + bytes);
       want = MAX2(want, (size_t)64 * 1024);
-      CUdeviceptr fresh;
-      if (cuMemAllocManaged(&fresh, want, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+      CUdeviceptr fresh = 0;
+      void *fresh_host = NULL;
+      if (cuMemAlloc(&fresh, want) != CUDA_SUCCESS ||
+          cuMemAllocHost(&fresh_host, want) != CUDA_SUCCESS) {
+         if (fresh)
+            cuMemFree(fresh);
          return set->buf;
+      }
 
       /* The old arena is still referenced by the draws already recorded, so
-       * it is kept until the command buffer is reset rather than freed here.
-       * One leak per growth, bounded by the buffer's lifetime. */
-      if (cmd->desc_arena)
-         cpvk_arena_retire(cmd, cmd->desc_arena);
+       * keep both halves until reset and upload it along with the current one
+       * at submit. */
+      if (cmd->desc_arena &&
+          !cpvk_arena_retire(cmd, cmd->desc_arena, cmd->desc_arena_host,
+                             cmd->desc_arena_used)) {
+         cuMemFree(fresh);
+         cuMemFreeHost(fresh_host);
+         return set->buf;
+      }
       cmd->desc_arena = fresh;
-      cmd->desc_arena_host = (struct cpvk_descriptor *)(uintptr_t)fresh;
+      cmd->desc_arena_host = fresh_host;
       cmd->desc_arena_size = want;
       cmd->desc_arena_used = 0;
    }
@@ -514,6 +540,7 @@ cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
    CUdeviceptr addr = cmd->desc_arena + cmd->desc_arena_used;
    memcpy(dst, set->host, bytes);
    cmd->desc_arena_used += bytes;
+   cmd->desc_arena_dirty = true;
    return addr;
 }
 
@@ -538,6 +565,13 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
        */
       unsigned slot = layout->set_slot[pInfo->firstSet + i];
       CUdeviceptr snap_addr = cpvk_snapshot_set(cmd, set);
+      struct cpvk_descriptor *snap;
+      if (snap_addr >= cmd->desc_arena &&
+          snap_addr < cmd->desc_arena + cmd->desc_arena_size)
+         snap = (struct cpvk_descriptor *)
+            ((char *)cmd->desc_arena_host + (snap_addr - cmd->desc_arena));
+      else
+         snap = (struct cpvk_descriptor *)(uintptr_t)snap_addr;
       if (slot < CPVK_MAX_ARG_BUFS) {
          cmd->addrs[slot] = snap_addr;
 
@@ -546,7 +580,7 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
           * snapshot; a batch key is a merge decision, not a security
           * boundary. */
          uint64_t h = 0xcbf29ce484222325ull;
-         const uint8_t *bytes = (const uint8_t *)(uintptr_t)snap_addr;
+         const uint8_t *bytes = (const uint8_t *)snap;
          size_t n = (size_t)set->layout->num_descriptors *
                     sizeof(struct cpvk_descriptor);
          for (size_t b = 0; bytes && b < n; b++) {
@@ -565,9 +599,6 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
        * than the set, because the next bind of the same set carries a
        * different offset and must not rewrite this draw's.
        */
-      struct cpvk_descriptor *snap =
-         (struct cpvk_descriptor *)(uintptr_t)snap_addr;
-
       for (unsigned b = 0; b < set->layout->num_bindings &&
                            dyn < pInfo->dynamicOffsetCount; b++) {
          VkDescriptorType ty = set->layout->bindings[b].type;

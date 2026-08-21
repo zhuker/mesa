@@ -24,10 +24,50 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       container_of(vk_queue->base.device, struct cpvk_device, vk);
 
    cuCtxSetCurrent(dev->cu_ctx);
+   dev->renderer.num_host_maps = 0;
 
    for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
       struct cpvk_cmd_buffer *cmd =
          container_of(submit->command_buffers[i], struct cpvk_cmd_buffer, vk);
+
+      /* Publish the host mirrors for sampler specialization. Shader UBO rows
+       * contain device addresses; this is the bounded translation used by the
+       * one renderer path which inspects descriptors on the CPU. */
+      unsigned needed = cmd->num_desc_retired + !!cmd->desc_arena;
+      if (dev->renderer.num_host_maps + needed > CP_MAX_HOST_MAPS)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      for (unsigned a = 0; a < cmd->num_desc_retired; a++)
+         dev->renderer.host_maps[dev->renderer.num_host_maps++] =
+            (struct cp_host_map) {
+               cmd->desc_retired[a].dev, cmd->desc_retired[a].host,
+               cmd->desc_retired[a].used,
+            };
+      if (cmd->desc_arena)
+         dev->renderer.host_maps[dev->renderer.num_host_maps++] =
+            (struct cp_host_map) {
+               cmd->desc_arena, cmd->desc_arena_host,
+               cmd->desc_arena_used,
+            };
+
+      /* Descriptor snapshots are written by the CPU while recording and read
+       * by every shader. A managed arena made that one page ping-pong on each
+       * frame: the first tiny vertex launch paid hundreds of GPU page faults.
+       * Upload each recorded arena once instead. The synchronous copy also
+       * orders it before both CUDA streams used below. */
+      if (cmd->desc_arena_dirty) {
+         for (unsigned a = 0; a < cmd->num_desc_retired; a++) {
+            if (cuMemcpyHtoD(cmd->desc_retired[a].dev,
+                             cmd->desc_retired[a].host,
+                             cmd->desc_retired[a].used) != CUDA_SUCCESS)
+               return vk_error(dev, VK_ERROR_DEVICE_LOST);
+         }
+         if (cmd->desc_arena_used &&
+             cuMemcpyHtoD(cmd->desc_arena, cmd->desc_arena_host,
+                          cmd->desc_arena_used) != CUDA_SUCCESS)
+            return vk_error(dev, VK_ERROR_DEVICE_LOST);
+         cmd->desc_arena_dirty = false;
+      }
+
       /* In record order: a clear after a draw must not run before it. */
       for (unsigned o = 0; o < cmd->num_ops; o++) {
          switch (cmd->ops[o].kind) {

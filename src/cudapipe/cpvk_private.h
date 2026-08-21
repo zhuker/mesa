@@ -462,8 +462,15 @@ struct cpvk_cmd_buffer {
    CUdeviceptr desc_arena;
    struct cpvk_descriptor *desc_arena_host;
    size_t desc_arena_size, desc_arena_used;
-   /* Arenas outgrown while draws still point into them; freed at reset. */
-   CUdeviceptr *desc_retired;
+   bool desc_arena_dirty;
+   /* Arenas outgrown while draws still point into them; copied at submit and
+    * freed at reset.  Host and device storage stay separate so a CPU rewrite
+    * cannot fault the page back while a shader is reading it. */
+   struct {
+      CUdeviceptr dev;
+      void *host;
+      size_t used;
+   } *desc_retired;
    unsigned num_desc_retired, max_desc_retired;
 };
 

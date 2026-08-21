@@ -2006,6 +2006,20 @@ cp_tune_after(struct cp_context *cp, struct cp_shader_binary *fs, bool timed)
  * buffers, and an ABI described in two places is an ABI that will be described
  * differently.
  */
+static const void *
+cp_host_ptr(const struct cp_context *cp, uint64_t addr)
+{
+   for (unsigned i = 0; i < cp->num_host_maps; i++) {
+      const struct cp_host_map *m = &cp->host_maps[i];
+      if (addr >= m->dev && addr - m->dev < m->size)
+         return (const char *)m->host + (addr - m->dev);
+   }
+   /* Gallium's bindings are managed allocations and remain directly host
+    * visible. Native addresses not in a map use the same fallback for null
+    * pages and other context-lifetime managed storage. */
+   return (const void *)(uintptr_t)addr;
+}
+
 static bool
 cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
                     CUdeviceptr counter, CUdeviceptr fs_in,
@@ -2042,7 +2056,7 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
       }
       for (unsigned r = 0; r < rows; r++) {
          const uint64_t *row = tbl_src + (size_t)r * CP_ARG_UBO_STRIDE;
-         const char *base = (const char *)(uintptr_t)row[ref->ubo_slot];
+         const char *base = cp_host_ptr(cp, row[ref->ubo_slot]);
          if (!base) {
             samplers_resolved = false;
             break;
@@ -2096,7 +2110,7 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
          for (unsigned i = 0; i < fs->num_tex_descs; i++) {
             const struct cp_tex_desc_ref *ref = &fs->tex_descs[i];
             const char *base = row && ref->ubo_slot < CP_ARG_UBO_STRIDE
-               ? (const char *)(uintptr_t)row[ref->ubo_slot] : NULL;
+               ? cp_host_ptr(cp, row[ref->ubo_slot]) : NULL;
             unsigned sampler = base
                ? *(const unsigned *)(base + ref->sampler_offset +
                                       CP_DESC_SAMPLER_INDEX_OFFSET) : 0;

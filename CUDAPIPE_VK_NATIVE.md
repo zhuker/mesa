@@ -5847,3 +5847,43 @@ Mesa already has the targeted pass for this: `nir_opt_move_to_top` with
 BENCH sweep exits zero throughout; the 18-sample correctness sweep remains
 17/18 (`pbribl` 0.0286, as before); 14/14 tests pass.  Both captures remain at
 1496/1496, 7.34 ms against 7.17 recorded, and 1510/1510, 22.76 against 25.20.
+
+## Command descriptor snapshots: stop faulting one page back and forth
+
+The 60-frame `texture` regression was not the input-hoist change.  A 600-frame
+run showed the real shape: a 0.176 ms median with 0.47--0.96 ms spikes early in
+the measured orbit, then none once the working pages were resident.  In an
+Nsight Systems capture made with GPU Unified Memory fault tracking explicitly
+enabled (despite its documented overhead):
+
+* 21 slow one-block vertex launches averaged 490.7 us and overlapped **1,916**
+  GPU page-fault events.
+* 1,019 fast launches averaged 5.4 us and overlapped 105 events.
+* Every event in a representative slow launch names the same address, and that
+  address is exactly the base page printed for the command buffer's 64 KiB
+  descriptor-snapshot arena.
+
+The arena was `cuMemAllocManaged`. Recording writes descriptor snapshots on the
+CPU; shaders read them on the GPU; the next recording writes the page again.
+Prefetching merely moves that ping-pong earlier and measured almost twice as
+slow.
+
+Split it instead: pinned host staging plus `cuMemAlloc` device storage.  A dirty
+command buffer copies all current and retired arenas once at submit with a
+synchronous HtoD copy, which also orders the data before both CUDA streams.
+Sampler specialization is the one renderer path that dereferences descriptor
+rows on the CPU; the queue publishes bounded device-to-host arena mappings and
+that path translates through them.  Re-submitting an unchanged command buffer
+does not upload it again.
+
+Measured with the same 60-frame BENCH sweep:
+
+* `texture`: 0.29 -> **0.17 ms**, Gallium 0.16 (1.81x -> **1.06x**).
+* `dynamicuniformbuffer`: 0.37 -> **0.23 ms**, Gallium 0.36.
+* Sweep median: 1.17x -> **1.14x**.
+* Crossroads replay: 7.34 -> **7.26 ms** (7.17 recorded).
+* Older replay: 22.76 -> **22.68 ms** (25.20 recorded).
+
+The full gate remains 18/18 executing, 17/18 pixel-correct (`pbribl` at its
+recorded 0.0286), 14/14 tests, and both captures at all frames.  Gallium remains
+unchanged.
