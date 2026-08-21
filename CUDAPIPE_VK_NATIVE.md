@@ -5440,3 +5440,32 @@ against eleven, and a UI overlay drawn into the same pass afterwards.
 
 Default behaviour is unchanged and measured so: 18/18 samples run, 17/18
 pixel-correct, fifteen unit tests, replays 7.36 and 22.84 ms.
+
+### A false positive, and what it actually showed
+
+Raising the reproducer to `pushconstants`' index count -- 13,536 a draw, 148,896
+vertices over an eleven-draw batch -- made the two drivers differ, and for a
+few minutes that looked like the reproduction. Bisecting the index count found
+a difference at every size down to 16,500 vertices, which ruled out the 16-bit
+overflow the numbers had suggested.
+
+It was the geometry, not the index count. Those triangles all sit at z = 0.5
+and overlap each other at 0.14 spacing, so the picture depends on which
+coincident-depth fragment wins. Narrowing them so they do not overlap:
+
+    NIDX      3      identical
+    NIDX     90      identical
+    NIDX    900      identical
+    NIDX  13536      identical
+
+So the index count is ruled out too, and what the overlapping case showed is a
+real but separate thing: **under batching this driver resolves coincident-depth
+fragments differently from the Gallium one.** That is worth knowing and is not
+what makes `pushconstants` render 12,961 lit pixels where 51,880 is correct --
+missing geometry is not a tie-break.
+
+Ruled out for the push-constant defect now: index range, identical ranges, a
+descriptor UBO beside the push block, instancing to 66k vertices, index counts
+to 13,536, and total vertices to 148,896. What remains is the sample's mat4
+uniforms, its depth buffer, its fifteen draws, and the UI overlay in the same
+pass.
