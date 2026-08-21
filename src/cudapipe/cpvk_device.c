@@ -354,7 +354,7 @@ cpvk_report_env(void)
       "CPVK_DEBUG_RT", "CPVK_DEBUG_PUSH", "CPVK_DEBUG_FACES",
       "CPVK_DEBUG_EPISODE", "CPVK_DEBUG_PASS", "CPVK_DEBUG_ROWS",
       "CPVK_ABUF_MIN_TRIS", "CPVK_NO_MERGE_SCISSOR", "CPVK_KEEP_PUSHKEY",
-      "CPVK_DEBUG_CLIP",
+      "CPVK_DEBUG_CLIP", "CPVK_NO_HOIST_INPUTS",
       /* Names this driver no longer reads, reported so that a script or a
        * shell still carrying one is not silently ignored. */
       "CPVK_BATCH", "CPVK_BATCH_BLEND",

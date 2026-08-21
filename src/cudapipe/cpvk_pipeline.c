@@ -831,6 +831,19 @@ cpvk_compile_stage(struct cpvk_device *dev,
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             cp_type_size_vec4, nir_lower_io_lower_64bit_to_32);
 
+   /* Hoist vertex-input loads before the arithmetic which consumes them.
+    *
+    * The instancing sample's rock shader runs over 4.42 million vertices.  In
+    * this frontend's NIR the loads were interleaved with sin/cos and matrix
+    * chains; the CUDA JIT then kept only 104 registers live and serialized
+    * global loads (94.4% long-scoreboard stalls, 21% DRAM throughput).  Mesa's
+    * existing pass exposes those independent loads just as the Gallium path's
+    * lowering does: 6.14 instead of 8.63 ms/frame on that sample. */
+   if (!getenv("CPVK_NO_HOIST_INPUTS") &&
+       nir->info.stage == MESA_SHADER_VERTEX)
+      NIR_PASS(_, nir, nir_opt_move_to_top,
+               nir_move_to_top_input_loads_simple);
+
    /*
     * Registers back to SSA, immediately before the backend.
     *

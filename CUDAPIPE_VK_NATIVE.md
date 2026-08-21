@@ -5797,3 +5797,53 @@ Which is worth having on its own -- the host issue profile is not where the
 difference is -- and it is what makes the next question askable: the ranges now
 name which stage owns the third fragment launch of each draw, the one costing
 4,043 us here against 939.
+
+## Correction and fix: it was the instanced vertex shader, starved of load parallelism
+
+The restored NVTX ranges make the prior "third fragment launch" claim
+checkable, and it was wrong.  Joining each device kernel's CUPTI correlation ID
+to the host `cuLaunchKernel`, then containing that host timestamp in the NVTX
+ranges, names the repeating four:
+
+    0  fs      draw 1 tris
+    1  fs      draw 1984 tris
+    2  vertex  draw 1474560 tris inst
+    3  fs      draw 1474560 tris inst
+
+So the 4,043 us launch is the **instanced-rock vertex shader**, not a fragment
+shader.  It runs 4.42 million invocations.  That correction is why restoring
+instrumentation was not merely cosmetic.
+
+Nsight Compute on exactly launch 2 then says what differs:
+
+                                      native       Gallium
+    duration                            3.64 ms       0.95 ms
+    executed instructions          104,993,792  104,993,792
+    DRAM read                         981.3 MB      980.6 MB
+    DRAM write                        420.3 MB      421.0 MB
+    global-load sectors           86,938,624   86,938,624
+    L1 hit                                83.1%        83.7%
+    L2 hit                                52.3%        51.1%
+    long-scoreboard stall               94.4%        50.3%
+    DRAM throughput                      21.4%        84.0%
+    final registers/thread                 104          120
+
+It is identical dynamic work and traffic, but this frontend interleaves vertex
+input loads with the shader's trigonometric and matrix dependency chains.  The
+JIT cannot keep enough independent memory operations in flight: nearly every
+warp cycle waits on a long L1/TEX dependency while the memory system is only a
+quarter full.  Gallium's lowering hoists those inputs and retains more live
+values.
+
+Mesa already has the targeted pass for this: `nir_opt_move_to_top` with
+`nir_move_to_top_input_loads_simple`.  Running it after native IO lowering:
+
+* `instancing`: 8.63 -> **6.14 ms/frame**, Gallium 5.84, **1.47x -> 1.05x**.
+* Exact shader under NCU: 3.64 -> **1.36 ms**.
+* Long-scoreboard stalls: 94.4% -> **85.4%**.
+* Sweep median: 1.20x -> **1.17x**.
+
+`CPVK_NO_HOIST_INPUTS=1` restores the old scheduling for an A/B.  The 60-frame
+BENCH sweep exits zero throughout; the 18-sample correctness sweep remains
+17/18 (`pbribl` 0.0286, as before); 14/14 tests pass.  Both captures remain at
+1496/1496, 7.34 ms against 7.17 recorded, and 1510/1510, 22.76 against 25.20.
