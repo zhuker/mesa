@@ -5707,3 +5707,39 @@ and whether they are the same kernels has not been shown.
 
 That is the thread to pull next, and `tests/cp_prof_kernels.py` exists for
 exactly this problem.
+
+## The remaining gap, attributed: one fragment launch in ten costs 4.3x
+
+`tests/cp_prof_kernels.py` splits by grid geometry, which is the only way to
+tell this driver's shaders apart -- they are all named `main`. Against the
+Gallium driver on instancing, every kernel matches within one percent except
+one:
+
+    kernel                grid    native med   gallium med
+    cp_vertex_fetch      17280      1838.9 us     1841.7 us
+    cp_clip_triangles    23040      1622.4        1639.5
+    cp_rasterize_stage1  46080       259.1         258.1
+    cp_fs_interpolate      900        34.6          34.7
+    main                  4096       380.4         301.5
+
+and `main` at grid 4096 -- the fragment stage -- is not slower in the median so
+much as **bimodal**:
+
+              n     med      p90       max      mean
+    native   1628   380 us   4,057 us  4,290 us  1,151 us
+    gallium  1676   302      940       1,350       336
+
+One launch in ten costs 4.0 ms here against 0.94 ms there. Those 163 launches
+carry 35.6% of the kernel time against the other driver's 28.2%, and the
+excess is 163 x 3.1 ms = 508 ms over 300 frames -- **1.7 ms/frame of the 2.8
+ms/frame gap.**
+
+That is the first quantitative account of what is left. It is also the third
+time the tool named in `CLAUDE.md` for a question answered a question three
+turns of guessing could not: `cp_gpu_busy.sh` for host-versus-kernel bound,
+`cp_perf_run.sh` for the sweep comparison that found the host-side transfer
+paths, and now `cp_prof_kernels.py` for which kernel actually differs.
+
+The next question is which launches those are -- there are four `main` at grid
+4096 per draw and roughly one in ten is slow, so it is a property of particular
+draws rather than of every fourth launch.
