@@ -5535,3 +5535,35 @@ narrower and better posed: a varying written by a batched draw, in a shader
 whose fragment stage reads no constant buffer, arrives at the interpolator
 wrong -- while `gl_Position`, written by the same shader from the same block,
 arrives right.
+
+### The affected draws read a zero push block, and the upload is not the reason
+
+Two more measurements sharpen it further.
+
+**It is not `inColor`.** Replacing the sample's vertex shader with
+`outColor = pushConsts.color.rgb`, dropping the attribute entirely, leaves the
+merged frame just as wrong: 14,041 lit pixels over 5 colours against 51,880
+over 16. The push block itself is what reads wrong.
+
+**And the affected draws read it as zero, not as another draw's.** The black
+circle in the merged frame is at the *centre of the ring* -- the origin. Those
+spheres are not misplaced, they are at `position = 0` with `colour = 0`, all
+stacked on each other. So the shader sees a zero block, which is what the null
+descriptor holds.
+
+That retracts the previous entry's conclusion: `position` is not "right for
+every draw". It is right for the handful of draws that render correctly and
+zero for the rest, exactly as the colour is. Both come from the same block and
+both are zero together, which is a simpler and more likely story than a varying
+path that misbehaves while `gl_Position` does not.
+
+**But the upload never fails.** `cp_upload_begin()` refuses zero times over the
+frame, merged or not, so `push_dev` is always a real address and the slot is
+never the null descriptor for want of arena space. `CPVK_DEBUG_ROWS` already
+showed the rows holding distinct, non-null pointers 0x100 apart.
+
+So the block is uploaded, the pointer is recorded per draw, the row is
+distinct -- and the shader reads zeros. What is left is the ordering between
+the `cuMemcpyHtoDAsync` that sends the block and the launch that reads it:
+`cp_upload_end()` posts the copy on `cp->stream`, and if the batch's kernels
+run on any other stream that ordering does not exist.
