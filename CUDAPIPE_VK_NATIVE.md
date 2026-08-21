@@ -5219,3 +5219,46 @@ So the gap is host-side, it is not the submit drain, and it is not the shader.
 What has not been looked at is the host work *between* launches: 38 launches a
 frame against the Gallium driver's 40.5, at 8.50 ms a frame against 5.75, is
 about 70 microseconds per launch of host time that driver does not spend.
+
+## Host-side transfer paths were the sweep gap
+
+`cp_perf_run.sh`, the project's own sweep harness, compares `ms/frame` against
+the driver being replaced. It had never been run for this driver. It says:
+
+    median ms/frame ratio 1.56, and the outliers name themselves --
+    multisampling 8.92x, multithreading 4.91x, pushconstants 3.28x,
+    texture3d 2.07x, texture 1.88x, texturemipmapgen 1.77x, pbribl 1.74x
+
+Two of those are the same defect, and both were documented as harmless in a
+comment next to the code:
+
+- **`cpvk_execute_copy` resolved multisamples on the host** -- every sample
+  plane read back, averaged on the CPU, written out again, once per render pass
+  -- "this is not on a frame's critical path and a kernel can replace it when
+  something resolves per draw". The kernel already existed and this driver
+  already loaded it: `cp_resolve_samples`, which the Gallium driver launches
+  from `cp_resource.c`.
+- **It scaled blits on the host too** -- "builds a mip chain at load time and is
+  not on a frame's critical path". `cp_blit_linear` does the same
+  bilinear-at-pixel-centres arithmetic over any encoding, and was equally
+  unused.
+
+Both now launch the kernel and fall through to the host path if the launch is
+refused. Measured by the same harness:
+
+    sample              before    now   gallium   was     now
+    multisampling        13.29   2.02     1.49   8.92x   1.36x
+    texture3d             0.31   0.16     0.15   2.07    1.07
+    texture               0.30   0.18     0.16   1.88    1.12
+    texturecubemap        0.74   0.63     0.61   1.21    1.03
+    instancing            9.11   8.61     5.84   1.56    1.47
+    computeshader         0.53   0.48     0.37   1.43    1.30
+
+    median                                       1.56x   1.30x
+
+18/18 samples run, 17/18 pixel-correct, fourteen unit tests including the four
+that exist for exactly these paths -- lod, cubelod, cubelodf16, lodblit.
+
+Still outstanding, and now the whole list: multithreading 4.90x, pushconstants
+3.26x, texturemipmapgen 1.77x, pbribl 1.74x, vulkanscene 1.35x, instancing
+1.47x.

@@ -2002,6 +2002,7 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
          .dst_h = scaling ? (unsigned)dh : 0,
          .bpp = sbpp,
          .filter_linear = pInfo->filter == VK_FILTER_LINEAR,
+         .encoding = (src->color == dst->color) ? src->color : -1,
       };
    }
 }
@@ -2353,6 +2354,45 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
             fprintf(stderr, " %04x", h[k]);
          fprintf(stderr, "\n");
       }
+   }
+
+   if (c->src_w && c->filter_linear && c->encoding >= 0 && !c->swap_rb &&
+       cp->screen->kernels.blit_linear) {
+      /*
+       * A scaling blit, on the device.
+       *
+       * The host path below reads the source back, filters it on the CPU and
+       * writes the result out, and its comment says this builds a mip chain
+       * at load time and is not on a frame's critical path. The sweep harness
+       * disagrees: texturemipmapgen is 1.77x the reference and pbribl spends
+       * 33 seconds building its irradiance cube, which is 11.7x that driver's
+       * whole run.
+       *
+       * cp_blit_linear does the same bilinear-at-pixel-centres arithmetic the
+       * host path documents, over any encoding, and this driver already loads
+       * it. A refused launch falls through.
+       */
+      struct cp_blit_linear_args ba = {
+         .src = c->src,
+         .dst = c->dst,
+         .src_width = c->src_w,
+         .src_height = c->src_h,
+         .dst_width = c->dst_w,
+         .dst_height = c->dst_h,
+         .src_stride = (uint32_t)(c->src_pitch ? c->src_pitch
+                                               : (size_t)c->src_w * c->bpp),
+         .dst_stride = (uint32_t)(c->dst_pitch ? c->dst_pitch
+                                               : (size_t)c->dst_w * c->bpp),
+         .src_layer_stride = 0,
+         .dst_layer_stride = 0,
+         .layers = 1,
+         .encoding = c->encoding,
+      };
+      void *params[] = { &ba };
+      if (cuLaunchKernel(cp->screen->kernels.blit_linear,
+                         (c->dst_w + 15) / 16, (c->dst_h + 15) / 16, 1,
+                         16, 16, 1, 0, cp->stream, params, NULL) == CUDA_SUCCESS)
+         return;
    }
 
    if (c->src_w) {
