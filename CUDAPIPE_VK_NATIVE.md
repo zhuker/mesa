@@ -5500,3 +5500,38 @@ recorded per frame.
 
 The next thing to try is the overlay, because it is the only one that puts a
 different pipeline into the same pass as the batch.
+
+### Looking at the frame: the positions are right and the colours are gone
+
+Rendering `pushconstants` both ways and looking at the two frames rather than
+their pixel counts:
+
+    correct   sixteen spheres in a ring, each its own colour
+    merged    the spheres are in the right places, and most of them are black
+
+That changes the diagnosis. The vertex shader is
+
+    outColor    = inColor * pushConsts.color.rgb;
+    worldPos    = locPos  + pushConsts.position.xyz;
+
+Both read the same push block. **`position` is right for every draw and `color`
+is not**, so the block itself reaches the vertex stage correctly -- if slot 0
+were wrong or null, every sphere would sit at the origin, and none does.
+
+What differs between them is the path afterwards: `position` goes to
+`gl_Position`, `color` goes out as a varying and comes back interpolated. So
+the defect is in per-vertex output, not in the per-draw uniform row, and every
+experiment aimed at the row was aimed at the wrong thing.
+
+Tried since, all still identical to the Gallium driver:
+
+    back-face culling on, half the triangles wound backwards   identical
+    the same test with culling off, for contrast               identical
+    the vertex shader reading a vertex attribute and
+      multiplying it by the push colour, as the sample does    identical
+
+So the reproducer still does not reproduce it, and the thing to explain is now
+narrower and better posed: a varying written by a batched draw, in a shader
+whose fragment stage reads no constant buffer, arrives at the interpolator
+wrong -- while `gl_Position`, written by the same shader from the same block,
+arrives right.
