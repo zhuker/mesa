@@ -5743,3 +5743,28 @@ paths, and now `cp_prof_kernels.py` for which kernel actually differs.
 The next question is which launches those are -- there are four `main` at grid
 4096 per draw and roughly one in ten is slow, so it is a property of particular
 draws rather than of every fourth launch.
+
+### Which launch: the third of four, every draw, 4.3x
+
+Ordering the `main` grid-4096 launches and grouping by position within each
+draw's four:
+
+    position   native med   gallium med   ratio
+      0            13.9 us       7.4 us    1.9x
+      1           126.7         56.2       2.3x
+      2         4,043.7        939.3       4.3x
+      3           390.1        308.0       1.27x
+
+It is not a tail at all -- the third launch of every draw takes 4,043 us here
+and 939 there, with a maximum of 4,290 against 1,349, so it is the same work
+every time and it is consistently four times the cost. The other three are
+1.3x to 2.3x, which is the shape of the rest of the sweep.
+
+That single launch is 1.36 a frame x 4,043 us = 5.5 ms/frame of traced kernel
+time against the other driver's 1.3, and it is the whole of the instancing
+difference.
+
+So the question is no longer "why is the fragment stage slower" but "what is
+the third shading launch of a draw, and why does it cost four times as much
+here when the vertex fetch, the clipper, the rasterizer and the interpolator
+beside it are all within one percent".
