@@ -5104,3 +5104,37 @@ explained.
 
 Left at the safe state: 18/18 run, 17/18 pixel-correct, fourteen unit tests,
 replays 7.35 and 22.75 ms.
+
+### Four wrong places to look for the register, and where it is not
+
+The two `alloca <3 x i32>` are named `%reg`, which is the name
+`emit_intrinsic`'s `decl_reg` case gives them, and they sit in the fragment
+shader's `fused_interp` blocks. So they are NIR registers. But:
+
+- **Both compile sites hand over shaders with none.** A probe counting
+  `decl_reg` by full traversal immediately before `cp_compile_nir_to_ptx`
+  reports `regs=0 visible=0` for all six shaders, and there is no compute
+  compile in this sample at all. The register does not exist when the backend
+  is called.
+- **So the backend's own pass loop creates it** -- `cp_compile_nir_to_ptx`
+  runs a second optimisation loop of its own, which is why lowering registers
+  anywhere in the front end finds nothing to do. That also retires the 7%
+  `nir_lower_reg_intrinsics_to_ssa` was credited with last turn: the pass had
+  nothing to lower, so the difference was noise that three runs each did not
+  separate.
+- **Adding the lowering at the end of that loop changes nothing**, so the
+  register is created after it, or is in a form the pass declines.
+- **It is not a declaration in the wrong block.** Hoisting every `decl_reg` to
+  the entry block by hand -- the part of `nir_trivialize_registers` that
+  `nir_foreach_reg_decl` needs -- leaves the count at two.
+- **It is not `nir_lower_indirect_derefs_to_if_else_trees`.** Disabling that
+  pass leaves the count at two.
+
+What still holds: `nir_trivialize_registers` followed by the SSA conversion
+removes them completely and matches the Gallium driver's output exactly, and it
+asserts on phis. Since the declaration is already in the entry block, what
+`trivialize` fixes must be the *load and store form*, not the declaration --
+which is the next thing to test and the last untested part of that pass.
+
+All of this turn's experiments are reverted; the tree is at the last verified
+state. 18/18 run, 17/18 pixel-correct, fourteen unit tests.
