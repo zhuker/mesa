@@ -5360,3 +5360,25 @@ shader resolves its constant-buffer base once instead of once per vertex, which
 where to look. The front-end change is a one-line deletion waiting on it, and
 it is worth `multithreading` at 4.90x and `pushconstants` at 3.26x -- between
 them, most of the remaining sweep gap.
+
+### A fifteenth test: three draws differing only in vertex-stage push constants
+
+`cpvk_batch` covers this shape for descriptor sets, which the *fragment* stage
+resolves per draw. `cpvk_batchpush` covers the vertex stage's equivalent, which
+has no other user -- the merge key compares descriptors, so a batch's draws
+have always shared their vertex-stage bindings, and push constants would be the
+first thing to vary.
+
+Three draws, one descriptor set, one pipeline, three push blocks: an offset and
+a colour each, both read by the vertex shader. Three triangles side by side in
+red, green and blue. Byte-identical to the Gallium driver.
+
+It passes today because the push block is in the merge key and these draws are
+never merged. It is here so that whoever removes that key -- worth
+`multithreading` at 4.90x and `pushconstants` at 3.26x -- finds out in three
+draws rather than in a sample, and has the failure in a form small enough to
+step through.
+
+    $ cpvk_batchpush
+    colours {red: 20, green: 20, blue: 20} over a 64x64 frame
+    identical to the Gallium reference
