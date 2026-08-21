@@ -5633,3 +5633,30 @@ That is the shape of what is left. It is not a defect -- every one of those
 syncs is doing something -- and it is the reason the remaining samples sit
 between 1.2x and 1.8x while the captures, which are draw-heavy and amortise
 them, are at 1.03x and 0.91x.
+
+### Retraction: the Gallium driver synchronises too, more often
+
+The previous entry said this driver "synchronises, the other does not", from
+`cuStreamSynchronize` counts. That was a partial view of the API table:
+
+    instancing        native  9.6 cuStreamSynchronize/f, 3,653 ms
+                      gallium 11.3 cuEventSynchronize/f,  2,391 ms
+    texturemipmapgen  native 32.7 cuStreamSynchronize/f, 1,120 ms
+                      gallium 56.3 cuEventSynchronize/f,  1,031 ms
+
+**The Gallium driver waits more often than this one**, through a different
+call. Both drivers run the same `cp_renderer.c`; it would have been surprising
+if one of them had somehow stopped reading its counters back. The right
+conclusion is the dull one: the two spend comparable time waiting, 1,120 ms
+against 1,031 on texturemipmapgen, and the sweep gap is not synchronisation
+count.
+
+Two entries in this file have now been retracted for the same reason -- a
+number read without checking what else could carry the same meaning. The first
+was `nsys` kernel durations that turned out to be concurrency inflation, caught
+by `ncu`. This is the second.
+
+So what remains of the sweep gap is not yet attributed. The honest position:
+the median is 1.20x of the driver being replaced, down from 1.56x at the start
+of this session, and the mechanism behind the rest is unknown rather than
+understood.
