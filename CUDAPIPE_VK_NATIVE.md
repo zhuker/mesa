@@ -5610,3 +5610,26 @@ With that, the push block leaves the merge key:
 `pushconstants` is now **faster than the driver being replaced**. 18/18 samples
 run, 17/18 pixel-correct, fifteen unit tests, replays 7.36 and 22.87 ms.
 `CPVK_KEEP_PUSHKEY=1` puts the key back.
+
+### Where the remaining sweep gap is: this driver synchronises, the other does not
+
+    texturemipmapgen   cuStreamSynchronize 32.7 a frame here, 0.0 in the
+                       Gallium driver -- 1,120 ms of 1,121 ms of API time
+    instancing          9.6 a frame here, 0.0 there
+    pushconstants      24.8 a frame here, 0.0 there
+
+And it is not the A-buffer size test: `CPVK_ABUF_MIN_TRIS=0` moves nothing in
+the right direction -- texturemipmapgen 1.49x to 1.46x, negativeviewportheight
+1.64x to 1.83x, computeshader 1.27x to 1.39x.
+
+The sites are known and each has a reason written beside it: the A-buffer's
+counter readback drains the stream once per eligible draw ("482 of them a frame
+on the capture"), and the peel loop's convergence check drains every
+`check_interval` passes to see whether anything is left to composite. Both are
+readbacks the host has to wait for, and the Gallium driver reaches the same
+decisions without them.
+
+That is the shape of what is left. It is not a defect -- every one of those
+syncs is doing something -- and it is the reason the remaining samples sit
+between 1.2x and 1.8x while the captures, which are draw-heavy and amortise
+them, are at 1.03x and 0.91x.
