@@ -5262,3 +5262,32 @@ that exist for exactly these paths -- lod, cubelod, cubelodf16, lodblit.
 Still outstanding, and now the whole list: multithreading 4.90x, pushconstants
 3.26x, texturemipmapgen 1.77x, pbribl 1.74x, vulkanscene 1.35x, instancing
 1.47x.
+
+### Why push constants cannot leave the merge key
+
+pushconstants issues **56.7 draws a frame against the Gallium driver's 9.2**,
+and 513.8 kernel launches against 101.7, because the push block is part of the
+merge key and the sample changes it every draw.
+
+It looks like it should not have to be. The block is bound as UBO slot
+`CPVK_UBO_PUSH_SLOT`, each staged draw uploads its own into the arena -- whose
+offsets reset at flush, not per draw, so the addresses do not collide -- and
+`cp_batch_record` snapshots the whole uniform row per draw, which is what
+cp_renderer.c calls "the bindings the key stopped comparing".
+
+Dropping it renders **pushconstants and multithreading wrong**. The reason is
+the same `rows_stable` condition the scissor relaxation depends on: a batch
+carries per-draw rows only when its fragments can be attributed to their draw,
+which needs blending or a fragment shader that reads constant buffers. Without
+one of those the batch row is zero for every fragment and every draw reads the
+first draw's push block.
+
+pushconstants is opaque and its fragment shader reads nothing, so it meets
+neither. Gating the relaxation on blending -- exactly what the scissor fix does
+-- is correct, 17/18 pixel-correct, and worth nothing measurable: 7.34 and
+22.78 ms against 7.37 and 22.82, gltfscenerendering 1.29x against 1.24x. Not
+kept.
+
+What would earn it is making the batch row resolvable for an opaque draw whose
+fragment shader reads nothing -- the same missing mechanism, reached from a
+third direction.
