@@ -5382,3 +5382,32 @@ step through.
     $ cpvk_batchpush
     colours {red: 20, green: 20, blue: 20} over a 64x64 frame
     identical to the Gallium reference
+
+### Correction: the vertex stage's per-draw row works
+
+The previous entry concluded that the vertex stage reads row zero for every
+vertex and that this is why merging push constants renders wrong. **That was
+wrong**, and `cpvk_batchpush` is what shows it.
+
+Three variants, each run against the Gallium driver with `CPVK_MERGE_PUSH=1`
+so the draws actually merge:
+
+    3 draws, distinct index ranges, VS reads push only     identical
+    3 draws, same index range every draw                   identical
+    12 draws (an 11-draw batch), VS reads a UBO and push   identical
+
+`cudapipe: batch of 11 draws`, twelve distinct push blocks, and the frame is
+byte-identical to the reference. So a batch does deliver per-draw push
+constants to the vertex stage, with or without a descriptor UBO beside them,
+and with or without differing index ranges.
+
+The evidence for the earlier conclusion was the pixel count in the
+`pushconstants` sample -- 4 coarse colours over 12,961 lit pixels against 16
+over 51,880 -- read as "every sphere at the first draw's position". The count
+is real and the sample does still fail, but the mechanism inferred from it is
+not the one, because the mechanism reproduces correctly in isolation at
+eleven draws.
+
+So `pushconstants` fails for something it does that this test does not, and the
+list of candidates is now short: 13,536 vertices a draw against three, mat4
+uniforms against a vec4, a depth buffer, and fifteen draws against eleven.
