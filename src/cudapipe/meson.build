@@ -62,10 +62,23 @@ foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_fs.cu',
   )
 endforeach
 
+# The NVTX timeline ranges, exactly as the Gallium target enables them.
+#
+# cp_nvtx.h compiles every push and pop to nothing without this, so the native
+# build emitted no ranges at all and cp_prof_nvtx.py reported "no NVTX_EVENTS
+# table" -- while the same renderer sources, built for the Gallium target,
+# named every stage. That is the driver's own answer to every shader being a
+# CUDA kernel called `main`, and this build had quietly lost it.
+cpvk_nvtx_args = []
+if meson.get_compiler('c').has_header('nvtx3/nvToolsExt.h')
+  cpvk_nvtx_args += '-DCP_HAVE_NVTX'
+endif
+
 libcudapipe_vk = static_library(
   'cudapipe_vk',
   [libcudapipe_vk_files, libcudapipe_vk_shared, cpvk_entrypoints,
    cpvk_kernel_incs],
+  c_args : cpvk_nvtx_args,
   include_directories : [inc_include, inc_src, inc_util,
                          include_directories('.'),
                          include_directories('nir_to_ptx'),

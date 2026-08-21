@@ -5768,3 +5768,32 @@ So the question is no longer "why is the fragment stage slower" but "what is
 the third shading launch of a draw, and why does it cost four times as much
 here when the vertex fetch, the clipper, the rasterizer and the interpolator
 beside it are all within one percent".
+
+### The native build had silently lost its NVTX instrumentation
+
+`cp_prof_nvtx.py` on a native trace: **"no NVTX_EVENTS table"**. On a Gallium
+trace of the same sample it names every stage. Both build the same
+`cp_renderer.c`, which has the same nine `cp_nvtx_push`/`pop` sites in each.
+
+The difference was in the build. `src/gallium/drivers/cudapipe/meson.build`
+defines `-DCP_HAVE_NVTX` when the header is present; `src/cudapipe/meson.build`
+never did, and `cp_nvtx.h` compiles every push and pop to nothing without it.
+So the driver's own answer to "every shader is a CUDA kernel called `main`" was
+absent from the native build, and nobody noticed because absence looks exactly
+like a trace of a driver that does not use NVTX.
+
+Restored, and the two now agree on where the host spends its time:
+
+    stage        native us/draw   gallium us/draw
+    draw (all)        48.68           46.77
+    pass 0            19.68           16.44
+    vertex            16.25           17.20
+    raster             6.31            6.43
+    fs                 2.90            3.07
+    interp             2.18            2.27
+    writeback          2.16            2.28
+
+Which is worth having on its own -- the host issue profile is not where the
+difference is -- and it is what makes the next question askable: the ranges now
+name which stage owns the third fragment launch of each draw, the one costing
+4,043 us here against 939.
