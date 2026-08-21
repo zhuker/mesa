@@ -5291,3 +5291,38 @@ kept.
 What would earn it is making the batch row resolvable for an opaque draw whose
 fragment shader reads nothing -- the same missing mechanism, reached from a
 third direction.
+
+### multithreading is the same defect, and where it is not
+
+    multithreading   446.8 draws a frame here, 21.9 in the Gallium driver
+                     4,022 kernel launches a frame against 202
+    pushconstants     56.7 draws against 9.2, 513.8 launches against 101.7
+
+Both change the push block every draw and both are refused for it, so the two
+worst remaining samples are one defect. Between them they are most of what is
+left of the sweep gap.
+
+What is now known about it:
+
+- **The host side is correct.** `CPVK_DEBUG_ROWS` shows the batch's uniform
+  rows for pushconstants incrementing by 0x100 a draw -- thirteen distinct push
+  blocks, each at its own address, snapshotted per draw. `cp_upload_begin`
+  advances the arena offset and the offsets reset at flush, not per draw, so
+  they do not collide.
+- **Without batching it renders correctly.** `CPVK_MERGE_PUSH=1
+  CPVK_NO_BATCH=1` gives 0.0 and 0.002 against the reference; with batching on,
+  6.25 and 0.64. So the defect is in the batch path's row resolution, not in
+  the upload or the snapshot.
+- **It is not the compacting clipper.** The comment at `stable_clip` says an
+  opaque batch's primitive index only names the input triangle in stable mode,
+  otherwise `cp_write_batch_rows()` maps fragments to the wrong draw -- exactly
+  the failure shape. Forcing stable mode for every batch changes neither
+  sample, 6.2493 against 6.2493.
+- **Gating on blending, as the scissor relaxation does, is correct and worth
+  nothing** -- these two samples are opaque, so it never fires for them.
+
+So: the rows are right, the batch path loses them, and the one mechanism whose
+comment describes this failure is not responsible. The next thing to check is
+whether the *vertex* stage gets its `batch_rows` at all -- it is allocated only
+when `cp->vs_shader->reads_const_bufs`, and nothing has yet confirmed that flag
+is set for these two shaders.
