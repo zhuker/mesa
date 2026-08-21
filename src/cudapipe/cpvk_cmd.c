@@ -1380,7 +1380,25 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
    CPVK_DIFF(a->num_vb != b->num_vb, "vertex buffer count");
    CPVK_DIFF(memcmp(a->vb_base, b->vb_base, sizeof(a->vb_base)), "vertex buffers");
    CPVK_DIFF(a->push_size != b->push_size, "push constant size");
-   CPVK_DIFF(memcmp(a->push, b->push, a->push_size), "push constants");
+   /*
+    * The push block is in the key, and it is what stops multithreading and
+    * pushconstants batching: 446.8 draws a frame against the Gallium driver's
+    * 21.9, and 56.7 against 9.2.
+    *
+    * It should not have to be. The block is bound as UBO slot
+    * CPVK_UBO_PUSH_SLOT, each staged draw uploads its own, and the batch
+    * snapshots the whole uniform row per draw. cpvk_batchpush merges eleven
+    * draws with twelve distinct push blocks and renders byte-identical to
+    * that driver, with and without a descriptor UBO beside them.
+    *
+    * CPVK_MERGE_PUSH=1 removes it. Those two samples still render wrong with
+    * it, for a reason the test does not yet reproduce -- see
+    * CUDAPIPE_VK_NATIVE.md. The switch is here so the next attempt can bisect
+    * from a passing three-draw case toward the failing sample rather than the
+    * other way round.
+    */
+   if (!getenv("CPVK_MERGE_PUSH"))
+      CPVK_DIFF(memcmp(a->push, b->push, a->push_size), "push constants");
    return true;
 #undef CPVK_DIFF
 }

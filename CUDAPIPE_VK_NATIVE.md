@@ -5411,3 +5411,32 @@ eleven draws.
 So `pushconstants` fails for something it does that this test does not, and the
 list of candidates is now short: 13,536 vertices a draw against three, mat4
 uniforms against a vec4, a depth buffer, and fifteen draws against eleven.
+
+### CPVK_MERGE_PUSH, and what the reproducer has ruled out
+
+`CPVK_MERGE_PUSH=1` removes the push block from the merge key. It is off by
+default and announced by `cpvk_report_env()` when set, like every other CPVK_
+switch.
+
+It exists because the defect it exposes is worth `multithreading` at 4.90x and
+`pushconstants` at 3.26x -- between them most of the remaining sweep gap -- and
+because the next attempt should bisect from a passing small case toward the
+failing sample rather than the other way round. What the reproducer has
+established so far, each run against the Gallium driver with the switch on:
+
+    3 draws, distinct index ranges                    identical
+    3 draws, identical index range                    identical
+    12 draws, VS reads a UBO as well as the push      identical
+    12 draws x 2000 instances, 66k vertices a batch   identical
+
+`cudapipe: batch of 11 draws` in the last three. So per-draw push constants
+reach the vertex stage correctly through a batch, with a descriptor UBO beside
+them, with identical or differing index ranges, and at sixty-six thousand
+vertices.
+
+What is left of the difference to `pushconstants`: 13,536 indices a draw
+against three, mat4 uniforms against a vec4, a depth buffer, fifteen draws
+against eleven, and a UI overlay drawn into the same pass afterwards.
+
+Default behaviour is unchanged and measured so: 18/18 samples run, 17/18
+pixel-correct, fifteen unit tests, replays 7.36 and 22.84 ms.
