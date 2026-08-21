@@ -533,6 +533,20 @@ struct cp_context {
       CUdeviceptr overflow[64];
       unsigned num_overflow;
    } dscratch;
+
+   /*
+    * A batch's per-draw uploads are live until its launches are issued.
+    *
+    * Each staged draw puts its push block in the upload arena and records the
+    * address in its uniform row. cp_scratch_reset() rewinds that arena, and
+    * cp_draw_execute() calls cp_scratch_begin() before it uploads anything of
+    * its own -- so a reclaim there hands the batch's own slice table and
+    * argument block the addresses the push blocks are sitting at, and every
+    * merged draw reads whatever landed on top of it.
+    *
+    * Set when a draw joins a batch, cleared when cp_draw_execute() returns.
+    */
+   bool batch_uploads_live;
 };
 
 

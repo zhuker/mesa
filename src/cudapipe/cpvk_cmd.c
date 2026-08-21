@@ -1397,7 +1397,7 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
     * from a passing three-draw case toward the failing sample rather than the
     * other way round.
     */
-   if (!getenv("CPVK_MERGE_PUSH"))
+   if (getenv("CPVK_KEEP_PUSHKEY"))
       CPVK_DIFF(memcmp(a->push, b->push, a->push_size), "push constants");
    return true;
 #undef CPVK_DIFF

@@ -385,10 +385,19 @@ cp_scratch_reset(struct cp_context *cp)
     * staging the uploads were copied out of is free to be written over
     * again — rewound to the current generation's slice, since the epoch
     * arithmetic in cp_upload_begin keeps running either way. */
-   cp->arena_offset = (size_t)cp->scratch.current *
-                      (cp->arena_size / cp->flush_gens);
-   cp->upload_offset = (size_t)cp->scratch.current *
-                       (cp->upload_size / cp->flush_gens);
+   /*
+    * Unless a batch's uploads are still waiting to be launched. The device
+    * being idle says the *previous* work has finished reading the arena; it
+    * says nothing about a batch whose push blocks are already in it and whose
+    * kernels have not been issued yet. Rewinding then lets this draw's own
+    * uploads land on them.
+    */
+   if (!cp->batch_uploads_live) {
+      cp->arena_offset = (size_t)cp->scratch.current *
+                         (cp->arena_size / cp->flush_gens);
+      cp->upload_offset = (size_t)cp->scratch.current *
+                          (cp->upload_size / cp->flush_gens);
+   }
 }
 
 void
@@ -3213,6 +3222,12 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
    if (!cp->pass.appending || cp->pass.nsegs == 0)
       cp_scratch_begin(cp);
 
+   /*
+    * The batch's uploads have survived the reclaim above; everything this
+    * draw uploads from here is its own, and the next draw may rewind freely.
+    */
+   cp->batch_uploads_live = false;
+
    /* A shader with no declared inputs needs no vertex buffer: it builds its
     * positions from gl_VertexIndex, which is how a fullscreen pass is drawn.
     * A batch carries its own snapshot of the bindings, so the live state —
@@ -5044,6 +5059,9 @@ cp_batch_record(struct cp_context *cp,
    cp->batch.scissors[cp->batch.ndraws] = cp->scissor;
    cp->batch.tris += tris;
    cp->batch.ndraws++;
+   /* This draw's push block is now in the upload arena and its address is in
+    * the row above; nothing may rewind that arena until the batch launches. */
+   cp->batch_uploads_live = true;
 }
 
 /*

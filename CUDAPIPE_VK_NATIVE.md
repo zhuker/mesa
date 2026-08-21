@@ -5567,3 +5567,46 @@ distinct -- and the shader reads zeros. What is left is the ordering between
 the `cuMemcpyHtoDAsync` that sends the block and the launch that reads it:
 `cp_upload_end()` posts the copy on `cp->stream`, and if the batch's kernels
 run on any other stream that ordering does not exist.
+
+## The defect: cp_scratch_reset() rewinds the arena out from under a staged batch
+
+A batch's draws each stage a push block into the upload arena and record its
+address in their uniform row. `cp_draw_execute()` then calls
+`cp_scratch_begin()` *before* uploading anything of its own -- and when that
+reclaims, `cp_scratch_reset()` rewinds `cp->arena_offset` to the generation
+base. The batch's own slice table and argument block are then handed the
+addresses the push blocks are sitting at, and every merged draw reads whatever
+landed on top of it.
+
+The reset's comment says the device has already been waited for, "so the
+staging the uploads were copied out of is free to be written over again". That
+is true of the *host* staging and of work already issued. It is not true of a
+batch whose blocks are in the device arena and whose kernels have not been
+launched yet.
+
+Which is why it only appeared on large workloads: `cp_scratch_begin()` reclaims
+at five overflows or `CP_SCRATCH_RECLAIM_BYTES`, and `pushconstants` at fifteen
+draws of 13,536 vertices reaches it where an eleven-draw test of three-vertex
+triangles never does. Every experiment that made the reproducer bigger was
+looking in the right place for the wrong reason.
+
+`cp_context::batch_uploads_live` is set when a draw joins a batch and cleared
+once `cp_draw_execute()` is past its reclaim; `cp_scratch_reset()` skips the
+two rewinds while it is set.
+
+With that, the push block leaves the merge key:
+
+    sample              start     now   gallium    was     now
+    pushconstants        1.28    0.21      0.39   3.28x   0.54x
+    multithreading      26.90    6.55      5.48   4.91    1.20
+    pbribl               1.22    0.77      0.70   1.74    1.10
+    multisampling       13.29    2.02      1.49   8.92    1.36
+    texture3d            0.31    0.16      0.15   2.07    1.07
+    texture              0.30    0.17      0.16   1.88    1.06
+    texturecubemap       0.74    0.62      0.61   1.21    1.02
+
+    median ms/frame against the driver being replaced: 1.56x -> 1.20x
+
+`pushconstants` is now **faster than the driver being replaced**. 18/18 samples
+run, 17/18 pixel-correct, fifteen unit tests, replays 7.36 and 22.87 ms.
+`CPVK_KEEP_PUSHKEY=1` puts the key back.
