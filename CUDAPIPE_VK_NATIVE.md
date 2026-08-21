@@ -5138,3 +5138,44 @@ which is the next thing to test and the last untested part of that pass.
 
 All of this turn's experiments are reverted; the tree is at the last verified
 state. 18/18 run, 17/18 pixel-correct, fourteen unit tests.
+
+## The register is a phi, and removing it does not help
+
+`nir_convert_from_ssa(nir, true, false)` -- the line before emission, whose own
+comment says "eliminate phi nodes" -- turns every remaining phi into a NIR
+register. `emit_intrinsic` gives a register an alloca and the NVPTX backend
+puts that in a `__local_depot`. **That is why the register could not be found
+anywhere earlier in the pipeline: it does not exist until that line.** The
+Gallium-hosted driver runs the same code and emits no depot, because lavapipe
+had already flattened those branches into `bcsel` before cudapipe saw the
+shader.
+
+Flattening them here with `nir_opt_peephole_select(limit = ~0u)` removes the
+depot completely -- no alloca, no local operation, matching that driver exactly.
+
+**And it makes things slower.** Measured against the same driver in the same
+mode, three runs each:
+
+    sample            flat off   flat on   gallium   off/gal   on/gal
+    instancing          8.80 ms    9.23      5.80      1.52     1.59
+    texture             0.19       0.23      0.19      0.98     1.16
+    vulkanscene         1.23       1.19      0.89      1.37     1.33
+    particlesystem      3.59       3.52      3.19      1.13     1.10
+
+It also renders bloom wrong at every limit from 8 upward. So the depot is real,
+it is understood, it can be removed -- and it is not what makes these shaders
+slow. The theory that has driven the last three turns is dead.
+
+**And the sweep gap is smaller than reported.** The earlier table had texture
+at 1.36x; measured properly it is 0.98x. That number came from comparing a
+`--benchmark` run against an `--offscreenframes` one -- two different harness
+modes, one of which saves every frame. The real per-frame regressions are
+instancing 1.52x and vulkanscene 1.37x, both with absolute times large enough
+to mean something; texture and particlesystem are within noise of the
+reference.
+
+Kept from this turn: `bcsel` now reconciles its two branches at any width. It
+compared the scalar type kinds only, so a vector pair never matched and
+`select <4 x i1>, <4 x i32>, <4 x float>` reached the verifier. That is a real
+defect on any path that produces a vector `bcsel`, and it is what let the
+flattening experiment run at all.

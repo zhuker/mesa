@@ -1859,16 +1859,32 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
          cond_val = LLVMBuildICmp(ctx->builder, LLVMIntNE, cond_val,
             LLVMConstNull(LLVMTypeOf(cond_val)), "");
       }
-      /* Ensure both branches have matching types — NIR constant folding can
-       * produce a bcsel with an i32 zero on one side and a float on the other. */
+      /*
+       * Ensure both branches have matching types -- NIR constant folding can
+       * produce a bcsel with an i32 zero on one side and a float on the other.
+       *
+       * This tested the scalar type kinds only, so a vector pair never
+       * matched and `select <4 x i1>, <4 x i32>, <4 x float>` reached the
+       * verifier. Compare the element kinds instead, which is the same
+       * question at any width, and bitcast the integer side to the float
+       * side's type.
+       */
       LLVMTypeRef t1 = LLVMTypeOf(src[1]);
       LLVMTypeRef t2 = LLVMTypeOf(src[2]);
       if (t1 != t2) {
-         if (LLVMGetTypeKind(t1) == LLVMFloatTypeKind &&
-             LLVMGetTypeKind(t2) == LLVMIntegerTypeKind)
+         LLVMTypeRef e1 = LLVMGetTypeKind(t1) == LLVMVectorTypeKind
+            ? LLVMGetElementType(t1) : t1;
+         LLVMTypeRef e2 = LLVMGetTypeKind(t2) == LLVMVectorTypeKind
+            ? LLVMGetElementType(t2) : t2;
+         bool f1 = LLVMGetTypeKind(e1) == LLVMFloatTypeKind ||
+                   LLVMGetTypeKind(e1) == LLVMHalfTypeKind ||
+                   LLVMGetTypeKind(e1) == LLVMDoubleTypeKind;
+         bool f2 = LLVMGetTypeKind(e2) == LLVMFloatTypeKind ||
+                   LLVMGetTypeKind(e2) == LLVMHalfTypeKind ||
+                   LLVMGetTypeKind(e2) == LLVMDoubleTypeKind;
+         if (f1 && LLVMGetTypeKind(e2) == LLVMIntegerTypeKind)
             src[2] = LLVMBuildBitCast(ctx->builder, src[2], t1, "");
-         else if (LLVMGetTypeKind(t2) == LLVMFloatTypeKind &&
-                  LLVMGetTypeKind(t1) == LLVMIntegerTypeKind)
+         else if (f2 && LLVMGetTypeKind(e1) == LLVMIntegerTypeKind)
             src[1] = LLVMBuildBitCast(ctx->builder, src[1], t2, "");
       }
       result = LLVMBuildSelect(ctx->builder, cond_val, src[1], src[2], "");
@@ -3242,6 +3258,36 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    ctx.writes_memory = cp_nir_writes_memory(nir);
    struct cp_shader_binary tex_meta = {0};
    capture_tex_desc_refs(nir, &tex_meta);
+
+   /*
+    * nir_convert_from_ssa() turns every remaining phi into a NIR register, and
+    * emit_intrinsic gives a register an alloca, which the NVPTX backend puts
+    * in a __local_depot -- off-chip memory, and in instancing's fragment
+    * shader inside a loop. That is why the register could not be found
+    * anywhere earlier: it does not exist until this line. The Gallium-hosted
+    * driver emits no depot because lavapipe had already flattened those
+    * branches into bcsel.
+    *
+    * Flattening them here with nir_opt_peephole_select does remove it
+    * completely -- no alloca, no local operation, matching that driver
+    * exactly -- and it is **not worth doing**: measured against the same
+    * driver in the same mode, instancing goes 1.52x to 1.59x, texture 0.98 to
+    * 1.16, vulkanscene 1.37 to 1.33, particlesystem 1.13 to 1.10. It also
+    * renders bloom wrong at every limit from 8 up. The depot is real and it is
+    * not what makes these shaders slow.
+    */
+   /*
+    * nir_convert_from_ssa() below turns every remaining phi into a NIR
+    * register, and emit_intrinsic gives a register an alloca, which the NVPTX
+    * backend puts in a __local_depot -- off-chip memory, and in instancing's
+    * fragment shader inside a loop. That is why the register could not be
+    * found anywhere earlier in the pipeline: it does not exist until this
+    * line.
+    *
+    * The Gallium-hosted driver runs this same code and emits no depot,
+    * because lavapipe had already flattened those branches into bcsel before
+    * cudapipe saw the shader. This is that pass.
+    */
 
    /* Convert from SSA to reg form to eliminate phi nodes */
    nir_convert_from_ssa(nir, true, false);
