@@ -5469,3 +5469,34 @@ descriptor UBO beside the push block, instancing to 66k vertices, index counts
 to 13,536, and total vertices to 148,896. What remains is the sample's mat4
 uniforms, its depth buffer, its fifteen draws, and the UI overlay in the same
 pass.
+
+### mat4 uniforms ruled out; what is left is the sample's shape, not its data
+
+    12 draws, three mat4s in the vertex shader, 13,536 indices   identical
+     4 draws, three mat4s, geometry large enough to see          identical
+
+`cudapipe: batch of 3 draws`, thirty-three lit pixels across three colours,
+byte-identical to the Gallium driver. The scaffold has a depth attachment, so
+that is covered as well.
+
+The whole list of things tried against `CPVK_MERGE_PUSH=1`, all identical to
+the reference:
+
+    index range differing per draw          identical
+    index range identical per draw          identical
+    a descriptor UBO beside the push block  identical
+    three mat4s in that UBO                 identical
+    2000 instances a draw, 66k vertices     identical
+    13,536 indices a draw, 148,896 vertices identical
+    a depth attachment                      identical
+    batches of 3 and of 11                  identical
+
+So per-draw push constants through a batch are correct under every condition
+the reproducer can construct, and `pushconstants` still renders 12,961 lit
+pixels where 51,880 is right. What separates them is no longer a property of
+the draws: it is the sample's *shape* -- fifteen draws rather than eleven, a UI
+overlay drawn into the same render pass afterwards, and a second command buffer
+recorded per frame.
+
+The next thing to try is the overlay, because it is the only one that puts a
+different pipeline into the same pass as the batch.
