@@ -5677,3 +5677,33 @@ separates them.
 
 Nothing is changed on the strength of this: three samples want one setting, one
 wants the other, and the differences are 5-10% against a gap of 40-70%.
+
+### Not concurrency, not clocks -- and the ncu comparison was not sound
+
+Three things measured, to attribute the in-situ kernel-time difference on
+instancing (3,527 ms against 2,277 over the same 300 frames):
+
+**Not concurrency.** Both drivers run every kernel on **one stream**, and the
+summed kernel duration is within 6% of the wall span in each: native 3,527 ms
+over a 3,724 ms span, gallium 2,277 over 2,774. Nothing overlaps, so nothing is
+inflated by overlapping.
+
+**Not clocks.** Sampling `clocks.sm` through both runs: 2,865 MHz native and
+2,857 gallium on instancing, 2,857 on both for texturemipmapgen. The GPU is at
+the same clock for each.
+
+**And the `ncu` result that started this does not mean what it was read to
+mean.** It compared "the kernel named `main` at grid 4096" in the two
+processes and found 235,680 ns against 236,992. But *every* compiled shader in
+this driver is named `main` -- `CLAUDE.md` says so, and says what to do about
+it -- and the two processes do not even have the same number of them: six
+entries here against seven there, with different instruction counts. Matching
+by name and grid does not identify the same shader.
+
+So the claim "the kernels are identical and only the surroundings differ" is
+withdrawn. What is actually established is narrower: the same *number* of
+kernels, serialised the same way, at the same clock, take 1.55x as long here --
+and whether they are the same kernels has not been shown.
+
+That is the thread to pull next, and `tests/cp_prof_kernels.py` exists for
+exactly this problem.
