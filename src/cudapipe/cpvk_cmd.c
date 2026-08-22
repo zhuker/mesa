@@ -634,23 +634,10 @@ cpvk_arena_retire(struct cpvk_cmd_buffer *cmd, CUdeviceptr arena,
  * device address. The host mirror remains available for sampler specialization;
  * queue submission uploads it once before either CUDA stream can consume it.
  */
-static CUdeviceptr
-cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
+static bool
+cpvk_arena_append(struct cpvk_cmd_buffer *cmd, const void *src, size_t bytes,
+                  CUdeviceptr *out_addr, void **out_host)
 {
-   if (!set->host || !set->layout->num_descriptors) {
-      /* Returning zero here is an address of zero in a shader, which is the
-       * fault compute-sanitizer reports as a read at 0x80 -- descriptor two
-       * of a set that is not there. Say so at the point it happens. */
-      fprintf(stderr, "cudapipe: descriptor set has no buffer (%u descriptors, "
-              "host=%p); shaders reading it will fault\n",
-              set->layout ? set->layout->num_descriptors : 0,
-              (void *)set->host);
-      return 0;
-   }
-
-   size_t bytes = (size_t)set->layout->num_descriptors *
-                  sizeof(struct cpvk_descriptor);
-
    if (cmd->desc_arena_used + bytes > cmd->desc_arena_size) {
       size_t want = MAX2(cmd->desc_arena_size * 2,
                          cmd->desc_arena_used + bytes);
@@ -663,18 +650,19 @@ cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
          free(fresh_host);
          if (fresh)
             cuMemFree(fresh);
-         return 0;
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return false;
       }
 
-      /* The old arena is still referenced by the draws already recorded, so
-       * keep both halves until reset and upload it along with the current one
-       * at submit. */
+      /* The old arena is still referenced by draws already recorded, so keep
+       * both halves until reset and upload them together at submit. */
       if (cmd->desc_arena &&
           !cpvk_arena_retire(cmd, cmd->desc_arena, cmd->desc_arena_host,
                              cmd->desc_arena_used)) {
          cuMemFree(fresh);
          free(fresh_host);
-         return 0;
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return false;
       }
       cmd->desc_arena = fresh;
       cmd->desc_arena_host = fresh_host;
@@ -682,13 +670,34 @@ cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
       cmd->desc_arena_used = 0;
    }
 
-   struct cpvk_descriptor *dst =
-      (struct cpvk_descriptor *)((char *)cmd->desc_arena_host +
-                                 cmd->desc_arena_used);
+   char *host = (char *)cmd->desc_arena_host + cmd->desc_arena_used;
    CUdeviceptr addr = cmd->desc_arena + cmd->desc_arena_used;
-   memcpy(dst, set->host, bytes);
+   if (src)
+      memcpy(host, src, bytes);
    cmd->desc_arena_used += bytes;
    cmd->desc_arena_dirty = true;
+   *out_addr = addr;
+   if (out_host)
+      *out_host = host;
+   return true;
+}
+
+static CUdeviceptr
+cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
+{
+   if (!set->host || !set->layout->num_descriptors) {
+      fprintf(stderr, "cudapipe: descriptor set has no buffer (%u descriptors, "
+              "host=%p); shaders reading it will fault\n",
+              set->layout ? set->layout->num_descriptors : 0,
+              (void *)set->host);
+      return 0;
+   }
+
+   size_t bytes = (size_t)set->layout->num_descriptors *
+                  sizeof(struct cpvk_descriptor);
+   CUdeviceptr addr = 0;
+   if (!cpvk_arena_append(cmd, set->host, bytes, &addr, NULL))
+      return 0;
    return addr;
 }
 
@@ -713,6 +722,8 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
        */
       unsigned slot = layout->set_slot[pInfo->firstSet + i];
       CUdeviceptr snap_addr = cpvk_snapshot_set(cmd, set);
+      if (!snap_addr)
+         return;
       struct cpvk_descriptor *snap;
       if (snap_addr >= cmd->desc_arena &&
           snap_addr < cmd->desc_arena + cmd->desc_arena_size)
@@ -901,6 +912,84 @@ cpvk_execute_dispatch(struct cpvk_device *dev,
  * reset before the primary is submitted, and the answer would be a
  * use-after-free.
  */
+struct cpvk_arena_map {
+   CUdeviceptr src, dst;
+   size_t bytes;
+};
+
+static CUdeviceptr
+cpvk_remap_secondary_addr(CUdeviceptr addr, const struct cpvk_arena_map *maps,
+                          unsigned count)
+{
+   for (unsigned i = 0; i < count; i++)
+      if (addr >= maps[i].src && addr < maps[i].src + maps[i].bytes)
+         return maps[i].dst + (addr - maps[i].src);
+   return addr;
+}
+
+static bool
+cpvk_import_secondary_arenas(struct cpvk_cmd_buffer *dst,
+                             const struct cpvk_cmd_buffer *src,
+                             struct cpvk_arena_map **out_maps,
+                             unsigned *out_count)
+{
+   unsigned capacity = src->num_desc_retired + (src->desc_arena_used ? 1 : 0);
+   struct cpvk_arena_map *maps = capacity ? calloc(capacity, sizeof(*maps)) : NULL;
+   if (capacity && !maps) {
+      vk_command_buffer_set_error(&dst->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return false;
+   }
+
+   unsigned count = 0;
+   for (unsigned i = 0; i < src->num_desc_retired; i++) {
+      if (!src->desc_retired[i].used)
+         continue;
+      CUdeviceptr imported = 0;
+      if (!cpvk_arena_append(dst, src->desc_retired[i].host,
+                             src->desc_retired[i].used, &imported, NULL)) {
+         free(maps);
+         return false;
+      }
+      maps[count++] = (struct cpvk_arena_map) {
+         .src = src->desc_retired[i].dev,
+         .dst = imported,
+         .bytes = src->desc_retired[i].used,
+      };
+   }
+   if (src->desc_arena_used) {
+      CUdeviceptr imported = 0;
+      if (!cpvk_arena_append(dst, src->desc_arena_host,
+                             src->desc_arena_used, &imported, NULL)) {
+         free(maps);
+         return false;
+      }
+      maps[count++] = (struct cpvk_arena_map) {
+         .src = src->desc_arena,
+         .dst = imported,
+         .bytes = src->desc_arena_used,
+      };
+   }
+
+   *out_maps = maps;
+   *out_count = count;
+   return true;
+}
+
+static void
+cpvk_remap_secondary_op(struct cpvk_op *op,
+                        const struct cpvk_arena_map *maps, unsigned count)
+{
+   CUdeviceptr *addrs = NULL;
+   if (op->kind == CPVK_OP_DRAW)
+      addrs = op->draw_cmd.addrs;
+   else if (op->kind == CPVK_OP_DISPATCH)
+      addrs = op->dispatch.addrs;
+   if (!addrs)
+      return;
+   for (unsigned i = 0; i < CPVK_MAX_ARG_BUFS; i++)
+      addrs[i] = cpvk_remap_secondary_addr(addrs[i], maps, count);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t count,
                         const VkCommandBuffer *pCommandBuffers)
@@ -931,11 +1020,17 @@ cpvk_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t count,
          }
       }
 
+      struct cpvk_arena_map *maps = NULL;
+      unsigned num_maps = 0;
+      if (!cpvk_import_secondary_arenas(cmd, sec, &maps, &num_maps))
+         return;
+
       if (cmd->num_ops + sec->num_ops > cmd->max_ops) {
          unsigned want = MAX2(cmd->max_ops ? cmd->max_ops * 2 : 64,
                               cmd->num_ops + sec->num_ops);
          struct cpvk_op *ops = realloc(cmd->ops, want * sizeof(*ops));
          if (!ops) {
+            free(maps);
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
             return;
          }
@@ -943,9 +1038,13 @@ cpvk_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t count,
          cmd->max_ops = want;
       }
 
-      memcpy(cmd->ops + cmd->num_ops, sec->ops,
+      unsigned first = cmd->num_ops;
+      memcpy(cmd->ops + first, sec->ops,
              sec->num_ops * sizeof(*sec->ops));
       cmd->num_ops += sec->num_ops;
+      for (unsigned o = first; o < cmd->num_ops; o++)
+         cpvk_remap_secondary_op(&cmd->ops[o], maps, num_maps);
+      free(maps);
    }
 }
 

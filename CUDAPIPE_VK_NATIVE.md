@@ -37,7 +37,7 @@ The important files are:
 | `cp_renderer.[ch]` | shared draw renderer: batching, clipping, rasterization, A-buffer/peel paths, pass episodes, arenas and shader launches |
 | `cp_kernels.[ch]`, `kernels/` | NVRTC compilation, persistent source/options-keyed PTX caching and CUDA kernels, including the lazy 3D sampler variant |
 | `nir_to_ptx/` | the shared NIR→LLVM/NVPTX backend and loaded shader binaries |
-| `tests/cpvk_*.c` | 31 small native differential/regression programs, including fence/semaphore/event state, recorded-object lifetime and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
+| `tests/cpvk_*.c` | 32 small native differential/regression programs, including synchronization state, recorded-object lifetime, secondary descriptor ownership and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
 
 The native `cpvk_device` owns one CUDA context, one `cp_device` containing the
 kernel modules, and one `cp_context` renderer with its ordered graphics/compute
@@ -301,12 +301,11 @@ pass.
 
 ### Standalone and sample gates
 
-- 31/31 `src/cudapipe/tests/cpvk_*.c` programs pass functionally, including
-  negative fence state/timeouts, ordered host/device event state, graphics and
-  compute pipeline/query/event destruction after recording, and concurrent
-  per-device A-buffer execution, with no driver error, unimplemented, refusal
-  or overflow diagnostic. This is not a claim that all 31 are clean under the
-  Vulkan validation layer.
+- 32/32 `src/cudapipe/tests/cpvk_*.c` programs pass functionally, including
+  negative synchronization state, recorded-object destruction, descriptor-using
+  secondary command buffers and concurrent per-device A-buffer execution, with
+  no driver error, unimplemented, refusal or overflow diagnostic. This is not a
+  claim that all 32 are clean under the Vulkan validation layer.
 - `cpvk_tex3d` passes on native and NVIDIA; NVIDIA with
   `VK_LAYER_KHRONOS_validation` is clean.
 - The post-optimization 60-frame sweep is
@@ -473,11 +472,12 @@ continue staging explicit paths rather than using `git add -A`.
    host status/set/reset is mutex protected. The synchronization2 feature is no
    longer exposed at Vulkan 1.1. Stage/access scopes are conservatively treated
    as all commands and event waits can block queue submission on the host.
-10. **Descriptor-using secondary command buffers are unsafe.** ExecuteCommands
-   memcpy-appends their operations but queue submit publishes/uploads only the
-   primary command buffer's descriptor arenas. A secondary that was not
-   separately submitted can therefore carry uninitialized descriptor snapshot
-   addresses. There is no focused test for this path.
+10. **Secondary render-scope inheritance is still implicit.** ExecuteCommands
+   now imports every current/retired secondary descriptor arena into primary
+   ownership, remaps draw/dispatch addresses and retains recorded objects; a
+   descriptor-using secondary matches the primary-rendered image byte for byte.
+   Rendering inheritance is not yet represented by explicit immutable scope
+   indices, so nested/independent secondary rendering needs the scope refactor.
 11. **Recorded ownership is only partially complete.** Command buffers retain
     unique references to every bound graphics/compute pipeline and recorded
     query pool; secondary operation copies import those references. Focused
@@ -605,10 +605,10 @@ In order:
    outputs, logs and checksums out of `/tmp` before cleanup or reboot.
 2. **Continue the focused semantic series before asynchronous submission.**
    Fresh/reset fence status, zero-time waits, binary semaphore ordering and
-   recorded event timing/lifetime now pass. Add draw/copy↔dispatch dependencies
-   in both directions and a secondary command buffer using descriptors without
-   prior submission. Preserve the ordered renderer stream and finish retained
-   ownership.
+   recorded event timing/lifetime and secondary descriptor import now pass.
+   Add draw/copy↔dispatch dependencies in both directions and explicit secondary
+   render-scope inheritance. Preserve the ordered renderer stream and finish
+   retained ownership.
    Only then should CUDA-event fence retirement and removal of submit drains be
    considered as one measured change.
 3. **Complete the external image evidence.** Replay the existing Crossroads and

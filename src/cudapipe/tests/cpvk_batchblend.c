@@ -516,6 +516,11 @@ cpvk_batchblend_run(int argc, char **argv,
       .commandBufferCount = 1 };
    VkCommandBuffer cmd;
    CHECK(vkAllocateCommandBuffers(dev, &cbai, &cmd));
+#ifdef CPVK_SECONDARY_DESCRIPTOR
+   cbai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+   VkCommandBuffer secondary;
+   CHECK(vkAllocateCommandBuffers(dev, &cbai, &secondary));
+#endif
 
    VkCommandBufferBeginInfo bi = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -551,21 +556,49 @@ cpvk_batchblend_run(int argc, char **argv,
    }
 
    VkDeviceSize zero = 0;
+#ifdef CPVK_SECONDARY_DESCRIPTOR
+   VkCommandBufferInheritanceRenderingInfo rendering_inheritance = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO,
+      .colorAttachmentCount = 1,
+      .pColorAttachmentFormats = &cfmt,
+      .depthAttachmentFormat = dimgi.format,
+      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+   };
+   VkCommandBufferInheritanceInfo inheritance = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,
+      .pNext = &rendering_inheritance,
+   };
+   VkCommandBufferBeginInfo secondary_bi = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT,
+      .pInheritanceInfo = &inheritance,
+   };
+   CHECK(vkBeginCommandBuffer(secondary, &secondary_bi));
+   VkCommandBuffer draw_cmd = secondary;
+#else
    beginRendering(cmd, &ri);
-   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-   vkCmdSetViewport(cmd, 0, 1, &vp);
-   vkCmdSetScissor(cmd, 0, 1, &sc);
-   vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &zero);
-   vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT32);
+   VkCommandBuffer draw_cmd = cmd;
+#endif
+   vkCmdBindPipeline(draw_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+   vkCmdSetViewport(draw_cmd, 0, 1, &vp);
+   vkCmdSetScissor(draw_cmd, 0, 1, &sc);
+   vkCmdBindVertexBuffers(draw_cmd, 0, 1, &vbuf, &zero);
+   vkCmdBindIndexBuffer(draw_cmd, ibuf, 0, VK_INDEX_TYPE_UINT32);
 
    /* Two draws, two index ranges, two sets naming two different textures. */
-   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
-                           &scene_set, 0, NULL);
+   vkCmdBindDescriptorSets(draw_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+                           0, 1, &scene_set, 0, NULL);
    for (int n = 0; n < NDRAW; n++) {
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1,
-                              1, &dset[n], 0, NULL);
-      vkCmdDrawIndexed(cmd, TPD * 3, 1, n * TPD * 3, 0, 0);
+      vkCmdBindDescriptorSets(draw_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              layout, 1, 1, &dset[n], 0, NULL);
+      vkCmdDrawIndexed(draw_cmd, TPD * 3, 1, n * TPD * 3, 0, 0);
    }
+#ifdef CPVK_SECONDARY_DESCRIPTOR
+   CHECK(vkEndCommandBuffer(secondary));
+   ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+   beginRendering(cmd, &ri);
+   vkCmdExecuteCommands(cmd, 1, &secondary);
+#endif
    endRendering(cmd);
    CHECK(vkEndCommandBuffer(cmd));
 
