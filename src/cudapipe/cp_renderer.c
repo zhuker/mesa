@@ -7062,6 +7062,28 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
  * every microsecond of it.
  */
 void
+cp_render_scope_begin(struct cp_context *cp, const struct cp_render_scope *scope)
+{
+   cp_batch_flush_why(cp, "framebuffer");
+   if (getenv("CPVK_DEBUG_EPISODE"))
+      fprintf(stderr, "episode-cut: begin_render\n");
+   cp_pass_finish(cp);
+   cp->pass.scope = *scope;
+   cp->pass.scope_open = true;
+   cp_context_set_framebuffer(cp, &scope->fb, scope->attachment_samples);
+}
+
+void
+cp_render_scope_end(struct cp_context *cp)
+{
+   cp_batch_flush_why(cp, "render scope end");
+   if (getenv("CPVK_DEBUG_EPISODE"))
+      fprintf(stderr, "episode-cut: end_render\n");
+   cp_pass_finish(cp);
+   cp->pass.scope_open = false;
+}
+
+void
 cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
                            unsigned samples)
 {

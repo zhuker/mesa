@@ -100,8 +100,9 @@ dispatch addresses are remapped, retained objects are imported, and inherited
 render-scope indices resolve to the primary's active scope.
 
 Dynamic rendering is translated into immutable `cp_render_scope` values;
+recorded draws carry only a scope index. The renderer owns the open scope value,
 render-pass load clears, end markers and end-of-pass resolves are explicit
-operations. End markers flush batches/pass episodes but do not drain CUDA.
+operations, and end markers flush batches/pass episodes without draining CUDA.
 
 ### Descriptors and command-buffer immutability
 
@@ -483,14 +484,13 @@ continue staging explicit paths rather than using `git add -A`.
    host status/set/reset is mutex protected. The synchronization2 feature is no
    longer exposed at Vulkan 1.1. Stage/access scopes are conservatively treated
    as all commands and event waits can block queue submission on the host.
-10. **Immutable render-scope conversion is deliberately transitional.** Begin
-   and draw operations now use remappable scope indices, inherited secondary
-   rendering resolves to the primary scope, and explicit end markers prevent
-   episodes spanning a Vulkan rendering boundary. Recorded draws retain the old
-   framebuffer copy only as a submit-time field assertion. Prepared draw
-   packets, pending batches and pass/fallback segments now own indexed
-   scope/state snapshots. The renderer still stages a batch snapshot into live
-   context fields at execution entry; threading packet state through every
+10. **Immutable execution still has one legacy staging boundary.** Begin and
+   draw operations use remappable scope indices, inherited secondary rendering
+   resolves to the primary scope, and explicit end markers prevent episodes
+   spanning a Vulkan rendering boundary. Recorded draws no longer duplicate the
+   framebuffer. Prepared packets, pending batches and pass/fallback segments own
+   complete scope/state snapshots, but the renderer still stages a snapshot
+   into live context fields at execution entry. Threading state through every
    launch helper and deleting those live draw fields is the remaining stage.
 11. **Recorded ownership is only partially complete.** Command buffers retain
     unique references to every bound graphics/compute pipeline and recorded

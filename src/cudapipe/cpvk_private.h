@@ -93,6 +93,7 @@ struct cpvk_device {
     * for the complete synchronous submit walk, and is never retained after the
     * submit callback clears prev_draw_valid. */
    const struct cpvk_draw_cmd *prev_draw;
+   const struct cp_render_scope *prev_scope;
    bool prev_draw_valid;
 
    /*
@@ -292,8 +293,6 @@ struct cpvk_dispatch {
 struct cpvk_draw_cmd {
    struct cpvk_pipeline *pipeline;
    uint32_t scope_index;
-   /* Retained through the scope transition as a consistency assertion. */
-   struct cp_fb_desc fb;
    struct cp_viewport_state viewport;
    struct cp_rect scissor;
    struct cp_draw_call call;
@@ -404,14 +403,10 @@ struct cpvk_op {
    enum cpvk_op_kind kind;
    /* BEGIN_RENDER/DRAW only; remapped when secondary ops are imported. */
    uint32_t scope_index;
-   /* BEGIN_RENDER only: the attachment's sample count, which cp_fb_desc does
-    * not carry because the Gallium adapter passes it beside the desc. */
-   unsigned fb_samples;
    union {
       struct cpvk_draw_cmd draw_cmd;
       struct cpvk_clear clear;
       struct cpvk_copy copy;
-      struct cp_fb_desc fb;
       struct cpvk_query_op query;
       struct cpvk_dispatch dispatch;
       struct cpvk_event_op event;
@@ -502,9 +497,6 @@ void cpvk_execute_draw_cmd(struct cpvk_device *dev,
 void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
 void cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
 void cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q);
-void cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb,
-                               unsigned samples);
-void cpvk_execute_end_render(struct cpvk_device *dev);
 
 extern const struct vk_command_buffer_ops cpvk_cmd_buffer_ops;
 extern const struct vk_sync_type *const cpvk_sync_types[];

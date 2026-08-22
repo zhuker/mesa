@@ -222,6 +222,8 @@ struct cp_context {
    } *pass_segs;                    /* [CP_PASS_MAX_SEGS], at context create */
 
    struct {
+      struct cp_render_scope scope;
+      bool scope_open;
       unsigned nsegs;
       unsigned total_draws;
       uint32_t next_prim;           /* running global slot base */
@@ -859,6 +861,9 @@ void cp_pass_record_segment(struct cp_context *cp,
 void cp_context_set_framebuffer(struct cp_context *cp,
                                 const struct cp_fb_desc *fb,
                                 unsigned samples);
+void cp_render_scope_begin(struct cp_context *cp,
+                           const struct cp_render_scope *scope);
+void cp_render_scope_end(struct cp_context *cp);
 
 struct glsl_type;
 int cp_type_size_vec4(const struct glsl_type *type, bool bindless);

@@ -1009,11 +1009,8 @@ cpvk_remap_secondary_op(struct cpvk_cmd_buffer *cmd, struct cpvk_op *op,
    else if (scope != CP_RENDER_SCOPE_NONE)
       scope += scope_base;
    op->scope_index = scope;
-   if (op->kind == CPVK_OP_DRAW) {
+   if (op->kind == CPVK_OP_DRAW)
       op->draw_cmd.scope_index = scope;
-      if (scope < cmd->num_scopes)
-         op->draw_cmd.fb = cmd->scopes[scope].fb;
-   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1258,8 +1255,6 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       if (!op)
          return;
       op->scope_index = scope;
-      op->fb = fb;
-      op->fb_samples = cmd->fb_samples;
    }
 
    /* LOAD_OP_CLEAR, recorded in order with the draws that follow it. */
@@ -1442,7 +1437,6 @@ cpvk_record_draw_cmd(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first
    op->scope_index = cmd->active_scope;
    d->pipeline = cmd->pipeline;
    d->scope_index = cmd->active_scope;
-   d->fb = cmd->fb;
    d->viewport = cmd->viewport;
    d->scissor = cmd->scissor;
    d->range = (struct cp_draw_range) {
@@ -1615,7 +1609,8 @@ cpvk_build_batch_key(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
  * in the Gallium adapter, which is the worked example.
  */
 static bool
-cpvk_batch_structural(struct cpvk_device *dev, const struct cpvk_draw_cmd *d)
+cpvk_batch_structural(struct cpvk_device *dev, const struct cp_render_scope *scope,
+                      const struct cpvk_draw_cmd *d)
 {
    struct cp_context *cp = &dev->renderer;
    const struct cpvk_pipeline *p = d->pipeline;
@@ -1632,7 +1627,7 @@ cpvk_batch_structural(struct cpvk_device *dev, const struct cpvk_draw_cmd *d)
    if (!d->num_vb || !d->vb_base[0])
       return false;
 
-   if (!d->fb.nr_cbufs || !d->fb.color || !cp->visbuf || !cp->depthbuf)
+   if (!scope->fb.nr_cbufs || !scope->fb.color || !cp->visbuf || !cp->depthbuf)
       return false;
 
    uint64_t tris = (uint64_t)cp_triangles_for_draw(d->call.mode,
@@ -1645,6 +1640,7 @@ cpvk_batch_structural(struct cpvk_device *dev, const struct cpvk_draw_cmd *d)
 }
 
 static bool cpvk_batch_eligible(struct cpvk_device *dev,
+                                const struct cp_render_scope *scope,
                                 const struct cpvk_draw_cmd *d, bool *blended);
 
 /*
@@ -1696,7 +1692,6 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
                        pa->num_velem * sizeof(pa->velem[0])), "vertex layout");
       CPVK_DIFF(pa->samples != pb->samples, "sample count");
    }
-   CPVK_DIFF(memcmp(&a->fb, &b->fb, sizeof(a->fb)), "framebuffer");
    CPVK_DIFF(memcmp(&a->viewport, &b->viewport, sizeof(a->viewport)), "viewport");
    /*
     * The scissor need not match when the renderer will carry one rectangle
@@ -1779,14 +1774,16 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
  * descriptor, vertex-layout, vertex-buffer, push-constant, scissor and draw
  * changes are captured per segment; these are not. */
 static bool
-cpvk_draws_episode_compatible(const struct cpvk_draw_cmd *a,
+cpvk_draws_episode_compatible(const struct cp_render_scope *sa,
+                              const struct cpvk_draw_cmd *a,
+                              const struct cp_render_scope *sb,
                               const struct cpvk_draw_cmd *b)
 {
    const struct cpvk_pipeline *pa = a->pipeline, *pb = b->pipeline;
    if (!pa || !pb)
       return false;
 
-   return !memcmp(&a->fb, &b->fb, sizeof(a->fb)) &&
+   return sa && sb && sa->serial == sb->serial &&
           !memcmp(&a->viewport, &b->viewport, sizeof(a->viewport)) &&
           !memcmp(&pa->raster, &pb->raster, sizeof(pa->raster)) &&
           !memcmp(&pa->depth, &pb->depth, sizeof(pa->depth)) &&
@@ -1795,13 +1792,14 @@ cpvk_draws_episode_compatible(const struct cpvk_draw_cmd *a,
 }
 
 static bool
-cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
-                    bool *out_blended)
+cpvk_batch_can_join(struct cpvk_device *dev,
+                    const struct cp_render_scope *scope,
+                    const struct cpvk_draw_cmd *d, bool *out_blended)
 {
    struct cp_context *cp = &dev->renderer;
    bool blended = false;
 
-   if (!cpvk_batch_eligible(dev, d, &blended))
+   if (!cpvk_batch_eligible(dev, scope, d, &blended))
       return false;
 
    /* Out to the caller, which stages it on the batch: it decides at flush
@@ -1814,7 +1812,8 @@ cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
    if (!cp->batch.pending)
       return true;
 
-   if (!dev->prev_draw_valid || !dev->prev_draw ||
+   if (!dev->prev_draw_valid || !dev->prev_draw || !dev->prev_scope ||
+       scope->serial != dev->prev_scope->serial ||
        !cpvk_draws_mergeable(d, dev->prev_draw)) {
       if (cp_debug->debug_batchdiff)
          fprintf(stderr, "batchdiff: the draws differ\n");
@@ -1847,8 +1846,9 @@ cpvk_pipeline_order_free(const struct cpvk_pipeline *p)
 }
 
 static bool
-cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
-                    bool *blended)
+cpvk_batch_eligible(struct cpvk_device *dev,
+                    const struct cp_render_scope *scope,
+                    const struct cpvk_draw_cmd *d, bool *blended)
 {
    /*
     * Off, and measured rather than abandoned.
@@ -1898,7 +1898,7 @@ cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
 
    if (cp_debug->no_batch)
       return false;
-   if (!cpvk_batch_structural(dev, d))
+   if (!cpvk_batch_structural(dev, scope, d))
       return false;
 
    if (cpvk_pipeline_order_free(d->pipeline)) {
@@ -2010,7 +2010,7 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
     * what that flag is for.
     */
    bool batch_blended = false;
-   bool batch_ok = cpvk_batch_can_join(dev, d, &batch_blended);
+   bool batch_ok = cpvk_batch_can_join(dev, scope, d, &batch_blended);
    if (!batch_ok) {
       /*
        * A batch-key break is a per-segment change, but only while the state
@@ -2022,10 +2022,11 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
        */
       bool can_defer = cp->batch.pending && dev->prev_draw_valid &&
                        dev->prev_draw &&
-                       cpvk_draws_episode_compatible(d, dev->prev_draw);
+                       cpvk_draws_episode_compatible(scope, d, dev->prev_scope,
+                                                      dev->prev_draw);
       bool eligible = false;
       if (can_defer)
-         eligible = cpvk_batch_eligible(dev, d, &batch_blended);
+         eligible = cpvk_batch_eligible(dev, scope, d, &batch_blended);
 
       if (can_defer && eligible)
          cp_batch_flush_defer_why(cp, "the next draw starts a segment");
@@ -2034,10 +2035,11 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
 
       /* With the previous batch submitted, an eligible draw starts a fresh
        * batch which can become the next segment. */
-      batch_ok = cpvk_batch_can_join(dev, d, &batch_blended);
+      batch_ok = cpvk_batch_can_join(dev, scope, d, &batch_blended);
    }
 
    dev->prev_draw = d;
+   dev->prev_scope = scope;
    dev->prev_draw_valid = true;
 
    struct cp_draw_packet packet;
@@ -2808,36 +2810,6 @@ cpvk_execute_order_op(struct cpvk_device *dev, const struct cpvk_op *op)
    return VK_SUCCESS;
 }
 
-void
-cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb,
-                          unsigned samples)
-{
-   /*
-    * End whatever the previous pass left open before binding the next
-    * framebuffer, which is what the Gallium adapter does at the same point:
-    * "the visibility and depth buffers may be freed below, and the held-back
-    * draws were recorded against the framebuffer that is going away."
-    *
-    * The native path did neither, and a second vkCmdBeginRendering in one
-    * command buffer made the draws after it fault in the rasterizer -- which
-    * is what stopped pbribl's spheres, after three offscreen passes.
-    */
-   cp_batch_flush_why(&dev->renderer, "framebuffer");
-   if (getenv("CPVK_DEBUG_EPISODE"))
-      fprintf(stderr, "episode-cut: begin_render\n");
-   cp_pass_finish(&dev->renderer);
-
-   cp_context_set_framebuffer(&dev->renderer, fb, MAX2(samples, 1u));
-}
-
-void
-cpvk_execute_end_render(struct cpvk_device *dev)
-{
-   cp_batch_flush_why(&dev->renderer, "render scope end");
-   if (getenv("CPVK_DEBUG_EPISODE"))
-      fprintf(stderr, "episode-cut: end_render\n");
-   cp_pass_finish(&dev->renderer);
-}
 
 void
 cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)

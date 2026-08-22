@@ -18,16 +18,6 @@
 #include "vk_sync.h"
 #include "vk_util.h"
 
-static bool
-cpvk_fb_equal(const struct cp_fb_desc *a, const struct cp_fb_desc *b)
-{
-   return a->width == b->width && a->height == b->height &&
-          a->nr_cbufs == b->nr_cbufs && a->color == b->color &&
-          a->color_encoding == b->color_encoding &&
-          a->color_sample_stride == b->color_sample_stride &&
-          a->has_zs == b->has_zs;
-}
-
 static VkResult
 cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
@@ -93,14 +83,11 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             if (s >= cmd->num_scopes)
                return vk_error(dev, VK_ERROR_DEVICE_LOST);
             const struct cp_render_scope *scope = &cmd->scopes[s];
-            assert(cpvk_fb_equal(&cmd->ops[o].fb, &scope->fb));
-            assert(cmd->ops[o].fb_samples == scope->attachment_samples);
-            cpvk_execute_begin_render(dev, &scope->fb,
-                                      scope->attachment_samples);
+            cp_render_scope_begin(&dev->renderer, scope);
             break;
          }
          case CPVK_OP_END_RENDER:
-            cpvk_execute_end_render(dev);
+            cp_render_scope_end(&dev->renderer);
             break;
          case CPVK_OP_CLEAR:
             cpvk_execute_clear(dev, &cmd->ops[o].clear);
@@ -116,8 +103,6 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             if (s >= cmd->num_scopes)
                return vk_error(dev, VK_ERROR_DEVICE_LOST);
             assert(cmd->ops[o].draw_cmd.scope_index == s);
-            assert(cpvk_fb_equal(&cmd->ops[o].draw_cmd.fb,
-                                   &cmd->scopes[s].fb));
             cpvk_execute_draw_cmd(dev, &cmd->scopes[s],
                                   &cmd->ops[o].draw_cmd);
             break;
@@ -155,6 +140,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * their high-water sizes; obsolete growth allocations go. */
    cp_scratch_reset(&dev->renderer);
    dev->prev_draw = NULL;
+   dev->prev_scope = NULL;
    dev->prev_draw_valid = false;
 
    for (uint32_t i = 0; i < submit->signal_count; i++) {
