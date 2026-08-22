@@ -1926,12 +1926,96 @@ cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
    return false;
 }
 
-/* Run one recorded draw through the renderer. */
-void
-cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cpvk_draw_cmd *d)
+static void
+cpvk_prepare_draw(struct cpvk_device *dev, const struct cp_render_scope *scope,
+                  const struct cpvk_draw_cmd *d, struct cp_draw_packet *packet)
 {
    struct cp_context *cp = &dev->renderer;
    struct cpvk_pipeline *p = d->pipeline;
+   memset(packet, 0, sizeof(*packet));
+   packet->scope = scope;
+   packet->state.vs = p->vs;
+   packet->state.fs = p->fs;
+   packet->state.viewport = d->viewport;
+   packet->state.raster = p->raster;
+   packet->state.depth = p->depth;
+   packet->state.blend = p->blend;
+   packet->state.pipeline_samples = p->samples;
+   memcpy(packet->state.velem, p->velem, sizeof(packet->state.velem));
+   memcpy(packet->state.vb_base, d->vb_base, sizeof(packet->state.vb_base));
+   packet->state.num_vertex_buffers = d->num_vb;
+   packet->state.num_vertex_elements = p->num_velem;
+   packet->state.vertex_stride = p->vertex_stride;
+   packet->state.num_vs_ubos = CP_MAX_CONST_BUFFERS;
+   packet->state.num_fs_ubos = CP_MAX_CONST_BUFFERS;
+   packet->call = d->call;
+   packet->range = d->range;
+   packet->scissor = d->scissor;
+
+   CUdeviceptr push_dev = 0;
+   if (d->push_size) {
+      void *host = NULL;
+      push_dev = cp_upload_begin(cp, d->push_size, &host);
+      if (push_dev) {
+         memcpy(host, d->push, d->push_size);
+         cp_upload_end(cp, push_dev, host, d->push_size);
+      }
+   }
+
+   for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
+      uint64_t addr = d->addrs[i] ? d->addrs[i] : dev->null_desc;
+      packet->state.vs_ubos[i] = addr;
+      packet->state.fs_ubos[i] = addr;
+   }
+   uint64_t push_slot = push_dev ? push_dev : dev->null_desc;
+   packet->state.vs_ubos[CPVK_UBO_PUSH_SLOT] = push_slot;
+   packet->state.fs_ubos[CPVK_UBO_PUSH_SLOT] = push_slot;
+}
+
+/* Temporary adapter: packet ownership is explicit before renderer internals
+ * stop reading the live context. */
+static void
+cpvk_stage_packet_legacy(struct cp_context *cp,
+                         const struct cp_draw_packet *packet)
+{
+   const struct cp_draw_state *s = &packet->state;
+   cp->viewport = s->viewport;
+   cp->scissor = packet->scissor;
+   cp->rasterizer = s->raster;
+   cp->depth_stencil = s->depth;
+   cp->blend_desc = s->blend;
+   cp->blend_enabled = s->blend.enable;
+   cp->vs_shader = s->vs;
+   cp->fs_shader = s->fs;
+   memcpy(cp->velem, s->velem, sizeof(cp->velem));
+   cp->num_vertex_elements = s->num_vertex_elements;
+   cp->vertex_stride = s->vertex_stride;
+   memcpy(cp->vb_base, s->vb_base, sizeof(cp->vb_base));
+   cp->num_vertex_buffers = s->num_vertex_buffers;
+   for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
+      cp->vs_ubos[i].buffer = (void *)(uintptr_t)s->vs_ubos[i];
+      cp->vs_ubos[i].managed_copy = 0;
+      cp->vs_ubos[i].user_copy = false;
+      cp->fs_ubos[i].buffer = (void *)(uintptr_t)s->fs_ubos[i];
+      cp->fs_ubos[i].managed_copy = 0;
+      cp->fs_ubos[i].user_copy = false;
+   }
+   cp->num_vs_ubos = s->num_vs_ubos;
+   cp->num_fs_ubos = s->num_fs_ubos;
+
+   assert(cp->vs_shader == s->vs && cp->fs_shader == s->fs);
+   assert(cp->num_vertex_elements == s->num_vertex_elements);
+   assert(cp->num_vertex_buffers == s->num_vertex_buffers);
+   assert(cp->num_vs_ubos == s->num_vs_ubos &&
+          cp->num_fs_ubos == s->num_fs_ubos);
+}
+
+/* Run one recorded draw through the renderer. */
+void
+cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *scope,
+                      const struct cpvk_draw_cmd *d)
+{
+   struct cp_context *cp = &dev->renderer;
 
    /*
     * Decide about the batch *before* staging this draw's state.
@@ -1975,68 +2059,9 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cpvk_draw_cmd *d)
    dev->prev_draw = d;
    dev->prev_draw_valid = true;
 
-   cp->viewport = d->viewport;
-   cp->scissor = d->scissor;
-   cp->rasterizer = p->raster;
-   cp->depth_stencil = p->depth;
-   cp->blend_desc = p->blend;
-   cp->blend_enabled = p->blend.enable;
-   cp->vs_shader = p->vs;
-   cp->fs_shader = p->fs;
-   memcpy(cp->velem, p->velem, sizeof(cp->velem));
-   cp->num_vertex_elements = p->num_velem;
-   cp->vertex_stride = p->vertex_stride;
-   memcpy(cp->vb_base, d->vb_base, sizeof(cp->vb_base));
-   cp->num_vertex_buffers = d->num_vb;
-
-   /*
-    * The descriptor sets the command buffer resolved become the shaders'
-    * constant buffers. A cudapipe descriptor set is an array of device
-    * addresses, which is exactly what a UBO binding is here.
-    *
-    * It goes in `buffer`, which is the binding's device address, and not in
-    * `managed_copy`, which is where the Gallium adapter stages a binding that
-    * came from a user pointer. The single-draw path builds its uniform table
-    * out of `buffer`; filling the other field left the table full of nulls
-    * and the vertex shader read address zero.
-    */
-   /* Slot 0 is the push constant block, staged into the upload arena so the
-    * kernels read it from device memory like any other binding. */
-   CUdeviceptr push_dev = 0;
-   if (d->push_size) {
-      void *host = NULL;
-      push_dev = cp_upload_begin(cp, d->push_size, &host);
-      if (push_dev) {
-         memcpy(host, d->push, d->push_size);
-         /* Reserving the block does not send it. Without this the shaders read
-          * whatever the arena held. */
-         cp_upload_end(cp, push_dev, host, d->push_size);
-      }
-   }
-
-   for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
-      cp->vs_ubos[i].buffer = (void *)(uintptr_t)
-         (d->addrs[i] ? d->addrs[i] : dev->null_desc);
-      cp->vs_ubos[i].managed_copy = 0;
-      cp->vs_ubos[i].user_copy = false;
-      cp->fs_ubos[i].buffer = (void *)(uintptr_t)
-         (d->addrs[i] ? d->addrs[i] : dev->null_desc);
-      cp->fs_ubos[i].managed_copy = 0;
-      cp->fs_ubos[i].user_copy = false;
-   }
-   /*
-    * Slot zero, and never a null. This assignment used to overwrite the null
-    * descriptor the loop above had just put there, so a draw with no push
-    * constants -- or one whose upload came back empty because the arena was
-    * exhausted -- pointed a shader at address zero. compute-sanitizer put it
-    * at `main+0x230 reading 4 bytes at 0x0`, in the second render pass of a
-    * command buffer, which is what stopped pbribl's spheres.
-    */
-   CUdeviceptr push_slot = push_dev ? push_dev : dev->null_desc;
-   cp->vs_ubos[CPVK_UBO_PUSH_SLOT].buffer = (void *)(uintptr_t)push_slot;
-   cp->fs_ubos[CPVK_UBO_PUSH_SLOT].buffer = (void *)(uintptr_t)push_slot;
-   cp->num_vs_ubos = cp->num_fs_ubos = CP_MAX_CONST_BUFFERS;
-
+   struct cp_draw_packet packet;
+   cpvk_prepare_draw(dev, scope, d, &packet);
+   cpvk_stage_packet_legacy(cp, &packet);
 
    /* The renderer takes draw state through explicit launch arguments and
     * immutable batch snapshots; no device-global mutable state is published. */

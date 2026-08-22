@@ -496,7 +496,9 @@ void cpvk_query_pool_unref(struct cpvk_query_pool *pool);
 void cpvk_event_ref(struct cpvk_event *event);
 void cpvk_event_unref(struct cpvk_event *event);
 
-void cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cpvk_draw_cmd *d);
+void cpvk_execute_draw_cmd(struct cpvk_device *dev,
+                           const struct cp_render_scope *scope,
+                           const struct cpvk_draw_cmd *d);
 void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
 void cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
 void cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q);

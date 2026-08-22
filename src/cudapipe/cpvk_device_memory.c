@@ -118,7 +118,8 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             assert(cmd->ops[o].draw_cmd.scope_index == s);
             assert(cpvk_fb_equal(&cmd->ops[o].draw_cmd.fb,
                                    &cmd->scopes[s].fb));
-            cpvk_execute_draw_cmd(dev, &cmd->ops[o].draw_cmd);
+            cpvk_execute_draw_cmd(dev, &cmd->scopes[s],
+                                  &cmd->ops[o].draw_cmd);
             break;
          }
          case CPVK_OP_DISPATCH: {
