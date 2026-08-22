@@ -91,7 +91,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             cpvk_execute_copy(dev, &cmd->ops[o].copy);
             break;
          case CPVK_OP_DRAW:
-            cpvk_execute_draw(dev, &cmd->ops[o].draw);
+            cpvk_execute_draw_cmd(dev, &cmd->ops[o].draw_cmd);
             break;
          case CPVK_OP_DISPATCH: {
             /* Here, in record order, and not before the copy that fills what
@@ -125,6 +125,8 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    /* Rewind after full retirement.  The current arena generations remain at
     * their high-water sizes; obsolete growth allocations go. */
    cp_scratch_reset(&dev->renderer);
+   dev->prev_draw = NULL;
+   dev->prev_draw_valid = false;
 
    for (uint32_t i = 0; i < submit->signal_count; i++) {
       result = vk_sync_signal(&dev->vk, submit->signals[i].sync,

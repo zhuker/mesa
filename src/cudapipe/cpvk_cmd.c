@@ -1255,7 +1255,7 @@ cpvk_CmdSetScissor(VkCommandBuffer commandBuffer, uint32_t firstScissor,
 
 /* One recorded draw, shared by vkCmdDraw and vkCmdDrawIndexed. */
 static void
-cpvk_record_draw(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first,
+cpvk_record_draw_cmd(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first,
                  unsigned instance_count, unsigned first_instance,
                  int vertex_offset, bool indexed)
 {
@@ -1265,7 +1265,7 @@ cpvk_record_draw(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first,
    struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_DRAW);
    if (!op)
       return;
-   struct cpvk_draw *d = &op->draw;
+   struct cpvk_draw_cmd *d = &op->draw_cmd;
 
    d->pipeline = cmd->pipeline;
    d->fb = cmd->fb;
@@ -1296,7 +1296,7 @@ cpvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
              uint32_t firstInstance)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   cpvk_record_draw(cmd, vertexCount, firstVertex, instanceCount,
+   cpvk_record_draw_cmd(cmd, vertexCount, firstVertex, instanceCount,
                     firstInstance, 0, false);
 }
 
@@ -1306,7 +1306,7 @@ cpvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
                     int32_t vertexOffset, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   cpvk_record_draw(cmd, indexCount, firstIndex, instanceCount, firstInstance,
+   cpvk_record_draw_cmd(cmd, indexCount, firstIndex, instanceCount, firstInstance,
                     vertexOffset, true);
 }
 
@@ -1385,7 +1385,7 @@ static_assert(sizeof(struct cpvk_batch_state) <= CP_BATCH_STATE_BYTES,
  * any of them.
  */
 static void
-cpvk_build_batch_key(struct cpvk_device *dev, const struct cpvk_draw *d,
+cpvk_build_batch_key(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
                      struct cp_batch_key *key, bool blended)
 {
    struct cp_context *cp = &dev->renderer;
@@ -1440,7 +1440,7 @@ cpvk_build_batch_key(struct cpvk_device *dev, const struct cpvk_draw *d,
  * in the Gallium adapter, which is the worked example.
  */
 static bool
-cpvk_batch_structural(struct cpvk_device *dev, const struct cpvk_draw *d)
+cpvk_batch_structural(struct cpvk_device *dev, const struct cpvk_draw_cmd *d)
 {
    struct cp_context *cp = &dev->renderer;
 
@@ -1470,7 +1470,7 @@ cpvk_batch_structural(struct cpvk_device *dev, const struct cpvk_draw *d)
 }
 
 static bool cpvk_batch_eligible(struct cpvk_device *dev,
-                                const struct cpvk_draw *d, bool *blended);
+                                const struct cpvk_draw_cmd *d, bool *blended);
 
 /*
  * Whether this draw can join whatever is pending -- answered without touching
@@ -1489,7 +1489,7 @@ static bool cpvk_batch_eligible(struct cpvk_device *dev,
  * all, which is what makes it safe to run before the draw is staged.
  */
 static bool
-cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
+cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *b)
 {
 #define CPVK_DIFF(cond, what)                                   \
    do {                                                         \
@@ -1604,8 +1604,8 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
  * descriptor, vertex-layout, vertex-buffer, push-constant, scissor and draw
  * changes are captured per segment; these are not. */
 static bool
-cpvk_draws_episode_compatible(const struct cpvk_draw *a,
-                              const struct cpvk_draw *b)
+cpvk_draws_episode_compatible(const struct cpvk_draw_cmd *a,
+                              const struct cpvk_draw_cmd *b)
 {
    const struct cpvk_pipeline *pa = a->pipeline, *pb = b->pipeline;
    if (!pa || !pb)
@@ -1620,7 +1620,7 @@ cpvk_draws_episode_compatible(const struct cpvk_draw *a,
 }
 
 static bool
-cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw *d,
+cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
                     bool *out_blended)
 {
    struct cp_context *cp = &dev->renderer;
@@ -1654,7 +1654,7 @@ cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw *d,
 }
 
 static bool
-cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw *d,
+cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
                     bool *blended)
 {
    /*
@@ -1754,7 +1754,7 @@ cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw *d,
 
 /* Run one recorded draw through the renderer. */
 void
-cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
+cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cpvk_draw_cmd *d)
 {
    struct cp_context *cp = &dev->renderer;
    struct cpvk_pipeline *p = d->pipeline;

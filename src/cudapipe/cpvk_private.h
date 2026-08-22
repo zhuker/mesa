@@ -86,18 +86,12 @@ struct cpvk_device {
    CUdeviceptr null_desc;
    CUdeviceptr null_data;
 
-   /*
-    * The last draw staged into the renderer, for deciding whether the next
-    * one may join its batch. A copy of the draw rather than anything read
-    * from the context, because the decision has to be made before the
-    * incoming draw is staged -- a flush renders what is held back and reads
-    * the context to do it -- and the context at that moment still describes
-    * the previous draw. Allocated once; struct cpvk_draw is declared later.
-    */
-   /* Last recorded draw while a renderer batch is pending. Command-buffer
-    * operations are immutable for the duration of submit, so retaining their
-    * pointer avoids copying the large descriptor/push snapshot on every draw. */
-   const struct cpvk_draw *prev_draw;
+   /* The last command draw staged into a pending renderer batch. Merge must be
+    * decided before the incoming draw mutates live renderer state. The pointer
+    * refers into an immutable command-buffer op array, whose storage is stable
+    * for the complete synchronous submit walk, and is never retained after the
+    * submit callback clears prev_draw_valid. */
+   const struct cpvk_draw_cmd *prev_draw;
    bool prev_draw_valid;
 
    /*
@@ -294,7 +288,7 @@ struct cpvk_dispatch {
 
 #define CPVK_DESCRIPTOR_SIZE 64
 
-struct cpvk_draw {
+struct cpvk_draw_cmd {
    struct cpvk_pipeline *pipeline;
    struct cp_fb_desc fb;
    struct cp_viewport_state viewport;
@@ -408,7 +402,7 @@ struct cpvk_op {
     * not carry because the Gallium adapter passes it beside the desc. */
    unsigned fb_samples;
    union {
-      struct cpvk_draw draw;
+      struct cpvk_draw_cmd draw_cmd;
       struct cpvk_clear clear;
       struct cpvk_copy copy;
       struct cp_fb_desc fb;
@@ -492,7 +486,7 @@ void cpvk_query_pool_unref(struct cpvk_query_pool *pool);
 void cpvk_event_ref(struct cpvk_event *event);
 void cpvk_event_unref(struct cpvk_event *event);
 
-void cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d);
+void cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cpvk_draw_cmd *d);
 void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
 void cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
 void cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q);
