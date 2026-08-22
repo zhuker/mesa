@@ -22,8 +22,10 @@
 
 #include "kernels/cp_rast_types.h"
 
+#include "cp_shader_abi.h"
+
 #define CP_MAX_SHADER_BUFFERS 16
-#define CP_MAX_CONST_BUFFERS  16
+/* CP_MAX_CONST_BUFFERS is the shader ABI's, in cp_shader_abi.h. */
 /*
  * Distinct sampler states, not VkSampler objects: identical states share one
  * entry because shader specialization compares the state, not the index. The

@@ -948,14 +948,22 @@ struct cp_sampler_info {
 };
 
 /*
- * Offsets into lavapipe's descriptors. These are the only two things we read
- * out of structures we don't own, and cp_context.c static-asserts both against
- * offsetof() so a layout change upstream breaks the build rather than the
- * rendering.
+ * The three fields of a descriptor row that CUDA code reads: cp_sampler.cu and
+ * the generated shader PTX both address them by these byte offsets.
+ *
+ * They are this driver's own layout, defined and asserted against
+ * struct cpvk_descriptor in cp_shader_abi.h, which is the only place to change
+ * them. The numbers were originally lavapipe's, because lavapipe used to be
+ * the Vulkan front end that produced these descriptors and the rows were its
+ * structures; nothing outside this directory produces one now.
+ *
+ * They are here rather than in cp_shader_abi.h because this header is
+ * stringified into the kernel sources at build time and NVRTC compiles it with
+ * nothing else available.
  */
-#define CP_DESC_IMAGE_BASE_OFFSET      0   /* lp_image_descriptor.texture.base */
-#define CP_DESC_IMAGE_FUNCTIONS_OFFSET 48  /* lp_image_descriptor.functions */
-#define CP_DESC_SAMPLER_INDEX_OFFSET   28  /* lp_sampler_descriptor.sampler_index */
+#define CP_DESC_IMAGE_BASE_OFFSET      0   /* cpvk_descriptor.base */
+#define CP_DESC_IMAGE_FUNCTIONS_OFFSET 48  /* cpvk_descriptor.texture_info */
+#define CP_DESC_SAMPLER_INDEX_OFFSET   28  /* .sampler_index_or_img_stride */
 
 /*
  * Persistent GPU-visible state. Written by CPU on pipe state changes

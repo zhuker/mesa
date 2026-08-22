@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include "cp_device.h"
 #include "cp_renderer.h"
+#include "cp_shader_abi.h"
 #include "cp_draw_packet.h"
 #include "vk_buffer.h"
 #include "vk_image.h"
@@ -193,61 +194,8 @@ struct cpvk_pipeline_layout {
    unsigned num_descriptors;
 };
 
-/*
- * One descriptor, laid out so the kernels find what they read where they read
- * it. Only three offsets are fixed and they are fixed by the kernels, not by
- * this struct: the buffer base at 0, the sampler index at
- * CP_DESC_SAMPLER_INDEX_OFFSET, the texture info pointer at
- * CP_DESC_IMAGE_FUNCTIONS_OFFSET. Everything between them is padding this
- * driver owns.
- */
-#define CPVK_DESCRIPTOR_SIZE 64
-
-struct cpvk_descriptor {
-   uint64_t base;                     /* +0  buffer base, or image base */
-   /*
-    * The extent, which the storage-image path clamps against before it
-    * touches memory. Leaving it zero is not a missing optimisation: every
-    * coordinate then reads as out of bounds and robustness returns zero for
-    * the whole image, so computeshader's emboss convolved a constant and its
-    * half of the frame came out flat grey, 128 in every channel.
-    */
-   /*
-    * +8 is the extent for a storage image and the bound range in bytes for a
-    * buffer. The kernels read it as the image width; get_ssbo_size reads it
-    * as the buffer's size, which is what `buffer.length()` divides by its
-    * array stride.
-    */
-   uint32_t width_or_range;           /* +8 */
-   uint16_t height;                   /* +12 */
-   uint16_t depth;                    /* +14 */
-   uint8_t  pad0[8];
-   uint32_t row_stride;               /* +24 storage image only */
-   /*
-    * +28 is two things, because a descriptor is one kind or the other and
-    * lavapipe's lp_descriptor overlaps them the same way: a sampler's table
-    * index, or a storage image's layer stride.
-    */
-   uint32_t sampler_index_or_img_stride;
-   uint8_t  pad1[8];
-   uint32_t base_offset;              /* +40 storage image only */
-   uint8_t  pad2[4];
-   uint64_t texture_info;             /* +48 struct cp_texture_info * */
-   uint8_t  pad3[8];
-};
-static_assert(sizeof(struct cpvk_descriptor) == CPVK_DESCRIPTOR_SIZE,
-              "the kernels read fixed offsets into this");
-static_assert(offsetof(struct cpvk_descriptor, base) == 0, "descriptor ABI");
-static_assert(offsetof(struct cpvk_descriptor, width_or_range) == 8,
-              "descriptor ABI");
-static_assert(offsetof(struct cpvk_descriptor, row_stride) == 24,
-              "descriptor ABI");
-static_assert(offsetof(struct cpvk_descriptor,
-                       sampler_index_or_img_stride) == 28, "descriptor ABI");
-static_assert(offsetof(struct cpvk_descriptor, base_offset) == 40,
-              "descriptor ABI");
-static_assert(offsetof(struct cpvk_descriptor, texture_info) == 48,
-              "descriptor ABI");
+/* The descriptor row, the constant-buffer slots and their assertions all
+ * live in the shader ABI header now; see cp_shader_abi.h. */
 
 #define CPVK_DESCRIPTOR_TYPE_COUNT (VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1)
 
@@ -350,7 +298,6 @@ struct cpvk_event {
 #define CPVK_MAX_DISPATCHES 64
 
 /* Buffer slot 0 is the push constant block; descriptors start after it. */
-#define CPVK_UBO_PUSH_SLOT  0
 #define CPVK_MAX_PUSH_BYTES 256
 
 struct cpvk_dispatch {

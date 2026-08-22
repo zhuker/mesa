@@ -4,6 +4,7 @@
 #include "compiler/nir/nir.h"
 #include "util/u_memory.h"
 #include "kernels/cp_rast_types.h"
+#include "cp_shader_abi.h"
 
 #include <llvm-c/Core.h>
 #include <llvm-c/Target.h>
@@ -2087,10 +2088,8 @@ cp_tex_flags(const nir_tex_instr *tex)
  * written in CUDA C (cp_sampler.cu). Its relocatable PTX is linked with this
  * shader's PTX at module-load time, so this is just an external call.
  */
-/* One descriptor, matching cpvk_private.h's struct cpvk_descriptor. The
- * backend cannot include the Vulkan driver's header, so the size is asserted
- * against the layout the descriptor lowering uses. */
-#define CPVK_DESCRIPTOR_SIZE 64
+/* The descriptor row's stride, from the shader ABI header the front end and
+ * the kernels also use. */
 
 static void
 emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)

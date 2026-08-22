@@ -21,9 +21,9 @@
 #include "vk_common_entrypoints.h"
 #include "vk_util.h"
 
+/* CPVK_ARG_UBO_BASE and CPVK_MAX_ARG_BUFS come from cp_shader_abi.h, which is
+ * where the kernels' argument-block layout is stated and asserted. */
 #define CPVK_ARG_SLOTS      34
-#define CPVK_ARG_UBO_BASE   18
-#define CPVK_MAX_ARG_BUFS   16
 
 /* ---------------------------------------------------------------- pools */
 
