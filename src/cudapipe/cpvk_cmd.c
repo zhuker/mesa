@@ -2462,14 +2462,14 @@ cpvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
 static bool
 cpvk_is_bgra(VkFormat f)
 {
-   switch (f) {
-   case VK_FORMAT_B8G8R8A8_UNORM:
-   case VK_FORMAT_B8G8R8A8_SRGB:
-   case VK_FORMAT_B8G8R8A8_SNORM:
-      return true;
-   default:
-      return false;
-   }
+   return f == VK_FORMAT_B8G8R8A8_UNORM;
+}
+
+static bool
+cpvk_is_blit_rgba8(VkFormat f)
+{
+   return f == VK_FORMAT_R8G8B8A8_UNORM ||
+          f == VK_FORMAT_B8G8R8A8_UNORM;
 }
 
 /*
@@ -2495,8 +2495,10 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
       size_t sp, dp;
       unsigned sbpp, dbpp;
       if (!cpvk_image_plane(src, r->srcSubresource.mipLevel, &sb, &sp, &sbpp) ||
-          !cpvk_image_plane(dst, r->dstSubresource.mipLevel, &db, &dp, &dbpp))
+          !cpvk_image_plane(dst, r->dstSubresource.mipLevel, &db, &dp, &dbpp)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
+      }
 
       int sw = r->srcOffsets[1].x - r->srcOffsets[0].x;
       int sh = r->srcOffsets[1].y - r->srcOffsets[0].y;
@@ -2507,13 +2509,16 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
          fprintf(stderr, "cudapipe: vkCmdBlitImage %dx%d -> %dx%d (%u/%u bpp) "
                  "changes texel size or inverts, which is not implemented\n",
                  sw, sh, dw, dh, sbpp, dbpp);
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
 
       bool scaling = (sw != dw || sh != dh);
-      if (scaling && sbpp != 4) {
-         fprintf(stderr, "cudapipe: vkCmdBlitImage scales a %u-byte texel, "
-                 "which is not implemented\n", sbpp);
+      if (scaling && (!cpvk_is_blit_rgba8(src->vk.format) ||
+                      !cpvk_is_blit_rgba8(dst->vk.format))) {
+         fprintf(stderr, "cudapipe: vkCmdBlitImage scales unsupported formats "
+                 "%u -> %u\n", src->vk.format, dst->vk.format);
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
 
@@ -2522,13 +2527,16 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
        * than approximated. */
       bool swap_rb = false;
       if (src->vk.format != dst->vk.format) {
-         if (sbpp == 4 && cpvk_is_bgra(src->vk.format) !=
-                          cpvk_is_bgra(dst->vk.format)) {
+         if (cpvk_is_blit_rgba8(src->vk.format) &&
+             cpvk_is_blit_rgba8(dst->vk.format) &&
+             cpvk_is_bgra(src->vk.format) != cpvk_is_bgra(dst->vk.format)) {
             swap_rb = true;
          } else {
             fprintf(stderr, "cudapipe: vkCmdBlitImage %u -> %u is a format "
                     "conversion that is not implemented\n",
                     src->vk.format, dst->vk.format);
+            vk_command_buffer_set_error(&cmd->vk,
+                                        VK_ERROR_FEATURE_NOT_PRESENT);
             return;
          }
       }
@@ -2558,13 +2566,14 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
          .src_end = cpvk_image_end(src),
          .dst_end = cpvk_image_end(dst),
          .swap_rb = swap_rb,
-         .src_w = scaling ? (unsigned)sw : 0,
-         .src_h = scaling ? (unsigned)sh : 0,
-         .dst_w = scaling ? (unsigned)dw : 0,
-         .dst_h = scaling ? (unsigned)dh : 0,
+         .src_w = (scaling || swap_rb) ? (unsigned)sw : 0,
+         .src_h = (scaling || swap_rb) ? (unsigned)sh : 0,
+         .dst_w = (scaling || swap_rb) ? (unsigned)dw : 0,
+         .dst_h = (scaling || swap_rb) ? (unsigned)dh : 0,
          .bpp = sbpp,
          .filter_linear = pInfo->filter == VK_FILTER_LINEAR,
-         .encoding = (src->color == dst->color) ? src->color : -1,
+         .encoding = src->color,
+         .dst_encoding = dst->color,
       };
    }
 }
@@ -2926,7 +2935,7 @@ cpvk_execute_order_op(struct cpvk_device *dev, const struct cpvk_op *op)
 }
 
 
-void
+VkResult
 cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
 {
    struct cp_context *cp = &dev->renderer;
@@ -2968,12 +2977,14 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
               c->width_bytes, c->rows, c->src_pitch, c->dst_pitch,
               (void *)(uintptr_t)src_reach, (void *)(uintptr_t)dst_reach,
               (void *)(uintptr_t)c->src_end, (void *)(uintptr_t)c->dst_end);
-      return;
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
    }
 
    if (c->rows <= 1 && !c->src_pitch && !c->dst_pitch) {
-      cuMemcpyDtoDAsync(c->dst, c->src, c->width_bytes, cp->stream);
-      return;
+      if (cuMemcpyDtoDAsync(c->dst, c->src, c->width_bytes,
+                            cp->stream) != CUDA_SUCCESS)
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+      return VK_SUCCESS;
    }
 
    if (c->samples > 1 && cp->screen->kernels.resolve_samples &&
@@ -3003,55 +3014,14 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
       if (cuLaunchKernel(cp->screen->kernels.resolve_samples,
                          (ra.width + 15) / 16, (ra.height + 15) / 16, 1,
                          16, 16, 1, 0, cp->stream, params, NULL) == CUDA_SUCCESS)
-         return;
-      /* Fall through to the host path if the launch was refused. */
+         return VK_SUCCESS;
    }
 
    if (c->samples > 1) {
-      /*
-       * Resolve on the host, once per render pass. Every sample plane is read
-       * and averaged into the destination; this is not on a frame's critical
-       * path and a kernel can replace it when something resolves per draw.
-       */
-      size_t bytes = c->width_bytes * c->rows;
-      uint8_t *acc_src = malloc(bytes);
-      uint32_t *acc = calloc(bytes / 4 * 4, sizeof(uint32_t));
-      uint8_t *out = malloc(bytes);
-      if (!acc_src || !acc || !out) {
-         free(acc_src); free(acc); free(out);
-         return;
-      }
-
-      cuStreamSynchronize(cp->stream);
-      for (unsigned s = 0; s < c->samples; s++) {
-         CUDA_MEMCPY2D d2h = {
-            .srcMemoryType = CU_MEMORYTYPE_DEVICE,
-            .srcDevice = c->src + s * c->sample_stride,
-            .srcPitch = c->src_pitch,
-            .dstMemoryType = CU_MEMORYTYPE_HOST, .dstHost = acc_src,
-            .dstPitch = c->width_bytes,
-            .WidthInBytes = c->width_bytes, .Height = c->rows,
-         };
-         if (cuMemcpy2D(&d2h) != CUDA_SUCCESS)
-            break;
-         for (size_t i = 0; i < bytes; i++)
-            acc[i] += acc_src[i];
-      }
-
-      for (size_t i = 0; i < bytes; i++)
-         out[i] = (uint8_t)((acc[i] + c->samples / 2) / c->samples);
-
-      CUDA_MEMCPY2D h2d = {
-         .srcMemoryType = CU_MEMORYTYPE_HOST, .srcHost = out,
-         .srcPitch = c->width_bytes,
-         .dstMemoryType = CU_MEMORYTYPE_DEVICE, .dstDevice = c->dst,
-         .dstPitch = c->dst_pitch,
-         .WidthInBytes = c->width_bytes, .Height = c->rows,
-      };
-      cuMemcpy2D(&h2d);
-      free(acc_src); free(acc); free(out);
-      return;
+      fprintf(stderr, "cudapipe: device MSAA resolve is unavailable\n");
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
    }
+
 
    if (getenv("CPVK_DEBUG_RT")) {
       /* The first texels of the source, as halves: what the pass just
@@ -3066,7 +3036,7 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
       }
    }
 
-   if (c->src_w && c->filter_linear && c->encoding >= 0 && !c->swap_rb &&
+   if (c->src_w && c->encoding >= 0 && c->dst_encoding >= 0 &&
        cp->screen->kernels.blit_linear) {
       /*
        * A scaling blit, on the device.
@@ -3078,9 +3048,9 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
        * 33 seconds building its irradiance cube, which is 11.7x that driver's
        * whole run.
        *
-       * cp_blit_linear does the same bilinear-at-pixel-centres arithmetic the
-       * host path documents, over any encoding, and this driver already loads
-       * it. A refused launch falls through.
+       * cp_blit_linear implements LINEAR and NEAREST at Vulkan pixel centres
+       * and decodes/encodes the source and destination independently, including
+       * RGBA/BGRA conversion. No host fallback remains.
        */
       struct cp_blit_linear_args ba = {
          .src = c->src,
@@ -3096,142 +3066,28 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
          .src_layer_stride = 0,
          .dst_layer_stride = 0,
          .layers = 1,
-         .encoding = c->encoding,
+         .src_encoding = c->encoding,
+         .dst_encoding = c->dst_encoding,
+         .filter_linear = c->filter_linear,
       };
       void *params[] = { &ba };
-      if (cuLaunchKernel(cp->screen->kernels.blit_linear,
-                         (c->dst_w + 15) / 16, (c->dst_h + 15) / 16, 1,
-                         16, 16, 1, 0, cp->stream, params, NULL) == CUDA_SUCCESS)
-         return;
+      CUresult err = cuLaunchKernel(cp->screen->kernels.blit_linear,
+                                    (c->dst_w + 15) / 16,
+                                    (c->dst_h + 15) / 16, 1,
+                                    16, 16, 1, 0, cp->stream, params, NULL);
+      if (err != CUDA_SUCCESS) {
+         fprintf(stderr, "cudapipe: device blit failed: %d\n", err);
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+      }
+      return VK_SUCCESS;
    }
 
    if (c->src_w) {
-      /*
-       * A scaling blit, on the host and synchronously, for the same reason
-       * the converting one is: this builds a mip chain at load time and is
-       * not on a frame's critical path. Box-filtered when the caller asked
-       * for LINEAR, which is what a downscale by two wants and what every
-       * mip generator asks for; point-sampled otherwise.
-       */
-      size_t src_bytes = (size_t)c->src_w * c->src_h * 4;
-      size_t dst_bytes = (size_t)c->dst_w * c->dst_h * 4;
-      uint8_t *src = malloc(src_bytes), *dst = malloc(dst_bytes);
-      if (!src || !dst) {
-         free(src); free(dst);
-         return;
-      }
-
-      CUDA_MEMCPY2D d2h = {
-         .srcMemoryType = CU_MEMORYTYPE_DEVICE, .srcDevice = c->src,
-         .srcPitch = c->src_pitch,
-         .dstMemoryType = CU_MEMORYTYPE_HOST, .dstHost = src,
-         .dstPitch = (size_t)c->src_w * 4,
-         .WidthInBytes = (size_t)c->src_w * 4, .Height = c->src_h,
-      };
-      cuStreamSynchronize(cp->stream);
-      cuMemcpy2D(&d2h);
-
-      for (unsigned y = 0; y < c->dst_h; y++) {
-         for (unsigned x = 0; x < c->dst_w; x++) {
-            uint8_t *o = dst + ((size_t)y * c->dst_w + x) * 4;
-            if (c->filter_linear) {
-               /*
-                * Bilinear at pixel centres, which is what the Gallium
-                * adapter's blit does and therefore what the mip chains a
-                * sample builds have to match. This was a box filter over the
-                * destination texel's source footprint -- exact for a
-                * power-of-two halving and different everywhere else, which is
-                * texturemipmapgen's minified centre.
-                */
-               float fx = ((float)x + 0.5f) * (float)c->src_w /
-                          (float)c->dst_w - 0.5f;
-               float fy = ((float)y + 0.5f) * (float)c->src_h /
-                          (float)c->dst_h - 0.5f;
-               int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
-               float wx = fx - (float)x0, wy = fy - (float)y0;
-               int x1 = CLAMP(x0 + 1, 0, (int)c->src_w - 1);
-               int y1 = CLAMP(y0 + 1, 0, (int)c->src_h - 1);
-               x0 = CLAMP(x0, 0, (int)c->src_w - 1);
-               y0 = CLAMP(y0, 0, (int)c->src_h - 1);
-
-               const uint8_t *p00 = src + ((size_t)y0 * c->src_w + x0) * 4;
-               const uint8_t *p10 = src + ((size_t)y0 * c->src_w + x1) * 4;
-               const uint8_t *p01 = src + ((size_t)y1 * c->src_w + x0) * 4;
-               const uint8_t *p11 = src + ((size_t)y1 * c->src_w + x1) * 4;
-               for (int k = 0; k < 4; k++) {
-                  float a = (float)p00[k] + ((float)p10[k] - (float)p00[k]) * wx;
-                  float b = (float)p01[k] + ((float)p11[k] - (float)p01[k]) * wx;
-                  float v = a + (b - a) * wy;
-                  o[k] = (uint8_t)(v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v + 0.5f));
-               }
-            } else {
-               unsigned sx = x * c->src_w / c->dst_w;
-               unsigned sy = y * c->src_h / c->dst_h;
-               memcpy(o, src + ((size_t)sy * c->src_w + sx) * 4, 4);
-            }
-
-            if (c->swap_rb) {
-               uint8_t r = o[0];
-               o[0] = o[2];
-               o[2] = r;
-            }
-         }
-      }
-
-      CUDA_MEMCPY2D h2d = {
-         .srcMemoryType = CU_MEMORYTYPE_HOST, .srcHost = dst,
-         .srcPitch = (size_t)c->dst_w * 4,
-         .dstMemoryType = CU_MEMORYTYPE_DEVICE, .dstDevice = c->dst,
-         .dstPitch = c->dst_pitch,
-         .WidthInBytes = (size_t)c->dst_w * 4, .Height = c->dst_h,
-      };
-      cuMemcpy2D(&h2d);
-      free(src);
-      free(dst);
-      return;
+      fprintf(stderr, "cudapipe: unsupported device blit encoding %d -> %d\n",
+              c->encoding, c->dst_encoding);
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
    }
 
-   if (c->swap_rb) {
-      /*
-       * The converting blit, on the host and synchronously.
-       *
-       * This is the path an offscreen app takes once per saved frame, and it
-       * is not on any frame's critical path. Doing it here rather than as a
-       * kernel keeps the kernel set as it is; if something ever blits per
-       * frame, this is the line that says it needs one.
-       */
-      size_t bytes = c->width_bytes * c->rows;
-      uint32_t *tmp = malloc(bytes);
-      if (!tmp)
-         return;
-
-      CUDA_MEMCPY2D d2h = {
-         .srcMemoryType = CU_MEMORYTYPE_DEVICE, .srcDevice = c->src,
-         .srcPitch = c->src_pitch,
-         .dstMemoryType = CU_MEMORYTYPE_HOST, .dstHost = tmp,
-         .dstPitch = c->width_bytes,
-         .WidthInBytes = c->width_bytes, .Height = c->rows,
-      };
-      cuStreamSynchronize(cp->stream);
-      cuMemcpy2D(&d2h);
-
-      for (size_t i = 0; i < bytes / 4; i++) {
-         uint32_t v = tmp[i];
-         tmp[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) |
-                  ((v & 0x000000FFu) << 16);
-      }
-
-      CUDA_MEMCPY2D h2d = {
-         .srcMemoryType = CU_MEMORYTYPE_HOST, .srcHost = tmp,
-         .srcPitch = c->width_bytes,
-         .dstMemoryType = CU_MEMORYTYPE_DEVICE, .dstDevice = c->dst,
-         .dstPitch = c->dst_pitch,
-         .WidthInBytes = c->width_bytes, .Height = c->rows,
-      };
-      cuMemcpy2D(&h2d);
-      free(tmp);
-      return;
-   }
 
    CUDA_MEMCPY2D m = {
       .srcMemoryType = CU_MEMORYTYPE_DEVICE,
@@ -3243,7 +3099,8 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
       .WidthInBytes = c->width_bytes,
       .Height = c->rows,
    };
-   cuMemcpy2DAsync(&m, cp->stream);
+   if (cuMemcpy2DAsync(&m, cp->stream) != CUDA_SUCCESS)
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
    if (getenv("CPVK_DEBUG_RT")) {
       /* And what landed, read back from the destination this copy just
@@ -3258,7 +3115,9 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
          fprintf(stderr, "\n");
       }
    }
+   return VK_SUCCESS;
 }
+
 
 
 /* ------------------------------------------------------------- queries */

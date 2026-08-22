@@ -212,9 +212,10 @@ Advertised format features are intentionally closed over the implementation:
 - unsupported formats/features are refused rather than advertised and later
   clamped.
 
-Device kernels handle the supported linear blit and multisample resolve paths.
-Operations outside the supported family are diagnosed/refused; some older
-host copy/resolve fallback code remains and must not become a frame path.
+Device kernels handle supported LINEAR/NEAREST scaling, RGBA↔BGRA conversion
+and multisample resolve paths. The copy executor has no host fallback; command
+recording rejects operations outside the advertised closed family and CUDA
+launch/copy failures propagate as submit errors.
 
 ### Draw batching, clipping, episodes and A-buffer ownership
 
@@ -455,10 +456,10 @@ continue staging explicit paths rather than using `git add -A`.
    `KHR_surface`/`KHR_swapchain` are advertised so headless applications can
    use their image layouts; real surface/swapchain creation is outside the
    supported envelope.
-3. **The generated development manifest is stale.** The driver reports Vulkan
-   1.1, but `cudapipe_native_devenv_icd.x86_64.json` currently says
-   `api_version: 1.0.354`. Align the manifest with the implemented 1.1 contract
-   without raising the driver itself to 1.3.
+3. **The development manifest intentionally stops at Vulkan 1.1.** It now
+   matches the physical-device contract (`api_version: 1.1.x`) so loader
+   dispatch no longer hides core 1.1 entrypoints. Do not raise either manifest
+   or driver to 1.3 as a shortcut for mandatory unimplemented features.
 4. **Vulkan 1.1 is intentional.** Advertising 1.3 was tested and broke feature
    negotiation because the version promises mandatory functionality this
    driver does not implement. Raise the version only with the promised feature
@@ -636,11 +637,10 @@ In order:
    shared manifest. Until then the external result is the 9/10-image sentinel
    gate, not a full-frame correctness pass. Investigate the standing
    `gltfscenerendering` NVIDIA mismatch rather than changing its tolerance.
-4. **Close the remaining object lifetime holes and manifest drift.** Enforce
-   descriptor-pool `maxSets`/pool-size capacity and accounting, add
-   create/reset/destroy stress for pool-owned host descriptor sets, free
-   image-view texture info, complete remaining resource retention, audit
-   context allocations, and emit a Vulkan-1.1 development manifest.
+4. **Close the remaining object lifetime holes and manifest drift.** Pool
+   capacity/reset/free stress and image-view texture-info destruction now pass;
+   complete remaining resource-retention and context-allocation audits. The
+   generated development manifest now matches Vulkan 1.1.
 5. **Make the native validation surface clean.** Fill the remaining physical
    limits/properties, implement or stop exposing unsupported KHR/WSI surfaces,
    run the native tests and representative samples with
@@ -659,9 +659,10 @@ In order:
    persistent and validated. Application NIR→PTX or CUDA JIT caching must key
    the lowered resource ABI, compiler/toolkit version, SM, helper PTX and every
    option; never treat SPIR-V identity alone as sufficient.
-9. **Implement real depth-image and layered-rendering semantics**, then add
-   depth copy/sample and array/cube render-target tests. Transfer-layer support
-   is not proof that draw-layer or attachment persistence works.
+9. **Extend the explicit attachment model deliberately.** D32 load/clear/store
+   persistence now has a focused test. Add depth copy/sample comparisons before
+   broadening it, then implement stencil, depth resolve and layered/multiview
+   rendering rather than treating transfer-layer support as draw-layer proof.
 10. **Finish robustness and query semantics** where workloads need them rather
     than hiding unsupported behavior behind null allocations or invented
     counts.

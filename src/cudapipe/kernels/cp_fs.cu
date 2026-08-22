@@ -1372,43 +1372,52 @@ cp_blit_linear(struct cp_blit_linear_args args)
    if (x >= args.dst_width || y >= args.dst_height || layer >= args.layers)
       return;
 
-   float fx = ((float)x + 0.5f) * (float)args.src_width /
-              (float)args.dst_width - 0.5f;
-   float fy = ((float)y + 0.5f) * (float)args.src_height /
-              (float)args.dst_height - 0.5f;
-   int x0 = (int)floorf(fx);
-   int y0 = (int)floorf(fy);
-   float wx = fx - (float)x0;
-   float wy = fy - (float)y0;
-   int x1 = x0 + 1;
-   int y1 = y0 + 1;
-   x0 = x0 < 0 ? 0 : (x0 >= (int)args.src_width ? (int)args.src_width - 1 : x0);
-   x1 = x1 < 0 ? 0 : (x1 >= (int)args.src_width ? (int)args.src_width - 1 : x1);
-   y0 = y0 < 0 ? 0 : (y0 >= (int)args.src_height ? (int)args.src_height - 1 : y0);
-   y1 = y1 < 0 ? 0 : (y1 >= (int)args.src_height ? (int)args.src_height - 1 : y1);
-
-   uint32_t bpp = cp_bytes_per_pixel(args.encoding);
+   uint32_t src_bpp = cp_bytes_per_pixel(args.src_encoding);
+   uint32_t dst_bpp = cp_bytes_per_pixel(args.dst_encoding);
    const char *src = (const char *)(uintptr_t)args.src +
                      (size_t)layer * args.src_layer_stride;
    char *dst = (char *)(uintptr_t)args.dst +
                (size_t)layer * args.dst_layer_stride;
-   float c00[4], c10[4], c01[4], c11[4], out[4];
-   cp_load_dst(src + (size_t)y0 * args.src_stride + (size_t)x0 * bpp,
-               args.encoding, c00);
-   cp_load_dst(src + (size_t)y0 * args.src_stride + (size_t)x1 * bpp,
-               args.encoding, c10);
-   cp_load_dst(src + (size_t)y1 * args.src_stride + (size_t)x0 * bpp,
-               args.encoding, c01);
-   cp_load_dst(src + (size_t)y1 * args.src_stride + (size_t)x1 * bpp,
-               args.encoding, c11);
-   for (unsigned c = 0; c < 4; c++) {
-      float top = c00[c] + (c10[c] - c00[c]) * wx;
-      float bottom = c01[c] + (c11[c] - c01[c]) * wx;
-      out[c] = top + (bottom - top) * wy;
+   float out[4];
+
+   if (args.filter_linear) {
+      float fx = ((float)x + 0.5f) * (float)args.src_width /
+                 (float)args.dst_width - 0.5f;
+      float fy = ((float)y + 0.5f) * (float)args.src_height /
+                 (float)args.dst_height - 0.5f;
+      int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+      float wx = fx - (float)x0, wy = fy - (float)y0;
+      int x1 = x0 + 1, y1 = y0 + 1;
+      x0 = x0 < 0 ? 0 : (x0 >= (int)args.src_width ? (int)args.src_width - 1 : x0);
+      x1 = x1 < 0 ? 0 : (x1 >= (int)args.src_width ? (int)args.src_width - 1 : x1);
+      y0 = y0 < 0 ? 0 : (y0 >= (int)args.src_height ? (int)args.src_height - 1 : y0);
+      y1 = y1 < 0 ? 0 : (y1 >= (int)args.src_height ? (int)args.src_height - 1 : y1);
+      float c00[4], c10[4], c01[4], c11[4];
+      cp_load_dst(src + (size_t)y0 * args.src_stride + (size_t)x0 * src_bpp,
+                  args.src_encoding, c00);
+      cp_load_dst(src + (size_t)y0 * args.src_stride + (size_t)x1 * src_bpp,
+                  args.src_encoding, c10);
+      cp_load_dst(src + (size_t)y1 * args.src_stride + (size_t)x0 * src_bpp,
+                  args.src_encoding, c01);
+      cp_load_dst(src + (size_t)y1 * args.src_stride + (size_t)x1 * src_bpp,
+                  args.src_encoding, c11);
+      for (unsigned c = 0; c < 4; c++) {
+         float top = c00[c] + (c10[c] - c00[c]) * wx;
+         float bottom = c01[c] + (c11[c] - c01[c]) * wx;
+         out[c] = top + (bottom - top) * wy;
+      }
+   } else {
+      uint32_t sx = min((uint32_t)(((uint64_t)(2 * x + 1) * args.src_width) /
+                                   (2 * args.dst_width)), args.src_width - 1);
+      uint32_t sy = min((uint32_t)(((uint64_t)(2 * y + 1) * args.src_height) /
+                                   (2 * args.dst_height)), args.src_height - 1);
+      cp_load_dst(src + (size_t)sy * args.src_stride + (size_t)sx * src_bpp,
+                  args.src_encoding, out);
    }
-   void *dst_pixel = dst + (size_t)y * args.dst_stride + (size_t)x * bpp;
-   if (args.encoding == CP_COLOR_R11G11B10_FLOAT)
+
+   void *dst_pixel = dst + (size_t)y * args.dst_stride + (size_t)x * dst_bpp;
+   if (args.dst_encoding == CP_COLOR_R11G11B10_FLOAT)
       cp_store_r11g11b10_exact(dst_pixel, out);
    else
-      cp_store_dst(dst_pixel, args.encoding, out);
+      cp_store_dst(dst_pixel, args.dst_encoding, out);
 }

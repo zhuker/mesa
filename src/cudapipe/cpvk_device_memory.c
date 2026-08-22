@@ -95,9 +95,12 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          case CPVK_OP_QUERY:
             cpvk_execute_query(dev, &cmd->ops[o].query);
             break;
-         case CPVK_OP_COPY:
-            cpvk_execute_copy(dev, &cmd->ops[o].copy);
+         case CPVK_OP_COPY: {
+            VkResult r = cpvk_execute_copy(dev, &cmd->ops[o].copy);
+            if (r != VK_SUCCESS)
+               return r;
             break;
+         }
          case CPVK_OP_DRAW: {
             uint32_t s = cmd->ops[o].scope_index;
             if (s >= cmd->num_scopes)

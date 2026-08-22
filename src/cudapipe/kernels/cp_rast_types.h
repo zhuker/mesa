@@ -1080,7 +1080,9 @@ struct cp_blit_linear_args {
    uint32_t src_layer_stride;
    uint32_t dst_layer_stride;
    uint32_t layers;
-   uint32_t encoding;
+   int32_t src_encoding;
+   int32_t dst_encoding;
+   uint32_t filter_linear;
 };
 #define CP_MAX_NONTRIVIAL    1000000
 #define CP_MAX_HUGE_TILES    2000000
