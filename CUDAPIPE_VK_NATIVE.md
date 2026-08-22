@@ -346,7 +346,7 @@ unchanged.
 
 ### Standalone and sample gates
 
-- 39/39 tests in the `cudapipe-native` Meson suite pass:
+- 43/43 tests in the `cudapipe-native` Meson suite pass:
   `meson test -C build-cudapipe --suite cudapipe-native`. They cover descriptor
   semantics (sparse bindings, copies, immutable samplers, graphics/compute
   independence), per-stage push constants, static viewport/scissor,
@@ -382,11 +382,75 @@ unchanged.
   `CUDAPIPE_BATCH_MAX=1`, no-pass and forced-fallback modes:
   `e2ced6cb150b67d3`, `cab20de2d74b1bb3`, `7f57f68ea59ac0de`,
   `baff13435350b962`, `3dca5ecba53a70ee`, `7f57f68ea59ac0de`.
-- The 600-frame BENCH sweep sums to **31.86 ms** hot means and **41.29 s**
-  wall time, against **31.96 ms / 41.31 s** at the architecture checkpoint and
-  32.43 ms / 43.28 s at the performance checkpoint. The two controlled Gallium
+- The 600-frame BENCH sweep sums to **29.79 ms** hot means and **41.51 s**
+  wall time, against 31.86 ms at the semantic pass, **31.96 ms / 41.31 s** at
+  the architecture checkpoint and 32.43 ms / 43.28 s at the performance
+  checkpoint. The 2.07 ms is one sample: `gltfscenerendering` at 10.80 -> 8.77
+  ms, from sampler specialisation reaching it for the first time. The two controlled Gallium
   sweeps sum to 35.73–35.76 ms and 74.01–74.16 s, so native remains faster by
   both the hot submission diagnostic and end-to-end completion.
+
+### The shader ABI, and what it is no longer tied to
+
+The layout a compiled kernel uses to reach its resources is stated once, in
+`cp_shader_abi.h`, and asserted: the descriptor row's stride, every offset CUDA
+code reads, every offset the backend spells as a byte constant, and the two
+cross-checks nobody had written down — that the per-draw table's stride equals
+the constant-buffer slot count, and that push constants occupy a slot inside
+that range. Moving `CP_DESC_SAMPLER_INDEX_OFFSET` from 28 to 32 now fails the
+build rather than producing a driver that samples the wrong four bytes.
+
+The driver no longer emits lavapipe's `load_const_buf_base_addr_lvp`. It has
+its own suffixed intrinsic, which is Mesa's convention for a driver-private
+opcode. The inheritance was historical: the Gallium-hosted driver ran *under*
+lavapipe, so its backend had to implement whatever lavapipe's descriptor
+lowering emitted. The semantics had already diverged — for a merged batch this
+resolves per draw through the row table, which lavapipe has no notion of.
+
+What remains shared with Mesa is Mesa, not Gallium: NIR, `util/format`'s
+`pipe_format` (which nvk, radv, panvk and anv all use), and the Vulkan runtime.
+`src/gallium/drivers/cudapipe` compiles none of these files and never did —
+the two drivers keep separate copies which have diverged by hundreds of lines,
+so nothing about the Gallium driver constrains this one.
+
+### Sampler specialisation, and how it is watched
+
+The specialiser bakes one sampler state into a variant kernel with `#define`s,
+recognising sampler handles by an exact NIR shape. That fails silently: images
+stay correct and a frame simply gets slower. `CUDAPIPE_SPEC_STATS` reports
+launches specialised, shaders seen, unmatched handles and — when a handle is
+rejected — the reason.
+
+It immediately found that `gltfscenerendering` specialised none of 19,292
+launches, for two reasons that each measure as a no-op alone. A set's first
+binding is at flat offset zero, so `nir_iadd_imm` folds the addition away and
+the matcher, which only knew `base + constant`, never saw an `iadd`. With that
+fixed the shaders had two matched descriptors and were refused by a gate
+reading `num_tex_descs == 1` — stricter than the mechanism, whose real
+constraint is that all handles resolve to the *same* state. Together:
+0% -> 95.3%, and 10.80 -> 8.77 ms for that sample.
+
+Steady-state numbers to compare against, from 600-frame runs, since short runs
+report near zero regardless (a variant is only built once register tuning has
+finished):
+
+| sample | specialised | note |
+|---|---|---|
+| `texture` | 98.7% | 83-launch tuning prefix |
+| `texturecubemap` | 96.6% | |
+| `gltfscenerendering` | 95.3% | 0% before this pass |
+| `pbribl` | 46.9% | two of five shaders resolve to differing states |
+| `multithreading` | 0% | |
+
+The equality requirement is correctness, not tidiness: two descriptors with
+different sampler state must fall back, or one texture is filtered with the
+other's sampler. `cpvk_sampler_two_bindings` is that case and carries two
+negative controls. Note that it reports 0/4 specialised — four launches is
+inside the tuning warm-up and its rows do not resolve for a reason not yet
+understood — so today it guards the fallback, not the specialised path. The
+evidence that multi-descriptor specialisation is correct is
+`gltfscenerendering`: 16,175 specialised launches with its NVIDIA comparison
+unmoved.
 
 ### GFXReconstruct gate — external references only
 
@@ -437,6 +501,10 @@ Three repetitions per capture, paired-submit medians:
 | Crossroads | 7.85 ms | 7.84 ms | 7.83 ms | **7.84 ms** |
 | old | 24.98 ms | 24.94 ms | 24.89 ms | **24.94 ms** |
 
+After sampler specialisation reached multi-texture shaders, one further
+repetition of each: **7.58 ms** and **24.58 ms**, with both sets of llvmpipe
+sentinels still exactly at their recorded structure.
+
 **Replay medians are only comparable within one session.** The architecture
 checkpoint recorded 7.22–7.26 ms for Crossroads; re-measuring that exact
 committed build on the machine in this session gave **7.76 ms**, against this
@@ -451,7 +519,7 @@ the old replay is at the approximately 25 ms target.
 
 ## Commit and scope
 
-The current branch tip is `49e641edd7f`. The series relevant to this handoff,
+The current branch tip is `96bb21226ab`. The series relevant to this handoff,
 newest last:
 
 - `733ba22cb66` — the architecture series through immutable draw/render-scope
@@ -462,7 +530,17 @@ newest last:
 - `a553a1f78d2` — the descriptor, query, attachment, capability and
   allocation-failure pass described throughout this document;
 - `49e641edd7f` — the native tests as a Meson suite, plus the four new tests
-  and the two corrected ones.
+  and the two corrected ones;
+- `875bdcff994` — `buffer.length()`, which crashed the process before;
+- `5acc6e60e2e` — `CUDAPIPE_SPEC_STATS`, and the native driver's own
+  `FLAGS.md` generator, since the existing one checked the Gallium registry;
+- `abb23e1a5e6` — descriptor-array and sampler-array tests, and the three
+  array-dynamic-indexing feature bits they showed were implemented but
+  advertised false;
+- `e969ee8e0e2` — `cp_shader_abi.h`: the shader ABI stated once and asserted;
+- `4054d4c8924` — cudapipe's own descriptor intrinsic in place of lavapipe's;
+- `96bb21226ab` — sampler specialisation for shaders sampling more than one
+  texture.
 
 `src/gallium/drivers/cudapipe/` remains byte-identical to `e2e966953d7`.
 Unrelated root documents, scripts and logs remain untracked intentionally;
@@ -731,57 +809,65 @@ Three lessons from this pass are worth keeping in front:
 
 In order:
 
-1. **Implement the four below-minimum limits rather than raising them.**
+1. **Find out why `cpvk_sampler_two_bindings` never specialises.** It reports
+   0 of 4 launches even with register tuning forced, while `texture` with one
+   descriptor specialises and `gltfscenerendering` with two now does. Its
+   sampler indices read back as zero for both bindings under
+   `CUDAPIPE_DEBUG_TEX`, which is what a failed host mapping of the descriptor
+   row looks like, so the suspicion is `cp_host_ptr` over an arena this test's
+   four descriptor sets land in. Until it is understood, that test guards the
+   fallback rather than the specialised path.
+2. **Implement the four below-minimum limits rather than raising them.**
    Multiple colour attachments, layered rendering and input attachments are
    what `maxColorAttachments`, `maxFragmentOutputAttachments`,
    `maxFramebufferLayers` and `maxDescriptorSetInputAttachments` currently
    admit are missing. Until they exist, Vulkan 1.1 is advertised
    non-conformantly and the validation layer says so on every test.
-2. **Implement stencil, or stop needing the exception.** Stencil test/write
+3. **Implement stencil, or stop needing the exception.** Stencil test/write
    state is ignored with a one-time message because refusing it ends the
    Crossroads replay. The honest end state is a stencil implementation with a
    differential test, after which the pipeline can be refused when it is not
    implemented.
-3. **Complete the external image evidence.** Replay the existing Crossroads and
+4. **Complete the external image evidence.** Replay the existing Crossroads and
    old-capture `all.json` plans with llvmpipe or NVIDIA and compare by the
    shared manifest. Until then the external result is the 9/10-image sentinel
    gate, not a full-frame correctness pass. Investigate the standing
    `gltfscenerendering` NVIDIA mismatch rather than changing its tolerance.
-4. **Make the older tests validation-clean.** The four newest are; most of the
+5. **Make the older tests validation-clean.** The four newest are; most of the
    rest set dynamic state their pipeline declares statically, and none of them
    transition image layouts. Fix the tests, then use the layer as a gate rather
    than as a survey.
-5. **Stress asynchronous completion and retirement further.** Queue retirement,
+6. **Stress asynchronous completion and retirement further.** Queue retirement,
    ordered query availability, per-query waits, device-loss latching and the
    256 MiB scratch bound now have tests or explicit bounds. Add longer
    draw/copy↔dispatch dependency and command-pool-reset stress. Preserve the
    single ordered renderer stream until a real multi-queue model exists.
-6. **Close the remaining replay gap.** Fresh controlled traces put native at
+7. **Close the remaining replay gap.** Fresh controlled traces put native at
    4.88 ms of kernels per Crossroads frame versus Gallium's 4.76 ms; the larger
    residual is host/launch scheduling, not an unexplained multi-millisecond
    kernel. Start with unprofiled GPU-busy data, then split compiled `main`
    kernels by grid/register class before changing synchronization. Re-measure
    the baseline build in the same session before believing a replay delta.
-7. **Extend caching only with complete keys.** Embedded/lazy NVRTC PTX is now
+8. **Extend caching only with complete keys.** Embedded/lazy NVRTC PTX is now
    persistent and validated. Application NIR→PTX or CUDA JIT caching must key
    the lowered resource ABI, compiler/toolkit version, SM, helper PTX and every
    option; never treat SPIR-V identity alone as sufficient.
-8. **Extend the attachment model deliberately.** Depth load/clear/store,
+9. **Extend the attachment model deliberately.** Depth load/clear/store,
    stencil clear and sample-zero depth resolve have tests or captures behind
    them. Add depth copy/sample comparisons, then averaging depth resolve and
    layered/multiview rendering, rather than treating transfer-layer support as
    draw-layer proof.
-9. **Finish robustness and the remaining query semantics** where workloads need
+10. **Finish robustness and the remaining query semantics** where workloads need
    them, rather than hiding unsupported behavior behind null allocations or
    invented counts. Occlusion and pipeline-statistics queries still report
    zero, and timestamps are still host approximations.
-10. **Broaden formats/blits/resolves one closed family at a time**, each with a
+11. **Broaden formats/blits/resolves one closed family at a time**, each with a
     validation-correct NVIDIA comparison. Storage-image atomics in particular
     are not implemented for compare-exchange and the format bit is deliberately
     not advertised.
-11. **Resolve the internal A-buffer colour-verifier mismatches** before
+12. **Resolve the internal A-buffer colour-verifier mismatches** before
     treating per-device external equality as a clean verification-mode pass.
-12. **Only then spend native-only render-pass information** on load/store
+13. **Only then spend native-only render-pass information** on load/store
     elision, tile residency or parallel command translation. The original
     motivation is still valid, but earlier pass-wide reordering and immutable
     sampler theories measured at zero. Require a baseline and one isolated
