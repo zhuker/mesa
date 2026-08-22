@@ -1,34 +1,9 @@
 /* Recorded event commands execute in queue order and retain their event. */
-#include <stdatomic.h>
-#include <stdbool.h>
 #include <stdio.h>
-#include <threads.h>
-#include <time.h>
 #include <vulkan/vulkan.h>
 
 #define CHECK(x) do { VkResult r = (x); if (r != VK_SUCCESS) { \
    fprintf(stderr, "%s failed: %d\n", #x, r); return 1; } } while (0)
-
-struct submit_args {
-   VkQueue queue;
-   VkCommandBuffer command;
-   atomic_bool done;
-   VkResult result;
-};
-
-static int
-submit_thread(void *data)
-{
-   struct submit_args *a = data;
-   VkSubmitInfo submit = {
-      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-      .commandBufferCount = 1,
-      .pCommandBuffers = &a->command,
-   };
-   a->result = vkQueueSubmit(a->queue, 1, &submit, VK_NULL_HANDLE);
-   atomic_store(&a->done, true);
-   return 0;
-}
 
 static VkCommandBuffer
 alloc_command(VkDevice device, VkCommandPool pool)
@@ -126,23 +101,18 @@ main(void)
                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                    0, NULL, 0, NULL, 0, NULL);
    CHECK(vkEndCommandBuffer(wait));
-   struct submit_args args = { .queue = queue, .command = wait };
-   atomic_init(&args.done, false);
-   thrd_t thread;
-   if (thrd_create(&thread, submit_thread, &args) != thrd_success)
-      return 1;
-   struct timespec pause = { .tv_nsec = 20000000 };
-   thrd_sleep(&pause, NULL);
-   if (atomic_load(&args.done)) {
-      fprintf(stderr, "event wait did not wait\n");
+   VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+   VkFence wait_fence;
+   CHECK(vkCreateFence(device, &fci, NULL, &wait_fence));
+   si.pCommandBuffers = &wait;
+   CHECK(vkQueueSubmit(queue, 1, &si, wait_fence));
+   if (vkWaitForFences(device, 1, &wait_fence, VK_TRUE, 0) != VK_TIMEOUT) {
+      fprintf(stderr, "event wait completed before the event was set\n");
       return 1;
    }
    CHECK(vkSetEvent(device, event));
-   thrd_join(thread, NULL);
-   if (args.result != VK_SUCCESS) {
-      fprintf(stderr, "event wait submit failed: %d\n", args.result);
-      return 1;
-   }
+   CHECK(vkWaitForFences(device, 1, &wait_fence, VK_TRUE, UINT64_MAX));
+   vkDestroyFence(device, wait_fence, NULL);
 
    VkEvent retained;
    CHECK(vkCreateEvent(device, &eci, NULL, &retained));

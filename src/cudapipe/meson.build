@@ -124,3 +124,66 @@ cpvk_devenv_icd = custom_target(
   ],
   build_by_default : true,
 )
+
+
+# Focused external-API regression suite. These link the Vulkan loader rather
+# than driver internals and select the generated development ICD, so they test
+# the same dispatch and object-lifetime boundary as applications do.
+dep_vulkan_loader = dependency('vulkan', required : false)
+if dep_vulkan_loader.found()
+  cpvk_test_env = environment()
+  cpvk_test_env.set('VK_DRIVER_FILES', cpvk_devenv_icd.full_path())
+  cpvk_test_env.set('VK_ICD_FILENAMES', cpvk_devenv_icd.full_path())
+  cpvk_test_names = [
+    'cpvk_batch',
+    'cpvk_batchbig',
+    'cpvk_batchblend',
+    'cpvk_batchclip',
+    'cpvk_batchpush',
+    'cpvk_batchtex',
+    'cpvk_bccopy',
+    'cpvk_compute_pipeline_lifetime',
+    'cpvk_cubebig',
+    'cpvk_cubebig_pbrsamp',
+    'cpvk_cubedir',
+    'cpvk_cubelod',
+    'cpvk_cubelodf16',
+    'cpvk_cubesph',
+    'cpvk_cubesph_nearest',
+    'cpvk_depth_attachment',
+    'cpvk_descriptor_pool',
+    'cpvk_descriptor_semantics',
+    'cpvk_draw',
+    'cpvk_event_state',
+    'cpvk_lod',
+    'cpvk_lodblit',
+    'cpvk_lodimp',
+    'cpvk_mesh',
+    'cpvk_multidevice',
+    'cpvk_pipeline_lifetime',
+    'cpvk_query_async',
+    'cpvk_query_lifetime',
+    'cpvk_rtt',
+    'cpvk_secondary_descriptor',
+    'cpvk_push_stages',
+    'cpvk_smoke',
+    'cpvk_static_viewport',
+    'cpvk_sync_state',
+    'cpvk_tex',
+    'cpvk_tex3d',
+    'cpvk_tri',
+    'cpvk_ubo',
+    'cpvk_wsi',
+  ]
+  foreach test_name : cpvk_test_names
+    test_exe = executable(test_name, files('tests/' + test_name + '.c'),
+                          dependencies : dep_vulkan_loader,
+                          c_args : ['-Wno-error=missing-prototypes'],
+                          build_by_default : false)
+    test(test_name, test_exe,
+         suite : 'cudapipe-native',
+         env : cpvk_test_env,
+         timeout : 120,
+         depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  endforeach
+endif

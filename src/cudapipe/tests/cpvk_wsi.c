@@ -103,7 +103,6 @@ main(void)
    }
    VkImage *images = calloc(count, sizeof(*images));
    CHECK(vkGetSwapchainImagesKHR(device, swapchain, &count, images));
-   free(images);
 
    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
    VkFence fence;
@@ -112,6 +111,52 @@ main(void)
    CHECK(vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
                                VK_NULL_HANDLE, fence, &image_index));
    CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+
+   VkCommandPoolCreateInfo pci = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .queueFamilyIndex = 0,
+   };
+   VkCommandPool pool;
+   CHECK(vkCreateCommandPool(device, &pci, NULL, &pool));
+   VkCommandBufferAllocateInfo cai = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = pool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+   };
+   VkCommandBuffer cmd;
+   CHECK(vkAllocateCommandBuffers(device, &cai, &cmd));
+   VkCommandBufferBeginInfo bi = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+   };
+   CHECK(vkBeginCommandBuffer(cmd, &bi));
+   VkImageMemoryBarrier barrier = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .srcAccessMask = 0,
+      .dstAccessMask = 0,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = images[image_index],
+      .subresourceRange = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .baseMipLevel = 0, .levelCount = 1,
+         .baseArrayLayer = 0, .layerCount = 1,
+      },
+   };
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                        0, NULL, 0, NULL, 1, &barrier);
+   CHECK(vkEndCommandBuffer(cmd));
+   VkSubmitInfo submit = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &cmd,
+   };
+   CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+
    VkPresentInfoKHR present = {
       .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
       .swapchainCount = 1, .pSwapchains = &swapchain,
@@ -120,6 +165,8 @@ main(void)
    CHECK(vkQueuePresentKHR(queue, &present));
    CHECK(vkQueueWaitIdle(queue));
 
+   vkDestroyCommandPool(device, pool, NULL);
+   free(images);
    vkDestroyFence(device, fence, NULL);
    vkDestroySwapchainKHR(device, swapchain, NULL);
    vkDestroyDevice(device, NULL);
