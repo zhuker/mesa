@@ -37,7 +37,7 @@ The important files are:
 | `cp_renderer.[ch]` | shared draw renderer: batching, clipping, rasterization, A-buffer/peel paths, pass episodes, arenas and shader launches |
 | `cp_kernels.[ch]`, `kernels/` | NVRTC compilation, persistent source/options-keyed PTX caching and CUDA kernels, including the lazy 3D sampler variant |
 | `nir_to_ptx/` | the shared NIR→LLVM/NVPTX backend and loaded shader binaries |
-| `tests/cpvk_*.c` | 35 small native differential/regression programs, including synchronization state, recorded-object lifetime, secondary descriptor ownership and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
+| `tests/cpvk_*.c` | 39 small native differential/regression programs, including descriptor semantics, per-stage push constants, static viewport/scissor, synchronization state, asynchronous query availability, recorded-object lifetime, secondary descriptor ownership, headless WSI and concurrent-device A-buffer stress; they are a Meson suite (`meson test -C build-cudapipe --suite cudapipe-native`) that runs against the generated development ICD |
 
 The native `cpvk_device` owns one CUDA context, one `cp_device` containing the
 kernel modules, and one `cp_context` renderer with its ordered graphics/compute
@@ -125,6 +125,24 @@ lowering maps a recorded set snapshot to a constant-buffer slot and a
 binding/array element to a byte offset. Slot 0 is push constants. Texture
 handles point into the command-buffer snapshot and buffer/image base addresses
 are loaded from that descriptor row.
+
+Binding numbers are the application's and are sparse; the ABI's flat index is
+not. A layout sorts its bindings once, assigns each a dense flat base, and
+every later lookup — NIR lowering, the shader-cache key, writes, copies and
+dynamic offsets — goes through that one map. Bindings, flat descriptors,
+per-descriptor immutable-sampler state and the image views a storage
+descriptor names are all sized by the layout in one trailing allocation, so no
+constant caps a legal set and no write is silently dropped. `vkUpdateDescriptorSets`
+implements `pCopies` through a temporary row, because a copy may overlap inside
+one set, and immutable samplers survive both writes and copies. Storage-image
+rows are re-resolved from their view when the set is snapshotted, so binding
+image memory after the descriptor write still produces the right base and
+strides.
+
+Graphics and compute keep independent bound-pipeline, descriptor-slot and
+push-constant state, and push constants are per stage: VERTEX and FRAGMENT
+writes to the same bytes stay distinct, and a draw uploads one block per stage
+(one upload when they are equal, which is what `ALL_GRAPHICS` produces).
 
 Recorded commands must not point at a live set: applications update or bind the
 same set with different dynamic offsets after recording a draw. Each bind is
@@ -319,54 +337,56 @@ explicit next step.
 
 ## Exact validated state
 
-The native source at `d7a88fd13b6` was rebuilt after its final source edit.
-The repeat rebuild was bit-identical and `ninja` reported no work; this later
-handoff-only update does not alter the DSO. `git diff --check`,
-`cp_debug_doc.py --check`, a warning scan and the Gallium-integrity diff all
-pass.
+The validated native source is `49e641edd7f`, on top of `a553a1f78d2`
+(semantic/capability pass) and `35f83439757` (headless WSI). The DSO SHA-256
+is `b46dbe9999083ed11b675abb45a1fa0d4d498d5a68eaf9ab553d31132d6f785b`.
+`git diff --check`, `cp_debug_doc.py --check` and the Gallium-integrity diff
+against `e2e966953d7` all pass, and `src/gallium/drivers/cudapipe/` is
+unchanged.
 
 ### Standalone and sample gates
 
-- 34/34 `src/cudapipe/tests/cpvk_*.c` programs pass functionally, including
-  negative synchronization state, recorded-object destruction, descriptor-using
-  secondary command buffers and concurrent per-device A-buffer execution, with
-  no driver error, unimplemented, refusal or overflow diagnostic. This is not a
-  claim that all 32 are clean under the Vulkan validation layer.
+- 39/39 tests in the `cudapipe-native` Meson suite pass:
+  `meson test -C build-cudapipe --suite cudapipe-native`. They cover descriptor
+  semantics (sparse bindings, copies, immutable samplers, graphics/compute
+  independence), per-stage push constants, static viewport/scissor,
+  asynchronous query availability, negative synchronization state,
+  recorded-object destruction, descriptor-using secondary command buffers,
+  headless WSI and concurrent per-device A-buffer execution, with no driver
+  error, unimplemented, refusal or overflow diagnostic.
+- The suite is not validation-clean as a whole, and the layer is now the way
+  to see what is left. Running it with `VK_LAYER_KHRONOS_validation` reports
+  errors dominated by the four deliberately below-minimum limits (see "Known
+  issues"), by image layouts the small tests never transition, and by the
+  older tests' habit of calling `vkCmdSetViewport`/`vkCmdSetScissor` for state
+  their pipeline declares statically. The four newest tests
+  (`cpvk_descriptor_semantics`, `cpvk_push_stages`, `cpvk_static_viewport`,
+  `cpvk_query_async`) are validation-clean on lavapipe, NVIDIA and native.
 - `cpvk_tex3d` passes on native and NVIDIA; NVIDIA with
   `VK_LAYER_KHRONOS_validation` is clean.
-- The post-optimization 60-frame sweep is
-  `/tmp/cpvk-final-opt-frames60`: all 18 samples exit zero. Against the
-  checkpoint sweep, every animated sample remains within its frame-0 budget;
-  the largest current-only movement is 47 pixels at tolerance 8/255.
+- The 60-frame sweep is
+  `$HOME/git/Vulkan/build/iter/native-vk-conformance`: all 18 samples exit
+  zero.
 - Gallium comparisons are useful same-backend regression diagnostics, but
-  NVIDIA is the independent sample oracle. At tolerance 8/255, the stored
-  NVIDIA animated comparisons pass except the standing
+  NVIDIA is the independent sample oracle. At tolerance 8/255 the animated
+  comparison passes for every stored sample except the standing
   `gltfscenerendering` deviation: 15,695 differing pixels at frame 0 and a
-  59,925-pixel worst frame against a 25,542-pixel budget. Do not relabel that
-  external mismatch as noise merely because native agrees with Gallium.
-  `renderheadless` is byte-identical to Gallium but has no stored external
-  reference; the retained checkpoint-only manual artifact is
-  `/tmp/renderheadless-final14/native/headless.ppm`. The post-optimization
-  sweep records its successful process but does not create a new independent
-  image reference. The independently tested corrected `texture3d` result
-  matches NVIDIA; Gallium's one-slice filtering is knowingly wrong.
-- The final 600-frame BENCH sweep is
-  `/tmp/cpvk-final-opt-perf-n2-cache`: the 17 benchmarked sample means sum to
-  32.43 ms and wall time sums to 43.28 s. An isolated initially empty cache run
-  (`/tmp/cpvk-final-opt-perf-cold-cache`) is 32.35 ms / 47.43 s. The two
-  controlled Gallium sweeps sum to 35.73–35.76 ms and 74.01–74.16 s, so native
-  is faster by both the hot submission diagnostic and end-to-end completion,
-  even cold. A cold cache compiles each exact NVRTC product once; later
-  processes retrieve PTX by source, embedded header, options, SM and
-  NVRTC-version key.
-
-The completed architecture series at this handoff builds cleanly and passes all 34 standalone native programs.
-The six batch reproducers are byte-identical in default, no-batch,
-`CUDAPIPE_BATCH_MAX=1`, no-pass and forced-fallback modes. Its 600-frame
-18-sample sweep sums to **31.96 ms** hot means and **41.31 s** wall time, versus
-32.43 ms / 43.28 s at the performance checkpoint. The DSO SHA-256 for that
-validation build is
-`03a4ee72349fa5e69d8efbd0e4975468c3925abc4fa4997bd6bda2fad242473a`.
+  59,926-pixel worst frame against a 25,542-pixel budget. Every other sample
+  moves by at most three pixels against the architecture checkpoint, which is
+  the documented atomic-ordering nondeterminism. Do not relabel that external
+  mismatch as noise merely because native agrees with Gallium.
+  `renderheadless` runs but has no stored external reference. The
+  independently tested corrected `texture3d` result matches NVIDIA; Gallium's
+  one-slice filtering is knowingly wrong.
+- The six batch reproducers are byte-identical in default, no-batch,
+  `CUDAPIPE_BATCH_MAX=1`, no-pass and forced-fallback modes:
+  `e2ced6cb150b67d3`, `cab20de2d74b1bb3`, `7f57f68ea59ac0de`,
+  `baff13435350b962`, `3dca5ecba53a70ee`, `7f57f68ea59ac0de`.
+- The 600-frame BENCH sweep sums to **31.86 ms** hot means and **41.29 s**
+  wall time, against **31.96 ms / 41.31 s** at the architecture checkpoint and
+  32.43 ms / 43.28 s at the performance checkpoint. The two controlled Gallium
+  sweeps sum to 35.73–35.76 ms and 74.01–74.16 s, so native remains faster by
+  both the hot submission diagnostic and end-to-end completion.
 
 ### GFXReconstruct gate — external references only
 
@@ -382,91 +402,71 @@ Crossroads  /home/alexzhukov/headless_streamer_1818_20260817T173522.gfxr
 old         /home/alexzhukov/headless_streamer_20260814T155742.gfxr
 ```
 
-Final sentinel outputs are:
-
-```text
-/tmp/cpvk-final-cache-cross-sentinels
-/tmp/cpvk-final-cache-old-sentinels
-```
-
-They were compared to the llvmpipe sentinel directories, not to self:
+The current replay evidence is under `/tmp/cpvk-gfxr-final`, one directory per
+capture and repetition, each holding its own timing, extracted frames and
+report. Frames were compared to the llvmpipe sentinel directories, not to self:
 
 ```text
 /tmp/cp-validation/crossroads/llvmpipe
 /tmp/cp-validation/old/llvmpipe
 ```
 
-Crossroads frames 632–634, 755–757 and 906–908 retain the recorded external
-structure: mean RGB delta 1.0466–1.6053, at most 6,319 pixels over 32/255 and
-74 over 96/255. Old frames 0, 1, 2, 10, 50, 200, 500, 754, 1200 and 1508 retain
-mean 0.0206–0.4993, at most 1,815 pixels over 32 and 45 over 96. Relative to
-the recorded native candidate *measured against the same llvmpipe images*, the
-final counts move by at most one pixel and non-background counts are unchanged.
-Both replays exit zero and their logs contain no driver error/failure.
+Both captures replay to completion with no fatal error. The nine Crossroads
+sentinel frames retain the recorded external structure exactly: mean RGB delta
+1.0467–1.6055, at most 6,319 pixels over 32/255 and 74 over 96/255. The ten old
+sentinel frames likewise: mean 0.0206–0.4922, at most 1,815 pixels over 32 and
+45 over 96. Those are the same numbers the architecture checkpoint recorded, so
+this pass moved no sentinel pixel.
 
-The pre-`d7a88fd13b6` checkpoint plans
-`/tmp/cp-validation/full-cross-final/all.json` and
-`/tmp/cp-validation/full-old-final/all.json` produced every planned native dump
-(1,494 and 1,509 respectively). They were not rerun after the stable-work,
-descriptor, memory and stream changes. Their adjacent reference run is Gallium,
-not llvmpipe/NVIDIA, so they prove execution coverage and local stability only
-for the base checkpoint. They are **not** current full-frame evidence or a
-full-frame external correctness pass. Current-code evidence is the 60-frame
-sweep and final-cache external sentinels above; rerun the full plans with
-llvmpipe or NVIDIA before making a stronger claim.
+Two capture behaviours are load-bearing and were each found by a failed replay
+rather than by reading the spec:
 
-Final FPS-plugin repetitions contain 1,496 Crossroads frames / 2,994 submits
-and 1,510 old frames / 3,022 submits:
+- the Crossroads capture creates a graphics pipeline whose stencil state would
+  be observable, so refusing such a pipeline ends the replay at call 348,306;
+- both captures create images they never asked about — a sampled D16 depth
+  image and a sampled 4x multisample depth image — so failing `vkCreateImage`
+  makes GFXReconstruct dereference the null image it recorded and crash.
+
+Both are documented under "Known issues" as deliberate exceptions rather than
+being hidden.
+
+Three repetitions per capture, paired-submit medians:
 
 | capture | repeat A | repeat B | repeat C | median |
 |---|---:|---:|---:|---:|
-| Crossroads | 7.891 ms | 7.893 ms | 7.877 ms | **7.891 ms** |
-| old | 25.054 ms | 25.258 ms | 25.285 ms | **25.258 ms** |
+| Crossroads | 7.85 ms | 7.84 ms | 7.83 ms | **7.84 ms** |
+| old | 24.98 ms | 24.94 ms | 24.89 ms | **24.94 ms** |
 
-Timing files are `/tmp/cpvk-final-cache-{0,1,2}-{cross,old}.txt`. Prefer the
-paired-submit median: lazy pipeline/JIT work makes early-frame means noisy.
-The remaining Crossroads gap to Gallium is under a millisecond; the old replay
-is at the approximately 25 ms target.
+**Replay medians are only comparable within one session.** The architecture
+checkpoint recorded 7.22–7.26 ms for Crossroads; re-measuring that exact
+committed build on the machine in this session gave **7.76 ms**, against this
+tree's 7.83 ms in the same session. The 8% apparent regression against the
+stored number is environment drift, and the honest comparison is the
+same-session pair: +0.9%, inside the spread. Always re-measure the baseline
+before attributing a replay delta to a change.
+
+Prefer the paired-submit median: lazy pipeline/JIT work makes early-frame
+means noisy. The remaining Crossroads gap to Gallium is under a millisecond;
+the old replay is at the approximately 25 ms target.
 
 ## Commit and scope
 
-The validated state is two focused commits:
+The current branch tip is `49e641edd7f`. The series relevant to this handoff,
+newest last:
 
-- `02f75c3637e` — workload-complete native checkpoint: 18 files, 3,271
-  insertions and 304 deletions, including `cpvk_bccopy`, `cpvk_tex3d` and
-  `CUDAPIPE_VALIDATION.md`;
-- `d7a88fd13b6` — performance recovery documented here: 11 files, 357
-  insertions and 283 deletions.
-
-The recovery commit changes only the handoff and these native implementation
-files:
-
-```text
-CUDAPIPE_VK_NATIVE.md
-src/cudapipe/cp_kernels.c
-src/cudapipe/cp_kernels.h
-src/cudapipe/cp_renderer.c
-src/cudapipe/cpvk_cmd.c
-src/cudapipe/cpvk_device.c
-src/cudapipe/cpvk_device_memory.c
-src/cudapipe/cpvk_private.h
-src/cudapipe/cpvk_sync.c
-src/cudapipe/kernels/cp_rast_types.h
-src/cudapipe/kernels/cp_rasterize.cu
-```
+- `733ba22cb66` — the architecture series through immutable draw/render-scope
+  execution, per-device A-buffer ownership, event-backed queue retirement and
+  captured depth-stencil attachments;
+- `35f83439757` — headless WSI through Mesa `wsi_common`, and thread-safe
+  NVPTX target initialization;
+- `a553a1f78d2` — the descriptor, query, attachment, capability and
+  allocation-failure pass described throughout this document;
+- `49e641edd7f` — the native tests as a Meson suite, plus the four new tests
+  and the two corrected ones.
 
 `src/gallium/drivers/cudapipe/` remains byte-identical to `e2e966953d7`.
 Unrelated root documents, scripts and logs remain untracked intentionally;
 continue staging explicit paths rather than using `git add -A`.
-
-The post-architecture CUDA-event repetitions complete without replay errors:
-Crossroads medians are **7.22, 7.24 and 7.26 ms**; old-capture medians are
-**24.75, 24.77 and 24.78 ms**. Fresh external sentinel extraction reproduces
-the established llvmpipe ranges exactly: Crossroads mean RGB 1.0467–1.6055,
-at most 6,319 pixels over 32 and 74 over 96; old mean 0.0206–0.4922, at most
-1,815 over 32 and 45 over 96. The 60-frame NVIDIA sample gate also retains the
-standing `gltfscenerendering` exception at 15,694 frame-0 / 59,925 worst; every
-other referenced sample passes and `renderheadless` still has no reference.
 
 ## Known issues and deliberate limits
 
@@ -476,21 +476,42 @@ other referenced sample passes and `renderheadless` still has no reference.
 2. **Headless WSI and CUDA device 0 only.** Mesa WSI common now backs the
    advertised `KHR_surface`, `EXT_headless_surface` and `KHR_swapchain` paths;
    a focused test creates a real headless surface/swapchain, acquires and
-   presents. No X11, Wayland or display extension is exposed. Physical-device
-   enumeration still exposes only CUDA device 0 when CUDA reports more.
+   presents, and the test transitions the acquired image to
+   `PRESENT_SRC_KHR` so it is validation-clean. No X11, Wayland or display
+   extension is exposed. Physical-device enumeration still exposes only CUDA
+   device 0 when CUDA reports more.
 3. **The development manifest intentionally stops at Vulkan 1.1.** It now
    matches the physical-device contract (`api_version: 1.1.x`) so loader
    dispatch no longer hides core 1.1 entrypoints. Do not raise either manifest
    or driver to 1.3 as a shortcut for mandatory unimplemented features.
-4. **Vulkan 1.1 is intentional.** Advertising 1.3 was tested and broke feature
+4. **Vulkan 1.1 is intentional, and its extension dependencies are now
+   satisfied.** Advertising 1.3 was tested and broke feature
    negotiation because the version promises mandatory functionality this
    driver does not implement. Raise the version only with the promised feature
-   set and replay/sweep tests.
-5. **Validation is not globally clean.** Some physical-device limits remain
-   zero/incomplete and can trigger validation errors such as
-   `VUID-vkAllocateMemory-maxMemoryAllocationCount-04101`. The new 3D
-   differential test is validation-clean on NVIDIA; that is not evidence that
-   the native ICD has closed every limit/property VUID.
+   set and replay/sweep tests. At 1.1 `KHR_dynamic_rendering` depends on
+   `KHR_depth_stencil_resolve` and `KHR_create_renderpass2`, so both are now
+   advertised and implemented -- render passes through the runtime's common
+   emulation over this driver's dynamic rendering, and sample-zero
+   depth/stencil resolve as the first sample plane's copy. Without them an
+   application that enables dynamic rendering is committing invalid usage,
+   which is what the validation layer reported for every test in the suite.
+5. **The limits are now populated, and some are deliberately below the Vulkan
+   1.1 minima.** Memory/sampler counts and sizes, per-set descriptor counts,
+   vertex/fragment component counts, precision bits, sample counts, framebuffer
+   sizes and copy alignments are filled in, and the per-set descriptor limits
+   are exactly the core minima because a set's storage is sized by its layout.
+   Four values are honestly below their core minimum because the matching
+   functionality does not exist: `maxColorAttachments` and
+   `maxFragmentOutputAttachments` are 1 (one colour attachment),
+   `maxFramebufferLayers` is 1 (no layered rendering) and
+   `maxDescriptorSetInputAttachments` is 0 (no input attachments). Advertising
+   Vulkan 1.1 with those values is non-conformant; closing it means
+   implementing multiple colour attachments, layered rendering and input
+   attachments, not raising the numbers. Running the native suite under
+   `VK_LAYER_KHRONOS_validation` is now the way to see what is left: the
+   remaining errors are dominated by those four limits, by image layouts the
+   small tests never transition, and by dynamic state the tests set
+   redundantly.
 6. **One standing external sample mismatch remains.** The final animated
    NVIDIA comparison is within budget for every stored sample except
    `gltfscenerendering`: 15,695 pixels differ in frame 0 and the worst frame
@@ -499,16 +520,28 @@ other referenced sample passes and `renderheadless` still has no reference.
 7. **Queue completion is asynchronous but intentionally single-stream.** Each
    submit records a CUDA event and returns; a per-device worker publishes Vulkan
    signals after event completion. The fresh/reset/timeout test now includes 64
-   queued fences. Scratch is reclaimed only after the pending queue retires, so
-   continuous unsynchronized submission can temporarily grow its high-water
-   allocation. Timeline semaphores and multi-queue ownership are not exposed.
+   queued fences. Scratch is normally reclaimed only after the pending queue
+   retires; a producer that never waits is bounded by draining once its live
+   scratch passes 256 MiB, so the high-water allocation cannot grow without
+   limit. A failed completion event, a failed signal or an aborted submit
+   latches device loss: waiters are still released rather than left blocked,
+   and the next submit, device wait or waited query reports
+   `VK_ERROR_DEVICE_LOST`. Timeline semaphores and multi-queue ownership are
+   not exposed.
 8. **Barriers are ordered but do not track layouts/access masks.** Legacy and
    synchronization2 barrier commands now record explicit execution order points
    that flush batches and close pass episodes on the one ordered renderer
    stream. They do not model ownership transfers or per-resource access/layout
    state and cannot express dependencies outside that queue/stream. Timestamps
    remain host approximations; occlusion and pipeline-statistics queries return
-   zero rather than fabricating unsupported counts.
+   zero rather than fabricating unsupported counts. A query's availability is
+   published by an ordered CUDA host callback at the point the recorded
+   command retires, not when the host finishes translating the submit, so
+   `vkGetQueryPoolResults` before that point reports `VK_NOT_READY`.
+   `VK_QUERY_RESULT_WAIT_BIT` waits on exactly the requested queries -- a
+   device-wide drain would block behind unrelated later work on the one
+   ordered stream -- and `VK_QUERY_RESULT_PARTIAL_BIT` suppresses `NOT_READY`
+   rather than being ignored.
 9. **Device events are ordered callbacks, not general dependency graphs.**
    Legacy set/reset/wait commands and their internal synchronization2 variants
    execute in submit order and retain the event object. Set/reset state changes
@@ -522,6 +555,13 @@ other referenced sample passes and `renderheadless` still has no reference.
    push constants and one flat 64-byte descriptor array per set in later UBO
    slots. That proven layout is intentionally retained until a narrower ABI can
    be measured without changing batching, sampler specialization or captures.
+   It is no longer bounded by a constant: a set's bindings, flat descriptors,
+   immutable-sampler state and storage-image views are sized by its layout, so
+   the per-set descriptor limits are the Vulkan 1.1 minima and a legal set is
+   never partially stored. Sparse binding numbers, `pCopies`, immutable
+   samplers, storage-image view subresources, independent graphics/compute
+   bind state and per-stage push constants are all implemented and covered by
+   `cpvk_descriptor_semantics` and `cpvk_push_stages`.
 11. **Recorded ownership is only partially complete.** Command buffers retain
     unique references to every bound graphics/compute pipeline and recorded
     query pool; secondary operation copies import those references. Focused
@@ -533,7 +573,18 @@ other referenced sample passes and `renderheadless` still has no reference.
 13. **Blit/resolve and format support are narrow by design.** Size-changing,
    inverted or format-converting operations outside the closed implemented
    family are refused. Do not expand advertised feature bits before adding an
-   implementation and a differential test.
+   implementation and a differential test. Format properties now also report
+   `VERTEX_BUFFER` for exactly the plain formats the fetch kernel converts and
+   `STORAGE_IMAGE` for the plain formats of at most four bytes the backend's
+   bindless load/store addresses; multisample counts are reported only for the
+   attachment usages that have sample planes here.
+   **`vkCreateImage` is deliberately permissive.** The promise lives in
+   `vkGetPhysicalDeviceImageFormatProperties2`, which refuses what this driver
+   cannot serve. Refusing at creation as well was implemented and measured: the
+   two stored captures create a sampled D16 image and a sampled 4x multisample
+   depth image without asking, `vkCreateImage` then fails, and GFXReconstruct
+   dereferences the null image it recorded. Unsupported use is refused where
+   the work happens instead.
 14. **Robustness is incomplete.** The shader hash currently assumes the default
    robustness state. The null allocations prevent catastrophic hangs but are
    not a full robust-buffer/image implementation.
@@ -550,12 +601,31 @@ other referenced sample passes and `renderheadless` still has no reference.
     image-view destruction frees its managed texture metadata. Command buffers own descriptor snapshots but do not retain every
     buffer, image, image view or sampler named by an application descriptor;
     those objects must remain valid through execution as Vulkan requires.
+    An image keeps a lock-protected list of its views so that binding memory
+    refreshes their texture metadata; creation-time failures for the null
+    pages, an image view's texture metadata and the renderer's own CUDA
+    allocations are now propagated as errors instead of leaving a zero
+    address behind, and renderer cleanup frees the framebuffer-sized buffers
+    and the sampler table it owns.
 17. **Depth attachment support is deliberately narrow.** Dynamic rendering
     resolves exact D32F, D32F+S8 and D24+S8 view subresources and models depth
     LOAD, CLEAR, STORE, sample planes and partial render areas through ordered
-    device conversion kernels. A shared stencil aspect is preserved when the
-    capture does not use stencil testing/writes; stencil rendering, multiview,
-    layered draws and depth resolve remain unsupported and are rejected.
+    device conversion kernels. The shared stencil aspect is preserved, and a
+    stencil `LOAD_OP_CLEAR` is honoured by the store, which is the only place
+    this driver writes stencil bits. `SAMPLE_ZERO` depth/stencil resolve is
+    implemented as the first sample plane's copy, recorded after the scope's
+    store, and `KHR_depth_stencil_resolve` and `KHR_create_renderpass2` are
+    advertised because `KHR_dynamic_rendering` depends on them at Vulkan 1.1.
+    Averaging depth resolve modes, multiview and layered draws remain
+    unsupported and are rejected.
+    **Stencil test/write state is ignored, not rejected.** Refusing such a
+    pipeline is the honest answer and was implemented; the Crossroads capture
+    creates one, and the replay then ends at call 348,306. The driver reports
+    the limitation once on stderr and renders without stencil, which is the
+    behaviour every stored external result was gathered under.
+    Colour clears and colour resolves now use the render area's offset and the
+    view's own mip pitch, and a resolve is refused unless its mode, format,
+    sample counts and extent are exactly what the resolve kernel implements.
 18. **Application shader caching is still process-local.** The native compile
     path does not consume/serialize application `VkPipelineCache` data and
     reports zero cache/driver UUIDs. Embedded CUDA sources and lazy sampler
@@ -634,64 +704,84 @@ other referenced sample passes and `renderheadless` still has no reference.
 
 Do not retry these without new evidence: global `CUDAPIPE_NO_REGCAP=1`, API
 1.3 by version edit, serial/one-block clipping, a generic sampler wrapper that
-contains both 2D and 3D paths, host-side frame-path blits/resolves, or broad
-pass-episode changes. Each was measured and either regressed correctness or
-performance. The historical log below records the individual experiments.
+contains both 2D and 3D paths, host-side frame-path blits/resolves, broad
+pass-episode changes, refusing a pipeline whose stencil state is unimplemented,
+or refusing `vkCreateImage` for a format/usage the format query already
+refuses. Each was measured and either regressed correctness, ended a stored
+replay, or regressed performance. The historical log below records the
+individual experiments.
+
+Three lessons from this pass are worth keeping in front:
+
+- **A capability audit must be measured against the workloads, not only the
+  spec.** Three honest-looking refusals — stencil pipelines, unsupported image
+  formats and unsupported sample counts at creation — each ended a stored
+  capture replay. The advertised query is the promise; the creation path is
+  where compatibility lives.
+- **Advertising an extension means advertising its dependencies.** Every test
+  in the suite was committing invalid usage by enabling
+  `KHR_dynamic_rendering` at Vulkan 1.1 without `KHR_depth_stencil_resolve`
+  and `KHR_create_renderpass2`, and the driver could not have been used
+  correctly until both were implemented.
+- **A replay median is only comparable inside one session.** The committed
+  baseline re-measured 7.76 ms here against a stored 7.22 ms. Re-run the
+  baseline build before attributing a delta to a change.
 
 ## Evidence-based next steps
 
 In order:
 
-1. **Archive the checkpoint evidence.** The two focused commits record the
-   source, tests and procedures as a validated workload milestone, not a
-   conformance claim. Copy the validated DSO, plans, external references,
-   outputs, logs and checksums out of `/tmp` before cleanup or reboot.
-2. **Stress asynchronous completion and retirement.** CUDA-event completion,
-   binary semaphore ordering, 64 queued fences, recorded event lifetime,
-   secondary descriptor import and scope inheritance now pass. Add longer
-   draw/copy↔dispatch dependency and command-pool-reset stress, and bound scratch
-   high-water growth under intentionally unsynchronized submission. Preserve the
-   single ordered renderer stream until a real multi-queue model exists.
+1. **Implement the four below-minimum limits rather than raising them.**
+   Multiple colour attachments, layered rendering and input attachments are
+   what `maxColorAttachments`, `maxFragmentOutputAttachments`,
+   `maxFramebufferLayers` and `maxDescriptorSetInputAttachments` currently
+   admit are missing. Until they exist, Vulkan 1.1 is advertised
+   non-conformantly and the validation layer says so on every test.
+2. **Implement stencil, or stop needing the exception.** Stencil test/write
+   state is ignored with a one-time message because refusing it ends the
+   Crossroads replay. The honest end state is a stencil implementation with a
+   differential test, after which the pipeline can be refused when it is not
+   implemented.
 3. **Complete the external image evidence.** Replay the existing Crossroads and
    old-capture `all.json` plans with llvmpipe or NVIDIA and compare by the
    shared manifest. Until then the external result is the 9/10-image sentinel
    gate, not a full-frame correctness pass. Investigate the standing
    `gltfscenerendering` NVIDIA mismatch rather than changing its tolerance.
-4. **Close the remaining object lifetime holes and manifest drift.** Pool
-   capacity/reset/free stress and image-view texture-info destruction now pass;
-   complete remaining resource-retention and context-allocation audits. The
-   generated development manifest now matches Vulkan 1.1.
-5. **Make the native validation surface clean.** Fill the remaining physical
-   limits/properties, implement or stop exposing unsupported KHR/WSI surfaces,
-   run the native tests and representative samples with
-   `VK_LAYER_KHRONOS_validation`, and distinguish driver VUIDs from harness
-   limitations. Do not raise API version or feature bits as a shortcut.
-6. **Turn the standalone native tests into a reproducible Meson test suite.**
-   Preserve NVIDIA-runnable differential cases, especially BC-compatible
-   copies, 2D-array↔3D copies, batching and 3D filtering, and include the new
-   negative synchronization/secondary tests.
-7. **Close the remaining replay gap.** Fresh controlled traces put native at
+4. **Make the older tests validation-clean.** The four newest are; most of the
+   rest set dynamic state their pipeline declares statically, and none of them
+   transition image layouts. Fix the tests, then use the layer as a gate rather
+   than as a survey.
+5. **Stress asynchronous completion and retirement further.** Queue retirement,
+   ordered query availability, per-query waits, device-loss latching and the
+   256 MiB scratch bound now have tests or explicit bounds. Add longer
+   draw/copy↔dispatch dependency and command-pool-reset stress. Preserve the
+   single ordered renderer stream until a real multi-queue model exists.
+6. **Close the remaining replay gap.** Fresh controlled traces put native at
    4.88 ms of kernels per Crossroads frame versus Gallium's 4.76 ms; the larger
    residual is host/launch scheduling, not an unexplained multi-millisecond
    kernel. Start with unprofiled GPU-busy data, then split compiled `main`
-   kernels by grid/register class before changing synchronization.
-8. **Extend caching only with complete keys.** Embedded/lazy NVRTC PTX is now
+   kernels by grid/register class before changing synchronization. Re-measure
+   the baseline build in the same session before believing a replay delta.
+7. **Extend caching only with complete keys.** Embedded/lazy NVRTC PTX is now
    persistent and validated. Application NIR→PTX or CUDA JIT caching must key
    the lowered resource ABI, compiler/toolkit version, SM, helper PTX and every
    option; never treat SPIR-V identity alone as sufficient.
-9. **Extend the explicit attachment model deliberately.** D32 load/clear/store
-   persistence has a focused test, and both captures exercise D24/D32+stencil
-   depth persistence. Add depth copy/sample comparisons before
-   broadening it, then implement stencil, depth resolve and layered/multiview
-   rendering rather than treating transfer-layer support as draw-layer proof.
-10. **Finish robustness and query semantics** where workloads need them rather
-    than hiding unsupported behavior behind null allocations or invented
-    counts.
-11. **Broaden formats/blits/resolves one closed family at a time**, each with a
-    validation-correct NVIDIA comparison.
-12. **Resolve the internal A-buffer colour-verifier mismatches** before
+8. **Extend the attachment model deliberately.** Depth load/clear/store,
+   stencil clear and sample-zero depth resolve have tests or captures behind
+   them. Add depth copy/sample comparisons, then averaging depth resolve and
+   layered/multiview rendering, rather than treating transfer-layer support as
+   draw-layer proof.
+9. **Finish robustness and the remaining query semantics** where workloads need
+   them, rather than hiding unsupported behavior behind null allocations or
+   invented counts. Occlusion and pipeline-statistics queries still report
+   zero, and timestamps are still host approximations.
+10. **Broaden formats/blits/resolves one closed family at a time**, each with a
+    validation-correct NVIDIA comparison. Storage-image atomics in particular
+    are not implemented for compare-exchange and the format bit is deliberately
+    not advertised.
+11. **Resolve the internal A-buffer colour-verifier mismatches** before
     treating per-device external equality as a clean verification-mode pass.
-13. **Only then spend native-only render-pass information** on load/store
+12. **Only then spend native-only render-pass information** on load/store
     elision, tile residency or parallel command translation. The original
     motivation is still valid, but earlier pass-wide reordering and immutable
     sampler theories measured at zero. Require a baseline and one isolated
