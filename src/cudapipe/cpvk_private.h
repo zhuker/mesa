@@ -29,6 +29,7 @@
 #include "cp_kernels.h"
 #include "cp_debug.h"
 #include <stdatomic.h>
+#include <stddef.h>
 #include "cp_device.h"
 #include "cp_renderer.h"
 #include "cp_draw_packet.h"
@@ -173,6 +174,8 @@ struct cpvk_pipeline_layout {
  * CP_DESC_IMAGE_FUNCTIONS_OFFSET. Everything between them is padding this
  * driver owns.
  */
+#define CPVK_DESCRIPTOR_SIZE 64
+
 struct cpvk_descriptor {
    uint64_t base;                     /* +0  buffer base, or image base */
    /*
@@ -199,12 +202,30 @@ struct cpvk_descriptor {
    uint64_t texture_info;             /* +48 struct cp_texture_info * */
    uint8_t  pad3[8];
 };
-static_assert(sizeof(struct cpvk_descriptor) == 64,
+static_assert(sizeof(struct cpvk_descriptor) == CPVK_DESCRIPTOR_SIZE,
               "the kernels read fixed offsets into this");
+static_assert(offsetof(struct cpvk_descriptor, base) == 0, "descriptor ABI");
+static_assert(offsetof(struct cpvk_descriptor, width) == 8, "descriptor ABI");
+static_assert(offsetof(struct cpvk_descriptor, row_stride) == 24,
+              "descriptor ABI");
+static_assert(offsetof(struct cpvk_descriptor,
+                       sampler_index_or_img_stride) == 28, "descriptor ABI");
+static_assert(offsetof(struct cpvk_descriptor, base_offset) == 40,
+              "descriptor ABI");
+static_assert(offsetof(struct cpvk_descriptor, texture_info) == 48,
+              "descriptor ABI");
+
+#define CPVK_DESCRIPTOR_TYPE_COUNT (VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1)
 
 struct cpvk_descriptor_set {
    struct vk_object_base base;
-   struct cpvk_descriptor_set_layout *layout;
+   unsigned num_bindings;
+   unsigned num_descriptors;
+   struct {
+      VkDescriptorType type;
+      unsigned count;
+      unsigned flat;
+   } bindings[CPVK_MAX_BINDINGS];
    CUdeviceptr addrs[CPVK_MAX_BINDINGS];
 
    /* Descriptor updates are host-only.  Recording copies this array into the
@@ -212,6 +233,7 @@ struct cpvk_descriptor_set {
    struct cpvk_descriptor *host;
    struct cpvk_descriptor_pool *pool;
    struct cpvk_descriptor_set *pool_next;
+   uint32_t pool_counts[CPVK_DESCRIPTOR_TYPE_COUNT];
 };
 
 /*
@@ -245,21 +267,19 @@ struct cpvk_sampler {
    unsigned index;                    /* into cp_sampler_table */
 };
 
+
 struct cpvk_descriptor_pool {
    struct vk_object_base base;
    struct cpvk_descriptor_set *sets;
+   uint32_t max_sets, allocated_sets;
+   uint64_t capacity[CPVK_DESCRIPTOR_TYPE_COUNT];
+   uint64_t used[CPVK_DESCRIPTOR_TYPE_COUNT];
 };
 
 /*
- * An event, which on this driver is a boolean and nothing else.
- *
- * Everything submitted runs on one CUDA stream and stream order is program
- * order, so by the time a waiter could observe an event the work that sets it
- * has already run. That is the same reasoning that makes
- * vkCmdPipelineBarrier2 a no-op here, and it is why the device-side half of
- * the event API is empty rather than unimplemented. The host-side half is
- * real, because vkSetEvent and vkGetEventStatus are asked a question and must
- * answer it.
+ * Binary host/device event state. Device set, reset and wait commands retain
+ * this object and execute as ordered command-buffer operations; host access is
+ * guarded by the same mutex and condition variable.
  */
 struct cpvk_event {
    struct vk_object_base base;
@@ -288,7 +308,6 @@ struct cpvk_dispatch {
    unsigned push_size;
 };
 
-#define CPVK_DESCRIPTOR_SIZE 64
 
 struct cpvk_draw_cmd {
    struct cpvk_pipeline *pipeline;

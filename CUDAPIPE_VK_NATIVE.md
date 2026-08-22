@@ -37,7 +37,7 @@ The important files are:
 | `cp_renderer.[ch]` | shared draw renderer: batching, clipping, rasterization, A-buffer/peel paths, pass episodes, arenas and shader launches |
 | `cp_kernels.[ch]`, `kernels/` | NVRTC compilation, persistent source/options-keyed PTX caching and CUDA kernels, including the lazy 3D sampler variant |
 | `nir_to_ptx/` | the shared NIR→LLVM/NVPTX backend and loaded shader binaries |
-| `tests/cpvk_*.c` | 32 small native differential/regression programs, including synchronization state, recorded-object lifetime, secondary descriptor ownership and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
+| `tests/cpvk_*.c` | 34 small native differential/regression programs, including synchronization state, recorded-object lifetime, secondary descriptor ownership and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
 
 The native `cpvk_device` owns one CUDA context, one `cp_device` containing the
 kernel modules, and one `cp_context` renderer with its ordered graphics/compute
@@ -103,9 +103,14 @@ dispatch addresses are remapped, retained objects are imported, and inherited
 render-scope indices resolve to the primary's active scope.
 
 Dynamic rendering is translated into immutable `cp_render_scope` values;
-recorded draws carry only a scope index. The renderer owns the open scope value,
-render-pass load clears, end markers and end-of-pass resolves are explicit
-operations, and end markers flush batches/pass episodes without draining CUDA.
+recorded draws carry only a scope index. A scope resolves the exact colour and
+D32 depth view subresources, sample layout and depth load/store contract. Depth
+LOAD converts D32 image values into the rasterizer's sortable representation;
+STORE converts them back on the ordered renderer stream, and partial render-area
+clears preserve pixels outside the area. Render-pass clears, end markers and
+end-of-pass resolves are explicit operations, and end markers flush
+batches/pass episodes without draining CUDA. Stencil, multiview, layered draws
+and depth resolve are rejected rather than silently approximated.
 
 ### Descriptors and command-buffer immutability
 
@@ -126,8 +131,8 @@ buffer reset because earlier draws still point into them.
 
 Descriptor bindings are intentionally absent from the batch equality key. The
 renderer consumes one immutable descriptor/UBO row per draw, so requiring equal
-sets split correct work without protecting any episode-wide state. The 25
-focused tests and the final 60-frame sweep cover distinct UBO, texture, dynamic
+sets split correct work without protecting any episode-wide state. The focused
+tests and the final 60-frame sweep cover distinct UBO, texture, dynamic
 offset, discard, depth and large-batch rows; current output remains within the
 established native comparison envelope and does not enlarge the standing
 NVIDIA `gltfscenerendering` mismatch.
@@ -316,7 +321,7 @@ pass.
 
 ### Standalone and sample gates
 
-- 32/32 `src/cudapipe/tests/cpvk_*.c` programs pass functionally, including
+- 34/34 `src/cudapipe/tests/cpvk_*.c` programs pass functionally, including
   negative synchronization state, recorded-object destruction, descriptor-using
   secondary command buffers and concurrent per-device A-buffer execution, with
   no driver error, unimplemented, refusal or overflow diagnostic. This is not a
@@ -481,12 +486,13 @@ continue staging explicit paths rather than using `git add -A`.
    state and cannot express dependencies outside that queue/stream. Timestamps
    remain host approximations; occlusion and pipeline-statistics queries return
    zero rather than fabricating unsupported counts.
-9. **Device events are synchronous order points, not asynchronous GPU events.**
+9. **Device events are ordered callbacks, not general dependency graphs.**
    Legacy set/reset/wait commands and their internal synchronization2 variants
-   execute in submit order, wait on prior CUDA work and retain the event object;
-   host status/set/reset is mutex protected. The synchronization2 feature is no
-   longer exposed at Vulkan 1.1. Stage/access scopes are conservatively treated
-   as all commands and event waits can block queue submission on the host.
+   execute in submit order and retain the event object. Set/reset state changes
+   are CUDA host callbacks after prior stream work, so they no longer drain the
+   stream; waits can still block queue submission on the host. Host access is
+   mutex protected, synchronization2 is not exposed, and stage/access scopes
+   are conservatively treated as all commands.
 10. **The descriptor ABI is still constant-buffer shaped.** Immutable draw,
    batch and pass snapshots now own explicit VS/FS descriptor rows, and no live
    renderer state reconstructs them. The shader ABI still reserves slot 0 for
@@ -515,19 +521,18 @@ continue staging explicit paths rather than using `git add -A`.
    verification-mode run still logged two internal `VERDICT: MISMATCH` results
    (one 1-ULP/duplicate-unwritten case and one all-unwritten case), so external
    equality is not a clean internal colour-verification pass.
-16. **Some object and pool semantics remain incomplete below device scope.**
-    Descriptor sets are now host-only objects owned by their descriptor pool;
-    free, pool reset and pool destroy release them without per-set CUDA
-    allocations. Pool lifetime ownership is implemented, but `maxSets`, pool
-    sizes and allocation-capacity/accounting semantics are not enforced.
-    `cpvk_DestroyImageView` still does not explicitly free its managed
-    `cp_texture_info`. Audit image/view and other resource owners before
-    asynchronous submission or allocation-heavy workloads.
-17. **Depth attachments are renderer-private.** The current dynamic-rendering
-    path represents a depth attachment as `has_zs`, while depth tests/clears
-    use `cp_context::depthbuf`; it is not a general Vulkan depth-image storage
-    implementation. Sampling/copying preserved depth attachment contents is
-    therefore not established.
+16. **Recorded non-pipeline resources still rely on Vulkan validity rules.**
+    Descriptor pools now enforce `maxSets` and per-type capacities, retire
+    counts on free/reset, copy set-layout metadata needed after allocation, and
+    image-view destruction frees its managed texture metadata. Command buffers own descriptor snapshots but do not retain every
+    buffer, image, image view or sampler named by an application descriptor;
+    those objects must remain valid through execution as Vulkan requires.
+17. **Depth attachment support is deliberately D32-only.** Dynamic rendering
+    now resolves the exact D32 view subresource and models LOAD, CLEAR, STORE,
+    sample planes and partial render areas through ordered device conversion
+    kernels. D32+stencil is no longer advertised. Stencil attachments,
+    multiview, layered draws and depth resolve remain unsupported and are
+    rejected while recording.
 18. **Application shader caching is still process-local.** The native compile
     path does not consume/serialize application `VkPipelineCache` data and
     reports zero cache/driver UUIDs. Embedded CUDA sources and lazy sampler

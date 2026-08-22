@@ -308,6 +308,10 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
       return false;
    cuModuleGetFunction(&k->clear_kernel, k->clear_module, "cp_clear_kernel");
    cuModuleGetFunction(&k->clear_depth_kernel, k->clear_module, "cp_clear_depth_kernel");
+   cuModuleGetFunction(&k->depth_attachment_load, k->clear_module,
+                       "cp_depth_attachment_load");
+   cuModuleGetFunction(&k->depth_attachment_store, k->clear_module,
+                       "cp_depth_attachment_store");
 
    if (!build_module(&k->module, cp_rasterize_src, "cp_rasterize.cu", sm_major, sm_minor))
       goto fail;

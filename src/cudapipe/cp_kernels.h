@@ -15,6 +15,8 @@ struct cp_kernels {
    /* Clear kernels */
    CUfunction clear_kernel;
    CUfunction clear_depth_kernel;
+   CUfunction depth_attachment_load;
+   CUfunction depth_attachment_store;
 
    /* Rasterization kernels (3-stage adaptive) */
    CUfunction rasterize_triangles; /* alias for stage1, used by legacy code */

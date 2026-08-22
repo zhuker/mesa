@@ -39,6 +39,16 @@ struct cp_clear_args {
    uint32_t pixel_size;     /* Bytes per pixel */
 };
 
+struct cp_depth_attachment_args {
+   uint64_t image;
+   uint64_t depthbuf;
+   uint32_t width;
+   uint32_t height;
+   uint32_t row_stride;
+   uint32_t sample_stride;
+   uint32_t samples;
+};
+
 struct cp_vertex_args {
    uint64_t positions_out;  /* Output: clip-space positions (float4 per vertex) */
    uint64_t varyings_out;   /* Output: interpolated varyings */

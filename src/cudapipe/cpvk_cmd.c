@@ -35,7 +35,14 @@ cpvk_descriptor_set_free(struct cpvk_device *dev,
       return;
 
    if (set->pool) {
-      struct cpvk_descriptor_set **p = &set->pool->sets;
+      struct cpvk_descriptor_pool *pool = set->pool;
+      if (pool->allocated_sets)
+         pool->allocated_sets--;
+      for (unsigned type = 0; type < CPVK_DESCRIPTOR_TYPE_COUNT; type++) {
+         assert(pool->used[type] >= set->pool_counts[type]);
+         pool->used[type] -= set->pool_counts[type];
+      }
+      struct cpvk_descriptor_set **p = &pool->sets;
       while (*p && *p != set)
          p = &(*p)->pool_next;
       if (*p)
@@ -54,6 +61,10 @@ cpvk_descriptor_pool_clear(struct cpvk_device *dev,
       set->pool = NULL;
       vk_object_free(&dev->vk, NULL, set);
    }
+   if (pool) {
+      pool->allocated_sets = 0;
+      memset(pool->used, 0, sizeof(pool->used));
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -69,6 +80,13 @@ cpvk_CreateDescriptorPool(VkDevice _device,
                        VK_OBJECT_TYPE_DESCRIPTOR_POOL);
    if (!pool)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   pool->max_sets = pCreateInfo->maxSets;
+   for (uint32_t i = 0; i < pCreateInfo->poolSizeCount; i++) {
+      unsigned type = pCreateInfo->pPoolSizes[i].type;
+      if (type < CPVK_DESCRIPTOR_TYPE_COUNT)
+         pool->capacity[type] += pCreateInfo->pPoolSizes[i].descriptorCount;
+   }
 
    *pDescriptorPool = cpvk_descriptor_pool_to_handle(pool);
    return VK_SUCCESS;
@@ -96,6 +114,26 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
    VK_FROM_HANDLE(cpvk_descriptor_pool, pool,
                   pAllocateInfo->descriptorPool);
 
+   uint64_t required[CPVK_DESCRIPTOR_TYPE_COUNT] = {0};
+   if (!pool || pAllocateInfo->descriptorSetCount >
+                pool->max_sets - pool->allocated_sets)
+      return vk_error(dev, VK_ERROR_OUT_OF_POOL_MEMORY);
+   for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
+      VK_FROM_HANDLE(cpvk_descriptor_set_layout, layout,
+                     pAllocateInfo->pSetLayouts[i]);
+      if (!layout)
+         continue;
+      for (unsigned b = 0; b < layout->num_bindings; b++) {
+         unsigned type = layout->bindings[b].type;
+         if (type >= CPVK_DESCRIPTOR_TYPE_COUNT)
+            return vk_error(dev, VK_ERROR_OUT_OF_POOL_MEMORY);
+         required[type] += layout->bindings[b].count;
+      }
+   }
+   for (unsigned type = 0; type < CPVK_DESCRIPTOR_TYPE_COUNT; type++)
+      if (required[type] > pool->capacity[type] - pool->used[type])
+         return vk_error(dev, VK_ERROR_OUT_OF_POOL_MEMORY);
+
    for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
       VK_FROM_HANDLE(cpvk_descriptor_set_layout, layout,
                      pAllocateInfo->pSetLayouts[i]);
@@ -114,11 +152,23 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
          }
          return vk_error(dev, VK_ERROR_OUT_OF_POOL_MEMORY);
       }
-      set->layout = layout;
+      if (layout) {
+         set->num_bindings = layout->num_bindings;
+         set->num_descriptors = layout->num_descriptors;
+         memcpy(set->bindings, layout->bindings, sizeof(set->bindings));
+      }
       set->pool = pool;
       if (pool) {
          set->pool_next = pool->sets;
          pool->sets = set;
+         pool->allocated_sets++;
+         if (layout) {
+            for (unsigned b = 0; b < layout->num_bindings; b++) {
+               unsigned type = layout->bindings[b].type;
+               set->pool_counts[type] += layout->bindings[b].count;
+               pool->used[type] += layout->bindings[b].count;
+            }
+         }
       }
 
       if (desc_size) {
@@ -293,7 +343,7 @@ cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
          continue;
 
       for (uint32_t e = 0; e < write->descriptorCount; e++) {
-         unsigned flat = set->layout->bindings[write->dstBinding].flat +
+         unsigned flat = set->bindings[write->dstBinding].flat +
                          write->dstArrayElement + e;
          cpvk_write_descriptor(set, flat, write->descriptorType,
                                write->pImageInfo ? &write->pImageInfo[e] : NULL,
@@ -358,7 +408,7 @@ cpvk_UpdateDescriptorSetWithTemplate(VkDevice _device, VkDescriptorSet _set,
 
       for (uint32_t j = 0; j < e->descriptorCount; j++) {
          const char *src = (const char *)pData + e->offset + j * e->stride;
-         unsigned flat = set->layout->bindings[e->dstBinding].flat +
+         unsigned flat = set->bindings[e->dstBinding].flat +
                          e->dstArrayElement + j;
          cpvk_write_descriptor(set, flat, e->descriptorType,
                                (const VkDescriptorImageInfo *)src,
@@ -694,15 +744,15 @@ cpvk_arena_append(struct cpvk_cmd_buffer *cmd, const void *src, size_t bytes,
 static CUdeviceptr
 cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
 {
-   if (!set->host || !set->layout->num_descriptors) {
+   if (!set->host || !set->num_descriptors) {
       fprintf(stderr, "cudapipe: descriptor set has no buffer (%u descriptors, "
               "host=%p); shaders reading it will fault\n",
-              set->layout ? set->layout->num_descriptors : 0,
+              set->num_descriptors,
               (void *)set->host);
       return 0;
    }
 
-   size_t bytes = (size_t)set->layout->num_descriptors *
+   size_t bytes = (size_t)set->num_descriptors *
                   sizeof(struct cpvk_descriptor);
    CUdeviceptr addr = 0;
    if (!cpvk_arena_append(cmd, set->host, bytes, &addr, NULL))
@@ -757,15 +807,15 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
        * than the set, because the next bind of the same set carries a
        * different offset and must not rewrite this draw's.
        */
-      for (unsigned b = 0; b < set->layout->num_bindings &&
+      for (unsigned b = 0; b < set->num_bindings &&
                            dyn < pInfo->dynamicOffsetCount; b++) {
-         VkDescriptorType ty = set->layout->bindings[b].type;
+         VkDescriptorType ty = set->bindings[b].type;
          if (ty != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
              ty != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
             continue;
-         for (unsigned e = 0; e < set->layout->bindings[b].count &&
+         for (unsigned e = 0; e < set->bindings[b].count &&
                               dyn < pInfo->dynamicOffsetCount; e++) {
-            unsigned flat = set->layout->bindings[b].flat + e;
+            unsigned flat = set->bindings[b].flat + e;
             uint32_t off = pInfo->pDynamicOffsets[dyn++];
             if (snap && flat < CPVK_MAX_BINDINGS && set->addrs[flat])
                snap[flat].base = set->addrs[flat] + off;
@@ -1115,7 +1165,7 @@ cpvk_op_alloc(struct cpvk_cmd_buffer *cmd, enum cpvk_op_kind kind)
 
 static uint32_t
 cpvk_scope_append(struct cpvk_cmd_buffer *cmd, const struct cp_fb_desc *fb,
-                  unsigned samples)
+                  const struct cp_depth_attachment *depth, unsigned samples)
 {
    if (cmd->num_scopes == cmd->max_scopes) {
       unsigned want = cmd->max_scopes ? cmd->max_scopes * 2 : 8;
@@ -1130,6 +1180,7 @@ cpvk_scope_append(struct cpvk_cmd_buffer *cmd, const struct cp_fb_desc *fb,
    uint32_t index = cmd->num_scopes++;
    cmd->scopes[index] = (struct cp_render_scope) {
       .fb = *fb,
+      .depth = *depth,
       .attachment_samples = MAX2(samples, 1u),
       .serial = cmd->next_scope_serial++,
    };
@@ -1142,7 +1193,10 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
 
-   if (pRenderingInfo->colorAttachmentCount > 1) {
+   if (pRenderingInfo->colorAttachmentCount > 1 ||
+       pRenderingInfo->layerCount > 1 || pRenderingInfo->viewMask != 0 ||
+       (pRenderingInfo->pStencilAttachment &&
+        pRenderingInfo->pStencilAttachment->imageView != VK_NULL_HANDLE)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -1154,14 +1208,14 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                 pRenderingInfo->renderArea.extent.height,
       .nr_cbufs = pRenderingInfo->colorAttachmentCount,
       .color_encoding = -1,
-      .has_zs = pRenderingInfo->pDepthAttachment != NULL &&
-                pRenderingInfo->pDepthAttachment->imageView != VK_NULL_HANDLE,
    };
 
    const VkRenderingAttachmentInfo *cat =
       pRenderingInfo->colorAttachmentCount ?
       &pRenderingInfo->pColorAttachments[0] : NULL;
-   struct cpvk_image *cimg = NULL;
+   const VkRenderingAttachmentInfo *dat = pRenderingInfo->pDepthAttachment;
+   struct cpvk_image *cimg = NULL, *dimg = NULL;
+   struct cp_depth_attachment depth = {0};
 
    if (cat && cat->imageView) {
       VK_FROM_HANDLE(cpvk_image_view, view, cat->imageView);
@@ -1200,20 +1254,45 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       }
    }
 
-   /*
-    * Layered rendering is not implemented: every draw goes to one layer, the
-    * one the colour view names. A pass that asks for more silently rendered
-    * its layers on top of each other, which is the failure mode this driver
-    * spends most of its warnings avoiding.
-    */
-   if (pRenderingInfo->layerCount > 1) {
-      static bool said;
-      if (!said) {
-         said = true;
-         fprintf(stderr, "cudapipe: vkCmdBeginRendering with layerCount=%u; "
-                 "layered rendering is not implemented and every layer goes "
-                 "to the first\n", pRenderingInfo->layerCount);
+   if (dat && dat->imageView) {
+      if (dat->resolveMode != VK_RESOLVE_MODE_NONE) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
       }
+      VK_FROM_HANDLE(cpvk_image_view, view, dat->imageView);
+      if (!view || !view->image || !view->image->mem ||
+          view->vk.format != VK_FORMAT_D32_SFLOAT) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      dimg = view->image;
+      unsigned level = MIN2(view->vk.base_mip_level,
+                            CPVK_MAX_MIP_LEVELS - 1);
+      bool store = dat->storeOp == VK_ATTACHMENT_STORE_OP_STORE;
+      bool full_area = pRenderingInfo->renderArea.offset.x == 0 &&
+                       pRenderingInfo->renderArea.offset.y == 0 &&
+                       pRenderingInfo->renderArea.extent.width ==
+                          u_minify(dimg->vk.extent.width, level) &&
+                       pRenderingInfo->renderArea.extent.height ==
+                          u_minify(dimg->vk.extent.height, level);
+      depth = (struct cp_depth_attachment) {
+         .data = dimg->mem->dev_ptr + dimg->offset +
+                 dimg->level_offset[level] +
+                 (uint64_t)view->vk.base_array_layer * dimg->level_size[level],
+         .row_stride = dimg->row_stride[level],
+         .sample_stride = dimg->sample_stride,
+         .load = dat->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
+                 (store && !full_area),
+         .store = store,
+      };
+      fb.has_zs = true;
+   }
+
+
+
+   if (cimg && dimg && cimg->vk.samples != dimg->vk.samples) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
    }
 
    cmd->fb = fb;
@@ -1245,8 +1324,9 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    {
       /* The attachment's sample count comes from the image rather than the
        * pipeline because framebuffer-sized buffers follow the attachment. */
-      cmd->fb_samples = cimg ? MAX2(cimg->vk.samples, 1u) : 1;
-      uint32_t scope = cpvk_scope_append(cmd, &fb, cmd->fb_samples);
+      cmd->fb_samples = cimg ? MAX2(cimg->vk.samples, 1u) :
+                        dimg ? MAX2(dimg->vk.samples, 1u) : 1;
+      uint32_t scope = cpvk_scope_append(cmd, &fb, &depth, cmd->fb_samples);
       if (scope == CP_RENDER_SCOPE_NONE)
          return;
       cmd->active_scope = scope;
@@ -1279,7 +1359,6 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                             cat->clearValue.color.float32, 1);
    }
 
-   const VkRenderingAttachmentInfo *dat = pRenderingInfo->pDepthAttachment;
    if (dat && dat->imageView && dat->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
       struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_CLEAR);
       if (!op)
@@ -1287,6 +1366,14 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       op->clear = (struct cpvk_clear) {
          .depth = true,
          .depth_value = dat->clearValue.depthStencil.depth,
+         .offset = ((uint64_t)pRenderingInfo->renderArea.offset.y * fb.width +
+                    pRenderingInfo->renderArea.offset.x) * sizeof(uint32_t),
+         .width = pRenderingInfo->renderArea.extent.width,
+         .height = pRenderingInfo->renderArea.extent.height,
+         .stride = fb.width * sizeof(uint32_t),
+         .pixel_size = sizeof(uint32_t),
+         .samples = cmd->fb_samples,
+         .sample_stride = (uint64_t)fb.width * fb.height * sizeof(uint32_t),
       };
    }
 }
@@ -1488,7 +1575,14 @@ cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c)
    cp_batch_flush(cp);
 
    if (c->depth) {
-      cp_clear_depthbuf(cp, c->depth_value);
+      uint32_t value[4] = { cp_depth_to_sortable(c->depth_value) };
+      for (unsigned s = 0; s < MAX2(c->samples, 1u); s++)
+         cp_clear_rect(cp,
+                       (void *)(uintptr_t)(cp->depthbuf +
+                                           s * c->sample_stride),
+                       c->offset, c->width, c->height, c->stride,
+                       c->pixel_size, value, true);
+      cp->depthbuf_cleared = true;
       return;
    }
 
@@ -2782,6 +2876,20 @@ cpvk_execute_order_point(struct cpvk_device *dev)
    cp_pass_finish(&dev->renderer);
 }
 
+struct cpvk_event_callback {
+   struct cpvk_event *event;
+   bool signaled;
+};
+
+static void CUDA_CB
+cpvk_event_callback_run(void *data)
+{
+   struct cpvk_event_callback *callback = data;
+   cpvk_event_set_state(callback->event, callback->signaled);
+   cpvk_event_unref(callback->event);
+   free(callback);
+}
+
 VkResult
 cpvk_execute_order_op(struct cpvk_device *dev, const struct cpvk_op *op)
 {
@@ -2789,14 +2897,21 @@ cpvk_execute_order_op(struct cpvk_device *dev, const struct cpvk_op *op)
    if (op->kind == CPVK_OP_BARRIER)
       return VK_SUCCESS;
 
-   if (cuStreamSynchronize(dev->renderer.stream) != CUDA_SUCCESS)
-      return vk_error(dev, VK_ERROR_DEVICE_LOST);
-
    struct cpvk_event *event = op->event.event;
-   if (op->kind == CPVK_OP_EVENT_SET) {
-      cpvk_event_set_state(event, true);
-   } else if (op->kind == CPVK_OP_EVENT_RESET) {
-      cpvk_event_set_state(event, false);
+   if (op->kind == CPVK_OP_EVENT_SET || op->kind == CPVK_OP_EVENT_RESET) {
+      struct cpvk_event_callback *callback = malloc(sizeof(*callback));
+      if (!callback)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      callback->event = event;
+      callback->signaled = op->kind == CPVK_OP_EVENT_SET;
+      cpvk_event_ref(event);
+      CUresult err = cuLaunchHostFunc(dev->renderer.stream,
+                                     cpvk_event_callback_run, callback);
+      if (err != CUDA_SUCCESS) {
+         cpvk_event_unref(event);
+         free(callback);
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+      }
    } else if (op->kind == CPVK_OP_EVENT_WAIT) {
       mtx_lock(&event->lock);
       while (!event->signaled) {

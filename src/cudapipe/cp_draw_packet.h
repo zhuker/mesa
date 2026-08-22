@@ -6,9 +6,19 @@
 #include "kernels/cp_rast_types.h"
 #include <stdint.h>
 
+/* One VkRenderingAttachmentInfo resolved to its exact image subresource. */
+struct cp_depth_attachment {
+   uint64_t data;
+   uint32_t row_stride;
+   uint32_t sample_stride;
+   uint32_t load;
+   uint32_t store;
+};
+
 /* One vkCmdBeginRendering boundary, owned by its recording command buffer. */
 struct cp_render_scope {
    struct cp_fb_desc fb;
+   struct cp_depth_attachment depth;
    uint32_t attachment_samples;
    uint32_t serial;
 };

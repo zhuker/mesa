@@ -53,3 +53,37 @@ cp_clear_depth_kernel(struct cp_clear_args args)
    }
 }
 
+
+
+extern "C" __global__ void
+cp_depth_attachment_load(struct cp_depth_attachment_args args)
+{
+   uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+   uint32_t sample = blockIdx.z;
+   if (x >= args.width || y >= args.height || sample >= args.samples)
+      return;
+   const uint8_t *src = (const uint8_t *)(uintptr_t)args.image +
+                        (uint64_t)sample * args.sample_stride +
+                        (uint64_t)y * args.row_stride + x * 4;
+   uint32_t *dst = (uint32_t *)(uintptr_t)args.depthbuf;
+   uint32_t bits = *(const uint32_t *)src;
+   dst[((uint64_t)sample * args.height + y) * args.width + x] =
+      bits ^ 0x80000000u;
+}
+
+extern "C" __global__ void
+cp_depth_attachment_store(struct cp_depth_attachment_args args)
+{
+   uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+   uint32_t sample = blockIdx.z;
+   if (x >= args.width || y >= args.height || sample >= args.samples)
+      return;
+   const uint32_t *src = (const uint32_t *)(uintptr_t)args.depthbuf;
+   uint8_t *dst = (uint8_t *)(uintptr_t)args.image +
+                  (uint64_t)sample * args.sample_stride +
+                  (uint64_t)y * args.row_stride + x * 4;
+   *(uint32_t *)dst =
+      src[((uint64_t)sample * args.height + y) * args.width + x] ^ 0x80000000u;
+}

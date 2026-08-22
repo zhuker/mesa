@@ -1629,6 +1629,39 @@ cp_depth_to_sortable(float depth)
    return v.u ^ mask;
 }
 
+static bool
+cp_depth_attachment_xfer(struct cp_context *cp,
+                         const struct cp_render_scope *scope, bool store)
+{
+   const struct cp_depth_attachment *depth = &scope->depth;
+   CUfunction fn = store ? cp->screen->kernels.depth_attachment_store
+                         : cp->screen->kernels.depth_attachment_load;
+   if (!fn || !depth->data || !cp->depthbuf)
+      return false;
+
+   if (!scope->fb.width || !scope->fb.height)
+      return true;
+
+   struct cp_depth_attachment_args args = {
+      .image = depth->data,
+      .depthbuf = cp->depthbuf,
+      .width = scope->fb.width,
+      .height = scope->fb.height,
+      .row_stride = depth->row_stride,
+      .sample_stride = depth->sample_stride,
+      .samples = MAX2(scope->attachment_samples, 1u),
+   };
+   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   void *params[] = { &args };
+   CUresult err = cuLaunchKernel(fn,
+      (args.width + 15) / 16, (args.height + 15) / 16, args.samples,
+      16, 16, 1, 0, cp->stream, params, NULL);
+   if (err != CUDA_SUCCESS)
+      fprintf(stderr, "cudapipe: depth attachment %s failed: %d\n",
+              store ? "store" : "load", err);
+   return err == CUDA_SUCCESS;
+}
+
 void
 cp_clear_depthbuf(struct cp_context *cp, float depth)
 {
@@ -6952,6 +6985,11 @@ cp_render_scope_begin(struct cp_context *cp, const struct cp_render_scope *scope
    cp->pass.scope = *scope;
    cp->pass.scope_open = true;
    cp_context_set_framebuffer(cp, &scope->fb, scope->attachment_samples);
+   if (scope->fb.has_zs) {
+      cp->depthbuf_cleared = false;
+      if (scope->depth.load && cp_depth_attachment_xfer(cp, scope, false))
+         cp->depthbuf_cleared = true;
+   }
 }
 
 void
@@ -6961,6 +6999,8 @@ cp_render_scope_end(struct cp_context *cp)
    if (getenv("CPVK_DEBUG_EPISODE"))
       fprintf(stderr, "episode-cut: end_render\n");
    cp_pass_finish(cp);
+   if (cp->pass.scope.depth.store)
+      cp_depth_attachment_xfer(cp, &cp->pass.scope, true);
    cp->pass.scope_open = false;
 }
 

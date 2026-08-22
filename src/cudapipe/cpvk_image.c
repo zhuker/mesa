@@ -64,7 +64,6 @@ static const struct cpvk_format_info cpvk_formats[] = {
    { VK_FORMAT_BC3_UNORM_BLOCK,      CP_TEXEL_DXT5_RGBA,          -1,                           false },
    { VK_FORMAT_BC3_SRGB_BLOCK,       CP_TEXEL_DXT5_RGBA,          -1,                           false },
    { VK_FORMAT_D32_SFLOAT,          CP_TEXEL_R32_FLOAT,           -1,                           true  },
-   { VK_FORMAT_D32_SFLOAT_S8_UINT,  0,                           -1,                           true  },
 };
 
 const struct cpvk_format_info *
@@ -387,8 +386,15 @@ cpvk_DestroyImageView(VkDevice _device, VkImageView _view,
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_image_view, view, _view);
 
-   if (view)
+   if (view) {
+      if (view->tex_info) {
+         cuCtxSetCurrent(dev->cu_ctx);
+         cuMemFree(view->tex_info);
+         view->tex_info = 0;
+         view->tex_info_host = NULL;
+      }
       vk_image_view_destroy(&dev->vk, pAllocator, &view->vk);
+   }
 }
 
 

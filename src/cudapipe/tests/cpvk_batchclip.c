@@ -382,7 +382,7 @@ main(int argc, char **argv)
       { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, NDRAW } };
    VkDescriptorPoolCreateInfo dpi = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-      .maxSets = NDRAW, .poolSizeCount = 2, .pPoolSizes = dps };
+      .maxSets = NDRAW + 1, .poolSizeCount = 2, .pPoolSizes = dps };
    VkDescriptorPool dpool;
    CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &dpool));
    VkDescriptorSetAllocateInfo dsai = {
