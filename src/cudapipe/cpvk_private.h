@@ -212,7 +212,13 @@ struct cpvk_descriptor {
     * the whole image, so computeshader's emboss convolved a constant and its
     * half of the frame came out flat grey, 128 in every channel.
     */
-   uint32_t width;                    /* +8  storage image only */
+   /*
+    * +8 is the extent for a storage image and the bound range in bytes for a
+    * buffer. The kernels read it as the image width; get_ssbo_size reads it
+    * as the buffer's size, which is what `buffer.length()` divides by its
+    * array stride.
+    */
+   uint32_t width_or_range;           /* +8 */
    uint16_t height;                   /* +12 */
    uint16_t depth;                    /* +14 */
    uint8_t  pad0[8];
@@ -232,7 +238,8 @@ struct cpvk_descriptor {
 static_assert(sizeof(struct cpvk_descriptor) == CPVK_DESCRIPTOR_SIZE,
               "the kernels read fixed offsets into this");
 static_assert(offsetof(struct cpvk_descriptor, base) == 0, "descriptor ABI");
-static_assert(offsetof(struct cpvk_descriptor, width) == 8, "descriptor ABI");
+static_assert(offsetof(struct cpvk_descriptor, width_or_range) == 8,
+              "descriptor ABI");
 static_assert(offsetof(struct cpvk_descriptor, row_stride) == 24,
               "descriptor ABI");
 static_assert(offsetof(struct cpvk_descriptor,

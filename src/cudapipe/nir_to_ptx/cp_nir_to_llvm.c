@@ -775,9 +775,9 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
    }
    case nir_intrinsic_get_ssbo_size: {
       /*
-       * Descriptor struct: { ptr base (8 bytes); u32 num_elements (4 bytes); }
-       * num_elements is at offset 8 from the descriptor address.
-       * Returns size in BYTES (num_elements is already in the unit the shader expects).
+       * The bound range in bytes, which the descriptor row carries beside the
+       * base: struct cpvk_descriptor { u64 base; u32 width_or_range; ... }.
+       * NIR divides it by the array stride to answer `buffer.length()`.
        */
       LLVMValueRef desc_addr = get_src(ctx, &instr->src[0]);
       LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
@@ -791,9 +791,8 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
    }
    case nir_intrinsic_load_ssbo: {
       /*
-       * After lavapipe lowering, src[0] is a 64-bit address pointing to a
-       * descriptor struct: { ptr base; u32 num_elements; }
-       * We read the base pointer from the descriptor, then access base[offset].
+       * src[0] is a 64-bit address pointing at a descriptor row whose first
+       * member is the buffer base. Read the base, then access base[offset].
        */
       LLVMValueRef buf_ptr = emit_buffer_base(ctx, &instr->src[0]);
       LLVMValueRef byte_offset = get_src(ctx, &instr->src[1]);
@@ -2362,6 +2361,7 @@ capture_tex_desc_refs(struct nir_shader *nir, struct cp_shader_binary *bin)
                 tex->op == nir_texop_txb);
             if (!sampled)
                continue;
+            bin->num_tex_instrs++;
             struct cp_tex_desc_ref ref = { .flags = flags };
             if (!capture_tex_desc_ref(tex, &ref)) {
                bin->tex_descs_dynamic = true;

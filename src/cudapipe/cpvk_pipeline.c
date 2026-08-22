@@ -353,7 +353,15 @@ lower_descriptors(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_load_ssbo:
    case nir_intrinsic_store_ssbo:
    case nir_intrinsic_ssbo_atomic:
-   case nir_intrinsic_ssbo_atomic_swap: {
+   case nir_intrinsic_ssbo_atomic_swap:
+   /*
+    * get_ssbo_size belongs here too, and did not: it kept the (slot, offset)
+    * triple its resource index produced, and the backend read that as a
+    * 64-bit descriptor address. `buffer.length()` therefore did not work at
+    * all -- which nothing noticed, because no test, sample or capture calls
+    * it.
+    */
+   case nir_intrinsic_get_ssbo_size: {
       unsigned si = intr->intrinsic == nir_intrinsic_store_ssbo ? 1 : 0;
       if (nir_src_num_components(intr->src[si]) == 1)
          return false;

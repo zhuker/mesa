@@ -256,7 +256,7 @@ cpvk_storage_image_row(struct cpvk_descriptor *desc,
    desc->base = img->mem->dev_ptr + img->offset +
                 img->level_offset[level] + layer_offset;
    /* The view's subresource, not the whole image, is addressable storage. */
-   desc->width = MAX2(img->vk.extent.width >> level, 1u);
+   desc->width_or_range = MAX2(img->vk.extent.width >> level, 1u);
    desc->height = MAX2(img->vk.extent.height >> level, 1u);
    desc->depth = img->vk.image_type == VK_IMAGE_TYPE_3D
       ? MAX2(img->vk.extent.depth >> level, 1u)
@@ -319,8 +319,21 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
       VK_FROM_HANDLE(cpvk_buffer, buffer, bi->buffer);
       set->addrs[flat] = buffer && buffer->mem
          ? buffer->mem->dev_ptr + buffer->offset + bi->offset : 0;
-      if (set->host)
+      if (set->host) {
          set->host[flat].base = set->addrs[flat];
+         /*
+          * The bound range, which `buffer.length()` divides by its array
+          * stride. VK_WHOLE_SIZE is what is left of the buffer after the
+          * descriptor's own offset; a dynamic offset moves the base and does
+          * not shorten the range, which is what the spec says the shader
+          * sees.
+          */
+         uint64_t size = buffer ? buffer->vk.size : 0;
+         uint64_t start = MIN2(bi->offset, size);
+         uint64_t range = bi->range == VK_WHOLE_SIZE ? size - start
+                                                     : bi->range;
+         set->host[flat].width_or_range = (uint32_t)MIN2(range, size - start);
+      }
       break;
    }
 
