@@ -14,6 +14,7 @@
 #include "cp_debug.h"
 #include "cp_device.h"
 #include "cp_draw_types.h"
+#include "cp_draw_packet.h"
 
 #include <cuda.h>
 #include <stdbool.h>
@@ -134,24 +135,9 @@ struct cp_abuf_dbg_state {
 };
 
 
-struct cp_context {
-
-   /* Per-renderer A-buffer storage: every CUDA pointer belongs to this
-    * context's device instead of to process-global state. */
-   struct cp_abuf *abuf;
-   struct cp_abuf_dbg_state abuf_dbg;
-
-   /* The device, not the screen: four fields the pipeline reads, and no
-    * pipe_screen behind them. A Vulkan front end supplies one directly. */
-   struct cp_device *screen;
-
-   /*
-    * Draws held back for merging. `pending` means one or more draws have been
-    * accepted and nothing has run yet, so every path that observes rendering —
-    * a flush, a readback, a clear, a blit, a dispatch — has to call
-    * cp_batch_flush() before it looks.
-    */
-   struct {
+struct cp_draw_batch {
+   struct cp_draw_state state;
+   struct cp_render_scope scope;
       bool pending;
       unsigned ndraws;
       /* Triangles over the whole batch, which is what the clipper's output
@@ -187,7 +173,26 @@ struct cp_context {
       /* The scissor each draw was recorded under, for the per-draw clip
        * rectangles — see cp_rasterize_args.clip_rects. */
       struct cp_rect scissors[CP_MAX_BATCH_DRAWS];
-   } batch;
+};
+
+struct cp_context {
+
+   /* Per-renderer A-buffer storage: every CUDA pointer belongs to this
+    * context's device instead of to process-global state. */
+   struct cp_abuf *abuf;
+   struct cp_abuf_dbg_state abuf_dbg;
+
+   /* The device, not the screen: four fields the pipeline reads, and no
+    * pipe_screen behind them. A Vulkan front end supplies one directly. */
+   struct cp_device *screen;
+
+   /*
+    * Draws held back for merging. `pending` means one or more draws have been
+    * accepted and nothing has run yet, so every path that observes rendering —
+    * a flush, a readback, a clear, a blit, a dispatch — has to call
+    * cp_batch_flush() before it looks.
+    */
+   struct cp_draw_batch batch;
 
    /*
     * A pass episode: consecutive blended batches sharing one A-buffer build,
@@ -853,7 +858,16 @@ void cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info, 
 bool cp_batch_abuf_ok(struct cp_context *cp);
 bool cp_batch_order_free(struct cp_context *cp);
 
-void cp_batch_record(struct cp_context *cp, const struct cp_draw_range *draw, unsigned tris, unsigned drawid_offset, unsigned instance_count);
+void cp_stage_draw_state_legacy(struct cp_context *cp,
+                                const struct cp_draw_state *state,
+                                const struct cp_render_scope *scope,
+                                const struct cp_rect *scissor);
+void cp_batch_begin_packet(struct cp_context *cp,
+                           const struct cp_draw_packet *packet,
+                           const struct cp_batch_key *key, bool blended);
+void cp_batch_record_packet(struct cp_context *cp,
+                            const struct cp_draw_packet *packet,
+                            unsigned tris);
 void cp_pass_record_segment(struct cp_context *cp, const struct cp_rasterize_args *aa, const struct cp_rast_queues *queues, unsigned rast_num_triangles, unsigned num_triangles, const struct cp_draw_call *info, unsigned drawid_offset, unsigned ndraws, const struct cp_draw_range *draws, const uint32_t *instance_counts, const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table, const uint32_t *draw_ids, const uint64_t *vb_table, const struct cp_rect *scissors);
 
 void cp_context_set_framebuffer(struct cp_context *cp,

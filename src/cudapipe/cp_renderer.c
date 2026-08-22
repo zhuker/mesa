@@ -5109,63 +5109,96 @@ cp_batch_abuf_ok(struct cp_context *cp)
 /* Snapshot this draw's index range and vertex-stage bindings as the next row
  * of the batch's tables. */
 void
-cp_batch_record(struct cp_context *cp,
-                const struct cp_draw_range *draw, unsigned tris,
-                unsigned drawid_offset, unsigned instance_count)
+cp_stage_draw_state_legacy(struct cp_context *cp,
+                           const struct cp_draw_state *s,
+                           const struct cp_render_scope *scope,
+                           const struct cp_rect *scissor)
 {
-   if (getenv("CPVK_DEBUG_ROWS"))
-   {
-      fprintf(stderr, "row %u: fs slots", cp->batch.ndraws);
-      for (unsigned q = 0; q < 4 && q < cp->num_fs_ubos; q++)
+   cp->fb = scope->fb;
+   cp->fb_samples = scope->attachment_samples;
+   cp->viewport = s->viewport;
+   cp->scissor = *scissor;
+   cp->rasterizer = s->raster;
+   cp->depth_stencil = s->depth;
+   cp->blend_desc = s->blend;
+   cp->blend_enabled = s->blend.enable;
+   cp->vs_shader = s->vs;
+   cp->fs_shader = s->fs;
+   memcpy(cp->velem, s->velem, sizeof(cp->velem));
+   cp->num_vertex_elements = s->num_vertex_elements;
+   cp->vertex_stride = s->vertex_stride;
+   memcpy(cp->vb_base, s->vb_base, sizeof(cp->vb_base));
+   cp->num_vertex_buffers = s->num_vertex_buffers;
+   for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
+      cp->vs_ubos[i].buffer = (void *)(uintptr_t)s->vs_ubos[i];
+      cp->vs_ubos[i].managed_copy = 0;
+      cp->vs_ubos[i].user_copy = false;
+      cp->fs_ubos[i].buffer = (void *)(uintptr_t)s->fs_ubos[i];
+      cp->fs_ubos[i].managed_copy = 0;
+      cp->fs_ubos[i].user_copy = false;
+   }
+   cp->num_vs_ubos = s->num_vs_ubos;
+   cp->num_fs_ubos = s->num_fs_ubos;
+}
+
+void
+cp_batch_begin_packet(struct cp_context *cp,
+                      const struct cp_draw_packet *packet,
+                      const struct cp_batch_key *key, bool blended)
+{
+   cp->batch.state = packet->state;
+   cp->batch.scope = *packet->scope;
+   cp->batch.key = *key;
+   cp->batch.info = packet->call;
+   cp->batch.drawid_offset = packet->drawid_offset;
+   cp->batch.ndraws = 0;
+   cp->batch.tris = 0;
+   cp->batch.pending = true;
+   cp->batch.blended = blended;
+}
+
+/* Snapshot this packet's range and per-draw rows into batch-owned storage. */
+void
+cp_batch_record_packet(struct cp_context *cp,
+                       const struct cp_draw_packet *packet, unsigned tris)
+{
+   const struct cp_draw_state *s = &packet->state;
+   unsigned n = cp->batch.ndraws;
+   if (getenv("CPVK_DEBUG_ROWS")) {
+      fprintf(stderr, "row %u: fs slots", n);
+      for (unsigned q = 0; q < 4 && q < s->num_fs_ubos; q++)
          fprintf(stderr, " [%u]=%p", q,
-                 (void *)(uintptr_t)cp->fs_ubos[q].buffer);
-      fprintf(stderr, "  start=%u count=%u\n", draw->start, draw->count);
+                 (void *)(uintptr_t)s->fs_ubos[q]);
+      fprintf(stderr, "  start=%u count=%u\n",
+              packet->range.start, packet->range.count);
    }
 
-   uint64_t *row = cp->batch.vs_ubos +
-      (size_t)cp->batch.ndraws * CP_ARG_UBO_STRIDE;
+   uint64_t *row = cp->batch.vs_ubos + (size_t)n * CP_ARG_UBO_STRIDE;
    memset(row, 0, CP_ARG_UBO_STRIDE * sizeof(*row));
-   for (unsigned i = 0; i < cp->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
-      row[i] = (uint64_t)(uintptr_t)cp->vs_ubos[i].buffer;
+   memcpy(row, s->vs_ubos,
+          MIN2(s->num_vs_ubos, CP_MAX_CONST_BUFFERS) * sizeof(*row));
 
-   /* The fragment stage's — the bindings the key stopped comparing, for every
-    * batch since the opaque path adopted the per-draw table too. Recorded now,
-    * because by the time the batch runs the next draw's have been bound over
-    * them. */
-   {
-      uint64_t *frow = cp->batch.fs_ubos +
-         (size_t)cp->batch.ndraws * CP_ARG_UBO_STRIDE;
-      memset(frow, 0, CP_ARG_UBO_STRIDE * sizeof(*frow));
-      for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
-         frow[i] = (uint64_t)(uintptr_t)cp->fs_ubos[i].buffer;
+   uint64_t *frow = cp->batch.fs_ubos + (size_t)n * CP_ARG_UBO_STRIDE;
+   memset(frow, 0, CP_ARG_UBO_STRIDE * sizeof(*frow));
+   memcpy(frow, s->fs_ubos,
+          MIN2(s->num_fs_ubos, CP_MAX_CONST_BUFFERS) * sizeof(*frow));
+
+   uint64_t *vrow = cp->batch.vb_bases + (size_t)n * CP_VB_TABLE_STRIDE;
+   memset(vrow, 0, CP_VB_TABLE_STRIDE * sizeof(*vrow));
+   for (unsigned e = 0; e < s->num_vertex_elements &&
+                        e < CP_VB_TABLE_STRIDE; e++) {
+      unsigned vb_idx = s->velem[e].vertex_buffer_index;
+      if (vb_idx < s->num_vertex_buffers && vb_idx < 16 &&
+          s->vb_base[vb_idx])
+         vrow[e] = s->vb_base[vb_idx];
    }
 
-   /* The vertex-buffer bases, resolved per element the way the launch would
-    * resolve them — snapshotted for the same reason as the uniform rows. */
-   {
-      uint64_t *vrow = cp->batch.vb_bases +
-         (size_t)cp->batch.ndraws * CP_VB_TABLE_STRIDE;
-      memset(vrow, 0, CP_VB_TABLE_STRIDE * sizeof(*vrow));
-      for (unsigned e = 0; e < cp->num_vertex_elements &&
-                           e < CP_VB_TABLE_STRIDE; e++) {
-         unsigned vb_idx = cp->velem[e].vertex_buffer_index;
-         if (vb_idx < cp->num_vertex_buffers && vb_idx < 16 &&
-             cp->vb_base[vb_idx]) {
-            /* Base and offset were folded together when the buffer was
-             * bound, which is the same value this computed for itself. */
-            vrow[e] = cp->vb_base[vb_idx];
-         }
-      }
-   }
-
-   cp->batch.draws[cp->batch.ndraws] = *draw;
-   cp->batch.instance_counts[cp->batch.ndraws] = instance_count;
-   cp->batch.draw_ids[cp->batch.ndraws] = drawid_offset;
-   cp->batch.scissors[cp->batch.ndraws] = cp->scissor;
+   cp->batch.draws[n] = packet->range;
+   cp->batch.instance_counts[n] = packet->call.instance_count;
+   cp->batch.draw_ids[n] = packet->drawid_offset;
+   cp->batch.scissors[n] = packet->scissor;
    cp->batch.tris += tris;
    cp->batch.ndraws++;
-   /* This draw's push block is now in the upload arena and its address is in
-    * the row above; nothing may rewind that arena until the batch launches. */
    cp->batch_uploads_live = true;
 }
 
@@ -7041,6 +7074,11 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
    cp->batch.ndraws = 0;
    cp->batch.tris = 0;
    cp->batch.blended = false;
+
+   /* Execution consumes the immutable state captured when the batch began,
+    * not whichever frontend draw happened to touch the live context last. */
+   cp_stage_draw_state_legacy(cp, &cp->batch.state, &cp->batch.scope,
+                              &cp->batch.scissors[ndraws - 1]);
 
    if (cp_debug->debug_draw) {
       fprintf(stderr, "cudapipe: batch of %u draws\n", ndraws);

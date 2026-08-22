@@ -1560,27 +1560,28 @@ static_assert(sizeof(struct cpvk_batch_state) <= CP_BATCH_STATE_BYTES,
  */
 static void
 cpvk_build_batch_key(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
+                     const struct cp_draw_packet *packet,
                      struct cp_batch_key *key, bool blended)
 {
    struct cp_context *cp = &dev->renderer;
 
    memset(key, 0, sizeof(*key));
 
-   key->vs = cp->vs_shader;
-   key->fs = cp->fs_shader;
+   key->vs = packet->state.vs;
+   key->fs = packet->state.fs;
 
    /* The colour target's identity. Natively an image view names it, and its
     * memory is what the kernels write, so both go in. */
-   key->cbuf_texture = d->fb.color;
-   key->color_data = d->fb.color;
-   key->zs_texture = d->fb.has_zs ? (const void *)(uintptr_t)1 : NULL;
+   key->cbuf_texture = packet->scope->fb.color;
+   key->color_data = packet->scope->fb.color;
+   key->zs_texture = packet->scope->fb.has_zs ? (const void *)(uintptr_t)1 : NULL;
    key->visbuf = cp->visbuf;
    key->depthbuf = cp->depthbuf;
-   key->fb_w = d->fb.width;
-   key->fb_h = d->fb.height;
-   key->fb_nr_cbufs = d->fb.nr_cbufs;
-   key->fb_samples = cp->fb_samples;
-   key->cbuf_format = (uint32_t)d->fb.color_encoding;
+   key->fb_w = packet->scope->fb.width;
+   key->fb_h = packet->scope->fb.height;
+   key->fb_nr_cbufs = packet->scope->fb.nr_cbufs;
+   key->fb_samples = packet->scope->attachment_samples;
+   key->cbuf_format = (uint32_t)packet->scope->fb.color_encoding;
 
    key->mode = d->call.mode;
    key->index_size = d->call.index_size;
@@ -1594,16 +1595,16 @@ cpvk_build_batch_key(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
    memset(&state, 0, sizeof(state));
    state.pipeline = d->pipeline;
    state.viewport = d->viewport;
-   state.fb_samples = cp->fb_samples;
+   state.fb_samples = packet->scope->attachment_samples;
    for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++)
-      state.fs_ubos[i] = (uint64_t)(uintptr_t)cp->fs_ubos[i].buffer;
+      state.fs_ubos[i] = packet->state.fs_ubos[i];
    memcpy(key->state, &state, sizeof(state));
 
-   key->num_vertex_elements = cp->num_vertex_elements;
-   key->vertex_stride = cp->vertex_stride;
-   key->num_vertex_buffers = cp->num_vertex_buffers;
-   key->num_fs_ubos = cp->num_fs_ubos;
-   key->num_vs_ubos = cp->num_vs_ubos;
+   key->num_vertex_elements = packet->state.num_vertex_elements;
+   key->vertex_stride = packet->state.vertex_stride;
+   key->num_vertex_buffers = packet->state.num_vertex_buffers;
+   key->num_fs_ubos = packet->state.num_fs_ubos;
+   key->num_vs_ubos = packet->state.num_vs_ubos;
    key->sampler_table = cp->sampler_table;
    key->num_samplers = cp->num_samplers;
 }
@@ -1617,9 +1618,9 @@ static bool
 cpvk_batch_structural(struct cpvk_device *dev, const struct cpvk_draw_cmd *d)
 {
    struct cp_context *cp = &dev->renderer;
+   const struct cpvk_pipeline *p = d->pipeline;
 
-   if (!cp->vs_shader || !cp->vs_shader->kernel ||
-       !cp->fs_shader || !cp->fs_shader->kernel)
+   if (!p || !p->vs || !p->vs->kernel || !p->fs || !p->fs->kernel)
       return false;
    if (d->call.mode != MESA_PRIM_TRIANGLES)
       return false;
@@ -1628,10 +1629,10 @@ cpvk_batch_structural(struct cpvk_device *dev, const struct cpvk_draw_cmd *d)
 
    /* A batch replays vertex buffers; a shader building positions from
     * gl_VertexIndex has nothing to gain and stays on the single-draw path. */
-   if (!cp->num_vertex_buffers || !cp->vb_base[0])
+   if (!d->num_vb || !d->vb_base[0])
       return false;
 
-   if (!cp->fb.nr_cbufs || !cp->fb.color || !cp->visbuf || !cp->depthbuf)
+   if (!d->fb.nr_cbufs || !d->fb.color || !cp->visbuf || !cp->depthbuf)
       return false;
 
    uint64_t tris = (uint64_t)cp_triangles_for_draw(d->call.mode,
@@ -1828,6 +1829,24 @@ cpvk_batch_can_join(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
 }
 
 static bool
+cpvk_pipeline_order_free(const struct cpvk_pipeline *p)
+{
+   if (!p || p->blend.enable || p->fs->uses_discard)
+      return false;
+   if (!p->depth.depth_enabled || !p->depth.depth_writemask)
+      return false;
+   switch (p->depth.depth_func) {
+   case CP_FUNC_LESS:
+   case CP_FUNC_LEQUAL:
+   case CP_FUNC_GREATER:
+   case CP_FUNC_GEQUAL:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
 cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
                     bool *blended)
 {
@@ -1882,7 +1901,7 @@ cpvk_batch_eligible(struct cpvk_device *dev, const struct cpvk_draw_cmd *d,
    if (!cpvk_batch_structural(dev, d))
       return false;
 
-   if (cp_batch_order_free(&dev->renderer)) {
+   if (cpvk_pipeline_order_free(d->pipeline)) {
       *blended = false;
       return true;
    }
@@ -1978,36 +1997,12 @@ static void
 cpvk_stage_packet_legacy(struct cp_context *cp,
                          const struct cp_draw_packet *packet)
 {
-   const struct cp_draw_state *s = &packet->state;
-   cp->viewport = s->viewport;
-   cp->scissor = packet->scissor;
-   cp->rasterizer = s->raster;
-   cp->depth_stencil = s->depth;
-   cp->blend_desc = s->blend;
-   cp->blend_enabled = s->blend.enable;
-   cp->vs_shader = s->vs;
-   cp->fs_shader = s->fs;
-   memcpy(cp->velem, s->velem, sizeof(cp->velem));
-   cp->num_vertex_elements = s->num_vertex_elements;
-   cp->vertex_stride = s->vertex_stride;
-   memcpy(cp->vb_base, s->vb_base, sizeof(cp->vb_base));
-   cp->num_vertex_buffers = s->num_vertex_buffers;
-   for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
-      cp->vs_ubos[i].buffer = (void *)(uintptr_t)s->vs_ubos[i];
-      cp->vs_ubos[i].managed_copy = 0;
-      cp->vs_ubos[i].user_copy = false;
-      cp->fs_ubos[i].buffer = (void *)(uintptr_t)s->fs_ubos[i];
-      cp->fs_ubos[i].managed_copy = 0;
-      cp->fs_ubos[i].user_copy = false;
-   }
-   cp->num_vs_ubos = s->num_vs_ubos;
-   cp->num_fs_ubos = s->num_fs_ubos;
-
-   assert(cp->vs_shader == s->vs && cp->fs_shader == s->fs);
-   assert(cp->num_vertex_elements == s->num_vertex_elements);
-   assert(cp->num_vertex_buffers == s->num_vertex_buffers);
-   assert(cp->num_vs_ubos == s->num_vs_ubos &&
-          cp->num_fs_ubos == s->num_fs_ubos);
+   cp_stage_draw_state_legacy(cp, &packet->state, packet->scope,
+                              &packet->scissor);
+   assert(cp->vs_shader == packet->state.vs &&
+          cp->fs_shader == packet->state.fs);
+   assert(cp->num_vertex_elements == packet->state.num_vertex_elements);
+   assert(cp->num_vertex_buffers == packet->state.num_vertex_buffers);
 }
 
 /* Run one recorded draw through the renderer. */
@@ -2061,7 +2056,6 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
 
    struct cp_draw_packet packet;
    cpvk_prepare_draw(dev, scope, d, &packet);
-   cpvk_stage_packet_legacy(cp, &packet);
 
    /* The renderer takes draw state through explicit launch arguments and
     * immutable batch snapshots; no device-global mutable state is published. */
@@ -2079,23 +2073,15 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
       unsigned tris = cp_triangles_for_draw(d->call.mode, d->range.count) *
                       MAX2(d->call.instance_count, 1u);
       if (!cp->batch.pending) {
-         cpvk_build_batch_key(dev, d, &cp->batch.key, batch_blended);
-         cp->batch.info = d->call;
-         cp->batch.drawid_offset = 0;
-         cp->batch.pending = true;
-         /*
-          * Whether this batch is blended, which decides at flush whether it
-          * appends to an A-buffer pass episode or to the opaque one. It was
-          * hardcoded false, so a blended batch -- once the front end merged
-          * one at all -- still took the opaque branch and no episode was ever
-          * entered.
-          */
-         cp->batch.blended = batch_blended;
+         struct cp_batch_key key;
+         cpvk_build_batch_key(dev, d, &packet, &key, batch_blended);
+         cp_batch_begin_packet(cp, &packet, &key, batch_blended);
       }
-      cp_batch_record(cp, &d->range, tris, 0, d->call.instance_count);
+      cp_batch_record_packet(cp, &packet, tris);
       return;
    }
 
+   cpvk_stage_packet_legacy(cp, &packet);
    cp_draw_execute(cp, &d->call, 0, &d->range, 1, 1, NULL, NULL, NULL, NULL,
                    NULL, NULL);
 }

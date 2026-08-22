@@ -72,8 +72,10 @@ pipeline pointer and snapshot the framebuffer (temporarily duplicated as a
 scope consistency check), viewport/scissor, vertex/index input, push constants
 and descriptor rows. At submit `cpvk_prepare_draw()` resolves that command into
 one complete immutable `cp_draw_packet`, including uploaded push and VS/FS UBO
-rows. A temporary adapter stages the packet into legacy renderer fields while
-batch/pass ownership is migrated. Queue submission:
+rows. Pending `cp_draw_batch` values now own a copy of packet state/scope and
+all compact per-draw rows; a successful batched record never stages live draw
+state, and flush stages only from that batch-owned snapshot. Direct execution
+and pass segments still use a temporary legacy adapter. Queue submission:
 
 1. publishes bounded host mappings used by sampler specialization;
 2. uploads dirty descriptor-snapshot arenas from ordinary host storage to
@@ -484,9 +486,9 @@ continue staging explicit paths rather than using `git add -A`.
    rendering resolves to the primary scope, and explicit end markers prevent
    episodes spanning a Vulkan rendering boundary. Recorded draws retain the old
    framebuffer copy only as a submit-time field assertion. Prepared draw
-   packets now take the indexed scope as their render-target source, but the
-   legacy renderer adapter still reconstructs live context state until batch
-   and fallback ownership move into packet snapshots.
+   packets and pending batches now own indexed scope/state snapshots; the
+   legacy renderer adapter remains for direct execution and pass segments until
+   fallback ownership moves into the same immutable batch representation.
 11. **Recorded ownership is only partially complete.** Command buffers retain
     unique references to every bound graphics/compute pipeline and recorded
     query pool; secondary operation copies import those references. Focused
