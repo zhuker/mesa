@@ -662,23 +662,40 @@ cpvk_CreatePipelineLayout(VkDevice _device,
  */
 
 static void
-cpvk_pipeline_destroy(struct cpvk_device *dev, struct cpvk_pipeline *pipeline,
-                      const VkAllocationCallbacks *pAllocator)
+cpvk_pipeline_init_ref(struct cpvk_device *dev, struct cpvk_pipeline *pipeline,
+                       const VkAllocationCallbacks *pAllocator)
 {
+   pipeline->dev = dev;
+   pipeline->alloc = pAllocator ? *pAllocator : dev->vk.alloc;
+   atomic_init(&pipeline->refcnt, 1);
+}
+
+void
+cpvk_pipeline_ref(struct cpvk_pipeline *pipeline)
+{
+   if (pipeline)
+      atomic_fetch_add_explicit(&pipeline->refcnt, 1, memory_order_relaxed);
+}
+
+void
+cpvk_pipeline_unref(struct cpvk_pipeline *pipeline)
+{
+   if (!pipeline ||
+       atomic_fetch_sub_explicit(&pipeline->refcnt, 1,
+                                 memory_order_acq_rel) != 1)
+      return;
+
    if (pipeline->bin)
       cp_shader_binary_destroy(pipeline->bin);
-   vk_object_free(&dev->vk, pAllocator, pipeline);
+   vk_object_free(&pipeline->dev->vk, &pipeline->alloc, pipeline);
 }
 
 VKAPI_ATTR void VKAPI_CALL
 cpvk_DestroyPipeline(VkDevice _device, VkPipeline _pipeline,
                      const VkAllocationCallbacks *pAllocator)
 {
-   VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_pipeline, pipeline, _pipeline);
-
-   if (pipeline)
-      cpvk_pipeline_destroy(dev, pipeline, pAllocator);
+   cpvk_pipeline_unref(pipeline);
 }
 
 static bool
@@ -767,6 +784,7 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
          first_error = VK_ERROR_OUT_OF_HOST_MEMORY;
          break;
       }
+      cpvk_pipeline_init_ref(dev, pipeline, pAllocator);
       pipeline->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
 
       void *mem_ctx = ralloc_context(NULL);
@@ -776,7 +794,7 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
          &cpvk_spirv_options, &cp_nir_options, mem_ctx, &nir);
       if (result != VK_SUCCESS) {
          ralloc_free(mem_ctx);
-         cpvk_pipeline_destroy(dev, pipeline, pAllocator);
+         cpvk_pipeline_unref(pipeline);
          if (first_error == VK_SUCCESS)
             first_error = result;
          continue;
@@ -803,7 +821,7 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       ralloc_free(mem_ctx);
 
       if (!pipeline->bin || !pipeline->bin->kernel) {
-         cpvk_pipeline_destroy(dev, pipeline, pAllocator);
+         cpvk_pipeline_unref(pipeline);
          if (first_error == VK_SUCCESS)
             first_error = vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
          continue;
@@ -1147,6 +1165,7 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
          first_error = VK_ERROR_OUT_OF_HOST_MEMORY;
          break;
       }
+      cpvk_pipeline_init_ref(dev, pipeline, pAllocator);
       pipeline->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
 
       /* Both stages through the cache, so identical SPIR-V compiles once and
@@ -1168,7 +1187,7 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
             pipeline->vs = bin;
       }
       if (result != VK_SUCCESS || !pipeline->vs || !pipeline->fs) {
-         cpvk_pipeline_destroy(dev, pipeline, pAllocator);
+         cpvk_pipeline_unref(pipeline);
          if (first_error == VK_SUCCESS) {
             VkResult error = result != VK_SUCCESS
                ? result : VK_ERROR_INITIALIZATION_FAILED;

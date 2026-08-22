@@ -28,6 +28,7 @@
 #include "cp_nir_to_llvm.h"
 #include "cp_kernels.h"
 #include "cp_debug.h"
+#include <stdatomic.h>
 #include "cp_device.h"
 #include "cp_renderer.h"
 #include "vk_buffer.h"
@@ -228,6 +229,9 @@ struct cpvk_descriptor_set {
  */
 struct cpvk_query_pool {
    struct vk_object_base base;
+   struct cpvk_device *dev;
+   VkAllocationCallbacks alloc;
+   atomic_uint refcnt;
    VkQueryType type;
    uint32_t count;
    uint64_t *results;
@@ -403,6 +407,10 @@ struct cpvk_op {
 struct cpvk_cmd_buffer {
    struct vk_command_buffer vk;
    struct cpvk_pipeline *pipeline;
+   struct cpvk_pipeline **retained_pipelines;
+   unsigned num_retained_pipelines, max_retained_pipelines;
+   struct cpvk_query_pool **retained_queries;
+   unsigned num_retained_queries, max_retained_queries;
    CUdeviceptr addrs[16];
    struct cpvk_dispatch dispatches[CPVK_MAX_DISPATCHES];
    unsigned num_dispatches;
@@ -461,6 +469,11 @@ struct cpvk_cmd_buffer {
    unsigned num_desc_retired, max_desc_retired;
 };
 
+void cpvk_pipeline_ref(struct cpvk_pipeline *pipeline);
+void cpvk_pipeline_unref(struct cpvk_pipeline *pipeline);
+void cpvk_query_pool_ref(struct cpvk_query_pool *pool);
+void cpvk_query_pool_unref(struct cpvk_query_pool *pool);
+
 void cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d);
 void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
 void cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
@@ -478,6 +491,9 @@ VkResult cpvk_execute_cmd_buffer(struct cpvk_device *dev,
 
 struct cpvk_pipeline {
    struct vk_object_base base;
+   struct cpvk_device *dev;
+   VkAllocationCallbacks alloc;
+   atomic_uint refcnt;
    VkPipelineBindPoint bind_point;
    struct cp_shader_binary *bin;   /* the compiled CUDA kernel */
    struct cp_shader_binary *vs;    /* graphics: the two stages */

@@ -37,7 +37,7 @@ The important files are:
 | `cp_renderer.[ch]` | shared draw renderer: batching, clipping, rasterization, A-buffer/peel paths, pass episodes, arenas and shader launches |
 | `cp_kernels.[ch]`, `kernels/` | NVRTC compilation, persistent source/options-keyed PTX caching and CUDA kernels, including the lazy 3D sampler variant |
 | `nir_to_ptx/` | the shared NIR→LLVM/NVPTX backend and loaded shader binaries |
-| `tests/cpvk_*.c` | 27 small native differential/regression programs, including sync-state and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
+| `tests/cpvk_*.c` | 30 small native differential/regression programs, including sync state, recorded pipeline/query lifetime and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
 
 The native `cpvk_device` owns one CUDA context, one `cp_device` containing the
 kernel modules, and one `cp_context` renderer with its ordered graphics/compute
@@ -65,8 +65,8 @@ supersedes the pinned-host/two-heap milestone described in the historical log.
 
 A command buffer records a growable, ordered array of `cpvk_op` values. The
 operation kinds are begin-render, clear, query, copy, draw and dispatch. Draws
-store a raw pipeline pointer and snapshot the framebuffer, viewport/scissor,
-vertex/index input, push constants and descriptor rows. Queue submission:
+store a retained pipeline pointer and snapshot the framebuffer,
+viewport/scissor, vertex/index input, push constants and descriptor rows. Queue submission:
 
 1. publishes bounded host mappings used by sampler specialization;
 2. uploads dirty descriptor-snapshot arenas from ordinary host storage to
@@ -301,10 +301,11 @@ pass.
 
 ### Standalone and sample gates
 
-- 27/27 `src/cudapipe/tests/cpvk_*.c` programs pass functionally, including
-  negative fence state/timeouts and concurrent per-device A-buffer execution,
+- 30/30 `src/cudapipe/tests/cpvk_*.c` programs pass functionally, including
+  negative fence state/timeouts, graphics/compute pipeline and query-pool
+  destruction after recording, and concurrent per-device A-buffer execution,
   with no driver error, unimplemented, refusal or overflow diagnostic. This is
-  not a claim that all 27 are clean under the Vulkan validation layer.
+  not a claim that all 30 are clean under the Vulkan validation layer.
 - `cpvk_tex3d` passes on native and NVIDIA; NVIDIA with
   `VK_LAYER_KHRONOS_validation` is clean.
 - The post-optimization 60-frame sweep is
@@ -473,12 +474,12 @@ continue staging explicit paths rather than using `git add -A`.
    primary command buffer's descriptor arenas. A secondary that was not
    separately submitted can therefore carry uninitialized descriptor snapshot
    addresses. There is no focused test for this path.
-11. **Recorded pipeline lifetime is not self-contained.** Draw and dispatch
-    operations retain raw `cpvk_pipeline *` pointers; graphics fixed state is
-    read from that object at submit, and a compute binary is pipeline-owned.
-    Destroying a pipeline after recording but before submission can therefore
-    become a use-after-free instead of using immutable recorded state. Audit
-    query-pool and other recorded object pointers in the same pass.
+11. **Recorded ownership is only partially complete.** Command buffers retain
+    unique references to every bound graphics/compute pipeline and recorded
+    query pool; secondary operation copies import those references. Focused
+    tests destroy graphics pipelines, compute pipelines and query pools after
+    recording and submit successfully. Event objects, secondary descriptor
+    arenas and other recorded resources still require the same ownership audit.
 12. **Layered rendering is not implemented.** Transfers understand layers and
    3D slices, and cube/array sampling works, but a draw targets one image layer.
 13. **Blit/resolve and format support are narrow by design.** Size-changing,
@@ -501,8 +502,8 @@ continue staging explicit paths rather than using `git add -A`.
     allocations. Pool lifetime ownership is implemented, but `maxSets`, pool
     sizes and allocation-capacity/accounting semantics are not enforced.
     `cpvk_DestroyImageView` still does not explicitly free its managed
-    `cp_texture_info`, and recorded pipelines remain raw pointers. Audit those
-    owners before asynchronous submission or allocation-heavy workloads.
+    `cp_texture_info`. Audit image/view and other resource owners before
+    asynchronous submission or allocation-heavy workloads.
 17. **Depth attachments are renderer-private.** The current dynamic-rendering
     path represents a depth attachment as `has_zs`, while depth tests/clears
     use `cp_context::depthbuf`; it is not a general Vulkan depth-image storage
@@ -601,9 +602,9 @@ In order:
 2. **Continue the focused semantic series before asynchronous submission.**
    Fresh/reset fence status, zero-time waits and binary semaphore ordering now
    pass. Add command-buffer event timing, draw/copy↔dispatch dependencies in
-   both directions, a secondary command buffer using descriptors without prior
-   submission, and pipeline destruction after recording but before submit.
-   Preserve the ordered renderer stream and add correct retained ownership.
+   both directions and a secondary command buffer using descriptors without
+   prior submission. Pipeline/query destruction after recording now passes.
+   Preserve the ordered renderer stream and finish retained ownership.
    Only then should CUDA-event fence retirement and removal of submit drains be
    considered as one measured change.
 3. **Complete the external image evidence.** Replay the existing Crossroads and
@@ -614,8 +615,8 @@ In order:
 4. **Close the remaining object lifetime holes and manifest drift.** Enforce
    descriptor-pool `maxSets`/pool-size capacity and accounting, add
    create/reset/destroy stress for pool-owned host descriptor sets, free
-   image-view texture info, refcount pipelines recorded by command buffers,
-   audit context allocations, and emit a Vulkan-1.1 development manifest.
+   image-view texture info, complete event/resource retention, audit context
+   allocations, and emit a Vulkan-1.1 development manifest.
 5. **Make the native validation surface clean.** Fill the remaining physical
    limits/properties, implement or stop exposing unsupported KHR/WSI surfaces,
    run the native tests and representative samples with

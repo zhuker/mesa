@@ -569,6 +569,11 @@ cpvk_batchblend_run(int argc, char **argv,
    endRendering(cmd);
    CHECK(vkEndCommandBuffer(cmd));
 
+#ifdef CPVK_DESTROY_PIPELINE_BEFORE_SUBMIT
+   vkDestroyPipeline(dev, pipe, NULL);
+   pipe = VK_NULL_HANDLE;
+#endif
+
    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                        .commandBufferCount = 1, .pCommandBuffers = &cmd };
    CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
@@ -591,7 +596,8 @@ cpvk_batchblend_run(int argc, char **argv,
 
    vkUnmapMemory(dev, mem);
    vkDestroyCommandPool(dev, pool, NULL);
-   vkDestroyPipeline(dev, pipe, NULL);
+   if (pipe)
+      vkDestroyPipeline(dev, pipe, NULL);
    vkDestroyPipelineLayout(dev, layout, NULL);
    vkDestroyDescriptorPool(dev, dpool, NULL);
    vkDestroyDescriptorSetLayout(dev, dsl_mat, NULL);

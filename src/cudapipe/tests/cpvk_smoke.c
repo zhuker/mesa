@@ -164,6 +164,11 @@ static int test_dispatch(VkDevice dev, VkQueue queue, uint32_t memtype)
    vkCmdDispatch(cb, N / 64, 1, 1);
    CHECK(vkEndCommandBuffer(cb));
 
+#ifdef CPVK_DESTROY_COMPUTE_PIPELINE_BEFORE_SUBMIT
+   vkDestroyPipeline(dev, pipe, NULL);
+   pipe = VK_NULL_HANDLE;
+#endif
+
    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                        .commandBufferCount = 1, .pCommandBuffers = &cb };
    CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
@@ -185,7 +190,8 @@ static int test_dispatch(VkDevice dev, VkQueue queue, uint32_t memtype)
    vkDestroyBuffer(dev, buf, NULL);
    vkFreeMemory(dev, mem, NULL);
 
-   vkDestroyPipeline(dev, pipe, NULL);
+   if (pipe)
+      vkDestroyPipeline(dev, pipe, NULL);
    vkDestroyShaderModule(dev, sm, NULL);
    vkDestroyPipelineLayout(dev, pl, NULL);
    vkDestroyDescriptorSetLayout(dev, dsl, NULL);

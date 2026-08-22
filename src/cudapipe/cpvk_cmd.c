@@ -395,12 +395,72 @@ cpvk_UpdateDescriptorSetWithTemplateKHR(
 /* -------------------------------------------------------- command buffers */
 
 static void
+cpvk_cmd_release_objects(struct cpvk_cmd_buffer *cmd)
+{
+   for (unsigned i = 0; i < cmd->num_retained_pipelines; i++)
+      cpvk_pipeline_unref(cmd->retained_pipelines[i]);
+   cmd->num_retained_pipelines = 0;
+   for (unsigned i = 0; i < cmd->num_retained_queries; i++)
+      cpvk_query_pool_unref(cmd->retained_queries[i]);
+   cmd->num_retained_queries = 0;
+}
+
+static bool
+cpvk_cmd_retain_pipeline(struct cpvk_cmd_buffer *cmd,
+                         struct cpvk_pipeline *pipeline)
+{
+   if (!pipeline)
+      return true;
+   for (unsigned i = 0; i < cmd->num_retained_pipelines; i++)
+      if (cmd->retained_pipelines[i] == pipeline)
+         return true;
+   if (cmd->num_retained_pipelines == cmd->max_retained_pipelines) {
+      unsigned cap = cmd->max_retained_pipelines ?
+                     cmd->max_retained_pipelines * 2 : 8;
+      void *p = realloc(cmd->retained_pipelines,
+                        cap * sizeof(*cmd->retained_pipelines));
+      if (!p)
+         return false;
+      cmd->retained_pipelines = p;
+      cmd->max_retained_pipelines = cap;
+   }
+   cpvk_pipeline_ref(pipeline);
+   cmd->retained_pipelines[cmd->num_retained_pipelines++] = pipeline;
+   return true;
+}
+
+static bool
+cpvk_cmd_retain_query(struct cpvk_cmd_buffer *cmd,
+                      struct cpvk_query_pool *pool)
+{
+   if (!pool)
+      return true;
+   for (unsigned i = 0; i < cmd->num_retained_queries; i++)
+      if (cmd->retained_queries[i] == pool)
+         return true;
+   if (cmd->num_retained_queries == cmd->max_retained_queries) {
+      unsigned cap = cmd->max_retained_queries ?
+                     cmd->max_retained_queries * 2 : 4;
+      void *p = realloc(cmd->retained_queries,
+                        cap * sizeof(*cmd->retained_queries));
+      if (!p)
+         return false;
+      cmd->retained_queries = p;
+      cmd->max_retained_queries = cap;
+   }
+   cpvk_query_pool_ref(pool);
+   cmd->retained_queries[cmd->num_retained_queries++] = pool;
+   return true;
+}
+
+static void
 cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
                       VkCommandBufferResetFlags flags)
 {
    struct cpvk_cmd_buffer *cmd =
       container_of(vk_cmd, struct cpvk_cmd_buffer, vk);
 
+   cpvk_cmd_release_objects(cmd);
    vk_command_buffer_reset(&cmd->vk);
    cmd->num_dispatches = 0;
    cmd->num_ops = 0;
@@ -427,12 +487,15 @@ cpvk_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd)
    struct cpvk_cmd_buffer *cmd =
       container_of(vk_cmd, struct cpvk_cmd_buffer, vk);
 
+   cpvk_cmd_release_objects(cmd);
    vk_command_buffer_finish(&cmd->vk);
    for (unsigned i = 0; i < cmd->num_desc_retired; i++) {
       cuMemFree(cmd->desc_retired[i].dev);
       free(cmd->desc_retired[i].host);
    }
    free(cmd->desc_retired);
+   free(cmd->retained_pipelines);
+   free(cmd->retained_queries);
    if (cmd->desc_arena)
       cuMemFree(cmd->desc_arena);
    if (cmd->desc_arena_host)
@@ -511,6 +574,10 @@ cpvk_CmdBindPipeline(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_pipeline, pipeline, _pipeline);
 
+   if (!cpvk_cmd_retain_pipeline(cmd, pipeline)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
    cmd->pipeline = pipeline;
 }
 
@@ -818,12 +885,27 @@ cpvk_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t count,
       if (!sec || !sec->num_ops)
          continue;
 
+      for (unsigned p = 0; p < sec->num_retained_pipelines; p++) {
+         if (!cpvk_cmd_retain_pipeline(cmd, sec->retained_pipelines[p])) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+            return;
+         }
+      }
+      for (unsigned q = 0; q < sec->num_retained_queries; q++) {
+         if (!cpvk_cmd_retain_query(cmd, sec->retained_queries[q])) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+            return;
+         }
+      }
+
       if (cmd->num_ops + sec->num_ops > cmd->max_ops) {
          unsigned want = MAX2(cmd->max_ops ? cmd->max_ops * 2 : 64,
                               cmd->num_ops + sec->num_ops);
          struct cpvk_op *ops = realloc(cmd->ops, want * sizeof(*ops));
-         if (!ops)
+         if (!ops) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
             return;
+         }
          cmd->ops = ops;
          cmd->max_ops = want;
       }
@@ -841,8 +923,10 @@ cpvk_op_alloc(struct cpvk_cmd_buffer *cmd, enum cpvk_op_kind kind)
    if (cmd->num_ops >= cmd->max_ops) {
       unsigned want = cmd->max_ops ? cmd->max_ops * 2 : 64;
       struct cpvk_op *ops = realloc(cmd->ops, want * sizeof(*ops));
-      if (!ops)
+      if (!ops) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
          return NULL;
+      }
       cmd->ops = ops;
       cmd->max_ops = want;
    }
@@ -2732,6 +2816,9 @@ cpvk_CreateQueryPool(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
    if (!pool)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   pool->dev = dev;
+   pool->alloc = pAllocator ? *pAllocator : dev->vk.alloc;
+   atomic_init(&pool->refcnt, 1);
    pool->type = pCreateInfo->queryType;
    pool->count = pCreateInfo->queryCount;
    pool->results = calloc(pool->count, sizeof(*pool->results));
@@ -2739,7 +2826,9 @@ cpvk_CreateQueryPool(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
    if (!pool->results || !pool->available) {
       free(pool->results);
       free(pool->available);
-      vk_object_free(&dev->vk, pAllocator, pool);
+      pool->results = NULL;
+      pool->available = NULL;
+      cpvk_query_pool_unref(pool);
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
@@ -2747,18 +2836,31 @@ cpvk_CreateQueryPool(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
    return VK_SUCCESS;
 }
 
+void
+cpvk_query_pool_ref(struct cpvk_query_pool *pool)
+{
+   if (pool)
+      atomic_fetch_add_explicit(&pool->refcnt, 1, memory_order_relaxed);
+}
+
+void
+cpvk_query_pool_unref(struct cpvk_query_pool *pool)
+{
+   if (!pool ||
+       atomic_fetch_sub_explicit(&pool->refcnt, 1,
+                                 memory_order_acq_rel) != 1)
+      return;
+   free(pool->results);
+   free(pool->available);
+   vk_object_free(&pool->dev->vk, &pool->alloc, pool);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_DestroyQueryPool(VkDevice _device, VkQueryPool _pool,
                       const VkAllocationCallbacks *pAllocator)
 {
-   VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
-
-   if (!pool)
-      return;
-   free(pool->results);
-   free(pool->available);
-   vk_object_free(&dev->vk, pAllocator, pool);
+   cpvk_query_pool_unref(pool);
 }
 
 static void
@@ -2767,6 +2869,10 @@ cpvk_record_query(struct cpvk_cmd_buffer *cmd, struct cpvk_query_pool *pool,
 {
    if (!pool)
       return;
+   if (!cpvk_cmd_retain_query(cmd, pool)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
    struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_QUERY);
    if (!op)
       return;
