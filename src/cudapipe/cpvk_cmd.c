@@ -1991,20 +1991,6 @@ cpvk_prepare_draw(struct cpvk_device *dev, const struct cp_render_scope *scope,
    packet->state.fs_ubos[CPVK_UBO_PUSH_SLOT] = push_slot;
 }
 
-/* Temporary adapter: packet ownership is explicit before renderer internals
- * stop reading the live context. */
-static void
-cpvk_stage_packet_legacy(struct cp_context *cp,
-                         const struct cp_draw_packet *packet)
-{
-   cp_stage_draw_state_legacy(cp, &packet->state, packet->scope,
-                              &packet->scissor);
-   assert(cp->vs_shader == packet->state.vs &&
-          cp->fs_shader == packet->state.fs);
-   assert(cp->num_vertex_elements == packet->state.num_vertex_elements);
-   assert(cp->num_vertex_buffers == packet->state.num_vertex_buffers);
-}
-
 /* Run one recorded draw through the renderer. */
 void
 cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *scope,
@@ -2081,9 +2067,16 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
       return;
    }
 
-   cpvk_stage_packet_legacy(cp, &packet);
-   cp_draw_execute(cp, &d->call, 0, &d->range, 1, 1, NULL, NULL, NULL, NULL,
-                   NULL, NULL);
+   struct cp_draw_batch direct = {
+      .state = packet.state,
+      .scope = *packet.scope,
+      .info = packet.call,
+      .ndraws = 1,
+      .draws = { packet.range },
+      .instance_counts = { packet.call.instance_count },
+      .scissors = { packet.scissor },
+   };
+   cp_draw_execute_batch(cp, &direct);
 }
 
 /* ----------------------------------------------------------- transfers */

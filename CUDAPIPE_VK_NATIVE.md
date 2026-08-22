@@ -72,10 +72,12 @@ pipeline pointer and snapshot the framebuffer (temporarily duplicated as a
 scope consistency check), viewport/scissor, vertex/index input, push constants
 and descriptor rows. At submit `cpvk_prepare_draw()` resolves that command into
 one complete immutable `cp_draw_packet`, including uploaded push and VS/FS UBO
-rows. Pending `cp_draw_batch` values now own a copy of packet state/scope and
-all compact per-draw rows; a successful batched record never stages live draw
-state, and flush stages only from that batch-owned snapshot. Direct execution
-and pass segments still use a temporary legacy adapter. Queue submission:
+rows. Pending `cp_draw_batch` values own a copy of packet state/scope and all
+compact per-draw rows; a successful batched record never stages live draw
+state. Direct draws are one-row batch views, `cp_draw_execute_batch()` is the
+only draw executor, and every pass segment owns the same complete batch
+snapshot. Fallback joins side streams and replays those immutable snapshots in
+submission order. Queue submission:
 
 1. publishes bounded host mappings used by sampler specialization;
 2. uploads dirty descriptor-snapshot arenas from ordinary host storage to
@@ -486,9 +488,10 @@ continue staging explicit paths rather than using `git add -A`.
    rendering resolves to the primary scope, and explicit end markers prevent
    episodes spanning a Vulkan rendering boundary. Recorded draws retain the old
    framebuffer copy only as a submit-time field assertion. Prepared draw
-   packets and pending batches now own indexed scope/state snapshots; the
-   legacy renderer adapter remains for direct execution and pass segments until
-   fallback ownership moves into the same immutable batch representation.
+   packets, pending batches and pass/fallback segments now own indexed
+   scope/state snapshots. The renderer still stages a batch snapshot into live
+   context fields at execution entry; threading packet state through every
+   launch helper and deleting those live draw fields is the remaining stage.
 11. **Recorded ownership is only partially complete.** Command buffers retain
     unique references to every bound graphics/compute pipeline and recorded
     query pool; secondary operation copies import those references. Focused

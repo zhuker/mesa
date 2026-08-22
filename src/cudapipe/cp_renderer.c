@@ -3063,17 +3063,27 @@ cp_abuf_verify_colors(struct cp_abuf *ab, unsigned w, unsigned h,
  * to what it was.
  */
 void
-cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
-                unsigned drawid_offset,
-                const struct cp_draw_range *draws,
-                unsigned num_draws, unsigned batch_draws,
-                const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table,
-                const uint32_t *draw_ids, const uint32_t *instance_counts,
-                const uint64_t *vb_table,
-                const struct cp_rect *scissors)
+cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 {
+   unsigned batch_draws = batch->ndraws;
+   const struct cp_draw_call *info = &batch->info;
+   unsigned drawid_offset = batch->drawid_offset;
+   const struct cp_draw_range *draws = batch->draws;
+   unsigned num_draws = 1;
+   const uint64_t *vs_ubo_table = batch->compact_rows ? batch->vs_ubos : NULL;
+   const uint64_t *fs_ubo_table = batch->compact_rows ? batch->fs_ubos : NULL;
+   const uint32_t *draw_ids = batch->compact_rows ? batch->draw_ids : NULL;
+   const uint32_t *instance_counts = batch->compact_rows ?
+                                     batch->instance_counts : NULL;
+   const uint64_t *vb_table = batch->compact_rows ? batch->vb_bases : NULL;
+   const struct cp_rect *scissors = batch->compact_rows ?
+                                    batch->scissors : NULL;
+
+   assert(batch_draws > 0);
+   cp_stage_draw_state_legacy(cp, &batch->state, &batch->scope,
+                              &batch->scissors[batch_draws - 1]);
    struct cp_device *screen = cp->screen;
-   const struct cp_fb_desc *fb = &cp->fb;
+   const struct cp_fb_desc *fb = &batch->scope.fb;
 
    /*
     * The fragment stage's per-draw uniform bindings.
@@ -4345,9 +4355,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
        * at cp_pass_finish(). */
       if (cp->pass.appending) {
          cp_pass_record_segment(cp, &aa, &rast_queues, rast_num_triangles,
-                                num_triangles, info, drawid_offset,
-                                batch_draws, draws, instance_counts, vs_ubo_table,
-                                fs_ubo_table, draw_ids, vb_table, scissors);
+                                num_triangles, batch);
          return;
       }
 
@@ -4711,10 +4719,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
           cp_debug->tiled_opaque) {
          rast_queues.mode = CP_QUEUE_FILL;
          cp_pass_record_segment(cp, &rast_args, &rast_queues,
-                                rast_num_triangles, num_triangles, info,
-                                drawid_offset, batch_draws, draws,
-                                instance_counts, vs_ubo_table, fs_ubo_table,
-                                draw_ids, vb_table, scissors);
+                                rast_num_triangles, num_triangles, batch);
          return;
       }
 
@@ -4779,10 +4784,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
 
       if (cp->pass.appending && cp->pass.opaque) {
          cp_pass_record_segment(cp, &rast_args, &rast_queues,
-                                rast_num_triangles, num_triangles, info,
-                                drawid_offset, batch_draws, draws,
-                                instance_counts, vs_ubo_table, fs_ubo_table, draw_ids,
-                                vb_table, scissors);
+                                rast_num_triangles, num_triangles, batch);
          return;
       }
 
@@ -5154,6 +5156,7 @@ cp_batch_begin_packet(struct cp_context *cp,
    cp->batch.ndraws = 0;
    cp->batch.tris = 0;
    cp->batch.pending = true;
+   cp->batch.compact_rows = true;
    cp->batch.blended = blended;
 }
 
@@ -5407,19 +5410,6 @@ cp_pass_live_restore(struct cp_context *cp, const struct cp_pass_live *lv)
    cp->fs_batch = lv->fs_batch;
 }
 
-static void
-cp_pass_seg_restore(struct cp_context *cp, const struct cp_pass_seg *sg)
-{
-   cp->vs_shader = sg->vs;
-   cp->fs_shader = sg->fs;
-   memcpy(cp->velem, sg->velem, sizeof(sg->velem));
-   memcpy(cp->vb_base, sg->vb_base, sizeof(sg->vb_base));
-   cp->num_vertex_buffers = sg->num_vertex_buffers;
-   cp->num_vertex_elements = sg->num_vertex_elements;
-   cp->vertex_stride = sg->vertex_stride;
-   cp->num_vs_ubos = sg->num_vs_ubos;
-   cp->num_fs_ubos = sg->num_fs_ubos;
-}
 
 /* The episode could not deliver; render every segment the classic way, in
  * submission order, from its snapshot. Rasterization is idempotent — the
@@ -5436,10 +5426,7 @@ cp_pass_fallback(struct cp_context *cp, struct cp_pass_seg *segs,
    cp_pass_live_save(cp, &lv);
    for (unsigned s = 0; s < nsegs; s++) {
       struct cp_pass_seg *sg = &segs[s];
-      cp_pass_seg_restore(cp, sg);
-      cp_draw_execute(cp, &sg->info, sg->drawid_offset, sg->draws, 1,
-                      sg->ndraws, sg->vs_ubos, sg->fs_ubos, sg->draw_ids,
-                      sg->instance_counts, sg->vb_bases, sg->scissors);
+      cp_draw_execute_batch(cp, &sg->batch);
    }
    cp_pass_live_restore(cp, &lv);
 }
@@ -5613,12 +5600,13 @@ cp_opaque_finish(struct cp_context *cp)
       if (!cp_debug->no_seg_merge) {
          for (unsigned g = 0; g < ngroups; g++) {
             struct cp_pass_seg *first = &segs[group_first[g]];
-            if (first->vs == segs[s].vs && first->fs == segs[s].fs &&
-                first->num_fs_ubos == segs[s].num_fs_ubos &&
-                first->info.mode == segs[s].info.mode &&
-                first->ndraws == segs[s].ndraws &&
-                !memcmp(first->fs_ubos, segs[s].fs_ubos,
-                        (size_t)first->ndraws * CP_ARG_UBO_STRIDE *
+            if (first->batch.state.vs == segs[s].batch.state.vs &&
+                first->batch.state.fs == segs[s].batch.state.fs &&
+                first->batch.state.num_fs_ubos == segs[s].batch.state.num_fs_ubos &&
+                first->batch.info.mode == segs[s].batch.info.mode &&
+                first->batch.ndraws == segs[s].batch.ndraws &&
+                !memcmp(first->batch.fs_ubos, segs[s].batch.fs_ubos,
+                        (size_t)first->batch.ndraws * CP_ARG_UBO_STRIDE *
                            sizeof(uint64_t))) {
                group = g;
                break;
@@ -5654,13 +5642,13 @@ cp_opaque_finish(struct cp_context *cp)
          ranges[nranges++] = (struct cp_seg_range) {
             .positions = seg->rast.positions,
             .draw_slices = seg->slices_dev,
-            .num_draw_slices = seg->ndraws,
+            .num_draw_slices = seg->batch.ndraws,
             .prim_base = seg->prim_base,
             .prim_end = seg->prim_base + seg->prim_slots,
             .row_base = group_rows,
             .prim_shift = seg->prim_shift,
          };
-         group_rows += seg->ndraws;
+         group_rows += seg->batch.ndraws;
       }
       group_range_count[g] = nranges - group_range_base[g];
    }
@@ -5691,19 +5679,20 @@ cp_opaque_finish(struct cp_context *cp)
          struct cp_pass_seg *member = &segs[s];
          memcpy(cp->pass_group_ubos +
                    (size_t)group_rows * CP_ARG_UBO_STRIDE,
-                member->fs_ubos,
-                (size_t)member->ndraws * CP_ARG_UBO_STRIDE *
+                member->batch.fs_ubos,
+                (size_t)member->batch.ndraws * CP_ARG_UBO_STRIDE *
                    sizeof(uint64_t));
-         group_rows += member->ndraws;
+         group_rows += member->batch.ndraws;
       }
       cp->scratch.used = shade_mark;
       cp->dscratch.used = shade_dmark;
-      cp_pass_seg_restore(cp, seg);
+      cp_stage_draw_state_legacy(cp, &seg->batch.state, &seg->batch.scope,
+                                 &seg->batch.scissors[seg->batch.ndraws - 1]);
       cp->fs_batch.ubos = cp->pass_group_ubos;
       cp->fs_batch.ndraws = group_rows;
       cp->fs_batch.slices = seg->slices_dev;
       cp->fs_batch.prim_shift = seg->prim_shift;
-      cp_shade_fragments(cp, &seg->info, cp->visbuf, seg->rast.positions,
+      cp_shade_fragments(cp, &seg->batch.info, cp->visbuf, seg->rast.positions,
                          seg->rast.positions, seg->num_triangles, w, h,
                          color_data, seg->rast.vp_scale_x,
                          seg->rast.vp_scale_y, seg->rast.vp_trans_x,
@@ -5846,7 +5835,7 @@ cp_tile_census_common(struct cp_context *cp, struct cp_pass_seg *segs,
    for (unsigned s = 0; s < nsegs; s++) {
       bases[s] = segs[s].prim_base;
       seqs[s] = cp->tile_census_seq + s;
-      unsigned i = cp_tile_census_shader_index(cp, segs[s].fs);
+      unsigned i = cp_tile_census_shader_index(cp, segs[s].batch.state.fs);
       shaders[s] = (uint8_t)i;
       if (i + 1 > nshaders)
          nshaders = i + 1;
@@ -5879,7 +5868,7 @@ cp_tile_census_common(struct cp_context *cp, struct cp_pass_seg *segs,
    cp->tile_census_marks++;
    cp->tile_census_shaders += cp->tile_census_nfs;
    for (unsigned s = 0; s < nsegs; s++)
-      cp->tile_census_marked_draws += segs[s].ndraws;
+      cp->tile_census_marked_draws += segs[s].batch.ndraws;
 
    /* How large the bin itself would be, which the shaded counts cannot say. */
    if (cp->screen->kernels.tile_census_refs) {
@@ -6137,9 +6126,10 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       for (unsigned i = 0; i < ngroups && !cp_debug->no_seg_merge &&
                            !cp_debug->unsafe_no_overflow; i++) {
          struct cp_pass_seg *first = &segs[group_first[i]];
-         if (first->vs == segs[s].vs && first->fs == segs[s].fs &&
-             first->num_fs_ubos == segs[s].num_fs_ubos &&
-             first->info.mode == segs[s].info.mode) {
+         if (first->batch.state.vs == segs[s].batch.state.vs &&
+             first->batch.state.fs == segs[s].batch.state.fs &&
+             first->batch.state.num_fs_ubos == segs[s].batch.state.num_fs_ubos &&
+             first->batch.info.mode == segs[s].batch.info.mode) {
             group = i;
             break;
          }
@@ -6226,7 +6216,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
    bool shaded = true;
    for (unsigned group = 0; group < ngroups && shaded; group++) {
       struct cp_pass_seg *first = &segs[group_first[group]];
-      bool need_rows = first->fs->reads_const_bufs;
+      bool need_rows = first->batch.state.fs->reads_const_bufs;
       if (need_rows && !cp->pass_group_ubos) {
          cp->pass_group_ubos =
             malloc((size_t)CP_PASS_MAX_SEGS * CP_MAX_BATCH_DRAWS *
@@ -6246,7 +6236,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          ranges[nranges++] = (struct cp_seg_range) {
             .positions = seg->rast.positions,
             .draw_slices = seg->slices_dev,
-            .num_draw_slices = seg->ndraws,
+            .num_draw_slices = seg->batch.ndraws,
             .prim_base = seg->prim_base,
             .prim_end = seg->prim_base + seg->prim_slots,
             .row_base = rows,
@@ -6254,9 +6244,9 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          };
          if (need_rows)
             memcpy(cp->pass_group_ubos + (size_t)rows * CP_ARG_UBO_STRIDE,
-                   seg->fs_ubos,
-                   (size_t)seg->ndraws * CP_ARG_UBO_STRIDE * sizeof(uint64_t));
-         rows += seg->ndraws;
+                   seg->batch.fs_ubos,
+                   (size_t)seg->batch.ndraws * CP_ARG_UBO_STRIDE * sizeof(uint64_t));
+         rows += seg->batch.ndraws;
       }
       CUdeviceptr ranges_dev =
          cp_upload(cp, ranges, (size_t)nranges * sizeof(ranges[0]));
@@ -6265,10 +6255,10 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          break;
       }
 
-      cp->vs_shader = first->vs;
-      cp->fs_shader = first->fs;
-      cp->num_fs_ubos = first->num_fs_ubos;
-      cp->fs_batch.ubos = need_rows ? cp->pass_group_ubos : first->fs_ubos;
+      cp->vs_shader = first->batch.state.vs;
+      cp->fs_shader = first->batch.state.fs;
+      cp->num_fs_ubos = first->batch.state.num_fs_ubos;
+      cp->fs_batch.ubos = need_rows ? cp->pass_group_ubos : first->batch.fs_ubos;
       cp->fs_batch.ndraws = rows;
       cp->fs_batch.slices = first->slices_dev;
       cp->fs_batch.prim_shift = first->prim_shift;
@@ -6282,7 +6272,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       };
       float ti, ts, tc;
       shaded = cp_abuf_shade(
-         cp, &first->info, ab, first->rast.positions, first->rast.positions,
+         cp, &first->batch.info, ab, first->rast.positions, first->rast.positions,
          w, h, first->rast.vp_scale_x, first->rast.vp_scale_y,
          first->rast.vp_trans_x, first->rast.vp_trans_y,
          (uint32_t)quad_bound, 0, false, NULL, false, &ti, &ts, &tc, &shade);
@@ -6591,9 +6581,10 @@ cp_pass_finish(struct cp_context *cp)
       if (!cp_debug->no_seg_merge) {
          for (unsigned i = 0; i < ngroups; i++) {
             struct cp_pass_seg *f = &segs[group_first[i]];
-            if (f->vs == segs[s].vs && f->fs == segs[s].fs &&
-                f->num_fs_ubos == segs[s].num_fs_ubos &&
-                f->info.mode == segs[s].info.mode) {
+            if (f->batch.state.vs == segs[s].batch.state.vs &&
+                f->batch.state.fs == segs[s].batch.state.fs &&
+                f->batch.state.num_fs_ubos == segs[s].batch.state.num_fs_ubos &&
+                f->batch.info.mode == segs[s].batch.info.mode) {
                g = i;
                break;
             }
@@ -6660,17 +6651,17 @@ cp_pass_finish(struct cp_context *cp)
          members += seg_group[s] == g;
       if (cp->seg_streams[0])
          cp->stream = cp_pass_seg_stream(cp, g);
-      cp->vs_shader = sg->vs;
-      cp->fs_shader = sg->fs;
-      cp->num_fs_ubos = sg->num_fs_ubos;
+      cp->vs_shader = sg->batch.state.vs;
+      cp->fs_shader = sg->batch.state.fs;
+      cp->num_fs_ubos = sg->batch.state.num_fs_ubos;
       struct cp_abuf_seg_shade ss = {
          .quad_list = grouped,
          .quad_list_base = group_base[g],
          .prim_base = sg->prim_base,
       };
       if (members == 1) {
-         cp->fs_batch.ubos = sg->fs_ubos;
-         cp->fs_batch.ndraws = sg->ndraws;
+         cp->fs_batch.ubos = sg->batch.fs_ubos;
+         cp->fs_batch.ndraws = sg->batch.ndraws;
          cp->fs_batch.slices = sg->slices_dev;
          cp->fs_batch.prim_shift = sg->prim_shift;
       } else {
@@ -6684,7 +6675,7 @@ cp_pass_finish(struct cp_context *cp)
          struct cp_seg_range ranges[CP_PASS_MAX_SEGS];
          unsigned nr = 0;
          uint32_t rows = 0;
-         bool need_rows = sg->fs->reads_const_bufs;
+         bool need_rows = sg->batch.state.fs->reads_const_bufs;
          if (need_rows && !cp->pass_group_ubos) {
             cp->pass_group_ubos =
                malloc((size_t)CP_PASS_MAX_SEGS * CP_MAX_BATCH_DRAWS *
@@ -6701,7 +6692,7 @@ cp_pass_finish(struct cp_context *cp)
             ranges[nr++] = (struct cp_seg_range) {
                .positions = m->rast.positions,
                .draw_slices = m->slices_dev,
-               .num_draw_slices = m->ndraws,
+               .num_draw_slices = m->batch.ndraws,
                .prim_base = m->prim_base,
                .prim_end = m->prim_base + m->prim_slots,
                .row_base = rows,
@@ -6709,10 +6700,10 @@ cp_pass_finish(struct cp_context *cp)
             };
             if (need_rows)
                memcpy(cp->pass_group_ubos + (size_t)rows * CP_ARG_UBO_STRIDE,
-                      m->fs_ubos,
-                      (size_t)m->ndraws * CP_ARG_UBO_STRIDE *
+                      m->batch.fs_ubos,
+                      (size_t)m->batch.ndraws * CP_ARG_UBO_STRIDE *
                       sizeof(uint64_t));
-            rows += m->ndraws;
+            rows += m->batch.ndraws;
          }
          CUdeviceptr ranges_dev =
             cp_upload(cp, ranges, (size_t)nr * sizeof(ranges[0]));
@@ -6725,13 +6716,13 @@ cp_pass_finish(struct cp_context *cp)
          /* The launch-wide table and slices are placeholders the ranges
           * override per quad; ndraws is the concatenated row count, which
           * is what enables the batch-rows path and sizes the upload. */
-         cp->fs_batch.ubos = need_rows ? cp->pass_group_ubos : sg->fs_ubos;
+         cp->fs_batch.ubos = need_rows ? cp->pass_group_ubos : sg->batch.fs_ubos;
          cp->fs_batch.ndraws = rows;
          cp->fs_batch.slices = sg->slices_dev;
          cp->fs_batch.prim_shift = sg->prim_shift;
       }
       float ti, ts, tc;
-      if (!cp_abuf_shade(cp, &sg->info, ab, sg->rast.positions,
+      if (!cp_abuf_shade(cp, &sg->batch.info, ab, sg->rast.positions,
                          sg->rast.positions, w, h,
                          sg->rast.vp_scale_x, sg->rast.vp_scale_y,
                          sg->rast.vp_trans_x, sg->rast.vp_trans_y,
@@ -6810,18 +6801,10 @@ cp_pass_record_segment(struct cp_context *cp,
                        const struct cp_rasterize_args *aa,
                        const struct cp_rast_queues *queues,
                        unsigned rast_num_triangles, unsigned num_triangles,
-                       const struct cp_draw_call *info,
-                       unsigned drawid_offset, unsigned ndraws,
-                       const struct cp_draw_range *draws,
-                       const uint32_t *instance_counts,
-                       const uint64_t *vs_ubo_table,
-                       const uint64_t *fs_ubo_table,
-                       const uint32_t *draw_ids, const uint64_t *vb_table,
-                       const struct cp_rect *scissors)
+                       const struct cp_draw_batch *batch)
 {
    struct cp_pass_seg *sg = &cp->pass_segs[cp->pass.nsegs];
 
-   memset(sg, 0, sizeof(*sg));
    sg->rast = *aa;
    sg->queues = *queues;
    sg->rast_num_triangles = rast_num_triangles;
@@ -6829,39 +6812,8 @@ cp_pass_record_segment(struct cp_context *cp,
    sg->prim_base = cp->pass.next_prim;
    sg->prim_slots = rast_num_triangles;
    sg->prim_shift = cp->fs_batch.prim_shift;
-   sg->vs = cp->vs_shader;
-   sg->fs = cp->fs_shader;
-   sg->info = *info;
-   sg->ndraws = ndraws;
-   sg->drawid_offset = drawid_offset;
+   sg->batch = *batch;
    sg->slices_dev = cp->fs_batch.slices;
-   memcpy(sg->draws, draws, (size_t)ndraws * sizeof(draws[0]));
-   if (instance_counts)
-      memcpy(sg->instance_counts, instance_counts,
-             (size_t)ndraws * sizeof(instance_counts[0]));
-   else
-      for (unsigned d = 0; d < ndraws; d++)
-         sg->instance_counts[d] = info->instance_count;
-   if (draw_ids)
-      memcpy(sg->draw_ids, draw_ids, (size_t)ndraws * sizeof(draw_ids[0]));
-   if (scissors)
-      memcpy(sg->scissors, scissors, (size_t)ndraws * sizeof(scissors[0]));
-   if (vs_ubo_table)
-      memcpy(sg->vs_ubos, vs_ubo_table,
-             (size_t)ndraws * CP_ARG_UBO_STRIDE * sizeof(uint64_t));
-   if (fs_ubo_table)
-      memcpy(sg->fs_ubos, fs_ubo_table,
-             (size_t)ndraws * CP_ARG_UBO_STRIDE * sizeof(uint64_t));
-   if (vb_table)
-      memcpy(sg->vb_bases, vb_table,
-             (size_t)ndraws * CP_VB_TABLE_STRIDE * sizeof(uint64_t));
-   memcpy(sg->velem, cp->velem, sizeof(sg->velem));
-   memcpy(sg->vb_base, cp->vb_base, sizeof(sg->vb_base));
-   sg->num_vertex_buffers = cp->num_vertex_buffers;
-   sg->num_vertex_elements = cp->num_vertex_elements;
-   sg->vertex_stride = cp->vertex_stride;
-   sg->num_vs_ubos = cp->num_vs_ubos;
-   sg->num_fs_ubos = cp->num_fs_ubos;
 
    if (cp->pass.nsegs == 0) {
       cp->pass.w = aa->width;
@@ -6927,11 +6879,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
                                 cp->batch.instance_counts)
           < cp_abuf_min_tris()) {
       cp_pass_finish(cp);
-      cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
-                      cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
-                      cp->batch.fs_ubos, cp->batch.draw_ids,
-                      cp->batch.instance_counts, cp->batch.vb_bases,
-                      cp->batch.scissors);
+      cp_draw_execute_batch(cp, &cp->batch);
       return;
    }
 
@@ -6944,11 +6892,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
       unsigned w = fb->width, h = fb->height;
       if (!w || !h || !cp_abuf_setup(ab, w, h)) {
          cp_pass_finish(cp);
-         cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
-                         cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
-                         cp->batch.fs_ubos, cp->batch.draw_ids,
-                         cp->batch.instance_counts, cp->batch.vb_bases,
-                         cp->batch.scissors);
+         cp_draw_execute_batch(cp, &cp->batch);
          return;
       }
       cuMemsetD32Async(ab->counts, 0, (size_t)w * h, cp->stream);
@@ -6970,11 +6914,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
 
    cp->pass.appending = true;
    cp->pass.append_failed = false;
-   cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
-                   cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
-                   cp->batch.fs_ubos, cp->batch.draw_ids,
-                   cp->batch.instance_counts, cp->batch.vb_bases,
-                   cp->batch.scissors);
+   cp_draw_execute_batch(cp, &cp->batch);
    cp->pass.appending = false;
    cp->stream = saved_stream;
    cp->cur_qset = saved_qset;
@@ -6987,11 +6927,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
        * every side stream so it always does. */
       cp_pass_join(cp, CP_PASS_STREAMS);
       cp_pass_finish(cp);
-      cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
-                      cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
-                      cp->batch.fs_ubos, cp->batch.draw_ids,
-                      cp->batch.instance_counts, cp->batch.vb_bases,
-                      cp->batch.scissors);
+      cp_draw_execute_batch(cp, &cp->batch);
    }
 }
 
@@ -7022,11 +6958,7 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    unsigned before = cp->pass.nsegs;
    cp->pass.appending = true;
    cp->pass.append_failed = false;
-   cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
-                   cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
-                   cp->batch.fs_ubos, cp->batch.draw_ids,
-                   cp->batch.instance_counts, cp->batch.vb_bases,
-                   cp->batch.scissors);
+   cp_draw_execute_batch(cp, &cp->batch);
    cp->pass.appending = false;
 
    if (cp->pass.append_failed || cp->pass.nsegs == before) {
@@ -7034,11 +6966,7 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
          fprintf(stderr, "episode-cut: append failed=%d nsegs %u->%u\n",
                  (int)cp->pass.append_failed, before, cp->pass.nsegs);
       cp_pass_finish(cp);
-      cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
-                      cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
-                      cp->batch.fs_ubos, cp->batch.draw_ids,
-                      cp->batch.instance_counts, cp->batch.vb_bases,
-                      cp->batch.scissors);
+      cp_draw_execute_batch(cp, &cp->batch);
    }
 }
 
@@ -7071,9 +6999,8 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
    /* Cleared first: cp_draw_execute() runs a whole frame's worth of driver
     * code and nothing in it may see a batch that is already on its way. */
    cp->batch.pending = false;
-   cp->batch.ndraws = 0;
-   cp->batch.tris = 0;
-   cp->batch.blended = false;
+   /* Keep the immutable payload intact while append/execute/fallback consumes
+    * it. cp_batch_begin_packet overwrites counters for the next batch. */
 
    /* Execution consumes the immutable state captured when the batch began,
     * not whichever frontend draw happened to touch the live context last. */
@@ -7111,11 +7038,7 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
    /* Whatever the episode holds was submitted before these draws. */
    cp_pass_finish(cp);
    cp->tile_census_solo += ndraws;
-   cp_draw_execute(cp, &cp->batch.info, cp->batch.drawid_offset,
-                   cp->batch.draws, 1, ndraws, cp->batch.vs_ubos,
-                   cp->batch.fs_ubos, cp->batch.draw_ids,
-                   cp->batch.instance_counts, cp->batch.vb_bases,
-                   cp->batch.scissors);
+   cp_draw_execute_batch(cp, &cp->batch);
 }
 
 void

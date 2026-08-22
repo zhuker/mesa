@@ -139,6 +139,7 @@ struct cp_draw_batch {
    struct cp_draw_state state;
    struct cp_render_scope scope;
       bool pending;
+      bool compact_rows;
       unsigned ndraws;
       /* Triangles over the whole batch, which is what the clipper's output
        * buffer is sized from and so what CP_MAX_BATCH_TRIS caps. */
@@ -215,30 +216,9 @@ struct cp_context {
       uint32_t prim_base;           /* first episode-global primitive slot */
       uint32_t prim_slots;          /* slots this segment occupies */
       unsigned prim_shift;
-      /* Shading state. */
-      struct cp_shader_binary *vs, *fs;
-      struct cp_draw_call info;
-      unsigned ndraws;
-      unsigned drawid_offset;
+      /* Complete immutable shading/fallback snapshot. */
+      struct cp_draw_batch batch;
       CUdeviceptr slices_dev;
-      /* The batch snapshot, both for the per-segment shade (fs rows) and for
-       * re-executing the segment classically when the episode falls back. */
-      struct cp_draw_range draws[CP_MAX_BATCH_DRAWS];
-      uint32_t instance_counts[CP_MAX_BATCH_DRAWS];
-      uint32_t draw_ids[CP_MAX_BATCH_DRAWS];
-      struct cp_rect scissors[CP_MAX_BATCH_DRAWS];
-      uint64_t vs_ubos[CP_MAX_BATCH_DRAWS * CP_ARG_UBO_STRIDE];
-      uint64_t fs_ubos[CP_MAX_BATCH_DRAWS * CP_ARG_UBO_STRIDE];
-      uint64_t vb_bases[CP_MAX_BATCH_DRAWS * CP_VB_TABLE_STRIDE];
-      /* Live state the fallback restores before re-executing: the resolved
-       * vertex input, which is what cp_draw_execute reads. The Gallium array
-       * is deliberately not saved — nothing in a re-execution looks at it,
-       * and leaving the live copy alone keeps the next batch key correct. */
-      struct cp_vertex_elem velem[16];
-      uint64_t vb_base[16];
-      unsigned num_vertex_buffers;
-      unsigned num_vertex_elements, vertex_stride;
-      unsigned num_vs_ubos, num_fs_ubos;
    } *pass_segs;                    /* [CP_PASS_MAX_SEGS], at context create */
 
    struct {
@@ -851,7 +831,8 @@ bool cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info, struc
  */
 
 
-void cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info, unsigned drawid_offset, const struct cp_draw_range *draws, unsigned num_draws, unsigned batch_draws, const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table, const uint32_t *draw_ids, const uint32_t *instance_counts, const uint64_t *vb_table, const struct cp_rect *scissors);
+void cp_draw_execute_batch(struct cp_context *cp,
+                           const struct cp_draw_batch *batch);
 void cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info, CUdeviceptr visbuf, CUdeviceptr positions, CUdeviceptr vs_output_buf, unsigned num_triangles, unsigned w, unsigned h, void *color_data, float vp_scale_x, float vp_scale_y, float vp_trans_x, float vp_trans_y, CUdeviceptr reject, CUdeviceptr resolved, unsigned reject_pass, CUdeviceptr seg_ranges, unsigned num_seg_ranges);
 
 
@@ -868,7 +849,12 @@ void cp_batch_begin_packet(struct cp_context *cp,
 void cp_batch_record_packet(struct cp_context *cp,
                             const struct cp_draw_packet *packet,
                             unsigned tris);
-void cp_pass_record_segment(struct cp_context *cp, const struct cp_rasterize_args *aa, const struct cp_rast_queues *queues, unsigned rast_num_triangles, unsigned num_triangles, const struct cp_draw_call *info, unsigned drawid_offset, unsigned ndraws, const struct cp_draw_range *draws, const uint32_t *instance_counts, const uint64_t *vs_ubo_table, const uint64_t *fs_ubo_table, const uint32_t *draw_ids, const uint64_t *vb_table, const struct cp_rect *scissors);
+void cp_pass_record_segment(struct cp_context *cp,
+                            const struct cp_rasterize_args *aa,
+                            const struct cp_rast_queues *queues,
+                            unsigned rast_num_triangles,
+                            unsigned num_triangles,
+                            const struct cp_draw_batch *batch);
 
 void cp_context_set_framebuffer(struct cp_context *cp,
                                 const struct cp_fb_desc *fb,
