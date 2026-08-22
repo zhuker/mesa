@@ -11,6 +11,8 @@ struct cp_depth_attachment {
    uint64_t data;
    uint32_t row_stride;
    uint32_t sample_stride;
+   uint32_t pixel_stride;
+   uint32_t format;
    uint32_t load;
    uint32_t store;
 };

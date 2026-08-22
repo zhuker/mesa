@@ -1193,10 +1193,19 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
 
+   const VkRenderingAttachmentInfo *stencil =
+      pRenderingInfo->pStencilAttachment;
+   bool unsupported_stencil = stencil && stencil->imageView &&
+      (!pRenderingInfo->pDepthAttachment ||
+       pRenderingInfo->pDepthAttachment->imageView != stencil->imageView ||
+       stencil->resolveMode != VK_RESOLVE_MODE_NONE);
    if (pRenderingInfo->colorAttachmentCount > 1 ||
        pRenderingInfo->layerCount > 1 || pRenderingInfo->viewMask != 0 ||
-       (pRenderingInfo->pStencilAttachment &&
-        pRenderingInfo->pStencilAttachment->imageView != VK_NULL_HANDLE)) {
+       unsupported_stencil) {
+      fprintf(stderr, "cudapipe: unsupported rendering colors=%u layers=%u "
+              "viewMask=%u stencil=%d\n", pRenderingInfo->colorAttachmentCount,
+              pRenderingInfo->layerCount, pRenderingInfo->viewMask,
+              unsupported_stencil);
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -1256,12 +1265,18 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    if (dat && dat->imageView) {
       if (dat->resolveMode != VK_RESOLVE_MODE_NONE) {
+         fprintf(stderr, "cudapipe: unsupported depth resolve %u\n",
+                 dat->resolveMode);
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
       VK_FROM_HANDLE(cpvk_image_view, view, dat->imageView);
       if (!view || !view->image || !view->image->mem ||
-          view->vk.format != VK_FORMAT_D32_SFLOAT) {
+          (view->vk.format != VK_FORMAT_D32_SFLOAT &&
+           view->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT &&
+           view->vk.format != VK_FORMAT_D24_UNORM_S8_UINT)) {
+         fprintf(stderr, "cudapipe: unsupported depth attachment format %u\n",
+                 view ? view->vk.format : 0);
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
@@ -1281,6 +1296,10 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                  (uint64_t)view->vk.base_array_layer * dimg->level_size[level],
          .row_stride = dimg->row_stride[level],
          .sample_stride = dimg->sample_stride,
+         .pixel_stride = util_format_get_blocksize(
+            vk_format_to_pipe_format(view->vk.format)),
+         .format = view->vk.format == VK_FORMAT_D24_UNORM_S8_UINT ? 2 :
+                   view->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT ? 1 : 0,
          .load = dat->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
                  (store && !full_area),
          .store = store,
@@ -1291,6 +1310,8 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
 
    if (cimg && dimg && cimg->vk.samples != dimg->vk.samples) {
+      fprintf(stderr, "cudapipe: attachment sample mismatch %u/%u\n",
+              cimg->vk.samples, dimg->vk.samples);
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -2514,8 +2535,7 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
       }
 
       bool scaling = (sw != dw || sh != dh);
-      if (scaling && (!cpvk_is_blit_rgba8(src->vk.format) ||
-                      !cpvk_is_blit_rgba8(dst->vk.format))) {
+      if (scaling && (src->color < 0 || dst->color < 0)) {
          fprintf(stderr, "cudapipe: vkCmdBlitImage scales unsupported formats "
                  "%u -> %u\n", src->vk.format, dst->vk.format);
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);

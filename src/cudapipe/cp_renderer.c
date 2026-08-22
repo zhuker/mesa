@@ -1649,6 +1649,8 @@ cp_depth_attachment_xfer(struct cp_context *cp,
       .height = scope->fb.height,
       .row_stride = depth->row_stride,
       .sample_stride = depth->sample_stride,
+      .pixel_stride = depth->pixel_stride,
+      .format = depth->format,
       .samples = MAX2(scope->attachment_samples, 1u),
    };
    cuCtxSetCurrent(cp->screen->cuda_ctx);

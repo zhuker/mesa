@@ -65,9 +65,17 @@ cp_depth_attachment_load(struct cp_depth_attachment_args args)
       return;
    const uint8_t *src = (const uint8_t *)(uintptr_t)args.image +
                         (uint64_t)sample * args.sample_stride +
-                        (uint64_t)y * args.row_stride + x * 4;
+                        (uint64_t)y * args.row_stride +
+                        (uint64_t)x * args.pixel_stride;
    uint32_t *dst = (uint32_t *)(uintptr_t)args.depthbuf;
-   uint32_t bits = *(const uint32_t *)src;
+   uint32_t packed = *(const uint32_t *)src;
+   uint32_t bits;
+   if (args.format == 2) {
+      float depth = (float)(packed & 0x00ffffffu) * (1.0f / 16777215.0f);
+      bits = __float_as_uint(depth);
+   } else {
+      bits = packed;
+   }
    dst[((uint64_t)sample * args.height + y) * args.width + x] =
       bits ^ 0x80000000u;
 }
@@ -83,7 +91,17 @@ cp_depth_attachment_store(struct cp_depth_attachment_args args)
    const uint32_t *src = (const uint32_t *)(uintptr_t)args.depthbuf;
    uint8_t *dst = (uint8_t *)(uintptr_t)args.image +
                   (uint64_t)sample * args.sample_stride +
-                  (uint64_t)y * args.row_stride + x * 4;
-   *(uint32_t *)dst =
+                  (uint64_t)y * args.row_stride +
+                  (uint64_t)x * args.pixel_stride;
+   uint32_t bits =
       src[((uint64_t)sample * args.height + y) * args.width + x] ^ 0x80000000u;
+   if (args.format == 2) {
+      float depth = __uint_as_float(bits);
+      depth = depth < 0.0f ? 0.0f : (depth > 1.0f ? 1.0f : depth);
+      uint32_t old = *(uint32_t *)dst;
+      uint32_t d24 = __float2uint_rn(depth * 16777215.0f);
+      *(uint32_t *)dst = (old & 0xff000000u) | (d24 & 0x00ffffffu);
+   } else {
+      *(uint32_t *)dst = bits;
+   }
 }

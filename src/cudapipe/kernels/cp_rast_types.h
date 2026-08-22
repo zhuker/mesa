@@ -46,6 +46,8 @@ struct cp_depth_attachment_args {
    uint32_t height;
    uint32_t row_stride;
    uint32_t sample_stride;
+   uint32_t pixel_stride;
+   uint32_t format;
    uint32_t samples;
 };
 

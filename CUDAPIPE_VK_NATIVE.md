@@ -104,8 +104,8 @@ render-scope indices resolve to the primary's active scope.
 
 Dynamic rendering is translated into immutable `cp_render_scope` values;
 recorded draws carry only a scope index. A scope resolves the exact colour and
-D32 depth view subresources, sample layout and depth load/store contract. Depth
-LOAD converts D32 image values into the rasterizer's sortable representation;
+depth view subresources, sample layout and depth load/store contract. Depth
+LOAD converts D32F or D24 values into the rasterizer's sortable representation;
 STORE converts them back on the ordered renderer stream, and partial render-area
 clears preserve pixels outside the area. Render-pass clears, end markers and
 end-of-pass resolves are explicit operations, and end markers flush
@@ -355,6 +355,14 @@ pass.
   processes retrieve PTX by source, embedded header, options, SM and
   NVRTC-version key.
 
+The completed architecture series at this handoff builds cleanly and passes all 34 standalone native programs.
+The six batch reproducers are byte-identical in default, no-batch,
+`CUDAPIPE_BATCH_MAX=1`, no-pass and forced-fallback modes. Its 600-frame
+18-sample sweep sums to **31.96 ms** hot means and **41.31 s** wall time, versus
+32.43 ms / 43.28 s at the performance checkpoint. The DSO SHA-256 for that
+validation build is
+`03a4ee72349fa5e69d8efbd0e4975468c3925abc4fa4997bd6bda2fad242473a`.
+
 ### GFXReconstruct gate — external references only
 
 **For replay correctness, compare against llvmpipe or the real NVIDIA driver.
@@ -446,6 +454,15 @@ src/cudapipe/kernels/cp_rasterize.cu
 Unrelated root documents, scripts and logs remain untracked intentionally;
 continue staging explicit paths rather than using `git add -A`.
 
+The post-architecture CUDA-event repetitions complete without replay errors:
+Crossroads medians are **7.22, 7.24 and 7.26 ms**; old-capture medians are
+**24.75, 24.77 and 24.78 ms**. Fresh external sentinel extraction reproduces
+the established llvmpipe ranges exactly: Crossroads mean RGB 1.0467–1.6055,
+at most 6,319 pixels over 32 and 74 over 96; old mean 0.0206–0.4922, at most
+1,815 over 32 and 45 over 96. The 60-frame NVIDIA sample gate also retains the
+standing `gltfscenerendering` exception at 15,694 frame-0 / 59,925 worst; every
+other referenced sample passes and `renderheadless` still has no reference.
+
 ## Known issues and deliberate limits
 
 1. **The validated commits are selective.** Unrelated documents, scripts and
@@ -528,12 +545,12 @@ continue staging explicit paths rather than using `git add -A`.
     image-view destruction frees its managed texture metadata. Command buffers own descriptor snapshots but do not retain every
     buffer, image, image view or sampler named by an application descriptor;
     those objects must remain valid through execution as Vulkan requires.
-17. **Depth attachment support is deliberately D32-only.** Dynamic rendering
-    now resolves the exact D32 view subresource and models LOAD, CLEAR, STORE,
-    sample planes and partial render areas through ordered device conversion
-    kernels. D32+stencil is no longer advertised. Stencil attachments,
-    multiview, layered draws and depth resolve remain unsupported and are
-    rejected while recording.
+17. **Depth attachment support is deliberately narrow.** Dynamic rendering
+    resolves exact D32F, D32F+S8 and D24+S8 view subresources and models depth
+    LOAD, CLEAR, STORE, sample planes and partial render areas through ordered
+    device conversion kernels. A shared stencil aspect is preserved when the
+    capture does not use stencil testing/writes; stencil rendering, multiview,
+    layered draws and depth resolve remain unsupported and are rejected.
 18. **Application shader caching is still process-local.** The native compile
     path does not consume/serialize application `VkPipelineCache` data and
     reports zero cache/driver UUIDs. Embedded CUDA sources and lazy sampler
@@ -658,7 +675,8 @@ In order:
    the lowered resource ABI, compiler/toolkit version, SM, helper PTX and every
    option; never treat SPIR-V identity alone as sufficient.
 9. **Extend the explicit attachment model deliberately.** D32 load/clear/store
-   persistence now has a focused test. Add depth copy/sample comparisons before
+   persistence has a focused test, and both captures exercise D24/D32+stencil
+   depth persistence. Add depth copy/sample comparisons before
    broadening it, then implement stencil, depth resolve and layered/multiview
    rendering rather than treating transfer-layer support as draw-layer proof.
 10. **Finish robustness and query semantics** where workloads need them rather
