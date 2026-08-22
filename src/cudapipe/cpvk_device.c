@@ -73,6 +73,23 @@ cpvk_get_features(struct vk_features *features)
       .fullDrawIndexUint32 = true,
       .independentBlend = false,
       .fragmentStoresAndAtomics = true,
+      /*
+       * Dynamically indexed descriptor arrays. The lowering resolves a
+       * non-constant array index through vulkan_resource_reindex and the
+       * kernels address the element at run time, which `cpvk_desc_array`
+       * checks against lavapipe and NVIDIA across two sets and two
+       * dispatches; `cpvk_sampler_array` does the same for a combined image
+       * sampler array indexed by a push constant. These were false while the
+       * implementation worked, which is the mirror image of the usual mistake
+       * and costs an application that checks features before using them.
+       *
+       * Storage *image* array dynamic indexing is deliberately still false:
+       * the same lowering would serve it, but nothing here tests it, and an
+       * untested feature bit is the thing this pass exists to remove.
+       */
+      .shaderUniformBufferArrayDynamicIndexing = true,
+      .shaderStorageBufferArrayDynamicIndexing = true,
+      .shaderSampledImageArrayDynamicIndexing = true,
       .vertexPipelineStoresAndAtomics = true,
       .shaderClipDistance = false,
       .samplerAnisotropy = true,
