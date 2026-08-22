@@ -88,14 +88,14 @@ order. Queue submission:
 3. issues draw, compute and transfer operations on the renderer stream in
    recorded order;
 4. flushes any renderer batch; and
-5. synchronizes that stream before returning, then frees overflow arenas and
-   rewinds the scratch/upload bump allocators.
+5. records a CUDA completion event and returns without draining the stream.
 
-The final drain is followed by explicit publication of every submission signal.
-Binary fences and semaphores track signal/reset state and deadline waits.
-Barriers and device events record conservative ordered execution points, while
-completion remains synchronous. Do not remove the drain until sync objects
-carry CUDA-event payloads and arena retirement follows those events.
+A per-device completion worker waits those events in queue order and only then
+publishes submission signals. Binary fences and semaphores therefore track real
+GPU completion, reset state and deadline waits. Scratch/upload generations are
+rewound only when all prior submissions have retired; otherwise the next submit
+appends without reusing in-flight addresses. Barriers and device events remain
+conservative ordered execution points on the same stream.
 
 Secondary command buffers are memcpy-appended to the primary operation stream.
 Their descriptor snapshots are imported into primary-owned arenas, draw and
@@ -474,12 +474,12 @@ continue staging explicit paths rather than using `git add -A`.
    `gltfscenerendering`: 15,695 pixels differ in frame 0 and the worst frame
    has 59,925 against a 25,542-pixel budget. `renderheadless` has only the
    separate Gallium parity artifact, not an independent stored reference.
-7. **Queue completion is still synchronous.** Binary fences and semaphores
-   now have real logical signal/reset state, deadline waits and explicit
-   post-drain queue publication; the focused fresh/reset/zero-time test passes.
-   They do not yet carry a CUDA-event payload, timeline values or asynchronous
-   retirement. Removing the submit drain therefore still requires event-backed
-   completion plus scratch and recorded-object lifetime handling.
+7. **Queue completion is asynchronous but intentionally single-stream.** Each
+   submit records a CUDA event and returns; a per-device worker publishes Vulkan
+   signals after event completion. The fresh/reset/timeout test now includes 64
+   queued fences. Scratch is reclaimed only after the pending queue retires, so
+   continuous unsynchronized submission can temporarily grow its high-water
+   allocation. Timeline semaphores and multi-queue ownership are not exposed.
 8. **Barriers are ordered but do not track layouts/access masks.** Legacy and
    synchronization2 barrier commands now record explicit execution order points
    that flush batches and close pass episodes on the one ordered renderer
@@ -624,14 +624,12 @@ In order:
    source, tests and procedures as a validated workload milestone, not a
    conformance claim. Copy the validated DSO, plans, external references,
    outputs, logs and checksums out of `/tmp` before cleanup or reboot.
-2. **Continue the focused semantic series before asynchronous submission.**
-   Fresh/reset fence status, zero-time waits, binary semaphore ordering and
-   recorded event timing/lifetime and secondary descriptor import now pass.
-   Add draw/copy↔dispatch dependencies in both directions and explicit secondary
-   render-scope inheritance. Preserve the ordered renderer stream and finish
-   retained ownership.
-   Only then should CUDA-event fence retirement and removal of submit drains be
-   considered as one measured change.
+2. **Stress asynchronous completion and retirement.** CUDA-event completion,
+   binary semaphore ordering, 64 queued fences, recorded event lifetime,
+   secondary descriptor import and scope inheritance now pass. Add longer
+   draw/copy↔dispatch dependency and command-pool-reset stress, and bound scratch
+   high-water growth under intentionally unsynchronized submission. Preserve the
+   single ordered renderer stream until a real multi-queue model exists.
 3. **Complete the external image evidence.** Replay the existing Crossroads and
    old-capture `all.json` plans with llvmpipe or NVIDIA and compare by the
    shared manifest. Until then the external result is the 9/10-image sentinel

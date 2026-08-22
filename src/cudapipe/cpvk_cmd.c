@@ -3303,8 +3303,8 @@ cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q)
    uint64_t value = 0;
    if (pool->type == VK_QUERY_TYPE_TIMESTAMP) {
       /* Nanoseconds, which is what timestampPeriod says a tick is. The
-       * stream has reached this point because the ops before it have already
-       * been issued and a submit synchronises before returning. */
+       * host has issued this point after all earlier operations. It remains a
+       * host approximation rather than a GPU timestamp. */
       struct timespec ts;
       clock_gettime(CLOCK_MONOTONIC, &ts);
       value = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;

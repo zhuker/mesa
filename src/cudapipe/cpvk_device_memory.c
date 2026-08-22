@@ -18,6 +18,113 @@
 #include "vk_sync.h"
 #include "vk_util.h"
 
+struct cpvk_pending_submit {
+   struct cpvk_pending_submit *next;
+   CUevent done;
+   uint32_t signal_count;
+   struct vk_sync_signal signals[];
+};
+
+static int
+cpvk_submit_worker(void *data)
+{
+   struct cpvk_device *dev = data;
+   cuCtxSetCurrent(dev->cu_ctx);
+   for (;;) {
+      mtx_lock(&dev->submit_lock);
+      while (!dev->submit_head && !dev->submit_worker_stop)
+         cnd_wait(&dev->submit_changed, &dev->submit_lock);
+      if (!dev->submit_head && dev->submit_worker_stop) {
+         mtx_unlock(&dev->submit_lock);
+         return 0;
+      }
+      struct cpvk_pending_submit *pending = dev->submit_head;
+      mtx_unlock(&dev->submit_lock);
+
+      CUresult status = cuEventSynchronize(pending->done);
+      if (status == CUDA_SUCCESS) {
+         for (uint32_t i = 0; i < pending->signal_count; i++) {
+            VkResult result = vk_sync_signal(&dev->vk,
+                                             pending->signals[i].sync,
+                                             pending->signals[i].signal_value);
+            if (result != VK_SUCCESS)
+               fprintf(stderr, "cudapipe: async sync signal failed: %d\n",
+                       result);
+         }
+      }
+      cuEventDestroy(pending->done);
+
+      mtx_lock(&dev->submit_lock);
+      assert(dev->submit_head == pending);
+      dev->submit_head = pending->next;
+      if (!dev->submit_head)
+         dev->submit_tail = NULL;
+      cnd_broadcast(&dev->submit_changed);
+      mtx_unlock(&dev->submit_lock);
+      free(pending);
+   }
+}
+
+static VkResult
+cpvk_submit_worker_init(struct cpvk_device *dev)
+{
+   if (mtx_init(&dev->submit_lock, mtx_plain) != thrd_success)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   if (cnd_init(&dev->submit_changed) != thrd_success) {
+      mtx_destroy(&dev->submit_lock);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+   if (thrd_create(&dev->submit_thread, cpvk_submit_worker, dev) !=
+       thrd_success) {
+      cnd_destroy(&dev->submit_changed);
+      mtx_destroy(&dev->submit_lock);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+   dev->submit_worker_initialized = true;
+   return VK_SUCCESS;
+}
+
+static void
+cpvk_submit_worker_finish(struct cpvk_device *dev)
+{
+   if (!dev->submit_worker_initialized)
+      return;
+   mtx_lock(&dev->submit_lock);
+   dev->submit_worker_stop = true;
+   cnd_broadcast(&dev->submit_changed);
+   mtx_unlock(&dev->submit_lock);
+   thrd_join(dev->submit_thread, NULL);
+   cnd_destroy(&dev->submit_changed);
+   mtx_destroy(&dev->submit_lock);
+   dev->submit_worker_initialized = false;
+}
+
+static void
+cpvk_submit_wait_pending(struct cpvk_device *dev)
+{
+   if (!dev->submit_worker_initialized)
+      return;
+   mtx_lock(&dev->submit_lock);
+   while (dev->submit_head)
+      cnd_wait(&dev->submit_changed, &dev->submit_lock);
+   mtx_unlock(&dev->submit_lock);
+}
+
+
+static VkResult
+cpvk_submit_abort(struct cpvk_device *dev, VkResult result)
+{
+   cp_batch_flush(&dev->renderer);
+   cuCtxSetCurrent(dev->cu_ctx);
+   cuStreamSynchronize(dev->renderer.stream);
+   cpvk_submit_wait_pending(dev);
+   cp_scratch_reset(&dev->renderer);
+   dev->prev_draw = NULL;
+   dev->prev_scope = NULL;
+   dev->prev_draw_valid = false;
+   return result;
+}
+
 static VkResult
 cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
@@ -31,6 +138,11 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       return result;
 
    cuCtxSetCurrent(dev->cu_ctx);
+   mtx_lock(&dev->submit_lock);
+   bool retired = dev->submit_head == NULL;
+   mtx_unlock(&dev->submit_lock);
+   if (retired)
+      cp_scratch_reset(&dev->renderer);
    dev->renderer.num_host_maps = 0;
 
    for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
@@ -66,12 +178,12 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             if (cuMemcpyHtoD(cmd->desc_retired[a].dev,
                              cmd->desc_retired[a].host,
                              cmd->desc_retired[a].used) != CUDA_SUCCESS)
-               return vk_error(dev, VK_ERROR_DEVICE_LOST);
+               return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
          }
          if (cmd->desc_arena_used &&
              cuMemcpyHtoD(cmd->desc_arena, cmd->desc_arena_host,
                           cmd->desc_arena_used) != CUDA_SUCCESS)
-            return vk_error(dev, VK_ERROR_DEVICE_LOST);
+            return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
          cmd->desc_arena_dirty = false;
       }
 
@@ -81,7 +193,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          case CPVK_OP_BEGIN_RENDER: {
             uint32_t s = cmd->ops[o].scope_index;
             if (s >= cmd->num_scopes)
-               return vk_error(dev, VK_ERROR_DEVICE_LOST);
+               return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
             const struct cp_render_scope *scope = &cmd->scopes[s];
             cp_render_scope_begin(&dev->renderer, scope);
             break;
@@ -98,13 +210,13 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          case CPVK_OP_COPY: {
             VkResult r = cpvk_execute_copy(dev, &cmd->ops[o].copy);
             if (r != VK_SUCCESS)
-               return r;
+               return cpvk_submit_abort(dev, r);
             break;
          }
          case CPVK_OP_DRAW: {
             uint32_t s = cmd->ops[o].scope_index;
             if (s >= cmd->num_scopes)
-               return vk_error(dev, VK_ERROR_DEVICE_LOST);
+               return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
             assert(cmd->ops[o].draw_cmd.scope_index == s);
             cpvk_execute_draw_cmd(dev, &cmd->scopes[s],
                                   &cmd->ops[o].draw_cmd);
@@ -115,7 +227,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
              * it reads. */
             VkResult r = cpvk_execute_dispatch(dev, &cmd->ops[o].dispatch);
             if (r != VK_SUCCESS)
-               return r;
+               return cpvk_submit_abort(dev, r);
             break;
          }
          case CPVK_OP_BARRIER:
@@ -124,34 +236,46 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          case CPVK_OP_EVENT_WAIT: {
             VkResult r = cpvk_execute_order_op(dev, &cmd->ops[o]);
             if (r != VK_SUCCESS)
-               return r;
+               return cpvk_submit_abort(dev, r);
             break;
          }
          }
       }
    }
 
-   /* Nothing may be left pending across a submit. Graphics, compute and
-    * transfer operations all use the renderer stream, so this one drain covers
-    * the queue in recorded order before its binary signal state is published. */
+   /* Finish command translation, then mark completion on the same ordered
+    * stream. The worker publishes Vulkan sync state only after this event;
+    * queue submission itself no longer drains CUDA. */
    cp_batch_flush(&dev->renderer);
-   CUresult cu_result = cuStreamSynchronize(dev->renderer.stream);
-   if (cu_result != CUDA_SUCCESS)
-      return vk_error(dev, VK_ERROR_DEVICE_LOST);
-
-   /* Rewind after full retirement.  The current arena generations remain at
-    * their high-water sizes; obsolete growth allocations go. */
-   cp_scratch_reset(&dev->renderer);
    dev->prev_draw = NULL;
    dev->prev_scope = NULL;
    dev->prev_draw_valid = false;
 
-   for (uint32_t i = 0; i < submit->signal_count; i++) {
-      result = vk_sync_signal(&dev->vk, submit->signals[i].sync,
-                              submit->signals[i].signal_value);
-      if (result != VK_SUCCESS)
-         return result;
+   size_t pending_size = sizeof(struct cpvk_pending_submit) +
+                         (size_t)submit->signal_count *
+                         sizeof(struct vk_sync_signal);
+   struct cpvk_pending_submit *pending = calloc(1, pending_size);
+   if (!pending)
+      return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY));
+   pending->signal_count = submit->signal_count;
+   memcpy(pending->signals, submit->signals,
+          (size_t)submit->signal_count * sizeof(struct vk_sync_signal));
+   if (cuEventCreate(&pending->done, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS ||
+       cuEventRecord(pending->done, dev->renderer.stream) != CUDA_SUCCESS) {
+      if (pending->done)
+         cuEventDestroy(pending->done);
+      free(pending);
+      return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
    }
+
+   mtx_lock(&dev->submit_lock);
+   if (dev->submit_tail)
+      dev->submit_tail->next = pending;
+   else
+      dev->submit_head = pending;
+   dev->submit_tail = pending;
+   cnd_signal(&dev->submit_changed);
+   mtx_unlock(&dev->submit_lock);
    return VK_SUCCESS;
 }
 
@@ -260,10 +384,15 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_stream;
    dev->queue.driver_submit = cpvk_queue_submit;
+   result = cpvk_submit_worker_init(dev);
+   if (result != VK_SUCCESS)
+      goto fail_queue;
 
    *pDevice = cpvk_device_to_handle(dev);
    return VK_SUCCESS;
 
+fail_queue:
+   vk_queue_finish(&dev->queue);
 fail_stream:
    if (renderer_initialized)
       cp_context_cleanup(&dev->renderer);
@@ -291,10 +420,12 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (!dev)
       return;
 
-   vk_queue_finish(&dev->queue);
-
    cuCtxSetCurrent(dev->cu_ctx);
    cuCtxSynchronize();
+   cpvk_submit_wait_pending(dev);
+   cpvk_submit_worker_finish(dev);
+   vk_queue_finish(&dev->queue);
+
    cp_context_cleanup(&dev->renderer);
    for (unsigned i = 0; i < dev->num_shaders; i++)
       cp_shader_binary_destroy(dev->shader_cache[i].bin);
@@ -319,9 +450,10 @@ cpvk_DeviceWaitIdle(VkDevice _device)
    VK_FROM_HANDLE(cpvk_device, dev, _device);
 
    cuCtxSetCurrent(dev->cu_ctx);
-   return cuCtxSynchronize() == CUDA_SUCCESS
-             ? VK_SUCCESS
-             : vk_error(dev, VK_ERROR_DEVICE_LOST);
+   if (cuCtxSynchronize() != CUDA_SUCCESS)
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
+   cpvk_submit_wait_pending(dev);
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

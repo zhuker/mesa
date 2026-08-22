@@ -57,12 +57,21 @@ struct cpvk_physical_device {
    size_t vram;
 };
 
+struct cpvk_pending_submit;
+
 struct cpvk_device {
    struct vk_device vk;
    struct cpvk_physical_device *pdev;
 
    CUcontext cu_ctx;
    struct vk_queue queue;
+
+   mtx_t submit_lock;
+   cnd_t submit_changed;
+   thrd_t submit_thread;
+   bool submit_worker_initialized;
+   bool submit_worker_stop;
+   struct cpvk_pending_submit *submit_head, *submit_tail;
 
    /* The renderer, and the device it runs on: the same CUDA draw pipeline the
     * Gallium-hosted driver uses, reached through a header with no Gallium in
@@ -91,8 +100,8 @@ struct cpvk_device {
    /* The last command draw staged into a pending renderer batch. Merge must be
     * decided before the incoming draw mutates live renderer state. The pointer
     * refers into an immutable command-buffer op array, whose storage is stable
-    * for the complete synchronous submit walk, and is never retained after the
-    * submit callback clears prev_draw_valid. */
+    * for the complete host-side submit translation walk, and is never retained
+    * after the callback clears prev_draw_valid. */
    const struct cpvk_draw_cmd *prev_draw;
    const struct cp_render_scope *prev_scope;
    bool prev_draw_valid;

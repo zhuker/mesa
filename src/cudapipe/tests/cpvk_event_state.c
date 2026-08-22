@@ -101,6 +101,7 @@ main(void)
       .commandBufferCount = 1, .pCommandBuffers = &set,
    };
    CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+   CHECK(vkQueueWaitIdle(queue));
    if (vkGetEventStatus(device, event) != VK_EVENT_SET) {
       fprintf(stderr, "recorded set did not execute\n");
       return 1;
@@ -112,6 +113,7 @@ main(void)
    CHECK(vkEndCommandBuffer(reset));
    si.pCommandBuffers = &reset;
    CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+   CHECK(vkQueueWaitIdle(queue));
    if (vkGetEventStatus(device, event) != VK_EVENT_RESET) {
       fprintf(stderr, "recorded reset did not execute\n");
       return 1;
@@ -151,6 +153,7 @@ main(void)
    vkDestroyEvent(device, retained, NULL);
    si.pCommandBuffers = &retain;
    CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+   CHECK(vkQueueWaitIdle(queue));
 
    vkDestroyEvent(device, event, NULL);
    vkDestroyCommandPool(device, pool, NULL);

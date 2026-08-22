@@ -125,6 +125,7 @@ main(void)
                            .commandBufferCount = 1,
                            .pCommandBuffers = &command };
    CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+   CHECK(vkQueueWaitIdle(queue));
 
    float *mapped;
    CHECK(vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, (void **)&mapped));
@@ -141,6 +142,7 @@ main(void)
    record_scope(command, view, VK_ATTACHMENT_LOAD_OP_LOAD, 0.0f);
    CHECK(vkEndCommandBuffer(command));
    CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+   CHECK(vkQueueWaitIdle(queue));
    for (unsigned i = 0; i < W * H; i++)
       if (fabsf(mapped[i] - 0.75f) > 1e-6f) {
          fprintf(stderr, "load mismatch at %u: %f\n", i, mapped[i]);

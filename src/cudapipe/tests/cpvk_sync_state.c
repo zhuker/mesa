@@ -1,6 +1,6 @@
 /*
- * Negative and positive binary sync state for the native queue.  A synchronous
- * submit is not permission to report a fresh or reset fence as signalled.
+ * Negative and positive binary sync state for the native queue, including
+ * asynchronous completion and a run of queued event-backed fences.
  */
 #include <stdio.h>
 #include <vulkan/vulkan.h>
@@ -65,8 +65,12 @@ main(void)
 
    VkSubmitInfo empty = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
    CHECK(vkQueueSubmit(queue, 1, &empty, fence));
-   CHECK(vkGetFenceStatus(device, fence));
-   CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 0));
+   VkResult pending = vkGetFenceStatus(device, fence);
+   if (pending != VK_SUCCESS && pending != VK_NOT_READY) {
+      fprintf(stderr, "submitted fence status: %d\n", pending);
+      return 1;
+   }
+   CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
 
    CHECK(vkResetFences(device, 1, &fence));
    EXPECT(vkGetFenceStatus(device, fence), VK_NOT_READY);
@@ -94,6 +98,18 @@ main(void)
    };
    CHECK(vkQueueSubmit(queue, 1, &wait, fence));
    CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+
+   enum { STRESS = 64 };
+   VkFence stress[STRESS];
+   for (unsigned i = 0; i < STRESS; i++) {
+      CHECK(vkCreateFence(device, &fci, NULL, &stress[i]));
+      CHECK(vkQueueSubmit(queue, 1, &empty, stress[i]));
+   }
+   CHECK(vkWaitForFences(device, STRESS, stress, VK_TRUE, UINT64_MAX));
+   for (unsigned i = 0; i < STRESS; i++) {
+      CHECK(vkGetFenceStatus(device, stress[i]));
+      vkDestroyFence(device, stress[i], NULL);
+   }
 
    VkFenceCreateInfo signaled_fci = {
       .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
