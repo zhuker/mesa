@@ -423,6 +423,20 @@ struct cp_context {
    struct cp_sampler_info sampler_table_host[CP_MAX_SAMPLERS];
    unsigned num_samplers;
 
+   /*
+    * Sampler-specialisation counters, reported at teardown under
+    * CUDAPIPE_SPEC_STATS. The specialiser recognises an exact IR shape, so a
+    * lowering change can stop it firing with no error at all; these are what
+    * make that visible before the next sweep blames something else.
+    */
+   struct {
+      uint64_t launches;             /* fragment launches decided */
+      uint64_t specialised;          /* of those, using a specialised kernel */
+      uint64_t shaders;              /* distinct fragment shaders launched */
+      uint64_t shaders_unmatched;    /* some sampler handle was not matchable */
+      uint64_t shaders_unmatchable;  /* samples textures, matched none at all */
+   } spec;
+
    /* GPU-resident pipeline state — managed memory, written by CPU on state
     * changes, read by GPU kernels during draws. */
    /* Device-only arena for per-draw scratch buffers. CPU never touches this

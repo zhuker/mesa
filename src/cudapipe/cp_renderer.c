@@ -418,6 +418,29 @@ cp_scratch_destroy(struct cp_context *cp)
    memset(&cp->dscratch, 0, sizeof(cp->dscratch));
 }
 
+/*
+ * What sampler specialisation actually did this process.
+ *
+ * Reported rather than inferred: the only other evidence that specialisation
+ * stopped firing is a slower sweep, which is indistinguishable from a dozen
+ * other causes.
+ */
+static void
+cp_spec_report(struct cp_context *cp)
+{
+   if (!cp_debug->spec_stats || !cp->spec.launches)
+      return;
+
+   fprintf(stderr, "cudapipe: sampler specialisation: %" PRIu64 "/%" PRIu64
+           " fragment launches specialised (%.1f%%), %" PRIu64 " shaders, "
+           "%" PRIu64 " with an unmatched sampler handle, %" PRIu64
+           " sampling with none matched\n",
+           cp->spec.specialised, cp->spec.launches,
+           100.0 * (double)cp->spec.specialised / (double)cp->spec.launches,
+           cp->spec.shaders, cp->spec.shaders_unmatched,
+           cp->spec.shaders_unmatchable);
+}
+
 void
 cp_context_cleanup(struct cp_context *cp)
 {
@@ -426,6 +449,7 @@ cp_context_cleanup(struct cp_context *cp)
 
    cuCtxSetCurrent(cp->screen->cuda_ctx);
    cuCtxSynchronize();
+   cp_spec_report(cp);
    cp_abuf_cleanup(cp->abuf);
    free(cp->abuf);
    cp->abuf = NULL;
@@ -2236,6 +2260,24 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
          fs, resolved_samplers, fs->num_tex_descs);
    }
    bool use_sampler_variant = sampler_variant != NULL;
+
+   /*
+    * Specialisation is invisible when it stops working, so count it. A
+    * shader whose sampler handles the specialiser could not match still
+    * renders correctly and simply launches the generic kernel.
+    */
+   cp->spec.launches++;
+   if (use_sampler_variant)
+      cp->spec.specialised++;
+   if (!fs->spec_counted) {
+      fs->spec_counted = true;
+      cp->spec.shaders++;
+      if (fs->num_tex_instrs > fs->num_tex_descs || fs->tex_descs_dynamic)
+         cp->spec.shaders_unmatched++;
+      if (fs->num_tex_instrs && !fs->num_tex_descs)
+         cp->spec.shaders_unmatchable++;
+   }
+
    CUmodule launch_module = use_sampler_variant
       ? sampler_variant->module : fs->module;
    CUfunction launch_kernel = use_sampler_variant

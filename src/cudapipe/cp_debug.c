@@ -80,6 +80,10 @@ static const struct cp_flag_def flags[] = {
      "trace every draw: geometry, attachments, and why a draw was skipped" },
    { "CUDAPIPE_DEBUG_TEX", CP_FLAG_BOOL_PRESENCE, F(debug_tex),
      "trace sampler and texture-handle setup" },
+   { "CUDAPIPE_SPEC_STATS", CP_FLAG_BOOL_VALUE, F(spec_stats),
+     "report at teardown how many fragment launches used a sampler-specialised "
+     "kernel, and which shaders sample textures the specialiser could not "
+     "match; a silent drop to zero is a performance regression with no error" },
    { "CUDAPIPE_DEBUG_VFETCH", CP_FLAG_BOOL_PRESENCE, F(debug_vfetch),
      "dump what the GPU vertex fetch gathered; syncs, so debug-only" },
    { "CUDAPIPE_DEBUG_WORK", CP_FLAG_BOOL_PRESENCE, F(debug_work),

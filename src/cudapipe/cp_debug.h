@@ -89,6 +89,7 @@ struct cp_debug {
     * they have always done and someone's script relies on it. */
    bool debug_draw;
    bool debug_tex;
+   bool spec_stats;
    bool debug_vfetch;
    bool debug_work;
    bool debug_discard;

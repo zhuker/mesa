@@ -184,6 +184,15 @@ struct cp_shader_binary {
    struct cp_tex_desc_ref tex_descs[CP_MAX_TEX_DESCS];
    bool tex_descs_dynamic;
    bool tex_descs_reported;
+   /*
+    * Every sampled texture instruction this shader contains, matched or not.
+    * Specialisation depends on recognising an exact IR shape, so it can stop
+    * firing without any error: the images stay correct and the frame gets
+    * slower. num_tex_instrs > num_tex_descs is that failure, and
+    * CUDAPIPE_SPEC_STATS is how it becomes visible.
+    */
+   unsigned num_tex_instrs;
+   bool spec_counted;
 
    struct cp_sampler_variant sampler_variants[CP_MAX_SAMPLER_VARIANTS];
    unsigned num_sampler_variants;
