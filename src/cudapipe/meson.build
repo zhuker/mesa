@@ -166,6 +166,7 @@ if dep_vulkan_loader.found()
     'cpvk_query_lifetime',
     'cpvk_rtt',
     'cpvk_sampler_array',
+    'cpvk_sampler_two_bindings',
     'cpvk_secondary_descriptor',
     'cpvk_push_stages',
     'cpvk_smoke',

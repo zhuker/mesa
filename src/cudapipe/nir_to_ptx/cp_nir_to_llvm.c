@@ -2304,6 +2304,11 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
    }
 }
 
+/* Why a sampler handle could not be matched, for CUDAPIPE_SPEC_STATS. The
+ * matcher's failure is otherwise indistinguishable from a shader that simply
+ * has no textures. */
+static const char *cp_spec_reject_reason;
+
 static bool
 capture_tex_desc_ref(nir_tex_instr *tex, struct cp_tex_desc_ref *ref)
 {
@@ -2314,13 +2319,39 @@ capture_tex_desc_ref(nir_tex_instr *tex, struct cp_tex_desc_ref *ref)
          break;
       }
    }
-   if (!handle)
+   if (!handle) {
+      cp_spec_reject_reason = "the instruction carries no sampler handle";
       return false;
+   }
 
    nir_instr *parent = nir_def_instr(handle->ssa);
+
+   /*
+    * The first binding of a set is at offset zero, so nir_iadd_imm folds the
+    * addition away and the handle *is* the base. The matcher only knew the
+    * base + constant shape, so every texture at flat offset 0 was
+    * unspecialisable -- which is both of gltfscenerendering's fragment
+    * shaders and two of pbribl's, and it is why they reported 0 of 19,292
+    * specialised launches while their handles were as static as any other's.
+    */
+   if (parent->type == nir_instr_type_intrinsic &&
+       nir_instr_as_intrinsic(parent)->intrinsic ==
+          nir_intrinsic_load_const_buf_base_addr_cudapipe) {
+      nir_intrinsic_instr *base = nir_instr_as_intrinsic(parent);
+      if (!nir_src_is_const(base->src[0])) {
+         cp_spec_reject_reason = "the constant-buffer slot is not constant";
+         return false;
+      }
+      ref->ubo_slot = nir_src_as_uint(base->src[0]);
+      ref->sampler_offset = 0;
+      return true;
+   }
+
    if (parent->type != nir_instr_type_alu ||
-       nir_instr_as_alu(parent)->op != nir_op_iadd)
+       nir_instr_as_alu(parent)->op != nir_op_iadd) {
+      cp_spec_reject_reason = "the handle is not base + constant offset";
       return false;
+   }
    nir_alu_instr *add = nir_instr_as_alu(parent);
    nir_src *base_src = NULL, *offset_src = NULL;
    for (unsigned i = 0; i < 2; i++) {
@@ -2333,12 +2364,17 @@ capture_tex_desc_ref(nir_tex_instr *tex, struct cp_tex_desc_ref *ref)
                   nir_intrinsic_load_const_buf_base_addr_cudapipe)
          base_src = src;
    }
-   if (!base_src || !offset_src)
+   if (!base_src || !offset_src) {
+      cp_spec_reject_reason =
+         "neither operand is a constant-buffer base with a constant offset";
       return false;
+   }
    nir_intrinsic_instr *base =
       nir_instr_as_intrinsic(nir_def_instr(base_src->ssa));
-   if (!nir_src_is_const(base->src[0]))
+   if (!nir_src_is_const(base->src[0])) {
+      cp_spec_reject_reason = "the constant-buffer slot is not constant";
       return false;
+   }
 
    ref->ubo_slot = nir_src_as_uint(base->src[0]);
    ref->sampler_offset = nir_src_as_uint(*offset_src);
@@ -2362,8 +2398,15 @@ capture_tex_desc_refs(struct nir_shader *nir, struct cp_shader_binary *bin)
                continue;
             bin->num_tex_instrs++;
             struct cp_tex_desc_ref ref = { .flags = flags };
+            cp_spec_reject_reason = NULL;
             if (!capture_tex_desc_ref(tex, &ref)) {
                bin->tex_descs_dynamic = true;
+               if (cp_debug->spec_stats && !bin->spec_rejected_reported) {
+                  bin->spec_rejected_reported = true;
+                  fprintf(stderr, "cudapipe: sampler handle not specialisable: "
+                          "%s\n", cp_spec_reject_reason ? cp_spec_reject_reason
+                                                        : "unknown");
+               }
                continue;
             }
             bool seen = false;

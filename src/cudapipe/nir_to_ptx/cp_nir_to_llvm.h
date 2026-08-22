@@ -193,6 +193,7 @@ struct cp_shader_binary {
     */
    unsigned num_tex_instrs;
    bool spec_counted;
+   bool spec_rejected_reported;
 
    struct cp_sampler_variant sampler_variants[CP_MAX_SAMPLER_VARIANTS];
    unsigned num_sampler_variants;

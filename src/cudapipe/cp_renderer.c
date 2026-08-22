@@ -2207,9 +2207,23 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
    const uint64_t *tbl_src = cp->fs_batch.ubos;
    unsigned rows = (tbl_src && fs->reads_const_bufs)
       ? MAX2(cp->fs_batch.ndraws, 1u) : 1;
+   /*
+    * Specialisation bakes one sampler state into the kernel with #defines, so
+    * a shader qualifies when every sampler handle it uses resolves to the
+    * same state -- not only when it uses exactly one, which is what this said
+    * and which no longer costs nothing: with the handle matcher fixed,
+    * gltfscenerendering's two fragment shaders each carry two matched
+    * descriptors and a scene creates both samplers the same way.
+    *
+    * The equality check below is therefore correctness, not tidiness: two
+    * descriptors with different states must fall back, or one texture is
+    * filtered with the other's sampler. cpvk_sampler_two_bindings is that
+    * case.
+    */
    struct cp_sampler_info resolved_samplers[CP_MAX_TEX_DESCS];
    bool samplers_resolved = !cp_debug->no_sampler_variant &&
-      fs->num_tex_descs == 1 && !fs->tex_descs_dynamic && tbl_src;
+      fs->num_tex_descs >= 1 && fs->num_tex_descs <= CP_MAX_TEX_DESCS &&
+      !fs->tex_descs_dynamic && tbl_src;
    for (unsigned i = 0; i < fs->num_tex_descs && samplers_resolved; i++) {
       const struct cp_tex_desc_ref *ref = &fs->tex_descs[i];
       bool have_state = false;
@@ -2240,6 +2254,12 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
          memcpy(&resolved_samplers[i], state, sizeof(*state));
          have_state = true;
       }
+      /* Only one state reaches the compiled variant, so every descriptor has
+       * to agree with the first. */
+      if (samplers_resolved && i &&
+          memcmp(&resolved_samplers[0], &resolved_samplers[i],
+                 sizeof(resolved_samplers[0])))
+         samplers_resolved = false;
    }
    struct cp_sampler_variant *sampler_variant = samplers_resolved
       ? cp_shader_find_sampler_variant(fs, resolved_samplers,
