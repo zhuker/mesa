@@ -22,22 +22,14 @@
  * aliases implemented explicitly.
  */
 static const struct vk_instance_extension_table cpvk_instance_extensions = {
-   /*
-    * Advertised without any WSI behind it, which is what lavapipe does and
-    * for the same stated reason: an offscreen app enables this to get the
-    * PRESENT_SRC_KHR image layout, and never creates a surface. The Vulkan
-    * sample suite asks for it unconditionally and asks for a platform
-    * surface extension only when it opens a window, so this is the whole gap
-    * between "cannot create an instance" and "renders".
-    *
-    * If a surface is ever created this is a lie, and the honest fix then is
-    * wsi_common rather than a wider claim here.
-    */
+   /* Mesa WSI common supplies a real headless surface implementation. No X11,
+    * Wayland or display platform extension is exposed by this build. */
    .KHR_surface = true,
+   .EXT_headless_surface = true,
 };
 
 static const struct vk_device_extension_table cpvk_device_extensions = {
-   /* Filled in as features land. Headless: no swapchain, ever. */
+   /* Filled in as features land. */
 
    /* Dynamic rendering, because there is no other kind here: this driver has
     * no tiler to hand a render pass to, and the runtime only builds the
@@ -46,8 +38,7 @@ static const struct vk_device_extension_table cpvk_device_extensions = {
     * is what it did. */
    .KHR_dynamic_rendering = true,
 
-   /* Same bargain as KHR_surface above: enabled for the image layout, with
-    * no swapchain implementation behind it. */
+   /* Real CPU-visible headless swapchains through Mesa WSI common. */
    .KHR_swapchain = true,
 
    /*
@@ -180,12 +171,24 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
    memset(props->driverUUID, 0, VK_UUID_SIZE);
 }
 
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+cpvk_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *name)
+{
+   VK_FROM_HANDLE(cpvk_physical_device, pdev, physicalDevice);
+   return vk_instance_get_proc_addr_unchecked(pdev->vk.instance, name);
+}
+
 static void
 cpvk_physical_device_destroy(struct vk_physical_device *vk_pdev)
 {
    struct cpvk_physical_device *pdev =
       container_of(vk_pdev, struct cpvk_physical_device, vk);
 
+   if (pdev->wsi_initialized) {
+      pdev->vk.wsi_device = NULL;
+      wsi_device_finish(&pdev->wsi_device, &pdev->vk.instance->alloc);
+      pdev->wsi_initialized = false;
+   }
    if (pdev->vk.disk_cache) {
       disk_cache_destroy(pdev->vk.disk_cache);
       pdev->vk.disk_cache = NULL;
@@ -242,6 +245,8 @@ cpvk_enumerate_physical_devices(struct vk_instance *vk_instance)
    vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch_table, &cpvk_physical_device_entrypoints, true);
    vk_physical_device_dispatch_table_from_entrypoints(
+      &dispatch_table, &wsi_physical_device_entrypoints, false);
+   vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch_table, &vk_common_physical_device_entrypoints, false);
 
    VkResult result =
@@ -252,6 +257,20 @@ cpvk_enumerate_physical_devices(struct vk_instance *vk_instance)
       vk_free(&instance->vk.alloc, pdev);
       return result;
    }
+
+   result = wsi_device_init(&pdev->wsi_device,
+                            cpvk_physical_device_to_handle(pdev),
+                            cpvk_wsi_proc_addr, &instance->vk.alloc,
+                            -1, NULL,
+                            &(struct wsi_device_options){ .sw_device = true });
+   if (result != VK_SUCCESS) {
+      vk_physical_device_finish(&pdev->vk);
+      vk_free(&instance->vk.alloc, pdev);
+      return result;
+   }
+   pdev->wsi_initialized = true;
+   pdev->wsi_device.wants_linear = true;
+   pdev->vk.wsi_device = &pdev->wsi_device;
 
    pdev->vk.supported_sync_types = cpvk_sync_types;
    pdev->vk.disk_cache = disk_cache_create(
@@ -278,6 +297,8 @@ cpvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    struct vk_instance_dispatch_table dispatch_table;
    vk_instance_dispatch_table_from_entrypoints(
       &dispatch_table, &cpvk_instance_entrypoints, true);
+   vk_instance_dispatch_table_from_entrypoints(
+      &dispatch_table, &wsi_instance_entrypoints, false);
    vk_instance_dispatch_table_from_entrypoints(
       &dispatch_table, &vk_common_instance_entrypoints, false);
 

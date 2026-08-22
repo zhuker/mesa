@@ -83,8 +83,9 @@ libcudapipe_vk = static_library(
                          include_directories('.'),
                          include_directories('nir_to_ptx'),
                          include_directories('../compiler/nir')],
-  dependencies : [idep_vulkan_runtime, idep_vulkan_util, idep_mesautil,
-                  idep_nir, dep_llvm, dep_cuda_vk, dep_nvrtc, dep_nvjitlink],
+  dependencies : [idep_vulkan_runtime, idep_vulkan_util, idep_vulkan_wsi,
+                  idep_mesautil, idep_nir, dep_llvm, dep_cuda_vk, dep_nvrtc,
+                  dep_nvjitlink],
   gnu_symbol_visibility : 'hidden',
 )
 

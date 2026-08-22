@@ -209,6 +209,10 @@ cpvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
 
+   if (wsi_common_is_swapchain_image(pCreateInfo))
+      return wsi_common_create_swapchain_image(&dev->pdev->wsi_device,
+                                               pCreateInfo, pImage);
+
    if (pCreateInfo->mipLevels > CPVK_MAX_MIP_LEVELS)
       return vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);
 

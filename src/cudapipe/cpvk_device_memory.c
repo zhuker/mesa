@@ -323,6 +323,8 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
                                              &cpvk_device_entrypoints, false);
    vk_device_dispatch_table_from_entrypoints(
+      &dispatch_table, &wsi_device_entrypoints, false);
+   vk_device_dispatch_table_from_entrypoints(
       &dispatch_table, &vk_common_device_entrypoints, false);
 
    VkResult result = vk_device_init(&dev->vk, &pdev->vk, &dispatch_table,

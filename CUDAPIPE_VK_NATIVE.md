@@ -33,11 +33,11 @@ The important files are:
 | `cpvk_image.c` | closed format table, tightly packed mip layout, images/views, texture descriptors and samplers |
 | `cpvk_pipeline.c` | SPIR-V→NIR preparation, descriptor lowering, graphics/compute pipeline compilation and the in-process stage cache |
 | `cpvk_cmd.c` | descriptors, command-buffer recording, dynamic rendering, draws/dispatches, copies/blits/resolves, events and queries |
-| `cpvk_sync.c` | stateful binary fence/semaphore reset, signal, status and deadline waits; submit still drains before publishing signals |
+| `cpvk_sync.c` | stateful binary fence/semaphore reset, signal, status and deadline waits; CUDA-event completion publishes signals asynchronously |
 | `cp_renderer.[ch]` | shared draw renderer: batching, clipping, rasterization, A-buffer/peel paths, pass episodes, arenas and shader launches |
 | `cp_kernels.[ch]`, `kernels/` | NVRTC compilation, persistent source/options-keyed PTX caching and CUDA kernels, including the lazy 3D sampler variant |
 | `nir_to_ptx/` | the shared NIR→LLVM/NVPTX backend and loaded shader binaries |
-| `tests/cpvk_*.c` | 34 small native differential/regression programs, including synchronization state, recorded-object lifetime, secondary descriptor ownership and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
+| `tests/cpvk_*.c` | 35 small native differential/regression programs, including synchronization state, recorded-object lifetime, secondary descriptor ownership and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
 
 The native `cpvk_device` owns one CUDA context, one `cp_device` containing the
 kernel modules, and one `cp_context` renderer with its ordered graphics/compute
@@ -96,6 +96,11 @@ GPU completion, reset state and deadline waits. Scratch/upload generations are
 rewound only when all prior submissions have retired; otherwise the next submit
 appends without reusing in-flight addresses. Barriers and device events remain
 conservative ordered execution points on the same stream.
+
+Mesa WSI common owns the headless surface/swapchain implementation. Swapchain
+images use the driver's ordinary host-visible image/memory entrypoints, and the
+same CUDA-event queue completion orders acquire/present synchronization. Only
+`EXT_headless_surface` is exposed; platform window-system extensions are absent.
 
 Secondary command buffers are memcpy-appended to the primary operation stream.
 Their descriptor snapshots are imported into primary-owned arenas, draw and
@@ -468,11 +473,11 @@ other referenced sample passes and `renderheadless` still has no reference.
 1. **The validated commits are selective.** Unrelated documents, scripts and
    logs remain untracked at repository root and are intentionally outside this
    state. Continue to stage explicit paths rather than using `git add -A`.
-2. **Headless and device 0 only.** There is no WSI, and physical-device
-   enumeration exposes only CUDA device 0 even when CUDA reports more.
-   `KHR_surface`/`KHR_swapchain` are advertised so headless applications can
-   use their image layouts; real surface/swapchain creation is outside the
-   supported envelope.
+2. **Headless WSI and CUDA device 0 only.** Mesa WSI common now backs the
+   advertised `KHR_surface`, `EXT_headless_surface` and `KHR_swapchain` paths;
+   a focused test creates a real headless surface/swapchain, acquires and
+   presents. No X11, Wayland or display extension is exposed. Physical-device
+   enumeration still exposes only CUDA device 0 when CUDA reports more.
 3. **The development manifest intentionally stops at Vulkan 1.1.** It now
    matches the physical-device contract (`api_version: 1.1.x`) so loader
    dispatch no longer hides core 1.1 entrypoints. Do not raise either manifest

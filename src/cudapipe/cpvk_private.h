@@ -24,6 +24,7 @@
 #include "vk_instance.h"
 #include "vk_physical_device.h"
 #include "vk_queue.h"
+#include "vulkan/wsi/wsi_common.h"
 #include "vk_command_buffer.h"
 #include "cp_nir_to_llvm.h"
 #include "cp_kernels.h"
@@ -50,6 +51,8 @@ struct cpvk_instance {
 
 struct cpvk_physical_device {
    struct vk_physical_device vk;
+   struct wsi_device wsi_device;
+   bool wsi_initialized;
 
    CUdevice cu_dev;
    int sm_major, sm_minor;

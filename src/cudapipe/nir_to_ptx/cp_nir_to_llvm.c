@@ -2669,6 +2669,17 @@ emit_function(struct ntl_context *ctx)
    return true;
 }
 
+static once_flag cp_nvptx_once = ONCE_FLAG_INIT;
+
+static void
+cp_initialize_nvptx(void)
+{
+   LLVMInitializeNVPTXTargetInfo();
+   LLVMInitializeNVPTXTarget();
+   LLVMInitializeNVPTXTargetMC();
+   LLVMInitializeNVPTXAsmPrinter();
+}
+
 static char *
 compile_module_to_ptx(LLVMModuleRef module, int sm_major, int sm_minor, size_t *out_size)
 {
@@ -2688,10 +2699,7 @@ compile_module_to_ptx(LLVMModuleRef module, int sm_major, int sm_minor, size_t *
    }
    snprintf(cpu, sizeof(cpu), "sm_%d%d", llvm_major, llvm_minor);
 
-   LLVMInitializeNVPTXTargetInfo();
-   LLVMInitializeNVPTXTarget();
-   LLVMInitializeNVPTXTargetMC();
-   LLVMInitializeNVPTXAsmPrinter();
+   call_once(&cp_nvptx_once, cp_initialize_nvptx);
 
    char *error = NULL;
    LLVMTargetRef target;
