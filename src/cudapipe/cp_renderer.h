@@ -497,8 +497,6 @@ struct cp_context {
 
    /* GPU-resident pipeline state — managed memory, written by CPU on state
     * changes, read by GPU kernels during draws. */
-   struct cp_gpu_state *gpu_state;
-
    /* Device-only arena for per-draw scratch buffers. CPU never touches this
     * memory — just tracks offsets as integers. See cp_upload(). */
    CUdeviceptr arena_base;
@@ -863,7 +861,6 @@ void cp_context_set_framebuffer(struct cp_context *cp,
 struct glsl_type;
 int cp_type_size_vec4(const struct glsl_type *type, bool bindless);
 
-void cp_context_publish_state(struct cp_context *cp);
 
 /* The vertex-format description both front ends fetch with; see the
  * definition for why a narrow attribute cannot be copied verbatim. */

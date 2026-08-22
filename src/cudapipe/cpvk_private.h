@@ -59,7 +59,6 @@ struct cpvk_device {
    struct cpvk_physical_device *pdev;
 
    CUcontext cu_ctx;
-   CUstream stream;
    struct vk_queue queue;
 
    /* The renderer, and the device it runs on: the same CUDA draw pipeline the

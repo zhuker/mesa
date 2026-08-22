@@ -41,8 +41,7 @@ The important files are:
 
 The native `cpvk_device` owns one CUDA context, one `cp_device` containing the
 kernel modules, and one `cp_context` renderer with its ordered graphics/compute
-stream and optional episode side streams. The legacy `dev->stream` is still
-allocated but carries no submitted work. Vulkan fixed-function state is
+stream and optional episode side streams. Vulkan fixed-function state is
 converted once to the renderer's own `cp_*` types. No `pipe_context` or Gallium
 state crosses this boundary.
 
@@ -248,8 +247,8 @@ The final gain is a set of independent mechanisms, not one broad relaxation:
   per-dispatch allocation, synchronization and free;
 - after the required synchronous queue drain, `cp_scratch_reset()` frees
   overflow arenas and rewinds the renderer scratch/upload bump allocators;
-- obsolete per-draw publication to the unread managed `cp_gpu_state` is gone;
-  and
+- the unread managed `cp_gpu_state`, its publication API and the unused native
+  device stream have been removed; and
 - exact embedded/lazy NVRTC products persist through Mesa's disk cache.
 
 Do not remove submission drains or broaden merge compatibility based on the

@@ -173,11 +173,6 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_device;
    }
-   if (cuStreamCreate(&dev->stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS) {
-      result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
-      goto fail_ctx;
-   }
-
    /*
     * The device the renderer runs on, and then the renderer: the same
     * NVRTC-compiled kernels and the same cp_context_init() the Gallium-hosted
@@ -236,8 +231,6 @@ fail_stream:
       cuMemFree(dev->null_desc);
    if (dev->null_data)
       cuMemFree(dev->null_data);
-   cuStreamDestroy(dev->stream);
-fail_ctx:
    cuCtxDestroy(dev->cu_ctx);
 fail_device:
    vk_device_finish(&dev->vk);
@@ -269,7 +262,6 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       cuMemFree(dev->null_data);
    simple_mtx_destroy(&dev->shader_cache_lock);
 
-   cuStreamDestroy(dev->stream);
    cuCtxDestroy(dev->cu_ctx);
 
    const VkAllocationCallbacks *alloc = &dev->vk.alloc;

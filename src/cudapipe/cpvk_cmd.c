@@ -1742,11 +1742,8 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
    cp->num_vs_ubos = cp->num_fs_ubos = CP_MAX_CONST_BUFFERS;
 
 
-
-   /* The renderer takes all draw state through explicit launch arguments and
-    * batch snapshots.  Its legacy managed cp_gpu_state has no kernel reader;
-    * publishing 16 vertex bases and 32 UBO pointers into it on every recorded
-    * draw only dirtied managed pages on the host. */
+   /* The renderer takes draw state through explicit launch arguments and
+    * immutable batch snapshots; no device-global mutable state is published. */
 
    /*
     * Hold the draw back if it can join the one before it. The machinery is
