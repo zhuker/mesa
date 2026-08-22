@@ -2374,6 +2374,14 @@ system_value("shader_call_data_offset_lvp", 1)
 
 intrinsic("load_const_buf_base_addr_lvp", src_comp=[1], bit_sizes=[64], dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER])
 
+# The base address of cudapipe's constant buffer src[0]: the kernel argument
+# block's slot for a descriptor set, or -- in a merged batch of draws -- the
+# slot of the row belonging to the draw this invocation came from. cudapipe
+# emitted the lavapipe intrinsic above for years because lavapipe used to be
+# the Vulkan front end feeding its backend; its native front end resolves the
+# slot itself and the two drivers' models are no longer the same one.
+intrinsic("load_const_buf_base_addr_cudapipe", src_comp=[1], bit_sizes=[64], dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER])
+
 # Broadcom-specific instrinc for tile buffer color reads.
 #
 # The hardware requires that we read the samples and components of a pixel

@@ -257,7 +257,7 @@ emit_local_invocation_id(struct ntl_context *ctx, unsigned component)
  * The base pointer of the stage's constant buffer number `slot`.
  *
  * Every read of args[18..] in the generated code goes through here — the index
- * form of load_ubo/load_ssbo below, and nir_intrinsic_load_const_buf_base_addr_lvp,
+ * form of load_ubo/load_ssbo below, and load_const_buf_base_addr_cudapipe,
  * which is how a lavapipe-lowered shader actually reaches a uniform block. That
  * is what makes it one function rather than a line in each of them, and what
  * makes `reads_const_bufs` trustworthy.
@@ -760,11 +760,11 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       set_ssa_def(ctx, &instr->def, vec);
       break;
    }
-   case nir_intrinsic_load_const_buf_base_addr_lvp: {
+   case nir_intrinsic_load_const_buf_base_addr_cudapipe: {
       /*
-       * The 64-bit base address of constant buffer `src[0]`. This is how a
-       * lavapipe-lowered shader reaches a uniform block: the address lands
-       * here, and the load_ubo that follows dereferences the descriptor at it.
+       * The 64-bit base address of constant buffer `src[0]`: how a shader
+       * reaches a descriptor set. The address lands here and the load_ubo or
+       * texture handle that follows dereferences the descriptor row at it.
        * emit_const_buf_base() owns the layout, including the per-draw table
        * the vertex stage reads through when draws are batched.
        */
@@ -2330,7 +2330,7 @@ capture_tex_desc_ref(nir_tex_instr *tex, struct cp_tex_desc_ref *ref)
          offset_src = src;
       else if (src_parent->type == nir_instr_type_intrinsic &&
                nir_instr_as_intrinsic(src_parent)->intrinsic ==
-                  nir_intrinsic_load_const_buf_base_addr_lvp)
+                  nir_intrinsic_load_const_buf_base_addr_cudapipe)
          base_src = src;
    }
    if (!base_src || !offset_src)

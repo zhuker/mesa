@@ -369,7 +369,7 @@ lower_descriptors(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       b->cursor = nir_before_instr(&intr->instr);
       nir_def *slot = nir_channel(b, intr->src[si].ssa, 0);
       nir_def *offset = nir_channel(b, intr->src[si].ssa, 1);
-      nir_def *desc = nir_iadd(b, nir_load_const_buf_base_addr_lvp(b, slot),
+      nir_def *desc = nir_iadd(b, nir_load_const_buf_base_addr_cudapipe(b, slot),
                                nir_u2u64(b, offset));
       nir_src_rewrite(&intr->src[si], desc);
       return true;
@@ -403,10 +403,10 @@ lower_descriptors(nir_builder *b, nir_intrinsic_instr *intr, void *data)
  *
  * A handle is `set_base + binding * sizeof(struct cpvk_descriptor)`, computed
  * here and never loaded: the kernel dereferences it to reach the
- * cp_texture_info and the sampler index. load_const_buf_base_addr_lvp is the
- * intrinsic the backend already implements for exactly this -- it resolves to
- * the same constant-buffer slot lookup a uniform read uses -- so the set's
- * buffer address goes in its own slot and the offset is added on top.
+ * cp_texture_info and the sampler index. load_const_buf_base_addr_cudapipe is
+ * the intrinsic the backend implements for exactly this -- it resolves to the
+ * same constant-buffer slot lookup a uniform read uses -- so the set's buffer
+ * address goes in its own slot and the offset is added on top.
  */
 /* The descriptor handle for a set/binding, in the form the kernels read. */
 static nir_def *
@@ -424,7 +424,8 @@ cpvk_descriptor_handle(nir_builder *b,
    unsigned flat = map ? map->flat : 0;
 
    nir_def *base =
-      nir_load_const_buf_base_addr_lvp(b, nir_imm_int(b, layout->set_slot[set]));
+      nir_load_const_buf_base_addr_cudapipe(b,
+                                            nir_imm_int(b, layout->set_slot[set]));
    return nir_iadd_imm(b, base, (uint64_t)flat * CPVK_DESCRIPTOR_SIZE);
 }
 
