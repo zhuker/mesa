@@ -33,11 +33,11 @@ The important files are:
 | `cpvk_image.c` | closed format table, tightly packed mip layout, images/views, texture descriptors and samplers |
 | `cpvk_pipeline.c` | SPIR-V→NIR preparation, descriptor lowering, graphics/compute pipeline compilation and the in-process stage cache |
 | `cpvk_cmd.c` | descriptors, command-buffer recording, dynamic rendering, draws/dispatches, copies/blits/resolves, events and queries |
-| `cpvk_sync.c` | placeholder payload-free sync; post-submit workload waits happen to work because submit drains, but initial/reset/status semantics do not |
+| `cpvk_sync.c` | stateful binary fence/semaphore reset, signal, status and deadline waits; submit still drains before publishing signals |
 | `cp_renderer.[ch]` | shared draw renderer: batching, clipping, rasterization, A-buffer/peel paths, pass episodes, arenas and shader launches |
 | `cp_kernels.[ch]`, `kernels/` | NVRTC compilation, persistent source/options-keyed PTX caching and CUDA kernels, including the lazy 3D sampler variant |
 | `nir_to_ptx/` | the shared NIR→LLVM/NVPTX backend and loaded shader binaries |
-| `tests/cpvk_*.c` | 25 small native differential/regression programs; they are standalone sources, not yet a Meson test suite |
+| `tests/cpvk_*.c` | 27 small native differential/regression programs, including sync-state and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
 
 The native `cpvk_device` owns one CUDA context, one `cp_device` containing the
 kernel modules, and one `cp_context` renderer with its ordered graphics/compute
@@ -77,11 +77,12 @@ vertex/index input, push constants and descriptor rows. Queue submission:
 5. synchronizes that stream before returning, then frees overflow arenas and
    rewinds the scratch/upload bump allocators.
 
-The final drain keeps the current payload-free sync objects usable for the
-validated workloads, but it does not repair initially-unsignalled/reset fence
-state, no-op barriers, recording-time events or general Vulkan synchronization.
-Do not remove it until sync objects carry CUDA event payloads and arena
-retirement follows those events.
+The final drain is followed by explicit publication of every submission signal.
+Binary fences and semaphores now track signal/reset state and deadline waits,
+including correct fresh/reset status and zero-time timeout behavior. The drain
+still does not implement barriers, recording-time device events or asynchronous
+completion. Do not remove it until sync objects carry CUDA-event payloads and
+arena retirement follows those events.
 
 Secondary command buffers are memcpy-appended to the primary operation stream,
 but their descriptor arenas are not transferred/published/uploaded with those
@@ -300,9 +301,10 @@ pass.
 
 ### Standalone and sample gates
 
-- 25/25 `src/cudapipe/tests/cpvk_*.c` programs pass functionally with no
-  driver error, unimplemented, refusal or overflow diagnostic. This is not a
-  claim that all 25 are clean under the Vulkan validation layer.
+- 27/27 `src/cudapipe/tests/cpvk_*.c` programs pass functionally, including
+  negative fence state/timeouts and concurrent per-device A-buffer execution,
+  with no driver error, unimplemented, refusal or overflow diagnostic. This is
+  not a claim that all 27 are clean under the Vulkan validation layer.
 - `cpvk_tex3d` passes on native and NVIDIA; NVIDIA with
   `VK_LAYER_KHRONOS_validation` is clean.
 - The post-optimization 60-frame sweep is
@@ -450,13 +452,12 @@ continue staging explicit paths rather than using `git add -A`.
    `gltfscenerendering`: 15,695 pixels differ in frame 0 and the worst frame
    has 59,925 against a 25,542-pixel budget. `renderheadless` has only the
    separate Gallium parity artifact, not an independent stored reference.
-7. **Sync objects are not Vulkan-correct.** Every submit drains the ordered
-   renderer stream, which makes post-submit waits used by the validated
-   workloads safe, but `cpvk_sync.c` stores no logical signal state:
-   init/signal/reset are no-ops and status behaves as signalled. A new or reset
-   unsignalled fence therefore reports `VK_SUCCESS` instead of `VK_NOT_READY`,
-   and a zero-time wait returns success instead of `VK_TIMEOUT`. Real stateful
-   fence/semaphore semantics are required even before asynchronous submit.
+7. **Queue completion is still synchronous.** Binary fences and semaphores
+   now have real logical signal/reset state, deadline waits and explicit
+   post-drain queue publication; the focused fresh/reset/zero-time test passes.
+   They do not yet carry a CUDA-event payload, timeline values or asynchronous
+   retirement. Removing the submit drain therefore still requires event-backed
+   completion plus scratch and recorded-object lifetime handling.
 8. **Vulkan barriers remain no-ops.** Draws, clears, transfers and dispatches
    now share `renderer.stream`, so queue order covers their validated
    dependencies. `vkCmdPipelineBarrier2` still tracks no access/layout state
@@ -528,9 +529,8 @@ continue staging explicit paths rather than using `git add -A`.
     of low-delta pixels between runs. Exit status and byte identity are not the
     replay gate; use the documented external RGB/>32/>96 structure.
 22. **Some source comments describe obsolete milestones or overstate support.**
-    In particular, the `cpvk_sync.c` comment calls always-signalled sync
-    correct, older headers still say rendering is unwired, and renderer TODOs
-    can describe paths that have since changed. Treat the tested code and this
+    Older headers still say rendering is unwired, and renderer TODOs can
+    describe paths that have since changed. Treat the tested code and this
     handoff as authoritative, then update a stale comment with the fix it
     accompanies.
 
@@ -553,10 +553,10 @@ continue staging explicit paths rather than using `git add -A`.
   every API call still returned success. Memcpy-appending a secondary command
   is not enough when its recorded addresses belong to a secondary-owned arena.
 - Moving graphics, transfer and compute onto one CUDA stream supplies queue
-  order; draining it supplies retirement. Neither operation gives payload-free
-  Vulkan fences logical unsignalled/reset state or turns recording-time event
-  mutation into execution-time semantics. Test negative/status cases, not only
-  the workload's successful waits.
+  order; draining it supplies retirement. Explicit binary sync state is still
+  required for fresh/reset/timeout behavior, and neither operation turns
+  recording-time event mutation into execution-time semantics. Test negative
+  status cases, not only the workload's successful waits.
 - Shader cache identity includes resource layout. SPIR-V-only keys silently
   reused code with the wrong descriptor offsets.
 - Primitive ordering is observable for blending. Atomic clip compaction is not
@@ -598,15 +598,14 @@ In order:
    source, tests and procedures as a validated workload milestone, not a
    conformance claim. Copy the validated DSO, plans, external references,
    outputs, logs and checksums out of `/tmp` before cleanup or reboot.
-2. **Write focused semantic tests before more optimization.** Add initial and
-   reset fence status/zero-time waits, semaphore state, command-buffer event
-   timing, draw/copy↔dispatch dependencies in both directions, a secondary
-   command buffer that uses descriptors without prior submission, and
-   pipeline destruction after recording but before submit. Fix those
-   failures with stateful sync, preserve the current ordered renderer stream,
-   and add correct secondary arena ownership/upload. Only after that should
-   asynchronous return, CUDA-event fence retirement and removal of submit
-   drains be considered as one measured change.
+2. **Continue the focused semantic series before asynchronous submission.**
+   Fresh/reset fence status, zero-time waits and binary semaphore ordering now
+   pass. Add command-buffer event timing, draw/copy↔dispatch dependencies in
+   both directions, a secondary command buffer using descriptors without prior
+   submission, and pipeline destruction after recording but before submit.
+   Preserve the ordered renderer stream and add correct retained ownership.
+   Only then should CUDA-event fence retirement and removal of submit drains be
+   considered as one measured change.
 3. **Complete the external image evidence.** Replay the existing Crossroads and
    old-capture `all.json` plans with llvmpipe or NVIDIA and compare by the
    shared manifest. Until then the external result is the 9/10-image sentinel

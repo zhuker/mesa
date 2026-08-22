@@ -15,6 +15,7 @@
 
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
+#include "vk_sync.h"
 #include "vk_util.h"
 
 static VkResult
@@ -22,6 +23,12 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
    struct cpvk_device *dev =
       container_of(vk_queue->base.device, struct cpvk_device, vk);
+
+   VkResult result = vk_sync_wait_many(&dev->vk, submit->wait_count,
+                                       submit->waits,
+                                       VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+   if (result != VK_SUCCESS)
+      return result;
 
    cuCtxSetCurrent(dev->cu_ctx);
    dev->renderer.num_host_maps = 0;
@@ -103,11 +110,20 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * returns.  Graphics, compute and transfer operations all use the renderer
     * stream, so this one drain covers the queue in recorded order. */
    cp_batch_flush(&dev->renderer);
-   cuStreamSynchronize(dev->renderer.stream);
+   CUresult cu_result = cuStreamSynchronize(dev->renderer.stream);
+   if (cu_result != CUDA_SUCCESS)
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
    /* Rewind after full retirement.  The current arena generations remain at
     * their high-water sizes; obsolete growth allocations go. */
    cp_scratch_reset(&dev->renderer);
+
+   for (uint32_t i = 0; i < submit->signal_count; i++) {
+      result = vk_sync_signal(&dev->vk, submit->signals[i].sync,
+                              submit->signals[i].signal_value);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    return VK_SUCCESS;
 }
 
