@@ -8,9 +8,8 @@ it, instead of lavapipe and Gallium.
 > failed experiments, but its milestone labels, intermediate scores and
 > forward-looking statements describe earlier states and are not a plan.
 
-**Branch `cudapipe-vk-native`; this checkpoint commit (parent
-`d8d215aad3e`) captures the validated workload candidate.** It enumerates a
-device,
+**Branch `cudapipe-vk-native`; base workload checkpoint `02f75c3637e`,
+performance recovery `d7a88fd13b6`.** The current tree enumerates a device,
 creates graphics and compute pipelines, records and submits command buffers,
 runs the complete 18-sample sweep, and replays both supported GFXReconstruct
 captures to completion. The final validated native DSO has SHA-256
@@ -36,15 +35,32 @@ The important files are:
 | `cpvk_cmd.c` | descriptors, command-buffer recording, dynamic rendering, draws/dispatches, copies/blits/resolves, events and queries |
 | `cpvk_sync.c` | placeholder payload-free sync; post-submit workload waits happen to work because submit drains, but initial/reset/status semantics do not |
 | `cp_renderer.[ch]` | shared draw renderer: batching, clipping, rasterization, A-buffer/peel paths, pass episodes, arenas and shader launches |
-| `cp_kernels.[ch]`, `kernels/` | NVRTC compilation and CUDA kernels, including the base and lazy 3D sampler PTX |
+| `cp_kernels.[ch]`, `kernels/` | NVRTC compilation, persistent source/options-keyed PTX caching and CUDA kernels, including the lazy 3D sampler variant |
 | `nir_to_ptx/` | the shared NIR→LLVM/NVPTX backend and loaded shader binaries |
 | `tests/cpvk_*.c` | 25 small native differential/regression programs; they are standalone sources, not yet a Meson test suite |
 
 The native `cpvk_device` owns one CUDA context, one `cp_device` containing the
 kernel modules, and one `cp_context` renderer with its ordered graphics/compute
-stream and optional episode side streams. Vulkan fixed-function state is
+stream and optional episode side streams. The legacy `dev->stream` is still
+allocated but carries no submitted work. Vulkan fixed-function state is
 converted once to the renderer's own `cp_*` types. No `pipe_context` or Gallium
 state crosses this boundary.
+
+### Vulkan memory model
+
+The ICD exposes one device-local heap and three memory types on it:
+
+| type | Vulkan properties | CUDA backing |
+|---:|---|---|
+| 0 | `DEVICE_LOCAL` | unmappable `cuMemAlloc` |
+| 1 | `HOST_VISIBLE + HOST_COHERENT + HOST_CACHED` | `cuMemAllocManaged` |
+| 2 | type 1 plus `DEVICE_LOCAL` | `cuMemAllocManaged` |
+
+The two host-visible types intentionally share an implementation but preserve
+distinct captured property requirements. They are managed allocations, not
+permanently pinned host memory: frequently GPU-read pages such as UBOs and
+SSBOs can migrate instead of forcing every access over PCIe. This mapping
+supersedes the pinned-host/two-heap milestone described in the historical log.
 
 ### Recording and submission
 
@@ -59,7 +75,8 @@ vertex/index input, push constants and descriptor rows. Queue submission:
 3. issues draw, compute and transfer operations on the renderer stream in
    recorded order;
 4. flushes any renderer batch; and
-5. synchronizes that stream before returning, then retires scratch generations.
+5. synchronizes that stream before returning, then frees overflow arenas and
+   rewinds the scratch/upload bump allocators.
 
 The final drain keeps the current payload-free sync objects usable for the
 validated workloads, but it does not repair initially-unsignalled/reset fence
@@ -78,10 +95,11 @@ end-of-pass resolves are explicit operations.
 ### Descriptors and command-buffer immutability
 
 A descriptor is a 64-byte `cpvk_descriptor`, matching the offsets the CUDA
-sampler/backend read. A set is one flat descriptor array. NIR lowering maps a
-set to a constant-buffer slot and a binding/array element to a byte offset.
-Slot 0 is push constants. Texture handles point into the set and buffer/image
-base addresses are loaded from the descriptor.
+sampler/backend read. A live set is one host-only flat descriptor array. NIR
+lowering maps a recorded set snapshot to a constant-buffer slot and a
+binding/array element to a byte offset. Slot 0 is push constants. Texture
+handles point into the command-buffer snapshot and buffer/image base addresses
+are loaded from that descriptor row.
 
 Recorded commands must not point at a live set: applications update or bind the
 same set with different dynamic offsets after recording a draw. Each bind is
@@ -96,13 +114,22 @@ renderer consumes one immutable descriptor/UBO row per draw, so requiring equal
 sets split correct work without protecting any episode-wide state. The 25
 focused tests and the final 60-frame sweep cover distinct UBO, texture, dynamic
 offset, discard, depth and large-batch rows; current output remains within the
-validated native and NVIDIA comparison bounds.
+established native comparison envelope and does not enlarge the standing
+NVIDIA `gltfscenerendering` mismatch.
 
 The graphics shader-cache key is resource-aware: SPIR-V alone is
 not enough because descriptor layouts change the constant-buffer slots and
 flat offsets baked into NIR. Cache insertion performs a second locked lookup
 after compilation so concurrent creators return one shared binary; pointer
 identity is itself part of the batching contract.
+
+When Mesa's disk cache is available and enabled, the embedded CUDA sources and
+lazy sampler variants persist their NVRTC PTX there. The key contains the exact
+source, embedded header, all NVRTC options, target SM and NVRTC major/minor
+version. A missing, disabled or invalid cache entry falls back to NVRTC
+compilation. This is deliberately a
+PTX cache, not an application `VkPipelineCache`: generated application shader
+PTX and CUDA JIT products remain process-local.
 
 The separate 1 MiB null-data and 64 KiB null-descriptor allocations are a
 bring-up safety net. They keep an unbound or unwritten read finite and
@@ -169,25 +196,30 @@ Device kernels handle the supported linear blit and multisample resolve paths.
 Operations outside the supported family are diagnosed/refused; some older
 host copy/resolve fallback code remains and must not become a frame path.
 
-### Draw batching, episodes and A-buffer ownership
+### Draw batching, clipping, episodes and A-buffer ownership
 
 The original plan said native recording would remove batching and episode
 deferral. The measured implementation does not: conditional draw batching and
-pass episodes remain part of current replay performance. Native merge keys use
-pipeline/state plus descriptor contents. Push constants may leave the merge
-key only because per-draw rows work; `batch_uploads_live` prevents
-`cp_scratch_reset()` from rewinding the arena under push blocks belonging to a
-staged batch.
+pass episodes remain load-bearing. Merge equality covers episode-wide
+pipeline/fixed state, vertex/index identity and push-block size. Descriptor and
+push contents may differ because every draw carries immutable descriptor/UBO
+rows; `batch_uploads_live` prevents `cp_scratch_reset()` from rewinding the
+upload arena under rows belonging to a staged batch.
 
-Clipped blended primitives use stable output slots. Atomic compaction does not
-preserve submission order, and changing that order changes composition even
-for a single draw. Opaque batches need stable slots when fragment constant
-buffers make the primitive→draw mapping observable.
+Clipped blended primitives retain fixed output IDs, because fragment order is
+observable even inside one draw. Fixed IDs used to make the rasterizer visit all
+eight reserved slots per input triangle, most of them empty. Stable clipping
+now also appends each emitted fixed ID to a compact `active_ids` worklist.
+Rasterization enumerates that worklist while queues, visibility and A-buffer
+records continue to carry the original stable ID. Allocation failure falls back
+to the proven hole-filled path rather than changing ordering.
 
 The A-buffer is enabled by default with `CPVK_ABUF_MIN_TRIS=0`. The bootstrap
 scan uses unlimited capacity until the fragment array exists; an empty draw is
-a successful no-op. These details are why Crossroads is about 11 ms rather
-than the roughly 33 ms seen with the old threshold/bootstrap behavior.
+a successful no-op. The zero threshold and corrected bootstrap remain the
+reason the renderer does not return to the roughly 33 ms Crossroads failure
+mode. The complete current path, including descriptor batching and stable-work
+compaction, measures about 7.9 ms.
 
 The A-buffer allocation is process-global but CUDA-context-owned. The first
 context to use it claims ownership under a process-global mutex. Other live
@@ -199,6 +231,30 @@ stress test kept two logical devices alive, destroyed them concurrently, then
 created a third; default and verification-mode external outputs were
 byte-identical. The internal colour verifier was not clean, as recorded under
 known issues below.
+
+### Performance-recovery mechanisms retained at `d7a88fd13b6`
+
+The final gain is a set of independent mechanisms, not one broad relaxation:
+
+- descriptor sets are inline host objects owned by their pool; recording alone
+  copies them into command-buffer device arenas, so allocation/free/reset no
+  longer performs one managed CUDA allocation per set;
+- descriptor content is not hashed or compared for batching because immutable
+  per-draw rows are the consumed state;
+- host-visible Vulkan allocations use managed memory, allowing hot UBO/SSBO
+  pages to migrate to the GPU instead of forcing every shader read over PCIe;
+- compute arguments and push constants use the renderer upload arena and
+  dispatches run on the renderer stream, preserving queue order without
+  per-dispatch allocation, synchronization and free;
+- after the required synchronous queue drain, `cp_scratch_reset()` frees
+  overflow arenas and rewinds the renderer scratch/upload bump allocators;
+- obsolete per-draw publication to the unread managed `cp_gpu_state` is gone;
+  and
+- exact embedded/lazy NVRTC products persist through Mesa's disk cache.
+
+Do not remove submission drains or broaden merge compatibility based on the
+aggregate speedup. Each mechanism above has its own ordering or lifetime proof;
+the remaining Vulkan sync and recorded-object gaps are listed below.
 
 ## Build and run
 
@@ -239,15 +295,17 @@ explicit next step.
 
 ## Exact validated state
 
-The current source was rebuilt after the final edit. The repeat rebuild was
-bit-identical and `ninja` reports no work. `git diff --check`,
+The native source at `d7a88fd13b6` was rebuilt after its final source edit.
+The repeat rebuild was bit-identical and `ninja` reported no work; this later
+handoff-only update does not alter the DSO. `git diff --check`,
 `cp_debug_doc.py --check`, a warning scan and the Gallium-integrity diff all
 pass.
 
 ### Standalone and sample gates
 
-- 25/25 `src/cudapipe/tests/cpvk_*.c` programs pass with no error,
-  unimplemented, refusal or overflow diagnostic.
+- 25/25 `src/cudapipe/tests/cpvk_*.c` programs pass functionally with no
+  driver error, unimplemented, refusal or overflow diagnostic. This is not a
+  claim that all 25 are clean under the Vulkan validation layer.
 - `cpvk_tex3d` passes on native and NVIDIA; NVIDIA with
   `VK_LAYER_KHRONOS_validation` is clean.
 - The post-optimization 60-frame sweep is
@@ -261,10 +319,11 @@ pass.
   59,925-pixel worst frame against a 25,542-pixel budget. Do not relabel that
   external mismatch as noise merely because native agrees with Gallium.
   `renderheadless` is byte-identical to Gallium but has no stored external
-  reference; its manual output is
-  `/tmp/renderheadless-final14/native/headless.ppm`. The independently tested
-  corrected `texture3d` result matches NVIDIA; Gallium's one-slice filtering
-  is knowingly wrong.
+  reference; the retained checkpoint-only manual artifact is
+  `/tmp/renderheadless-final14/native/headless.ppm`. The post-optimization
+  sweep records its successful process but does not create a new independent
+  image reference. The independently tested corrected `texture3d` result
+  matches NVIDIA; Gallium's one-slice filtering is knowingly wrong.
 - The final 600-frame BENCH sweep is
   `/tmp/cpvk-final-opt-perf-n2-cache`: the 17 benchmarked sample means sum to
   32.43 ms and wall time sums to 43.28 s. An isolated initially empty cache run
@@ -311,12 +370,16 @@ the recorded native candidate *measured against the same llvmpipe images*, the
 final counts move by at most one pixel and non-background counts are unchanged.
 Both replays exit zero and their logs contain no driver error/failure.
 
-The full-frame plans `/tmp/cp-validation/full-cross-final/all.json` and
-`/tmp/cp-validation/full-old-final/all.json` produced every planned native
-dump (1,494 and 1,509 respectively). The adjacent reference run is Gallium,
-not llvmpipe/NVIDIA, so these directories prove execution coverage and local
-stability only. They are **not** a full-frame external correctness pass. Run
-the same plans with llvmpipe or NVIDIA before making that claim.
+The pre-`d7a88fd13b6` checkpoint plans
+`/tmp/cp-validation/full-cross-final/all.json` and
+`/tmp/cp-validation/full-old-final/all.json` produced every planned native dump
+(1,494 and 1,509 respectively). They were not rerun after the stable-work,
+descriptor, memory and stream changes. Their adjacent reference run is Gallium,
+not llvmpipe/NVIDIA, so they prove execution coverage and local stability only
+for the base checkpoint. They are **not** current full-frame evidence or a
+full-frame external correctness pass. Current-code evidence is the 60-frame
+sweep and final-cache external sentinels above; rerun the full plans with
+llvmpipe or NVIDIA before making a stronger claim.
 
 Final FPS-plugin repetitions contain 1,496 Crossroads frames / 2,994 submits
 and 1,510 old frames / 3,022 submits:
@@ -331,38 +394,42 @@ paired-submit median: lazy pipeline/JIT work makes early-frame means noisy.
 The remaining Crossroads gap to Gallium is under a millisecond; the old replay
 is at the approximately 25 ms target.
 
-## Checkpoint scope
+## Commit and scope
 
-This commit records a validated code delta of 1,024 insertions / 302 deletions
-in these 14 native files, the two new tests, and the two handoff/validation
-documents below. It deliberately excludes unrelated working-tree files:
+The validated state is two focused commits:
+
+- `02f75c3637e` — workload-complete native checkpoint: 18 files, 3,271
+  insertions and 304 deletions, including `cpvk_bccopy`, `cpvk_tex3d` and
+  `CUDAPIPE_VALIDATION.md`;
+- `d7a88fd13b6` — performance recovery documented here: 11 files, 357
+  insertions and 283 deletions.
+
+The recovery commit changes only the handoff and these native implementation
+files:
 
 ```text
+CUDAPIPE_VK_NATIVE.md
 src/cudapipe/cp_kernels.c
 src/cudapipe/cp_kernels.h
 src/cudapipe/cp_renderer.c
-src/cudapipe/cp_renderer.h
 src/cudapipe/cpvk_cmd.c
 src/cudapipe/cpvk_device.c
 src/cudapipe/cpvk_device_memory.c
-src/cudapipe/cpvk_image.c
-src/cudapipe/cpvk_pipeline.c
-src/cudapipe/kernels/cp_fs.cu
+src/cudapipe/cpvk_private.h
+src/cudapipe/cpvk_sync.c
 src/cudapipe/kernels/cp_rast_types.h
-src/cudapipe/kernels/cp_sampler.cu
-src/cudapipe/nir_to_ptx/cp_nir_to_llvm.c
-src/cudapipe/nir_to_ptx/cp_nir_to_llvm.h
-src/cudapipe/tests/cpvk_bccopy.c
-src/cudapipe/tests/cpvk_tex3d.c
-CUDAPIPE_VK_NATIVE.md                  # native handoff
-CUDAPIPE_VALIDATION.md                 # validation procedure
+src/cudapipe/kernels/cp_rasterize.cu
 ```
+
+`src/gallium/drivers/cudapipe/` remains byte-identical to `e2e966953d7`.
+Unrelated root documents, scripts and logs remain untracked intentionally;
+continue staging explicit paths rather than using `git add -A`.
 
 ## Known issues and deliberate limits
 
-1. **The checkpoint is selective.** Unrelated documents, scripts and logs
-   remain untracked at repository root and are intentionally not part of this
-   commit. Continue to stage explicit paths rather than using `git add -A`.
+1. **The validated commits are selective.** Unrelated documents, scripts and
+   logs remain untracked at repository root and are intentionally outside this
+   state. Continue to stage explicit paths rather than using `git add -A`.
 2. **Headless and device 0 only.** There is no WSI, and physical-device
    enumeration exposes only CUDA device 0 even when CUDA reports more.
    `KHR_surface`/`KHR_swapchain` are advertised so headless applications can
@@ -431,13 +498,14 @@ CUDAPIPE_VALIDATION.md                 # validation procedure
    `VERDICT: MISMATCH` results (one 1-ULP/duplicate-unwritten case and one
    all-unwritten case). That run proves context safety/output equality, not a
    clean internal colour-verification pass.
-16. **Some object lifetime remains incomplete below device scope.**
+16. **Some object and pool semantics remain incomplete below device scope.**
     Descriptor sets are now host-only objects owned by their descriptor pool;
     free, pool reset and pool destroy release them without per-set CUDA
-    allocations. `cpvk_DestroyImageView` still does not explicitly free its
-    managed `cp_texture_info`, and recorded pipelines remain raw pointers.
-    Audit those owners before asynchronous submission or allocation-heavy
-    workloads.
+    allocations. Pool lifetime ownership is implemented, but `maxSets`, pool
+    sizes and allocation-capacity/accounting semantics are not enforced.
+    `cpvk_DestroyImageView` still does not explicitly free its managed
+    `cp_texture_info`, and recorded pipelines remain raw pointers. Audit those
+    owners before asynchronous submission or allocation-heavy workloads.
 17. **Depth attachments are renderer-private.** The current dynamic-rendering
     path represents a depth attachment as `has_zs`, while depth tests/clears
     use `cp_context::depthbuf`; it is not a general Vulkan depth-image storage
@@ -488,10 +556,11 @@ CUDAPIPE_VALIDATION.md                 # validation procedure
   scratch-arena rewind under a deferred batch both violated that rule while
   every API call still returned success. Memcpy-appending a secondary command
   is not enough when its recorded addresses belong to a secondary-owned arena.
-- Draining two CUDA streams proves eventual completion, not ordering between
-  them. It also cannot make an initially unsignalled fence report unsignalled
-  or turn recording-time event mutation into execution-time semantics. Test
-  negative/status cases, not only the workload's successful waits.
+- Moving graphics, transfer and compute onto one CUDA stream supplies queue
+  order; draining it supplies retirement. Neither operation gives payload-free
+  Vulkan fences logical unsignalled/reset state or turns recording-time event
+  mutation into execution-time semantics. Test negative/status cases, not only
+  the workload's successful waits.
 - Shader cache identity includes resource layout. SPIR-V-only keys silently
   reused code with the wrong descriptor offsets.
 - Primitive ordering is observable for blending. Atomic clip compaction is not
@@ -529,7 +598,7 @@ performance. The historical log below records the individual experiments.
 
 In order:
 
-1. **Archive the checkpoint evidence.** This focused commit records the
+1. **Archive the checkpoint evidence.** The two focused commits record the
    source, tests and procedures as a validated workload milestone, not a
    conformance claim. Copy the validated DSO, plans, external references,
    outputs, logs and checksums out of `/tmp` before cleanup or reboot.
@@ -538,20 +607,20 @@ In order:
    timing, draw/copy↔dispatch dependencies in both directions, a secondary
    command buffer that uses descriptors without prior submission, and
    pipeline destruction after recording but before submit. Fix those
-   failures with stateful sync, explicit cross-stream CUDA ordering (or one
-   ordered stream), and correct secondary arena ownership/upload. Only after
-   that should asynchronous return, CUDA-event fence retirement and removal of
-   submit drains be considered as one measured change.
+   failures with stateful sync, preserve the current ordered renderer stream,
+   and add correct secondary arena ownership/upload. Only after that should
+   asynchronous return, CUDA-event fence retirement and removal of submit
+   drains be considered as one measured change.
 3. **Complete the external image evidence.** Replay the existing Crossroads and
    old-capture `all.json` plans with llvmpipe or NVIDIA and compare by the
    shared manifest. Until then the external result is the 9/10-image sentinel
    gate, not a full-frame correctness pass. Investigate the standing
    `gltfscenerendering` NVIDIA mismatch rather than changing its tolerance.
-4. **Close the remaining object lifetime holes and manifest drift.** Add
-   create/reset/destroy stress for the now pool-owned host descriptor sets,
-   free image-view texture info, refcount pipelines recorded by command
-   buffers, audit context allocations, and emit a Vulkan-1.1 development
-   manifest.
+4. **Close the remaining object lifetime holes and manifest drift.** Enforce
+   descriptor-pool `maxSets`/pool-size capacity and accounting, add
+   create/reset/destroy stress for pool-owned host descriptor sets, free
+   image-view texture info, refcount pipelines recorded by command buffers,
+   audit context allocations, and emit a Vulkan-1.1 development manifest.
 5. **Make the native validation surface clean.** Fill the remaining physical
    limits/properties, implement or stop exposing unsupported KHR/WSI surfaces,
    run the native tests and representative samples with
@@ -1570,6 +1639,12 @@ one sampler state for a whole batch and falls back only if every row agrees.
 
 Until then the descriptor hash stays in the comparison: it is conservative,
 it is correct, and it costs the merges the capture would want.
+
+> **Superseded by `d7a88fd13b6`.** The later descriptor ownership/snapshot
+> rework removed the hash from merge equality. Focused descriptor tests, the
+> 60-frame sweep and the stored NVIDIA comparison established the accepted
+> current bounds; the unresolved experiment described in this historical
+> section is not the current design.
 
 ### Both binding tables are correct, and the merge is still wrong
 
@@ -6458,6 +6533,11 @@ Sampler specialization is the one renderer path that dereferences descriptor
 rows on the CPU; the queue publishes bounded device-to-host arena mappings and
 that path translates through them.  Re-submitting an unchanged command buffer
 does not upload it again.
+
+> **Updated by `d7a88fd13b6`.** The split host/device snapshot design remains,
+> but current staging is ordinary host allocation and graphics, compute and
+> transfers all execute on `renderer.stream`; the two-stream wording above is
+> historical.
 
 Measured with the same 60-frame BENCH sweep:
 
