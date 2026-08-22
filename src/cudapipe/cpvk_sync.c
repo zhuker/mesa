@@ -51,7 +51,7 @@ cpvk_sync_wait(struct vk_device *device, struct vk_sync *sync,
    /* Cheap insurance rather than a bare return: if a future submit stops
     * draining, this still means what it says. */
    cuCtxSetCurrent(dev->cu_ctx);
-   cuStreamSynchronize(dev->stream);
+   cuStreamSynchronize(dev->renderer.stream);
    return VK_SUCCESS;
 }
 

@@ -94,7 +94,10 @@ struct cpvk_device {
     * the context to do it -- and the context at that moment still describes
     * the previous draw. Allocated once; struct cpvk_draw is declared later.
     */
-   struct cpvk_draw *prev_draw;
+   /* Last recorded draw while a renderer batch is pending. Command-buffer
+    * operations are immutable for the duration of submit, so retaining their
+    * pointer avoids copying the large descriptor/push snapshot on every draw. */
+   const struct cpvk_draw *prev_draw;
    bool prev_draw_valid;
 
    /*
@@ -208,15 +211,11 @@ struct cpvk_descriptor_set {
    struct cpvk_descriptor_set_layout *layout;
    CUdeviceptr addrs[CPVK_MAX_BINDINGS];
 
-   /*
-    * The set as one buffer, which is what a texture handle points into: the
-    * shader computes `set_base + binding * sizeof(struct cpvk_descriptor)`
-    * and never loads it, so there is nowhere to put a per-binding address.
-    * Managed, because cp_renderer.c's sampler-variant specialisation reads
-    * these on the host.
-    */
-   CUdeviceptr buf;
+   /* Descriptor updates are host-only.  Recording copies this array into the
+    * command buffer's device arena, so a set itself needs no CUDA allocation. */
    struct cpvk_descriptor *host;
+   struct cpvk_descriptor_pool *pool;
+   struct cpvk_descriptor_set *pool_next;
 };
 
 /*
@@ -249,6 +248,7 @@ struct cpvk_sampler {
 
 struct cpvk_descriptor_pool {
    struct vk_object_base base;
+   struct cpvk_descriptor_set *sets;
 };
 
 /*
@@ -296,17 +296,6 @@ struct cpvk_draw {
    uint64_t vb_base[16];
    unsigned num_vb;
    CUdeviceptr addrs[16];
-   /*
-    * A hash of each bound set's descriptors, taken when it was bound.
-    *
-    * The addresses cannot be compared -- every bind is snapshotted into fresh
-    * memory, so two draws binding the identical set never share one -- and
-    * they cannot be ignored either, because merging draws that sample
-    * different textures shades the batch with one of them. gltfscenerendering
-    * went from exact to 20.768 that way. The contents are what matters and
-    * this is them.
-    */
-   uint64_t desc_hash[16];
    unsigned char push[CPVK_MAX_PUSH_BYTES];
    unsigned push_size;
 };
@@ -434,7 +423,6 @@ struct cpvk_cmd_buffer {
    struct cp_rect scissor;
    uint64_t vb_base[16];
    unsigned num_vb;
-   uint64_t desc_hash[16];
    unsigned fb_samples;
    const void *index_ptr;
    unsigned index_size;

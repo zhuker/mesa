@@ -98,21 +98,16 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       }
    }
 
-   /*
-    * Both streams. The compute path launches on dev->stream; every graphics
-    * op -- draws, clears and transfers alike -- launches on the renderer's
-    * cp->stream, and waiting only on the first left the whole graphics path
-    * unsynchronised. It raced and usually won, which is the worst way for
-    * this to be wrong: the textured test rendered correctly under a debug
-    * flag, whose device-side printing forced the synchronisation the driver
-    * had failed to ask for, and produced an empty frame without it.
-    */
-   /* Nothing may be left pending across a submit: the fence the caller
-    * waits on has to mean the draws have run. */
+   /* Nothing may be left pending across a submit: the payload-free sync
+    * objects are published by the common runtime as soon as this callback
+    * returns.  Graphics, compute and transfer operations all use the renderer
+    * stream, so this one drain covers the queue in recorded order. */
    cp_batch_flush(&dev->renderer);
-
-   cuStreamSynchronize(dev->stream);
    cuStreamSynchronize(dev->renderer.stream);
+
+   /* Rewind after full retirement.  The current arena generations remain at
+    * their high-water sizes; obsolete growth allocations go. */
+   cp_scratch_reset(&dev->renderer);
    return VK_SUCCESS;
 }
 
@@ -192,7 +187,8 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->cp_dev.cuda_ctx = dev->cu_ctx;
    dev->cp_dev.sm_major = pdev->sm_major;
    dev->cp_dev.sm_minor = pdev->sm_minor;
-   if (!cp_kernels_init(&dev->cp_dev.kernels, pdev->sm_major, pdev->sm_minor)) {
+   if (!cp_kernels_init(&dev->cp_dev.kernels, pdev->sm_major, pdev->sm_minor,
+                         pdev->vk.disk_cache)) {
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_stream;
    }
@@ -240,7 +236,6 @@ fail_stream:
       cuMemFree(dev->null_desc);
    if (dev->null_data)
       cuMemFree(dev->null_data);
-   free(dev->prev_draw);
    cuStreamDestroy(dev->stream);
 fail_ctx:
    cuCtxDestroy(dev->cu_ctx);
@@ -272,7 +267,6 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       cuMemFree(dev->null_desc);
    if (dev->null_data)
       cuMemFree(dev->null_data);
-   free(dev->prev_draw);
    simple_mtx_destroy(&dev->shader_cache_lock);
 
    cuStreamDestroy(dev->stream);
@@ -319,9 +313,13 @@ cpvk_AllocateMemory(VkDevice _device,
       mem->host_ptr = NULL;
       break;
    case CPVK_MEM_HOST:
-      err = cuMemHostAlloc(&mem->host_ptr, size, CU_MEMHOSTALLOC_DEVICEMAP);
-      if (err == CUDA_SUCCESS)
-         err = cuMemHostGetDevicePointer(&mem->dev_ptr, mem->host_ptr, 0);
+      /* Host-visible Vulkan allocations can contain hot UBO/SSBO data.  A
+       * permanently mapped cuMemAllocHost allocation makes every shader read
+       * cross PCIe; managed memory remains directly mappable but can settle on
+       * the GPU between host accesses. */
+      err = cuMemAllocManaged(&mem->dev_ptr, size, CU_MEM_ATTACH_GLOBAL);
+      mem->host_ptr = err == CUDA_SUCCESS
+         ? (void *)(uintptr_t)mem->dev_ptr : NULL;
       break;
    default:
       err = cuMemAllocManaged(&mem->dev_ptr, size, CU_MEM_ATTACH_GLOBAL);
@@ -362,14 +360,7 @@ cpvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
       return;
 
    cuCtxSetCurrent(dev->cu_ctx);
-   switch (mem->kind) {
-   case CPVK_MEM_HOST:
-      cuMemFreeHost(mem->host_ptr);
-      break;
-   default:
-      cuMemFree(mem->dev_ptr);
-      break;
-   }
+   cuMemFree(mem->dev_ptr);
 
    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
 }

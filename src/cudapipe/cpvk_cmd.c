@@ -27,6 +27,35 @@
 
 /* ---------------------------------------------------------------- pools */
 
+static void
+cpvk_descriptor_set_free(struct cpvk_device *dev,
+                         struct cpvk_descriptor_set *set)
+{
+   if (!set)
+      return;
+
+   if (set->pool) {
+      struct cpvk_descriptor_set **p = &set->pool->sets;
+      while (*p && *p != set)
+         p = &(*p)->pool_next;
+      if (*p)
+         *p = set->pool_next;
+   }
+   vk_object_free(&dev->vk, NULL, set);
+}
+
+static void
+cpvk_descriptor_pool_clear(struct cpvk_device *dev,
+                           struct cpvk_descriptor_pool *pool)
+{
+   while (pool && pool->sets) {
+      struct cpvk_descriptor_set *set = pool->sets;
+      pool->sets = set->pool_next;
+      set->pool = NULL;
+      vk_object_free(&dev->vk, NULL, set);
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_CreateDescriptorPool(VkDevice _device,
                           const VkDescriptorPoolCreateInfo *pCreateInfo,
@@ -52,8 +81,10 @@ cpvk_DestroyDescriptorPool(VkDevice _device, VkDescriptorPool _pool,
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_descriptor_pool, pool, _pool);
 
-   if (pool)
+   if (pool) {
+      cpvk_descriptor_pool_clear(dev, pool);
       vk_object_free(&dev->vk, pAllocator, pool);
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -62,46 +93,40 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
                             VkDescriptorSet *pDescriptorSets)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   VK_FROM_HANDLE(cpvk_descriptor_pool, pool,
+                  pAllocateInfo->descriptorPool);
 
    for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
       VK_FROM_HANDLE(cpvk_descriptor_set_layout, layout,
                      pAllocateInfo->pSetLayouts[i]);
+      size_t desc_size = layout
+         ? (size_t)layout->num_descriptors * sizeof(struct cpvk_descriptor)
+         : 0;
 
       struct cpvk_descriptor_set *set =
-         vk_object_zalloc(&dev->vk, NULL, sizeof(*set),
+         vk_object_zalloc(&dev->vk, NULL, sizeof(*set) + desc_size,
                           VK_OBJECT_TYPE_DESCRIPTOR_SET);
       if (!set) {
          for (uint32_t j = 0; j < i; j++) {
             VK_FROM_HANDLE(cpvk_descriptor_set, s, pDescriptorSets[j]);
-            vk_object_free(&dev->vk, NULL, s);
+            cpvk_descriptor_set_free(dev, s);
             pDescriptorSets[j] = VK_NULL_HANDLE;
          }
          return vk_error(dev, VK_ERROR_OUT_OF_POOL_MEMORY);
       }
       set->layout = layout;
+      set->pool = pool;
+      if (pool) {
+         set->pool_next = pool->sets;
+         pool->sets = set;
+      }
 
-      /* The set as one buffer: a texture handle is an offset into it. */
-      if (layout && layout->num_descriptors) {
-         cuCtxSetCurrent(dev->cu_ctx);
-         size_t size = (size_t)layout->num_descriptors *
-                       sizeof(struct cpvk_descriptor);
-         if (cuMemAllocManaged(&set->buf, size, CU_MEM_ATTACH_GLOBAL) ==
-             CUDA_SUCCESS) {
-            set->host = (struct cpvk_descriptor *)(uintptr_t)set->buf;
-            memset(set->host, 0, size);
-
-            /*
-             * A descriptor nothing ever writes still gets read, by a shader
-             * that declares a binding the application does not use on this
-             * path. Its base pointed at zero and took the device down; it
-             * points at the null page instead, so the read lands in zeroes
-             * and the frame is merely wrong. The capture's first compute
-             * dispatch died on exactly this: descriptor two of a bound set,
-             * never written, read eight bytes at 0x80.
-             */
-            for (unsigned d = 0; d < layout->num_descriptors; d++)
-               set->host[d].base = dev->null_data;
-         }
+      if (desc_size) {
+         set->host = (struct cpvk_descriptor *)(set + 1);
+         /* A descriptor nothing ever writes still gets read by some shaders.
+          * Point it at the null page instead of address zero. */
+         for (unsigned d = 0; d < layout->num_descriptors; d++)
+            set->host[d].base = dev->null_data;
       }
 
       pDescriptorSets[i] = cpvk_descriptor_set_to_handle(set);
@@ -117,8 +142,7 @@ cpvk_FreeDescriptorSets(VkDevice _device, VkDescriptorPool pool,
 
    for (uint32_t i = 0; i < count; i++) {
       VK_FROM_HANDLE(cpvk_descriptor_set, set, pSets[i]);
-      if (set)
-         vk_object_free(&dev->vk, NULL, set);
+      cpvk_descriptor_set_free(dev, set);
    }
    return VK_SUCCESS;
 }
@@ -127,6 +151,9 @@ VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_ResetDescriptorPool(VkDevice _device, VkDescriptorPool pool,
                          VkDescriptorPoolResetFlags flags)
 {
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+   VK_FROM_HANDLE(cpvk_descriptor_pool, desc_pool, pool);
+   cpvk_descriptor_pool_clear(dev, desc_pool);
    return VK_SUCCESS;
 }
 
@@ -387,7 +414,7 @@ cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
    cmd->push_size = 0;
    for (unsigned i = 0; i < cmd->num_desc_retired; i++) {
       cuMemFree(cmd->desc_retired[i].dev);
-      cuMemFreeHost(cmd->desc_retired[i].host);
+      free(cmd->desc_retired[i].host);
    }
    cmd->num_desc_retired = 0;
    cmd->desc_arena_used = 0;
@@ -403,13 +430,13 @@ cpvk_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd)
    vk_command_buffer_finish(&cmd->vk);
    for (unsigned i = 0; i < cmd->num_desc_retired; i++) {
       cuMemFree(cmd->desc_retired[i].dev);
-      cuMemFreeHost(cmd->desc_retired[i].host);
+      free(cmd->desc_retired[i].host);
    }
    free(cmd->desc_retired);
    if (cmd->desc_arena)
       cuMemFree(cmd->desc_arena);
    if (cmd->desc_arena_host)
-      cuMemFreeHost(cmd->desc_arena_host);
+      free(cmd->desc_arena_host);
    free(cmd->ops);
    vk_free(&cmd->vk.pool->alloc, cmd);
 }
@@ -461,7 +488,7 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->push_size = 0;
    for (unsigned i = 0; i < cmd->num_desc_retired; i++) {
       cuMemFree(cmd->desc_retired[i].dev);
-      cuMemFreeHost(cmd->desc_retired[i].host);
+      free(cmd->desc_retired[i].host);
    }
    cmd->num_desc_retired = 0;
    cmd->desc_arena_used = 0;
@@ -535,12 +562,14 @@ cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
                          cmd->desc_arena_used + bytes);
       want = MAX2(want, (size_t)64 * 1024);
       CUdeviceptr fresh = 0;
-      void *fresh_host = NULL;
-      if (cuMemAlloc(&fresh, want) != CUDA_SUCCESS ||
-          cuMemAllocHost(&fresh_host, want) != CUDA_SUCCESS) {
+      void *fresh_host = malloc(want);
+      /* Recording only writes this mirror and submit performs a synchronous
+       * HtoD copy, so page-locked memory buys no transfer overlap. */
+      if (!fresh_host || cuMemAlloc(&fresh, want) != CUDA_SUCCESS) {
+         free(fresh_host);
          if (fresh)
             cuMemFree(fresh);
-         return set->buf;
+         return 0;
       }
 
       /* The old arena is still referenced by the draws already recorded, so
@@ -550,8 +579,8 @@ cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
           !cpvk_arena_retire(cmd, cmd->desc_arena, cmd->desc_arena_host,
                              cmd->desc_arena_used)) {
          cuMemFree(fresh);
-         cuMemFreeHost(fresh_host);
-         return set->buf;
+         free(fresh_host);
+         return 0;
       }
       cmd->desc_arena = fresh;
       cmd->desc_arena_host = fresh_host;
@@ -600,19 +629,9 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
       if (slot < CPVK_MAX_ARG_BUFS) {
          cmd->addrs[slot] = snap_addr;
 
-         /* What the set contains, so two draws binding equal descriptors can
-          * merge even though each bind has its own copy. FNV-1a over the
-          * snapshot; a batch key is a merge decision, not a security
-          * boundary. */
-         uint64_t h = 0xcbf29ce484222325ull;
-         const uint8_t *bytes = (const uint8_t *)snap;
-         size_t n = (size_t)set->layout->num_descriptors *
-                    sizeof(struct cpvk_descriptor);
-         for (size_t b = 0; bytes && b < n; b++) {
-            h ^= bytes[b];
-            h *= 0x100000001b3ull;
-         }
-         cmd->desc_hash[slot] = h;
+         /* The snapshot itself is the per-draw descriptor row.  Its contents
+          * need not be hashed now that batches are allowed to carry distinct
+          * rows. */
       }
 
       /*
@@ -715,50 +734,50 @@ cpvk_execute_dispatch(struct cpvk_device *dev,
       }
    }
 
-   /* The argument block: an array of pointers, with the grid behind it,
-    * exactly as cp_launch_grid() builds it. */
-   const size_t args_bytes = CPVK_ARG_SLOTS * sizeof(void *);
-   const size_t total = args_bytes + 3 * sizeof(uint32_t);
+   /* A dispatch is an operation in the same Vulkan queue as graphics.  Flush
+    * anything recorded before it, then launch on the renderer stream so CUDA
+    * stream order implements that queue order in both directions. */
+   struct cp_context *cp = &dev->renderer;
+   cp_batch_flush(cp);
 
-   CUdeviceptr block;
-   if (cuMemAllocManaged(&block, total, CU_MEM_ATTACH_GLOBAL) !=
-       CUDA_SUCCESS)
+   /* One device-only upload block: the argument pointer array, its grid, and
+    * the optional push constants.  Managed allocations made the first warp
+    * fault these pages back from the host on every dispatch, then forced a
+    * stream drain merely so they could be freed. */
+   const size_t args_bytes = CPVK_ARG_SLOTS * sizeof(void *);
+   const size_t grid_bytes = 3 * sizeof(uint32_t);
+   const size_t push_off = ALIGN_POT(args_bytes + grid_bytes, 16);
+   const size_t total = push_off + d->push_size;
+   void *host = NULL;
+   CUdeviceptr block = cp_upload_begin(cp, total, &host);
+   if (!block || !host)
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
-   void **slots = (void **)(uintptr_t)block;
-   memset(slots, 0, total);
+   memset(host, 0, total);
+   void **slots = host;
    slots[0] = (void *)(uintptr_t)(block + args_bytes);
    for (unsigned s = 0; s < CPVK_MAX_ARG_BUFS; s++)
       slots[CPVK_ARG_UBO_BASE + s] = (void *)(uintptr_t)
          (d->addrs[s] ? d->addrs[s] : dev->null_desc);
 
-   /*
-    * The push constant block, in slot 0, which the graphics path staged
-    * and this one did not. A compute shader reading push constants
-    * therefore read address zero: compute-sanitizer reported an 8-byte
-    * read at 0x80, which is 128 bytes into a block that was not there.
-    */
-   CUdeviceptr push_block = 0;
    if (d->push_size) {
-      if (cuMemAllocManaged(&push_block, d->push_size,
-                            CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
-         memcpy((void *)(uintptr_t)push_block, d->push, d->push_size);
-         slots[CPVK_ARG_UBO_BASE + CPVK_UBO_PUSH_SLOT] =
-            (void *)(uintptr_t)push_block;
-      }
+      memcpy((char *)host + push_off, d->push, d->push_size);
+      slots[CPVK_ARG_UBO_BASE + CPVK_UBO_PUSH_SLOT] =
+         (void *)(uintptr_t)(block + push_off);
    }
 
-   uint32_t *grid = (uint32_t *)((char *)slots + args_bytes);
+   uint32_t *grid = (uint32_t *)((char *)host + args_bytes);
    grid[0] = d->grid[0];
    grid[1] = d->grid[1];
    grid[2] = d->grid[2];
+   cp_upload_end(cp, block, host, total);
 
    void *kernel_args[] = { &block };
    unsigned bx = MAX2(d->pipeline->local_size[0], (uint16_t)1);
    unsigned by = MAX2(d->pipeline->local_size[1], (uint16_t)1);
    unsigned bz = MAX2(d->pipeline->local_size[2], (uint16_t)1);
    CUresult err = cuLaunchKernel(bin->kernel, d->grid[0], d->grid[1],
-                                 d->grid[2], bx, by, bz, 0, dev->stream,
+                                 d->grid[2], bx, by, bz, 0, cp->stream,
                                  kernel_args, NULL);
    if (err != CUDA_SUCCESS) {
       /* Name it. A submit that returns DEVICE_LOST and says nothing else
@@ -773,18 +792,8 @@ cpvk_execute_dispatch(struct cpvk_device *dev,
          if (d->addrs[s])
             fprintf(stderr, " [%u]=%p", s, (void *)(uintptr_t)d->addrs[s]);
       fprintf(stderr, "\n");
-      cuMemFree(block);
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
    }
-
-   /* The blocks are read by the kernel, so they cannot be released until
-    * the launch has run. One sync per dispatch is the wrong answer and is
-    * replaced by the upload arena when there is a frame to amortise it
-    * over; at one dispatch it is honest and obvious. */
-   cuStreamSynchronize(dev->stream);
-   cuMemFree(block);
-   if (push_block)
-      cuMemFree(push_block);
 
    return VK_SUCCESS;
 }
@@ -1155,7 +1164,6 @@ cpvk_record_draw(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first,
    memcpy(d->vb_base, cmd->vb_base, sizeof(d->vb_base));
    d->num_vb = cmd->num_vb;
    memcpy(d->addrs, cmd->addrs, sizeof(d->addrs));
-   memcpy(d->desc_hash, cmd->desc_hash, sizeof(d->desc_hash));
    memcpy(d->push, cmd->push, sizeof(d->push));
    d->push_size = cmd->push_size;
 }
@@ -1441,34 +1449,9 @@ cpvk_draws_mergeable(const struct cpvk_draw *a, const struct cpvk_draw *b)
     */
    if (getenv("CPVK_KEEP_INSTKEY"))
       CPVK_DIFF(a->call.instance_count != b->call.instance_count, "instance count");
-   /*
-    * The descriptors, by content.
-    *
-    * cpvk_batch and cpvk_batchtex show two and three draws differing only in
-    * their descriptor set -- uniform buffers in one, textures in the other --
-    * merging correctly without this, so in principle the per-draw binding
-    * rows make it unnecessary. In practice removing it still costs
-    * gltfscenerendering its correctness (0.000 to 20.768) even with the
-    * vertex offset now a merge condition, and one measurement to the contrary
-    * in the same turn did not reproduce. It stays until that is settled.
-    */
-   /*
-    * The descriptors, by content.
-    *
-    * Required, measured three runs each way: gltfscenerendering is 0.000 with
-    * this and 20.768 without. Why is still open -- every property of those
-    * draws that could plausibly need it has been reproduced in cpvk_batch and
-    * cpvk_batchtex and merges correctly without it: three draws, three
-    * descriptor sets, three textures, overlapping geometry at three depths
-    * with the depth test on, and a discarding fragment shader.
-    *
-    * What is left untested is the size of the batch (nine draws there, three
-    * here) and a layout with more than one descriptor set. CPVK_NO_DESC_KEY
-    * turns it off for the next person who wants to bisect that.
-    */
-   if (!getenv("CPVK_NO_DESC_KEY"))
-      CPVK_DIFF(memcmp(a->desc_hash, b->desc_hash, sizeof(a->desc_hash)),
-                "descriptors");
+   /* Descriptor bindings deliberately differ inside a batch.  The renderer's
+    * per-draw UBO rows point at the immutable snapshots owned by this command
+    * buffer; requiring equal sets only split otherwise identical work. */
    CPVK_DIFF(a->num_vb != b->num_vb, "vertex buffer count");
    CPVK_DIFF(memcmp(a->vb_base, b->vb_base, sizeof(a->vb_base)), "vertex buffers");
    CPVK_DIFF(a->push_size != b->push_size, "push constant size");
@@ -1693,12 +1676,8 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
       batch_ok = cpvk_batch_can_join(dev, d, &batch_blended);
    }
 
-   if (!dev->prev_draw)
-      dev->prev_draw = malloc(sizeof(*dev->prev_draw));
-   if (dev->prev_draw) {
-      *dev->prev_draw = *d;
-      dev->prev_draw_valid = true;
-   }
+   dev->prev_draw = d;
+   dev->prev_draw_valid = true;
 
    cp->viewport = d->viewport;
    cp->scissor = d->scissor;
@@ -1764,7 +1743,10 @@ cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d)
 
 
 
-   cp_context_publish_state(cp);
+   /* The renderer takes all draw state through explicit launch arguments and
+    * batch snapshots.  Its legacy managed cp_gpu_state has no kernel reader;
+    * publishing 16 vertex bases and 32 UBO pointers into it on every recorded
+    * draw only dirtied managed pages on the host. */
 
    /*
     * Hold the draw back if it can join the one before it. The machinery is

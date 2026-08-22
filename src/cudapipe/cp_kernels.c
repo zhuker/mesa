@@ -3,6 +3,8 @@
 #include "kernels/cp_rast_types.h"
 #include "util/u_memory.h"
 #include "util/macros.h"
+#include "util/blob.h"
+#include "util/disk_cache.h"
 
 #include <nvrtc.h>
 #include <assert.h>
@@ -29,6 +31,12 @@ static const char cp_sampler_src[] =
 static const char cp_vertex_fetch_src[] =
 #include "cp_vertex_fetch.cu.inc"
 ;
+
+
+/* The physical device owns this cache.  Native exposes one CUDA device per
+ * process today; keeping the pointer here also covers lazily compiled sampler
+ * variants without threading cache state through every helper. */
+static struct disk_cache *cp_nvrtc_cache;
 
 /* The kernels share this header; NVRTC has no filesystem, so hand it over
  * in memory rather than pointing it at an include directory. */
@@ -138,6 +146,38 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
    }
 
    assert(num_opts <= ARRAY_SIZE(opts));
+
+   cache_key key;
+   bool have_key = false;
+   if (cp_nvrtc_cache) {
+      struct blob key_blob;
+      blob_init(&key_blob);
+      blob_write_string(&key_blob, "cudapipe NVRTC PTX v1");
+      int nvrtc_major = 0, nvrtc_minor = 0;
+      nvrtcVersion(&nvrtc_major, &nvrtc_minor);
+      blob_write_uint32(&key_blob, (uint32_t)nvrtc_major);
+      blob_write_uint32(&key_blob, (uint32_t)nvrtc_minor);
+      blob_write_string(&key_blob, name);
+      blob_write_string(&key_blob, source);
+      blob_write_string(&key_blob, cp_rast_types_src);
+      for (unsigned i = 0; i < num_opts; i++)
+         blob_write_string(&key_blob, opts[i]);
+      if (!key_blob.out_of_memory) {
+         disk_cache_compute_key(cp_nvrtc_cache, key_blob.data, key_blob.size,
+                                key);
+         have_key = true;
+         size_t cached_size = 0;
+         char *cached = disk_cache_get(cp_nvrtc_cache, key, &cached_size);
+         if (cached && cached_size && cached[cached_size - 1] == '\0') {
+            blob_finish(&key_blob);
+            nvrtcDestroyProgram(&prog);
+            return cached;
+         }
+         free(cached);
+      }
+      blob_finish(&key_blob);
+   }
+
    res = nvrtcCompileProgram(prog, num_opts, opts);
    if (res != NVRTC_SUCCESS) {
       size_t log_size;
@@ -156,6 +196,8 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
    nvrtcGetPTX(prog, ptx);
    nvrtcDestroyProgram(&prog);
 
+   if (have_key)
+      disk_cache_put(cp_nvrtc_cache, key, ptx, ptx_size, NULL);
    return ptx;
 }
 
@@ -256,9 +298,11 @@ build_module(CUmodule *out, const char *src, const char *name,
 }
 
 bool
-cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor)
+cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
+                struct disk_cache *disk_cache)
 {
    memset(k, 0, sizeof(*k));
+   cp_nvrtc_cache = disk_cache;
 
    if (!build_module(&k->clear_module, cp_clear_src, "cp_clear.cu", sm_major, sm_minor))
       return false;

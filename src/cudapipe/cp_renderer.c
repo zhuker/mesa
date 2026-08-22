@@ -3938,6 +3938,14 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                   bool stable_clip = cp->blend_enabled ||
                      (batch_draws > 1 && cp->fs_shader &&
                       cp->fs_shader->reads_const_bufs);
+                  /* Stable IDs no longer require rasterizing all seven unused
+                   * slots beside the usual one-triangle output.  The clipper
+                   * appends live fixed-slot IDs here; allocation failure keeps
+                   * the proven hole-filled path as a correctness fallback. */
+                  CUdeviceptr active_ids = stable_clip
+                     ? cp_scratch_alloc_device(
+                          cp, (size_t)max_clipped * sizeof(uint32_t))
+                     : 0;
 
                   if (getenv("CPVK_DEBUG_CLIP"))
                      fprintf(stderr, "clip: tris=%u batch_draws=%u stable=%d "
@@ -3946,13 +3954,14 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                              cp->fs_shader ? (int)cp->fs_shader->reads_const_bufs : -1);
 
                   cuMemsetD32Async(clip_count,
-                                   stable_clip ? max_clipped : 0, 1,
-                                   cp->stream);
+                                   stable_clip && !active_ids ? max_clipped : 0,
+                                   1, cp->stream);
 
                   struct cp_clip_args clip = {
                      .vs_out = vs_output_buf,
                      .out = clipped,
                      .out_count = clip_count,
+                     .active_ids = active_ids,
                      .num_triangles = num_triangles,
                      .num_slots = num_vs_outputs,
                      .max_triangles = max_clipped,
@@ -3968,6 +3977,12 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                      vs_output_buf = clipped;
                      rast_args.positions = clipped;
                      rast_args.tri_count = clip_count;
+                     rast_args.active_ids = active_ids;
+                     /* active_ids contains fixed IDs up to max_clipped - 1;
+                      * num_triangles is their validity bound, while tri_count
+                      * remains the compact amount of initial work. */
+                     if (active_ids)
+                        rast_args.num_triangles = max_clipped;
                      rast_num_triangles = max_clipped;
                      if (stable_clip) {
                         cp->fs_batch.prim_shift = 3;
@@ -4627,7 +4642,11 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                      cp->fs_shader && !cp->fs_shader->writes_memory &&
                      (size_t)ab->nblocks * rast_num_triangles * 4 <=
                         (size_t)(512u << 10) &&
-                     (size_t)rast_num_triangles * n <= ab->capacity &&
+                     /* Clipping triangulates each input polygon; its pieces
+                      * do not multiply covered pixels. Stable-slot capacity is
+                      * therefore bounded by input triangles, not by the eight
+                      * reserved output IDs per input triangle. */
+                     (size_t)num_triangles * n <= ab->capacity &&
                      (size_t)ab->nblocks * rast_num_triangles <=
                         ab->quad_capacity;
       if (bounded) {

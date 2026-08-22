@@ -8,6 +8,7 @@
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
 #include "vk_util.h"
+#include "util/disk_cache.h"
 #include "util/u_debug.h"
 
 /*
@@ -200,6 +201,10 @@ cpvk_physical_device_destroy(struct vk_physical_device *vk_pdev)
    struct cpvk_physical_device *pdev =
       container_of(vk_pdev, struct cpvk_physical_device, vk);
 
+   if (pdev->vk.disk_cache) {
+      disk_cache_destroy(pdev->vk.disk_cache);
+      pdev->vk.disk_cache = NULL;
+   }
    vk_physical_device_finish(&pdev->vk);
    vk_free(&pdev->vk.instance->alloc, pdev);
 }
@@ -264,6 +269,8 @@ cpvk_enumerate_physical_devices(struct vk_instance *vk_instance)
    }
 
    pdev->vk.supported_sync_types = cpvk_sync_types;
+   pdev->vk.disk_cache = disk_cache_create(
+      pdev->name, "cudapipe-native-nvrtc-v1", 0);
 
    list_addtail(&pdev->vk.link, &instance->vk.physical_devices.list);
    return VK_SUCCESS;
@@ -422,9 +429,10 @@ cpvk_GetPhysicalDeviceMemoryProperties(
     * type index exceeds number of available memory types" before a frame
     * was drawn. One heap for the same reason.
     *
-    * Both host-visible types are honest: cuMemAllocHost is pinned and the
-    * CPU caches it, and managed memory is device-local and host-visible by
-    * construction.
+    * Both host-visible types use managed memory, which is directly host
+    * mapped and can migrate to the GPU.  Type 2 additionally advertises that
+    * device locality; type 1 exists so captured non-device-local requirements
+    * still have an exact property match.
     */
    *pMemoryProperties = (VkPhysicalDeviceMemoryProperties) {
       .memoryHeapCount = 1,

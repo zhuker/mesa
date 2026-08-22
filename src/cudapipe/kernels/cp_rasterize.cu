@@ -229,6 +229,16 @@ clip_emit(struct cp_clip_args *args, float4 *out, uint32_t slots,
       : atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
    if (o >= args->max_triangles)
       return NULL;
+
+   /* In stable mode o is the primitive's ordered fixed-slot ID.  Append that
+    * ID to a compact worklist instead of making the rasterizer visit the
+    * unused slots beside it.  The append order is deliberately irrelevant:
+    * visibility and A-buffer records retain o, which is the ordering key. */
+   if (args->stable && args->active_ids) {
+      uint32_t at = atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
+      if (at < args->max_triangles)
+         ((uint32_t *)(uintptr_t)args->active_ids)[at] = o;
+   }
    return out + (size_t)o * 3 * slots;
 }
 
@@ -286,7 +296,7 @@ cp_clip_triangles(struct cp_clip_args args)
       float4 *dst = clip_emit(&args, out, slots, tri, 0);
       if (dst)
          clip_copy(dst, v, 3 * slots);
-      if (args.stable)
+      if (args.stable && !args.active_ids)
          clip_retire(&args, out, slots, tri, 1);
       return;
    }
@@ -301,7 +311,7 @@ cp_clip_triangles(struct cp_clip_args args)
       float4 *dst = (p & 1) ? poly_b : poly_a;
       n = clip_poly(dst, src, n, slots, p);
       if (n < 3) {
-         if (args.stable)
+         if (args.stable && !args.active_ids)
             clip_retire(&args, out, slots, tri, 0);
          return;
       }
@@ -319,7 +329,7 @@ cp_clip_triangles(struct cp_clip_args args)
       clip_copy(dst + slots, src + (size_t)i * slots, slots);
       clip_copy(dst + 2 * slots, src + (size_t)(i + 1) * slots, slots);
    }
-   if (args.stable)
+   if (args.stable && !args.active_ids)
       clip_retire(&args, out, slots, tri, (uint32_t)k);
 }
 
@@ -338,6 +348,24 @@ cp_num_triangles(const struct cp_rasterize_args *args)
    return args->tri_count
       ? *(const volatile uint32_t *)(uintptr_t)args->tri_count
       : args->num_triangles;
+}
+
+/* Map a compact work item back to the fixed primitive ID stable clipping
+ * assigned it.  Queues, visibility and fragment records all carry that fixed
+ * ID; only kernels which enumerate the initial work use this mapping. */
+static __device__ __forceinline__ uint32_t
+cp_triangle_id(const struct cp_rasterize_args *args, uint32_t work)
+{
+   return args->active_ids
+      ? ((const uint32_t *)(uintptr_t)args->active_ids)[work]
+      : work;
+}
+
+static __device__ __forceinline__ bool
+cp_triangle_id_valid(const struct cp_rasterize_args *args, uint32_t tri)
+{
+   return tri < (args->active_ids ? args->num_triangles
+                                  : cp_num_triangles(args));
 }
 
 /*
@@ -701,11 +729,12 @@ template <bool ABUF>
 static __device__ __forceinline__ void
 cp_rasterize_stage1_body(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
-   uint32_t tri_id = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t work = blockIdx.x * blockDim.x + threadIdx.x;
    /* After clipping the count lives on the device, so the grid is sized for
     * the worst case and each thread bounds itself. */
-   if (tri_id >= cp_num_triangles(&args))
+   if (work >= cp_num_triangles(&args))
       return;
+   uint32_t tri_id = cp_triangle_id(&args, work);
 
    struct tri_setup s;
    if (!setup_triangle(&args, tri_id, &s))
@@ -801,7 +830,6 @@ cp_rasterize_stage2_body(struct cp_rasterize_args args, struct cp_rast_queues qu
    uint32_t *nt_counter = (uint32_t *)(uintptr_t)queues.nontrivial_count;
    uint32_t num_nontrivial = cp_queue_used(*nt_counter, CP_MAX_NONTRIVIAL);
    uint32_t *nt_queue = (uint32_t *)(uintptr_t)queues.nontrivial;
-   uint32_t num_triangles = cp_num_triangles(&args);
 
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
 
@@ -829,7 +857,7 @@ cp_rasterize_stage2_body(struct cp_rasterize_args args, struct cp_rast_queues qu
          continue;
 
       uint32_t tri_id = entry;
-      if (tri_id >= num_triangles)
+      if (!cp_triangle_id_valid(&args, tri_id))
          continue;
 
       /* Lane 0 does triangle setup for the whole warp. */
@@ -944,7 +972,6 @@ cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues qu
 {
    uint32_t *huge_counter = (uint32_t *)(uintptr_t)queues.huge_count;
    uint32_t num_tiles = cp_queue_used(*huge_counter, CP_MAX_HUGE_TILES);
-   uint32_t num_triangles = cp_num_triangles(&args);
 
    struct cp_tile_pair *huge_queue =
       (struct cp_tile_pair *)(uintptr_t)queues.huge_tiles;
@@ -979,7 +1006,8 @@ cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues qu
       if (threadIdx.x == 0) {
          struct tri_setup s;
          sh_valid = 0;
-         if (tri_id < num_triangles && setup_triangle(&args, tri_id, &s)) {
+         if (cp_triangle_id_valid(&args, tri_id) &&
+             setup_triangle(&args, tri_id, &s)) {
             sh_s = s;
 
             /* A point's square is tested per pixel below; it has no edges to
@@ -1976,8 +2004,9 @@ cp_tile_census_refs(struct cp_rasterize_args rast,
                     struct cp_tile_census_args args)
 {
    uint32_t n = cp_num_triangles(&rast);
-   for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x; tri < n;
-        tri += gridDim.x * blockDim.x) {
+   for (uint32_t work = blockIdx.x * blockDim.x + threadIdx.x; work < n;
+        work += gridDim.x * blockDim.x) {
+      uint32_t tri = cp_triangle_id(&rast, work);
       struct tri_setup setup;
       if (!setup_triangle(&rast, tri, &setup))
          continue;
@@ -2145,8 +2174,9 @@ extern "C" __global__ void
 cp_opaque_tile_count(struct cp_opaque_tile_build_args args)
 {
    uint32_t n = cp_num_triangles(&args.rast);
-   for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x; tri < n;
-        tri += gridDim.x * blockDim.x) {
+   for (uint32_t work = blockIdx.x * blockDim.x + threadIdx.x; work < n;
+        work += gridDim.x * blockDim.x) {
+      uint32_t tri = cp_triangle_id(&args.rast, work);
       struct tri_setup setup;
       if (!setup_triangle(&args.rast, tri, &setup))
          continue;
@@ -2165,8 +2195,9 @@ extern "C" __global__ void
 cp_opaque_tile_fill(struct cp_opaque_tile_build_args args)
 {
    uint32_t n = cp_num_triangles(&args.rast);
-   for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x; tri < n;
-        tri += gridDim.x * blockDim.x) {
+   for (uint32_t work = blockIdx.x * blockDim.x + threadIdx.x; work < n;
+        work += gridDim.x * blockDim.x) {
+      uint32_t tri = cp_triangle_id(&args.rast, work);
       struct tri_setup setup;
       if (!setup_triangle(&args.rast, tri, &setup))
          continue;

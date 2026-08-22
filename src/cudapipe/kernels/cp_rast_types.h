@@ -109,6 +109,15 @@ struct cp_rasterize_args {
     * Zero means the count is not known on the GPU and num_triangles applies. */
    uint64_t tri_count;
    /*
+    * Stable clipping keeps the primitive ID tied to the input triangle so
+    * ordered blending can sort by submission order.  active_ids compacts the
+    * actual output into work indices without renumbering those primitives:
+    * stage 1 maps work item i through active_ids[i], while later queues and
+    * visibility records continue to carry the stable ID.  num_triangles is
+    * the stable-ID limit and *tri_count is the compact work count.
+    */
+   uint64_t active_ids;      /* const uint32_t *, zero on the compact path */
+   /*
     * Alpha-tested geometry. Visibility is resolved before the shader runs, so
     * a fragment that turns out to discard has already displaced the one behind
     * it. The draw is repeated: each pass records the triangle that discarded
@@ -276,6 +285,9 @@ struct cp_clip_args {
    uint64_t vs_out;         /* Input: 3 vertices per triangle, num_slots float4 each */
    uint64_t out;            /* Output: same layout, compacted */
    uint64_t out_count;      /* Output: uint32 triangle counter */
+   /* Stable mode optionally appends each live fixed-slot ID here.  This keeps
+    * primitive IDs ordered while letting rasterization skip retired holes. */
+   uint64_t active_ids;      /* Output: uint32[max_triangles], or zero */
    uint32_t num_triangles;
    uint32_t num_slots;      /* Position plus varyings, i.e. num_varyings + 1 */
    uint32_t max_triangles;  /* Capacity of `out`, in triangles */

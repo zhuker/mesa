@@ -87,7 +87,9 @@ bool cp_kernels_instrumented(void);
 /* The device's compute capability is all this needs of a screen, so it takes
  * that and not the screen: the kernels are the same kernels whichever Vulkan
  * front end is above them, and this file is compiled into both drivers. */
-bool cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor);
+struct disk_cache;
+bool cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
+                     struct disk_cache *disk_cache);
 void cp_kernels_destroy(struct cp_kernels *k);
 
 char *cp_compile_sampler_3d(int sm_major, int sm_minor);
