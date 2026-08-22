@@ -403,6 +403,9 @@ cpvk_cmd_release_objects(struct cpvk_cmd_buffer *cmd)
    for (unsigned i = 0; i < cmd->num_retained_queries; i++)
       cpvk_query_pool_unref(cmd->retained_queries[i]);
    cmd->num_retained_queries = 0;
+   for (unsigned i = 0; i < cmd->num_retained_events; i++)
+      cpvk_event_unref(cmd->retained_events[i]);
+   cmd->num_retained_events = 0;
 }
 
 static bool
@@ -453,6 +456,29 @@ cpvk_cmd_retain_query(struct cpvk_cmd_buffer *cmd,
    return true;
 }
 
+static bool
+cpvk_cmd_retain_event(struct cpvk_cmd_buffer *cmd, struct cpvk_event *event)
+{
+   if (!event)
+      return true;
+   for (unsigned i = 0; i < cmd->num_retained_events; i++)
+      if (cmd->retained_events[i] == event)
+         return true;
+   if (cmd->num_retained_events == cmd->max_retained_events) {
+      unsigned cap = cmd->max_retained_events ?
+                     cmd->max_retained_events * 2 : 4;
+      void *p = realloc(cmd->retained_events,
+                        cap * sizeof(*cmd->retained_events));
+      if (!p)
+         return false;
+      cmd->retained_events = p;
+      cmd->max_retained_events = cap;
+   }
+   cpvk_event_ref(event);
+   cmd->retained_events[cmd->num_retained_events++] = event;
+   return true;
+}
+
 static void
 cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
                       VkCommandBufferResetFlags flags)
@@ -496,6 +522,7 @@ cpvk_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd)
    free(cmd->desc_retired);
    free(cmd->retained_pipelines);
    free(cmd->retained_queries);
+   free(cmd->retained_events);
    if (cmd->desc_arena)
       cuMemFree(cmd->desc_arena);
    if (cmd->desc_arena_host)
@@ -897,6 +924,12 @@ cpvk_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t count,
             return;
          }
       }
+      for (unsigned e = 0; e < sec->num_retained_events; e++) {
+         if (!cpvk_cmd_retain_event(cmd, sec->retained_events[e])) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+            return;
+         }
+      }
 
       if (cmd->num_ops + sec->num_ops > cmd->max_ops) {
          unsigned want = MAX2(cmd->max_ops ? cmd->max_ops * 2 : 64,
@@ -944,6 +977,11 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                        const VkRenderingInfo *pRenderingInfo)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+
+   if (pRenderingInfo->colorAttachmentCount > 1) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
 
    struct cp_fb_desc fb = {
       .width = pRenderingInfo->renderArea.offset.x +
@@ -2365,34 +2403,78 @@ cpvk_CreateEvent(VkDevice _device, const VkEventCreateInfo *pCreateInfo,
    if (!event)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   event->dev = dev;
+   event->alloc = pAllocator ? *pAllocator : dev->vk.alloc;
+   atomic_init(&event->refcnt, 1);
+   if (mtx_init(&event->lock, mtx_plain) != thrd_success) {
+      vk_object_free(&dev->vk, &event->alloc, event);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   if (cnd_init(&event->changed) != thrd_success) {
+      mtx_destroy(&event->lock);
+      vk_object_free(&dev->vk, &event->alloc, event);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
    *pEvent = cpvk_event_to_handle(event);
    return VK_SUCCESS;
+}
+
+void
+cpvk_event_ref(struct cpvk_event *event)
+{
+   if (event)
+      atomic_fetch_add_explicit(&event->refcnt, 1, memory_order_relaxed);
+}
+
+void
+cpvk_event_unref(struct cpvk_event *event)
+{
+   if (!event ||
+       atomic_fetch_sub_explicit(&event->refcnt, 1,
+                                 memory_order_acq_rel) != 1)
+      return;
+   cnd_destroy(&event->changed);
+   mtx_destroy(&event->lock);
+   vk_object_free(&event->dev->vk, &event->alloc, event);
 }
 
 VKAPI_ATTR void VKAPI_CALL
 cpvk_DestroyEvent(VkDevice _device, VkEvent _event,
                   const VkAllocationCallbacks *pAllocator)
 {
-   VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_event, event, _event);
-
-   if (event)
-      vk_object_free(&dev->vk, pAllocator, event);
+   cpvk_event_unref(event);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_GetEventStatus(VkDevice _device, VkEvent _event)
 {
    VK_FROM_HANDLE(cpvk_event, event, _event);
-   return (event && event->signaled) ? VK_EVENT_SET : VK_EVENT_RESET;
+   if (!event)
+      return VK_EVENT_RESET;
+   mtx_lock(&event->lock);
+   bool signaled = event->signaled;
+   mtx_unlock(&event->lock);
+   return signaled ? VK_EVENT_SET : VK_EVENT_RESET;
+}
+
+static void
+cpvk_event_set_state(struct cpvk_event *event, bool signaled)
+{
+   if (!event)
+      return;
+   mtx_lock(&event->lock);
+   event->signaled = signaled;
+   cnd_broadcast(&event->changed);
+   mtx_unlock(&event->lock);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_SetEvent(VkDevice _device, VkEvent _event)
 {
    VK_FROM_HANDLE(cpvk_event, event, _event);
-   if (event)
-      event->signaled = true;
+   cpvk_event_set_state(event, true);
    return VK_SUCCESS;
 }
 
@@ -2400,27 +2482,41 @@ VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_ResetEvent(VkDevice _device, VkEvent _event)
 {
    VK_FROM_HANDLE(cpvk_event, event, _event);
-   if (event)
-      event->signaled = false;
+   cpvk_event_set_state(event, false);
    return VK_SUCCESS;
+}
+
+static void
+cpvk_record_event(struct cpvk_cmd_buffer *cmd, struct cpvk_event *event,
+                  enum cpvk_op_kind kind)
+{
+   if (!event)
+      return;
+   if (!cpvk_cmd_retain_event(cmd, event)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   struct cpvk_op *op = cpvk_op_alloc(cmd, kind);
+   if (op)
+      op->event.event = event;
 }
 
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
                   const VkDependencyInfo *pDependencyInfo)
 {
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_event, event, _event);
-   if (event)
-      event->signaled = true;
+   cpvk_record_event(cmd, event, CPVK_OP_EVENT_SET);
 }
 
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
                     VkPipelineStageFlags2 stageMask)
 {
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_event, event, _event);
-   if (event)
-      event->signaled = false;
+   cpvk_record_event(cmd, event, CPVK_OP_EVENT_RESET);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2428,20 +2524,107 @@ cpvk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
                     const VkEvent *pEvents,
                     const VkDependencyInfo *pDependencyInfos)
 {
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   for (uint32_t i = 0; i < eventCount; i++) {
+      VK_FROM_HANDLE(cpvk_event, event, pEvents[i]);
+      cpvk_record_event(cmd, event, CPVK_OP_EVENT_WAIT);
+   }
 }
 
-/*
- * Barriers are recorded and ignored, deliberately.
- *
- * Everything this driver submits runs on one CUDA stream, and stream order is
- * program order, so the dependency a barrier expresses already holds. This is
- * not a stub to fill in later: it is the same reasoning that lets the Gallium
- * driver launch a clear on cp->stream instead of synchronising.
- */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdSetEvent(VkCommandBuffer commandBuffer, VkEvent _event,
+                 VkPipelineStageFlags stageMask)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_event, event, _event);
+   cpvk_record_event(cmd, event, CPVK_OP_EVENT_SET);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdResetEvent(VkCommandBuffer commandBuffer, VkEvent _event,
+                   VkPipelineStageFlags stageMask)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_event, event, _event);
+   cpvk_record_event(cmd, event, CPVK_OP_EVENT_RESET);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount,
+                   const VkEvent *pEvents,
+                   VkPipelineStageFlags srcStageMask,
+                   VkPipelineStageFlags dstStageMask,
+                   uint32_t memoryBarrierCount,
+                   const VkMemoryBarrier *pMemoryBarriers,
+                   uint32_t bufferMemoryBarrierCount,
+                   const VkBufferMemoryBarrier *pBufferMemoryBarriers,
+                   uint32_t imageMemoryBarrierCount,
+                   const VkImageMemoryBarrier *pImageMemoryBarriers)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   for (uint32_t i = 0; i < eventCount; i++) {
+      VK_FROM_HANDLE(cpvk_event, event, pEvents[i]);
+      cpvk_record_event(cmd, event, CPVK_OP_EVENT_WAIT);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdPipelineBarrier(VkCommandBuffer commandBuffer,
+                        VkPipelineStageFlags srcStageMask,
+                        VkPipelineStageFlags dstStageMask,
+                        VkDependencyFlags dependencyFlags,
+                        uint32_t memoryBarrierCount,
+                        const VkMemoryBarrier *pMemoryBarriers,
+                        uint32_t bufferMemoryBarrierCount,
+                        const VkBufferMemoryBarrier *pBufferMemoryBarriers,
+                        uint32_t imageMemoryBarrierCount,
+                        const VkImageMemoryBarrier *pImageMemoryBarriers)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   cpvk_op_alloc(cmd, CPVK_OP_BARRIER);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                          const VkDependencyInfo *pDependencyInfo)
 {
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   cpvk_op_alloc(cmd, CPVK_OP_BARRIER);
+}
+
+static void
+cpvk_execute_order_point(struct cpvk_device *dev)
+{
+   cp_batch_flush_why(&dev->renderer, "Vulkan order point");
+   cp_pass_finish(&dev->renderer);
+}
+
+VkResult
+cpvk_execute_order_op(struct cpvk_device *dev, const struct cpvk_op *op)
+{
+   cpvk_execute_order_point(dev);
+   if (op->kind == CPVK_OP_BARRIER)
+      return VK_SUCCESS;
+
+   if (cuStreamSynchronize(dev->renderer.stream) != CUDA_SUCCESS)
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
+
+   struct cpvk_event *event = op->event.event;
+   if (op->kind == CPVK_OP_EVENT_SET) {
+      cpvk_event_set_state(event, true);
+   } else if (op->kind == CPVK_OP_EVENT_RESET) {
+      cpvk_event_set_state(event, false);
+   } else if (op->kind == CPVK_OP_EVENT_WAIT) {
+      mtx_lock(&event->lock);
+      while (!event->signaled) {
+         if (cnd_wait(&event->changed, &event->lock) == thrd_error) {
+            mtx_unlock(&event->lock);
+            return vk_error(dev, VK_ERROR_DEVICE_LOST);
+         }
+      }
+      mtx_unlock(&event->lock);
+   }
+   return VK_SUCCESS;
 }
 
 void

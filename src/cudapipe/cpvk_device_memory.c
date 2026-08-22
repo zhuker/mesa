@@ -101,14 +101,22 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
                return r;
             break;
          }
+         case CPVK_OP_BARRIER:
+         case CPVK_OP_EVENT_SET:
+         case CPVK_OP_EVENT_RESET:
+         case CPVK_OP_EVENT_WAIT: {
+            VkResult r = cpvk_execute_order_op(dev, &cmd->ops[o]);
+            if (r != VK_SUCCESS)
+               return r;
+            break;
+         }
          }
       }
    }
 
-   /* Nothing may be left pending across a submit: the payload-free sync
-    * objects are published by the common runtime as soon as this callback
-    * returns.  Graphics, compute and transfer operations all use the renderer
-    * stream, so this one drain covers the queue in recorded order. */
+   /* Nothing may be left pending across a submit. Graphics, compute and
+    * transfer operations all use the renderer stream, so this one drain covers
+    * the queue in recorded order before its binary signal state is published. */
    cp_batch_flush(&dev->renderer);
    CUresult cu_result = cuStreamSynchronize(dev->renderer.stream);
    if (cu_result != CUDA_SUCCESS)

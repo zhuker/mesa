@@ -37,7 +37,7 @@ The important files are:
 | `cp_renderer.[ch]` | shared draw renderer: batching, clipping, rasterization, A-buffer/peel paths, pass episodes, arenas and shader launches |
 | `cp_kernels.[ch]`, `kernels/` | NVRTC compilation, persistent source/options-keyed PTX caching and CUDA kernels, including the lazy 3D sampler variant |
 | `nir_to_ptx/` | the shared NIR→LLVM/NVPTX backend and loaded shader binaries |
-| `tests/cpvk_*.c` | 30 small native differential/regression programs, including sync state, recorded pipeline/query lifetime and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
+| `tests/cpvk_*.c` | 31 small native differential/regression programs, including fence/semaphore/event state, recorded-object lifetime and concurrent-device A-buffer stress; they are standalone sources, not yet a Meson test suite |
 
 The native `cpvk_device` owns one CUDA context, one `cp_device` containing the
 kernel modules, and one `cp_context` renderer with its ordered graphics/compute
@@ -301,11 +301,12 @@ pass.
 
 ### Standalone and sample gates
 
-- 30/30 `src/cudapipe/tests/cpvk_*.c` programs pass functionally, including
-  negative fence state/timeouts, graphics/compute pipeline and query-pool
-  destruction after recording, and concurrent per-device A-buffer execution,
-  with no driver error, unimplemented, refusal or overflow diagnostic. This is
-  not a claim that all 30 are clean under the Vulkan validation layer.
+- 31/31 `src/cudapipe/tests/cpvk_*.c` programs pass functionally, including
+  negative fence state/timeouts, ordered host/device event state, graphics and
+  compute pipeline/query/event destruction after recording, and concurrent
+  per-device A-buffer execution, with no driver error, unimplemented, refusal
+  or overflow diagnostic. This is not a claim that all 31 are clean under the
+  Vulkan validation layer.
 - `cpvk_tex3d` passes on native and NVIDIA; NVIDIA with
   `VK_LAYER_KHRONOS_validation` is clean.
 - The post-optimization 60-frame sweep is
@@ -459,16 +460,19 @@ continue staging explicit paths rather than using `git add -A`.
    They do not yet carry a CUDA-event payload, timeline values or asynchronous
    retirement. Removing the submit drain therefore still requires event-backed
    completion plus scratch and recorded-object lifetime handling.
-8. **Vulkan barriers remain no-ops.** Draws, clears, transfers and dispatches
-   now share `renderer.stream`, so queue order covers their validated
-   dependencies. `vkCmdPipelineBarrier2` still tracks no access/layout state
-   and cannot express dependencies outside that one queue/stream. Timestamps
+8. **Barriers are ordered but do not track layouts/access masks.** Legacy and
+   synchronization2 barrier commands now record explicit execution order points
+   that flush batches and close pass episodes on the one ordered renderer
+   stream. They do not model ownership transfers or per-resource access/layout
+   state and cannot express dependencies outside that queue/stream. Timestamps
    remain host approximations; occlusion and pipeline-statistics queries return
    zero rather than fabricating unsupported counts.
-9. **Device event commands are not implemented.** Host events are booleans,
-   while `cpvk_CmdSetEvent2`/`ResetEvent2` mutate that boolean during command
-   recording and `cpvk_CmdWaitEvents2` records no wait. Status can change before
-   submission and no device dependency is enforced.
+9. **Device events are synchronous order points, not asynchronous GPU events.**
+   Legacy set/reset/wait commands and their internal synchronization2 variants
+   execute in submit order, wait on prior CUDA work and retain the event object;
+   host status/set/reset is mutex protected. The synchronization2 feature is no
+   longer exposed at Vulkan 1.1. Stage/access scopes are conservatively treated
+   as all commands and event waits can block queue submission on the host.
 10. **Descriptor-using secondary command buffers are unsafe.** ExecuteCommands
    memcpy-appends their operations but queue submit publishes/uploads only the
    primary command buffer's descriptor arenas. A secondary that was not
@@ -477,9 +481,9 @@ continue staging explicit paths rather than using `git add -A`.
 11. **Recorded ownership is only partially complete.** Command buffers retain
     unique references to every bound graphics/compute pipeline and recorded
     query pool; secondary operation copies import those references. Focused
-    tests destroy graphics pipelines, compute pipelines and query pools after
-    recording and submit successfully. Event objects, secondary descriptor
-    arenas and other recorded resources still require the same ownership audit.
+    tests destroy graphics pipelines, compute pipelines, query pools and events
+    after recording and submit successfully. Secondary descriptor arenas and
+    other recorded resources still require the same ownership audit.
 12. **Layered rendering is not implemented.** Transfers understand layers and
    3D slices, and cube/array sampling works, but a draw targets one image layer.
 13. **Blit/resolve and format support are narrow by design.** Size-changing,
@@ -600,11 +604,11 @@ In order:
    conformance claim. Copy the validated DSO, plans, external references,
    outputs, logs and checksums out of `/tmp` before cleanup or reboot.
 2. **Continue the focused semantic series before asynchronous submission.**
-   Fresh/reset fence status, zero-time waits and binary semaphore ordering now
-   pass. Add command-buffer event timing, draw/copy↔dispatch dependencies in
-   both directions and a secondary command buffer using descriptors without
-   prior submission. Pipeline/query destruction after recording now passes.
-   Preserve the ordered renderer stream and finish retained ownership.
+   Fresh/reset fence status, zero-time waits, binary semaphore ordering and
+   recorded event timing/lifetime now pass. Add draw/copy↔dispatch dependencies
+   in both directions and a secondary command buffer using descriptors without
+   prior submission. Preserve the ordered renderer stream and finish retained
+   ownership.
    Only then should CUDA-event fence retirement and removal of submit drains be
    considered as one measured change.
 3. **Complete the external image evidence.** Replay the existing Crossroads and
@@ -615,8 +619,8 @@ In order:
 4. **Close the remaining object lifetime holes and manifest drift.** Enforce
    descriptor-pool `maxSets`/pool-size capacity and accounting, add
    create/reset/destroy stress for pool-owned host descriptor sets, free
-   image-view texture info, complete event/resource retention, audit context
-   allocations, and emit a Vulkan-1.1 development manifest.
+   image-view texture info, complete remaining resource retention, audit
+   context allocations, and emit a Vulkan-1.1 development manifest.
 5. **Make the native validation surface clean.** Fill the remaining physical
    limits/properties, implement or stop exposing unsupported KHR/WSI surfaces,
    run the native tests and representative samples with

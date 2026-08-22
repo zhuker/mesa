@@ -69,32 +69,17 @@ cpvk_get_features(struct vk_features *features)
    *features = (struct vk_features) {
       /* Vulkan 1.0 */
       .fullDrawIndexUint32 = true,
-      .independentBlend = true,
+      .independentBlend = false,
       .fragmentStoresAndAtomics = true,
       .vertexPipelineStoresAndAtomics = true,
       .shaderClipDistance = false,
       .samplerAnisotropy = true,
 
-      /*
-       * Vulkan 1.3 makes all of these mandatory, so reporting 1.3 means
-       * declaring them. Where the driver has nothing to do for one, it has
-       * nothing to do: a barrier is already satisfied by one in-order stream,
-       * an event is a boolean, and private data and cache control are the
-       * runtime's. They are declared because the version number promises
-       * them, and the entry points behind them exist and return.
-       */
+      /* KHR_dynamic_rendering is the one advertised post-1.1 feature. Keep
+       * newer feature structs zero unless the matching extension and behavior
+       * are both implemented; the old Vulkan-1.3 experiment overclaimed all
+       * of these merely because that core version made them mandatory. */
       .dynamicRendering = true,
-      .synchronization2 = true,
-      .maintenance4 = true,
-      .privateData = true,
-      .pipelineCreationCacheControl = true,
-      .shaderTerminateInvocation = true,
-      .shaderDemoteToHelperInvocation = true,
-      .shaderZeroInitializeWorkgroupMemory = true,
-      .shaderIntegerDotProduct = true,
-      .subgroupSizeControl = true,
-      .computeFullSubgroups = true,
-      .inlineUniformBlock = true,
    };
 }
 
@@ -140,7 +125,7 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
       .maxBoundDescriptorSets = 8,
-      .maxColorAttachments = 4,
+      .maxColorAttachments = 1,
       .maxPerStageDescriptorSamplers = 32,
       .maxPerStageDescriptorSampledImages = 32,
       .maxPerStageDescriptorUniformBuffers = 16,

@@ -1158,6 +1158,12 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
 
    for (uint32_t i = 0; i < count; i++) {
       const VkGraphicsPipelineCreateInfo *info = &pCreateInfos[i];
+      if (info->pColorBlendState &&
+          info->pColorBlendState->attachmentCount > 1) {
+         if (first_error == VK_SUCCESS)
+            first_error = vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+         continue;
+      }
       struct cpvk_pipeline *pipeline =
          vk_object_zalloc(&dev->vk, pAllocator, sizeof(*pipeline),
                           VK_OBJECT_TYPE_PIPELINE);

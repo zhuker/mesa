@@ -267,6 +267,11 @@ struct cpvk_descriptor_pool {
  */
 struct cpvk_event {
    struct vk_object_base base;
+   struct cpvk_device *dev;
+   VkAllocationCallbacks alloc;
+   atomic_uint refcnt;
+   mtx_t lock;
+   cnd_t changed;
    bool signaled;
 };
 
@@ -387,6 +392,14 @@ enum cpvk_op_kind {
     * recorded copy had not filled yet and embossed a constant.
     */
    CPVK_OP_DISPATCH,
+   CPVK_OP_BARRIER,
+   CPVK_OP_EVENT_SET,
+   CPVK_OP_EVENT_RESET,
+   CPVK_OP_EVENT_WAIT,
+};
+
+struct cpvk_event_op {
+   struct cpvk_event *event;
 };
 
 struct cpvk_op {
@@ -401,6 +414,7 @@ struct cpvk_op {
       struct cp_fb_desc fb;
       struct cpvk_query_op query;
       struct cpvk_dispatch dispatch;
+      struct cpvk_event_op event;
    };
 };
 
@@ -411,6 +425,8 @@ struct cpvk_cmd_buffer {
    unsigned num_retained_pipelines, max_retained_pipelines;
    struct cpvk_query_pool **retained_queries;
    unsigned num_retained_queries, max_retained_queries;
+   struct cpvk_event **retained_events;
+   unsigned num_retained_events, max_retained_events;
    CUdeviceptr addrs[16];
    struct cpvk_dispatch dispatches[CPVK_MAX_DISPATCHES];
    unsigned num_dispatches;
@@ -473,6 +489,8 @@ void cpvk_pipeline_ref(struct cpvk_pipeline *pipeline);
 void cpvk_pipeline_unref(struct cpvk_pipeline *pipeline);
 void cpvk_query_pool_ref(struct cpvk_query_pool *pool);
 void cpvk_query_pool_unref(struct cpvk_query_pool *pool);
+void cpvk_event_ref(struct cpvk_event *event);
+void cpvk_event_unref(struct cpvk_event *event);
 
 void cpvk_execute_draw(struct cpvk_device *dev, const struct cpvk_draw *d);
 void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
@@ -486,6 +504,8 @@ extern const struct vk_sync_type *const cpvk_sync_types[];
 
 VkResult cpvk_execute_dispatch(struct cpvk_device *dev,
                                const struct cpvk_dispatch *d);
+VkResult cpvk_execute_order_op(struct cpvk_device *dev,
+                              const struct cpvk_op *op);
 VkResult cpvk_execute_cmd_buffer(struct cpvk_device *dev,
                                  struct cpvk_cmd_buffer *cmd);
 
