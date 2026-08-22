@@ -109,6 +109,7 @@ struct cp_batch_key {
  * without a pipe_context existing at all.
  */
 struct cp_gallium;
+struct cp_abuf;
 
 /* A native frontend may stage CPU-written descriptor snapshots separately
  * from the device addresses stored in shader UBO rows.  The fragment sampler
@@ -135,6 +136,9 @@ struct cp_abuf_dbg_state {
 
 struct cp_context {
 
+   /* Per-renderer A-buffer storage: every CUDA pointer belongs to this
+    * context's device instead of to process-global state. */
+   struct cp_abuf *abuf;
    struct cp_abuf_dbg_state abuf_dbg;
 
    /* The device, not the screen: four fields the pipeline reads, and no
@@ -802,13 +806,11 @@ struct cp_abuf {
    unsigned verified, verify_max;
    unsigned seq;
 };
-extern struct cp_abuf cp_abuf;
-
 bool cp_abuf_batch_enabled(void);
-bool cp_abuf_enabled(void);
-void cp_abuf_mark(CUevent ev, CUstream stream);
-void cp_abuf_report(void);
-void cp_abuf_cleanup(void);
+bool cp_abuf_enabled(struct cp_abuf *ab);
+void cp_abuf_mark(struct cp_abuf *ab, CUevent ev, CUstream stream);
+void cp_abuf_report(struct cp_abuf *ab);
+void cp_abuf_cleanup(struct cp_abuf *ab);
 void cp_abuf_scan(struct cp_context *cp, struct cp_device *screen, struct cp_abuf *ab, unsigned n);
 void cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen, CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x, CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3, unsigned n, unsigned nb1, unsigned nb2, unsigned nb3, CUdeviceptr clamp_counts, uint32_t clamp_capacity, CUdeviceptr clamp_overflow);
 bool cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h);

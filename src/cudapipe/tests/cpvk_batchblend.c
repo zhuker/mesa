@@ -86,8 +86,13 @@ pick_memory(VkPhysicalDevice pdev, uint32_t bits, VkMemoryPropertyFlags want)
    return UINT32_MAX;
 }
 
+typedef void (*cpvk_batchblend_hook)(void *data);
+
 int
-main(int argc, char **argv)
+cpvk_batchblend_run(int argc, char **argv,
+                    cpvk_batchblend_hook after_device_create,
+                    cpvk_batchblend_hook before_device_destroy,
+                    void *hook_data)
 {
    const char *vs_path = argc > 1 ? argv[1] : "/tmp/lat/tex.vert.spv";
    const char *fs_path = argc > 2 ? argv[2] : "/tmp/lat/tex.frag.spv";
@@ -120,6 +125,8 @@ main(int argc, char **argv)
                               .ppEnabledExtensionNames = dev_exts };
    VkDevice dev;
    CHECK(vkCreateDevice(pdev, &dci, NULL, &dev));
+   if (after_device_create)
+      after_device_create(hook_data);
 
    VkQueue queue;
    vkGetDeviceQueue(dev, 0, 0, &queue);
@@ -581,5 +588,50 @@ main(int argc, char **argv)
    }
    fclose(f);
    printf("  %s written\n", out);
+
+   vkUnmapMemory(dev, mem);
+   vkDestroyCommandPool(dev, pool, NULL);
+   vkDestroyPipeline(dev, pipe, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyDescriptorPool(dev, dpool, NULL);
+   vkDestroyDescriptorSetLayout(dev, dsl_mat, NULL);
+   vkDestroyDescriptorSetLayout(dev, dsl, NULL);
+   vkDestroySampler(dev, samp, NULL);
+   vkDestroyShaderModule(dev, fs, NULL);
+   vkDestroyShaderModule(dev, vs, NULL);
+   for (int n = 0; n < NDRAW; n++) {
+      vkDestroyImageView(dev, tview[n], NULL);
+      vkDestroyImage(dev, timg[n], NULL);
+      vkFreeMemory(dev, tmem[n], NULL);
+   }
+   for (int u = 0; u < 2; u++) {
+      vkDestroyBuffer(dev, ubuf[u], NULL);
+      vkFreeMemory(dev, umem[u], NULL);
+   }
+   vkDestroyBuffer(dev, ibuf, NULL);
+   vkFreeMemory(dev, imem, NULL);
+   vkDestroyBuffer(dev, vbuf, NULL);
+   vkFreeMemory(dev, vmem, NULL);
+   vkDestroyImageView(dev, dview, NULL);
+   vkDestroyImage(dev, dimg, NULL);
+   vkFreeMemory(dev, dmem, NULL);
+   vkDestroyImageView(dev, view, NULL);
+   vkDestroyImage(dev, img, NULL);
+   vkFreeMemory(dev, mem, NULL);
+   free(indices);
+   free(verts);
+
+   if (before_device_destroy)
+      before_device_destroy(hook_data);
+   vkDestroyDevice(dev, NULL);
+   vkDestroyInstance(inst, NULL);
    return 0;
 }
+
+#ifndef CPVK_BATCHBLEND_NO_MAIN
+int
+main(int argc, char **argv)
+{
+   return cpvk_batchblend_run(argc, argv, NULL, NULL, NULL);
+}
+#endif

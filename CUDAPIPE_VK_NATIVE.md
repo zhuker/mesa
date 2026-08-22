@@ -220,16 +220,14 @@ reason the renderer does not return to the roughly 33 ms Crossroads failure
 mode. The complete current path, including descriptor batching and stable-work
 compaction, measures about 7.9 ms.
 
-The A-buffer allocation is process-global but CUDA-context-owned. The first
-context to use it claims ownership under a process-global mutex. Other live
-VkDevices take the peel fallback; they never launch against the owner's CUDA
-pointers. Owner teardown synchronizes, frees all base allocations/events/host
-mirrors under the same mutex, clears ownership, and permits a later context to
-reacquire it. Debug comparison pointers are per `cp_context`, not global. A
-stress test kept two logical devices alive, destroyed them concurrently, then
-created a third; default and verification-mode external outputs were
-byte-identical. The internal colour verifier was not clean, as recorded under
-known issues below.
+A-buffer storage is owned by each `cp_context`; no CUDA pointer, event or host
+mirror is process-global. Concurrent VkDevices therefore use their own
+A-buffers instead of forcing all but one device onto the peel fallback. A
+stress test kept two logical devices active concurrently, destroyed both, then
+created a third. All three A-buffers allocated independently and their external
+PPMs were byte-identical. Debug comparison pointers are likewise per context.
+The older verification-mode internal colour-verifier caveat remains recorded
+under known issues below.
 
 ### Performance-recovery mechanisms retained at `d7a88fd13b6`
 
@@ -489,14 +487,13 @@ continue staging explicit paths rather than using `git add -A`.
 14. **Robustness is incomplete.** The shader hash currently assumes the default
    robustness state. The null allocations prevent catastrophic hangs but are
    not a full robust-buffer/image implementation.
-15. **One A-buffer owner at a time.** Multiple live devices are safe, but only
-   the owning CUDA context gets the global A-buffer; other devices peel. A true
-   per-device A-buffer would remove that performance asymmetry. The
-   multi-device verification-mode external PPMs were byte-identical and the
-   list/quad checks passed, but the internal colour verifier logged two
-   `VERDICT: MISMATCH` results (one 1-ULP/duplicate-unwritten case and one
-   all-unwritten case). That run proves context safety/output equality, not a
-   clean internal colour-verification pass.
+15. **Per-device A-buffer memory is intentionally substantial.** Concurrent
+   devices now allocate independent fragment/quad storage rather than sharing
+   one process-global owner. The focused stress produced byte-identical output
+   from two concurrent devices and a later third device. The older
+   verification-mode run still logged two internal `VERDICT: MISMATCH` results
+   (one 1-ULP/duplicate-unwritten case and one all-unwritten case), so external
+   equality is not a clean internal colour-verification pass.
 16. **Some object and pool semantics remain incomplete below device scope.**
     Descriptor sets are now host-only objects owned by their descriptor pool;
     free, pool reset and pool destroy release them without per-set CUDA
@@ -573,9 +570,9 @@ continue staging explicit paths rather than using `git add -A`.
 - Ordinary 2D shaders must not carry the 3D sampler's register/JIT footprint.
   The accepted design is separate symbols plus lazily split PTX, with filtered
   operations classified narrowly.
-- A process-global CUDA allocation must remember its owning context. Freeing
-  it under whichever VkDevice happens to die is a wrong-context free; debug
-  pointers must be per-context too.
+- CUDA allocations, events and host mirrors belong to a device context. The
+  final design keeps A-buffer and debug state per renderer rather than adding
+  ownership arbitration around process-global pointers.
 - `apiVersion`, extension bits and feature bits are promises, not ways to ask
   applications what they happen to use.
 - Native NVTX is conditional at compile time. `src/cudapipe/meson.build` must
@@ -646,9 +643,8 @@ In order:
     counts.
 11. **Broaden formats/blits/resolves one closed family at a time**, each with a
     validation-correct NVIDIA comparison.
-12. **Make A-buffer storage per device** if concurrent-device performance
-    matters, and fix/understand the internal colour verifier first; current
-    ownership/fallback is context-safe but asymmetric.
+12. **Resolve the internal A-buffer colour-verifier mismatches** before
+    treating per-device external equality as a clean verification-mode pass.
 13. **Only then spend native-only render-pass information** on load/store
     elision, tile residency or parallel command translation. The original
     motivation is still valid, but earlier pass-wide reordering and immutable

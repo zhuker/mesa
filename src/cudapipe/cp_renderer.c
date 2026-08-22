@@ -22,7 +22,6 @@
 #include <inttypes.h>
 
 #include "util/u_memory.h"
-#include "util/simple_mtx.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -66,6 +65,11 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
          }
       }
    }
+
+   cp->abuf = calloc(1, sizeof(*cp->abuf));
+   if (cp->abuf)
+      cp->abuf->enabled = -1;
+
    /* 256MB arena — device-only, never touched by CPU */
    cuMemAlloc(&cp->arena_base, 256 * 1024 * 1024);
    cp->arena_size = 256 * 1024 * 1024;
@@ -413,7 +417,9 @@ cp_context_cleanup(struct cp_context *cp)
 
    cuCtxSetCurrent(cp->screen->cuda_ctx);
    cuCtxSynchronize();
-   cp_abuf_cleanup();
+   cp_abuf_cleanup(cp->abuf);
+   free(cp->abuf);
+   cp->abuf = NULL;
    cp_scratch_destroy(cp);
 
    for (unsigned i = 0; i < cp->timer.cap; i++)
@@ -664,10 +670,6 @@ cp_census_dump(const char *what, unsigned draw_seq, unsigned peel_seq,
 #define CP_ABUF_SLACK        65536u  /* plus this, so a tiny first draw is not tiny */
 
 
-struct cp_abuf cp_abuf = { .enabled = -1 };
-static simple_mtx_t cp_abuf_mutex = SIMPLE_MTX_INITIALIZER;
-static CUcontext cp_abuf_owner;
-
 /*
  * Record an A-buffer stage boundary, but only when someone is going to read
  * it. cuEventElapsedTime is called only under CUDAPIPE_ABUFFER_TIMING, which
@@ -679,62 +681,35 @@ static CUcontext cp_abuf_owner;
  * once the A-buffer stopped disabling itself and started running.
  */
 void
-cp_abuf_mark(CUevent ev, CUstream stream)
+cp_abuf_mark(struct cp_abuf *ab, CUevent ev, CUstream stream)
 {
-   if (cp_abuf.timing)
+   if (ab && ab->timing)
       cuEventRecord(ev, stream);
 }
 
 bool
-cp_abuf_enabled(void)
+cp_abuf_enabled(struct cp_abuf *ab)
 {
-   CUcontext current = NULL;
-   if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || !current)
+   if (!ab)
       return false;
 
-   simple_mtx_lock(&cp_abuf_mutex);
-   if (cp_abuf_owner && cp_abuf_owner != current) {
-      simple_mtx_unlock(&cp_abuf_mutex);
-      return false;
-   }
-   if (!cp_abuf_owner)
-      cp_abuf_owner = current;
-
-   if (cp_abuf.enabled < 0) {
+   if (ab->enabled < 0) {
       /* On by default, off with CUDAPIPE_NO_ABUFFER=1 — the same shape as
        * CUDAPIPE_NO_BATCH and CUDAPIPE_NO_BINCACHE. CUDAPIPE_ABUFFER=1 still
        * means what it always did and is now a no-op, so a command line or a
        * script written against the opt-in version still does what it says. */
-      cp_abuf.enabled = cp_debug->no_abuffer ? 0 : 1;
+      ab->enabled = cp_debug->no_abuffer ? 0 : 1;
 
-      /*
-       * Compositing and verifying are exclusive, because the verification is
-       * an element-wise comparison against what the peel loop produced and
-       * compositing is exactly not running the peel loop. Asking for the
-       * check is therefore a way of asking for the old behaviour, and
-       * CUDAPIPE_ABUFFER_COMPOSITE=0 is the other.
-       *
-       * The default is to composite: the ~240 MB of comparison buffers and
-       * the host-side walks over them are not something a frame being
-       * measured should be carrying.
-       */
-      cp_abuf.verify = cp_debug->abuffer_verify;
-      cp_abuf.composite = cp_debug->abuffer_composite;
-
-      cp_abuf.verify_max = cp_debug->abuffer_verify_draws;
-      /* The per-draw event breakdown costs a drain and a line of stderr per
-       * draw, which nothing on the default path wants — it was on by default
-       * while the path was opt-in and something being examined, and is off by
-       * default now that it is how blended draws are rendered. */
-      cp_abuf.timing = cp_debug->abuffer_timing;
-      /* Likewise the running commentary on which draws are eligible: useful
-       * when the question is why a draw peeled, noise on every other run. */
-      cp_abuf.debug = cp_debug->abuffer_debug;
-      cp_abuf.max_layers = cp_debug->abuffer_layers;
+      /* Compositing and verification are mutually exclusive: verification
+       * compares against the peel path, while compositing skips that path. */
+      ab->verify = cp_debug->abuffer_verify;
+      ab->composite = cp_debug->abuffer_composite;
+      ab->verify_max = cp_debug->abuffer_verify_draws;
+      ab->timing = cp_debug->abuffer_timing;
+      ab->debug = cp_debug->abuffer_debug;
+      ab->max_layers = cp_debug->abuffer_layers;
    }
-   bool enabled = cp_abuf.enabled == 1;
-   simple_mtx_unlock(&cp_abuf_mutex);
-   return enabled;
+   return ab->enabled == 1;
 }
 
 /*
@@ -807,7 +782,7 @@ cp_abuf_alloc(struct cp_abuf *ab, CUdeviceptr *p, size_t bytes,
 bool
 cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
 {
-   if (!cp_abuf_enabled())
+   if (!cp_abuf_enabled(ab))
       return false;
    if (ab->disabled)
       return false;
@@ -951,7 +926,7 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
    /* The composite's worklist. Outside the growth block because the flag can be
     * turned on after the first setup — asking to verify without the kernels to
     * verify with falls back to compositing — and then this has to appear. */
-   if (cp_abuf.composite) {
+   if (ab->composite) {
       if (!ab->clist &&
           !cp_abuf_alloc(ab, &ab->clist, ab->cap_pixels * sizeof(uint32_t),
                          "composite worklist"))
@@ -960,7 +935,7 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
        * per-draw readback stays a single copy; nothing to allocate. */
    }
 
-   if (cp_abuf.verify && n > ab->cap_log_pixels) {
+   if (ab->verify && n > ab->cap_log_pixels) {
       size_t logb = n * CP_ABUF_LOG_LAYERS * sizeof(uint32_t);
       size_t deepb = CP_ABUF_DEEP_PIXELS * CP_BLEND_LAYERS * sizeof(uint32_t);
       ab->cap_log_pixels = 0;
@@ -1013,10 +988,9 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
  * for "tell me what this path did".
  */
 void
-cp_abuf_report(void)
+cp_abuf_report(struct cp_abuf *ab)
 {
-   struct cp_abuf *ab = &cp_abuf;
-   if (!cp_abuf.timing || !ab->peak)
+   if (!ab || !ab->timing || !ab->peak)
       return;
    fprintf(stderr, "abuffer: peak population %u fragments against a capacity "
            "of %u (%.1f%%), %u growth%s\n", ab->peak, ab->capacity,
@@ -1025,20 +999,12 @@ cp_abuf_report(void)
 }
 
 void
-cp_abuf_cleanup(void)
+cp_abuf_cleanup(struct cp_abuf *ab)
 {
-   CUcontext current = NULL;
-   if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || !current)
+   if (!ab)
       return;
 
-   simple_mtx_lock(&cp_abuf_mutex);
-   if (cp_abuf_owner != current) {
-      simple_mtx_unlock(&cp_abuf_mutex);
-      return;
-   }
-
-   struct cp_abuf *ab = &cp_abuf;
-   cp_abuf_report();
+   cp_abuf_report(ab);
 
    CUdeviceptr *device_allocs[] = {
       &ab->counts, &ab->offsets, &ab->cursor,
@@ -1078,8 +1044,6 @@ cp_abuf_cleanup(void)
 
    memset(ab, 0, sizeof(*ab));
    ab->enabled = -1;
-   cp_abuf_owner = NULL;
-   simple_mtx_unlock(&cp_abuf_mutex);
 }
 
 /*
@@ -1164,10 +1128,10 @@ cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
                       "quad blocks") ||
        /* Only the composite reads this one, and only the comparison against
         * the peel loop reads the other. */
-       (cp_abuf.composite &&
+       (ab->composite &&
         !cp_abuf_alloc(ab, &ab->shade_slot, want * sizeof(uint32_t),
                        "shading slots")) ||
-       (cp_abuf.verify &&
+       (ab->verify &&
         !cp_abuf_alloc(ab, &ab->peel_mask, want * sizeof(uint32_t),
                        "peel masks")))
       return false;
@@ -1192,7 +1156,7 @@ cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
               total);
    }
 
-   if (cp_abuf.verify) {
+   if (ab->verify) {
       free(ab->h_frags);
       free(ab->h_quad_prim);
       free(ab->h_quad_mask);
@@ -2908,9 +2872,9 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
                             frag_coord, discard_mask, front_face, coverage,
                             cp_debug->no_fused_abuf_interp ? 0 : interp_dev,
                             num_slots,
-                            cp_abuf.timing ? ab->ev[13] : 0, batch_rows))
+                            ab->timing ? ab->ev[13] : 0, batch_rows))
       return false;
-   cp_abuf_mark(ab->ev[14], cp->stream);
+   cp_abuf_mark(ab, ab->ev[14], cp->stream);
 
    /* A segment's colours are composited once for the whole episode, through
     * the per-quad segment map — hand the arrays back instead. */
@@ -2957,7 +2921,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
          .capacity = ab->capacity,
          .color_encoding = (uint32_t)MAX2(
             cp->fb.color_encoding, 0),
-         .max_layers = cp_abuf.max_layers,
+         .max_layers = ab->max_layers,
          .blend = cp_blend_desc_for(cp),
       };
       void *p[] = { &ca };
@@ -2967,11 +2931,11 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
        * anything depends on. */
       unsigned nwork = num_covered ? num_covered : w * h;
       cp_nvtx_push("composite");
-      cp_abuf_mark(ab->ev[15], cp->stream);
+      cp_abuf_mark(ab, ab->ev[15], cp->stream);
       CUresult ce = cuLaunchKernel(screen->kernels.abuf_composite,
                                    (nwork + 255) / 256, 1, 1, 256, 1, 1,
                                    0, cp->stream, p, NULL);
-      cp_abuf_mark(ab->ev[16], cp->stream);
+      cp_abuf_mark(ab, ab->ev[16], cp->stream);
       cp_nvtx_pop();   /* composite */
       if (ce != CUDA_SUCCESS) {
          fprintf(stderr, "abuffer: cp_abuf_composite launch failed (%d)\n", ce);
@@ -2983,7 +2947,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
     * Reading the events means draining, which is a real cost on a path whose
     * point is not to. Only done when the breakdown is being printed.
     */
-   if (cp_abuf.timing) {
+   if (ab->timing) {
       cuStreamSynchronize(cp->stream);
       cuEventElapsedTime(t_interp, ab->ev[11], ab->ev[12]);
       cuEventElapsedTime(t_shade, ab->ev[13], ab->ev[14]);
@@ -4196,7 +4160,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
     * that the extra rasterization passes have to leave the visibility buffer
     * as they found it — they do, because emit_fragment returns before it.
     */
-   struct cp_abuf *ab = &cp_abuf;
+   struct cp_abuf *ab = cp->abuf;
    bool abuf = false;
    bool abuf_log = false;
    unsigned abuf_deep_n = 0;
@@ -4211,12 +4175,12 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
     * merge; see there. */
    bool abuf_prod = false;
    uint32_t abuf_quads = 0, abuf_covered = 0;
-   if (cp_abuf_enabled() && peel && w && h && !ab->disabled) {
+   if (cp_abuf_enabled(ab) && peel && w && h && !ab->disabled) {
       /* Why a draw is not eligible is a question about one run, and this is a
        * path every blended draw now reaches — so it is said once, and only
        * when CUDAPIPE_ABUFFER_DEBUG asked. */
       static int said = 0;
-      if (!cp_abuf.debug)
+      if (!ab->debug)
          said = 1;
       /*
        * Asking for the comparison against the peel loop without the
@@ -4225,12 +4189,12 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
        * refused, so every pixel reads as a mismatch. Say so once and render
        * the ordinary way rather than print a thousand false ones.
        */
-      if (cp_abuf.verify && !screen->kernels.abuf_peel_log) {
+      if (ab->verify && !screen->kernels.abuf_peel_log) {
          fprintf(stderr, "abuffer: CUDAPIPE_ABUFFER_VERIFY needs the "
                  "instrumentation CUDAPIPE_ABUF_COMPILE=0 refused — "
                  "not verifying\n");
-         cp_abuf.verify = 0;
-         cp_abuf.composite = 1;
+         ab->verify = 0;
+         ab->composite = 1;
       }
       if (!screen->kernels.abuf_quad_fill) {
          if (!said++)
@@ -4308,7 +4272,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
     * classically. The vertex work above is repeated then; the case is rare.
     */
    if (cp->pass.appending && !cp->pass.opaque &&
-       (!abuf || ab->grow_to || !ab->frags || !cp_abuf.composite ||
+       (!abuf || ab->grow_to || !ab->frags || !ab->composite ||
         cp->pass.nsegs >= CP_PASS_MAX_SEGS)) {
       cp->pass.append_failed = true;
       return;
@@ -4361,7 +4325,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
       cuMemsetD32Async(cp->cur_qset.counts, 0, 2, cp->stream);
       aa.abuf_mode = CP_ABUF_COUNT;
       rast_queues.mode = CP_QUEUE_FILL;
-      cp_abuf_mark(ab->ev[0], cp->stream);
+      cp_abuf_mark(ab, ab->ev[0], cp->stream);
       void *ap[] = { &aa, &rast_queues };
       /* The _abuf specialisations: same rasterizer, compiled with the count
        * and fill branch live. Every other launch in this file uses the plain
@@ -4375,7 +4339,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
       CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
                      CLAMP(rast_num_triangles * 8, 512u, 2048u), 1, 1,
                      64, 1, 1, 0, cp->stream, ap, NULL);
-      cp_abuf_mark(ab->ev[1], cp->stream);
+      cp_abuf_mark(ab, ab->ev[1], cp->stream);
 
       /* The segment is counted; everything from the scan on happens once,
        * at cp_pass_finish(). */
@@ -4389,7 +4353,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
 
       /* --- step 2: prefix sum --- */
       cp_abuf_scan(cp, screen, ab, (unsigned)n);
-      cp_abuf_mark(ab->ev[2], cp->stream);
+      cp_abuf_mark(ab, ab->ev[2], cp->stream);
 
       /*
        * The count stays on the device.
@@ -4424,7 +4388,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
        * the per-pixel counts on the host before the fill, and there is no
        * later drain in those modes to read the total in.
        */
-      bool drain_for_count = !ab->frags || !cp_abuf.composite;
+      bool drain_for_count = !ab->frags || !ab->composite;
 
       if (!drain_for_count) {
          /* The final prefix-add clamps runs against the fragment array and
@@ -4472,7 +4436,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
       /* Which pixels to compare to full depth. Chosen here because this is
        * the first moment the counts exist on the host, and the peel loop that
        * has to log them has not started. */
-      if (cp_abuf.verify) {
+      if (ab->verify) {
          cuMemcpyDtoH(ab->h_counts, ab->counts, n * sizeof(uint32_t));
          struct cp_abuf_deep *d = malloc(n * sizeof(*d));
          if (d) {
@@ -4500,7 +4464,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
 
       /* --- step 3: fill --- */
       cuMemsetD32Async(ab->cursor, 0, n, cp->stream);
-      cp_abuf_mark(ab->ev[3], cp->stream);
+      cp_abuf_mark(ab, ab->ev[3], cp->stream);
       if (abuf_recs_filled && screen->kernels.abuf_fill_recs) {
          /* The count pass already appended every (pixel, prim) record; the
           * fill is a linear replay instead of a second rasterization. */
@@ -4524,7 +4488,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                         CLAMP(rast_num_triangles * 8, 512u, 2048u), 1, 1,
                         64, 1, 1, 0, cp->stream, ap, NULL);
       }
-      cp_abuf_mark(ab->ev[4], cp->stream);
+      cp_abuf_mark(ab, ab->ev[4], cp->stream);
 
       /* --- step 4: sort. The worklist build is inside this measurement: it
        * is a prerequisite of the sort as written, not a separate step. --- */
@@ -4539,7 +4503,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
          CP_LAUNCH(screen->kernels.abuf_sort, 4096, 1, 1, 256, 1, 1,
                         0, cp->stream, sp, NULL);
       }
-      cp_abuf_mark(ab->ev[5], cp->stream);
+      cp_abuf_mark(ab, ab->ev[5], cp->stream);
 
       /* The composite's worklist — every pixel with anything in it, not just
        * the ones worth sorting. Built here so it rides alongside the sort
@@ -4562,7 +4526,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
        */
       unsigned nblocks = ab->nblocks, qw = ab->quad_width;
       cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
-      cp_abuf_mark(ab->ev[6], cp->stream);
+      cp_abuf_mark(ab, ab->ev[6], cp->stream);
       {
          void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_list,
                        &ab->blk_list_count };
@@ -4570,7 +4534,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
                         (nblocks + 255) / 256, 1, 1, 256, 1, 1,
                         0, cp->stream, p, NULL);
       }
-      cp_abuf_mark(ab->ev[7], cp->stream);
+      cp_abuf_mark(ab, ab->ev[7], cp->stream);
 
       /* Counting pass, prefix sum, filling pass — the same shape as the
        * fragment lists themselves, and for the same reason: the merge has to
@@ -4587,7 +4551,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
          CP_LAUNCH(screen->kernels.abuf_quad_count, 1024, 1, 1, 32, 1, 1,
                         0, cp->stream, p, NULL);
       }
-      cp_abuf_mark(ab->ev[9], cp->stream);
+      cp_abuf_mark(ab, ab->ev[9], cp->stream);
       cp_abuf_scan_n(cp, screen, ab->blk_counts, ab->blk_offsets, ab->bsum1,
                      ab->bsum1x, ab->bsum2, ab->bsum2x, ab->bsum3, nblocks,
                      ab->bnb1, ab->bnb2, ab->bnb3, 0, 0, 0);
@@ -4600,8 +4564,8 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
          CP_LAUNCH(screen->kernels.abuf_quad_fill, 1024, 1, 1, 32, 1, 1,
                         0, cp->stream, p, NULL);
       }
-      cp_abuf_mark(ab->ev[10], cp->stream);
-      cp_abuf_mark(ab->ev[8], cp->stream);
+      cp_abuf_mark(ab, ab->ev[10], cp->stream);
+      cp_abuf_mark(ab, ab->ev[8], cp->stream);
 
       /*
        * Whether this draw is rendered by the A-buffer rather than merely
@@ -4630,7 +4594,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
        * entry), as do memory-writing shaders (their side-effect gate reads
        * coverage the interpolator never wrote for slots past the total).
        */
-      bool bounded = cp_abuf.composite && !cp_abuf.verify && !cp_abuf.timing &&
+      bool bounded = ab->composite && !ab->verify && !ab->timing &&
                      num_triangles <= 2 && cp->fs_batch.ndraws <= 1 &&
                      cp->fs_shader && !cp->fs_shader->writes_memory &&
                      (size_t)ab->nblocks * rast_num_triangles * 4 <=
@@ -4646,7 +4610,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
          abuf_prod = true;
          abuf_quads = (uint32_t)((size_t)ab->nblocks * rast_num_triangles);
          abuf_covered = 0;   /* the composite covers the framebuffer */
-      } else if (cp_abuf.composite) {
+      } else if (ab->composite) {
          uint32_t ctr[CP_ABUF_COUNTERS] = { 0 };
          cuStreamSynchronize(cp->stream);
          /* One copy: sum3, bsum3 and clist_count are contiguous. The last of
@@ -4692,7 +4656,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
        * to run records what it emits against it. Only while there is still a
        * verification to do: a frame that is only being timed must not carry
        * the instrumented interpolator. */
-      if (cp_abuf.verify && ab->verified < cp_abuf.verify_max) {
+      if (ab->verify && ab->verified < ab->verify_max) {
          cp->abuf_dbg.blk_offsets = ab->blk_offsets;
          cp->abuf_dbg.blk_counts = ab->blk_counts;
          cp->abuf_dbg.quad_prim = ab->quad_prim;
@@ -4908,7 +4872,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
        * to decide; the checking path still has to fetch them. */
       uint32_t qcounters[2] = { abuf_quads, 0 };
       uint32_t dbg[CP_ABUF_DBG_COUNTERS] = { 0 };
-      if (!cp_abuf.composite) {
+      if (!ab->composite) {
          cuStreamSynchronize(cp->stream);
          cuMemcpyDtoH(qcounters, ab->bsum3, sizeof(qcounters));
       }
@@ -4930,7 +4894,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
        * shades it itself. The comparison modes still want it, because what
        * they compare is the shading.
        */
-      if (qcounters[0] && !qcounters[1] && (abuf_prod || !cp_abuf.composite)) {
+      if (qcounters[0] && !qcounters[1] && (abuf_prod || !ab->composite)) {
          cp->scratch.used = shade_mark;
          cp->dscratch.used = shade_dmark;
          shaded = cp_abuf_shade(cp, info, ab, rast_args.positions,
@@ -4954,10 +4918,10 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
       }
 
       /* Read after the shading pass, so its own counter is in it. */
-      if (cp_abuf.timing || cp_abuf.verify)
+      if (ab->timing || ab->verify)
          cuMemcpyDtoH(dbg, ab->dbg, sizeof(dbg));
 
-      if (cp_abuf.timing) {
+      if (ab->timing) {
          cuStreamSynchronize(cp->stream);
          cuEventElapsedTime(&t_count, ab->ev[0], ab->ev[1]);
          cuEventElapsedTime(&t_scan, ab->ev[1], ab->ev[2]);
@@ -4989,7 +4953,7 @@ cp_draw_execute(struct cp_context *cp, const struct cp_draw_call *info,
        * interpolation must be the ordinary one. */
       memset(&cp->abuf_dbg, 0, sizeof(cp->abuf_dbg));
 
-      if (abuf_log && ab->verified < cp_abuf.verify_max) {
+      if (abuf_log && ab->verified < ab->verify_max) {
          size_t n = (size_t)w * h;
          uint32_t counters[3] = { 0, 0, 0 };
          cuMemcpyDtoH(counters, ab->sum3, sizeof(counters));
@@ -5108,8 +5072,9 @@ cp_batch_abuf_ok(struct cp_context *cp)
 {
    struct cp_device *screen = cp->screen;
    const struct cp_fb_desc *fb = &cp->fb;
+   struct cp_abuf *ab = cp->abuf;
 
-   if (!cp_abuf_enabled() || cp_abuf.disabled)
+   if (!cp_abuf_enabled(ab) || ab->disabled)
       return false;
    if (!screen->kernels.abuf_quad_fill || !screen->kernels.clip_triangles ||
        !screen->kernels.peel_advance)
@@ -5229,7 +5194,7 @@ static bool
 cp_pass_appendable(struct cp_context *cp)
 {
    struct cp_device *screen = cp->screen;
-   struct cp_abuf *ab = &cp_abuf;
+   struct cp_abuf *ab = cp->abuf;
 
    if (getenv("CPVK_DEBUG_PASS")) {
       static int said;
@@ -5238,8 +5203,8 @@ cp_pass_appendable(struct cp_context *cp)
                  "verify=%d comp=%d timing=%d census=%d segcount=%d frags=%d "
                  "grow=%d shade=%d clist=%d nsegs=%u\n",
                  (int)cp_debug->no_pass_episode, (int)cp_debug->no_abuf_batch,
-                 (int)cp_abuf_enabled(), (int)ab->disabled, (int)cp_abuf.verify,
-                 (int)!!cp_abuf.composite, (int)cp_abuf.timing,
+                 (int)cp_abuf_enabled(ab), (int)ab->disabled, (int)ab->verify,
+                 (int)!!ab->composite, (int)ab->timing,
                  (int)cp_census_enabled(),
                  (int)!!screen->kernels.abuf_seg_count, (int)!!ab->frags,
                  (int)!!ab->grow_to, (int)!!ab->shade_slot, (int)!!ab->clist,
@@ -5250,8 +5215,8 @@ cp_pass_appendable(struct cp_context *cp)
       return false;
    /* The verification, timing and census modes read per-draw state the
     * episode deliberately does not keep. */
-   if (!cp_abuf_enabled() || ab->disabled || cp_abuf.verify ||
-       !cp_abuf.composite || cp_abuf.timing || cp_census_enabled())
+   if (!cp_abuf_enabled(ab) || ab->disabled || ab->verify ||
+       !ab->composite || ab->timing || cp_census_enabled())
       return false;
    if (!screen->kernels.abuf_seg_count || !screen->kernels.abuf_seg_scatter ||
        !screen->kernels.abuf_composite || !screen->kernels.abuf_interpolate ||
@@ -5904,7 +5869,7 @@ cp_tile_census_quads(struct cp_context *cp, struct cp_pass_seg *segs,
                      unsigned nsegs, unsigned w, unsigned h)
 {
    struct cp_device *screen = cp->screen;
-   struct cp_abuf *ab = &cp_abuf;
+   struct cp_abuf *ab = cp->abuf;
    struct cp_tile_census_args ca;
 
    if (!ab->quad_prim || !ab->quad_block ||
@@ -6110,7 +6075,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
                               struct cp_pass_seg *segs,
                               unsigned nsegs, unsigned w, unsigned h)
 {
-   struct cp_abuf *ab = &cp_abuf;
+   struct cp_abuf *ab = cp->abuf;
    size_t quad_bound = 0;
 
    if (cp_debug->unsafe_no_overflow) {
@@ -6331,7 +6296,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       .capacity = ab->capacity,
       .color_encoding = (uint32_t)MAX2(
          fb->color_encoding, 0),
-      .max_layers = cp_abuf.max_layers,
+      .max_layers = ab->max_layers,
       .blend = cp_blend_desc_for(cp),
       .quad_seg = ngroups > 1 ? quad_seg : 0,
       .quad_dense = ngroups > 1 ? quad_dense : 0,
@@ -6351,7 +6316,7 @@ void
 cp_pass_finish(struct cp_context *cp)
 {
    struct cp_device *screen = cp->screen;
-   struct cp_abuf *ab = &cp_abuf;
+   struct cp_abuf *ab = cp->abuf;
    unsigned nsegs = cp->pass.nsegs;
 
    if (getenv("CPVK_DEBUG_EPISODE") && nsegs)
@@ -6785,7 +6750,7 @@ cp_pass_finish(struct cp_context *cp)
       .capacity = ab->capacity,
       .color_encoding = (uint32_t)MAX2(
          fb->color_encoding, 0),
-      .max_layers = cp_abuf.max_layers,
+      .max_layers = ab->max_layers,
       .blend = cp_blend_desc_for(cp),
       .quad_seg = quad_seg,
       .quad_dense = quad_dense,
@@ -6909,7 +6874,7 @@ cp_batch_total_triangles(const struct cp_draw_call *info,
 static void
 cp_pass_append(struct cp_context *cp, unsigned ndraws)
 {
-   struct cp_abuf *ab = &cp_abuf;
+   struct cp_abuf *ab = cp->abuf;
    const struct cp_fb_desc *fb = &cp->fb;
 
    if (cp->pass.nsegs && cp->pass.opaque)
