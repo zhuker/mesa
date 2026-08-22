@@ -1,7 +1,7 @@
 /*
  * What the draw pipeline needs to know about a draw.
  *
- * The pipeline itself -- cp_draw_execute(), 1,973 lines of it -- touches
+ * The pipeline itself -- cp_draw_execute_batch(), 1,973 lines of it -- touches
  * Gallium on sixteen lines, and reads exactly eight fields of
  * pipe_draw_info. This is those eight, so the body can stay as it is while
  * the front end above it changes: the Gallium adapter fills one in from

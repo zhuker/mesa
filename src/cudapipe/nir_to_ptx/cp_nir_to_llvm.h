@@ -163,7 +163,7 @@ struct cp_shader_binary {
     * CP_ARG_DRAW_PARAM_STRIDE row per merged draw indexed by the batch row —
     * so draws that disagree in them may still merge. The host needs the flag
     * to know the shader wants the batch-row array at all; see
-    * cp_draw_execute()'s batch_rows gating.
+    * cp_draw_execute_batch()'s batch_rows gating.
     */
    bool reads_draw_params;
 

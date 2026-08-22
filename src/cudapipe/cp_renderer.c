@@ -1802,10 +1802,9 @@ cp_cull_mode(const struct cp_raster_state *rs)
  * second place that can forget a field.
  */
 struct cp_blend_desc
-cp_blend_desc_for(const struct cp_context *cp)
+cp_blend_desc_for(const struct cp_draw_state *state)
 {
-   /* Resolved once when the state was bound; see cp_bind_blend_state. */
-   return cp->blend_desc;
+   return state->blend;
 }
 
 /*
@@ -1818,13 +1817,15 @@ cp_blend_desc_for(const struct cp_context *cp)
  * one is wrong about.
  */
 static void
-cp_fs_interp_setup(struct cp_context *cp, const struct cp_draw_call *info,
+cp_fs_interp_setup(struct cp_context *cp, const struct cp_draw_state *state,
+                   const struct cp_render_scope *scope,
+                   const struct cp_draw_call *info,
                    const struct cp_shader_binary *fs, unsigned num_fs_inputs,
                    unsigned num_vs_outputs, struct cp_fs_interp_args *interp)
 {
-   interp->num_samples = MAX2(cp->fb_samples, 1u);
+   interp->num_samples = MAX2(scope->attachment_samples, 1u);
    interp->point_mode = info->mode == MESA_PRIM_POINTS;
-   interp->psiz_slot = cp_slot_for_location(cp->vs_shader->out_location,
+   interp->psiz_slot = cp_slot_for_location(state->vs->out_location,
                                             num_vs_outputs, VARYING_SLOT_PSIZ);
    /* gl_PointCoord is a fragment shader input that no vertex shader output
     * drives, so the match below leaves it at -1 and the interpolator fills it
@@ -1851,7 +1852,7 @@ cp_fs_interp_setup(struct cp_context *cp, const struct cp_draw_call *info,
       if (location == VARYING_SLOT_MAX)
          continue;
       for (unsigned o = 0; o < num_vs_outputs && o < CP_MAX_IO_SLOTS; o++) {
-         if (cp->vs_shader->out_location[o] == location) {
+         if (state->vs->out_location[o] == location) {
             interp->input_vs_slot[i] = (int32_t)o;
             break;
          }
@@ -2089,7 +2090,8 @@ cp_host_ptr(const struct cp_context *cp, uint64_t addr)
 }
 
 static bool
-cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
+cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
+                    struct cp_shader_binary *fs,
                     CUdeviceptr counter, CUdeviceptr fs_in,
                     unsigned fs_in_stride, CUdeviceptr fs_out,
                     CUdeviceptr frag_coord, CUdeviceptr discard_mask,
@@ -2232,15 +2234,15 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
    for (unsigned d = 0; d < rows; d++) {
       const uint64_t *row = tbl_src ? tbl_src + (size_t)d * CP_ARG_UBO_STRIDE
                                     : NULL;
-      for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
+      for (unsigned i = 0; i < state->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
          fs_tbl[d * CP_ARG_UBO_STRIDE + i] =
-            row ? row[i] : (uint64_t)(uintptr_t)cp->fs_ubos[i].buffer;
+            row ? row[i] : (uint64_t)(uintptr_t)(void *)(uintptr_t)state->fs_ubos[i];
    }
 
    /* Still written, so that the block reads the same whichever form a stage
     * takes its bindings from — row zero, not the live binding, since a
     * deferred draw's is no longer what is bound. */
-   for (unsigned i = 0; i < cp->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
+   for (unsigned i = 0; i < state->num_fs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
       fs_args_host[18 + i] =
          (void *)(uintptr_t)fs_tbl[i];
 
@@ -2343,7 +2345,9 @@ cp_fs_launch_shader(struct cp_context *cp, struct cp_shader_binary *fs,
  * blend its output into the colour attachment.
  */
 void
-cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
+cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
+                   const struct cp_render_scope *scope,
+                   const struct cp_draw_call *info,
                    CUdeviceptr visbuf, CUdeviceptr positions,
                    CUdeviceptr vs_output_buf, unsigned num_triangles,
                    unsigned w, unsigned h, void *color_data,
@@ -2354,20 +2358,20 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
                    unsigned num_seg_ranges)
 {
    struct cp_device *screen = cp->screen;
-   struct cp_shader_binary *fs = cp->fs_shader;
+   struct cp_shader_binary *fs = state->fs;
 
-   if (!fs || !fs->kernel || !vs_output_buf || !cp->vs_shader ||
+   if (!fs || !fs->kernel || !vs_output_buf || !state->vs ||
        !screen->kernels.fs_interpolate || !screen->kernels.fs_writeback) {
       if (cp_debug->debug_draw)
          fprintf(stderr, "  no fragment stage: fs=%p kernel=%p vs_out=%p vs=%p\n",
                  (void *)fs, fs ? (void *)fs->kernel : NULL,
-                 (void *)(uintptr_t)vs_output_buf, (void *)cp->vs_shader);
+                 (void *)(uintptr_t)vs_output_buf, (void *)state->vs);
       return;
    }
 
    unsigned num_fs_inputs = MIN2(fs->nir_num_inputs, CP_MAX_FS_INPUTS);
-   unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs
-      ? cp->vs_shader->nir_num_outputs : 2;
+   unsigned num_vs_outputs = state->vs->nir_num_outputs
+      ? state->vs->nir_num_outputs : 2;
 
    /* Fragment shader I/O buffers are indexed by thread, and the shader is
     * launched in whole blocks, so round up to keep the tail threads in
@@ -2426,7 +2430,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
       .frag_coord = frag_coord,
       .coverage = coverage,
       .front_face = front_face,
-      .front_ccw = cp->rasterizer.front_ccw,
+      .front_ccw = state->raster.front_ccw,
       .width = w, .height = h,
       .vs_out_stride = num_vs_outputs * 16,
       .fs_in_stride = fs_in_stride,
@@ -2445,7 +2449,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
       .num_seg_ranges = num_seg_ranges,
    };
 
-   cp_fs_interp_setup(cp, info, fs, num_fs_inputs, num_vs_outputs, &interp);
+   cp_fs_interp_setup(cp, state, scope, info, fs, num_fs_inputs, num_vs_outputs, &interp);
 
    /* See the same block in cp_abuf_shade(). A blended batch reaches this path
     * only when its A-buffer merge was refused and the peel loop renders it
@@ -2506,7 +2510,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
     * early for threads beyond it. This avoids a sync just to read the count. */
    unsigned num_pixels = max_pixels;
 
-   if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
+   if (!cp_fs_launch_shader(cp, state, fs, counter, fs_in, fs_in_stride, fs_out,
                             frag_coord, discard_mask, front_face, coverage,
                             0, num_pixels, 0, batch_rows))
       return;
@@ -2536,18 +2540,18 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
       .resolved = resolved,
       .reject_layers = CP_DISCARD_LAYERS,
       .reject_pass = reject_pass,
-      .depth_write = cp->depth_stencil.depth_writemask,
-      .depth_key_invert = cp->depth_stencil.depth_enabled &&
-         (cp->depth_stencil.depth_func == CP_FUNC_GREATER ||
-          cp->depth_stencil.depth_func == CP_FUNC_GEQUAL),
+      .depth_write = state->depth.depth_writemask,
+      .depth_key_invert = state->depth.depth_enabled &&
+         (state->depth.depth_func == CP_FUNC_GREATER ||
+          state->depth.depth_func == CP_FUNC_GEQUAL),
       .width = w,
       .fs_out_stride = fs_out_stride,
       .num_pixels = num_pixels,
-      .color_encoding = (uint32_t)MAX2(cp->fb.color_encoding, 0),
-      .blend = cp_blend_desc_for(cp),
-      .num_samples = MAX2(cp->fb_samples, 1u),
+      .color_encoding = (uint32_t)MAX2(scope->fb.color_encoding, 0),
+      .blend = cp_blend_desc_for(state),
+      .num_samples = MAX2(scope->attachment_samples, 1u),
       .height = h,
-      .sample_stride = cp->fb.color_sample_stride,
+      .sample_stride = scope->fb.color_sample_stride,
    };
 
    /*
@@ -2711,7 +2715,9 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info,
 
 
 bool
-cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
+cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
+              const struct cp_render_scope *scope,
+              const struct cp_draw_call *info,
               struct cp_abuf *ab, CUdeviceptr positions,
               CUdeviceptr vs_output_buf, unsigned w, unsigned h,
               float vp_scale_x, float vp_scale_y,
@@ -2722,12 +2728,12 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
               struct cp_abuf_seg_shade *seg)
 {
    struct cp_device *screen = cp->screen;
-   struct cp_shader_binary *fs = cp->fs_shader;
+   struct cp_shader_binary *fs = state->fs;
 
    *t_interp = 0.0f;
    *t_shade = 0.0f;
    *t_composite = 0.0f;
-   if (!fs || !fs->kernel || !vs_output_buf || !cp->vs_shader ||
+   if (!fs || !fs->kernel || !vs_output_buf || !state->vs ||
        !screen->kernels.abuf_interpolate || !num_quads)
       return false;
    if (composite && (!screen->kernels.abuf_composite || !ab->shade_slot ||
@@ -2735,8 +2741,8 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
       return false;
 
    unsigned num_fs_inputs = MIN2(fs->nir_num_inputs, CP_MAX_FS_INPUTS);
-   unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs
-      ? cp->vs_shader->nir_num_outputs : 2;
+   unsigned num_vs_outputs = state->vs->nir_num_outputs
+      ? state->vs->nir_num_outputs : 2;
    unsigned fs_in_stride = MAX2(num_fs_inputs, 1u) * 16;
    unsigned fs_out_stride = MAX2(fs->nir_num_outputs, 1u) * 16;
 
@@ -2801,7 +2807,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
       .frag_coord = frag_coord,
       .coverage = coverage,
       .front_face = front_face,
-      .front_ccw = cp->rasterizer.front_ccw,
+      .front_ccw = state->raster.front_ccw,
       .width = w, .height = h,
       .vs_out_stride = num_vs_outputs * 16,
       .fs_in_stride = fs_in_stride,
@@ -2830,7 +2836,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
       if (seg->num_quads_dev)
          interp.num_quads_dev = seg->num_quads_dev;
    }
-   cp_fs_interp_setup(cp, info, fs, num_fs_inputs, num_vs_outputs, &interp);
+   cp_fs_interp_setup(cp, state, scope, info, fs, num_fs_inputs, num_vs_outputs, &interp);
 
    /* Which merged draw's fragment bindings each shaded slot is to use. Only a
     * batch has more than one answer, and only a shader that reads a constant
@@ -2868,7 +2874,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
                 cp->stream, interp_params, NULL);
    }
 
-   if (!cp_fs_launch_shader(cp, fs, counter, fs_in, fs_in_stride, fs_out,
+   if (!cp_fs_launch_shader(cp, state, fs, counter, fs_in, fs_in_stride, fs_out,
                             frag_coord, discard_mask, front_face, coverage,
                             cp_debug->no_fused_abuf_interp ? 0 : interp_dev,
                             num_slots,
@@ -2920,9 +2926,9 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info,
          .num_slots = num_slots,
          .capacity = ab->capacity,
          .color_encoding = (uint32_t)MAX2(
-            cp->fb.color_encoding, 0),
+            scope->fb.color_encoding, 0),
          .max_layers = ab->max_layers,
-         .blend = cp_blend_desc_for(cp),
+         .blend = cp_blend_desc_for(state),
       };
       void *p[] = { &ca };
       /* The worklist's own length, read in the drain that decided this path;
@@ -3080,8 +3086,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                                     batch->scissors : NULL;
 
    assert(batch_draws > 0);
-   cp_stage_draw_state_legacy(cp, &batch->state, &batch->scope,
-                              &batch->scissors[batch_draws - 1]);
+   const struct cp_draw_state *state = &batch->state;
+   const struct cp_rect *draw_scissor = &batch->scissors[batch_draws - 1];
    struct cp_device *screen = cp->screen;
    const struct cp_fb_desc *fb = &batch->scope.fb;
 
@@ -3123,7 +3129,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * function.
     */
    if (!fb->nr_cbufs && !fb->has_zs &&
-       !(cp->fs_shader && cp->fs_shader->writes_memory))
+       !(state->fs && state->fs->writes_memory))
       do { if (cp_debug->debug_draw)
             fprintf(stderr, "  skipped: no colour or depth attachment\n");
          return; } while (0);
@@ -3181,7 +3187,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 
    unsigned w = fb->width;
    unsigned h = fb->height;
-   unsigned fb_samples = MAX2(cp->fb_samples, 1u);
+   unsigned fb_samples = MAX2(batch->scope.attachment_samples, 1u);
 
    /* The visibility buffer only ever holds this draw's triangles: its entries
     * are triangle indices into this draw's vertex arrays, so carrying it
@@ -3210,10 +3216,10 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * TODO: proper VS execution with compiled vertex shader */
    /* Viewport: pass raw scale/translate. The rasterizer uses:
     * screen = ndc * scale + translate (handles both Y-flip and non-flip) */
-   float vp_scale_x = cp->viewport.scale[0];
-   float vp_scale_y = cp->viewport.scale[1];
-   float vp_trans_x = cp->viewport.translate[0];
-   float vp_trans_y = cp->viewport.translate[1];
+   float vp_scale_x = state->viewport.scale[0];
+   float vp_scale_y = state->viewport.scale[1];
+   float vp_trans_x = state->viewport.translate[0];
+   float vp_trans_y = state->viewport.translate[1];
    /* For the rasterize kernel: vp_x/y/w/h format */
    float vp_w = fabsf(vp_scale_x) * 2.0f;
    float vp_h = fabsf(vp_scale_y) * 2.0f;
@@ -3244,13 +3250,13 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * scissor exactly as before. A deferred draw's scissor is its snapshot,
     * not the live state.
     */
-   bool rows_stable = cp->blend_enabled ||
-      (cp->fs_shader && cp->fs_shader->reads_const_bufs);
+   bool rows_stable = state->blend.enable ||
+      (state->fs && state->fs->reads_const_bufs);
    bool per_draw_rects = scissors && batch_draws > 1 && rows_stable &&
-      cp->rasterizer.scissor;
-   if (cp->rasterizer.scissor && !per_draw_rects) {
+      state->raster.scissor;
+   if (state->raster.scissor && !per_draw_rects) {
       const struct cp_rect *sc0 =
-         scissors ? &scissors[0] : &cp->scissor;
+         scissors ? &scissors[0] : &(*draw_scissor);
       clip_x0 = MAX2(clip_x0, (int)sc0->minx);
       clip_y0 = MAX2(clip_y0, (int)sc0->miny);
       clip_x1 = MIN2(clip_x1, (int)sc0->maxx - 1);
@@ -3279,22 +3285,22 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * the camera.
        */
       .cull_mode = info->mode == MESA_PRIM_POINTS ? 0
-                 : cp_cull_mode(&cp->rasterizer),
-      .front_face = cp->rasterizer.front_ccw,
+                 : cp_cull_mode(&state->raster),
+      .front_face = state->raster.front_ccw,
       /* Points have no winding to cull and no edges to test; the square comes
        * from gl_PointSize, wherever the vertex shader put it. */
       .num_samples = fb_samples,
       .point_mode = info->mode == MESA_PRIM_POINTS,
-      .psiz_slot = cp->vs_shader
-         ? cp_slot_for_location(cp->vs_shader->out_location,
+      .psiz_slot = state->vs
+         ? cp_slot_for_location(state->vs->out_location,
                                 CP_MAX_IO_SLOTS, VARYING_SLOT_PSIZ)
          : -1,
       .depthbuf = cp->depthbuf,
-      .depth_test = cp->depth_stencil.depth_enabled,
-      .depth_func = cp->depth_stencil.depth_func,
-      .depth_key_invert = cp->depth_stencil.depth_enabled &&
-         (cp->depth_stencil.depth_func == CP_FUNC_GREATER ||
-          cp->depth_stencil.depth_func == CP_FUNC_GEQUAL),
+      .depth_test = state->depth.depth_enabled,
+      .depth_func = state->depth.depth_func,
+      .depth_key_invert = state->depth.depth_enabled &&
+         (state->depth.depth_func == CP_FUNC_GREATER ||
+          state->depth.depth_func == CP_FUNC_GEQUAL),
    };
    if (cp->pass.appending && cp->pass.opaque)
       rast_args.abuf_prim_base = cp->pass.next_prim;
@@ -3325,10 +3331,10 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * positions from gl_VertexIndex, which is how a fullscreen pass is drawn.
     * A batch carries its own snapshot of the bindings, so the live state —
     * which the next draw may have rebound over — is not consulted for one. */
-   bool has_vs = cp->vs_shader && cp->vs_shader->kernel &&
+   bool has_vs = state->vs && state->vs->kernel &&
                  (vb_table != NULL ||
-                  (cp->num_vertex_buffers > 0 && cp->vb_base[0]) ||
-                  cp->num_vertex_elements == 0);
+                  (state->num_vertex_buffers > 0 && state->vb_base[0]) ||
+                  state->num_vertex_elements == 0);
 
    /* Already resolved by whoever built the draw call: under Gallium that is
     * cp_draw_vbo unwrapping a pipe_resource, natively it is the recorded
@@ -3402,12 +3408,12 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    /* If no VS will run, pack positions from VB directly (passthrough).
     * When a VS is present, skip this — VS output provides positions. */
    if (!has_vs) {
-      if (cp->num_vertex_buffers > 0 && cp->vb_base[0]) {
+      if (state->num_vertex_buffers > 0 && state->vb_base[0]) {
          {
             /* Base and offset were folded together when the buffer was
              * bound. */
-            char *vb_start = (char *)(uintptr_t)cp->vb_base[0];
-            unsigned stride = cp->vertex_stride ? cp->vertex_stride : 16;
+            char *vb_start = (char *)(uintptr_t)state->vb_base[0];
+            unsigned stride = state->vertex_stride ? state->vertex_stride : 16;
 
             packed_positions =
                (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)total_verts * 16);
@@ -3436,26 +3442,26 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
     * The output replaces packed_positions for the rasterizer. */
    /* VS execution */
-   if (cp->vs_shader && cp->vs_shader->kernel) {
+   if (state->vs && state->vs->kernel) {
       CP_NVTX_SCOPE("vertex");
-      void *vb_data2 = (cp->num_vertex_buffers > 0)
-         ? (void *)(uintptr_t)cp->vb_base[0] : NULL;
+      void *vb_data2 = (state->num_vertex_buffers > 0)
+         ? (void *)(uintptr_t)state->vb_base[0] : NULL;
 
       /* A vertex shader may build its positions from gl_VertexIndex alone and
        * declare no inputs at all, which is how a fullscreen pass is drawn.
        * That draw binds no vertex buffer, and skipping it loses every
        * post-processing and skybox pass. A batch's bindings are its snapshot,
        * not the live state. */
-      if (vb_table != NULL || vb_data2 || cp->num_vertex_elements == 0) {
+      if (vb_table != NULL || vb_data2 || state->num_vertex_elements == 0) {
          unsigned stride;
-         unsigned num_vs_outputs = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
+         unsigned num_vs_outputs = state->vs->nir_num_outputs ? state->vs->nir_num_outputs : 2;
          unsigned out_stride = num_vs_outputs * 16;
 
          vs_output_buf = cp_scratch_alloc_device(cp, (size_t)total_verts * out_stride);
 
          /* Build VS input buffer on GPU: the vertex fetch kernel gathers
           * attributes in parallel, one thread per assembled vertex. */
-         unsigned vs_in_stride = cp->num_vertex_elements * 16;
+         unsigned vs_in_stride = state->num_vertex_elements * 16;
          CUdeviceptr vs_input_buf = vs_in_stride
             ? cp_scratch_alloc_device(cp, (size_t)total_verts * vs_in_stride)
             : 0;
@@ -3524,13 +3530,13 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                 instance_count == 1 && batch_draws == 1) {
                vid_buf = (CUdeviceptr)(uintptr_t)ib_base +
                          (size_t)draws[0].start * 4;
-            } else if (cp->vs_shader->reads_vertex_id) {
+            } else if (state->vs->reads_vertex_id) {
                out_vid = cp_scratch_alloc_device(cp, (size_t)total_verts * 4);
                if (!out_vid) { FREE(refs); return; }
                vid_buf = out_vid;
             }
 
-            if (cp->vs_shader->reads_instance_id) {
+            if (state->vs->reads_instance_id) {
                out_iid = cp_scratch_alloc_device(cp, (size_t)total_verts * 4);
                if (!out_iid) { FREE(refs); return; }
                iid_buf = out_iid;
@@ -3578,8 +3584,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             /* One row per assembled vertex, for the shader to pick its
              * uniform bindings and its draw parameters with. Only a shader
              * that reads either has any use for it. */
-            if (cp->vs_shader->reads_const_bufs ||
-                cp->vs_shader->reads_draw_params) {
+            if (state->vs->reads_const_bufs ||
+                state->vs->reads_draw_params) {
                batch_rows = cp_scratch_alloc_device(cp, (size_t)total_verts * 4);
                if (!batch_rows) { FREE(refs); return; }
             }
@@ -3635,7 +3641,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 
          struct cp_vertex_fetch_args vf_args = {
             .output = vs_input_buf,
-            .num_elements = cp->num_vertex_elements,
+            .num_elements = state->num_vertex_elements,
             .num_verts = total_verts,
             .vs_in_stride = vs_in_stride,
             .index_size = refs ? 0 : info->index_size,
@@ -3663,11 +3669,11 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             vf_args.index_buffer = (uint64_t)(uintptr_t)ib_base +
                (slices_dev ? 0 : (uint64_t)draws[0].start * info->index_size);
 
-         for (unsigned e = 0; e < cp->num_vertex_elements && e < 16; e++) {
-            const struct cp_vertex_elem *elem = &cp->velem[e];
+         for (unsigned e = 0; e < state->num_vertex_elements && e < 16; e++) {
+            const struct cp_vertex_elem *elem = &state->velem[e];
             unsigned vb_idx = elem->vertex_buffer_index;
-            if (vb_idx < cp->num_vertex_buffers && cp->vb_base[vb_idx])
-               vf_args.vb_bases[vb_idx] = cp->vb_base[vb_idx];
+            if (vb_idx < state->num_vertex_buffers && state->vb_base[vb_idx])
+               vf_args.vb_bases[vb_idx] = state->vb_base[vb_idx];
             vf_args.elem_vb_idx[e] = vb_idx;
             vf_args.elem_src_offset[e] = elem->src_offset;
             vf_args.elem_src_stride[e] = elem->src_stride;
@@ -3703,16 +3709,16 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             float *in = calloc(nfetch ? nfetch : 1, vs_in_stride);
             if (in)
                cuMemcpyDtoH(in, vs_input_buf, (size_t)nfetch * vs_in_stride);
-            for (unsigned e = 0; e < cp->num_vertex_elements && e < 8; e++)
+            for (unsigned e = 0; e < state->num_vertex_elements && e < 8; e++)
                fprintf(stderr, "  elem%u vb=%u off=%u stride=%u div=%u sz=%u\n",
-                       e, cp->velem[e].vertex_buffer_index,
-                       cp->velem[e].src_offset,
-                       cp->velem[e].src_stride,
-                       cp->velem[e].instance_divisor,
+                       e, state->velem[e].vertex_buffer_index,
+                       state->velem[e].src_offset,
+                       state->velem[e].src_stride,
+                       state->velem[e].instance_divisor,
                        vf_args.elem_attr_size[e]);
             for (unsigned v = 0; in && v < nfetch; v++) {
                fprintf(stderr, "  vfetch v%u:", v);
-               for (unsigned e = 0; e < cp->num_vertex_elements && e < 8; e++)
+               for (unsigned e = 0; e < state->num_vertex_elements && e < 8; e++)
                   fprintf(stderr, " e%u=[%.3f %.3f %.3f]", e,
                           in[(v * vs_in_stride) / 4 + e * 4 + 0],
                           in[(v * vs_in_stride) / 4 + e * 4 + 1],
@@ -3809,9 +3815,9 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          for (unsigned d = 0; d < batch_draws; d++) {
             const uint64_t *row = vs_ubo_table
                ? vs_ubo_table + (size_t)d * CP_ARG_UBO_STRIDE : NULL;
-            for (unsigned i = 0; i < cp->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
+            for (unsigned i = 0; i < state->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
                vs_tbl[d * CP_ARG_UBO_STRIDE + i] =
-                  row ? row[i] : (uint64_t)(uintptr_t)cp->vs_ubos[i].buffer;
+                  row ? row[i] : state->vs_ubos[i];
          }
 
          /* One row of draw parameters per merged draw, indexed by the same
@@ -3832,15 +3838,16 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 
          /* Still written, so that the block reads the same whichever form a
           * stage takes its bindings from. */
-         for (unsigned i = 0; i < cp->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
-            vs_args_host[CP_ARG_UBO_BASE + i] = cp->vs_ubos[i].buffer;
+         for (unsigned i = 0; i < state->num_vs_ubos && i < CP_MAX_CONST_BUFFERS; i++)
+            vs_args_host[CP_ARG_UBO_BASE + i] =
+               (void *)(uintptr_t)state->vs_ubos[i];
 
          cp_upload_end(cp, vs_args_dev, vs_blk, vs_blk_bytes);
 
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
          /* Compiled shaders grid-stride; see the fragment launch. */
-         CUresult vs_err = cuLaunchKernel(cp->vs_shader->kernel,
+         CUresult vs_err = cuLaunchKernel(state->vs->kernel,
             MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
             0, cp->stream, vs_params, NULL);
 
@@ -3902,9 +3909,9 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                    * rasterizes the whole 4x slot array, holes and all, and
                    * multithreading paid 72% for ordering nothing consumes.
                    */
-                  bool stable_clip = cp->blend_enabled ||
-                     (batch_draws > 1 && cp->fs_shader &&
-                      cp->fs_shader->reads_const_bufs);
+                  bool stable_clip = state->blend.enable ||
+                     (batch_draws > 1 && state->fs &&
+                      state->fs->reads_const_bufs);
                   /* Stable IDs no longer require rasterizing all seven unused
                    * slots beside the usual one-triangle output.  The clipper
                    * appends live fixed-slot IDs here; allocation failure keeps
@@ -3918,7 +3925,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                      fprintf(stderr, "clip: tris=%u batch_draws=%u stable=%d "
                              "reads_cb=%d\n", num_triangles, batch_draws,
                              (int)stable_clip,
-                             cp->fs_shader ? (int)cp->fs_shader->reads_const_bufs : -1);
+                             state->fs ? (int)state->fs->reads_const_bufs : -1);
 
                   cuMemsetD32Async(clip_count,
                                    stable_clip && !active_ids ? max_clipped : 0,
@@ -3972,12 +3979,12 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       fprintf(stderr, "cudapipe: [samples=%u] draw %u tris (%u instances), fb=%ux%u, "
               "vp=[%.0f,%.0f,%.0f,%.0f] stride=%u scale=[%.1f,%.1f] color=%p\n",
               fb_samples, num_triangles, instance_count, w, h, vp_x, vp_y, vp_w, vp_h,
-              cp->vertex_stride,
-              cp->viewport.scale[0], cp->viewport.scale[1], color_data);
-      for (unsigned e = 0; e < cp->num_vertex_elements && e < 4; e++)
+              state->vertex_stride,
+              state->viewport.scale[0], state->viewport.scale[1], color_data);
+      for (unsigned e = 0; e < state->num_vertex_elements && e < 4; e++)
          fprintf(stderr, "  elem[%u]: offset=%u fmt=%u vb=%u\n", e,
-                 cp->velem[e].src_offset, cp->velem[e].conv,
-                 cp->velem[e].vertex_buffer_index);
+                 state->velem[e].src_offset, state->velem[e].conv,
+                 state->velem[e].vertex_buffer_index);
    }
 
    /* 3-stage adaptive rasterize. The queue counters are zeroed inside the pass
@@ -3998,7 +4005,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * pass records what discarded where and repeats, letting the next fragment
     * win, until every pixel has settled or the layers run out.
     */
-   bool retry = cp->fs_shader && cp->fs_shader->uses_discard &&
+   bool retry = state->fs && state->fs->uses_discard &&
                 cp->reject && cp->resolved && color_data;
 
    /*
@@ -4010,7 +4017,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * colour, so that first pass never ran and the sample rendered its
     * background.
     */
-   bool fs_side_effects = cp->fs_shader && cp->fs_shader->writes_memory;
+   bool fs_side_effects = state->fs && state->fs->writes_memory;
 
    /*
     * Blended geometry needs every layer, not the nearest one. The visibility
@@ -4043,7 +4050,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * with exactly the answer it reached it with before.
     */
    bool peel = !retry && cp->peel_next && screen->kernels.peel_advance &&
-               ((color_data && cp->blend_enabled) ||
+               ((color_data && state->blend.enable) ||
                 (!color_data && fs_side_effects));
    /* A draw can never stack more layers than it has primitives, so a blended
     * draw of two triangles costs two passes rather than the cap. */
@@ -4143,7 +4150,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       census_draw_seq++;
       fprintf(stderr, "census: draw=%u tris=%u passes=%u peel=%d retry=%d "
               "blend=%d fb=%ux%u\n", this_draw_seq, num_triangles, passes,
-              peel ? 1 : 0, retry ? 1 : 0, cp->blend_enabled ? 1 : 0, w, h);
+              peel ? 1 : 0, retry ? 1 : 0, state->blend.enable ? 1 : 0, w, h);
       if (peel && w && h) {
          if (census_w != w || census_h != h) {
             if (census_buf)
@@ -4214,7 +4221,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          if (!said++)
             fprintf(stderr, "abuffer: %u samples per pixel; peel path only, "
                     "single-sampled only — skipped\n", fb_samples);
-      } else if (cp->depth_stencil.depth_writemask) {
+      } else if (state->depth.depth_writemask) {
          /*
           * A draw that writes depth changes the depth-test outcome between
           * peel passes, so a population counted once before the loop is not
@@ -4227,8 +4234,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          if (!said++)
             fprintf(stderr, "abuffer: draw writes depth (test=%d mask=%d), so "
                     "the depth-passing population changes between peel passes "
-                    "— skipped\n", cp->depth_stencil.depth_enabled ? 1 : 0,
-                    cp->depth_stencil.depth_writemask ? 1 : 0);
+                    "— skipped\n", state->depth.depth_enabled ? 1 : 0,
+                    state->depth.depth_writemask ? 1 : 0);
       } else if (fb->nr_cbufs != 1) {
          /* The composite writes one attachment, as the writeback does. */
          if (!said++)
@@ -4604,7 +4611,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        */
       bool bounded = ab->composite && !ab->verify && !ab->timing &&
                      num_triangles <= 2 && cp->fs_batch.ndraws <= 1 &&
-                     cp->fs_shader && !cp->fs_shader->writes_memory &&
+                     state->fs && !state->fs->writes_memory &&
                      (size_t)ab->nblocks * rast_num_triangles * 4 <=
                         (size_t)(512u << 10) &&
                      /* Clipping triangulates each input polygon; its pieces
@@ -4834,7 +4841,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * attachment — or, for a shader that exists for its stores rather than
        * for a colour, just the first two. */
       if (color_data || fs_side_effects)
-         cp_shade_fragments(cp, info, visbuf, rast_args.positions, vs_output_buf,
+         cp_shade_fragments(cp, state, &batch->scope, info, visbuf, rast_args.positions, vs_output_buf,
                             num_triangles, w, h, color_data,
                             vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
                             retry ? cp->reject : 0,
@@ -4899,7 +4906,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       if (qcounters[0] && !qcounters[1] && (abuf_prod || !ab->composite)) {
          cp->scratch.used = shade_mark;
          cp->dscratch.used = shade_dmark;
-         shaded = cp_abuf_shade(cp, info, ab, rast_args.positions,
+         shaded = cp_abuf_shade(cp, state, &batch->scope, info, ab, rast_args.positions,
                                 vs_output_buf, w, h, vp_scale_x, vp_scale_y,
                                 vp_trans_x, vp_trans_y, qcounters[0],
                                 abuf_covered,
@@ -5038,13 +5045,13 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
  * draws arrived in, because the visibility buffer resolves it with atomicMin.
  */
 bool
-cp_batch_order_free(struct cp_context *cp)
+cp_batch_order_free(const struct cp_draw_state *state)
 {
-   if (cp->blend_enabled || cp->fs_shader->uses_discard)
+   if (state->blend.enable || state->fs->uses_discard)
       return false;
-   if (!cp->depth_stencil.depth_enabled || !cp->depth_stencil.depth_writemask)
+   if (!state->depth.depth_enabled || !state->depth.depth_writemask)
       return false;
-   switch (cp->depth_stencil.depth_func) {
+   switch (state->depth.depth_func) {
    case CP_FUNC_LESS:
    case CP_FUNC_LEQUAL:
    case CP_FUNC_GREATER:
@@ -5069,79 +5076,11 @@ cp_batch_order_free(struct cp_context *cp)
  * instead composites its merged draws in the same primitive order and is
  * equally correct — but a batch that ends up anywhere else is not.
  */
-bool
-cp_batch_abuf_ok(struct cp_context *cp)
-{
-   struct cp_device *screen = cp->screen;
-   const struct cp_fb_desc *fb = &cp->fb;
-   struct cp_abuf *ab = cp->abuf;
 
-   if (!cp_abuf_enabled(ab) || ab->disabled)
-      return false;
-   if (!screen->kernels.abuf_quad_fill || !screen->kernels.clip_triangles ||
-       !screen->kernels.peel_advance)
-      return false;
-
-   /* What makes the draw peel at all — cp_draw_execute's `peel`. A discarding
-    * shader takes the retry path instead, and its fragments are not the
-    * A-buffer's population. */
-   if (!cp->blend_enabled || cp->fs_shader->uses_discard || !cp->peel_next)
-      return false;
-
-   /* The A-buffer's own gate. */
-   if (MAX2(cp->fb_samples, 1u) != 1 || cp->depth_stencil.depth_writemask)
-      return false;
-   if (fb->nr_cbufs != 1 || !fb->color || fb->color_encoding < 0)
-      return false;
-
-   /*
-    * The vertex shader's outputs have to fit the clipper, because the stable
-    * layout the ordering rests on is the clipper's. A draw wide enough to skip
-    * clipping keeps the compacting path, where a batch's primitive indices
-    * would still be in submission order — but it is one condition rather than
-    * two, so it is refused here and left on the single-draw path.
-    */
-   unsigned nout = cp->vs_shader->nir_num_outputs ? cp->vs_shader->nir_num_outputs : 2;
-   if (nout > CP_MAX_CLIP_SLOTS)
-      return false;
-
-   return true;
-}
 
 /* Snapshot this draw's index range and vertex-stage bindings as the next row
  * of the batch's tables. */
-void
-cp_stage_draw_state_legacy(struct cp_context *cp,
-                           const struct cp_draw_state *s,
-                           const struct cp_render_scope *scope,
-                           const struct cp_rect *scissor)
-{
-   cp->fb = scope->fb;
-   cp->fb_samples = scope->attachment_samples;
-   cp->viewport = s->viewport;
-   cp->scissor = *scissor;
-   cp->rasterizer = s->raster;
-   cp->depth_stencil = s->depth;
-   cp->blend_desc = s->blend;
-   cp->blend_enabled = s->blend.enable;
-   cp->vs_shader = s->vs;
-   cp->fs_shader = s->fs;
-   memcpy(cp->velem, s->velem, sizeof(cp->velem));
-   cp->num_vertex_elements = s->num_vertex_elements;
-   cp->vertex_stride = s->vertex_stride;
-   memcpy(cp->vb_base, s->vb_base, sizeof(cp->vb_base));
-   cp->num_vertex_buffers = s->num_vertex_buffers;
-   for (unsigned i = 0; i < CP_MAX_CONST_BUFFERS; i++) {
-      cp->vs_ubos[i].buffer = (void *)(uintptr_t)s->vs_ubos[i];
-      cp->vs_ubos[i].managed_copy = 0;
-      cp->vs_ubos[i].user_copy = false;
-      cp->fs_ubos[i].buffer = (void *)(uintptr_t)s->fs_ubos[i];
-      cp->fs_ubos[i].managed_copy = 0;
-      cp->fs_ubos[i].user_copy = false;
-   }
-   cp->num_vs_ubos = s->num_vs_ubos;
-   cp->num_fs_ubos = s->num_fs_ubos;
-}
+
 
 void
 cp_batch_begin_packet(struct cp_context *cp,
@@ -5301,20 +5240,22 @@ cp_pass_appendable(struct cp_context *cp)
 }
 
 static bool
-cp_opaque_appendable(struct cp_context *cp)
+cp_opaque_appendable(struct cp_context *cp,
+                     const struct cp_draw_batch *batch)
 {
-   const struct cp_fb_desc *fb = &cp->fb;
-   if (cp_debug->no_opaque_episode || !cp_batch_order_free(cp) ||
-       !cp->fs_shader || cp->fs_shader->writes_memory ||
-       MAX2(cp->fb_samples, 1u) != 1 || fb->nr_cbufs != 1 ||
+   const struct cp_draw_state *state = &batch->state;
+   const struct cp_fb_desc *fb = &batch->scope.fb;
+   if (cp_debug->no_opaque_episode || !cp_batch_order_free(state) ||
+       !state->fs || state->fs->writes_memory ||
+       MAX2(batch->scope.attachment_samples, 1u) != 1 || fb->nr_cbufs != 1 ||
        !fb->color || fb->color_encoding < 0) {
       if (getenv("CPVK_DEBUG_EPISODE"))
          fprintf(stderr, "no-episode: noflag=%d orderfree=%d fs=%d "
                  "writes=%d samples=%u cbufs=%u color=%d enc=%d\n",
-                 (int)cp_debug->no_opaque_episode, (int)cp_batch_order_free(cp),
-                 (int)!!cp->fs_shader,
-                 cp->fs_shader ? (int)cp->fs_shader->writes_memory : -1,
-                 MAX2(cp->fb_samples, 1u), fb->nr_cbufs, (int)!!fb->color,
+                 (int)cp_debug->no_opaque_episode, (int)cp_batch_order_free(state),
+                 (int)!!state->fs,
+                 state->fs ? (int)state->fs->writes_memory : -1,
+                 MAX2(batch->scope.attachment_samples, 1u), fb->nr_cbufs, (int)!!fb->color,
                  fb->color_encoding);
       return false;
    }
@@ -5364,52 +5305,6 @@ cp_pass_broadcast(struct cp_context *cp, unsigned nsegs)
       cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0);
 }
 
-/* Everything cp_draw_execute reads from live context state that varies per
- * segment, saved and restored around the fallback and the shading loop. */
-struct cp_pass_live {
-   struct cp_shader_binary *vs, *fs;
-   /* The resolved vertex input, which is what the draw path reads. The
-    * Gallium array is not saved: nothing during a fallback re-execution
-    * looks at it, and leaving the live copy alone is what keeps the next
-    * batch key correct. */
-   struct cp_vertex_elem velem[16];
-   uint64_t vb_base[16];
-   unsigned num_vertex_buffers;
-   unsigned num_vertex_elements, vertex_stride;
-   unsigned num_vs_ubos, num_fs_ubos;
-   struct cp_fs_batch fs_batch;
-};
-
-static void
-cp_pass_live_save(struct cp_context *cp, struct cp_pass_live *lv)
-{
-   lv->vs = cp->vs_shader;
-   lv->fs = cp->fs_shader;
-   memcpy(lv->velem, cp->velem, sizeof(lv->velem));
-   memcpy(lv->vb_base, cp->vb_base, sizeof(lv->vb_base));
-   lv->num_vertex_buffers = cp->num_vertex_buffers;
-   lv->num_vertex_elements = cp->num_vertex_elements;
-   lv->vertex_stride = cp->vertex_stride;
-   lv->num_vs_ubos = cp->num_vs_ubos;
-   lv->num_fs_ubos = cp->num_fs_ubos;
-   lv->fs_batch = cp->fs_batch;
-}
-
-static void
-cp_pass_live_restore(struct cp_context *cp, const struct cp_pass_live *lv)
-{
-   cp->vs_shader = lv->vs;
-   cp->fs_shader = lv->fs;
-   memcpy(cp->velem, lv->velem, sizeof(lv->velem));
-   memcpy(cp->vb_base, lv->vb_base, sizeof(lv->vb_base));
-   cp->num_vertex_buffers = lv->num_vertex_buffers;
-   cp->num_vertex_elements = lv->num_vertex_elements;
-   cp->vertex_stride = lv->vertex_stride;
-   cp->num_vs_ubos = lv->num_vs_ubos;
-   cp->num_fs_ubos = lv->num_fs_ubos;
-   cp->fs_batch = lv->fs_batch;
-}
-
 
 /* The episode could not deliver; render every segment the classic way, in
  * submission order, from its snapshot. Rasterization is idempotent — the
@@ -5422,13 +5317,12 @@ cp_pass_fallback(struct cp_context *cp, struct cp_pass_seg *segs,
     * streams, writing the shared lists the re-execution is about to clear. */
    cp_pass_join(cp, nsegs);
 
-   struct cp_pass_live lv;
-   cp_pass_live_save(cp, &lv);
+   struct cp_fs_batch saved_fs_batch = cp->fs_batch;
    for (unsigned s = 0; s < nsegs; s++) {
       struct cp_pass_seg *sg = &segs[s];
       cp_draw_execute_batch(cp, &sg->batch);
    }
-   cp_pass_live_restore(cp, &lv);
+   cp->fs_batch = saved_fs_batch;
 }
 
 static bool
@@ -5659,15 +5553,14 @@ cp_opaque_finish(struct cp_context *cp)
       return;
    }
 
-   const struct cp_fb_desc *fb = &cp->fb;
+   const struct cp_fb_desc *fb = &segs[0].batch.scope.fb;
    void *color_data = fb->color;
    if (!color_data) {
       cp_pass_fallback(cp, segs, nsegs);
       return;
    }
 
-   struct cp_pass_live live;
-   cp_pass_live_save(cp, &live);
+   struct cp_fs_batch saved_fs_batch = cp->fs_batch;
    size_t shade_mark = cp->scratch.used;
    size_t shade_dmark = cp->dscratch.used;
    for (unsigned g = 0; g < ngroups; g++) {
@@ -5686,13 +5579,12 @@ cp_opaque_finish(struct cp_context *cp)
       }
       cp->scratch.used = shade_mark;
       cp->dscratch.used = shade_dmark;
-      cp_stage_draw_state_legacy(cp, &seg->batch.state, &seg->batch.scope,
-                                 &seg->batch.scissors[seg->batch.ndraws - 1]);
       cp->fs_batch.ubos = cp->pass_group_ubos;
       cp->fs_batch.ndraws = group_rows;
       cp->fs_batch.slices = seg->slices_dev;
       cp->fs_batch.prim_shift = seg->prim_shift;
-      cp_shade_fragments(cp, &seg->batch.info, cp->visbuf, seg->rast.positions,
+      cp_shade_fragments(cp, &seg->batch.state, &seg->batch.scope,
+                         &seg->batch.info, cp->visbuf, seg->rast.positions,
                          seg->rast.positions, seg->num_triangles, w, h,
                          color_data, seg->rast.vp_scale_x,
                          seg->rast.vp_scale_y, seg->rast.vp_trans_x,
@@ -5701,7 +5593,7 @@ cp_opaque_finish(struct cp_context *cp)
                             sizeof(ranges[0]),
                          group_range_count[g]);
    }
-   cp_pass_live_restore(cp, &live);
+   cp->fs_batch = saved_fs_batch;
 }
 
 /*
@@ -6211,8 +6103,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
    struct cp_seg_range ranges[CP_PASS_MAX_SEGS];
    struct cp_seg_desc descs[CP_PASS_MAX_SEGS] = {0};
    struct cp_abuf_seg_shade group_shades[CP_PASS_MAX_SEGS] = {0};
-   struct cp_pass_live live;
-   cp_pass_live_save(cp, &live);
+   struct cp_fs_batch saved_fs_batch = cp->fs_batch;
    bool shaded = true;
    for (unsigned group = 0; group < ngroups && shaded; group++) {
       struct cp_pass_seg *first = &segs[group_first[group]];
@@ -6255,9 +6146,6 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          break;
       }
 
-      cp->vs_shader = first->batch.state.vs;
-      cp->fs_shader = first->batch.state.fs;
-      cp->num_fs_ubos = first->batch.state.num_fs_ubos;
       cp->fs_batch.ubos = need_rows ? cp->pass_group_ubos : first->batch.fs_ubos;
       cp->fs_batch.ndraws = rows;
       cp->fs_batch.slices = first->slices_dev;
@@ -6272,7 +6160,8 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       };
       float ti, ts, tc;
       shaded = cp_abuf_shade(
-         cp, &first->batch.info, ab, first->rast.positions, first->rast.positions,
+         cp, &first->batch.state, &first->batch.scope,
+         &first->batch.info, ab, first->rast.positions, first->rast.positions,
          w, h, first->rast.vp_scale_x, first->rast.vp_scale_y,
          first->rast.vp_trans_x, first->rast.vp_trans_y,
          (uint32_t)quad_bound, 0, false, NULL, false, &ti, &ts, &tc, &shade);
@@ -6292,11 +6181,11 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          };
       }
    }
-   cp_pass_live_restore(cp, &live);
+   cp->fs_batch = saved_fs_batch;
    if (!shaded)
       return false;
 
-   const struct cp_fb_desc *fb = &cp->fb;
+   const struct cp_fb_desc *fb = &segs[0].batch.scope.fb;
    void *color_data = fb->color;
    CUdeviceptr descs_dev = ngroups > 1
       ? cp_upload(cp, descs, (size_t)nsegs * sizeof(descs[0])) : 0;
@@ -6320,7 +6209,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       .color_encoding = (uint32_t)MAX2(
          fb->color_encoding, 0),
       .max_layers = ab->max_layers,
-      .blend = cp_blend_desc_for(cp),
+      .blend = cp_blend_desc_for(&segs[0].batch.state),
       .quad_seg = ngroups > 1 ? quad_seg : 0,
       .quad_dense = ngroups > 1 ? quad_dense : 0,
       .seg_desc = ngroups > 1 ? descs_dev : 0,
@@ -6637,8 +6526,7 @@ cp_pass_finish(struct cp_context *cp)
 
    /* --- shade each group densely over its slice of the quads, fanned out --- */
    cp_pass_broadcast(cp, nsegs);
-   struct cp_pass_live lv;
-   cp_pass_live_save(cp, &lv);
+   struct cp_fs_batch saved_fs_batch = cp->fs_batch;
    struct cp_seg_desc descs[CP_PASS_MAX_SEGS];
    memset(descs, 0, sizeof(descs));
    for (unsigned g = 0; g < ngroups && !failed; g++) {
@@ -6651,9 +6539,6 @@ cp_pass_finish(struct cp_context *cp)
          members += seg_group[s] == g;
       if (cp->seg_streams[0])
          cp->stream = cp_pass_seg_stream(cp, g);
-      cp->vs_shader = sg->batch.state.vs;
-      cp->fs_shader = sg->batch.state.fs;
-      cp->num_fs_ubos = sg->batch.state.num_fs_ubos;
       struct cp_abuf_seg_shade ss = {
          .quad_list = grouped,
          .quad_list_base = group_base[g],
@@ -6722,7 +6607,8 @@ cp_pass_finish(struct cp_context *cp)
          cp->fs_batch.prim_shift = sg->prim_shift;
       }
       float ti, ts, tc;
-      if (!cp_abuf_shade(cp, &sg->batch.info, ab, sg->rast.positions,
+      if (!cp_abuf_shade(cp, &sg->batch.state, &sg->batch.scope,
+                         &sg->batch.info, ab, sg->rast.positions,
                          sg->rast.positions, w, h,
                          sg->rast.vp_scale_x, sg->rast.vp_scale_y,
                          sg->rast.vp_trans_x, sg->rast.vp_trans_y,
@@ -6748,7 +6634,7 @@ cp_pass_finish(struct cp_context *cp)
       }
    }
    cp->stream = pass_main;
-   cp_pass_live_restore(cp, &lv);
+   cp->fs_batch = saved_fs_batch;
    cp_pass_join(cp, nsegs);
    if (failed) {
       cp_pass_fallback(cp, segs, nsegs);
@@ -6756,7 +6642,7 @@ cp_pass_finish(struct cp_context *cp)
    }
 
    /* --- one composite for the whole episode --- */
-   const struct cp_fb_desc *fb = &cp->fb;
+   const struct cp_fb_desc *fb = &segs[0].batch.scope.fb;
    void *color_data = fb->color;
    CUdeviceptr descs_dev = cp_upload(cp, descs,
                                      (size_t)nsegs * sizeof(descs[0]));
@@ -6775,7 +6661,7 @@ cp_pass_finish(struct cp_context *cp)
       .color_encoding = (uint32_t)MAX2(
          fb->color_encoding, 0),
       .max_layers = ab->max_layers,
-      .blend = cp_blend_desc_for(cp),
+      .blend = cp_blend_desc_for(&segs[0].batch.state),
       .quad_seg = quad_seg,
       .quad_dense = quad_dense,
       .seg_desc = descs_dev,
@@ -6860,7 +6746,7 @@ static void
 cp_pass_append(struct cp_context *cp, unsigned ndraws)
 {
    struct cp_abuf *ab = cp->abuf;
-   const struct cp_fb_desc *fb = &cp->fb;
+   const struct cp_fb_desc *fb = &cp->batch.scope.fb;
 
    if (cp->pass.nsegs && cp->pass.opaque)
       cp_pass_finish(cp);
@@ -6945,7 +6831,7 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    }
 
    if (!cp->pass.nsegs) {
-      const struct cp_fb_desc *fb = &cp->fb;
+      const struct cp_fb_desc *fb = &cp->batch.scope.fb;
       cp->pass.opaque = true;
       cp->pass.w = fb->width;
       cp->pass.h = fb->height;
@@ -6996,16 +6882,11 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
 
    unsigned ndraws = cp->batch.ndraws;
    bool blended = cp->batch.blended;
-   /* Cleared first: cp_draw_execute() runs a whole frame's worth of driver
+   /* Cleared first: cp_draw_execute_batch() runs a whole frame's worth of driver
     * code and nothing in it may see a batch that is already on its way. */
    cp->batch.pending = false;
    /* Keep the immutable payload intact while append/execute/fallback consumes
     * it. cp_batch_begin_packet overwrites counters for the next batch. */
-
-   /* Execution consumes the immutable state captured when the batch began,
-    * not whichever frontend draw happened to touch the live context last. */
-   cp_stage_draw_state_legacy(cp, &cp->batch.state, &cp->batch.scope,
-                              &cp->batch.scissors[ndraws - 1]);
 
    if (cp_debug->debug_draw) {
       fprintf(stderr, "cudapipe: batch of %u draws\n", ndraws);
@@ -7030,7 +6911,7 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
       cp_pass_append(cp, ndraws);
       return;
    }
-   if (!blended && cp_opaque_appendable(cp)) {
+   if (!blended && cp_opaque_appendable(cp, &cp->batch)) {
       cp_opaque_append(cp, ndraws);
       return;
    }
@@ -7087,14 +6968,10 @@ void
 cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
                            unsigned samples)
 {
-   cp->fb = *fb;
-
    /* Coverage and depth are per sample, so the buffers scale with the sample
     * count and it has to force a reallocation the same way the size does. */
    if (samples > CP_MAX_SAMPLES)
       samples = CP_MAX_SAMPLES;
-   cp->fb_samples = samples;
-
    /*
     * Size the five framebuffer-sized buffers, growing only.
     *
@@ -7113,7 +6990,7 @@ cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
     * use. The two counts are tracked separately because visbuf and depthbuf
     * scale with samples and the other three do not.
     */
-   unsigned w = cp->fb.width, h = cp->fb.height;
+   unsigned w = fb->width, h = fb->height;
    size_t px = (size_t)w * h;
    size_t px_samples = px * samples;
 

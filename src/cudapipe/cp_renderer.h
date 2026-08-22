@@ -146,7 +146,7 @@ struct cp_draw_batch {
       unsigned tris;
       struct cp_batch_key key;
       struct cp_draw_call info;
-      /* One index range per merged draw; cp_draw_execute() turns these into
+      /* One index range per merged draw; cp_draw_execute_batch() turns these into
        * the slice table cp_vertex_fetch searches. */
       struct cp_draw_range draws[CP_MAX_BATCH_DRAWS];
       uint32_t instance_counts[CP_MAX_BATCH_DRAWS];
@@ -295,7 +295,7 @@ struct cp_context {
 
    /*
     * What the fragment shader launches of the draw now running should hand to
-    * CP_ARG_SLOT_UBO_TABLE. Set once at the top of cp_draw_execute() so that
+    * CP_ARG_SLOT_UBO_TABLE. Set once at the top of cp_draw_execute_batch() so that
     * it cannot carry from one draw to the next, and read by
     * cp_fs_launch_shader() — which both shading paths go through, and which is
     * three call frames below where the batch is known.
@@ -340,32 +340,11 @@ struct cp_context {
       unsigned  num, cap;
    } timer;
 
-   /* What the draw path reads, resolved when the framebuffer was bound. */
-   struct cp_fb_desc fb;
-   struct cp_rect scissor;
-   /*
-    * What the pipeline reads, in the driver's own types: the viewport's scale
-    * and translate, three fields of the rasterizer and three of the depth
-    * state. Field names match Gallium's, so nothing that reads them changed.
-    */
-   struct cp_viewport_state viewport;
-   struct cp_raster_state rasterizer;
-   struct cp_depth_state depth_stencil;
-   /*
-    * And what the Gallium adapter compares to decide whether a held-back
-    * batch must be flushed, and what the batch key carries. Adapter-only, and
-    * gone with Gallium. The comparison deliberately did not move with the
-    * fields: narrowing it to what the pipeline reads would make batches
-    * larger than they are today, and batch size is what makes the clipper's
-    * unstable primitive order visible (gaps 15 and 16).
-    */
-
    /* Visibility buffer, rebuilt per draw: it resolves which triangle of the
     * current draw wins each pixel. */
    CUdeviceptr visbuf;
    CUdeviceptr reject;      /* per-pixel discarded triangles, CP_DISCARD_LAYERS deep */
    CUdeviceptr resolved;    /* per-pixel byte: a fragment has been written */
-   unsigned fb_samples;     /* samples per pixel of the bound framebuffer */
    unsigned visbuf_samples; /* what the visibility and depth buffers were sized for */
    CUdeviceptr peel_next;   /* per-pixel: first primitive not yet blended */
    CUdeviceptr peel_any;    /* one uint32, managed: a pass found work to do */
@@ -405,14 +384,6 @@ struct cp_context {
 
 
    struct cp_shader_binary *compute_shader;
-   struct cp_shader_binary *vs_shader;
-   struct cp_shader_binary *fs_shader;
-
-   /* Blend state */
-   /* What both kernels that evaluate a blend actually read, resolved once
-    * when the state was bound rather than rebuilt per draw. */
-   struct cp_blend_desc blend_desc;
-   bool blend_enabled;
 
    /* Texture state for FS */
    CUtexObject tex_objects[32];
@@ -423,22 +394,6 @@ struct cp_context {
       unsigned row_stride;
       unsigned pixel_size;
    } tex_resources[32];
-
-   /* Vertex buffers and elements */
-   /* The bindings themselves are not kept: nothing reads them once
-    * vb_base has the resolved address, and a stale pipe_vertex_buffer is a
-    * resource reference nobody counts. */
-   /* Resolved when the buffers were bound: base address plus offset, which
-    * is all the draw path ever wanted from them. */
-   uint64_t vb_base[16];
-   /* And the elements, with the format already turned into the fetch
-    * kernel's conversion. The Gallium array beside this stays for the
-    * batch key and the pass-segment snapshot. */
-   struct cp_vertex_elem velem[16];
-   unsigned num_vertex_buffers;
-
-   unsigned num_vertex_elements;
-   unsigned vertex_stride;
 
    struct {
       void *buffer;
@@ -455,30 +410,6 @@ struct cp_context {
    } compute_ubos[CP_MAX_CONST_BUFFERS];
    unsigned num_compute_ubos;
 
-   struct {
-      void *buffer;
-      unsigned buffer_size;
-      CUdeviceptr managed_copy;
-      unsigned managed_size;
-      /*
-       * The binding came from a user pointer and was copied into
-       * `managed_copy`, which is reused for every update. Two draws then see
-       * the same device address with different contents, so a batch that
-       * deferred either of them would shade both with whichever value landed
-       * last. cp_batch_eligible() refuses such a draw outright.
-       */
-      bool user_copy;
-   } fs_ubos[CP_MAX_CONST_BUFFERS];
-   unsigned num_fs_ubos;
-
-   struct {
-      void *buffer;
-      unsigned buffer_size;
-      CUdeviceptr managed_copy;
-      unsigned managed_size;
-      bool user_copy;
-   } vs_ubos[CP_MAX_CONST_BUFFERS];
-   unsigned num_vs_ubos;
 
    /* Device-visible table of deduplicated sampler states. Descriptors refer to
     * entries by index; see cp_register_sampler(). */
@@ -556,12 +487,12 @@ struct cp_context {
     *
     * Each staged draw puts its push block in the upload arena and records the
     * address in its uniform row. cp_scratch_reset() rewinds that arena, and
-    * cp_draw_execute() calls cp_scratch_begin() before it uploads anything of
+    * cp_draw_execute_batch() calls cp_scratch_begin() before it uploads anything of
     * its own -- so a reclaim there hands the batch's own slice table and
     * argument block the addresses the push blocks are sitting at, and every
     * merged draw reads whatever landed on top of it.
     *
-    * Set when a draw joins a batch, cleared when cp_draw_execute() returns.
+    * Set when a draw joins a batch, cleared when cp_draw_execute_batch() returns.
     */
    bool batch_uploads_live;
 };
@@ -821,9 +752,18 @@ int32_t cp_slot_for_location(const unsigned *locations, unsigned count, unsigned
 unsigned cp_triangles_for_draw(enum mesa_prim mode, unsigned count);
 struct cp_vertex_ref * cp_build_vertex_refs(const struct cp_draw_call *info, const struct cp_draw_range *draws, unsigned num_draws, unsigned instance_count, const void *ib_base, unsigned num_triangles);
 uint32_t cp_cull_mode(const struct cp_raster_state *rs);
-struct cp_blend_desc cp_blend_desc_for(const struct cp_context *cp);
+struct cp_blend_desc cp_blend_desc_for(const struct cp_draw_state *state);
 
-bool cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info, struct cp_abuf *ab, CUdeviceptr positions, CUdeviceptr vs_output_buf, unsigned w, unsigned h, float vp_scale_x, float vp_scale_y, float vp_trans_x, float vp_trans_y, uint32_t num_quads, uint32_t num_covered, bool record_colors, void *color_data, bool composite, float *t_interp, float *t_shade, float *t_composite, struct cp_abuf_seg_shade *seg);
+bool cp_abuf_shade(struct cp_context *cp,
+                   const struct cp_draw_state *state,
+                   const struct cp_render_scope *scope,
+                   const struct cp_draw_call *info, struct cp_abuf *ab,
+                   CUdeviceptr positions, CUdeviceptr vs_output_buf,
+                   unsigned w, unsigned h, float vp_scale_x, float vp_scale_y,
+                   float vp_trans_x, float vp_trans_y, uint32_t num_quads,
+                   uint32_t num_covered, bool record_colors, void *color_data,
+                   bool composite, float *t_interp, float *t_shade,
+                   float *t_composite, struct cp_abuf_seg_shade *seg);
 
 /*
  * TEMPORARY (CUDAPIPE_ABUFFER): the merged quad array, for the one draw whose
@@ -835,16 +775,20 @@ bool cp_abuf_shade(struct cp_context *cp, const struct cp_draw_call *info, struc
 
 void cp_draw_execute_batch(struct cp_context *cp,
                            const struct cp_draw_batch *batch);
-void cp_shade_fragments(struct cp_context *cp, const struct cp_draw_call *info, CUdeviceptr visbuf, CUdeviceptr positions, CUdeviceptr vs_output_buf, unsigned num_triangles, unsigned w, unsigned h, void *color_data, float vp_scale_x, float vp_scale_y, float vp_trans_x, float vp_trans_y, CUdeviceptr reject, CUdeviceptr resolved, unsigned reject_pass, CUdeviceptr seg_ranges, unsigned num_seg_ranges);
+void cp_shade_fragments(struct cp_context *cp,
+                        const struct cp_draw_state *state,
+                        const struct cp_render_scope *scope,
+                        const struct cp_draw_call *info, CUdeviceptr visbuf,
+                        CUdeviceptr positions, CUdeviceptr vs_output_buf,
+                        unsigned num_triangles, unsigned w, unsigned h,
+                        void *color_data, float vp_scale_x, float vp_scale_y,
+                        float vp_trans_x, float vp_trans_y, CUdeviceptr reject,
+                        CUdeviceptr resolved, unsigned reject_pass,
+                        CUdeviceptr seg_ranges, unsigned num_seg_ranges);
 
 
-bool cp_batch_abuf_ok(struct cp_context *cp);
-bool cp_batch_order_free(struct cp_context *cp);
+bool cp_batch_order_free(const struct cp_draw_state *state);
 
-void cp_stage_draw_state_legacy(struct cp_context *cp,
-                                const struct cp_draw_state *state,
-                                const struct cp_render_scope *scope,
-                                const struct cp_rect *scissor);
 void cp_batch_begin_packet(struct cp_context *cp,
                            const struct cp_draw_packet *packet,
                            const struct cp_batch_key *key, bool blended);

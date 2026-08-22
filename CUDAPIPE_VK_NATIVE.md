@@ -76,8 +76,11 @@ rows. Pending `cp_draw_batch` values own a copy of packet state/scope and all
 compact per-draw rows; a successful batched record never stages live draw
 state. Direct draws are one-row batch views, `cp_draw_execute_batch()` is the
 only draw executor, and every pass segment owns the same complete batch
-snapshot. Fallback joins side streams and replays those immutable snapshots in
-submission order. Queue submission:
+snapshot. Raster, shading, A-buffer and fallback helpers consume explicit
+packet state/scope parameters; the renderer context no longer contains mutable
+graphics shaders, fixed state, vertex input, graphics UBO rows or framebuffer
+state. Fallback joins side streams and replays immutable snapshots in submission
+order. Queue submission:
 
 1. publishes bounded host mappings used by sampler specialization;
 2. uploads dirty descriptor-snapshot arenas from ordinary host storage to
@@ -484,14 +487,12 @@ continue staging explicit paths rather than using `git add -A`.
    host status/set/reset is mutex protected. The synchronization2 feature is no
    longer exposed at Vulkan 1.1. Stage/access scopes are conservatively treated
    as all commands and event waits can block queue submission on the host.
-10. **Immutable execution still has one legacy staging boundary.** Begin and
-   draw operations use remappable scope indices, inherited secondary rendering
-   resolves to the primary scope, and explicit end markers prevent episodes
-   spanning a Vulkan rendering boundary. Recorded draws no longer duplicate the
-   framebuffer. Prepared packets, pending batches and pass/fallback segments own
-   complete scope/state snapshots, but the renderer still stages a snapshot
-   into live context fields at execution entry. Threading state through every
-   launch helper and deleting those live draw fields is the remaining stage.
+10. **The descriptor ABI is still constant-buffer shaped.** Immutable draw,
+   batch and pass snapshots now own explicit VS/FS descriptor rows, and no live
+   renderer state reconstructs them. The shader ABI still reserves slot 0 for
+   push constants and one flat 64-byte descriptor array per set in later UBO
+   slots. That proven layout is intentionally retained until a narrower ABI can
+   be measured without changing batching, sampler specialization or captures.
 11. **Recorded ownership is only partially complete.** Command buffers retain
     unique references to every bound graphics/compute pipeline and recorded
     query pool; secondary operation copies import those references. Focused
