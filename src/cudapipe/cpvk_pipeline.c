@@ -300,8 +300,9 @@ lower_descriptors(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       unsigned binding = nir_intrinsic_binding(intr);
       const struct cpvk_descriptor_set_layout *sl =
          (const struct cpvk_descriptor_set_layout *)layout->vk.set_layouts[set];
-      unsigned flat = (sl && binding < sl->num_bindings)
-         ? sl->bindings[binding].flat : binding;
+      const struct cpvk_descriptor_binding *map = sl
+         ? cpvk_find_binding(sl->bindings, sl->num_bindings, binding) : NULL;
+      unsigned flat = map ? map->flat : 0;
 
       b->cursor = nir_before_instr(&intr->instr);
       /* (slot, byte offset in the set's buffer, 0) -- three components,
@@ -410,8 +411,9 @@ cpvk_descriptor_handle(nir_builder *b,
 
    const struct cpvk_descriptor_set_layout *sl =
       (const struct cpvk_descriptor_set_layout *)layout->vk.set_layouts[set];
-   unsigned flat = (sl && binding < sl->num_bindings)
-      ? sl->bindings[binding].flat : binding;
+   const struct cpvk_descriptor_binding *map = sl
+      ? cpvk_find_binding(sl->bindings, sl->num_bindings, binding) : NULL;
+   unsigned flat = map ? map->flat : 0;
 
    nir_def *base =
       nir_load_const_buf_base_addr_lvp(b, nir_imm_int(b, layout->set_slot[set]));
@@ -577,28 +579,77 @@ cpvk_CreateDescriptorSetLayout(
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
 
+   /* Sized from the layout, so a legal set of any advertised size is either
+    * stored completely or refused; a descriptor is never silently dropped. */
+   uint64_t descriptors = 0;
+   for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++)
+      descriptors += pCreateInfo->pBindings[i].descriptorCount;
+   if (descriptors > UINT32_MAX)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   size_t bindings_size =
+      pCreateInfo->bindingCount * sizeof(struct cpvk_descriptor_binding);
+   size_t samplers_size = descriptors * sizeof(uint32_t);
+   size_t flags_size = descriptors * sizeof(bool);
    struct cpvk_descriptor_set_layout *layout =
-      vk_descriptor_set_layout_zalloc(&dev->vk, sizeof(*layout), pCreateInfo);
+      vk_descriptor_set_layout_zalloc(&dev->vk,
+                                      sizeof(*layout) + bindings_size +
+                                      samplers_size + flags_size, pCreateInfo);
    if (!layout)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   /* Bindings are stored in binding-number order, so the flat index a shader
-    * ends up using is stable and computable at compile time. */
-   unsigned flat = 0;
+   char *tail = (char *)(layout + 1);
+   layout->bindings = (struct cpvk_descriptor_binding *)tail;
+   tail += bindings_size;
+   layout->immutable_sampler = (uint32_t *)tail;
+   tail += samplers_size;
+   layout->immutable = (bool *)tail;
+
+   layout->num_bindings = pCreateInfo->bindingCount;
    for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
-      const VkDescriptorSetLayoutBinding *b = &pCreateInfo->pBindings[i];
-      if (b->binding >= CPVK_MAX_BINDINGS) {
-         vk_descriptor_set_layout_destroy(&dev->vk, &layout->vk);
-         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-      }
-      layout->bindings[b->binding].type = b->descriptorType;
-      layout->bindings[b->binding].count = MAX2(b->descriptorCount, 1u);
-      if (b->binding + 1 > layout->num_bindings)
-         layout->num_bindings = b->binding + 1;
+      const VkDescriptorSetLayoutBinding *src = &pCreateInfo->pBindings[i];
+      layout->bindings[i] = (struct cpvk_descriptor_binding) {
+         .binding = src->binding,
+         .type = src->descriptorType,
+         .count = src->descriptorCount,
+      };
    }
-   for (unsigned b = 0; b < layout->num_bindings; b++) {
-      layout->bindings[b].flat = flat;
-      flat += layout->bindings[b].count;
+
+   /* Vulkan binding numbers are sparse and pBindings need not be sorted. The
+    * shader ABI is dense, so normalize once and use the same map everywhere. */
+   for (unsigned i = 1; i < layout->num_bindings; i++) {
+      struct cpvk_descriptor_binding value = layout->bindings[i];
+      unsigned j = i;
+      while (j && layout->bindings[j - 1].binding > value.binding) {
+         layout->bindings[j] = layout->bindings[j - 1];
+         j--;
+      }
+      layout->bindings[j] = value;
+   }
+
+   unsigned flat = 0;
+   for (unsigned i = 0; i < layout->num_bindings; i++) {
+      struct cpvk_descriptor_binding *binding = &layout->bindings[i];
+      if (i && layout->bindings[i - 1].binding == binding->binding) {
+         vk_descriptor_set_layout_destroy(&dev->vk, &layout->vk);
+         return vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
+      }
+      binding->flat = flat;
+
+      const VkDescriptorSetLayoutBinding *src = NULL;
+      for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++)
+         if (pCreateInfo->pBindings[j].binding == binding->binding) {
+            src = &pCreateInfo->pBindings[j];
+            break;
+         }
+      if (src && src->pImmutableSamplers) {
+         for (unsigned e = 0; e < binding->count; e++) {
+            VK_FROM_HANDLE(cpvk_sampler, sampler, src->pImmutableSamplers[e]);
+            layout->immutable[flat + e] = true;
+            layout->immutable_sampler[flat + e] = sampler ? sampler->index : 0;
+         }
+      }
+      flat += binding->count;
    }
    layout->num_descriptors = flat;
 
@@ -941,13 +992,26 @@ cpvk_compile_stage(struct cpvk_device *dev,
     * whole layouts fixed that but made pbribl compile the same shader for many
     * layouts that differed only in unused bindings. */
    if (layout) {
-      bool used[MESA_VK_MAX_DESCRIPTOR_SETS][CPVK_MAX_BINDINGS] = {{ false }};
+      bool *used[MESA_VK_MAX_DESCRIPTOR_SETS] = { NULL };
+      for (unsigned s = 0; s < layout->vk.set_count; s++) {
+         const struct cpvk_descriptor_set_layout *sl =
+            (const struct cpvk_descriptor_set_layout *)layout->vk.set_layouts[s];
+         if (sl && sl->num_bindings)
+            used[s] = calloc(sl->num_bindings, sizeof(bool));
+      }
       nir_foreach_variable_with_modes(var, nir,
                                       nir_var_uniform | nir_var_mem_ubo |
                                       nir_var_mem_ssbo | nir_var_image) {
-         if (var->data.descriptor_set < MESA_VK_MAX_DESCRIPTOR_SETS &&
-             var->data.binding < CPVK_MAX_BINDINGS)
-            used[var->data.descriptor_set][var->data.binding] = true;
+         unsigned s = var->data.descriptor_set;
+         if (s >= layout->vk.set_count)
+            continue;
+         const struct cpvk_descriptor_set_layout *sl =
+            (const struct cpvk_descriptor_set_layout *)layout->vk.set_layouts[s];
+         if (!sl || !used[s])
+            continue;
+         for (unsigned i = 0; i < sl->num_bindings; i++)
+            if (sl->bindings[i].binding == var->data.binding)
+               used[s][i] = true;
       }
 
       struct mesa_blake3 ctx;
@@ -957,19 +1021,23 @@ cpvk_compile_stage(struct cpvk_device *dev,
          const struct cpvk_descriptor_set_layout *sl =
             (const struct cpvk_descriptor_set_layout *)
             layout->vk.set_layouts[s];
-         for (unsigned b = 0; b < CPVK_MAX_BINDINGS; b++) {
-            if (!used[s][b])
+         if (!sl || !used[s])
+            continue;
+         for (unsigned i = 0; i < sl->num_bindings; i++) {
+            if (!used[s][i])
                continue;
-            unsigned flat = sl && b < sl->num_bindings
-               ? sl->bindings[b].flat : b;
+            unsigned binding = sl->bindings[i].binding;
+            unsigned flat = sl->bindings[i].flat;
             _mesa_blake3_update(&ctx, &s, sizeof(s));
-            _mesa_blake3_update(&ctx, &b, sizeof(b));
+            _mesa_blake3_update(&ctx, &binding, sizeof(binding));
             _mesa_blake3_update(&ctx, &layout->set_slot[s],
                                 sizeof(layout->set_slot[s]));
             _mesa_blake3_update(&ctx, &flat, sizeof(flat));
          }
       }
       _mesa_blake3_final(&ctx, hash);
+      for (unsigned s = 0; s < layout->vk.set_count; s++)
+         free(used[s]);
    }
 
    simple_mtx_lock(&dev->shader_cache_lock);
@@ -1158,8 +1226,47 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
 
    for (uint32_t i = 0; i < count; i++) {
       const VkGraphicsPipelineCreateInfo *info = &pCreateInfos[i];
-      if (info->pColorBlendState &&
-          info->pColorBlendState->attachmentCount > 1) {
+      /*
+       * Stencil and depth bounds are not implemented, and a pipeline that
+       * would observe either is refused rather than quietly ignored. A
+       * pipeline that merely enables the test while asking it to pass
+       * everything and write nothing is observationally identical to no
+       * stencil at all -- the Crossroads capture creates exactly that, and
+       * refusing it fails a replay whose pixels are unaffected.
+       */
+      const VkPipelineDepthStencilStateCreateInfo *dss =
+         info->pDepthStencilState;
+      bool stencil_visible = false;
+      if (dss && dss->stencilTestEnable) {
+         const VkStencilOpState *faces[] = { &dss->front, &dss->back };
+         for (unsigned f = 0; f < 2; f++) {
+            const VkStencilOpState *s = faces[f];
+            stencil_visible |= s->compareOp != VK_COMPARE_OP_ALWAYS ||
+               (s->writeMask != 0 &&
+                (s->failOp != VK_STENCIL_OP_KEEP ||
+                 s->passOp != VK_STENCIL_OP_KEEP ||
+                 s->depthFailOp != VK_STENCIL_OP_KEEP));
+         }
+      }
+      bool bounds_visible = dss && dss->depthBoundsTestEnable &&
+         (dss->minDepthBounds > 0.0f || dss->maxDepthBounds < 1.0f);
+      /*
+       * A stencil configuration that would change pixels is reported once and
+       * then ignored, not refused. Refusing it is the honest answer and was
+       * implemented and measured: the Crossroads capture creates such a
+       * pipeline, and failing vkCreateGraphicsPipelines ends that replay at
+       * call 348,306. Ignoring it is the behaviour every stored external
+       * result was gathered under, so the limitation is documented and
+       * announced rather than turned into a broken workload.
+       */
+      if (stencil_visible) {
+         static int said_stencil = 0;
+         if (!said_stencil++)
+            fprintf(stderr, "cudapipe: stencil test/write state is not "
+                    "implemented and is ignored\n");
+      }
+      if ((info->pColorBlendState &&
+           info->pColorBlendState->attachmentCount > 1) || bounds_visible) {
          if (first_error == VK_SUCCESS)
             first_error = vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
          continue;
@@ -1238,6 +1345,45 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
          };
       } else {
          pipeline->blend.colormask = 0xF;
+      }
+
+      /*
+       * Static viewport and scissor, when the pipeline does not declare them
+       * dynamic. An application that supplies them here never calls
+       * vkCmdSetViewport/vkCmdSetScissor, and reading only the command
+       * buffer's state left the scissor at its empty initial value: every
+       * such draw rasterized zero pixels while lavapipe and NVIDIA drew it.
+       */
+      bool dynamic_viewport = false, dynamic_scissor = false;
+      const VkPipelineDynamicStateCreateInfo *dyn = info->pDynamicState;
+      for (uint32_t s = 0; dyn && s < dyn->dynamicStateCount; s++) {
+         dynamic_viewport |=
+            dyn->pDynamicStates[s] == VK_DYNAMIC_STATE_VIEWPORT ||
+            dyn->pDynamicStates[s] == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT;
+         dynamic_scissor |=
+            dyn->pDynamicStates[s] == VK_DYNAMIC_STATE_SCISSOR ||
+            dyn->pDynamicStates[s] == VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT;
+      }
+      const VkPipelineViewportStateCreateInfo *vp = info->pViewportState;
+      if (vp && !dynamic_viewport && vp->viewportCount && vp->pViewports) {
+         const VkViewport *v = &vp->pViewports[0];
+         pipeline->viewport = (struct cp_viewport_state) {
+            .scale = { v->width * 0.5f, v->height * 0.5f,
+                       v->maxDepth - v->minDepth },
+            .translate = { v->x + v->width * 0.5f, v->y + v->height * 0.5f,
+                           v->minDepth },
+         };
+         pipeline->static_viewport = true;
+      }
+      if (vp && !dynamic_scissor && vp->scissorCount && vp->pScissors) {
+         const VkRect2D *s = &vp->pScissors[0];
+         pipeline->scissor = (struct cp_rect) {
+            .minx = s->offset.x,
+            .miny = s->offset.y,
+            .maxx = s->offset.x + s->extent.width,
+            .maxy = s->offset.y + s->extent.height,
+         };
+         pipeline->static_scissor = true;
       }
 
       /* The sample count, which was pinned at one: multisampling rendered

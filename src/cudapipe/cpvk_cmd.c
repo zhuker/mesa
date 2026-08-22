@@ -137,12 +137,19 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
    for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
       VK_FROM_HANDLE(cpvk_descriptor_set_layout, layout,
                      pAllocateInfo->pSetLayouts[i]);
-      size_t desc_size = layout
-         ? (size_t)layout->num_descriptors * sizeof(struct cpvk_descriptor)
-         : 0;
+      unsigned num_bindings = layout ? layout->num_bindings : 0;
+      unsigned num_descriptors = layout ? layout->num_descriptors : 0;
+      size_t desc_size = (size_t)num_descriptors * sizeof(struct cpvk_descriptor);
+      size_t bindings_size =
+         (size_t)num_bindings * sizeof(struct cpvk_descriptor_binding);
+      size_t addrs_size = (size_t)num_descriptors * sizeof(CUdeviceptr);
+      size_t views_size =
+         (size_t)num_descriptors * sizeof(struct cpvk_image_view *);
+      size_t flags_size = num_descriptors * sizeof(bool);
 
       struct cpvk_descriptor_set *set =
-         vk_object_zalloc(&dev->vk, NULL, sizeof(*set) + desc_size,
+         vk_object_zalloc(&dev->vk, NULL, sizeof(*set) + desc_size +
+                          bindings_size + addrs_size + views_size + flags_size,
                           VK_OBJECT_TYPE_DESCRIPTOR_SET);
       if (!set) {
          for (uint32_t j = 0; j < i; j++) {
@@ -152,10 +159,21 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
          }
          return vk_error(dev, VK_ERROR_OUT_OF_POOL_MEMORY);
       }
+      char *tail = (char *)(set + 1);
+      set->host = desc_size ? (struct cpvk_descriptor *)tail : NULL;
+      tail += desc_size;
+      set->bindings = (struct cpvk_descriptor_binding *)tail;
+      tail += bindings_size;
+      set->addrs = (CUdeviceptr *)tail;
+      tail += addrs_size;
+      set->views = (struct cpvk_image_view **)tail;
+      tail += views_size;
+      set->immutable = (bool *)tail;
       if (layout) {
-         set->num_bindings = layout->num_bindings;
-         set->num_descriptors = layout->num_descriptors;
-         memcpy(set->bindings, layout->bindings, sizeof(set->bindings));
+         set->num_bindings = num_bindings;
+         set->num_descriptors = num_descriptors;
+         memcpy(set->bindings, layout->bindings, bindings_size);
+         memcpy(set->immutable, layout->immutable, flags_size);
       }
       set->pool = pool;
       if (pool) {
@@ -172,11 +190,14 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
       }
 
       if (desc_size) {
-         set->host = (struct cpvk_descriptor *)(set + 1);
          /* A descriptor nothing ever writes still gets read by some shaders.
           * Point it at the null page instead of address zero. */
-         for (unsigned d = 0; d < layout->num_descriptors; d++)
+         for (unsigned d = 0; d < layout->num_descriptors; d++) {
             set->host[d].base = dev->null_data;
+            if (layout->immutable[d])
+               set->host[d].sampler_index_or_img_stride =
+                  layout->immutable_sampler[d];
+         }
       }
 
       pDescriptorSets[i] = cpvk_descriptor_set_to_handle(set);
@@ -214,6 +235,63 @@ cpvk_ResetDescriptorPool(VkDevice _device, VkDescriptorPool pool,
  * application memory -- and a second copy of this switch would be a second
  * thing to be right about a descriptor the first one is wrong about.
  */
+/*
+ * The storage-image half of a descriptor, resolved from the view.
+ *
+ * Recomputed rather than only written once: vkBindImageMemory2 may legally
+ * follow the descriptor write, and a row cached before the bind names the
+ * null page for the life of the set.
+ */
+static void
+cpvk_storage_image_row(struct cpvk_descriptor *desc,
+                       const struct cpvk_image_view *view)
+{
+   const struct cpvk_image *img = view ? view->image : NULL;
+   if (!img || !img->mem)
+      return;
+
+   unsigned level = view->vk.base_mip_level;
+   uint64_t layer_offset =
+      (uint64_t)view->vk.base_array_layer * img->level_size[level];
+   desc->base = img->mem->dev_ptr + img->offset +
+                img->level_offset[level] + layer_offset;
+   /* The view's subresource, not the whole image, is addressable storage. */
+   desc->width = MAX2(img->vk.extent.width >> level, 1u);
+   desc->height = MAX2(img->vk.extent.height >> level, 1u);
+   desc->depth = img->vk.image_type == VK_IMAGE_TYPE_3D
+      ? MAX2(img->vk.extent.depth >> level, 1u)
+      : MAX2(view->vk.layer_count, 1u);
+   desc->row_stride = img->row_stride[level];
+   /* One z step is one slice of this level, not the whole level. */
+   enum pipe_format pfmt = vk_format_to_pipe_format(view->vk.format);
+   unsigned rows = util_format_get_nblocksy(
+      pfmt, MAX2(img->vk.extent.height >> level, 1u));
+   desc->sampler_index_or_img_stride = img->row_stride[level] * rows;
+   desc->base_offset = 0;
+}
+
+static bool
+cpvk_descriptor_location(const struct cpvk_descriptor_set *set,
+                         uint32_t binding, uint32_t element,
+                         VkDescriptorType type, unsigned *flat)
+{
+   unsigned i = 0;
+   while (i < set->num_bindings && set->bindings[i].binding != binding)
+      i++;
+   while (i < set->num_bindings) {
+      const struct cpvk_descriptor_binding *map = &set->bindings[i];
+      if (map->type != type)
+         return false;
+      if (element < map->count) {
+         *flat = map->flat + element;
+         return *flat < set->num_descriptors;
+      }
+      element -= map->count;
+      i++;
+   }
+   return false;
+}
+
 static void
 cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
                       VkDescriptorType type,
@@ -224,8 +302,12 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
       fprintf(stderr, "descw flat=%u type=%u ii=%p bi=%p\n", flat, type,
               (const void *)ii, (const void *)bi);
 
-   if (flat >= CPVK_MAX_BINDINGS)
+   if (flat >= set->num_descriptors)
       return;
+
+   /* A rewritten descriptor is a new kind; drop any storage-image view the
+    * previous write left behind. */
+   set->views[flat] = NULL;
 
    switch (type) {
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
@@ -252,7 +334,7 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
          VK_FROM_HANDLE(cpvk_image_view, view, ii->imageView);
          set->host[flat].texture_info = view ? view->tex_info : 0;
       }
-      if (ii->sampler) {
+      if (ii->sampler && !set->immutable[flat]) {
          VK_FROM_HANDLE(cpvk_sampler, samp, ii->sampler);
          set->host[flat].sampler_index_or_img_stride = samp ? samp->index : 0;
       }
@@ -298,23 +380,11 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
        */
       if (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && ii->imageView) {
          VK_FROM_HANDLE(cpvk_image_view, view, ii->imageView);
-         struct cpvk_image *img = view ? view->image : NULL;
-         if (img && img->mem) {
-            unsigned level = view->vk.base_mip_level;
-            set->host[flat].base = img->mem->dev_ptr + img->offset;
-            /*
-             * The extent at this level, which the load and store paths clamp
-             * against. Without it width read zero, every coordinate was out
-             * of bounds, and robustness returned zero for the whole image.
-             */
-            set->host[flat].width = MAX2(img->vk.extent.width >> level, 1u);
-            set->host[flat].height = MAX2(img->vk.extent.height >> level, 1u);
-            set->host[flat].depth = MAX2(img->vk.extent.depth >> level, 1u);
-            set->host[flat].row_stride = img->row_stride[level];
-            set->host[flat].sampler_index_or_img_stride = img->level_size[level];
-            set->host[flat].base_offset = img->level_offset[level];
-         }
+         set->views[flat] = view;
+         set->has_storage_views = true;
+         cpvk_storage_image_row(&set->host[flat], view);
       }
+
       break;
    }
 
@@ -330,25 +400,81 @@ cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
                           const VkCopyDescriptorSet *pCopies)
 {
    if (getenv("CPVK_DEBUG_RT"))
-      fprintf(stderr, "updsets n=%u\n", writeCount);
+      fprintf(stderr, "updsets n=%u copies=%u\n", writeCount, copyCount);
 
    for (uint32_t w = 0; w < writeCount; w++) {
       const VkWriteDescriptorSet *write = &pWrites[w];
       VK_FROM_HANDLE(cpvk_descriptor_set, set, write->dstSet);
-      if (getenv("CPVK_DEBUG_RT"))
-         fprintf(stderr, "  w=%u bind=%u type=%u set=%p n=%u\n", w,
-                 write->dstBinding, write->descriptorType, (void *)set,
-                 write->descriptorCount);
-      if (!set || write->dstBinding >= CPVK_MAX_BINDINGS)
+      if (!set)
          continue;
-
       for (uint32_t e = 0; e < write->descriptorCount; e++) {
-         unsigned flat = set->bindings[write->dstBinding].flat +
-                         write->dstArrayElement + e;
+         unsigned flat;
+         if (!cpvk_descriptor_location(set, write->dstBinding,
+                                       write->dstArrayElement + e,
+                                       write->descriptorType, &flat))
+            continue;
          cpvk_write_descriptor(set, flat, write->descriptorType,
                                write->pImageInfo ? &write->pImageInfo[e] : NULL,
                                write->pBufferInfo ? &write->pBufferInfo[e] : NULL);
       }
+   }
+
+   for (uint32_t c = 0; c < copyCount; c++) {
+      const VkCopyDescriptorSet *copy = &pCopies[c];
+      VK_FROM_HANDLE(cpvk_descriptor_set, src, copy->srcSet);
+      VK_FROM_HANDLE(cpvk_descriptor_set, dst, copy->dstSet);
+      if (!src || !dst)
+         continue;
+      const struct cpvk_descriptor_binding *src_map =
+         cpvk_find_binding(src->bindings, src->num_bindings, copy->srcBinding);
+      const struct cpvk_descriptor_binding *dst_map =
+         cpvk_find_binding(dst->bindings, dst->num_bindings, copy->dstBinding);
+      if (!src_map || !dst_map || src_map->type != dst_map->type)
+         continue;
+      unsigned count = MIN2(copy->descriptorCount, src->num_descriptors);
+      struct cpvk_descriptor *descriptors =
+         calloc(count, sizeof(*descriptors));
+      CUdeviceptr *addrs = calloc(count, sizeof(*addrs));
+      struct cpvk_image_view **views = calloc(count, sizeof(*views));
+      bool *valid = calloc(count, sizeof(*valid));
+      if (!descriptors || !addrs || !views || !valid) {
+         free(descriptors); free(addrs); free(views); free(valid);
+         continue;
+      }
+      /* Copy through a temporary row: source and destination may overlap in
+       * one set, and Vulkan defines the update as if all sources were read
+       * before any destination is written. */
+      for (unsigned e = 0; e < count; e++) {
+         unsigned sf;
+         if (cpvk_descriptor_location(src, copy->srcBinding,
+                                      copy->srcArrayElement + e,
+                                      src_map->type, &sf)) {
+            descriptors[e] = src->host[sf];
+            addrs[e] = src->addrs[sf];
+            views[e] = src->views[sf];
+            valid[e] = true;
+         }
+      }
+      for (unsigned e = 0; e < count; e++) {
+         unsigned df;
+         if (!valid[e] ||
+             !cpvk_descriptor_location(dst, copy->dstBinding,
+                                       copy->dstArrayElement + e,
+                                       dst_map->type, &df))
+            continue;
+         uint32_t immutable_sampler =
+            dst->host[df].sampler_index_or_img_stride;
+         dst->host[df] = descriptors[e];
+         dst->addrs[df] = addrs[e];
+         dst->views[df] = views[e];
+         dst->has_storage_views |= views[e] != NULL;
+         if (dst->immutable[df])
+            dst->host[df].sampler_index_or_img_stride = immutable_sampler;
+      }
+      free(descriptors);
+      free(addrs);
+      free(views);
+      free(valid);
    }
 }
 
@@ -403,13 +529,13 @@ cpvk_UpdateDescriptorSetWithTemplate(VkDevice _device, VkDescriptorSet _set,
 
    for (uint32_t i = 0; i < tmpl->entry_count; i++) {
       const VkDescriptorUpdateTemplateEntry *e = &tmpl->entries[i];
-      if (e->dstBinding >= CPVK_MAX_BINDINGS)
-         continue;
-
       for (uint32_t j = 0; j < e->descriptorCount; j++) {
          const char *src = (const char *)pData + e->offset + j * e->stride;
-         unsigned flat = set->bindings[e->dstBinding].flat +
-                         e->dstArrayElement + j;
+         unsigned flat;
+         if (!cpvk_descriptor_location(set, e->dstBinding,
+                                       e->dstArrayElement + j,
+                                       e->descriptorType, &flat))
+            continue;
          cpvk_write_descriptor(set, flat, e->descriptorType,
                                (const VkDescriptorImageInfo *)src,
                                (const VkDescriptorBufferInfo *)src);
@@ -543,14 +669,18 @@ cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
    cmd->num_scopes = 0;
    cmd->active_scope = CP_RENDER_SCOPE_NONE;
    cmd->next_scope_serial = 0;
-   cmd->pipeline = NULL;
-   memset(cmd->addrs, 0, sizeof(cmd->addrs));
+   cmd->graphics_pipeline = NULL;
+   cmd->compute_pipeline = NULL;
+   memset(cmd->graphics_addrs, 0, sizeof(cmd->graphics_addrs));
+   memset(cmd->compute_addrs, 0, sizeof(cmd->compute_addrs));
    memset(cmd->vb_base, 0, sizeof(cmd->vb_base));
    cmd->num_vb = 0;
    cmd->has_fb = false;
    cmd->index_ptr = NULL;
    cmd->index_size = 0;
-   cmd->push_size = 0;
+   cmd->vs_push_size = 0;
+   cmd->fs_push_size = 0;
+   cmd->compute_push_size = 0;
    for (unsigned i = 0; i < cmd->num_desc_retired; i++) {
       cuMemFree(cmd->desc_retired[i].dev);
       free(cmd->desc_retired[i].host);
@@ -625,14 +755,18 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->num_scopes = 0;
    cmd->active_scope = CP_RENDER_SCOPE_NONE;
    cmd->next_scope_serial = 0;
-   cmd->pipeline = NULL;
-   memset(cmd->addrs, 0, sizeof(cmd->addrs));
+   cmd->graphics_pipeline = NULL;
+   cmd->compute_pipeline = NULL;
+   memset(cmd->graphics_addrs, 0, sizeof(cmd->graphics_addrs));
+   memset(cmd->compute_addrs, 0, sizeof(cmd->compute_addrs));
    memset(cmd->vb_base, 0, sizeof(cmd->vb_base));
    cmd->num_vb = 0;
    cmd->has_fb = false;
    cmd->index_ptr = NULL;
    cmd->index_size = 0;
-   cmd->push_size = 0;
+   cmd->vs_push_size = 0;
+   cmd->fs_push_size = 0;
+   cmd->compute_push_size = 0;
    for (unsigned i = 0; i < cmd->num_desc_retired; i++) {
       cuMemFree(cmd->desc_retired[i].dev);
       free(cmd->desc_retired[i].host);
@@ -664,7 +798,10 @@ cpvk_CmdBindPipeline(VkCommandBuffer commandBuffer,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return;
    }
-   cmd->pipeline = pipeline;
+   if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
+      cmd->graphics_pipeline = pipeline;
+   else if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE)
+      cmd->compute_pipeline = pipeline;
 }
 
 /* Keep an outgrown arena alive until the command buffer is reset. */
@@ -752,6 +889,15 @@ cpvk_snapshot_set(struct cpvk_cmd_buffer *cmd, struct cpvk_descriptor_set *set)
       return 0;
    }
 
+   /* Re-resolve storage rows: their image memory may have been bound after
+    * the descriptor was written, which Vulkan permits. Sets without storage
+    * images -- every set in both captures -- skip the walk entirely. */
+   if (set->has_storage_views) {
+      for (unsigned d = 0; d < set->num_descriptors; d++)
+         if (set->views[d])
+            cpvk_storage_image_row(&set->host[d], set->views[d]);
+   }
+
    size_t bytes = (size_t)set->num_descriptors *
                   sizeof(struct cpvk_descriptor);
    CUdeviceptr addr = 0;
@@ -767,6 +913,14 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_pipeline_layout, layout, pInfo->layout);
    unsigned dyn = 0;
+   VkShaderStageFlags graphics_stages =
+      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+      VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT |
+      VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+   bool bind_graphics = (pInfo->stageFlags & graphics_stages) != 0;
+   bool bind_compute = (pInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+   if (!bind_graphics && !bind_compute)
+      bind_graphics = bind_compute = true;
 
    for (uint32_t i = 0; i < pInfo->descriptorSetCount; i++) {
       VK_FROM_HANDLE(cpvk_descriptor_set, set, pInfo->pDescriptorSets[i]);
@@ -791,11 +945,13 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
       else
          snap = (struct cpvk_descriptor *)(uintptr_t)snap_addr;
       if (slot < CPVK_MAX_ARG_BUFS) {
-         cmd->addrs[slot] = snap_addr;
+         if (bind_graphics)
+            cmd->graphics_addrs[slot] = snap_addr;
+         if (bind_compute)
+            cmd->compute_addrs[slot] = snap_addr;
 
-         /* The snapshot itself is the per-draw descriptor row.  Its contents
-          * need not be hashed now that batches are allowed to carry distinct
-          * rows. */
+         /* The snapshot itself is the per-draw descriptor row. Its contents
+          * need not be hashed now that batches carry distinct rows. */
       }
 
       /*
@@ -817,7 +973,7 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
                               dyn < pInfo->dynamicOffsetCount; e++) {
             unsigned flat = set->bindings[b].flat + e;
             uint32_t off = pInfo->pDynamicOffsets[dyn++];
-            if (snap && flat < CPVK_MAX_BINDINGS && set->addrs[flat])
+            if (snap && flat < set->num_descriptors && set->addrs[flat])
                snap[flat].base = set->addrs[flat] + off;
          }
       }
@@ -835,7 +991,7 @@ cpvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
 
-   if (!cmd->pipeline)
+   if (!cmd->compute_pipeline)
       return;
 
    /* In the op list, so that it runs where it was recorded. */
@@ -843,13 +999,13 @@ cpvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
    if (!op)
       return;
    struct cpvk_dispatch *d = &op->dispatch;
-   d->pipeline = cmd->pipeline;
+   d->pipeline = cmd->compute_pipeline;
    d->grid[0] = groupCountX;
    d->grid[1] = groupCountY;
    d->grid[2] = groupCountZ;
-   memcpy(d->addrs, cmd->addrs, sizeof(d->addrs));
-   memcpy(d->push, cmd->push, sizeof(d->push));
-   d->push_size = cmd->push_size;
+   memcpy(d->addrs, cmd->compute_addrs, sizeof(d->addrs));
+   memcpy(d->push, cmd->compute_push, sizeof(d->push));
+   d->push_size = cmd->compute_push_size;
 }
 
 /* ------------------------------------------------------------- execution */
@@ -1187,6 +1343,8 @@ cpvk_scope_append(struct cpvk_cmd_buffer *cmd, const struct cp_fb_desc *fb,
    return index;
 }
 
+static uint64_t cpvk_image_end(const struct cpvk_image *img);
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                        const VkRenderingInfo *pRenderingInfo)
@@ -1198,7 +1356,10 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    bool unsupported_stencil = stencil && stencil->imageView &&
       (!pRenderingInfo->pDepthAttachment ||
        pRenderingInfo->pDepthAttachment->imageView != stencil->imageView ||
-       stencil->resolveMode != VK_RESOLVE_MODE_NONE);
+       stencil->resolveMode != (pRenderingInfo->pDepthAttachment
+                                ? pRenderingInfo->pDepthAttachment->resolveMode
+                                : VK_RESOLVE_MODE_NONE) ||
+       false);
    if (pRenderingInfo->colorAttachmentCount > 1 ||
        pRenderingInfo->layerCount > 1 || pRenderingInfo->viewMask != 0 ||
        unsupported_stencil) {
@@ -1224,11 +1385,15 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       &pRenderingInfo->pColorAttachments[0] : NULL;
    const VkRenderingAttachmentInfo *dat = pRenderingInfo->pDepthAttachment;
    struct cpvk_image *cimg = NULL, *dimg = NULL;
+   struct cpvk_image_view *cview = NULL;
+   unsigned color_level = 0;
+   enum pipe_format color_format = PIPE_FORMAT_NONE;
    struct cp_depth_attachment depth = {0};
 
    if (cat && cat->imageView) {
       VK_FROM_HANDLE(cpvk_image_view, view, cat->imageView);
       if (view && view->image && view->image->mem) {
+         cview = view;
          cimg = view->image;
          /*
           * The view's subresource, not the image's base. A cube map is
@@ -1237,11 +1402,14 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
           * Ignoring both meant every face of pbribl's environment cube was
           * rendered over face zero, so its spheres reflected nothing.
           */
-         unsigned rlevel = MIN2(view->vk.base_mip_level, CPVK_MAX_MIP_LEVELS - 1);
+         color_level = MIN2(view->vk.base_mip_level,
+                            CPVK_MAX_MIP_LEVELS - 1);
+         fb.width = u_minify(cimg->vk.extent.width, color_level);
+         fb.height = u_minify(cimg->vk.extent.height, color_level);
          fb.color = (void *)(uintptr_t)(cimg->mem->dev_ptr + cimg->offset +
-                                        cimg->level_offset[rlevel] +
+                                        cimg->level_offset[color_level] +
                                         (uint64_t)view->vk.base_array_layer *
-                                        cimg->level_size[rlevel]);
+                                        cimg->level_size[color_level]);
          /*
           * The view's format decides the encoding, not the image's. They are
           * usually the same and were assumed to be; when they are not, the
@@ -1249,6 +1417,7 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
           * out with red and blue exchanged and every pixel otherwise exact.
           */
          const struct cpvk_format_info *vf = cpvk_format_info(view->vk.format);
+         color_format = vk_format_to_pipe_format(view->vk.format);
          fb.color_encoding = vf ? vf->color : cimg->color;
          /* How far apart the samples are, which the renderer needs in order
           * to write them and the resolve needs in order to find them. */
@@ -1264,7 +1433,12 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    }
 
    if (dat && dat->imageView) {
-      if (dat->resolveMode != VK_RESOLVE_MODE_NONE) {
+      /* Sample zero is the one mode advertised, and it is a copy of the first
+       * sample plane: it needs no averaging kernel and gives the packed
+       * depth-stencil aspects the same answer. */
+      if (dat->resolveMode != VK_RESOLVE_MODE_NONE &&
+          (dat->resolveMode != VK_RESOLVE_MODE_SAMPLE_ZERO_BIT ||
+           dat->resolveImageView == VK_NULL_HANDLE)) {
          fprintf(stderr, "cudapipe: unsupported depth resolve %u\n",
                  dat->resolveMode);
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -1283,6 +1457,10 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       dimg = view->image;
       unsigned level = MIN2(view->vk.base_mip_level,
                             CPVK_MAX_MIP_LEVELS - 1);
+      if (!cimg) {
+         fb.width = u_minify(dimg->vk.extent.width, level);
+         fb.height = u_minify(dimg->vk.extent.height, level);
+      }
       bool store = dat->storeOp == VK_ATTACHMENT_STORE_OP_STORE;
       bool full_area = pRenderingInfo->renderArea.offset.x == 0 &&
                        pRenderingInfo->renderArea.offset.y == 0 &&
@@ -1302,11 +1480,65 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                    view->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT ? 1 : 0,
          .load = dat->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
                  (store && !full_area),
-         .store = store,
+         /* A resolve reads the attachment image, so its contents must be
+          * written back even when the application discards them. */
+         .store = store || dat->resolveMode != VK_RESOLVE_MODE_NONE,
+         /* A stencil clear on the shared aspect is honoured by the store,
+          * which is the only place this driver writes stencil bits. Without
+          * a store the aspect's contents are undefined anyway. */
+         .stencil_clear = stencil && stencil->imageView &&
+                          stencil->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR,
+         .stencil_value = stencil ?
+            stencil->clearValue.depthStencil.stencil : 0,
       };
       fb.has_zs = true;
+
+      if (dat->resolveMode == VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) {
+         VK_FROM_HANDLE(cpvk_image_view, rview, dat->resolveImageView);
+         struct cpvk_image *rimg = rview ? rview->image : NULL;
+         unsigned rlevel = rview ? MIN2(rview->vk.base_mip_level,
+                                        CPVK_MAX_MIP_LEVELS - 1) : 0;
+         if (!rimg || !rimg->mem || rview->vk.format != view->vk.format ||
+             rimg->vk.samples != VK_SAMPLE_COUNT_1_BIT) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
+         unsigned bpp = depth.pixel_stride;
+         uint64_t offset_y = (uint64_t)pRenderingInfo->renderArea.offset.y;
+         uint64_t offset_x = (uint64_t)pRenderingInfo->renderArea.offset.x;
+         cmd->depth_resolve = (struct cpvk_copy) {
+            .src = depth.data + offset_y * depth.row_stride + offset_x * bpp,
+            .dst = rimg->mem->dev_ptr + rimg->offset +
+                   rimg->level_offset[rlevel] +
+                   (uint64_t)rview->vk.base_array_layer *
+                      rimg->level_size[rlevel] +
+                   offset_y * rimg->row_stride[rlevel] + offset_x * bpp,
+            .src_pitch = depth.row_stride,
+            .dst_pitch = rimg->row_stride[rlevel],
+            .width_bytes =
+               (size_t)pRenderingInfo->renderArea.extent.width * bpp,
+            .rows = pRenderingInfo->renderArea.extent.height,
+            .src_end = cpvk_image_end(dimg),
+            .dst_end = cpvk_image_end(rimg),
+            .samples = 1,
+            .encoding = -1,
+            .dst_encoding = -1,
+         };
+         cmd->depth_resolve_valid = true;
+      }
    }
 
+
+
+   if (pRenderingInfo->renderArea.offset.x < 0 ||
+       pRenderingInfo->renderArea.offset.y < 0 ||
+       (uint64_t)pRenderingInfo->renderArea.offset.x +
+          pRenderingInfo->renderArea.extent.width > fb.width ||
+       (uint64_t)pRenderingInfo->renderArea.offset.y +
+          pRenderingInfo->renderArea.extent.height > fb.height) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
 
 
    if (cimg && dimg && cimg->vk.samples != dimg->vk.samples) {
@@ -1319,16 +1551,58 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    cmd->fb = fb;
    cmd->has_fb = true;
 
-   cmd->resolve_src = NULL;
-   cmd->resolve_dst = NULL;
-   if (cat && cimg && cat->resolveImageView != VK_NULL_HANDLE &&
+   cmd->resolve_valid = false;
+   if (cat && cview && cat->resolveImageView != VK_NULL_HANDLE &&
        cat->resolveMode != VK_RESOLVE_MODE_NONE) {
       VK_FROM_HANDLE(cpvk_image_view, rview, cat->resolveImageView);
-      if (rview && rview->image && rview->image->mem) {
-         cmd->resolve_src = cimg;
-         cmd->resolve_dst = rview->image;
-         cmd->resolve_area = pRenderingInfo->renderArea;
+      struct cpvk_image *rimg = rview ? rview->image : NULL;
+      unsigned rlevel = rview ? MIN2(rview->vk.base_mip_level,
+                                     CPVK_MAX_MIP_LEVELS - 1) : 0;
+      enum pipe_format rformat = rview
+         ? vk_format_to_pipe_format(rview->vk.format) : PIPE_FORMAT_NONE;
+      unsigned bpp = util_format_get_blocksize(color_format);
+      unsigned rbpp = util_format_get_blocksize(rformat);
+      const struct cpvk_format_info *rf = rview
+         ? cpvk_format_info(rview->vk.format) : NULL;
+      if (cat->resolveMode != VK_RESOLVE_MODE_AVERAGE_BIT ||
+          !rimg || !rimg->mem || cimg->vk.samples <= 1 ||
+          rimg->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+          bpp != 4 || rbpp != bpp || !rf ||
+          rf->color != fb.color_encoding ||
+          (uint64_t)pRenderingInfo->renderArea.offset.x +
+             pRenderingInfo->renderArea.extent.width >
+             u_minify(rimg->vk.extent.width, rlevel) ||
+          (uint64_t)pRenderingInfo->renderArea.offset.y +
+             pRenderingInfo->renderArea.extent.height >
+             u_minify(rimg->vk.extent.height, rlevel)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
       }
+      uint64_t src_offset =
+         (uint64_t)pRenderingInfo->renderArea.offset.y *
+            cimg->row_stride[color_level] +
+         (uint64_t)pRenderingInfo->renderArea.offset.x * bpp;
+      uint64_t dst_offset = rimg->level_offset[rlevel] +
+         (uint64_t)rview->vk.base_array_layer * rimg->level_size[rlevel] +
+         (uint64_t)pRenderingInfo->renderArea.offset.y *
+            rimg->row_stride[rlevel] +
+         (uint64_t)pRenderingInfo->renderArea.offset.x * bpp;
+      cmd->resolve = (struct cpvk_copy) {
+         .src = (CUdeviceptr)(uintptr_t)fb.color + src_offset,
+         .dst = rimg->mem->dev_ptr + rimg->offset + dst_offset,
+         .src_pitch = cimg->row_stride[color_level],
+         .dst_pitch = rimg->row_stride[rlevel],
+         .width_bytes =
+            (size_t)pRenderingInfo->renderArea.extent.width * bpp,
+         .rows = pRenderingInfo->renderArea.extent.height,
+         .src_end = cpvk_image_end(cimg),
+         .dst_end = cpvk_image_end(rimg),
+         .samples = MAX2(cimg->vk.samples, 1u),
+         .sample_stride = cimg->sample_stride,
+         .encoding = fb.color_encoding,
+         .dst_encoding = rf->color,
+      };
+      cmd->resolve_valid = true;
    }
 
    /*
@@ -1360,23 +1634,24 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    /* LOAD_OP_CLEAR, recorded in order with the draws that follow it. */
    if (cat && cimg && cat->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
-      enum pipe_format pfmt = vk_format_to_pipe_format(cimg->vk.format);
+      unsigned bpp = util_format_get_blocksize(color_format);
       struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_CLEAR);
       if (!op)
          return;
       op->clear = (struct cpvk_clear) {
          .data = fb.color,
-         .width = fb.width,
-         .height = fb.height,
-         .stride = cimg->row_stride[0],
-         .pixel_size = util_format_get_blocksize(pfmt),
+         .offset =
+            (uint64_t)pRenderingInfo->renderArea.offset.y *
+               cimg->row_stride[color_level] +
+            (uint64_t)pRenderingInfo->renderArea.offset.x * bpp,
+         .width = pRenderingInfo->renderArea.extent.width,
+         .height = pRenderingInfo->renderArea.extent.height,
+         .stride = cimg->row_stride[color_level],
+         .pixel_size = bpp,
          .samples = cmd->fb_samples,
          .sample_stride = fb.color_sample_stride,
       };
-      /* Packed here rather than in the kernel: cp_clear_rect takes the value
-       * already packed, and packing it twice produces a plausible wrong
-       * colour rather than an obvious one. */
-      util_format_pack_rgba(pfmt, op->clear.value,
+      util_format_pack_rgba(color_format, op->clear.value,
                             cat->clearValue.color.float32, 1);
    }
 
@@ -1429,17 +1704,19 @@ cpvk_CmdPushConstants2(VkCommandBuffer commandBuffer,
    if (pInfo->offset + pInfo->size > CPVK_MAX_PUSH_BYTES)
       return;
 
-   memcpy(cmd->push + pInfo->offset, pInfo->pValues, pInfo->size);
-   if (getenv("CPVK_DEBUG_PUSH")) {
-      const float *f = (const float *)(const void *)cmd->push;
-      fprintf(stderr, "push off=%u size=%u -> now %u: ", pInfo->offset,
-              pInfo->size, cmd->push_size);
-      for (unsigned k = 0; k < 9; k++)
-         fprintf(stderr, "%.3f ", f[k]);
-      fprintf(stderr, "\n");
+   unsigned end = pInfo->offset + pInfo->size;
+   if (pInfo->stageFlags & VK_SHADER_STAGE_VERTEX_BIT) {
+      memcpy(cmd->vs_push + pInfo->offset, pInfo->pValues, pInfo->size);
+      cmd->vs_push_size = MAX2(cmd->vs_push_size, end);
    }
-   if (pInfo->offset + pInfo->size > cmd->push_size)
-      cmd->push_size = pInfo->offset + pInfo->size;
+   if (pInfo->stageFlags & VK_SHADER_STAGE_FRAGMENT_BIT) {
+      memcpy(cmd->fs_push + pInfo->offset, pInfo->pValues, pInfo->size);
+      cmd->fs_push_size = MAX2(cmd->fs_push_size, end);
+   }
+   if (pInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {
+      memcpy(cmd->compute_push + pInfo->offset, pInfo->pValues, pInfo->size);
+      cmd->compute_push_size = MAX2(cmd->compute_push_size, end);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1534,7 +1811,7 @@ cpvk_record_draw_cmd(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first
                  unsigned instance_count, unsigned first_instance,
                  int vertex_offset, bool indexed)
 {
-   if (!cmd->pipeline)
+   if (!cmd->graphics_pipeline)
       return;
 
    struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_DRAW);
@@ -1543,17 +1820,19 @@ cpvk_record_draw_cmd(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first
    struct cpvk_draw_cmd *d = &op->draw_cmd;
 
    op->scope_index = cmd->active_scope;
-   d->pipeline = cmd->pipeline;
+   d->pipeline = cmd->graphics_pipeline;
    d->scope_index = cmd->active_scope;
-   d->viewport = cmd->viewport;
-   d->scissor = cmd->scissor;
+   d->viewport = cmd->graphics_pipeline->static_viewport
+      ? cmd->graphics_pipeline->viewport : cmd->viewport;
+   d->scissor = cmd->graphics_pipeline->static_scissor
+      ? cmd->graphics_pipeline->scissor : cmd->scissor;
    d->range = (struct cp_draw_range) {
       .start = first,
       .count = count,
       .index_bias = vertex_offset,
    };
    d->call = (struct cp_draw_call) {
-      .mode = cmd->pipeline->topology,
+      .mode = cmd->graphics_pipeline->topology,
       .instance_count = MAX2(instance_count, 1u),
       .start_instance = first_instance,
       .index_size = indexed ? cmd->index_size : 0,
@@ -1561,9 +1840,11 @@ cpvk_record_draw_cmd(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first
    };
    memcpy(d->vb_base, cmd->vb_base, sizeof(d->vb_base));
    d->num_vb = cmd->num_vb;
-   memcpy(d->addrs, cmd->addrs, sizeof(d->addrs));
-   memcpy(d->push, cmd->push, sizeof(d->push));
-   d->push_size = cmd->push_size;
+   memcpy(d->addrs, cmd->graphics_addrs, sizeof(d->addrs));
+   memcpy(d->vs_push, cmd->vs_push, sizeof(d->vs_push));
+   memcpy(d->fs_push, cmd->fs_push, sizeof(d->fs_push));
+   d->vs_push_size = cmd->vs_push_size;
+   d->fs_push_size = cmd->fs_push_size;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1861,7 +2142,8 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
     * buffer; requiring equal sets only split otherwise identical work. */
    CPVK_DIFF(a->num_vb != b->num_vb, "vertex buffer count");
    CPVK_DIFF(memcmp(a->vb_base, b->vb_base, sizeof(a->vb_base)), "vertex buffers");
-   CPVK_DIFF(a->push_size != b->push_size, "push constant size");
+   CPVK_DIFF(a->vs_push_size != b->vs_push_size ||
+             a->fs_push_size != b->fs_push_size, "push constant size");
    /*
     * The push block is in the key, and it is what stops multithreading and
     * pushconstants batching: 446.8 draws a frame against the Gallium driver's
@@ -1880,7 +2162,9 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
     * other way round.
     */
    if (getenv("CPVK_KEEP_PUSHKEY"))
-      CPVK_DIFF(memcmp(a->push, b->push, a->push_size), "push constants");
+      CPVK_DIFF(memcmp(a->vs_push, b->vs_push, a->vs_push_size) ||
+                memcmp(a->fs_push, b->fs_push, a->fs_push_size),
+                "push constants");
    return true;
 #undef CPVK_DIFF
 }
@@ -2086,13 +2370,27 @@ cpvk_prepare_draw(struct cpvk_device *dev, const struct cp_render_scope *scope,
    packet->range = d->range;
    packet->scissor = d->scissor;
 
-   CUdeviceptr push_dev = 0;
-   if (d->push_size) {
+   CUdeviceptr vs_push_dev = 0, fs_push_dev = 0;
+   if (d->vs_push_size) {
       void *host = NULL;
-      push_dev = cp_upload_begin(cp, d->push_size, &host);
-      if (push_dev) {
-         memcpy(host, d->push, d->push_size);
-         cp_upload_end(cp, push_dev, host, d->push_size);
+      vs_push_dev = cp_upload_begin(cp, d->vs_push_size, &host);
+      if (vs_push_dev) {
+         memcpy(host, d->vs_push, d->vs_push_size);
+         cp_upload_end(cp, vs_push_dev, host, d->vs_push_size);
+      }
+   }
+   /* One upload when both stages see the same bytes, which is what an
+    * application pushing to ALL_GRAPHICS produces and what every measured
+    * workload here does. */
+   if (d->fs_push_size == d->vs_push_size &&
+       !memcmp(d->fs_push, d->vs_push, d->fs_push_size)) {
+      fs_push_dev = vs_push_dev;
+   } else if (d->fs_push_size) {
+      void *host = NULL;
+      fs_push_dev = cp_upload_begin(cp, d->fs_push_size, &host);
+      if (fs_push_dev) {
+         memcpy(host, d->fs_push, d->fs_push_size);
+         cp_upload_end(cp, fs_push_dev, host, d->fs_push_size);
       }
    }
 
@@ -2101,9 +2399,10 @@ cpvk_prepare_draw(struct cpvk_device *dev, const struct cp_render_scope *scope,
       packet->state.vs_ubos[i] = addr;
       packet->state.fs_ubos[i] = addr;
    }
-   uint64_t push_slot = push_dev ? push_dev : dev->null_desc;
-   packet->state.vs_ubos[CPVK_UBO_PUSH_SLOT] = push_slot;
-   packet->state.fs_ubos[CPVK_UBO_PUSH_SLOT] = push_slot;
+   packet->state.vs_ubos[CPVK_UBO_PUSH_SLOT] =
+      vs_push_dev ? vs_push_dev : dev->null_desc;
+   packet->state.fs_ubos[CPVK_UBO_PUSH_SLOT] =
+      fs_push_dev ? fs_push_dev : dev->null_desc;
 }
 
 /* Run one recorded draw through the renderer. */
@@ -2603,41 +2902,29 @@ cpvk_CmdEndRendering(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
 
-   /* The render scope's resolve is ordered before the explicit end marker. */
-   struct cpvk_image *src = cmd->resolve_src, *dst = cmd->resolve_dst;
-   if (src && dst) {
-      CUdeviceptr sb, db;
-      size_t sp, dp;
-      unsigned sbpp, dbpp;
-      if (cpvk_image_plane(src, 0, &sb, &sp, &sbpp) &&
-          cpvk_image_plane(dst, 0, &db, &dp, &dbpp) &&
-          sbpp == dbpp && sbpp == 4) {
-         struct cpvk_copy *c = cpvk_record_copy(cmd);
-         if (c) {
-            *c = (struct cpvk_copy) {
-               .src = sb,
-               .dst = db,
-               .src_pitch = sp,
-               .dst_pitch = dp,
-               .width_bytes = (size_t)cmd->resolve_area.extent.width * sbpp,
-               .rows = cmd->resolve_area.extent.height,
-               .src_end = cpvk_image_end(src),
-               .dst_end = cpvk_image_end(dst),
-               .samples = MAX2(src->vk.samples, 1u),
-               .sample_stride = src->sample_stride,
-               .encoding = src->color,
-            };
-         }
-      }
+   /* The colour resolve is ordered before the explicit end marker. */
+   if (cmd->resolve_valid) {
+      struct cpvk_copy *copy = cpvk_record_copy(cmd);
+      if (copy)
+         *copy = cmd->resolve;
    }
 
    struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_END_RENDER);
    if (op)
       op->scope_index = cmd->active_scope;
+
+   /* After the end marker: the depth attachment image is written by the
+    * scope's store, and the resolve reads what that store produced. */
+   if (cmd->depth_resolve_valid) {
+      struct cpvk_copy *copy = cpvk_record_copy(cmd);
+      if (copy)
+         *copy = cmd->depth_resolve;
+      cmd->depth_resolve_valid = false;
+   }
+
    cmd->active_scope = CP_RENDER_SCOPE_NONE;
    cmd->has_fb = false;
-   cmd->resolve_src = NULL;
-   cmd->resolve_dst = NULL;
+   cmd->resolve_valid = false;
 }
 
 /*
@@ -2907,14 +3194,22 @@ cpvk_execute_order_point(struct cpvk_device *dev)
 
 struct cpvk_event_callback {
    struct cpvk_event *event;
-   bool signaled;
+   enum cpvk_op_kind kind;
 };
 
 static void CUDA_CB
 cpvk_event_callback_run(void *data)
 {
    struct cpvk_event_callback *callback = data;
-   cpvk_event_set_state(callback->event, callback->signaled);
+   if (callback->kind == CPVK_OP_EVENT_WAIT) {
+      mtx_lock(&callback->event->lock);
+      while (!callback->event->signaled)
+         cnd_wait(&callback->event->changed, &callback->event->lock);
+      mtx_unlock(&callback->event->lock);
+   } else {
+      cpvk_event_set_state(callback->event,
+         callback->kind == CPVK_OP_EVENT_SET);
+   }
    cpvk_event_unref(callback->event);
    free(callback);
 }
@@ -2927,29 +3222,18 @@ cpvk_execute_order_op(struct cpvk_device *dev, const struct cpvk_op *op)
       return VK_SUCCESS;
 
    struct cpvk_event *event = op->event.event;
-   if (op->kind == CPVK_OP_EVENT_SET || op->kind == CPVK_OP_EVENT_RESET) {
-      struct cpvk_event_callback *callback = malloc(sizeof(*callback));
-      if (!callback)
-         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-      callback->event = event;
-      callback->signaled = op->kind == CPVK_OP_EVENT_SET;
-      cpvk_event_ref(event);
-      CUresult err = cuLaunchHostFunc(dev->renderer.stream,
-                                     cpvk_event_callback_run, callback);
-      if (err != CUDA_SUCCESS) {
-         cpvk_event_unref(event);
-         free(callback);
-         return vk_error(dev, VK_ERROR_DEVICE_LOST);
-      }
-   } else if (op->kind == CPVK_OP_EVENT_WAIT) {
-      mtx_lock(&event->lock);
-      while (!event->signaled) {
-         if (cnd_wait(&event->changed, &event->lock) == thrd_error) {
-            mtx_unlock(&event->lock);
-            return vk_error(dev, VK_ERROR_DEVICE_LOST);
-         }
-      }
-      mtx_unlock(&event->lock);
+   struct cpvk_event_callback *callback = malloc(sizeof(*callback));
+   if (!callback)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   callback->event = event;
+   callback->kind = op->kind;
+   cpvk_event_ref(event);
+   CUresult err = cuLaunchHostFunc(dev->renderer.stream,
+                                  cpvk_event_callback_run, callback);
+   if (err != CUDA_SUCCESS) {
+      cpvk_event_unref(event);
+      free(callback);
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
    }
    return VK_SUCCESS;
 }
@@ -3162,12 +3446,20 @@ cpvk_CreateQueryPool(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
    pool->count = pCreateInfo->queryCount;
    pool->results = calloc(pool->count, sizeof(*pool->results));
    pool->available = calloc(pool->count, sizeof(*pool->available));
-   if (!pool->results || !pool->available) {
+   if (!pool->results || !pool->available ||
+       mtx_init(&pool->lock, mtx_plain) != thrd_success) {
       free(pool->results);
       free(pool->available);
       pool->results = NULL;
       pool->available = NULL;
-      cpvk_query_pool_unref(pool);
+      vk_object_free(&dev->vk, pAllocator, pool);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   if (cnd_init(&pool->changed) != thrd_success) {
+      mtx_destroy(&pool->lock);
+      free(pool->results);
+      free(pool->available);
+      vk_object_free(&dev->vk, pAllocator, pool);
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
@@ -3189,6 +3481,8 @@ cpvk_query_pool_unref(struct cpvk_query_pool *pool)
        atomic_fetch_sub_explicit(&pool->refcnt, 1,
                                  memory_order_acq_rel) != 1)
       return;
+   cnd_destroy(&pool->changed);
+   mtx_destroy(&pool->lock);
    free(pool->results);
    free(pool->available);
    vk_object_free(&pool->dev->vk, &pool->alloc, pool);
@@ -3270,31 +3564,60 @@ cpvk_GetQueryPoolResults(VkDevice _device, VkQueryPool _pool,
                          size_t dataSize, void *pData, VkDeviceSize stride,
                          VkQueryResultFlags flags)
 {
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
 
    if (!pool)
       return VK_ERROR_UNKNOWN;
+
+   if (flags & VK_QUERY_RESULT_WAIT_BIT) {
+      mtx_lock(&pool->lock);
+      for (uint32_t i = 0; i < queryCount; i++) {
+         uint32_t q = firstQuery + i;
+         if (q >= pool->count)
+            continue;
+         while (!atomic_load_explicit(&pool->available[q],
+                                      memory_order_acquire)) {
+            if (atomic_load_explicit(&dev->device_lost,
+                                     memory_order_acquire)) {
+               mtx_unlock(&pool->lock);
+               return vk_error(dev, VK_ERROR_DEVICE_LOST);
+            }
+            if (cnd_wait(&pool->changed, &pool->lock) == thrd_error) {
+               mtx_unlock(&pool->lock);
+               return vk_error(dev, VK_ERROR_DEVICE_LOST);
+            }
+         }
+      }
+      mtx_unlock(&pool->lock);
+   }
 
    char *out = pData;
    VkResult result = VK_SUCCESS;
 
    for (uint32_t i = 0; i < queryCount; i++) {
       uint32_t q = firstQuery + i;
-      bool avail = q < pool->count && pool->available[q];
+      bool avail = q < pool->count &&
+         atomic_load_explicit(&pool->available[q], memory_order_acquire);
       uint64_t value = avail ? pool->results[q] : 0;
 
-      if (!avail)
+      /* NOT_READY is for a query neither waited for nor reported partially. */
+      if (!avail && !(flags & (VK_QUERY_RESULT_WAIT_BIT |
+                               VK_QUERY_RESULT_PARTIAL_BIT)))
          result = VK_NOT_READY;
 
       char *slot = out + (size_t)i * stride;
+      bool write_value = avail || (flags & VK_QUERY_RESULT_PARTIAL_BIT);
       if (flags & VK_QUERY_RESULT_64_BIT) {
          uint64_t *p = (uint64_t *)slot;
-         p[0] = value;
+         if (write_value)
+            p[0] = value;
          if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
             p[1] = avail;
       } else {
          uint32_t *p = (uint32_t *)slot;
-         p[0] = (uint32_t)value;
+         if (write_value)
+            p[0] = (uint32_t)value;
          if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
             p[1] = avail;
       }
@@ -3303,35 +3626,64 @@ cpvk_GetQueryPoolResults(VkDevice _device, VkQueryPool _pool,
    return result;
 }
 
-void
-cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q)
-{
-   struct cpvk_query_pool *pool = q->pool;
+struct cpvk_query_callback {
+   struct cpvk_query_pool *pool;
+   struct cpvk_query_op op;
+};
 
+static void CUDA_CB
+cpvk_query_complete(void *data)
+{
+   struct cpvk_query_callback *cb = data;
+   struct cpvk_query_pool *pool = cb->pool;
+   const struct cpvk_query_op *q = &cb->op;
+
+   mtx_lock(&pool->lock);
    if (q->reset) {
       for (uint32_t i = 0; i < q->count; i++)
          if (q->first + i < pool->count) {
             pool->results[q->first + i] = 0;
-            pool->available[q->first + i] = false;
+            atomic_store_explicit(&pool->available[q->first + i], false,
+                                  memory_order_release);
          }
-      return;
+   } else if (q->first < pool->count) {
+      uint64_t value = 0;
+      if (pool->type == VK_QUERY_TYPE_TIMESTAMP) {
+         struct timespec ts;
+         clock_gettime(CLOCK_MONOTONIC, &ts);
+         value = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+      }
+      pool->results[q->first] = value;
+      atomic_store_explicit(&pool->available[q->first], true,
+                            memory_order_release);
    }
+   cnd_broadcast(&pool->changed);
+   mtx_unlock(&pool->lock);
 
-   if (q->first >= pool->count)
-      return;
+   cpvk_query_pool_unref(pool);
+   free(cb);
+}
 
-   uint64_t value = 0;
-   if (pool->type == VK_QUERY_TYPE_TIMESTAMP) {
-      /* Nanoseconds, which is what timestampPeriod says a tick is. The
-       * host has issued this point after all earlier operations. It remains a
-       * host approximation rather than a GPU timestamp. */
-      struct timespec ts;
-      clock_gettime(CLOCK_MONOTONIC, &ts);
-      value = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+VkResult
+cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q)
+{
+   /* A query observes everything recorded before it, which includes pass
+    * segments a batch flush alone would leave open. */
+   cpvk_execute_order_point(dev);
+
+   struct cpvk_query_callback *cb = malloc(sizeof(*cb));
+   if (!cb)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   cb->pool = q->pool;
+   cb->op = *q;
+   cpvk_query_pool_ref(cb->pool);
+   if (cuLaunchHostFunc(dev->renderer.stream, cpvk_query_complete, cb) !=
+       CUDA_SUCCESS) {
+      cpvk_query_pool_unref(cb->pool);
+      free(cb);
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
    }
-
-   pool->results[q->first] = value;
-   pool->available[q->first] = true;
+   return VK_SUCCESS;
 }
 
 

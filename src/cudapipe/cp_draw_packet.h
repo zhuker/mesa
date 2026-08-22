@@ -15,6 +15,10 @@ struct cp_depth_attachment {
    uint32_t format;
    uint32_t load;
    uint32_t store;
+   /* A stencil LOAD_OP_CLEAR on the shared aspect: the store writes this
+    * value instead of preserving the image's stencil bits. */
+   uint32_t stencil_clear;
+   uint32_t stencil_value;
 };
 
 /* One vkCmdBeginRendering boundary, owned by its recording command buffer. */

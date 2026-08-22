@@ -49,6 +49,8 @@ struct cp_depth_attachment_args {
    uint32_t pixel_stride;
    uint32_t format;
    uint32_t samples;
+   uint32_t stencil_clear;
+   uint32_t stencil_value;
 };
 
 struct cp_vertex_args {

@@ -52,6 +52,17 @@ static const struct vk_device_extension_table cpvk_device_extensions = {
    /* The capture uses the KHR aliases even though these commands are core in
     * 1.1. The implementation below is shared with the core entrypoints. */
    .KHR_descriptor_update_template = true,
+
+   /*
+    * KHR_dynamic_rendering's dependency chain, which an application must be
+    * able to enable alongside it: without these an otherwise legal
+    * vkCreateDevice naming dynamic rendering is invalid usage. Render passes
+    * are the runtime's common implementation over this driver's dynamic
+    * rendering, and sample-zero depth/stencil resolve is implemented as the
+    * first sample plane's copy.
+    */
+   .KHR_create_renderpass2 = true,
+   .KHR_depth_stencil_resolve = true,
 };
 
 static void
@@ -115,6 +126,10 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
       .maxImageDimension3D = 2048,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
+      .maxTexelBufferElements = 65536,
+      .maxUniformBufferRange = 1u << 27,
+      .maxStorageBufferRange = 1u << 30,
+      .bufferImageGranularity = 1,
       .maxBoundDescriptorSets = 8,
       .maxColorAttachments = 1,
       .maxPerStageDescriptorSamplers = 32,
@@ -122,6 +137,26 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
       .maxPerStageDescriptorUniformBuffers = 16,
       .maxPerStageDescriptorStorageBuffers = 16,
       .maxPerStageDescriptorStorageImages = 16,
+      .maxPerStageResources = 128,
+      /*
+       * The Vulkan 1.1 per-set minima. A set's storage is sized by its
+       * layout rather than by a constant, so these are what the descriptor
+       * code can hold rather than a number chosen to look large; a legal set
+       * is either stored completely or refused at layout creation.
+       */
+      .maxDescriptorSetSamplers = 96,
+      .maxDescriptorSetSampledImages = 96,
+      .maxDescriptorSetUniformBuffers = 72,
+      .maxDescriptorSetUniformBuffersDynamic = 8,
+      .maxDescriptorSetStorageBuffers = 24,
+      .maxDescriptorSetStorageBuffersDynamic = 4,
+      .maxDescriptorSetStorageImages = 24,
+      /* Input attachments are not implemented, and a nonzero limit here
+       * would be the promise that they are. */
+      .maxDescriptorSetInputAttachments = 0,
+      .maxMemoryAllocationCount = 4096,
+      .maxSamplerAllocationCount = 4000,
+      .maxMemoryAllocationSize = 1u << 31,
       .maxPushConstantsSize = 256,
       .maxComputeWorkGroupInvocations = 1024,
       .maxComputeWorkGroupSize = { 1024, 1024, 64 },
@@ -129,9 +164,20 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
       .maxComputeSharedMemorySize = 48 * 1024,
       .maxVertexInputAttributes = 32,
       .maxVertexInputBindings = 32,
+      .maxVertexInputAttributeOffset = 2047,
+      .maxVertexInputBindingStride = 2048,
+      .maxVertexOutputComponents = 64,
+      .maxFragmentInputComponents = 64,
+      .maxFragmentOutputAttachments = 1,
+      .maxFragmentDualSrcAttachments = 0,
+      .maxFragmentCombinedOutputResources = 17,
       .maxViewports = 1,
       .maxViewportDimensions = { 16384, 16384 },
       .viewportBoundsRange = { -32768.0f, 32768.0f },
+      .viewportSubPixelBits = 8,
+      .maxFramebufferWidth = 16384,
+      .maxFramebufferHeight = 16384,
+      .maxFramebufferLayers = 1,
       /*
        * 1, 4 and 8, which is what the Gallium driver this replaces reports and
        * what the rasteriser's sample-position table actually holds -- it has
@@ -149,19 +195,49 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
       .framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT |
                                       VK_SAMPLE_COUNT_4_BIT |
                                       VK_SAMPLE_COUNT_8_BIT,
+      .framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT |
+                                        VK_SAMPLE_COUNT_4_BIT |
+                                        VK_SAMPLE_COUNT_8_BIT,
+      .framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .maxSampleMaskWords = 1,
+      .maxSamplerLodBias = 16.0f,
       .maxSamplerAnisotropy = 16.0f,
       .minMemoryMapAlignment = 4096,
+      .minTexelBufferOffsetAlignment = 16,
       .minUniformBufferOffsetAlignment = 256,
       .minStorageBufferOffsetAlignment = 256,
       .subPixelPrecisionBits = 8,
+      .subTexelPrecisionBits = 8,
+      .mipmapPrecisionBits = 8,
       .maxDrawIndexedIndexValue = UINT32_MAX,
       .maxDrawIndirectCount = UINT32_MAX,
       .timestampComputeAndGraphics = false,
+      .timestampPeriod = 1.0f,
+      .maxClipDistances = 0,
+      .maxCullDistances = 0,
+      .maxCombinedClipAndCullDistances = 0,
+      .discreteQueuePriorities = 2,
       .pointSizeRange = { 1.0f, 256.0f },
       .lineWidthRange = { 1.0f, 1.0f },
       .pointSizeGranularity = 0.125f,
       .lineWidthGranularity = 0.0f,
+      /* Sample zero only: it is a plane copy and needs no averaging kernel.
+       * Depth and stencil must use the same mode, which the packed formats
+       * make automatic. */
+      .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .independentResolveNone = false,
+      .independentResolve = false,
+      .strictLines = true,
+      .standardSampleLocations = true,
+      .optimalBufferCopyOffsetAlignment = 1,
+      .optimalBufferCopyRowPitchAlignment = 1,
+      .nonCoherentAtomSize = 256,
    };
 
    snprintf(props->deviceName, sizeof(props->deviceName), "cudapipe (%s)",

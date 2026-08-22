@@ -24,7 +24,13 @@
 
 #define CP_MAX_SHADER_BUFFERS 16
 #define CP_MAX_CONST_BUFFERS  16
-#define CP_MAX_SAMPLERS       256
+/*
+ * Distinct sampler states, not VkSampler objects: identical states share one
+ * entry because shader specialization compares the state, not the index. The
+ * count matches the advertised maxSamplerAllocationCount so a legal
+ * application cannot exhaust the table before that limit.
+ */
+#define CP_MAX_SAMPLERS       4096
 
 /*
  * Draw batching.

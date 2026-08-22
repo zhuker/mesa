@@ -47,7 +47,7 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
     * cannot be created the field stays zero, which is the legacy NULL stream
     * and exactly the behaviour this replaces. */
    if (cuStreamCreate(&cp->stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS)
-      cp->stream = NULL;
+      goto fail;
 
    /* The flush's generation ring; see cp_flush. A failed event creation
     * falls back to the draining flush by leaving flush_retire[0] null. */
@@ -67,18 +67,21 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
    }
 
    cp->abuf = calloc(1, sizeof(*cp->abuf));
-   if (cp->abuf)
-      cp->abuf->enabled = -1;
+   if (!cp->abuf)
+      goto fail;
+   cp->abuf->enabled = -1;
 
    /* 256MB arena — device-only, never touched by CPU */
-   cuMemAlloc(&cp->arena_base, 256 * 1024 * 1024);
+   if (cuMemAlloc(&cp->arena_base, 256 * 1024 * 1024) != CUDA_SUCCESS)
+      goto fail;
    cp->arena_size = 256 * 1024 * 1024;
    cp->arena_offset = 0;
 
    /* Staging for it. A frame of the heaviest sample in the sweep uploads
     * under a megabyte, and running out only costs a synchronisation. */
-   if (cuMemAllocHost(&cp->upload_host, 8 * 1024 * 1024) == CUDA_SUCCESS)
-      cp->upload_size = 8 * 1024 * 1024;
+   if (cuMemAllocHost(&cp->upload_host, 8 * 1024 * 1024) != CUDA_SUCCESS)
+      goto fail;
+   cp->upload_size = 8 * 1024 * 1024;
 
    /* Adaptive rasterizer queues — allocated once, reused across draws.
     *
@@ -87,13 +90,15 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
     * one call each. They are zeroed once per rasterizer pass and a blended
     * draw runs hundreds of passes, so this is two host calls per pass rather
     * than two bytes of memory. Only the base is freed. */
-   cuMemAlloc(&cp->rast_nontrivial,
-              (size_t)CP_MAX_NONTRIVIAL * sizeof(uint32_t));
-   cuMemAlloc(&cp->rast_counts, 256);
+   if (cuMemAlloc(&cp->rast_nontrivial,
+                  (size_t)CP_MAX_NONTRIVIAL * sizeof(uint32_t)) != CUDA_SUCCESS ||
+       cuMemAlloc(&cp->rast_counts, 256) != CUDA_SUCCESS ||
+       cuMemAlloc(&cp->rast_huge_tiles,
+                  (size_t)CP_MAX_HUGE_TILES * sizeof(struct cp_tile_pair)) !=
+          CUDA_SUCCESS)
+      goto fail;
    cp->rast_nontrivial_count = cp->rast_counts;
    cp->rast_huge_count = cp->rast_counts + sizeof(uint32_t);
-   cuMemAlloc(&cp->rast_huge_tiles,
-              (size_t)CP_MAX_HUGE_TILES * sizeof(struct cp_tile_pair));
 
    /* What cp_draw_execute builds its queue struct from; a pass-episode
     * segment append swaps in its stream's own set and restores this one. */
@@ -102,6 +107,10 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
    cp->cur_qset.counts = cp->rast_counts;
 
    return true;
+
+fail:
+   cp_context_cleanup(cp);
+   return false;
 }
 
 /*
@@ -443,6 +452,29 @@ cp_context_cleanup(struct cp_context *cp)
       cuStreamDestroy(cp->stream);
    if (cp->upload_host)
       cuMemFreeHost(cp->upload_host);
+   if (cp->arena_base)
+      cuMemFree(cp->arena_base);
+   if (cp->rast_nontrivial)
+      cuMemFree(cp->rast_nontrivial);
+   if (cp->rast_counts)
+      cuMemFree(cp->rast_counts);
+   if (cp->rast_huge_tiles)
+      cuMemFree(cp->rast_huge_tiles);
+
+   /* The framebuffer-sized buffers and the sampler table are context state,
+    * not draw scratch: nothing else frees them, and a Gallium context whose
+    * CUDA context outlives it would leak every one. */
+   CUdeviceptr *owned[] = {
+      &cp->visbuf, &cp->reject, &cp->resolved, &cp->peel_next, &cp->peel_any,
+      &cp->depthbuf, &cp->sampler_table,
+      &cp->tile_census_hist, &cp->tile_census_mask, &cp->tile_census_quads,
+      &cp->tile_census_smin, &cp->tile_census_smax, &cp->tile_census_refs,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(owned); i++) {
+      if (*owned[i])
+         cuMemFree(*owned[i]);
+      *owned[i] = 0;
+   }
 
    free(cp->pass_segs);
    free(cp->pass_group_ubos);
@@ -1652,6 +1684,8 @@ cp_depth_attachment_xfer(struct cp_context *cp,
       .pixel_stride = depth->pixel_stride,
       .format = depth->format,
       .samples = MAX2(scope->attachment_samples, 1u),
+      .stencil_clear = store ? depth->stencil_clear : 0,
+      .stencil_value = depth->stencil_value,
    };
    cuCtxSetCurrent(cp->screen->cuda_ctx);
    void *params[] = { &args };

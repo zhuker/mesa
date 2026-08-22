@@ -42,14 +42,19 @@ cpvk_submit_worker(void *data)
       mtx_unlock(&dev->submit_lock);
 
       CUresult status = cuEventSynchronize(pending->done);
-      if (status == CUDA_SUCCESS) {
-         for (uint32_t i = 0; i < pending->signal_count; i++) {
-            VkResult result = vk_sync_signal(&dev->vk,
-                                             pending->signals[i].sync,
-                                             pending->signals[i].signal_value);
-            if (result != VK_SUCCESS)
-               fprintf(stderr, "cudapipe: async sync signal failed: %d\n",
-                       result);
+      if (status != CUDA_SUCCESS)
+         atomic_store_explicit(&dev->device_lost, true, memory_order_release);
+      /* Always unblock Vulkan waiters. They observe DEVICE_LOST on the next
+       * queue/device call instead of hanging behind a failed CUDA event. */
+      for (uint32_t i = 0; i < pending->signal_count; i++) {
+         VkResult result = vk_sync_signal(&dev->vk,
+                                          pending->signals[i].sync,
+                                          pending->signals[i].signal_value);
+         if (result != VK_SUCCESS) {
+            atomic_store_explicit(&dev->device_lost, true,
+                                  memory_order_release);
+            fprintf(stderr, "cudapipe: async sync signal failed: %d\n",
+                    result);
          }
       }
       cuEventDestroy(pending->done);
@@ -114,6 +119,10 @@ cpvk_submit_wait_pending(struct cpvk_device *dev)
 static VkResult
 cpvk_submit_abort(struct cpvk_device *dev, VkResult result)
 {
+   /* An aborted submit leaves recorded work partially translated, so the
+    * queue's contract is broken from here on: latch it. */
+   if (result == VK_ERROR_DEVICE_LOST)
+      atomic_store_explicit(&dev->device_lost, true, memory_order_release);
    cp_batch_flush(&dev->renderer);
    cuCtxSetCurrent(dev->cu_ctx);
    cuStreamSynchronize(dev->renderer.stream);
@@ -131,6 +140,9 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    struct cpvk_device *dev =
       container_of(vk_queue->base.device, struct cpvk_device, vk);
 
+   if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
+
    VkResult result = vk_sync_wait_many(&dev->vk, submit->wait_count,
                                        submit->waits,
                                        VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
@@ -141,6 +153,12 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    mtx_lock(&dev->submit_lock);
    bool retired = dev->submit_head == NULL;
    mtx_unlock(&dev->submit_lock);
+   /* Keep asynchronous bursts asynchronous, but do not let a producer which
+    * never waits grow the retired scratch list without bound. */
+   if (!retired && dev->renderer.scratch.used >= 256ull * 1024 * 1024) {
+      cpvk_submit_wait_pending(dev);
+      retired = true;
+   }
    if (retired)
       cp_scratch_reset(&dev->renderer);
    dev->renderer.num_host_maps = 0;
@@ -204,9 +222,12 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          case CPVK_OP_CLEAR:
             cpvk_execute_clear(dev, &cmd->ops[o].clear);
             break;
-         case CPVK_OP_QUERY:
-            cpvk_execute_query(dev, &cmd->ops[o].query);
+         case CPVK_OP_QUERY: {
+            VkResult r = cpvk_execute_query(dev, &cmd->ops[o].query);
+            if (r != VK_SUCCESS)
+               return cpvk_submit_abort(dev, r);
             break;
+         }
          case CPVK_OP_COPY: {
             VkResult r = cpvk_execute_copy(dev, &cmd->ops[o].copy);
             if (r != VK_SUCCESS)
@@ -336,6 +357,7 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
     * dereferences this the moment a pool is created. */
    dev->vk.command_buffer_ops = &cpvk_cmd_buffer_ops;
    dev->pdev = pdev;
+   atomic_init(&dev->device_lost, false);
 
    /* CUDA 12.8: cuCtxCreate takes three arguments. Code written against
     * CUDA 13's four-argument form does not compile here. */
@@ -361,18 +383,22 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    /* Zeroed data, and a descriptor page whose every descriptor's base points
     * at it. Only the base fields are pointers; everything a shader reads as a
     * number reads as zero, so a loop bounded by one terminates. */
-   if (cuMemAllocManaged(&dev->null_data, 1024 * 1024, CU_MEM_ATTACH_GLOBAL) ==
-          CUDA_SUCCESS &&
-       cuMemAllocManaged(&dev->null_desc, 64 * 1024, CU_MEM_ATTACH_GLOBAL) ==
-          CUDA_SUCCESS) {
-      memset((void *)(uintptr_t)dev->null_data, 0, 1024 * 1024);
-      memset((void *)(uintptr_t)dev->null_desc, 0, 64 * 1024);
-      struct cpvk_descriptor *d = (struct cpvk_descriptor *)(uintptr_t)dev->null_desc;
-      for (unsigned i = 0; i < 64 * 1024 / sizeof(*d); i++)
-         d[i].base = dev->null_data;
+   if (cuMemAllocManaged(&dev->null_data, 1024 * 1024,
+                         CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS ||
+       cuMemAllocManaged(&dev->null_desc, 64 * 1024,
+                         CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
+      result = vk_error(pdev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      goto fail_stream;
    }
+   memset((void *)(uintptr_t)dev->null_data, 0, 1024 * 1024);
+   memset((void *)(uintptr_t)dev->null_desc, 0, 64 * 1024);
+   struct cpvk_descriptor *d =
+      (struct cpvk_descriptor *)(uintptr_t)dev->null_desc;
+   for (unsigned i = 0; i < 64 * 1024 / sizeof(*d); i++)
+      d[i].base = dev->null_data;
 
    simple_mtx_init(&dev->shader_cache_lock, mtx_plain);
+   simple_mtx_init(&dev->view_lock, mtx_plain);
    shader_lock_initialized = true;
 
    if (!cp_context_init(&dev->renderer, &dev->cp_dev)) {
@@ -398,8 +424,10 @@ fail_queue:
 fail_stream:
    if (renderer_initialized)
       cp_context_cleanup(&dev->renderer);
-   if (shader_lock_initialized)
+   if (shader_lock_initialized) {
       simple_mtx_destroy(&dev->shader_cache_lock);
+      simple_mtx_destroy(&dev->view_lock);
+   }
    if (kernels_initialized)
       cp_kernels_destroy(&dev->cp_dev.kernels);
    if (dev->null_desc)
@@ -438,6 +466,7 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (dev->null_data)
       cuMemFree(dev->null_data);
    simple_mtx_destroy(&dev->shader_cache_lock);
+   simple_mtx_destroy(&dev->view_lock);
 
    cuCtxDestroy(dev->cu_ctx);
 
@@ -453,9 +482,10 @@ cpvk_DeviceWaitIdle(VkDevice _device)
 
    cuCtxSetCurrent(dev->cu_ctx);
    if (cuCtxSynchronize() != CUDA_SUCCESS)
-      return vk_error(dev, VK_ERROR_DEVICE_LOST);
+      atomic_store_explicit(&dev->device_lost, true, memory_order_release);
    cpvk_submit_wait_pending(dev);
-   return VK_SUCCESS;
+   return atomic_load_explicit(&dev->device_lost, memory_order_acquire)
+      ? vk_error(dev, VK_ERROR_DEVICE_LOST) : VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

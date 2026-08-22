@@ -99,9 +99,15 @@ cp_depth_attachment_store(struct cp_depth_attachment_args args)
       float depth = __uint_as_float(bits);
       depth = depth < 0.0f ? 0.0f : (depth > 1.0f ? 1.0f : depth);
       uint32_t old = *(uint32_t *)dst;
+      uint32_t stencil = args.stencil_clear ? (args.stencil_value & 0xffu) << 24
+                                            : (old & 0xff000000u);
       uint32_t d24 = __float2uint_rn(depth * 16777215.0f);
-      *(uint32_t *)dst = (old & 0xff000000u) | (d24 & 0x00ffffffu);
+      *(uint32_t *)dst = stencil | (d24 & 0x00ffffffu);
    } else {
       *(uint32_t *)dst = bits;
+      /* D32_SFLOAT_S8_UINT keeps its stencil byte in the word after the
+       * depth; the depth store leaves it alone unless it was cleared. */
+      if (args.format == 1 && args.stencil_clear && args.pixel_stride >= 8)
+         dst[4] = (uint8_t)args.stencil_value;
    }
 }

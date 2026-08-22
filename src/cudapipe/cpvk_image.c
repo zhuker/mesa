@@ -64,6 +64,8 @@ static const struct cpvk_format_info cpvk_formats[] = {
    { VK_FORMAT_BC3_UNORM_BLOCK,      CP_TEXEL_DXT5_RGBA,          -1,                           false },
    { VK_FORMAT_BC3_SRGB_BLOCK,       CP_TEXEL_DXT5_RGBA,          -1,                           false },
    { VK_FORMAT_D32_SFLOAT,          CP_TEXEL_R32_FLOAT,           -1,                           true  },
+   { VK_FORMAT_D32_SFLOAT_S8_UINT,  0,                            -1,                           true  },
+   { VK_FORMAT_D24_UNORM_S8_UINT,   0,                            -1,                           true  },
 };
 
 const struct cpvk_format_info *
@@ -75,6 +77,24 @@ cpvk_format_info(VkFormat format)
    return NULL;
 }
 
+/*
+ * Storage images: what the backend's bindless load/store can address. It
+ * computes the texel stride from the format and either packs 8-bit-per-channel
+ * UNORM or moves the raw texel, so a plain uncompressed format of at most four
+ * bytes works and a block-compressed or wider one does not.
+ */
+static bool
+cpvk_format_storage(VkFormat format)
+{
+   const struct cpvk_format_info *info = cpvk_format_info(format);
+   if (!info || !info->texel || info->depth)
+      return false;
+   enum pipe_format pfmt = vk_format_to_pipe_format(format);
+   const struct util_format_description *desc = util_format_description(pfmt);
+   return desc && desc->layout == UTIL_FORMAT_LAYOUT_PLAIN &&
+          util_format_get_blocksize(pfmt) <= 4;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
                                         VkFormat format,
@@ -82,6 +102,26 @@ cpvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
 {
    const struct cpvk_format_info *info = cpvk_format_info(format);
    VkFormatFeatureFlags linear = 0, buffer = 0;
+
+   /*
+    * Vertex buffers do not go through the image format table: the fetch
+    * kernel converts any plain format whose channels are equal, whole bytes
+    * and at most 32 bits wide, and copies anything else verbatim -- which is
+    * not a conversion and must not be advertised.
+    */
+   const struct util_format_description *desc =
+      util_format_description(vk_format_to_pipe_format(format));
+   if (desc && desc->layout == UTIL_FORMAT_LAYOUT_PLAIN &&
+       desc->nr_channels >= 1 && desc->channel[0].size % 8 == 0 &&
+       desc->channel[0].size <= 32) {
+      bool uniform = true;
+      for (unsigned c = 1; c < desc->nr_channels; c++)
+         uniform &= desc->channel[c].size == desc->channel[0].size &&
+                    desc->channel[c].type == desc->channel[0].type &&
+                    desc->channel[c].normalized == desc->channel[0].normalized;
+      if (uniform)
+         buffer |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+   }
 
    if (info) {
       if (info->texel) {
@@ -104,6 +144,8 @@ cpvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
             linear |= VK_FORMAT_FEATURE_BLIT_SRC_BIT |
                       VK_FORMAT_FEATURE_BLIT_DST_BIT;
       }
+      if (cpvk_format_storage(format))
+         linear |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
       if (info->color >= 0)
          linear |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
                    VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
@@ -134,7 +176,31 @@ cpvk_GetPhysicalDeviceImageFormatProperties2(
    const struct cpvk_format_info *info =
       cpvk_format_info(pImageFormatInfo->format);
 
-   if (!info) {
+   bool storage = cpvk_format_storage(pImageFormatInfo->format);
+   /* Multisampling exists only for attachments this driver can allocate,
+    * clear and resolve; a sampled or storage view of a multisample image has
+    * no plane semantics here, so the answer for those usages is one. */
+   bool attachment_usage = (pImageFormatInfo->usage &
+      (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0;
+   bool other_usage = (pImageFormatInfo->usage &
+      ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+        VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) != 0;
+   bool msaa = info && attachment_usage && !other_usage &&
+      (info->depth ||
+       (info->color >= 0 &&
+        vk_format_get_blocksize(pImageFormatInfo->format) == 4));
+   if (!info ||
+       ((pImageFormatInfo->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+        info->color < 0) ||
+       ((pImageFormatInfo->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+        !info->depth) ||
+       ((pImageFormatInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !storage) ||
+       ((pImageFormatInfo->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        !info->texel)) {
       pImageFormatProperties->imageFormatProperties =
          (VkImageFormatProperties) { 0 };
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -144,7 +210,10 @@ cpvk_GetPhysicalDeviceImageFormatProperties2(
       .maxExtent = { 16384, 16384, 2048 },
       .maxMipLevels = 15,
       .maxArrayLayers = 2048,
-      .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .sampleCounts = msaa ? VK_SAMPLE_COUNT_1_BIT |
+                              VK_SAMPLE_COUNT_4_BIT |
+                              VK_SAMPLE_COUNT_8_BIT
+                           : VK_SAMPLE_COUNT_1_BIT,
       .maxResourceSize = 1ull << 31,
    };
    return VK_SUCCESS;
@@ -213,6 +282,18 @@ cpvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       return wsi_common_create_swapchain_image(&dev->pdev->wsi_device,
                                                pCreateInfo, pImage);
 
+   const struct cpvk_format_info *info = cpvk_format_info(pCreateInfo->format);
+   /*
+    * Creation is deliberately permissive; the promise is in
+    * vkGetPhysicalDeviceImageFormatProperties2, which refuses every format
+    * and usage combination this driver cannot serve. Refusing here as well
+    * breaks the two stored GFXReconstruct captures, which create a sampled
+    * D16 image and a 4x multisample sampled depth image without ever asking:
+    * vkCreateImage then fails, and the replayer dereferences the null image
+    * it recorded rather than reporting the error. What the driver cannot do
+    * with such an image is still refused where the work happens -- attachment
+    * binding, blit and resolve, and the sampled/storage descriptor paths.
+    */
    if (pCreateInfo->mipLevels > CPVK_MAX_MIP_LEVELS)
       return vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
@@ -221,7 +302,6 @@ cpvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    if (!image)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   const struct cpvk_format_info *info = cpvk_format_info(pCreateInfo->format);
    image->texel = info ? info->texel : 0;
    image->color = info ? info->color : -1;
    cpvk_image_layout(image);
@@ -255,16 +335,25 @@ cpvk_GetImageMemoryRequirements2(VkDevice _device,
    };
 }
 
+static void cpvk_image_view_refresh(struct cpvk_image_view *view);
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount,
                       const VkBindImageMemoryInfo *pBindInfos)
 {
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+
    for (uint32_t i = 0; i < bindInfoCount; i++) {
       VK_FROM_HANDLE(cpvk_image, image, pBindInfos[i].image);
       VK_FROM_HANDLE(cpvk_device_memory, mem, pBindInfos[i].memory);
 
       image->mem = mem;
       image->offset = pBindInfos[i].memoryOffset;
+      simple_mtx_lock(&dev->view_lock);
+      for (struct cpvk_image_view *view = image->views; view;
+           view = view->image_next)
+         cpvk_image_view_refresh(view);
+      simple_mtx_unlock(&dev->view_lock);
    }
    return VK_SUCCESS;
 }
@@ -307,6 +396,38 @@ cpvk_tex_target(VkImageViewType t)
 
 /* ------------------------------------------------------------------- views */
 
+static void
+cpvk_image_view_refresh(struct cpvk_image_view *view)
+{
+   struct cpvk_image *img = view->image;
+   if (!img || !view->tex_info_host)
+      return;
+
+   enum pipe_format pfmt = vk_format_to_pipe_format(view->vk.format);
+   unsigned levels = MIN2(img->vk.mip_levels, CP_MAX_TEXTURE_LEVELS);
+   *view->tex_info_host = (struct cp_texture_info) {
+      .base = img->mem ? img->mem->dev_ptr + img->offset : 0,
+      .width = img->vk.extent.width,
+      .height = img->vk.extent.height,
+      .depth = MAX2(img->vk.extent.depth, img->vk.array_layers),
+      .format = pfmt,
+      .target = cpvk_tex_target(view->vk.view_type),
+      .first_level = view->vk.base_mip_level,
+      .last_level = view->vk.base_mip_level + view->vk.level_count - 1,
+      .first_layer = view->vk.base_array_layer,
+      .encoding = img->texel,
+      .blocksize = util_format_get_blocksize(pfmt),
+      .is_srgb = util_format_is_srgb(pfmt),
+   };
+   for (unsigned l = 0; l < levels; l++) {
+      view->tex_info_host->row_stride[l] = img->row_stride[l];
+      unsigned h = util_format_get_nblocksy(
+         pfmt, MAX2(img->vk.extent.height >> l, 1u));
+      view->tex_info_host->img_stride[l] = img->row_stride[l] * h;
+      view->tex_info_host->mip_offset[l] = img->level_offset[l];
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_CreateImageView(VkDevice _device,
                      const VkImageViewCreateInfo *pCreateInfo,
@@ -320,63 +441,30 @@ cpvk_CreateImageView(VkDevice _device,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    view->image = cpvk_image_from_handle(pCreateInfo->image);
+   cuCtxSetCurrent(dev->cu_ctx);
+   if (cuMemAllocManaged(&view->tex_info, sizeof(struct cp_texture_info),
+                         CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
+      vk_image_view_destroy(&dev->vk, pAllocator, &view->vk);
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+   view->tex_info_host = (struct cp_texture_info *)(uintptr_t)view->tex_info;
+   cpvk_image_view_refresh(view);
 
-   /*
-    * The sampler reaches a texture through one of these and nothing else: a
-    * descriptor holds a pointer to it at CP_DESC_IMAGE_FUNCTIONS_OFFSET, and
-    * that is the whole interface. Managed, because the host reads descriptors
-    * when it specialises a shader on its sampler state.
-    */
-   struct cpvk_image *img = view->image;
-   if (img) {
-      cuCtxSetCurrent(dev->cu_ctx);
-      if (cuMemAllocManaged(&view->tex_info, sizeof(struct cp_texture_info),
-                            CU_MEM_ATTACH_GLOBAL) == CUDA_SUCCESS) {
-         view->tex_info_host = (struct cp_texture_info *)(uintptr_t)view->tex_info;
-         memset(view->tex_info_host, 0, sizeof(*view->tex_info_host));
+   if (view->image) {
+      simple_mtx_lock(&dev->view_lock);
+      view->image_next = view->image->views;
+      view->image->views = view;
+      simple_mtx_unlock(&dev->view_lock);
+   }
 
-         const VkImageSubresourceRange *r = &pCreateInfo->subresourceRange;
-         enum pipe_format pfmt = vk_format_to_pipe_format(pCreateInfo->format);
-         unsigned levels = MIN2(img->vk.mip_levels, CP_MAX_TEXTURE_LEVELS);
-
-         *view->tex_info_host = (struct cp_texture_info) {
-            .base = img->mem ? img->mem->dev_ptr + img->offset : 0,
-            .width = img->vk.extent.width,
-            .height = img->vk.extent.height,
-            .depth = MAX2(img->vk.extent.depth, img->vk.array_layers),
-            .format = pfmt,
-            .target = cpvk_tex_target(pCreateInfo->viewType),
-            .first_level = r->baseMipLevel,
-            .last_level = r->baseMipLevel +
-                          (r->levelCount == VK_REMAINING_MIP_LEVELS ?
-                           img->vk.mip_levels - r->baseMipLevel :
-                           r->levelCount) - 1,
-            .first_layer = r->baseArrayLayer,
-            .encoding = img->texel,
-            .blocksize = util_format_get_blocksize(pfmt),
-            .is_srgb = util_format_is_srgb(pfmt),
-         };
-         for (unsigned l = 0; l < levels; l++) {
-            view->tex_info_host->row_stride[l] = img->row_stride[l];
-            /* A sampler's z coordinate advances one depth slice, not one
-             * whole mip level.  They are equal for 2D arrays (depth is one),
-             * but a 3D level contains every z slice. */
-            unsigned h = util_format_get_nblocksy(
-               pfmt, MAX2(img->vk.extent.height >> l, 1u));
-            view->tex_info_host->img_stride[l] = img->row_stride[l] * h;
-            view->tex_info_host->mip_offset[l] = img->level_offset[l];
-         }
-
-         if (cp_debug->debug_tex) {
-            const struct cp_texture_info *ti = view->tex_info_host;
-            fprintf(stderr, "cudapipe: texture handle %p %ux%u fmt=%u enc=%u "
-                    "target=%u levels=%u..%u stride=%u base=%p\n",
-                    (void *)(uintptr_t)view->tex_info,
-                    ti->width, ti->height, ti->format, ti->encoding,
-                    ti->target, ti->first_level, ti->last_level,
-                    ti->row_stride[0], (void *)(uintptr_t)ti->base);
-         }
-      }
+   if (cp_debug->debug_tex) {
+      const struct cp_texture_info *ti = view->tex_info_host;
+      fprintf(stderr, "cudapipe: texture handle %p %ux%u fmt=%u enc=%u "
+              "target=%u levels=%u..%u stride=%u base=%p\n",
+              (void *)(uintptr_t)view->tex_info,
+              ti->width, ti->height, ti->format, ti->encoding,
+              ti->target, ti->first_level, ti->last_level,
+              ti->row_stride[0], (void *)(uintptr_t)ti->base);
    }
 
    *pView = cpvk_image_view_to_handle(view);
@@ -391,6 +479,15 @@ cpvk_DestroyImageView(VkDevice _device, VkImageView _view,
    VK_FROM_HANDLE(cpvk_image_view, view, _view);
 
    if (view) {
+      if (view->image) {
+         simple_mtx_lock(&dev->view_lock);
+         struct cpvk_image_view **link = &view->image->views;
+         while (*link && *link != view)
+            link = &(*link)->image_next;
+         if (*link)
+            *link = view->image_next;
+         simple_mtx_unlock(&dev->view_lock);
+      }
       if (view->tex_info) {
          cuCtxSetCurrent(dev->cu_ctx);
          cuMemFree(view->tex_info);
