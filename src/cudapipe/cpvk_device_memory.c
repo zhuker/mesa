@@ -18,6 +18,16 @@
 #include "vk_sync.h"
 #include "vk_util.h"
 
+static bool
+cpvk_fb_equal(const struct cp_fb_desc *a, const struct cp_fb_desc *b)
+{
+   return a->width == b->width && a->height == b->height &&
+          a->nr_cbufs == b->nr_cbufs && a->color == b->color &&
+          a->color_encoding == b->color_encoding &&
+          a->color_sample_stride == b->color_sample_stride &&
+          a->has_zs == b->has_zs;
+}
+
 static VkResult
 cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
@@ -78,8 +88,19 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       /* In record order: a clear after a draw must not run before it. */
       for (unsigned o = 0; o < cmd->num_ops; o++) {
          switch (cmd->ops[o].kind) {
-         case CPVK_OP_BEGIN_RENDER:
-            cpvk_execute_begin_render(dev, &cmd->ops[o].fb, cmd->ops[o].fb_samples);
+         case CPVK_OP_BEGIN_RENDER: {
+            uint32_t s = cmd->ops[o].scope_index;
+            if (s >= cmd->num_scopes)
+               return vk_error(dev, VK_ERROR_DEVICE_LOST);
+            const struct cp_render_scope *scope = &cmd->scopes[s];
+            assert(cpvk_fb_equal(&cmd->ops[o].fb, &scope->fb));
+            assert(cmd->ops[o].fb_samples == scope->attachment_samples);
+            cpvk_execute_begin_render(dev, &scope->fb,
+                                      scope->attachment_samples);
+            break;
+         }
+         case CPVK_OP_END_RENDER:
+            cpvk_execute_end_render(dev);
             break;
          case CPVK_OP_CLEAR:
             cpvk_execute_clear(dev, &cmd->ops[o].clear);
@@ -90,9 +111,16 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          case CPVK_OP_COPY:
             cpvk_execute_copy(dev, &cmd->ops[o].copy);
             break;
-         case CPVK_OP_DRAW:
+         case CPVK_OP_DRAW: {
+            uint32_t s = cmd->ops[o].scope_index;
+            if (s >= cmd->num_scopes)
+               return vk_error(dev, VK_ERROR_DEVICE_LOST);
+            assert(cmd->ops[o].draw_cmd.scope_index == s);
+            assert(cpvk_fb_equal(&cmd->ops[o].draw_cmd.fb,
+                                   &cmd->scopes[s].fb));
             cpvk_execute_draw_cmd(dev, &cmd->ops[o].draw_cmd);
             break;
+         }
          case CPVK_OP_DISPATCH: {
             /* Here, in record order, and not before the copy that fills what
              * it reads. */

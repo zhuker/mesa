@@ -64,9 +64,13 @@ supersedes the pinned-host/two-heap milestone described in the historical log.
 ### Recording and submission
 
 A command buffer records a growable, ordered array of `cpvk_op` values. The
-operation kinds are begin-render, clear, query, copy, draw and dispatch. Draws
-store a retained pipeline pointer and snapshot the framebuffer,
-viewport/scissor, vertex/index input, push constants and descriptor rows. Queue submission:
+operation kinds include begin/end-render, clear, query, copy, draw, dispatch,
+barrier and event order points. Each begin-render owns an immutable indexed
+`cp_render_scope`; begin/draw operations carry indices rather than pointers, so
+array growth and secondary import cannot invalidate them. Draws store a retained
+pipeline pointer and snapshot the framebuffer (temporarily duplicated as a
+scope consistency check), viewport/scissor, vertex/index input, push constants
+and descriptor rows. Queue submission:
 
 1. publishes bounded host mappings used by sampler specialization;
 2. uploads dirty descriptor-snapshot arenas from ordinary host storage to
@@ -78,19 +82,19 @@ viewport/scissor, vertex/index input, push constants and descriptor rows. Queue 
    rewinds the scratch/upload bump allocators.
 
 The final drain is followed by explicit publication of every submission signal.
-Binary fences and semaphores now track signal/reset state and deadline waits,
-including correct fresh/reset status and zero-time timeout behavior. The drain
-still does not implement barriers, recording-time device events or asynchronous
-completion. Do not remove it until sync objects carry CUDA-event payloads and
-arena retirement follows those events.
+Binary fences and semaphores track signal/reset state and deadline waits.
+Barriers and device events record conservative ordered execution points, while
+completion remains synchronous. Do not remove the drain until sync objects
+carry CUDA-event payloads and arena retirement follows those events.
 
-Secondary command buffers are memcpy-appended to the primary operation stream,
-but their descriptor arenas are not transferred/published/uploaded with those
-operations. Descriptor-using secondary buffers are therefore not established
-as supported; the current tests do not cover them.
+Secondary command buffers are memcpy-appended to the primary operation stream.
+Their descriptor snapshots are imported into primary-owned arenas, draw and
+dispatch addresses are remapped, retained objects are imported, and inherited
+render-scope indices resolve to the primary's active scope.
 
-Dynamic rendering is translated into `cp_fb_desc`; render-pass load clears and
-end-of-pass resolves are explicit operations.
+Dynamic rendering is translated into immutable `cp_render_scope` values;
+render-pass load clears, end markers and end-of-pass resolves are explicit
+operations. End markers flush batches/pass episodes but do not drain CUDA.
 
 ### Descriptors and command-buffer immutability
 
@@ -472,12 +476,12 @@ continue staging explicit paths rather than using `git add -A`.
    host status/set/reset is mutex protected. The synchronization2 feature is no
    longer exposed at Vulkan 1.1. Stage/access scopes are conservatively treated
    as all commands and event waits can block queue submission on the host.
-10. **Secondary render-scope inheritance is still implicit.** ExecuteCommands
-   now imports every current/retired secondary descriptor arena into primary
-   ownership, remaps draw/dispatch addresses and retains recorded objects; a
-   descriptor-using secondary matches the primary-rendered image byte for byte.
-   Rendering inheritance is not yet represented by explicit immutable scope
-   indices, so nested/independent secondary rendering needs the scope refactor.
+10. **Immutable render-scope conversion is deliberately transitional.** Begin
+   and draw operations now use remappable scope indices, inherited secondary
+   rendering resolves to the primary scope, and explicit end markers prevent
+   episodes spanning a Vulkan rendering boundary. Recorded draws retain the old
+   framebuffer copy only as a submit-time field assertion until prepared draw
+   packets make the indexed scope their sole render-target source.
 11. **Recorded ownership is only partially complete.** Command buffers retain
     unique references to every bound graphics/compute pipeline and recorded
     query pool; secondary operation copies import those references. Focused

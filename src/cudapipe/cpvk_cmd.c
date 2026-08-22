@@ -490,6 +490,9 @@ cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
    vk_command_buffer_reset(&cmd->vk);
    cmd->num_dispatches = 0;
    cmd->num_ops = 0;
+   cmd->num_scopes = 0;
+   cmd->active_scope = CP_RENDER_SCOPE_NONE;
+   cmd->next_scope_serial = 0;
    cmd->pipeline = NULL;
    memset(cmd->addrs, 0, sizeof(cmd->addrs));
    memset(cmd->vb_base, 0, sizeof(cmd->vb_base));
@@ -528,6 +531,7 @@ cpvk_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd)
    if (cmd->desc_arena_host)
       free(cmd->desc_arena_host);
    free(cmd->ops);
+   free(cmd->scopes);
    vk_free(&cmd->vk.pool->alloc, cmd);
 }
 
@@ -568,6 +572,9 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
    cmd->num_dispatches = 0;
    cmd->num_ops = 0;
+   cmd->num_scopes = 0;
+   cmd->active_scope = CP_RENDER_SCOPE_NONE;
+   cmd->next_scope_serial = 0;
    cmd->pipeline = NULL;
    memset(cmd->addrs, 0, sizeof(cmd->addrs));
    memset(cmd->vb_base, 0, sizeof(cmd->vb_base));
@@ -583,6 +590,8 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->num_desc_retired = 0;
    cmd->desc_arena_used = 0;
    cmd->desc_arena_dirty = false;
+   if (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT)
+      cmd->active_scope = CP_RENDER_SCOPE_INHERITED;
    return VK_SUCCESS;
 }
 
@@ -976,18 +985,35 @@ cpvk_import_secondary_arenas(struct cpvk_cmd_buffer *dst,
 }
 
 static void
-cpvk_remap_secondary_op(struct cpvk_op *op,
-                        const struct cpvk_arena_map *maps, unsigned count)
+cpvk_remap_secondary_op(struct cpvk_cmd_buffer *cmd, struct cpvk_op *op,
+                        const struct cpvk_arena_map *maps, unsigned count,
+                        uint32_t scope_base, uint32_t inherited_scope)
 {
    CUdeviceptr *addrs = NULL;
    if (op->kind == CPVK_OP_DRAW)
       addrs = op->draw_cmd.addrs;
    else if (op->kind == CPVK_OP_DISPATCH)
       addrs = op->dispatch.addrs;
-   if (!addrs)
+   if (addrs) {
+      for (unsigned i = 0; i < CPVK_MAX_ARG_BUFS; i++)
+         addrs[i] = cpvk_remap_secondary_addr(addrs[i], maps, count);
+   }
+
+   if (op->kind != CPVK_OP_BEGIN_RENDER &&
+       op->kind != CPVK_OP_END_RENDER && op->kind != CPVK_OP_DRAW)
       return;
-   for (unsigned i = 0; i < CPVK_MAX_ARG_BUFS; i++)
-      addrs[i] = cpvk_remap_secondary_addr(addrs[i], maps, count);
+
+   uint32_t scope = op->scope_index;
+   if (scope == CP_RENDER_SCOPE_INHERITED)
+      scope = inherited_scope;
+   else if (scope != CP_RENDER_SCOPE_NONE)
+      scope += scope_base;
+   op->scope_index = scope;
+   if (op->kind == CPVK_OP_DRAW) {
+      op->draw_cmd.scope_index = scope;
+      if (scope < cmd->num_scopes)
+         op->draw_cmd.fb = cmd->scopes[scope].fb;
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1020,6 +1046,24 @@ cpvk_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t count,
          }
       }
 
+      uint32_t scope_base = cmd->num_scopes;
+      if (cmd->num_scopes + sec->num_scopes > cmd->max_scopes) {
+         unsigned want = MAX2(cmd->max_scopes ? cmd->max_scopes * 2 : 8,
+                              cmd->num_scopes + sec->num_scopes);
+         void *p = realloc(cmd->scopes, want * sizeof(*cmd->scopes));
+         if (!p) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+            return;
+         }
+         cmd->scopes = p;
+         cmd->max_scopes = want;
+      }
+      for (unsigned s = 0; s < sec->num_scopes; s++) {
+         cmd->scopes[cmd->num_scopes] = sec->scopes[s];
+         cmd->scopes[cmd->num_scopes].serial = cmd->next_scope_serial++;
+         cmd->num_scopes++;
+      }
+
       struct cpvk_arena_map *maps = NULL;
       unsigned num_maps = 0;
       if (!cpvk_import_secondary_arenas(cmd, sec, &maps, &num_maps))
@@ -1043,7 +1087,8 @@ cpvk_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t count,
              sec->num_ops * sizeof(*sec->ops));
       cmd->num_ops += sec->num_ops;
       for (unsigned o = first; o < cmd->num_ops; o++)
-         cpvk_remap_secondary_op(&cmd->ops[o], maps, num_maps);
+         cpvk_remap_secondary_op(cmd, &cmd->ops[o], maps, num_maps,
+                                 scope_base, cmd->active_scope);
       free(maps);
    }
 }
@@ -1070,6 +1115,29 @@ cpvk_op_alloc(struct cpvk_cmd_buffer *cmd, enum cpvk_op_kind kind)
 }
 
 /* ------------------------------------------------------- rendering + draw */
+
+static uint32_t
+cpvk_scope_append(struct cpvk_cmd_buffer *cmd, const struct cp_fb_desc *fb,
+                  unsigned samples)
+{
+   if (cmd->num_scopes == cmd->max_scopes) {
+      unsigned want = cmd->max_scopes ? cmd->max_scopes * 2 : 8;
+      void *p = realloc(cmd->scopes, want * sizeof(*cmd->scopes));
+      if (!p) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return CP_RENDER_SCOPE_NONE;
+      }
+      cmd->scopes = p;
+      cmd->max_scopes = want;
+   }
+   uint32_t index = cmd->num_scopes++;
+   cmd->scopes[index] = (struct cp_render_scope) {
+      .fb = *fb,
+      .attachment_samples = MAX2(samples, 1u),
+      .serial = cmd->next_scope_serial++,
+   };
+   return index;
+}
 
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
@@ -1178,14 +1246,19 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     * shaded.
     */
    {
+      /* The attachment's sample count comes from the image rather than the
+       * pipeline because framebuffer-sized buffers follow the attachment. */
+      cmd->fb_samples = cimg ? MAX2(cimg->vk.samples, 1u) : 1;
+      uint32_t scope = cpvk_scope_append(cmd, &fb, cmd->fb_samples);
+      if (scope == CP_RENDER_SCOPE_NONE)
+         return;
+      cmd->active_scope = scope;
+
       struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_BEGIN_RENDER);
       if (!op)
          return;
+      op->scope_index = scope;
       op->fb = fb;
-      /* The attachment's sample count, taken from the image the rendering
-       * binds rather than from the pipeline, because it is what the
-       * framebuffer-sized buffers have to be sized for. */
-      cmd->fb_samples = cimg ? MAX2(cimg->vk.samples, 1u) : 1;
       op->fb_samples = cmd->fb_samples;
    }
 
@@ -1366,7 +1439,9 @@ cpvk_record_draw_cmd(struct cpvk_cmd_buffer *cmd, unsigned count, unsigned first
       return;
    struct cpvk_draw_cmd *d = &op->draw_cmd;
 
+   op->scope_index = cmd->active_scope;
    d->pipeline = cmd->pipeline;
+   d->scope_index = cmd->active_scope;
    d->fb = cmd->fb;
    d->viewport = cmd->viewport;
    d->scissor = cmd->scissor;
@@ -2399,36 +2474,39 @@ cpvk_CmdEndRendering(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
 
-   /* The render pass's own resolve, recorded where it happens: at the end of
-    * the rendering, after the draws and before whatever reads the result. */
+   /* The render scope's resolve is ordered before the explicit end marker. */
    struct cpvk_image *src = cmd->resolve_src, *dst = cmd->resolve_dst;
-   if (!src || !dst)
-      return;
+   if (src && dst) {
+      CUdeviceptr sb, db;
+      size_t sp, dp;
+      unsigned sbpp, dbpp;
+      if (cpvk_image_plane(src, 0, &sb, &sp, &sbpp) &&
+          cpvk_image_plane(dst, 0, &db, &dp, &dbpp) &&
+          sbpp == dbpp && sbpp == 4) {
+         struct cpvk_copy *c = cpvk_record_copy(cmd);
+         if (c) {
+            *c = (struct cpvk_copy) {
+               .src = sb,
+               .dst = db,
+               .src_pitch = sp,
+               .dst_pitch = dp,
+               .width_bytes = (size_t)cmd->resolve_area.extent.width * sbpp,
+               .rows = cmd->resolve_area.extent.height,
+               .src_end = cpvk_image_end(src),
+               .dst_end = cpvk_image_end(dst),
+               .samples = MAX2(src->vk.samples, 1u),
+               .sample_stride = src->sample_stride,
+               .encoding = src->color,
+            };
+         }
+      }
+   }
 
-   CUdeviceptr sb, db;
-   size_t sp, dp;
-   unsigned sbpp, dbpp;
-   if (!cpvk_image_plane(src, 0, &sb, &sp, &sbpp) ||
-       !cpvk_image_plane(dst, 0, &db, &dp, &dbpp) || sbpp != dbpp || sbpp != 4)
-      return;
-
-   struct cpvk_copy *c = cpvk_record_copy(cmd);
-   if (!c)
-      return;
-   *c = (struct cpvk_copy) {
-      .src = sb,
-      .dst = db,
-      .src_pitch = sp,
-      .dst_pitch = dp,
-      .width_bytes = (size_t)cmd->resolve_area.extent.width * sbpp,
-      .rows = cmd->resolve_area.extent.height,
-      .src_end = cpvk_image_end(src),
-      .dst_end = cpvk_image_end(dst),
-      .samples = MAX2(src->vk.samples, 1u),
-      .sample_stride = src->sample_stride,
-      .encoding = src->color,
-   };
-
+   struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_END_RENDER);
+   if (op)
+      op->scope_index = cmd->active_scope;
+   cmd->active_scope = CP_RENDER_SCOPE_NONE;
+   cmd->has_fb = false;
    cmd->resolve_src = NULL;
    cmd->resolve_dst = NULL;
 }
@@ -2746,6 +2824,15 @@ cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb,
    cp_pass_finish(&dev->renderer);
 
    cp_context_set_framebuffer(&dev->renderer, fb, MAX2(samples, 1u));
+}
+
+void
+cpvk_execute_end_render(struct cpvk_device *dev)
+{
+   cp_batch_flush_why(&dev->renderer, "render scope end");
+   if (getenv("CPVK_DEBUG_EPISODE"))
+      fprintf(stderr, "episode-cut: end_render\n");
+   cp_pass_finish(&dev->renderer);
 }
 
 void

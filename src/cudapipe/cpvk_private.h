@@ -31,6 +31,7 @@
 #include <stdatomic.h>
 #include "cp_device.h"
 #include "cp_renderer.h"
+#include "cp_draw_packet.h"
 #include "vk_buffer.h"
 #include "vk_image.h"
 #include "vk_descriptor_set_layout.h"
@@ -290,6 +291,8 @@ struct cpvk_dispatch {
 
 struct cpvk_draw_cmd {
    struct cpvk_pipeline *pipeline;
+   uint32_t scope_index;
+   /* Retained through the scope transition as a consistency assertion. */
    struct cp_fb_desc fb;
    struct cp_viewport_state viewport;
    struct cp_rect scissor;
@@ -375,6 +378,7 @@ struct cpvk_query_op {
 
 enum cpvk_op_kind {
    CPVK_OP_BEGIN_RENDER,
+   CPVK_OP_END_RENDER,
    CPVK_OP_QUERY,
    CPVK_OP_DRAW,
    CPVK_OP_CLEAR,
@@ -398,6 +402,8 @@ struct cpvk_event_op {
 
 struct cpvk_op {
    enum cpvk_op_kind kind;
+   /* BEGIN_RENDER/DRAW only; remapped when secondary ops are imported. */
+   uint32_t scope_index;
    /* BEGIN_RENDER only: the attachment's sample count, which cp_fb_desc does
     * not carry because the Gallium adapter passes it beside the desc. */
    unsigned fb_samples;
@@ -453,6 +459,10 @@ struct cpvk_cmd_buffer {
     */
    struct cpvk_op *ops;
    unsigned num_ops, max_ops;
+   struct cp_render_scope *scopes;
+   unsigned num_scopes, max_scopes;
+   uint32_t active_scope;
+   uint32_t next_scope_serial;
 
    /*
     * Descriptor sets are snapshotted at bind time into memory this command
@@ -492,6 +502,7 @@ void cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
 void cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q);
 void cpvk_execute_begin_render(struct cpvk_device *dev, const struct cp_fb_desc *fb,
                                unsigned samples);
+void cpvk_execute_end_render(struct cpvk_device *dev);
 
 extern const struct vk_command_buffer_ops cpvk_cmd_buffer_ops;
 extern const struct vk_sync_type *const cpvk_sync_types[];
