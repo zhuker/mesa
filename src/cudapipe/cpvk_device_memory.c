@@ -163,9 +163,17 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       cp_scratch_reset(&dev->renderer);
    dev->renderer.num_host_maps = 0;
    for (uint32_t i = 0; i < submit->command_buffer_count; i++)
-      dev->renderer.plan.arena_grows +=
-         container_of(submit->command_buffers[i],
-                      struct cpvk_cmd_buffer, vk)->arena_grows;
+      {
+         /* Consume rather than read: a command buffer recorded once and
+          * submitted N times grew its arena once, not N times. The first
+          * version of this counter read it repeatedly and manufactured the
+          * finding that the arena grows once per render scope. */
+         struct cpvk_cmd_buffer *c =
+            container_of(submit->command_buffers[i],
+                         struct cpvk_cmd_buffer, vk);
+         dev->renderer.plan.arena_grows += c->arena_grows;
+         c->arena_grows = 0;
+      }
 
    for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
       struct cpvk_cmd_buffer *cmd =
@@ -460,6 +468,7 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    cpvk_submit_worker_finish(dev);
    vk_queue_finish(&dev->queue);
 
+   cpvk_batch_break_report();
    cp_context_cleanup(&dev->renderer);
    for (unsigned i = 0; i < dev->num_shaders; i++)
       cp_shader_binary_destroy(dev->shader_cache[i].bin);

@@ -792,10 +792,48 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    return VK_SUCCESS;
 }
 
+static bool cpvk_draws_mergeable(const struct cpvk_draw_cmd *a,
+                                 const struct cpvk_draw_cmd *b);
+
+/*
+ * The recorded pass is a program, so decide the batch partition when the
+ * program is complete instead of rediscovering it every submission. This is
+ * where the Gallium-shaped "watch the draws go past" model starts giving way:
+ * the pairwise mergeability of consecutive draws is a property of the
+ * recording, computed here once, and a command buffer submitted N times pays
+ * for its partition once instead of N times.
+ *
+ * Only consecutive draw ops in one scope are planned. A draw after a clear, a
+ * copy or a barrier keeps plan_prev NULL and takes the dynamic path, which
+ * also keeps imported secondary ops correct: this walk runs over the primary's
+ * final array, overwriting whatever plan the secondary computed for its own.
+ */
+static void
+cpvk_plan_batches(struct cpvk_cmd_buffer *cmd)
+{
+   const struct cpvk_op *prev = NULL;
+   for (unsigned i = 0; i < cmd->num_ops; i++) {
+      struct cpvk_op *op = &cmd->ops[i];
+      if (op->kind == CPVK_OP_DRAW) {
+         struct cpvk_draw_cmd *d = &op->draw_cmd;
+         if (prev && prev->kind == CPVK_OP_DRAW &&
+             prev->scope_index == op->scope_index) {
+            d->plan_prev = &prev->draw_cmd;
+            d->plan_mergeable = cpvk_draws_mergeable(d, &prev->draw_cmd);
+         } else {
+            d->plan_prev = NULL;
+            d->plan_mergeable = false;
+         }
+      }
+      prev = op;
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   cpvk_plan_batches(cmd);
    return vk_command_buffer_end(&cmd->vk);
 }
 
@@ -2072,6 +2110,40 @@ static bool cpvk_batch_eligible(struct cpvk_device *dev,
  * documents for the Gallium side. The comparison touches no driver state at
  * all, which is what makes it safe to run before the draw is staged.
  */
+/*
+ * Which key component broke a batch, tallied by label for
+ * CUDAPIPE_PLAN_STATS. The labels are string literals, so pointer identity
+ * is the key. This is the attribution the merge-rate number lacks: the old
+ * capture merges 71% of its draws where Crossroads merges 84%, and the
+ * difference is some specific field of this comparison.
+ */
+static struct { const char *what; uint64_t n; } cpvk_break_tally[32];
+
+static void
+cpvk_batch_break_note(const char *what)
+{
+   if (!cp_debug->plan_stats)
+      return;
+   for (unsigned i = 0; i < 32; i++) {
+      if (cpvk_break_tally[i].what == what || !cpvk_break_tally[i].what) {
+         cpvk_break_tally[i].what = what;
+         cpvk_break_tally[i].n++;
+         return;
+      }
+   }
+}
+
+void
+cpvk_batch_break_report(void)
+{
+   if (!cp_debug->plan_stats || !cpvk_break_tally[0].what)
+      return;
+   fprintf(stderr, "cudapipe: batch breaks by cause:\n");
+   for (unsigned i = 0; i < 32 && cpvk_break_tally[i].what; i++)
+      fprintf(stderr, "  %8" PRIu64 "  %s\n",
+              cpvk_break_tally[i].n, cpvk_break_tally[i].what);
+}
+
 static bool
 cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *b)
 {
@@ -2080,6 +2152,7 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
       if (cond) {                                               \
          if (cp_debug->debug_batchdiff)                          \
             fprintf(stderr, "batchdiff: %s\n", what);           \
+         cpvk_batch_break_note(what);                            \
          return false;                                          \
       }                                                         \
    } while (0)
@@ -2215,8 +2288,11 @@ cpvk_batch_can_join(struct cpvk_device *dev,
    struct cp_context *cp = &dev->renderer;
    bool blended = false;
 
-   if (!cpvk_batch_eligible(dev, scope, d, &blended))
+   if (!cpvk_batch_eligible(dev, scope, d, &blended)) {
+      if (cp->batch.pending)
+         cpvk_batch_break_note("draw not batchable");
       return false;
+   }
 
    /* Out to the caller, which stages it on the batch: it decides at flush
     * whether the batch appends to a blended pass episode or an opaque one. */
@@ -2228,17 +2304,37 @@ cpvk_batch_can_join(struct cpvk_device *dev,
    if (!cp->batch.pending)
       return true;
 
-   if (!dev->prev_draw_valid || !dev->prev_draw || !dev->prev_scope ||
-       scope->serial != dev->prev_scope->serial ||
-       !cpvk_draws_mergeable(d, dev->prev_draw)) {
+   if (!dev->prev_draw_valid || !dev->prev_draw || !dev->prev_scope) {
+      cpvk_batch_break_note("no previous draw");
+      return false;
+   }
+   if (scope->serial != dev->prev_scope->serial) {
+      cpvk_batch_break_note("render scope changed");
+      return false;
+   }
+   /* The plan bit is this exact comparison, precomputed at
+    * vkEndCommandBuffer against this exact draw. */
+   bool mergeable;
+   if (d->plan_prev == dev->prev_draw) {
+      cp->plan.plan_hits++;
+      mergeable = d->plan_mergeable;
+   } else {
+      cp->plan.plan_misses++;
+      mergeable = cpvk_draws_mergeable(d, dev->prev_draw);
+   }
+   if (!mergeable) {
       if (cp_debug->debug_batchdiff)
          fprintf(stderr, "batchdiff: the draws differ\n");
       return false;
    }
-   if (cp->batch.ndraws >= (unsigned)cp_debug->batch_max)
+   if (cp->batch.ndraws >= (unsigned)cp_debug->batch_max) {
+      cpvk_batch_break_note("batch full");
       return false;
-   if (cp->batch.tris + tris > CP_MAX_BATCH_TRIS)
+   }
+   if (cp->batch.tris + tris > CP_MAX_BATCH_TRIS) {
+      cpvk_batch_break_note("triangle cap");
       return false;
+   }
 
    return true;
 }

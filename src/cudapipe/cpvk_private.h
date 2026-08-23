@@ -313,6 +313,18 @@ struct cpvk_dispatch {
 
 
 struct cpvk_draw_cmd {
+   /*
+    * The batch partition, decided when recording ends rather than while the
+    * submit walk happens to go past. plan_prev names the draw this decision
+    * was computed against -- the immediately preceding op, when that op is a
+    * draw in the same scope -- and plan_mergeable is cpvk_draws_mergeable()
+    * of the pair, computed once per recording instead of once per submission.
+    * The submit path uses it only when dev->prev_draw is exactly plan_prev;
+    * anything else falls back to the dynamic comparison, so behaviour is
+    * identical by construction.
+    */
+   const struct cpvk_draw_cmd *plan_prev;
+   bool plan_mergeable;
    struct cpvk_pipeline *pipeline;
    uint32_t scope_index;
    struct cp_viewport_state viewport;
@@ -533,6 +545,7 @@ void cpvk_execute_draw_cmd(struct cpvk_device *dev,
                            const struct cpvk_draw_cmd *d);
 void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
 VkResult cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
+void cpvk_batch_break_report(void);
 VkResult cpvk_execute_query(struct cpvk_device *dev,
                             const struct cpvk_query_op *q);
 

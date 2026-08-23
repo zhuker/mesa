@@ -455,6 +455,12 @@ cp_plan_report(struct cp_context *cp)
            cp->plan.key_builds / scopes, cp->plan.merge_tests / scopes,
            cp->plan.flushes / scopes, cp->plan.scratch_grows,
            cp->plan.arena_grows, cp->plan.fb_reallocs);
+   if (cp->plan.plan_hits + cp->plan.plan_misses)
+      fprintf(stderr, "cudapipe: batch plan answered %" PRIu64 " of %" PRIu64
+              " merge decisions (%.1f%%)\n", cp->plan.plan_hits,
+              cp->plan.plan_hits + cp->plan.plan_misses,
+              100.0 * (double)cp->plan.plan_hits /
+              (double)(cp->plan.plan_hits + cp->plan.plan_misses));
 }
 
 static void
@@ -6399,7 +6405,7 @@ cp_pass_finish(struct cp_context *cp)
    if (nsegs)
       cp->plan.pass_finishes++;
 
-   if (getenv("CPVK_DEBUG_EPISODE") && nsegs)
+   if (nsegs && getenv("CPVK_DEBUG_EPISODE"))
       fprintf(stderr, "episode: nsegs=%u opaque=%d\n", nsegs,
               (int)cp->pass.opaque);
 

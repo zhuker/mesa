@@ -463,6 +463,8 @@ struct cp_context {
       uint64_t arena_grows;     /* descriptor arena reallocations */
       uint64_t fb_reallocs;     /* framebuffer-sized buffer reallocations */
       uint64_t scopes;          /* render scopes begun */
+      uint64_t plan_hits;       /* merge answered by the recorded plan */
+      uint64_t plan_misses;     /* merge answered dynamically */
    } plan;
 
    /* GPU-resident pipeline state — managed memory, written by CPU on state
