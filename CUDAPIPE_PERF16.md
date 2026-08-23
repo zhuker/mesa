@@ -272,3 +272,33 @@ node parameter updates, stale rotating scratch pointers, or a full-scope graph
 before decisions are device-resident. Graphs are enabling architecture after a
 device-work reduction, not iteration 5 by themselves. Full report:
 `/tmp/perf16/graph-design.md`.
+
+## Fragment-stage architecture note and iteration 5
+
+Current-tip trace splits generated fragment work at **8.157 ms/frame**:
+direct 5.086 and A-buffer 3.071. Register-time ownership is 236 regs at 3.891
+ms, 126 regs at 2.241, and 127 regs at 1.517. The direct grid-4096 class alone
+is 4.838 ms/frame. Software input/output traffic is cache-hot (NCU DRAM only
+1–9%), so deleting bytes without resource isolation is not a multi-ms design.
+
+**Iteration 5:** retain a truly bare classic FS binary with no reference to
+`cp_fs.cu` beside the current helper-linked fused binary. A null helper argument
+is not a revert: iteration 4 proved linked call graphs retain union register
+allocation. A/B the *whole chain*: classic interpolator + bare FS versus slim
+compaction + fused FS, including sampler variants. The separate interpolator
+costs ~1.1 ms/frame; direct 236+127-reg groups alone cost 4.11 ms, so recovering
+an occupancy tier offers a plausible **1–3 ms net**. The classic/fused selection
+must choose distinct modules, and module lifetime/cache keys/tuners must own the
+mode explicitly. This is also the resource-admission foundation for hardware
+texture binaries and an honest revert control.
+
+**Later hardware texture path:** CUDA PITCH2D objects cover 50.4% of descriptor
+image updates with per-mip objects (34.7% single-mip). Cube 19.7%, 3D 15.3%,
+BC1/3 12.8%, and packed 1.7% need CUDA arrays or software fallback. A durable
+design aligns row pitches and every mip base, caches objects per
+(view,sampler,mip), defers destruction, and emits NVVM texture intrinsics
+directly so a linked wrapper does not recreate the register-union problem.
+PITCH2D ceiling: 0.8–2.5 ms; full array/mip/BC/cube/3D path: 2–5 ms. CUDA
+bilinear uses 8 fractional bits, so validation is against Vulkan tolerances and
+external reference sentinels, not native byte identity. Full analysis:
+`/tmp/perf16/fs-design.md`.

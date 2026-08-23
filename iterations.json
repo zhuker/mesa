@@ -39,6 +39,14 @@
    "old_median_ms": 48.05,
    "sweep_hot_ms": null,
    "note": "global-buffer helper ABI regressed partial replay 23.5->48.05ms; trivial VS 20->108 regs, 6->2 blocks/SM. Lane-local form invalid across LLVM local/NVRTC generic pointer ABI. All source reverted. Viable only with separate classic/fused binaries plus address-space-correct local result ABI and occupancy-tier selection."
+  },
+  {
+   "id": 5,
+   "name": "resource-isolate classic and fused fragment binaries; A/B the whole chain",
+   "verdict": "pending",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "current FS 8.157ms/frame; helper-linked null path still carries registers. Build truly bare FS beside fused helper binary; compare separate-interp+bare-FS against compact+fused-FS. Plausible 1-3ms net and prerequisite for hardware texture admission."
   }
  ]
 }
