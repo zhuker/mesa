@@ -475,6 +475,23 @@ Vulkan-shaped; the decision-making is still Gallium-shaped.
 | descriptor arena growths | 2,079 | 1.4 |
 | scratch growths / framebuffer reallocations | 1 / 2 | — |
 
+**How the old capture's 24.7 ms actually decomposes** (perf + GPU-busy +
+METRICS + NCU, reports in `/tmp/cpvk-kernel-ladder.md`): the main thread
+blocks 36.5 s of the replay in episode drains, 13.1 s in peel checks — mostly
+legitimate completion waits, since the GPU shows 85–96% GR-active. But that
+busy is **occupied-and-starved**: SM issue is 3–7%, a quarter of the SMs are
+active, five warps in flight on 170 SMs. The frame is 1,789 launches at a
+median of 3.5 µs, close to serialized. The compiled fragment class alone is
+9.16 ms/frame (35.6% of kernel time), register-capped to 1–2 blocks/SM with
+17–33% theoretical occupancy, `long_scoreboard` the top stall. Ranked levers,
+from the measurement: (1) extend the register-cap tuner to sampler-variant
+fragment shaders — `cp_tune_before` explicitly skips them, and they are 87%
+of fragment time on this capture; (2) launch granularity — fuse or overlap
+the per-draw sub-20 µs kernel chains, which is *why* busy is not issuing;
+(3) input-load hoisting for fragment descriptor loads; (4) stage3+A-buffer
+fusion. The earlier "one fragment launch in ten costs 4.3x" lead was already
+withdrawn by this document and does not describe this capture.
+
 **The decision cost is not where the host-side gap lives.** 176 small struct
 compares and 36 key builds a frame do not explain a millisecond, so a planner
 built to remove them would be paying for the wrong thing. Two prior
@@ -507,9 +524,21 @@ What the corrected measurements support:
   switch). The breaks are real state changes — different shaders cannot share
   a batch that launches one VS and one FS kernel — so the old capture's 71%
   merge rate against Crossroads' 84% is the workload, not a key defect.
-- **Load/store elision** remains the one genuinely pass-shaped opportunity
-  that has not been measured, and the only one Vulkan states explicitly where
-  Gallium never did.
+- **Load/store elision, now measured** (`/tmp/cpvk-loadstore.md`, full-stream
+  analysis of both captures): not one `loadOp=LOAD` in either capture is a
+  real load — 100% are preceded by a full-area store or clear of the same
+  image. Elidable per frame: Crossroads 1.0 depth STORE (100% of them),
+  1.43 stencil LOADs + 2.15 stencil STOREs; old 1.02 depth STOREs. The
+  driver-cost-model correction to the raw numbers: color LOAD/STORE are free
+  here because rendering writes image memory in place, so only the
+  depth/stencil conversion kernels count — **~4.6 full-screen kernels/frame
+  on Crossroads, ~1.1 on old**, order 0.1–0.2 ms/frame. Implementation shape:
+  retention (skip the depth LOAD when the depthbuf already holds that
+  attachment) plus lazy store (defer the conversion until a consumer;
+  materialize before the depthbuf is reused by another attachment, drop on
+  full-area clear). Cross-submission pending-store state and consumer hooks
+  in every copy/sample path are the correctness risk; the depth tests and
+  both captures are the gate. Worth doing; not blindly.
 
 ### GFXReconstruct gate — external references only
 
@@ -875,13 +904,21 @@ Three lessons from this pass are worth keeping in front:
 
 In order:
 
-1. **Extend the record-time plan toward a launch plan.** The batch partition
+1. **Extend the register-cap tuner to sampler-variant fragment shaders.**
+   `cp_tune_before` skips them; they own 87% of fragment time on the old
+   capture, whose fragment class is 9.16 ms of a 24.7 ms frame at 17–33%
+   theoretical occupancy. The single biggest measured lever in the tree.
+2. **Depth/stencil load/store elision**, per the measured analysis above:
+   retention first, lazy store second, ~4.6 kernels/frame on Crossroads.
+   The per-scope plan totals (`planned_draws`/`planned_tris`) and the
+   wait-attribution counters are already in place to validate it.
+3. **Extend the record-time plan toward a launch plan.** The batch partition
    is now data at `vkEndCommandBuffer` (100% coverage on the old capture).
    The remaining steps toward a CUDA-graph backend are per-scope resource
    requirements in the same walk, then a captured launch sequence per plan.
    Attribution says better batching is not available — the breaks are real
    shader changes — so the launch-count lever is graphs, not merging.
-2. **Find out why `cpvk_sampler_two_bindings` never specialises.** It reports
+4. **Find out why `cpvk_sampler_two_bindings` never specialises.** It reports
    0 of 4 launches even with register tuning forced, while `texture` with one
    descriptor specialises and `gltfscenerendering` with two now does. Its
    sampler indices read back as zero for both bindings under
@@ -889,57 +926,57 @@ In order:
    row looks like, so the suspicion is `cp_host_ptr` over an arena this test's
    four descriptor sets land in. Until it is understood, that test guards the
    fallback rather than the specialised path.
-3. **Implement the four below-minimum limits rather than raising them.**
+5. **Implement the four below-minimum limits rather than raising them.**
    Multiple colour attachments, layered rendering and input attachments are
    what `maxColorAttachments`, `maxFragmentOutputAttachments`,
    `maxFramebufferLayers` and `maxDescriptorSetInputAttachments` currently
    admit are missing. Until they exist, Vulkan 1.1 is advertised
    non-conformantly and the validation layer says so on every test.
-4. **Implement stencil, or stop needing the exception.** Stencil test/write
+6. **Implement stencil, or stop needing the exception.** Stencil test/write
    state is ignored with a one-time message because refusing it ends the
    Crossroads replay. The honest end state is a stencil implementation with a
    differential test, after which the pipeline can be refused when it is not
    implemented.
-5. **Complete the external image evidence.** Replay the existing Crossroads and
+7. **Complete the external image evidence.** Replay the existing Crossroads and
    old-capture `all.json` plans with llvmpipe or NVIDIA and compare by the
    shared manifest. Until then the external result is the 9/10-image sentinel
    gate, not a full-frame correctness pass. Investigate the standing
    `gltfscenerendering` NVIDIA mismatch rather than changing its tolerance.
-6. **Make the older tests validation-clean.** The four newest are; most of the
+8. **Make the older tests validation-clean.** The four newest are; most of the
    rest set dynamic state their pipeline declares statically, and none of them
    transition image layouts. Fix the tests, then use the layer as a gate rather
    than as a survey.
-7. **Stress asynchronous completion and retirement further.** Queue retirement,
+9. **Stress asynchronous completion and retirement further.** Queue retirement,
    ordered query availability, per-query waits, device-loss latching and the
    256 MiB scratch bound now have tests or explicit bounds. Add longer
    draw/copy↔dispatch dependency and command-pool-reset stress. Preserve the
    single ordered renderer stream until a real multi-queue model exists.
-8. **Close the remaining replay gap.** Fresh controlled traces put native at
+10. **Close the remaining replay gap.** Fresh controlled traces put native at
    4.88 ms of kernels per Crossroads frame versus Gallium's 4.76 ms; the larger
    residual is host/launch scheduling, not an unexplained multi-millisecond
    kernel. Start with unprofiled GPU-busy data, then split compiled `main`
    kernels by grid/register class before changing synchronization. Re-measure
    the baseline build in the same session before believing a replay delta.
-9. **Extend caching only with complete keys.** Embedded/lazy NVRTC PTX is now
+11. **Extend caching only with complete keys.** Embedded/lazy NVRTC PTX is now
    persistent and validated. Application NIR→PTX or CUDA JIT caching must key
    the lowered resource ABI, compiler/toolkit version, SM, helper PTX and every
    option; never treat SPIR-V identity alone as sufficient.
-10. **Extend the attachment model deliberately.** Depth load/clear/store,
+12. **Extend the attachment model deliberately.** Depth load/clear/store,
    stencil clear and sample-zero depth resolve have tests or captures behind
    them. Add depth copy/sample comparisons, then averaging depth resolve and
    layered/multiview rendering, rather than treating transfer-layer support as
    draw-layer proof.
-11. **Finish robustness and the remaining query semantics** where workloads need
+13. **Finish robustness and the remaining query semantics** where workloads need
    them, rather than hiding unsupported behavior behind null allocations or
    invented counts. Occlusion and pipeline-statistics queries still report
    zero, and timestamps are still host approximations.
-12. **Broaden formats/blits/resolves one closed family at a time**, each with a
+14. **Broaden formats/blits/resolves one closed family at a time**, each with a
     validation-correct NVIDIA comparison. Storage-image atomics in particular
     are not implemented for compare-exchange and the format bit is deliberately
     not advertised.
-13. **Resolve the internal A-buffer colour-verifier mismatches** before
+15. **Resolve the internal A-buffer colour-verifier mismatches** before
     treating per-device external equality as a clean verification-mode pass.
-14. **Only then spend native-only render-pass information** on load/store
+16. **Only then spend native-only render-pass information** on load/store
     elision, tile residency or parallel command translation. The original
     motivation is still valid, but earlier pass-wide reordering and immutable
     sampler theories measured at zero. Require a baseline and one isolated
