@@ -378,6 +378,7 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
    if (!build_module(&k->fs_module, cp_fs_src, "cp_fs.cu", sm_major, sm_minor))
       goto fail;
    cuModuleGetFunction(&k->fs_interpolate, k->fs_module, "cp_fs_interpolate");
+   cuModuleGetFunction(&k->fs_compact, k->fs_module, "cp_fs_compact");
    cuModuleGetFunction(&k->fs_writeback, k->fs_module, "cp_fs_writeback");
    cuModuleGetFunction(&k->resolve_samples, k->fs_module, "cp_resolve_samples");
    cuModuleGetFunction(&k->blit_linear, k->fs_module, "cp_blit_linear");

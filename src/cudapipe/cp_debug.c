@@ -153,6 +153,10 @@ static const struct cp_flag_def flags[] = {
      F(no_fused_abuf_interp),
      "launch A-buffer interpolation separately instead of calling it from "
      "the generated fragment shader; performance experiment only" },
+   { "CUDAPIPE_NO_FUSED_INTERP", CP_FLAG_BOOL_VALUE,
+     F(no_fused_interp),
+     "restore the direct shade path's separate cp_fs_interpolate launch "
+     "instead of the slim compaction plus in-shader interpolation" },
    { "CUDAPIPE_FORCE_PASS_FALLBACK", CP_FLAG_BOOL_VALUE,
      F(force_pass_fallback),
      "make every blended episode take the classic re-execution fallback; the "

@@ -120,6 +120,7 @@ struct cp_debug {
    bool no_seg_merge;
    bool no_abuf_append;
    bool no_fused_abuf_interp;
+   bool no_fused_interp;
    bool force_pass_fallback;
    unsigned tile_census;
    unsigned tile_census_every;

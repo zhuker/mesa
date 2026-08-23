@@ -67,6 +67,8 @@ struct cp_kernels {
 
    /* Fragment stage kernels bracketing the compiled fragment shader */
    CUfunction fs_interpolate;
+   /* The slim slot allocator for the fused direct chain; see cp_fs_compact. */
+   CUfunction fs_compact;
    CUfunction fs_writeback;
 
    /* Vertex fetch kernel — gathers attributes on GPU */

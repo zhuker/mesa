@@ -610,6 +610,19 @@ struct cp_fs_interp_args {
    uint32_t num_seg_ranges;
    uint32_t row_base;
    uint64_t quad_list_base_dev;
+   /*
+    * Fused direct shading. When fused_direct is set, this argument block is
+    * the one handed to the generated fragment shader at
+    * CP_ARG_SLOT_FUSED_INTERP, and the launch that would have been
+    * cp_fs_interpolate was cp_fs_compact instead: it allocated the slots and
+    * wrote pixel_list, coverage and out_batch_rows, and recorded each quad's
+    * primitive here -- one uint32 per four slots -- because the primitive is
+    * the one input cp_fs_direct_lane cannot recover from the slot alone. The
+    * shader then interpolates its own slot before running its body.
+    */
+   uint64_t out_prim_list;    /* uint32 per slot quad: global primitive id */
+   uint32_t fused_direct;
+   uint32_t pad_fused;
 };
 
 struct cp_fs_writeback_args {

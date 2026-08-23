@@ -359,9 +359,58 @@ cp_resolve_seg_range(struct cp_fs_interp_args *args, uint32_t gprim)
    return true;
 }
 
+/*
+ * Fused direct shading, step 2 of 2: interpolate one compacted slot from
+ * inside the generated fragment shader.
+ *
+ * cp_fs_compact below has already allocated this slot, named its pixel and
+ * primitive, and written its sample mask into coverage; what is left is
+ * exactly the interpolation cp_fs_interpolate would have done for it --
+ * setup from the primitive's positions, then cp_interp_pixel_prepared into
+ * fs_in / frag_coord / front_face. A degenerate primitive zeroes the slot's
+ * coverage, which is the value the peel interpolator writes for one, and
+ * returns invalid so the shader body is skipped -- the writeback then drops
+ * the slot the same way it always did.
+ *
+ * A slot at or past max_pixels exists only when the compaction's atomic ran
+ * past its refusal, where the peel interpolator wrote nothing either; it is
+ * declined rather than read out of bounds.
+ */
+static __device__ int
+cp_fs_direct_lane(const struct cp_fs_interp_args *source, uint32_t slot)
+{
+   struct cp_fs_interp_args args = *source;
+   if (slot >= args.max_pixels)
+      return 0;
+
+   uint32_t pixel = ((const uint32_t *)(uintptr_t)args.pixel_list)[slot];
+   uint32_t gprim =
+      ((const uint32_t *)(uintptr_t)args.out_prim_list)[slot >> 2];
+   unsigned char *coverage = (unsigned char *)(uintptr_t)args.coverage;
+
+   /* Cannot fail for a slot the compaction allocated -- it resolved the same
+    * primitive before allocating -- but the refusal stays the same shape. */
+   bool ok = cp_resolve_seg_range(&args, gprim);
+   if (ok) {
+      uint32_t prim = gprim - args.abuf_prim_base;
+      struct cp_interp_tri tri;
+      ok = cp_interp_setup(&args, prim, &tri) &&
+           cp_interp_pixel_prepared(&args, prim, pixel, slot, &tri);
+   }
+   if (!ok && coverage)
+      coverage[slot] = 0;
+   return ok ? 1 : 0;
+}
+
 extern "C" __device__ int
 cp_abuf_interpolate_lane(const struct cp_fs_interp_args *source, uint32_t slot)
 {
+   /* One entry point serves both fused forms, because the same compiled
+    * shader binary is launched on the A-buffer path and the direct path and
+    * only the argument block says which chain this launch belongs to. */
+   if (source->fused_direct)
+      return cp_fs_direct_lane(source, slot);
+
    struct cp_fs_interp_args args = *source;
    uint32_t iq = slot >> 2;
    uint32_t lane = slot & 3u;
@@ -727,6 +776,114 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
       (void)quad_mask;
       (void)degenerate;
 #endif
+   }
+}
+
+/*
+ * Fused direct shading, step 1 of 2: compact covered pixels into slots
+ * without interpolating them.
+ *
+ * cp_fs_interpolate above does three jobs per screen quad: find the distinct
+ * triangles in the visibility block, allocate four-aligned shading slots for
+ * each, and interpolate every slot's varyings. When the interpolation is
+ * fused into the generated fragment shader (cp_fs_direct_lane, reached
+ * through CP_ARG_SLOT_FUSED_INTERP), only the first two remain a separate
+ * launch, because they end in an atomic allocation whose result the shader
+ * cannot reproduce. Everything written here is exactly what
+ * cp_fs_interpolate writes for the same slot, minus what the lane
+ * recomputes: the pixel, the sample mask (which the lane zeroes for a
+ * degenerate primitive, the case where the interpolator would have written
+ * zero), the batch row -- and the primitive per quad in out_prim_list, the
+ * one thing the lane cannot recover from the visibility buffer, because a
+ * helper lane's pixel does not name the triangle it borrows.
+ *
+ * The instrumented records (CP_ABUF_INSTRUMENT) are not produced here: the
+ * host declines the fused form entirely when the instrumentation is
+ * compiled in, so a verification run always sees the peel interpolator's.
+ */
+extern "C" __global__ void
+cp_fs_compact(struct cp_fs_interp_args args)
+{
+   uint32_t quad = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t quad_h = (args.height + 1) / 2;
+   if (quad >= args.quad_width * quad_h)
+      return;
+
+   uint32_t qx = (quad % args.quad_width) * 2;
+   uint32_t qy = (quad / args.quad_width) * 2;
+
+   const uint64_t *visbuf = (const uint64_t *)(uintptr_t)args.visbuf;
+   uint32_t samples = args.num_samples ? args.num_samples : 1u;
+   uint32_t plane = args.width * args.height;
+   uint32_t pix[4];
+   bool in_fb[4];
+
+   for (int i = 0; i < 4; i++) {
+      uint32_t x = qx + (i & 1);
+      uint32_t y = qy + (i >> 1);
+      in_fb[i] = x < args.width && y < args.height;
+      /* Clamp so an odd-sized framebuffer still shades a full quad. */
+      pix[i] = (y < args.height ? y : args.height - 1) * args.width +
+               (x < args.width ? x : args.width - 1);
+   }
+
+   /* One quad per distinct triangle, exactly as cp_fs_interpolate emits
+    * them; see the comment there for why a quad must not straddle two. */
+   uint32_t tris[CP_MAX_BLOCK_TRIS];
+   int ntris = 0;
+   for (int i = 0; i < 4 && ntris < CP_MAX_BLOCK_TRIS; i++) {
+      if (!in_fb[i])
+         continue;
+      for (uint32_t sm = 0; sm < samples && ntris < CP_MAX_BLOCK_TRIS; sm++) {
+         uint64_t entry = visbuf[(size_t)sm * plane + pix[i]];
+         if (entry == VISBUF_EMPTY)
+            continue;
+         /* Complemented so atomicMin favours the last primitive on ties. */
+         uint32_t t = ~(uint32_t)(entry & 0xFFFFFFFFu);
+         bool seen = false;
+         for (int k = 0; k < ntris; k++)
+            seen |= (tris[k] == t);
+         if (!seen)
+            tris[ntris++] = t;
+      }
+   }
+
+   if (ntris == 0)
+      return;
+
+   unsigned char *coverage = (unsigned char *)(uintptr_t)args.coverage;
+   uint32_t *pixel_list = (uint32_t *)(uintptr_t)args.pixel_list;
+   uint32_t *prim_list = (uint32_t *)(uintptr_t)args.out_prim_list;
+
+   for (int t = 0; t < ntris; t++) {
+      struct cp_fs_interp_args tri_args = args;
+      if (!cp_resolve_seg_range(&tri_args, tris[t]))
+         continue;
+      uint32_t prim = tris[t] - tri_args.abuf_prim_base;
+      uint32_t base = atomicAdd((unsigned int *)(uintptr_t)args.counter, 4u);
+      if (base + 4 > args.max_pixels)
+         return;
+
+      cp_write_batch_rows(&tri_args, prim, base);
+      prim_list[base >> 2] = tris[t];
+
+      for (int i = 0; i < 4; i++) {
+         /* Which of this pixel's samples this triangle actually won. Zero
+          * makes the lane a helper: shaded for its derivatives, dropped by
+          * the writeback. */
+         uint32_t mask = 0;
+         if (in_fb[i]) {
+            for (uint32_t sm = 0; sm < samples; sm++) {
+               uint64_t entry = visbuf[(size_t)sm * plane + pix[i]];
+               if (entry != VISBUF_EMPTY &&
+                   (~(uint32_t)(entry & 0xFFFFFFFFu)) == tris[t])
+                  mask |= 1u << sm;
+            }
+         }
+         pixel_list[base + i] = pix[i];
+         if (coverage)
+            coverage[base + i] = (unsigned char)mask;
+      }
    }
 }
 

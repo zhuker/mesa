@@ -2745,6 +2745,36 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       }
    }
 
+   /*
+    * Fused interpolation — the direct path's version of what the A-buffer
+    * shade already does. The generated shader interpolates its own slot
+    * (cp_fs_direct_lane, through CP_ARG_SLOT_FUSED_INTERP) and the launch
+    * below shrinks to cp_fs_compact: the visibility scan and the atomic slot
+    * allocation, which the shader cannot reproduce because it does not know
+    * its slot until it has one. That removes one launch per shade and keeps
+    * the fs_in round trip inside the shader's own kernel.
+    *
+    * Declined — reverting to the classic three-launch chain — by
+    * CUDAPIPE_NO_FUSED_INTERP, when the A-buffer instrumentation is compiled
+    * in (the verification reads the peel interpolator's debug records, which
+    * the compaction does not produce), or when the per-quad primitive array
+    * or the argument upload is refused.
+    */
+   CUdeviceptr fused_interp_dev = 0;
+   if (!cp_debug->no_fused_interp && screen->kernels.fs_compact &&
+       !cp_kernels_instrumented()) {
+      CUdeviceptr prim_list = cp_scratch_alloc_device(cp, max_pixels);
+      if (prim_list) {
+         interp.out_prim_list = prim_list;
+         interp.fused_direct = 1;
+         fused_interp_dev = cp_upload(cp, &interp, sizeof(interp));
+         if (!fused_interp_dev) {
+            interp.out_prim_list = 0;
+            interp.fused_direct = 0;
+         }
+      }
+   }
+
    void *interp_params[] = { &interp };
    {
       /* Scoped rather than pushed and popped, because the launch check below
@@ -2753,7 +2783,9 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       /* One thread per 2x2 quad, and the shader then runs four threads per
        * quad so it can difference across one. */
       unsigned num_quads = ((w + 1) / 2) * ((h + 1) / 2);
-      CUresult interp_err = cuLaunchKernel(screen->kernels.fs_interpolate,
+      CUfunction interp_kernel = fused_interp_dev
+         ? screen->kernels.fs_compact : screen->kernels.fs_interpolate;
+      CUresult interp_err = cuLaunchKernel(interp_kernel,
                                            (num_quads + 255) / 256, 1, 1, 256, 1, 1,
                                            0, cp->stream, interp_params, NULL);
       if (interp_err != CUDA_SUCCESS) {
@@ -2770,7 +2802,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
 
    if (!cp_fs_launch_shader(cp, state, fs, counter, fs_in, fs_in_stride, fs_out,
                             frag_coord, discard_mask, front_face, coverage,
-                            0, num_pixels, 0, batch_rows))
+                            fused_interp_dev, num_pixels, 0, batch_rows))
       return;
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
