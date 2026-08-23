@@ -337,6 +337,10 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
    cuModuleGetFunction(&k->rasterize_stage3_abuf, k->module,
                        "cp_rasterize_stage3_abuf");
 
+   cuModuleGetFunction(&k->clip_rast_fused, k->module, "cp_clip_rast_fused");
+   cuModuleGetFunction(&k->clip_rast_fused_abuf, k->module,
+                       "cp_clip_rast_fused_abuf");
+
    cuModuleGetFunction(&k->abuf_scan_block, k->module, "cp_abuf_scan_block");
    cuModuleGetFunction(&k->abuf_scan_add, k->module, "cp_abuf_scan_add");
    cuModuleGetFunction(&k->abuf_worklist, k->module, "cp_abuf_worklist");

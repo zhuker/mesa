@@ -28,6 +28,9 @@ struct cp_kernels {
    CUfunction rasterize_stage1_abuf;
    CUfunction rasterize_stage2_abuf;
    CUfunction rasterize_stage3_abuf;
+   /* Fused clip+stage1, both specialisations; stages 2 and 3 still follow. */
+   CUfunction clip_rast_fused;
+   CUfunction clip_rast_fused_abuf;
    CUfunction clip_triangles;
    CUfunction clear_visbuf;
    CUfunction peel_advance;

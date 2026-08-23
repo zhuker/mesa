@@ -141,3 +141,42 @@ stage3→abuf-build. Kernel-only work (cp_rasterize.cu + renderer launch
 sites), no codegen. Vertex-chain fusion (fetch+VS+clip, 4.0 ms class, 204
 launches/frame each) is the fallback if the queue handoff proves
 irreducible.
+
+## Iteration 3 — result: kept (commit pending review)
+
+**Kept design:** factor clipping and raster stage 1 into per-primitive device
+bodies and execute them in one 64-thread-block kernel. Clipping still allocates
+stable compact output IDs. Stage 1 still rasterizes small primitives in place
+and appends nontrivial work to the unchanged global queue. Stages 2 and 3 stay
+machine-wide queue consumers. `CUDAPIPE_NO_FUSED_RAST=1` restores the classic
+chain. Instrumented and non-adjacent segment-replay paths refuse fusion.
+
+**Measured result:** old median **23.421/23.672 ms** vs **24.070 ms** with the
+revert flag (−0.40–0.65 ms, −1.7–2.7%). Crossroads **7.480 ms**. The 600-frame
+sweep is **29.17 → 28.51 ms**; three interleaved glTF pairs showed the fused
+form consistently 0.08–0.09 ms faster, proving the first sequential pair's
+apparent regression was a machine-state shift. Final trace shows combined
+clip+s1 device work also fell: direct 32.369→31.105 µs and A-buffer
+13.511→12.342 µs, in addition to removing the 2.784/3.488-µs launch gap.
+
+**Failed sub-iteration — clip+s1+s2:** correctness passed, performance did
+not: **24.23 → 27.21/27.27 ms**, Crossroads 7.88. No spills. The fusion let
+producer warps consume their own medium-triangle work, serializing up to 32
+queued entries behind one warp. Classic stage 2 uses a machine-sized grid (up
+to 4096 warps) over the global queue. This is an architectural constraint, not
+a block-size tuning problem: later queue consumers can fuse only through a
+persistent/cooperative design that preserves machine-scaled consumer
+parallelism. The failed form was removed rather than left as dormant code.
+
+**Gates:** clean build/docs/diff; root independently reran 43/43 at `-j8`, both
+`FLAGS.md` checks, Gallium byte-integrity, and six reproducible hashes across
+five batching modes plus the revert flag. Child validation found both
+llvmpipe sentinel envelopes exact and flag-on/off stored frames limited to the
+known one-pixel atomic-order nondeterminism.
+
+**Interference:** stage2/3 queue formats are unchanged, so a future persistent
+rasterizer starts at the same interface. Stage3+A-buffer fusion, vertex-chain
+fusion, and multi-stream overlap remain unblocked. Vertex fusion must honor
+the new deferred-clip block when consuming clip itself. The ~5 KiB clipping
+stack and unrestricted multi-process CUDA OOM are separate robustness work;
+test `-j8` is stable.

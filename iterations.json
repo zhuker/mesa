@@ -23,6 +23,14 @@
    "old_median_ms": 24.16,
    "sweep_hot_ms": 29.81,
    "note": "-0.3ms median, sweep 30.41->29.81; 3 launches->2 per direct shade, fs_in round-trip intra-kernel; all gates incl. 6-mode hashes + both sentinel sets; enables writeback fusion; commit a9a952f1c09"
+  },
+  {
+   "id": 3,
+   "name": "fuse clipping into raster stage 1; preserve machine-wide queue consumers",
+   "verdict": "kept",
+   "old_median_ms": 23.55,
+   "sweep_hot_ms": 28.51,
+   "note": "clip+s1: 23.421/23.672 vs flag-off 24.070; sweep 29.17->28.51; Crossroads 7.480; 43/43, 6-mode hashes unchanged, both sentinels exact. Rejected clip+s1+s2: 27.21/27.27 because producer-local warps serialized queue consumption. Persistent/machine-scaled consumer required."
   }
  ]
 }

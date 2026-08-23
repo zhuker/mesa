@@ -220,13 +220,14 @@ clip_poly(float4 *dst, const float4 *src, int n, uint32_t slots, int plane)
 
 static __device__ __forceinline__ float4 *
 clip_emit(struct cp_clip_args *args, float4 *out, uint32_t slots,
-          uint32_t tri, uint32_t k)
+          uint32_t tri, uint32_t k, uint32_t *id_out)
 {
    /* Stable mode owns its fixed per-triangle range outright, so there is no counter to
     * contend on and no order to lose; see cp_clip_args::stable. */
    uint32_t o = args->stable
       ? tri * CP_CLIP_MAX_OUT + k
       : atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
+   *id_out = o;
    if (o >= args->max_triangles)
       return NULL;
 
@@ -264,20 +265,26 @@ clip_retire(struct cp_clip_args *args, float4 *out, uint32_t slots,
    }
 }
 
-extern "C" __global__ void
-cp_clip_triangles(struct cp_clip_args args)
+/*
+ * Clip one input triangle, with every side effect the standalone kernel has:
+ * the emitted output triangles, the compact counter, the active-ID worklist
+ * and the retired slots. The caller may also collect the emitted primitive
+ * IDs — that is the only addition, and it is what lets the fused kernel
+ * rasterize what it just clipped without re-deriving the ID assignment.
+ * Returns how many triangles were emitted (and recorded in ids[]).
+ */
+static __device__ int
+cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
 {
-   uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x;
-   if (tri >= args.num_triangles)
-      return;
-
-   uint32_t slots = args.num_slots;
+   uint32_t slots = args->num_slots;
    if (slots > CP_MAX_CLIP_SLOTS)
       slots = CP_MAX_CLIP_SLOTS;
 
-   const float4 *in = (const float4 *)(uintptr_t)args.vs_out;
-   float4 *out = (float4 *)(uintptr_t)args.out;
+   const float4 *in = (const float4 *)(uintptr_t)args->vs_out;
+   float4 *out = (float4 *)(uintptr_t)args->out;
    const float4 *v = in + (size_t)tri * 3 * slots;
+   uint32_t id;
+   int emitted = 0;
 
    /* The overwhelming majority of triangles are wholly inside, so check that
     * first and copy straight through — the polygon buffers below live in local
@@ -293,12 +300,16 @@ cp_clip_triangles(struct cp_clip_args args)
    }
 
    if (inside == 3) {
-      float4 *dst = clip_emit(&args, out, slots, tri, 0);
-      if (dst)
+      float4 *dst = clip_emit(args, out, slots, tri, 0, &id);
+      if (dst) {
          clip_copy(dst, v, 3 * slots);
-      if (args.stable && !args.active_ids)
-         clip_retire(&args, out, slots, tri, 1);
-      return;
+         if (ids)
+            ids[emitted] = id;
+         emitted++;
+      }
+      if (args->stable && !args->active_ids)
+         clip_retire(args, out, slots, tri, 1);
+      return emitted;
    }
 
    float4 poly_a[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
@@ -311,9 +322,9 @@ cp_clip_triangles(struct cp_clip_args args)
       float4 *dst = (p & 1) ? poly_b : poly_a;
       n = clip_poly(dst, src, n, slots, p);
       if (n < 3) {
-         if (args.stable && !args.active_ids)
-            clip_retire(&args, out, slots, tri, 0);
-         return;
+         if (args->stable && !args->active_ids)
+            clip_retire(args, out, slots, tri, 0);
+         return 0;
       }
       src = dst;
    }
@@ -321,16 +332,29 @@ cp_clip_triangles(struct cp_clip_args args)
    /* Fan-triangulate the clipped polygon, which keeps the original winding. */
    int k = 0;
    for (int i = 1; i + 1 < n; i++) {
-      float4 *dst = clip_emit(&args, out, slots, tri, (uint32_t)k);
+      float4 *dst = clip_emit(args, out, slots, tri, (uint32_t)k, &id);
       if (!dst)
          break;
       k++;
       clip_copy(dst, src, slots);
       clip_copy(dst + slots, src + (size_t)i * slots, slots);
       clip_copy(dst + 2 * slots, src + (size_t)(i + 1) * slots, slots);
+      if (ids)
+         ids[emitted] = id;
+      emitted++;
    }
-   if (args.stable && !args.active_ids)
-      clip_retire(&args, out, slots, tri, (uint32_t)k);
+   if (args->stable && !args->active_ids)
+      clip_retire(args, out, slots, tri, (uint32_t)k);
+   return emitted;
+}
+
+extern "C" __global__ void
+cp_clip_triangles(struct cp_clip_args args)
+{
+   uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x;
+   if (tri >= args.num_triangles)
+      return;
+   cp_clip_one(&args, tri, NULL);
 }
 
 /*
@@ -721,6 +745,98 @@ cp_broadcast_setup(struct tri_setup *s)
 }
 
 /*
+ * Classify one primitive, and rasterize it on the spot when it is small.
+ *
+ * This is stage 1's whole job, factored per primitive so the fused kernel can
+ * run it on the triangles it just clipped. Returns true when the primitive is
+ * nontrivial and belongs to stage 2; *qidx then holds the queue slot it was
+ * appended to when `append` asked for one, or CP_MAX_NONTRIVIAL when no
+ * append happened or the queue was full — a full queue also returns false,
+ * because stage 2 would never have seen the entry.
+ */
+template <bool ABUF>
+static __device__ __forceinline__ bool
+cp_rast_small_or_defer(struct cp_rasterize_args *args,
+                       struct cp_rast_queues *queues, uint32_t tri_id,
+                       bool append, uint32_t *qidx)
+{
+   *qidx = CP_MAX_NONTRIVIAL;
+
+   struct tri_setup s;
+   if (!setup_triangle(args, tri_id, &s))
+      return false;
+
+   int bb_w = s.ix_max - s.ix_min + 1;
+   int bb_h = s.iy_max - s.iy_min + 1;
+   int bb_area = bb_w * bb_h;
+
+   if (bb_area <= 0)
+      return false;
+
+   /*
+    * Too big for one thread: queue it for a warp. Points go the same way as
+    * triangles here — a sprite is clamped to 256 pixels a side, which is
+    * 65,536 pixels and no more affordable on one lane than a triangle of the
+    * same size. Leaving them in this stage is what left particlesystem
+    * rasterizing its fire one thread at a time.
+    */
+   if (bb_area > CP_SMALL_THRESHOLD) {
+      if (append) {
+         uint32_t *counter = (uint32_t *)(uintptr_t)queues->nontrivial_count;
+         uint32_t idx = atomicAdd(counter, 1u);
+         if (idx >= CP_MAX_NONTRIVIAL)
+            return false;
+         uint32_t *queue = (uint32_t *)(uintptr_t)queues->nontrivial;
+         queue[idx] = tri_id;
+         *qidx = idx;
+      }
+      return true;
+   }
+
+   if (s.is_point) {
+      rasterize_point<ABUF>(args, &s, tri_id, 0, 1);
+      return false;
+   }
+
+   /*
+    * Small triangles, one pixel at a time. The edge functions are evaluated
+    * from the vertices at every pixel rather than stepped by their gradients
+    * across the bounding box: stepping accumulates rounding, and then the two
+    * triangles either side of a shared edge no longer see exactly opposite
+    * values, which is the property the fill rule needs to keep coverage
+    * watertight. Stepping is worth restoring only with a form that stays
+    * exact, such as snapping the vertices to a subpixel grid and iterating in
+    * integers the way llvmpipe's lp_setup_tri.c does.
+    */
+   for (int py = s.iy_min; py <= s.iy_max; py++) {
+      for (int px = s.ix_min; px <= s.ix_max; px++) {
+         for (int sm = 0; sm < (int)args->num_samples; sm++) {
+            float ox, oy;
+            cp_sample_pos(args->num_samples, sm, &ox, &oy);
+            float cx = (float)px + ox, cy = (float)py + oy;
+
+            float e0 = edge_function(s.sx1, s.sy1, s.sx2, s.sy2, cx, cy);
+            float e1 = edge_function(s.sx2, s.sy2, s.sx0, s.sy0, cx, cy);
+            float e2 = edge_function(s.sx0, s.sy0, s.sx1, s.sy1, cx, cy);
+
+            if (edge_inside(e0, s.e0_top_left) &&
+                edge_inside(e1, s.e1_top_left) &&
+                edge_inside(e2, s.e2_top_left)) {
+               float w0 = e0 * s.inv_area;
+               float w1 = e1 * s.inv_area;
+               float w2 = 1.0f - w0 - w1;
+
+               emit_fragment<ABUF>(args, tri_id, px, py, sm,
+                                   w0 * s.ndc_z0 + w1 * s.ndc_z1 +
+                                   w2 * s.ndc_z2);
+            }
+         }
+      }
+   }
+   return false;
+}
+
+/*
  * Stage 1: 1 thread per triangle.
  * Small triangles are rasterized with incremental edge stepping.
  * Large triangles are pushed to the nontrivial queue for stage 2.
@@ -736,82 +852,13 @@ cp_rasterize_stage1_body(struct cp_rasterize_args args, struct cp_rast_queues qu
       return;
    uint32_t tri_id = cp_triangle_id(&args, work);
 
-   struct tri_setup s;
-   if (!setup_triangle(&args, tri_id, &s))
-      return;
-
-   int bb_w = s.ix_max - s.ix_min + 1;
-   int bb_h = s.iy_max - s.iy_min + 1;
-   int bb_area = bb_w * bb_h;
-
-   if (bb_area <= 0)
-      return;
-
-   /*
-    * Too big for one thread: queue it for a warp. Points go the same way as
-    * triangles here — a sprite is clamped to 256 pixels a side, which is
-    * 65,536 pixels and no more affordable on one lane than a triangle of the
-    * same size. Leaving them in this stage is what left particlesystem
-    * rasterizing its fire one thread at a time.
-    */
-   if (bb_area > CP_SMALL_THRESHOLD) {
-      /* A reusing pass already has this id in the queue from the first pass,
-       * at the same index and behind the same counter. The classification is
-       * still done — it is what decides this thread does not rasterize — but
-       * the append is not. */
-      if (queues.mode != CP_QUEUE_REUSE) {
-         uint32_t *counter = (uint32_t *)(uintptr_t)queues.nontrivial_count;
-         uint32_t idx = atomicAdd(counter, 1u);
-         if (idx < CP_MAX_NONTRIVIAL) {
-            uint32_t *queue = (uint32_t *)(uintptr_t)queues.nontrivial;
-            queue[idx] = tri_id;
-         }
-      }
-      return;
-   }
-
-   if (s.is_point) {
-      rasterize_point<ABUF>(&args, &s, tri_id, 0, 1);
-      return;
-   }
-
-   /*
-    * Small triangles, one pixel at a time. The edge functions are evaluated
-    * from the vertices at every pixel rather than stepped by their gradients
-    * across the bounding box: stepping accumulates rounding, and then the two
-    * triangles either side of a shared edge no longer see exactly opposite
-    * values, which is the property the fill rule needs to keep coverage
-    * watertight. Stepping is worth restoring only with a form that stays
-    * exact, such as snapping the vertices to a subpixel grid and iterating in
-    * integers the way llvmpipe's lp_setup_tri.c does.
-    */
-   uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
-
-   for (int py = s.iy_min; py <= s.iy_max; py++) {
-      for (int px = s.ix_min; px <= s.ix_max; px++) {
-         for (int sm = 0; sm < (int)args.num_samples; sm++) {
-            float ox, oy;
-            cp_sample_pos(args.num_samples, sm, &ox, &oy);
-            float cx = (float)px + ox, cy = (float)py + oy;
-
-            float e0 = edge_function(s.sx1, s.sy1, s.sx2, s.sy2, cx, cy);
-            float e1 = edge_function(s.sx2, s.sy2, s.sx0, s.sy0, cx, cy);
-            float e2 = edge_function(s.sx0, s.sy0, s.sx1, s.sy1, cx, cy);
-
-            if (edge_inside(e0, s.e0_top_left) &&
-                edge_inside(e1, s.e1_top_left) &&
-                edge_inside(e2, s.e2_top_left)) {
-               float w0 = e0 * s.inv_area;
-               float w1 = e1 * s.inv_area;
-               float w2 = 1.0f - w0 - w1;
-
-               emit_fragment<ABUF>(&args, tri_id, px, py, sm,
-                                   w0 * s.ndc_z0 + w1 * s.ndc_z1 +
-                                   w2 * s.ndc_z2);
-            }
-         }
-      }
-   }
+   /* A reusing pass already has this id in the queue from the first pass,
+    * at the same index and behind the same counter. The classification is
+    * still done — it is what decides this thread does not rasterize — but
+    * the append is not. */
+   uint32_t qidx;
+   cp_rast_small_or_defer<ABUF>(&args, &queues, tri_id,
+                                queues.mode != CP_QUEUE_REUSE, &qidx);
 }
 
 /*
@@ -958,6 +1005,54 @@ cp_rasterize_stage2_body(struct cp_rasterize_args args, struct cp_rast_queues qu
                                 (1.0f - w0 - w1) * s.ndc_z2);
          }
       }
+   }
+}
+
+/*
+ * Clipping and stage 1 in one launch: one thread per *input* triangle clips
+ * it (every side effect of cp_clip_triangles included — the emitted
+ * triangles, the compact counter, the active-ID worklist, the retired
+ * slots), then runs stage 1's classify-or-rasterize on the outputs it just
+ * emitted, whose IDs it knows without re-deriving the assignment. Small
+ * primitives are rasterized on the spot; nontrivial ones are appended to
+ * the queue exactly as classic stage 1 appends them, and stages 2 and 3
+ * follow as their own launches.
+ *
+ * Stage 2 is deliberately *not* folded in. A first version processed each
+ * warp's nontrivial primitives warp-locally, and the old capture's median
+ * went from 24.2 to 27.2 ms: classic stage 2 spreads the queue over up to
+ * 4,096 warps, while the warp-local form serialized up to 32 entries behind
+ * the one warp that classified them — consumer parallelism has to scale
+ * with the work, not with the producers, and only a launch whose grid is
+ * sized to the machine does that. The same argument keeps stage 3 separate,
+ * with its grid of 2,048 blocks.
+ *
+ * Launched wherever the classic sequence was clip then stage 1 back to
+ * back, which is any first rasterization of a draw (CP_QUEUE_FILL or
+ * CP_QUEUE_BUILD); a reusing pass never clips. CUDAPIPE_NO_FUSED_RAST
+ * restores the standalone pair.
+ */
+template <bool ABUF>
+static __device__ __forceinline__ void
+cp_clip_rast_fused_body(struct cp_clip_args cargs,
+                        struct cp_rasterize_args args,
+                        struct cp_rast_queues queues)
+{
+   if (args.path_flag &&
+       (!!*(const volatile uint32_t *)(uintptr_t)args.path_flag) !=
+          !!args.path_value)
+      return;
+
+   uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x;
+   if (tri >= cargs.num_triangles)
+      return;
+
+   uint32_t emitted[CP_CLIP_MAX_OUT];
+   int n = cp_clip_one(&cargs, tri, emitted);
+   for (int i = 0; i < n; i++) {
+      uint32_t qi;
+      cp_rast_small_or_defer<ABUF>(&args, &queues, emitted[i],
+                                   queues.mode != CP_QUEUE_REUSE, &qi);
    }
 }
 
@@ -1203,6 +1298,28 @@ cp_rasterize_stage3_abuf(struct cp_rasterize_args args,
                          struct cp_rast_queues queues)
 {
    cp_rasterize_stage3_body<true>(args, queues);
+}
+
+/*
+ * The fused clip+stage1 forms, in the same two specialisations. The host
+ * launches one of these with one thread per input triangle wherever the
+ * classic sequence was clip then stage 1 back to back; stages 2 and 3 follow
+ * as their own launches either way. CUDAPIPE_NO_FUSED_RAST restores the
+ * standalone pair.
+ */
+extern "C" __global__ void
+cp_clip_rast_fused(struct cp_clip_args cargs, struct cp_rasterize_args args,
+                   struct cp_rast_queues queues)
+{
+   cp_clip_rast_fused_body<false>(cargs, args, queues);
+}
+
+extern "C" __global__ void
+cp_clip_rast_fused_abuf(struct cp_clip_args cargs,
+                        struct cp_rasterize_args args,
+                        struct cp_rast_queues queues)
+{
+   cp_clip_rast_fused_body<true>(cargs, args, queues);
 }
 
 /*

@@ -3349,6 +3349,47 @@ cp_abuf_verify_colors(struct cp_abuf *ab, unsigned w, unsigned h,
 }
 
 /*
+ * Launch the standalone clip kernel from a deferred argument block. The
+ * fallback for any path that needs the clipped buffer but cannot (or must
+ * not) launch the fused clip+rasterize kernel; identical to the immediate
+ * launch the non-fused path performs. Returns whether the launch succeeded —
+ * under memory pressure cuLaunchKernel can refuse (the clip kernel's local
+ * memory pool is real), and the caller then has to fail the way the classic
+ * path fails: rasterize unclipped rather than read a buffer nothing wrote.
+ */
+static bool
+cp_flush_pending_clip(struct cp_context *cp, struct cp_device *screen,
+                      struct cp_clip_args *clip, bool *pending)
+{
+   if (!*pending)
+      return true;
+   *pending = false;
+   void *params[] = { clip };
+   CUresult err = cuLaunchKernel(screen->kernels.clip_triangles,
+                                 (clip->num_triangles + 63) / 64, 1, 1,
+                                 64, 1, 1, 0, cp->stream, params, NULL);
+   if (err != CUDA_SUCCESS)
+      fprintf(stderr, "cudapipe: clip launch failed (%d)\n", err);
+   return err == CUDA_SUCCESS;
+}
+
+/*
+ * Undo the optimistic commit a deferred clip made to a rasterize-argument
+ * block, so a draw whose clip launch failed rasterizes the unclipped
+ * geometry — exactly the state the classic path's failure branch leaves.
+ */
+static void
+cp_rast_args_unclip(struct cp_rasterize_args *ra, uint64_t positions,
+                    uint32_t num_triangles, uint32_t rect_prim_shift)
+{
+   ra->positions = positions;
+   ra->tri_count = 0;
+   ra->active_ids = 0;
+   ra->num_triangles = num_triangles;
+   ra->rect_prim_shift = rect_prim_shift;
+}
+
+/*
  * Run one draw, or one batch of them, through the whole pipeline.
  *
  * `batch_draws` is how many merged draws this launch stands for and
@@ -3470,6 +3511,24 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    /* Near-plane clipping can split triangles, so the rasterizer grid is sized
     * for the post-clip worst case while the count itself lives on the GPU. */
    unsigned rast_num_triangles = total_triangles;
+
+   /*
+    * A clip launch waiting to be fused into the first rasterizer launch.
+    * When the fused clip+stage1 kernel is usable, the clip block below
+    * records its arguments here instead of launching, and whichever
+    * chain site consumes the geometry first launches the fused kernel. Any
+    * path that needs the clipped buffer without launching a chain flushes
+    * it as the classic standalone kernel instead.
+    */
+   struct cp_clip_args pending_clip = {0};
+   bool clip_pending = false;
+   /* The state the deferred clip's optimistic commit replaced, kept so a
+    * failed launch can put it back (see cp_rast_args_unclip). */
+   uint64_t preclip_positions = 0;
+   uint32_t preclip_num_triangles = 0;
+   unsigned preclip_rast_num = 0;
+   uint32_t preclip_rect_prim_shift = 0;
+   unsigned preclip_fs_prim_shift = 0;
 
    /* Resolved when the framebuffer was bound; NULL for a depth-only pass. */
    void *color_data = fb->color;
@@ -4232,11 +4291,31 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                      .max_triangles = max_clipped,
                      .stable = stable_clip,
                   };
-                  void *clip_params[] = { &clip };
-                  CUresult clip_err = cuLaunchKernel(
-                     screen->kernels.clip_triangles,
-                     (num_triangles + 63) / 64, 1, 1, 64, 1, 1,
-                     0, cp->stream, clip_params, NULL);
+                  /*
+                   * Fused path: hold the launch, and let the first
+                   * rasterizer chain below run clip+stage1 as one kernel.
+                   * The argument block is complete here — only the
+                   * launch moves. Instrumented builds keep the classic
+                   * sequence so every debug census sees the kernels it was
+                   * written against.
+                   */
+                  CUresult clip_err = CUDA_SUCCESS;
+                  if (screen->kernels.clip_rast_fused &&
+                      !cp_debug->no_fused_rast && !cp_kernels_instrumented()) {
+                     pending_clip = clip;
+                     clip_pending = true;
+                     preclip_positions = rast_args.positions;
+                     preclip_num_triangles = rast_args.num_triangles;
+                     preclip_rast_num = rast_num_triangles;
+                     preclip_rect_prim_shift = rast_args.rect_prim_shift;
+                     preclip_fs_prim_shift = cp->fs_batch.prim_shift;
+                  } else {
+                     void *clip_params[] = { &clip };
+                     clip_err = cuLaunchKernel(
+                        screen->kernels.clip_triangles,
+                        (num_triangles + 63) / 64, 1, 1, 64, 1, 1,
+                        0, cp->stream, clip_params, NULL);
+                  }
 
                   if (clip_err == CUDA_SUCCESS) {
                      vs_output_buf = clipped;
@@ -4582,6 +4661,10 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    if (cp->pass.appending && !cp->pass.opaque &&
        (!abuf || ab->grow_to || !ab->frags || !ab->composite ||
         cp->pass.nsegs >= CP_PASS_MAX_SEGS)) {
+      /* The re-execution repeats the vertex work, so nothing will read this
+       * clipped buffer — but flush anyway: one rare launch buys the
+       * invariant that a deferred clip always runs. */
+      cp_flush_pending_clip(cp, screen, &pending_clip, &clip_pending);
       cp->pass.append_failed = true;
       return;
    }
@@ -4634,13 +4717,40 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       aa.abuf_mode = CP_ABUF_COUNT;
       rast_queues.mode = CP_QUEUE_FILL;
       cp_abuf_mark(ab, ab->ev[0], cp->stream);
-      void *ap[] = { &aa, &rast_queues };
       /* The _abuf specialisations: same rasterizer, compiled with the count
        * and fill branch live. Every other launch in this file uses the plain
        * ones, which have no A-buffer code in them at all. */
-      CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
-                     (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
-                     0, cp->stream, ap, NULL);
+      bool fused_count = false;
+      if (clip_pending) {
+         /* Clip and stage 1 in one launch: a thread per input triangle, so
+          * the grid is the clip kernel's, an eighth of the worst-case slot
+          * count the classic stage 1 is sized for — and the clip kernel's
+          * 64-thread blocks, which measured 0.3 ms/frame better than 256 on
+          * the old capture (more blocks spread the same small draw over
+          * more SMs). Stages 2 and 3 follow unchanged — see the fused
+          * kernel's comment for why they keep their own grids. */
+         void *fp[] = { &pending_clip, &aa, &rast_queues };
+         fused_count = cuLaunchKernel(screen->kernels.clip_rast_fused_abuf,
+                          (pending_clip.num_triangles + 63) / 64, 1, 1,
+                          64, 1, 1, 0, cp->stream, fp, NULL) == CUDA_SUCCESS;
+         if (fused_count) {
+            clip_pending = false;
+         } else if (!cp_flush_pending_clip(cp, screen, &pending_clip,
+                                           &clip_pending)) {
+            cp_rast_args_unclip(&rast_args, preclip_positions,
+                                preclip_num_triangles, preclip_rect_prim_shift);
+            vs_output_buf = preclip_positions;
+            rast_num_triangles = preclip_rast_num;
+            cp->fs_batch.prim_shift = preclip_fs_prim_shift;
+            cp_rast_args_unclip(&aa, preclip_positions,
+                                preclip_num_triangles, preclip_rect_prim_shift);
+         }
+      }
+      void *ap[] = { &aa, &rast_queues };
+      if (!fused_count)
+         CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
+                        (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
+                        0, cp->stream, ap, NULL);
       CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
                      CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                      256, 1, 1, 0, cp->stream, ap, NULL);
@@ -5016,6 +5126,16 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * classic-overflow paths from one device-resident predicate. */
       if (cp->pass.appending && cp->pass.opaque &&
           cp_debug->tiled_opaque) {
+         /* The segment replay reads the clipped buffer without another clip
+          * launch, so a deferred clip must run now, classically. */
+         if (!cp_flush_pending_clip(cp, screen, &pending_clip,
+                                    &clip_pending)) {
+            cp_rast_args_unclip(&rast_args, preclip_positions,
+                                preclip_num_triangles, preclip_rect_prim_shift);
+            vs_output_buf = preclip_positions;
+            rast_num_triangles = preclip_rast_num;
+            cp->fs_batch.prim_shift = preclip_fs_prim_shift;
+         }
          rast_queues.mode = CP_QUEUE_FILL;
          cp_pass_record_segment(cp, &rast_args, &rast_queues,
                                 rast_num_triangles, num_triangles, batch);
@@ -5039,10 +5159,34 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 
       /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
       cp_nvtx_push("raster");
+      CUresult rast_err = CUDA_SUCCESS;
+      bool fused_rast = false;
+      if (clip_pending && rast_queues.mode != CP_QUEUE_REUSE) {
+         /* Clip and stage 1 fused; only pass 0 can get here, since the
+          * deferred clip is consumed by the first chain and a reusing pass
+          * never clips. The queue appends are classic stage 1's, so stages
+          * 2 and 3 below read exactly what they always read. */
+         void *fp[] = { &pending_clip, &rast_args, &rast_queues };
+         rast_err = cuLaunchKernel(screen->kernels.clip_rast_fused,
+            (pending_clip.num_triangles + 63) / 64, 1, 1, 64, 1, 1,
+            0, cp->stream, fp, NULL);
+         fused_rast = rast_err == CUDA_SUCCESS;
+         if (fused_rast) {
+            clip_pending = false;
+         } else if (!cp_flush_pending_clip(cp, screen, &pending_clip,
+                                           &clip_pending)) {
+            cp_rast_args_unclip(&rast_args, preclip_positions,
+                                preclip_num_triangles, preclip_rect_prim_shift);
+            vs_output_buf = preclip_positions;
+            rast_num_triangles = preclip_rast_num;
+            cp->fs_batch.prim_shift = preclip_fs_prim_shift;
+         }
+      }
       void *s1_params[] = { &rast_args, &rast_queues };
-      CUresult rast_err = cuLaunchKernel(screen->kernels.rasterize_stage1,
-         (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
-         0, cp->stream, s1_params, NULL);
+      if (!fused_rast)
+         rast_err = cuLaunchKernel(screen->kernels.rasterize_stage1,
+            (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
+            0, cp->stream, s1_params, NULL);
 
       /*
        * Both later stages stride their queue, so any grid is correct and the
