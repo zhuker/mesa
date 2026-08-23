@@ -43,10 +43,18 @@
   {
    "id": 5,
    "name": "resource-isolate classic and fused fragment binaries; A/B the whole chain",
+   "verdict": "reverted",
+   "old_median_ms": 24.747,
+   "sweep_hot_ms": null,
+   "note": "resource isolation worked (cpvk_tri 190->18 regs) but 64/65 old-capture textured FS kept identical 203/236 regs; sampler graph dominates. Classic chain 24.764/24.730 vs fused 23.652/23.531 (+1.156ms). All source reverted. Hardware texture execution is required before retry."
+  },
+  {
+   "id": 6,
+   "name": "hardware texture-object execution for admitted 2D descriptors",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "current FS 8.157ms/frame; helper-linked null path still carries registers. Build truly bare FS beside fused helper binary; compare separate-interp+bare-FS against compact+fused-FS. Plausible 1-3ms net and prerequisite for hardware texture admission."
+   "note": "remove cp_sampler.cu from compatible textured FS executions using direct NVVM/PTX texture ops and cached per-(view,sampler,mip) CUtexObjects; software fallback for unsupported; measure actual capture sample coverage first"
   }
  ]
 }

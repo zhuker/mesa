@@ -302,3 +302,36 @@ PITCH2D ceiling: 0.8–2.5 ms; full array/mip/BC/cube/3D path: 2–5 ms. CUDA
 bilinear uses 8 fractional bits, so validation is against Vulkan tolerances and
 external reference sentinels, not native byte identity. Full analysis:
 `/tmp/perf16/fs-design.md`.
+
+## Iteration 5 — result: rejected and fully reverted
+
+The dual-execution prototype proved honest resource isolation: `cpvk_tri` bare
+FS dropped **190→18 registers** and 1→6 blocks/SM. It also proved the capture's
+bottleneck is elsewhere. For **64 of 65** old-capture FS shaders, classic and
+fused had identical uncapped facts: 203 or 236 registers, identical spills,
+one block/SM. Their shared software-sampler graph fixes the allocation.
+
+Interleaved full replays: fused **23.652/23.531 ms**, bare classic
+**24.764/24.730 ms** — classic lost **1.156 ms (+4.9%)**, almost exactly the
+restored interpolator cost. Specialisation stayed 28.8%, so this is not a
+cache/admission miss. The prototype was reverted; full keep gates correctly
+stopped. Patch: `/tmp/perf16/iter5-rejected.patch`.
+
+**Architectural consequence:** capability-tagged execution objects remain the
+right ownership model, but a profitable split must first remove `cp_sampler.cu`
+from textured binaries while retaining fused interpolation. Module isolation
+then becomes the admission mechanism for hardware-texture, software-texture,
+and future writeback choices, each with independent resources/tuning.
+
+## Iteration 6 — (next) admitted CUDA hardware-texture execution
+
+For compatible 2D sampled-image/sampler pairs, cache CUDA PITCH2D texture
+objects per (view, sampler, mip), store an owned handle-array pointer in the
+descriptor ABI's existing tail space, and emit NVVM/PTX texture operations in
+the generated shader so `cp_sampler.cu` is absent from that execution. Preserve
+software sampling as the complete fallback for cube, 3D, BC, packed formats,
+misalignment, unsupported addressing/LOD, separate-descriptor combinations,
+and any precision mismatch. Measure actual *sample execution* coverage before
+enabling; descriptor-update coverage alone is not enough. Hardware linear
+weights use Vulkan-compatible 8 fractional bits, but external reference tests
+and Vulkan tolerances—not native byte identity—are the correctness authority.
