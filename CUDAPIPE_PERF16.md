@@ -180,3 +180,13 @@ fusion, and multi-stream overlap remain unblocked. Vertex fusion must honor
 the new deferred-clip block when consuming clip itself. The ~5 KiB clipping
 stack and unrestricted multi-process CUDA OOM are separate robustness work;
 test `-j8` is stable.
+
+## Iteration 4 — (in flight) fuse vertex fetch into generated VS
+
+`cp_vertex_fetch` (1.52 ms/frame, ~204 launches/frame) feeds generated vertex
+`main` (0.75 ms/frame, another ~204 launches) through a scratch input buffer.
+The clean design is the fragment-fusion pattern: link a per-lane vertex-fetch
+helper into the shader and pass an immutable fetch argument block, so formats,
+strides, divisors, batch rows, indexed/non-indexed IDs, and the explicit shader
+ABI stay owned in one implementation. Keep the old path behind a registry flag
+and decline fusion for unsupported/instrumented cases.
