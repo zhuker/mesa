@@ -439,6 +439,32 @@ struct cp_context {
       uint64_t shaders_unmatchable;  /* samples textures, matched none at all */
    } spec;
 
+   /*
+    * What deciding one draw at a time costs, reported under
+    * CUDAPIPE_PLAN_STATS.
+    *
+    * Batches and pass episodes are reconstructed by watching draws go past --
+    * build a key, compare it with the previous draw's, merge or flush -- which
+    * is the shape a Gallium driver needs because it only ever sees one draw.
+    * The native front end has the whole recorded pass in an array before it
+    * executes anything. Whether planning it instead of reacting to it is worth
+    * anything is a question about host time, so count the host work first.
+    */
+   struct {
+      uint64_t key_builds;      /* batch keys built */
+      uint64_t merge_tests;     /* pairwise "can this join the last one?" */
+      uint64_t merges;          /* of those, joined at the first attempt */
+      uint64_t key_breaks;      /* of those, forced a flush first */
+      uint64_t direct_draws;    /* executed alone, no batch */
+      uint64_t flushes;         /* batches submitted */
+      uint64_t pass_finishes;      /* episodes with segments, closed */
+      uint64_t pass_finish_calls;  /* attempts, most of them empty */
+      uint64_t scratch_grows;   /* scratch arena reallocations */
+      uint64_t arena_grows;     /* descriptor arena reallocations */
+      uint64_t fb_reallocs;     /* framebuffer-sized buffer reallocations */
+      uint64_t scopes;          /* render scopes begun */
+   } plan;
+
    /* GPU-resident pipeline state — managed memory, written by CPU on state
     * changes, read by GPU kernels during draws. */
    /* Device-only arena for per-draw scratch buffers. CPU never touches this

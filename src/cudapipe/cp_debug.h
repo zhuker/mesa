@@ -90,6 +90,7 @@ struct cp_debug {
    bool debug_draw;
    bool debug_tex;
    bool spec_stats;
+   bool plan_stats;
    bool debug_vfetch;
    bool debug_work;
    bool debug_discard;

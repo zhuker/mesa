@@ -80,6 +80,10 @@ static const struct cp_flag_def flags[] = {
      "trace every draw: geometry, attachments, and why a draw was skipped" },
    { "CUDAPIPE_DEBUG_TEX", CP_FLAG_BOOL_PRESENCE, F(debug_tex),
      "trace sampler and texture-handle setup" },
+   { "CUDAPIPE_PLAN_STATS", CP_FLAG_BOOL_VALUE, F(plan_stats),
+     "report at teardown what deciding one draw at a time costs: batch keys "
+     "built, pairwise merge tests, flushes, pass episodes closed and every "
+     "reactive reallocation, with per-scope averages" },
    { "CUDAPIPE_SPEC_STATS", CP_FLAG_BOOL_VALUE, F(spec_stats),
      "report at teardown how many fragment launches used a sampler-specialised "
      "kernel, and which shaders sample textures the specialiser could not "

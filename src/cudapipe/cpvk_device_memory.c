@@ -162,6 +162,10 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (retired)
       cp_scratch_reset(&dev->renderer);
    dev->renderer.num_host_maps = 0;
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++)
+      dev->renderer.plan.arena_grows +=
+         container_of(submit->command_buffers[i],
+                      struct cpvk_cmd_buffer, vk)->arena_grows;
 
    for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
       struct cpvk_cmd_buffer *cmd =

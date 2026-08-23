@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-61 switches.
+62 switches.
 
 ## Tracing
 
@@ -24,6 +24,7 @@ deliberately: someone's script sets one of these to 0 today.
 |---|---|---|---|---|
 | `CUDAPIPE_DEBUG_DRAW` | bool (presence) | `off` | — | trace every draw: geometry, attachments, and why a draw was skipped |
 | `CUDAPIPE_DEBUG_TEX` | bool (presence) | `off` | — | trace sampler and texture-handle setup |
+| `CUDAPIPE_PLAN_STATS` | bool (value) | `off` | — | report at teardown what deciding one draw at a time costs: batch keys built, pairwise merge tests, flushes, pass episodes closed and every reactive reallocation, with per-scope averages |
 | `CUDAPIPE_SPEC_STATS` | bool (value) | `off` | — | report at teardown how many fragment launches used a sampler-specialised kernel, and which shaders sample textures the specialiser could not match; a silent drop to zero is a performance regression with no error |
 | `CUDAPIPE_DEBUG_VFETCH` | bool (presence) | `off` | — | dump what the GPU vertex fetch gathered; syncs, so debug-only |
 | `CUDAPIPE_DEBUG_WORK` | bool (presence) | `off` | — | report how much of the shading launch did work; syncs |

@@ -505,6 +505,7 @@ struct cpvk_cmd_buffer {
     * recorded draw at the live set means they all see whatever the last bind
     * left behind, which is one object drawn twenty times.
     */
+   unsigned arena_grows;
    CUdeviceptr desc_arena;
    struct cpvk_descriptor *desc_arena_host;
    size_t desc_arena_size, desc_arena_used;

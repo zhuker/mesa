@@ -863,6 +863,10 @@ cpvk_arena_append(struct cpvk_cmd_buffer *cmd, const void *src, size_t bytes,
          return false;
       }
 
+      /* Counted for CUDAPIPE_PLAN_STATS: a pass whose descriptor volume was
+       * known in advance would size this once. */
+      cmd->arena_grows++;
+
       /* The old arena is still referenced by draws already recorded, so keep
        * both halves until reset and upload them together at submit. */
       if (cmd->desc_arena &&
@@ -2437,7 +2441,12 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
     * what that flag is for.
     */
    bool batch_blended = false;
+   cp->plan.merge_tests++;
    bool batch_ok = cpvk_batch_can_join(dev, scope, d, &batch_blended);
+   if (batch_ok)
+      cp->plan.merges++;
+   else
+      cp->plan.key_breaks++;
    if (!batch_ok) {
       /*
        * A batch-key break is a per-segment change, but only while the state
@@ -2489,12 +2498,14 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
                       MAX2(d->call.instance_count, 1u);
       if (!cp->batch.pending) {
          struct cp_batch_key key;
+         cp->plan.key_builds++;
          cpvk_build_batch_key(dev, d, &packet, &key, batch_blended);
          cp_batch_begin_packet(cp, &packet, &key, batch_blended);
       }
       cp_batch_record_packet(cp, &packet, tris);
       return;
    }
+   cp->plan.direct_draws++;
 
    struct cp_draw_batch direct = {
       .state = packet.state,

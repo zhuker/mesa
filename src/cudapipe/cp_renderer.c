@@ -139,6 +139,8 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
 
    cp->scratch.peak = MAX2(cp->scratch.peak, end);
 
+   cp->plan.scratch_grows++;
+
    /* Arena full — grow it in place by allocating a new larger chunk.
     * This replaces the current arena (the old one stays alive until flush
     * since the GPU may still be reading it). */
@@ -425,6 +427,36 @@ cp_scratch_destroy(struct cp_context *cp)
  * stopped firing is a slower sweep, which is indistinguishable from a dozen
  * other causes.
  */
+/*
+ * What reconstructing batches and episodes from a stream of draws cost, when
+ * the whole pass was in an array the entire time.
+ */
+static void
+cp_plan_report(struct cp_context *cp)
+{
+   if (!cp_debug->plan_stats || !cp->plan.merge_tests)
+      return;
+
+   double scopes = (double)MAX2(cp->plan.scopes, 1u);
+   fprintf(stderr,
+           "cudapipe: per-draw planning: %" PRIu64 " keys built, %" PRIu64
+           " merge tests, %" PRIu64 " merged first try (%.1f%%), %" PRIu64
+           " forced a flush first, %" PRIu64 " batches executed, %" PRIu64
+           " episodes closed of %" PRIu64 " attempts, over %" PRIu64
+           " render scopes\n",
+           cp->plan.key_builds, cp->plan.merge_tests, cp->plan.merges,
+           100.0 * (double)cp->plan.merges / (double)cp->plan.merge_tests,
+           cp->plan.key_breaks, cp->plan.flushes, cp->plan.pass_finishes,
+           cp->plan.pass_finish_calls, cp->plan.scopes);
+   fprintf(stderr,
+           "cudapipe: per scope: %.1f keys, %.1f merge tests, %.1f batches; "
+           "reactive reallocations: %" PRIu64 " scratch, %" PRIu64
+           " descriptor arena, %" PRIu64 " framebuffer\n",
+           cp->plan.key_builds / scopes, cp->plan.merge_tests / scopes,
+           cp->plan.flushes / scopes, cp->plan.scratch_grows,
+           cp->plan.arena_grows, cp->plan.fb_reallocs);
+}
+
 static void
 cp_spec_report(struct cp_context *cp)
 {
@@ -450,6 +482,7 @@ cp_context_cleanup(struct cp_context *cp)
    cuCtxSetCurrent(cp->screen->cuda_ctx);
    cuCtxSynchronize();
    cp_spec_report(cp);
+   cp_plan_report(cp);
    cp_abuf_cleanup(cp->abuf);
    free(cp->abuf);
    cp->abuf = NULL;
@@ -3202,6 +3235,7 @@ cp_abuf_verify_colors(struct cp_abuf *ab, unsigned w, unsigned h,
 void
 cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 {
+   cp->plan.flushes++;
    unsigned batch_draws = batch->ndraws;
    const struct cp_draw_call *info = &batch->info;
    unsigned drawid_offset = batch->drawid_offset;
@@ -6358,9 +6392,12 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
 void
 cp_pass_finish(struct cp_context *cp)
 {
+   cp->plan.pass_finish_calls++;
    struct cp_device *screen = cp->screen;
    struct cp_abuf *ab = cp->abuf;
    unsigned nsegs = cp->pass.nsegs;
+   if (nsegs)
+      cp->plan.pass_finishes++;
 
    if (getenv("CPVK_DEBUG_EPISODE") && nsegs)
       fprintf(stderr, "episode: nsegs=%u opaque=%d\n", nsegs,
@@ -7076,6 +7113,7 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
 void
 cp_render_scope_begin(struct cp_context *cp, const struct cp_render_scope *scope)
 {
+   cp->plan.scopes++;
    cp_batch_flush_why(cp, "framebuffer");
    if (getenv("CPVK_DEBUG_EPISODE"))
       fprintf(stderr, "episode-cut: begin_render\n");
@@ -7148,6 +7186,7 @@ cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
    if (px > 0 && (px > cp->fb_cap_px || px_samples > cp->fb_cap_px_samples)) {
       /* Grow both to the new high-water mark, so a later pass that is wider
        * but has fewer samples does not come back here. */
+      cp->plan.fb_reallocs++;
       cp->fb_cap_px = MAX2(cp->fb_cap_px, px);
       cp->fb_cap_px_samples = MAX2(cp->fb_cap_px_samples, px_samples);
 
