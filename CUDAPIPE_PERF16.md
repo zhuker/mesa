@@ -190,3 +190,24 @@ helper into the shader and pass an immutable fetch argument block, so formats,
 strides, divisors, batch rows, indexed/non-indexed IDs, and the explicit shader
 ABI stay owned in one implementation. Keep the old path behind a registry flag
 and decline fusion for unsupported/instrumented cases.
+
+## Raster stage2+3 architecture note (analysis after iteration 3)
+
+The rejected producer-local fusion does not rule out stage2+3 fusion; it rules
+out binding consumer parallelism to producer warps. A clean candidate is an
+ordinary **persistent 2048×64 kernel** with two dynamic-claim stage-2 warps per
+CTA, a device-scope release/acquire completion boundary, then one dynamic-claim
+stage-3 CTA consumer. Reuse the current 256-byte counter allocation by adding
+`nt_next`, `nt_done`, and `tile_next`; keep both existing global queues. This
+preserves up to 4096 logical stage-2 warps, 2048 stage-3 CTAs, queue BUILD/REUSE,
+and the multi-stream A-buffer architecture. Cooperative launch is a useful
+reference but a poor default because full-residency grids can interfere with
+the measured 8-stream episode win; dynamic parallelism is rejected.
+
+The final trace contains 113,443 stage2/stage3 pairs per 15-second window. One
+launch and ~2.2 µs median gap per chain offers only **~0.3–0.6 ms/frame** gross;
+per-item scheduler atomics, register growth, or >2.2 µs extra work erase it.
+The huge-tile queue cannot disappear safely: independent CTA consumers require
+its 16 MB / 16-byte-per-item write+read handoff. Therefore this becomes a
+measured opt-in A/B after iteration 4, not a speculative default. Full design:
+`/tmp/perf16/rast-persistent-design.md`.
