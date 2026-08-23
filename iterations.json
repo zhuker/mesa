@@ -15,6 +15,14 @@
    "old_median_ms": 24.51,
    "sweep_hot_ms": null,
    "note": "trials conclude: 2 CAPPED, 3 left-as-built; median unmoved (24.51 vs 24.53) \u2014 slow launches are per-warp efficient, occupancy was not their limiter. Kept: self-selecting, near-zero cost, helps register-bound variants elsewhere. Gates: 43/43, 5-mode hashes unchanged."
+  },
+  {
+   "id": 2,
+   "name": "fuse fragment chain on the direct shade path (interpolate into generated fs)",
+   "verdict": "kept",
+   "old_median_ms": 24.16,
+   "sweep_hot_ms": 29.81,
+   "note": "-0.3ms median, sweep 30.41->29.81; 3 launches->2 per direct shade, fs_in round-trip intra-kernel; all gates incl. 6-mode hashes + both sentinel sets; enables writeback fusion; commit a9a952f1c09"
   }
  ]
 }

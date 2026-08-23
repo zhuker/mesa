@@ -75,3 +75,69 @@ already fuses interpolation *into* the generated shader
 an in-tree precedent. Plan: extend the fused form to the direct path,
 starting with interpolate→fs; writeback second. Expected: −2 launches and −1
 buffer round-trip per shade, ~204 batches/frame here.
+
+## Sizing the road to 16 ms (from the ladder's class table, ms/frame)
+
+| class | ms/frame | launches/frame | median µs | note |
+|---|---:|---:|---:|---|
+| fs stage (generated) | 9.16 | 103 | 65 (grid-4096 class) | iteration 2 target |
+| rasterize_stage3_abuf | 2.44 | 128 | 18.1 | rasterize-chain fusion |
+| rasterize_stage3 | 2.04 | 82 | 7.9 | rasterize-chain fusion |
+| clip_triangles | 1.73 | 204 | 3.9 | one per batch — vertex-chain fusion |
+| rasterize_stage1 | 1.71 | 82 | 13.7 | rasterize-chain fusion |
+| fs_interpolate | 1.68 | 82 | 18.9 | removed by iteration 2 if fused |
+| vertex_fetch | 1.52 | 204 | 4.2 | one per batch — vertex-chain fusion |
+| vertex main (generated) | 0.75 | 204 | 3.5 | vertex-chain fusion |
+
+Needed: −8.5 ms. The candidates, in dependency-free order:
+
+- **Iteration 2 (in flight):** interpolate→fs fusion on the direct path.
+  Upper bound ≈ fs_interpolate's 1.68 ms plus the fs_in round-trip's share of
+  the fs class and the per-launch gaps.
+- **Iteration 3: vertex-chain fusion.** vertex_fetch + generated VS (+ clip's
+  launch) are 204 launches/frame *each* at ~4 µs — 4.0 ms/frame across three
+  classes that form a linear pipeline per batch with global-memory hand-offs.
+  Fusing fetch into the generated VS mirrors the fused-interp mechanism
+  exactly (a per-lane helper reading the vertex buffers). Clip is
+  per-triangle, different grid — stays separate at first.
+- **Iteration 4: rasterize-chain fusion** (stage1 → stage3 → stage3_abuf):
+  6.19 ms/frame at 8–18 µs per launch. The ladder's lever 4.
+- **Iteration 5: episode-drain overlap** — bounded by the ~15% GR-idle
+  (≈3.7 ms), and it compounds with the fusions (fewer, larger kernels make
+  the remaining gaps a bigger fraction).
+
+Interference map: iterations 2–4 all edit the codegen/kernels/renderer trio,
+so they are strictly sequential. Iteration 5 edits the episode machinery and
+can only start after 2–4 settle. Load/store elision (~1.1 kernels/frame here)
+is independent but small; it stays parked until the sequential chain is done.
+
+## Iteration 2 — result: kept (commit `a9a952f1c09`)
+
+Old median **24.42 → 24.14/24.18 ms** (−1.2%), sweep 30.41 → 29.81
+(gltfscenerendering 9.39 → 9.00). All gates pass, including six-mode batch
+hashes (five batching modes + `CUDAPIPE_NO_FUSED_INTERP=1`) and both llvmpipe
+sentinel sets at their recorded envelopes to the digit.
+
+**Why so small, in numbers:** the direct chain is 7.0 ms/frame of GPU busy,
+but 5.5 of that is the generated fs kernels, which fusion keeps by design.
+The interpolate launch was a full-framebuffer grid with 1-in-30 occupancy
+(20.7 µs); its replacement compaction is 5.0 µs, and the fs absorbed the
+interpolation at +8% kernel time. Structurally right, quantitatively bounded.
+
+**Interference:** none with stage3/abuf work (abuf fs time measured
+unchanged); writeback fusion is now *easier* (the fs knows its slot's
+coverage and pixel, and per-(pixel,sample) writes are unique in a shade);
+one fewer serialized kernel helps future overlap.
+
+## Iteration 3 — (next) rasterize-chain fusion
+
+Largest remaining non-fs class group: rasterize_stage1 (1.71) + stage3 (2.04)
++ stage3_abuf (2.44) = **6.19 ms/frame** at 8–18 µs/launch, communicating
+through device queues written and reread across kernel boundaries. Measure
+first: how much is launch gap + queue round-trip vs irreducible work.
+Candidate fusions in ascending risk: clip→stage1 (adjacent per batch),
+stage1→stage3 (producer/consumer over the nontrivial-triangle queue),
+stage3→abuf-build. Kernel-only work (cp_rasterize.cu + renderer launch
+sites), no codegen. Vertex-chain fusion (fetch+VS+clip, 4.0 ms class, 204
+launches/frame each) is the fallback if the queue handoff proves
+irreducible.
