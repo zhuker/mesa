@@ -19,20 +19,6 @@ struct cp_tex_desc_ref {
    int32_t flags;
 };
 
-struct cp_sampler_variant {
-   CUmodule module;
-   CUfunction kernel;
-   struct cp_sampler_info *states;
-   unsigned num_states;
-   int regs;
-   int spill_bytes;
-   bool globals_resolved;
-   CUdeviceptr sym_sampler_table;
-   CUdeviceptr sym_quad_derivs;
-   uint64_t last_sampler_table;
-   int last_quad_derivs;
-};
-
 /* Launches timed per phase of a shader's register-cap trial, and how many are
  * thrown away at the start of one. See cp_tune_before() in cp_context.c. */
 #define CP_TUNE_SAMPLES 24
@@ -56,6 +42,49 @@ struct cp_shader_tune {
    CUevent stop[CP_TUNE_SAMPLES];
    float us[2][CP_TUNE_SAMPLES];
 };
+
+struct cp_sampler_variant {
+   CUmodule module;
+   CUfunction kernel;
+   struct cp_sampler_info *states;
+   unsigned num_states;
+   int regs;
+   int spill_bytes;
+   int blocks_per_sm;
+   bool globals_resolved;
+   CUdeviceptr sym_sampler_table;
+   CUdeviceptr sym_quad_derivs;
+   uint64_t last_sampler_table;
+   int last_quad_derivs;
+
+   /*
+    * The variant's own register-cap trial.
+    *
+    * The base shader's verdict was measured on the generic sampler path; the
+    * specialised build inlines its sampler and has different register
+    * pressure, so inheriting the base's cap answered the wrong question. On
+    * the old capture the specialised builds are 87% of fragment time and ran
+    * at one or two blocks per SM, untimed. Same machinery as the base: an
+    * alternate capped build made beside this one, both timed on real draws,
+    * faster kept.
+    */
+   CUmodule alt_module;
+   CUfunction alt_kernel;
+   int alt_regs;
+   int alt_spill_bytes;
+   int alt_blocks_per_sm;
+   int reg_cap, alt_reg_cap;
+   bool alt_globals_resolved;
+   CUdeviceptr alt_sym_sampler_table;
+   CUdeviceptr alt_sym_quad_derivs;
+   uint64_t alt_last_sampler_table;
+   int alt_last_quad_derivs;
+   int tune_cap;
+   bool tune_done;
+   struct cp_shader_tune tune;
+};
+
+void cp_sampler_variant_swap_build(struct cp_sampler_variant *v);
 
 struct cp_shader_binary {
    char *ptx_text;

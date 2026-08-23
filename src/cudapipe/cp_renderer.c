@@ -2097,10 +2097,25 @@ cp_tune_median(struct cp_shader_tune *t, int phase)
    return 0.5 * (v[CP_TUNE_SAMPLES / 2] + v[(CP_TUNE_SAMPLES - 1) / 2]);
 }
 
+/*
+ * One register-cap trial, whoever owns it. The same state machine times a
+ * base shader's two builds and a sampler variant's two builds; only where the
+ * builds live and how they swap differs, which is what this view carries.
+ */
+struct cp_tune_ctx {
+   struct cp_shader_tune *t;
+   int tune_cap;
+   bool *done;
+   const int *num_regs;      /* the currently-bound build's register count */
+   void (*swap)(void *);
+   void *obj;
+   const char *what;
+};
+
 static void
-cp_tune_release(struct cp_shader_binary *fs)
+cp_tune_release(const struct cp_tune_ctx *c)
 {
-   struct cp_shader_tune *t = &fs->tune;
+   struct cp_shader_tune *t = c->t;
    if (t->events_made) {
       for (unsigned i = 0; i < CP_TUNE_SAMPLES; i++) {
          cuEventDestroy(t->start[i]);
@@ -2108,7 +2123,7 @@ cp_tune_release(struct cp_shader_binary *fs)
       }
       t->events_made = false;
    }
-   fs->tune_done = true;
+   *c->done = true;
 }
 
 /* Read a finished phase's events back, if the last of them has completed.
@@ -2130,12 +2145,9 @@ cp_tune_harvest(struct cp_shader_tune *t)
  * being timed. cp_tune_after() is called after every launch either way, and
  * is where a change of build takes effect. */
 static bool
-cp_tune_before(struct cp_context *cp, struct cp_shader_binary *fs)
+cp_tune_before_ctx(struct cp_context *cp, const struct cp_tune_ctx *c)
 {
-   if (cp_debug->no_regcap || !fs->tune_cap || fs->tune_done)
-      return false;
-
-   struct cp_shader_tune *t = &fs->tune;
+   struct cp_shader_tune *t = c->t;
 
    /* A phase whose events are still in flight. Keep launching what is bound
     * — a few extra launches of either build cost nothing — and read them when
@@ -2147,7 +2159,7 @@ cp_tune_before(struct cp_context *cp, struct cp_shader_binary *fs)
 
       if (t->phase == 0) {
          /* Back to the build the JIT chose, which is already loaded. */
-         t->regs_capped = fs->num_regs;
+         t->regs_capped = *c->num_regs;
          t->swap_pending = true;
          t->phase = 1;
          /* Not zero: the swap is already scheduled, and seen == 0 is what
@@ -2164,14 +2176,14 @@ cp_tune_before(struct cp_context *cp, struct cp_shader_binary *fs)
          t->swap_pending = true;   /* back to capped, on the next launch */
 
       if (cp_debug->shader_stats)
-         fprintf(stderr, "cudapipe: shader trial regs %3d -> %3d (cap %d): "
-                 "%.1f us -> %.1f us median of %d, %s\n",
-                 fs->num_regs, t->regs_capped, fs->tune_cap, as_built, capped,
+         fprintf(stderr, "cudapipe: %s trial regs %3d -> %3d (cap %d): "
+                 "%.1f us -> %.1f us median of %d, %s\n", c->what,
+                 *c->num_regs, t->regs_capped, c->tune_cap, as_built, capped,
                  CP_TUNE_SAMPLES, keep ? "CAPPED" : "left as built");
 
       /* The events go now; a swap still pending is applied by the launch this
        * call is about to let through, which no longer times anything. */
-      cp_tune_release(fs);
+      cp_tune_release(c);
       return false;
    }
 
@@ -2191,7 +2203,7 @@ cp_tune_before(struct cp_context *cp, struct cp_shader_binary *fs)
       for (unsigned i = 0; i < CP_TUNE_SAMPLES; i++) {
          if (cuEventCreate(&t->start[i], CU_EVENT_DEFAULT) != CUDA_SUCCESS ||
              cuEventCreate(&t->stop[i], CU_EVENT_DEFAULT) != CUDA_SUCCESS) {
-            fs->tune_done = true;
+            *c->done = true;
             return false;
          }
       }
@@ -2205,12 +2217,12 @@ cp_tune_before(struct cp_context *cp, struct cp_shader_binary *fs)
 /* Called after every fragment shader launch: applies a pending change of
  * build, and closes a timed launch's event pair. */
 static void
-cp_tune_after(struct cp_context *cp, struct cp_shader_binary *fs, bool timed)
+cp_tune_after_ctx(struct cp_context *cp, const struct cp_tune_ctx *c, bool timed)
 {
-   struct cp_shader_tune *t = &fs->tune;
+   struct cp_shader_tune *t = c->t;
 
    if (t->swap_pending) {
-      cp_shader_swap_build(fs);
+      c->swap(c->obj);
       t->swap_pending = false;
    }
    if (!timed)
@@ -2219,6 +2231,43 @@ cp_tune_after(struct cp_context *cp, struct cp_shader_binary *fs, bool timed)
    cuEventRecord(t->stop[t->timed], cp->stream);
    if (++t->timed >= CP_TUNE_SAMPLES)
       t->reading = true;
+}
+
+static void
+cp_tune_swap_shader(void *obj) { cp_shader_swap_build(obj); }
+static void
+cp_tune_swap_variant(void *obj) { cp_sampler_variant_swap_build(obj); }
+
+static struct cp_tune_ctx
+cp_tune_ctx_shader(struct cp_shader_binary *fs)
+{
+   return (struct cp_tune_ctx) { &fs->tune, fs->tune_cap, &fs->tune_done,
+                                 &fs->num_regs, cp_tune_swap_shader, fs,
+                                 "shader" };
+}
+
+static struct cp_tune_ctx
+cp_tune_ctx_variant(struct cp_sampler_variant *v)
+{
+   return (struct cp_tune_ctx) { &v->tune, v->tune_cap, &v->tune_done,
+                                 &v->regs, cp_tune_swap_variant, v,
+                                 "sampler variant" };
+}
+
+static bool
+cp_tune_before(struct cp_context *cp, struct cp_shader_binary *fs)
+{
+   if (cp_debug->no_regcap || !fs->tune_cap || fs->tune_done)
+      return false;
+   struct cp_tune_ctx c = cp_tune_ctx_shader(fs);
+   return cp_tune_before_ctx(cp, &c);
+}
+
+static void
+cp_tune_after(struct cp_context *cp, struct cp_shader_binary *fs, bool timed)
+{
+   struct cp_tune_ctx c = cp_tune_ctx_shader(fs);
+   cp_tune_after_ctx(cp, &c, timed);
 }
 
 /*
@@ -2509,8 +2558,22 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
       if (ev_before)
          cuEventRecord(ev_before, cp->stream);
       /* A shader the compiler marked as a register-cap candidate is timed
-       * here, both as built and capped, and the faster build kept. */
-      bool timed = use_sampler_variant ? false : cp_tune_before(cp, fs);
+       * here, both as built and capped, and the faster build kept. A sampler
+       * variant carries its own trial: the base's verdict was measured on
+       * the generic sampler path and does not transfer. */
+      bool timed;
+      struct cp_tune_ctx vctx;
+      bool tune_variant = use_sampler_variant && !cp_debug->no_regcap &&
+                          sampler_variant->tune_cap &&
+                          !sampler_variant->tune_done;
+      if (tune_variant) {
+         vctx = cp_tune_ctx_variant(sampler_variant);
+         timed = cp_tune_before_ctx(cp, &vctx);
+         /* The swap may retarget the launch below to the other build. */
+         launch_kernel = sampler_variant->kernel;
+      } else {
+         timed = use_sampler_variant ? false : cp_tune_before(cp, fs);
+      }
       /* Compiled shaders grid-stride now, so the launch is capped: the count
        * is device-side and num_threads is the framebuffer's worst case, so a
        * small draw's launch was mostly scheduling idle blocks. 4096 blocks
@@ -2524,7 +2587,9 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
                  fs_err);
          return false;
       }
-      if (!use_sampler_variant)
+      if (tune_variant)
+         cp_tune_after_ctx(cp, &vctx, timed);
+      else if (!use_sampler_variant)
          cp_tune_after(cp, fs, timed);
    }
    return true;

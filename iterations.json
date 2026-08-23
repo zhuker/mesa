@@ -1,0 +1,20 @@
+{
+ "goal": "old-capture gfxr replay median <= 16 ms/frame, correctness intact",
+ "baseline": {
+  "commit": "5ebc37aa36e",
+  "old_median_ms": 24.53,
+  "crossroads_median_ms": 7.61,
+  "sweep_hot_ms": 30.44,
+  "decomposition": "GPU 85-96% GR-active but starved: SM issue 3-7%, 1789 launches/frame @3.5us median, fs class 9.16ms/frame at 1-2 blocks/SM"
+ },
+ "iterations": [
+  {
+   "id": 1,
+   "name": "register-cap trials for sampler-variant fragment shaders",
+   "verdict": "kept (neutral here)",
+   "old_median_ms": 24.51,
+   "sweep_hot_ms": null,
+   "note": "trials conclude: 2 CAPPED, 3 left-as-built; median unmoved (24.51 vs 24.53) \u2014 slow launches are per-warp efficient, occupancy was not their limiter. Kept: self-selecting, near-zero cost, helps register-bound variants elsewhere. Gates: 43/43, 5-mode hashes unchanged."
+  }
+ ]
+}

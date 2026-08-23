@@ -2970,6 +2970,8 @@ measure_shader_cost(CUfunction fn, struct cp_shader_cost *cost)
                                                CP_SHADER_BLOCK_THREADS, 0);
 }
 
+static int cp_pick_reg_cap(void);
+
 bool
 cp_shader_build_sampler_variant(struct cp_shader_binary *bin,
                                 const char *sampler_ptx,
@@ -3008,10 +3010,77 @@ cp_shader_build_sampler_variant(struct cp_shader_binary *bin,
    variant->kernel = kernel;
    variant->regs = cost.regs;
    variant->spill_bytes = cost.spill;
+   variant->blocks_per_sm = cost.blocks;
+   variant->reg_cap = bin->reg_cap;
    variant->last_sampler_table = ~(uint64_t)0;
    variant->last_quad_derivs = -1;
+   variant->tune_done = true;
+
+   /*
+    * The variant's own register-cap candidacy, judged on the variant. The
+    * build above inherited the base's cap, but the base's trial timed the
+    * generic sampler path and this build inlines its sampler: different
+    * register pressure, different verdict. Same rule as
+    * load_shader_module_tuned -- register-bound below the target, and the cap
+    * must actually buy a block -- and the same runtime trial then decides.
+    */
+   if (!cp_debug->no_regcap && !cp_debug->max_registers &&
+       !cp_debug->regcap_static && !bin->reg_cap &&
+       cost.blocks >= 1 && cost.blocks < CP_SHADER_TARGET_BLOCKS) {
+      int cap = cp_pick_reg_cap();
+      if (cap > 0 && cap < cost.regs) {
+         CUmodule alt = NULL;
+         CUfunction alt_fn = NULL;
+         struct cp_shader_cost alt_cost = {0};
+         if (load_shader_module(&alt, bin->ptx_text, sampler_ptx,
+                                bin->fs_helper_ptx, cap) == CUDA_SUCCESS &&
+             cuModuleGetFunction(&alt_fn, alt, "main") == CUDA_SUCCESS)
+            measure_shader_cost(alt_fn, &alt_cost);
+         if (alt_fn && alt_cost.blocks > cost.blocks) {
+            variant->alt_module = alt;
+            variant->alt_kernel = alt_fn;
+            variant->alt_regs = alt_cost.regs;
+            variant->alt_spill_bytes = alt_cost.spill;
+            variant->alt_blocks_per_sm = alt_cost.blocks;
+            variant->alt_reg_cap = cap;
+            variant->alt_last_sampler_table = ~(uint64_t)0;
+            variant->alt_last_quad_derivs = -1;
+            variant->tune_cap = cap;
+            variant->tune_done = false;
+            if (cp_debug->shader_stats)
+               fprintf(stderr, "cudapipe: sampler variant regs %3d blocks/sm "
+                       "%d -> cap %d: regs %3d blocks/sm %d  on trial\n",
+                       cost.regs, cost.blocks, cap, alt_cost.regs,
+                       alt_cost.blocks);
+         } else if (alt) {
+            cuModuleUnload(alt);
+         }
+      }
+   }
+
    bin->num_sampler_variants++;
    return true;
+}
+
+void
+cp_sampler_variant_swap_build(struct cp_sampler_variant *v)
+{
+   if (!v->alt_module)
+      return;
+
+#define CP_SWAP(type, a, b) do { type tmp = (a); (a) = (b); (b) = tmp; } while (0)
+   CP_SWAP(CUmodule, v->module, v->alt_module);
+   CP_SWAP(CUfunction, v->kernel, v->alt_kernel);
+   CP_SWAP(int, v->regs, v->alt_regs);
+   CP_SWAP(int, v->spill_bytes, v->alt_spill_bytes);
+   CP_SWAP(int, v->blocks_per_sm, v->alt_blocks_per_sm);
+   CP_SWAP(int, v->reg_cap, v->alt_reg_cap);
+   CP_SWAP(bool, v->globals_resolved, v->alt_globals_resolved);
+   CP_SWAP(CUdeviceptr, v->sym_sampler_table, v->alt_sym_sampler_table);
+   CP_SWAP(CUdeviceptr, v->sym_quad_derivs, v->alt_sym_quad_derivs);
+   CP_SWAP(uint64_t, v->last_sampler_table, v->alt_last_sampler_table);
+   CP_SWAP(int, v->last_quad_derivs, v->alt_last_quad_derivs);
+#undef CP_SWAP
 }
 
 struct cp_sampler_variant *
@@ -3121,6 +3190,20 @@ cp_shader_set_reg_cap(struct cp_shader_binary *bin, int max_regs)
  * which is the shape the plan proposed and is kept so it can be measured.
  * CUDAPIPE_NO_REGCAP disables all of it.
  */
+/* The largest cap that fits the occupancy target, straight out of the
+ * device: on a 64K-register SM at 256 threads and two blocks that is 128. */
+static int
+cp_pick_reg_cap(void)
+{
+   CUdevice dev;
+   int regs_per_sm = 0;
+   if (cuCtxGetDevice(&dev) == CUDA_SUCCESS)
+      cuDeviceGetAttribute(&regs_per_sm,
+                           CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR,
+                           dev);
+   return regs_per_sm / (CP_SHADER_TARGET_BLOCKS * CP_SHADER_BLOCK_THREADS);
+}
+
 static CUresult
 load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
                          const char *sampler_ptx, const char *fs_helper_ptx,
@@ -3162,15 +3245,7 @@ load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
 
    int cap = 0;
    if (!why) {
-      /* The largest cap that fits the target, straight out of the device: on
-       * a 64K-register SM at 256 threads and two blocks that is 128. */
-      CUdevice dev;
-      int regs_per_sm = 0;
-      if (cuCtxGetDevice(&dev) == CUDA_SUCCESS)
-         cuDeviceGetAttribute(&regs_per_sm,
-                              CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR,
-                              dev);
-      cap = regs_per_sm / (CP_SHADER_TARGET_BLOCKS * CP_SHADER_BLOCK_THREADS);
+      cap = cp_pick_reg_cap();
       if (cap <= 0)
          why = "kept (device has no register count)";
       else if (cap >= cost.regs)
@@ -3533,9 +3608,18 @@ cp_shader_binary_destroy(struct cp_shader_binary *bin)
    if (bin->alt_module)
       cuModuleUnload(bin->alt_module);
    for (unsigned i = 0; i < bin->num_sampler_variants; i++) {
-      if (bin->sampler_variants[i].module)
-         cuModuleUnload(bin->sampler_variants[i].module);
-      free(bin->sampler_variants[i].states);
+      struct cp_sampler_variant *v = &bin->sampler_variants[i];
+      if (v->module)
+         cuModuleUnload(v->module);
+      if (v->alt_module)
+         cuModuleUnload(v->alt_module);
+      if (v->tune.events_made) {
+         for (unsigned e = 0; e < CP_TUNE_SAMPLES; e++) {
+            cuEventDestroy(v->tune.start[e]);
+            cuEventDestroy(v->tune.stop[e]);
+         }
+      }
+      free(v->states);
    }
    free(bin->ptx_text);
    FREE(bin);
