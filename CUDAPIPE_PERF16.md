@@ -244,3 +244,31 @@ copy static format cases into LLVM. The rejected patch is
 **Interference:** none because everything was reverted. The lesson applies to
 future helper fusion: a null call path is not resource isolation, and every
 revert control must select a binary without the helper call graph.
+
+## CUDA Graph architecture note (analysis after iteration 4)
+
+The final iteration-3 trace (622 ordinary frame intervals) measures a 23.608 ms
+median, 17.903 ms union of kernels/copies/memsets, and 5.679 ms with no device
+operation. Global idle gaps under 20 µs total 3.287 ms/frame; runtime activity
+is ~1329 kernels, 909 HtoD calls and 840 memsets/frame. CUPTI intercepts the
+very enqueue calls being measured, so these are ceilings, not predicted
+untraced wins. Perfect deletion of every traced idle interval still leaves
+**17.903 ms**: graphs cannot reach 16 ms without ≥1.9 ms device-work savings.
+
+Clean progression:
+
+1. Explicit, update-free three-node raster-tail graph cached by exact parameter
+   and allocation epoch (mechanism A/B; only 0.5–1 ms expected).
+2. Extend the record-time command-buffer plan into immutable batch/episode
+   recipes plus a command-owned device argument blob.
+3. Lazy-resolve update-free whole-direct-batch and blended-segment graph execs
+   per scratch/allocation generation, with retained shader modules and retired
+   execution slots. Expected untraced opportunity: **1–3 ms**.
+4. Keep the existing host episode drain initially; only then move bounded
+   overflow/no-work/group/peel decisions into CUDA 12.8 IF/SWITCH/WHILE nodes.
+
+No-go designs: whole-renderer stream capture, per-kernel graphs, per-submit
+node parameter updates, stale rotating scratch pointers, or a full-scope graph
+before decisions are device-resident. Graphs are enabling architecture after a
+device-work reduction, not iteration 5 by themselves. Full report:
+`/tmp/perf16/graph-design.md`.
