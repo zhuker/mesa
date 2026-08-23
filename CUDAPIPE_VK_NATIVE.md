@@ -483,16 +483,32 @@ pass-wide ideas already measured at zero for their own reasons — reordering
 on Crossroads) and immutable samplers — and this is the third such result.
 Record it before proposing the fourth.
 
-What the measurement does justify:
+**Correction.** The first version of this section claimed the descriptor arena
+grows once per render scope. That was a counter bug: the per-command-buffer
+count was read at every submission instead of consumed, so a buffer recorded
+once and submitted 600 times reported its one growth 600 times. The real
+number is **9 growths over the whole old-capture replay**. There is no
+per-frame allocation to remove, and the conclusion built on it is withdrawn.
 
-- **Size the descriptor arena from the pass.** It grows once per render scope
-  on every workload measured — 699/699 on `gltfscenerendering`, 767/767 on
-  `instancing`, 2,079 across the Crossroads replay — so each frame pays a fresh
-  `cuMemAlloc` for storage the previous frame already had.
-- **Skip empty episode closes.** 95.5% of `cp_pass_finish()` calls have no
-  segments, 210 a frame.
-- **Load/store elision** remains the one genuinely pass-shaped opportunity that
-  has not been measured, and the only one Vulkan states explicitly where
+What the corrected measurements support:
+
+- **The batch partition is now decided at `vkEndCommandBuffer`.**
+  `cpvk_plan_batches()` stores each draw's mergeability against its
+  predecessor in the recording; the submit path uses the stored answer when
+  `prev_draw` is exactly that predecessor and falls back to the dynamic
+  comparison otherwise. On the old capture the plan answers **100%** of
+  merge decisions with counters byte-identical to the dynamic walk. A buffer
+  submitted N times pays for its partition once, and the partition exists as
+  data before execution — the precondition for a CUDA-graph-shaped backend.
+- **Batch breaks, attributed** (`CUDAPIPE_PLAN_STATS` tallies the failing key
+  component): on the old capture, fragment shader 143,962, vertex shader
+  72,146, index buffer 44,626, rasterizer 1,764. Push constants are absent
+  because their contents merge by default (`CPVK_KEEP_PUSHKEY` is the revert
+  switch). The breaks are real state changes — different shaders cannot share
+  a batch that launches one VS and one FS kernel — so the old capture's 71%
+  merge rate against Crossroads' 84% is the workload, not a key defect.
+- **Load/store elision** remains the one genuinely pass-shaped opportunity
+  that has not been measured, and the only one Vulkan states explicitly where
   Gallium never did.
 
 ### GFXReconstruct gate — external references only
@@ -852,11 +868,12 @@ Three lessons from this pass are worth keeping in front:
 
 In order:
 
-1. **Size the descriptor arena from the recorded pass**, and skip empty episode
-   closes. `CUDAPIPE_PLAN_STATS` says the arena grows once per render scope on
-   every workload measured and that 95.5% of `cp_pass_finish()` calls do
-   nothing. Neither needs a planner; both are what knowing the pass in advance
-   is actually for.
+1. **Extend the record-time plan toward a launch plan.** The batch partition
+   is now data at `vkEndCommandBuffer` (100% coverage on the old capture).
+   The remaining steps toward a CUDA-graph backend are per-scope resource
+   requirements in the same walk, then a captured launch sequence per plan.
+   Attribution says better batching is not available — the breaks are real
+   shader changes — so the launch-count lever is graphs, not merging.
 2. **Find out why `cpvk_sampler_two_bindings` never specialises.** It reports
    0 of 4 launches even with register tuning forced, while `texture` with one
    descriptor specialises and `gltfscenerendering` with two now does. Its
