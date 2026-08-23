@@ -452,6 +452,49 @@ evidence that multi-descriptor specialisation is correct is
 `gltfscenerendering`: 16,175 specialised launches with its NVIDIA comparison
 unmoved.
 
+### Planning the pass, and what it would actually buy
+
+The Gallium-hosted driver saw one draw at a time, so batches and pass episodes
+had to be reconstructed by watching state go past. The native driver records
+the whole pass into `cmd->ops[]` and `cmd->scopes[]` and then consumes it one
+op at a time anyway, with a pairwise merge test against `dev->prev_draw` and a
+`cp_pass_finish()` call wherever an episode might have closed. The data is
+Vulkan-shaped; the decision-making is still Gallium-shaped.
+
+`CUDAPIPE_PLAN_STATS` measures what that costs. Crossroads, 1,496 frames:
+
+| | total | per frame |
+|---|---:|---:|
+| render scopes | 17,820 | 11.9 |
+| merge tests | 263,503 | 176 |
+| — merged first try | 221,362 (84.0%) | |
+| — forced a flush and a retest | 42,141 | 28 |
+| batch keys built | 53,511 | 36 |
+| batches executed | 75,243 | 50 |
+| episodes closed / attempts | 14,304 / 315,169 | 9.6 / 210 |
+| descriptor arena growths | 2,079 | 1.4 |
+| scratch growths / framebuffer reallocations | 1 / 2 | — |
+
+**The decision cost is not where the host-side gap lives.** 176 small struct
+compares and 36 key builds a frame do not explain a millisecond, so a planner
+built to remove them would be paying for the wrong thing. Two prior
+pass-wide ideas already measured at zero for their own reasons — reordering
+(applications already sort opaque geometry by material: 6,027 vs 6,027 groups
+on Crossroads) and immutable samplers — and this is the third such result.
+Record it before proposing the fourth.
+
+What the measurement does justify:
+
+- **Size the descriptor arena from the pass.** It grows once per render scope
+  on every workload measured — 699/699 on `gltfscenerendering`, 767/767 on
+  `instancing`, 2,079 across the Crossroads replay — so each frame pays a fresh
+  `cuMemAlloc` for storage the previous frame already had.
+- **Skip empty episode closes.** 95.5% of `cp_pass_finish()` calls have no
+  segments, 210 a frame.
+- **Load/store elision** remains the one genuinely pass-shaped opportunity that
+  has not been measured, and the only one Vulkan states explicitly where
+  Gallium never did.
+
 ### GFXReconstruct gate — external references only
 
 **For replay correctness, compare against llvmpipe or the real NVIDIA driver.
@@ -809,7 +852,12 @@ Three lessons from this pass are worth keeping in front:
 
 In order:
 
-1. **Find out why `cpvk_sampler_two_bindings` never specialises.** It reports
+1. **Size the descriptor arena from the recorded pass**, and skip empty episode
+   closes. `CUDAPIPE_PLAN_STATS` says the arena grows once per render scope on
+   every workload measured and that 95.5% of `cp_pass_finish()` calls do
+   nothing. Neither needs a planner; both are what knowing the pass in advance
+   is actually for.
+2. **Find out why `cpvk_sampler_two_bindings` never specialises.** It reports
    0 of 4 launches even with register tuning forced, while `texture` with one
    descriptor specialises and `gltfscenerendering` with two now does. Its
    sampler indices read back as zero for both bindings under
@@ -817,57 +865,57 @@ In order:
    row looks like, so the suspicion is `cp_host_ptr` over an arena this test's
    four descriptor sets land in. Until it is understood, that test guards the
    fallback rather than the specialised path.
-2. **Implement the four below-minimum limits rather than raising them.**
+3. **Implement the four below-minimum limits rather than raising them.**
    Multiple colour attachments, layered rendering and input attachments are
    what `maxColorAttachments`, `maxFragmentOutputAttachments`,
    `maxFramebufferLayers` and `maxDescriptorSetInputAttachments` currently
    admit are missing. Until they exist, Vulkan 1.1 is advertised
    non-conformantly and the validation layer says so on every test.
-3. **Implement stencil, or stop needing the exception.** Stencil test/write
+4. **Implement stencil, or stop needing the exception.** Stencil test/write
    state is ignored with a one-time message because refusing it ends the
    Crossroads replay. The honest end state is a stencil implementation with a
    differential test, after which the pipeline can be refused when it is not
    implemented.
-4. **Complete the external image evidence.** Replay the existing Crossroads and
+5. **Complete the external image evidence.** Replay the existing Crossroads and
    old-capture `all.json` plans with llvmpipe or NVIDIA and compare by the
    shared manifest. Until then the external result is the 9/10-image sentinel
    gate, not a full-frame correctness pass. Investigate the standing
    `gltfscenerendering` NVIDIA mismatch rather than changing its tolerance.
-5. **Make the older tests validation-clean.** The four newest are; most of the
+6. **Make the older tests validation-clean.** The four newest are; most of the
    rest set dynamic state their pipeline declares statically, and none of them
    transition image layouts. Fix the tests, then use the layer as a gate rather
    than as a survey.
-6. **Stress asynchronous completion and retirement further.** Queue retirement,
+7. **Stress asynchronous completion and retirement further.** Queue retirement,
    ordered query availability, per-query waits, device-loss latching and the
    256 MiB scratch bound now have tests or explicit bounds. Add longer
    draw/copy↔dispatch dependency and command-pool-reset stress. Preserve the
    single ordered renderer stream until a real multi-queue model exists.
-7. **Close the remaining replay gap.** Fresh controlled traces put native at
+8. **Close the remaining replay gap.** Fresh controlled traces put native at
    4.88 ms of kernels per Crossroads frame versus Gallium's 4.76 ms; the larger
    residual is host/launch scheduling, not an unexplained multi-millisecond
    kernel. Start with unprofiled GPU-busy data, then split compiled `main`
    kernels by grid/register class before changing synchronization. Re-measure
    the baseline build in the same session before believing a replay delta.
-8. **Extend caching only with complete keys.** Embedded/lazy NVRTC PTX is now
+9. **Extend caching only with complete keys.** Embedded/lazy NVRTC PTX is now
    persistent and validated. Application NIR→PTX or CUDA JIT caching must key
    the lowered resource ABI, compiler/toolkit version, SM, helper PTX and every
    option; never treat SPIR-V identity alone as sufficient.
-9. **Extend the attachment model deliberately.** Depth load/clear/store,
+10. **Extend the attachment model deliberately.** Depth load/clear/store,
    stencil clear and sample-zero depth resolve have tests or captures behind
    them. Add depth copy/sample comparisons, then averaging depth resolve and
    layered/multiview rendering, rather than treating transfer-layer support as
    draw-layer proof.
-10. **Finish robustness and the remaining query semantics** where workloads need
+11. **Finish robustness and the remaining query semantics** where workloads need
    them, rather than hiding unsupported behavior behind null allocations or
    invented counts. Occlusion and pipeline-statistics queries still report
    zero, and timestamps are still host approximations.
-11. **Broaden formats/blits/resolves one closed family at a time**, each with a
+12. **Broaden formats/blits/resolves one closed family at a time**, each with a
     validation-correct NVIDIA comparison. Storage-image atomics in particular
     are not implemented for compare-exchange and the format bit is deliberately
     not advertised.
-12. **Resolve the internal A-buffer colour-verifier mismatches** before
+13. **Resolve the internal A-buffer colour-verifier mismatches** before
     treating per-device external equality as a clean verification-mode pass.
-13. **Only then spend native-only render-pass information** on load/store
+14. **Only then spend native-only render-pass information** on load/store
     elision, tile residency or parallel command translation. The original
     motivation is still valid, but earlier pass-wide reordering and immutable
     sampler theories measured at zero. Require a baseline and one isolated
