@@ -748,30 +748,26 @@ cp_broadcast_setup(struct tri_setup *s)
  * Classify one primitive, and rasterize it on the spot when it is small.
  *
  * This is stage 1's whole job, factored per primitive so the fused kernel can
- * run it on the triangles it just clipped. Returns true when the primitive is
- * nontrivial and belongs to stage 2; *qidx then holds the queue slot it was
- * appended to when `append` asked for one, or CP_MAX_NONTRIVIAL when no
- * append happened or the queue was full — a full queue also returns false,
- * because stage 2 would never have seen the entry.
+ * run it on the triangles it just clipped. Nontrivial primitives are appended
+ * to the unchanged stage-2 queue when requested.
  */
 template <bool ABUF>
-static __device__ __forceinline__ bool
+static __device__ __forceinline__ void
 cp_rast_small_or_defer(struct cp_rasterize_args *args,
                        struct cp_rast_queues *queues, uint32_t tri_id,
-                       bool append, uint32_t *qidx)
+                       bool append)
 {
-   *qidx = CP_MAX_NONTRIVIAL;
 
    struct tri_setup s;
    if (!setup_triangle(args, tri_id, &s))
-      return false;
+      return;
 
    int bb_w = s.ix_max - s.ix_min + 1;
    int bb_h = s.iy_max - s.iy_min + 1;
    int bb_area = bb_w * bb_h;
 
    if (bb_area <= 0)
-      return false;
+      return;
 
    /*
     * Too big for one thread: queue it for a warp. Points go the same way as
@@ -785,17 +781,16 @@ cp_rast_small_or_defer(struct cp_rasterize_args *args,
          uint32_t *counter = (uint32_t *)(uintptr_t)queues->nontrivial_count;
          uint32_t idx = atomicAdd(counter, 1u);
          if (idx >= CP_MAX_NONTRIVIAL)
-            return false;
+            return;
          uint32_t *queue = (uint32_t *)(uintptr_t)queues->nontrivial;
          queue[idx] = tri_id;
-         *qidx = idx;
       }
-      return true;
+      return;
    }
 
    if (s.is_point) {
       rasterize_point<ABUF>(args, &s, tri_id, 0, 1);
-      return false;
+      return;
    }
 
    /*
@@ -833,7 +828,7 @@ cp_rast_small_or_defer(struct cp_rasterize_args *args,
          }
       }
    }
-   return false;
+   return;
 }
 
 /*
@@ -856,9 +851,8 @@ cp_rasterize_stage1_body(struct cp_rasterize_args args, struct cp_rast_queues qu
     * at the same index and behind the same counter. The classification is
     * still done — it is what decides this thread does not rasterize — but
     * the append is not. */
-   uint32_t qidx;
    cp_rast_small_or_defer<ABUF>(&args, &queues, tri_id,
-                                queues.mode != CP_QUEUE_REUSE, &qidx);
+                                queues.mode != CP_QUEUE_REUSE);
 }
 
 /*
@@ -1050,9 +1044,8 @@ cp_clip_rast_fused_body(struct cp_clip_args cargs,
    uint32_t emitted[CP_CLIP_MAX_OUT];
    int n = cp_clip_one(&cargs, tri, emitted);
    for (int i = 0; i < n; i++) {
-      uint32_t qi;
       cp_rast_small_or_defer<ABUF>(&args, &queues, emitted[i],
-                                   queues.mode != CP_QUEUE_REUSE, &qi);
+                                   queues.mode != CP_QUEUE_REUSE);
    }
 }
 
