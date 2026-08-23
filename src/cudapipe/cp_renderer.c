@@ -20,6 +20,7 @@
 #include "nir_to_ptx/cp_nir_to_llvm.h"
 
 #include <inttypes.h>
+#include "util/os_time.h"
 
 #include "util/u_memory.h"
 #include <string.h>
@@ -31,16 +32,16 @@
  * Everything here is CUDA and the driver's own bookkeeping -- a stream, the
  * flush generation ring, the device arena and its host staging, and the
  * rasterizer's queues. None of it needs a
- * pipe_screen or a pipe_context, which is the point: a Vulkan front end calls
+ * no Gallium object at all, which is the point: a Vulkan front end calls
  * this with a cp_device and gets a renderer it can draw with.
  */
 bool
 cp_context_init(struct cp_context *cp, struct cp_device *dev)
 {
-   cp->screen = dev;
+   cp->dev = dev;
 
    /* Allocate the persistent device-only arenas and queues. */
-   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   cuCtxSetCurrent(cp->dev->cuda_ctx);
 
    /* Every frame-path launch, memset and copy goes here; see cp_context.h for
     * why it is a default-flagged stream rather than a non-blocking one. If it
@@ -369,6 +370,17 @@ cp_abuf_min_tris(void)
 /* Reset scratch after all GPU work is done. Frees overflow arenas (old
  * arenas that were replaced during growth) and resets the bump pointer.
  * The current arena is kept at its grown size. */
+/* One timed synchronize: the wall time the calling thread spent blocked. */
+static void
+cp_sync_timed(struct cp_context *cp, CUstream stream,
+              uint64_t *ns, uint64_t *n)
+{
+   int64_t t0 = os_time_get_nano();
+   cuStreamSynchronize(stream);
+   *ns += (uint64_t)(os_time_get_nano() - t0);
+   (*n)++;
+}
+
 void
 cp_scratch_reset(struct cp_context *cp)
 {
@@ -455,6 +467,17 @@ cp_plan_report(struct cp_context *cp)
            cp->plan.key_builds / scopes, cp->plan.merge_tests / scopes,
            cp->plan.flushes / scopes, cp->plan.scratch_grows,
            cp->plan.arena_grows, cp->plan.fb_reallocs);
+   if (cp->plan.wait_episode_n + cp->plan.wait_quads_n + cp->plan.wait_peel_n +
+       cp->plan.wait_seg_n + cp->plan.wait_upload_n)
+      fprintf(stderr, "cudapipe: main-thread waits: episode drain %.1f ms/%"
+              PRIu64 ", quad counters %.1f ms/%" PRIu64 ", peel checks %.1f "
+              "ms/%" PRIu64 ", segment counters %.1f ms/%" PRIu64
+              ", desc uploads %.1f ms/%" PRIu64 "\n",
+              cp->plan.wait_episode_ns / 1e6, cp->plan.wait_episode_n,
+              cp->plan.wait_quads_ns / 1e6, cp->plan.wait_quads_n,
+              cp->plan.wait_peel_ns / 1e6, cp->plan.wait_peel_n,
+              cp->plan.wait_seg_ns / 1e6, cp->plan.wait_seg_n,
+              cp->plan.wait_upload_ns / 1e6, cp->plan.wait_upload_n);
    if (cp->plan.plan_hits + cp->plan.plan_misses)
       fprintf(stderr, "cudapipe: batch plan answered %" PRIu64 " of %" PRIu64
               " merge decisions (%.1f%%)\n", cp->plan.plan_hits,
@@ -482,10 +505,10 @@ cp_spec_report(struct cp_context *cp)
 void
 cp_context_cleanup(struct cp_context *cp)
 {
-   if (!cp || !cp->screen)
+   if (!cp || !cp->dev)
       return;
 
-   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   cuCtxSetCurrent(cp->dev->cuda_ctx);
    cuCtxSynchronize();
    cp_spec_report(cp);
    cp_plan_report(cp);
@@ -1729,8 +1752,8 @@ cp_depth_attachment_xfer(struct cp_context *cp,
                          const struct cp_render_scope *scope, bool store)
 {
    const struct cp_depth_attachment *depth = &scope->depth;
-   CUfunction fn = store ? cp->screen->kernels.depth_attachment_store
-                         : cp->screen->kernels.depth_attachment_load;
+   CUfunction fn = store ? cp->dev->kernels.depth_attachment_store
+                         : cp->dev->kernels.depth_attachment_load;
    if (!fn || !depth->data || !cp->depthbuf)
       return false;
 
@@ -1750,7 +1773,7 @@ cp_depth_attachment_xfer(struct cp_context *cp,
       .stencil_clear = store ? depth->stencil_clear : 0,
       .stencil_value = depth->stencil_value,
    };
-   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   cuCtxSetCurrent(cp->dev->cuda_ctx);
    void *params[] = { &args };
    CUresult err = cuLaunchKernel(fn,
       (args.width + 15) / 16, (args.height + 15) / 16, args.samples,
@@ -1770,7 +1793,7 @@ cp_clear_depthbuf(struct cp_context *cp, float depth)
    uint32_t value = cp_depth_to_sortable(depth);
    size_t count = (size_t)cp->depthbuf_w * cp->depthbuf_h;
 
-   cuCtxSetCurrent(cp->screen->cuda_ctx);
+   cuCtxSetCurrent(cp->dev->cuda_ctx);
    cuMemsetD32Async(cp->depthbuf, value, count * MAX2(cp->visbuf_samples, 1u), cp->stream);
    cp->depthbuf_cleared = true;
 }
@@ -2306,8 +2329,8 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
    if (samplers_resolved && !sampler_variant &&
        fs->num_sampler_variants < CP_MAX_SAMPLER_VARIANTS &&
        (!fs->tune_cap || fs->tune_done)) {
-      char *sampler_ptx = cp_compile_sampler_variant(cp->screen->sm_major,
-                                                     cp->screen->sm_minor,
+      char *sampler_ptx = cp_compile_sampler_variant(cp->dev->sm_major,
+                                                     cp->dev->sm_minor,
                                                      resolved_samplers,
                                                      fs->uses_tex_3d);
       if (sampler_ptx) {
@@ -2527,7 +2550,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
                    unsigned reject_pass, CUdeviceptr seg_ranges,
                    unsigned num_seg_ranges)
 {
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
    struct cp_shader_binary *fs = state->fs;
 
    if (!fs || !fs->kernel || !vs_output_buf || !state->vs ||
@@ -2897,7 +2920,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
               float *t_shade, float *t_composite,
               struct cp_abuf_seg_shade *seg)
 {
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
    struct cp_shader_binary *fs = state->fs;
 
    *t_interp = 0.0f;
@@ -3259,7 +3282,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    assert(batch_draws > 0);
    const struct cp_draw_state *state = &batch->state;
    const struct cp_rect *draw_scissor = &batch->scissors[batch_draws - 1];
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
    const struct cp_fb_desc *fb = &batch->scope.fb;
 
    /*
@@ -4798,7 +4821,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          abuf_covered = 0;   /* the composite covers the framebuffer */
       } else if (ab->composite) {
          uint32_t ctr[CP_ABUF_COUNTERS] = { 0 };
-         cuStreamSynchronize(cp->stream);
+         cp_sync_timed(cp, cp->stream, &cp->plan.wait_seg_ns,
+                       &cp->plan.wait_seg_n);
          /* One copy: sum3, bsum3 and clist_count are contiguous. The last of
           * them is free rather than merely cheap now — the composite's grid is
           * the covered pixels rather than the framebuffer, which on a sample
@@ -5029,7 +5053,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                         0, cp->stream, pa_params, NULL);
 
          if (pass + 1 >= interval_start + check_interval) {
-            cuStreamSynchronize(cp->stream);
+            cp_sync_timed(cp, cp->stream, &cp->plan.wait_peel_ns,
+                          &cp->plan.wait_peel_n);
             if (!*(volatile uint32_t *)(uintptr_t)cp->peel_any)
                break;
             interval_start = pass + 1;
@@ -5053,7 +5078,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       uint32_t qcounters[2] = { abuf_quads, 0 };
       uint32_t dbg[CP_ABUF_DBG_COUNTERS] = { 0 };
       if (!ab->composite) {
-         cuStreamSynchronize(cp->stream);
+         cp_sync_timed(cp, cp->stream, &cp->plan.wait_quads_ns,
+                       &cp->plan.wait_quads_n);
          cuMemcpyDtoH(qcounters, ab->bsum3, sizeof(qcounters));
       }
 
@@ -5339,7 +5365,7 @@ cp_batch_record_packet(struct cp_context *cp,
 static bool
 cp_pass_appendable(struct cp_context *cp)
 {
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
    struct cp_abuf *ab = cp->abuf;
 
    if (getenv("CPVK_DEBUG_PASS")) {
@@ -5500,7 +5526,7 @@ static bool
 cp_opaque_tile_visibility(struct cp_context *cp, struct cp_pass_seg *segs,
                           unsigned nsegs, unsigned w, unsigned h)
 {
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
    if (!cp_debug->tiled_opaque || !screen->kernels.opaque_tile_count ||
        !screen->kernels.opaque_tile_fill ||
        !screen->kernels.opaque_tile_raster)
@@ -5815,7 +5841,7 @@ cp_tile_census_shader_index(struct cp_context *cp, struct cp_shader_binary *fs)
 static bool
 cp_tile_census_begin(struct cp_context *cp, unsigned w, unsigned h)
 {
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
    unsigned tile = cp_debug->tile_census;
 
    if (!tile || !w || !h || !screen->kernels.tile_census_mark ||
@@ -5934,13 +5960,13 @@ cp_tile_census_common(struct cp_context *cp, struct cp_pass_seg *segs,
       cp->tile_census_marked_draws += segs[s].batch.ndraws;
 
    /* How large the bin itself would be, which the shaded counts cannot say. */
-   if (cp->screen->kernels.tile_census_refs) {
+   if (cp->dev->kernels.tile_census_refs) {
       for (unsigned s = 0; s < nsegs; s++) {
          unsigned n = segs[s].rast_num_triangles;
          if (!n)
             continue;
          void *p[] = { &segs[s].rast, ca };
-         CP_LAUNCH(cp->screen->kernels.tile_census_refs,
+         CP_LAUNCH(cp->dev->kernels.tile_census_refs,
                    MIN2((n + 255) / 256, 1024u), 1, 1, 256, 1, 1, 0,
                    cp->stream, p, NULL);
       }
@@ -5953,7 +5979,7 @@ static void
 cp_tile_census_quads(struct cp_context *cp, struct cp_pass_seg *segs,
                      unsigned nsegs, unsigned w, unsigned h)
 {
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
    struct cp_abuf *ab = cp->abuf;
    struct cp_tile_census_args ca;
 
@@ -5979,7 +6005,7 @@ static void
 cp_tile_census_visbuf(struct cp_context *cp, struct cp_pass_seg *segs,
                       unsigned nsegs, unsigned w, unsigned h)
 {
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
    struct cp_tile_census_args ca;
 
    if (!cp->visbuf || !screen->kernels.tile_census_mark_vis ||
@@ -6000,7 +6026,7 @@ cp_tile_census_visbuf(struct cp_context *cp, struct cp_pass_seg *segs,
 static void
 cp_tile_census_reduce_pass(struct cp_context *cp)
 {
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
 
    if (!cp->tile_census_open)
       return;
@@ -6226,7 +6252,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       if (compact)
          cuMemsetD32Async(ab->seg_counts, 0, CP_PASS_MAX_SEGS, cp->stream);
       void *bucket_params[] = { &bucket };
-      CP_LAUNCH(cp->screen->kernels.abuf_seg_count,
+      CP_LAUNCH(cp->dev->kernels.abuf_seg_count,
                 MIN2(((unsigned)quad_bound + 255) / 256, 1024u),
                 1, 1, 256, 1, 1, 0, cp->stream, bucket_params, NULL);
 
@@ -6254,7 +6280,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
             .ngroups = ngroups,
          };
          void *prefix_params[] = { &prefix };
-         CP_LAUNCH(cp->screen->kernels.abuf_seg_prefix,
+         CP_LAUNCH(cp->dev->kernels.abuf_seg_prefix,
                    1, 1, 1, 1, 1, 1, 0, cp->stream, prefix_params, NULL);
 
          cuMemsetD32Async(seg_cursor, 0, nsegs, cp->stream);
@@ -6265,7 +6291,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          bucket.seg_group = seg_group_dev;
          bucket.group_base = group_base_dev;
          void *scatter_params[] = { &bucket };
-         CP_LAUNCH(cp->screen->kernels.abuf_seg_scatter,
+         CP_LAUNCH(cp->dev->kernels.abuf_seg_scatter,
                    ((unsigned)quad_bound + 255) / 256,
                    1, 1, 256, 1, 1, 0, cp->stream, scatter_params, NULL);
       }
@@ -6386,7 +6412,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       .seg_desc = ngroups > 1 ? descs_dev : 0,
    };
    void *params[] = { &ca };
-   CUresult err = cuLaunchKernel(cp->screen->kernels.abuf_composite,
+   CUresult err = cuLaunchKernel(cp->dev->kernels.abuf_composite,
                                  ((size_t)w * h + 255) / 256, 1, 1,
                                  256, 1, 1, 0, cp->stream, params, NULL);
    if (err != CUDA_SUCCESS)
@@ -6399,7 +6425,7 @@ void
 cp_pass_finish(struct cp_context *cp)
 {
    cp->plan.pass_finish_calls++;
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
    struct cp_abuf *ab = cp->abuf;
    unsigned nsegs = cp->pass.nsegs;
    if (nsegs)
@@ -6596,7 +6622,8 @@ cp_pass_finish(struct cp_context *cp)
 
    /* --- the drain: the six counters and the per-segment quad counts --- */
    uint32_t ctr[CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS] = { 0 };
-   cuStreamSynchronize(cp->stream);
+   cp_sync_timed(cp, cp->stream, &cp->plan.wait_episode_ns,
+                 &cp->plan.wait_episode_n);
    cuMemcpyDtoH(ctr, ab->counters,
                 sizeof(uint32_t) * (CP_ABUF_COUNTERS + nsegs));
 
@@ -7212,7 +7239,7 @@ cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
       cp->resolved = 0;
       cp->peel_next = 0;
 
-      cuCtxSetCurrent(cp->screen->cuda_ctx);
+      cuCtxSetCurrent(cp->dev->cuda_ctx);
       CUresult e1 = cuMemAlloc(&cp->visbuf,
                                cp->fb_cap_px_samples * sizeof(uint64_t));
       CUresult e2 = cuMemAlloc(&cp->depthbuf,
@@ -7398,7 +7425,7 @@ cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
               unsigned width, unsigned height, unsigned stride,
               unsigned pixel_size, const uint32_t value[4], bool depth)
 {
-   struct cp_device *screen = cp->screen;
+   struct cp_device *screen = cp->dev;
    CUfunction fn = depth ? screen->kernels.clear_depth_kernel
                          : screen->kernels.clear_kernel;
 

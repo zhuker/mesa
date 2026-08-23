@@ -235,6 +235,17 @@ cpvk_ResetDescriptorPool(VkDevice _device, VkDescriptorPool pool,
  * application memory -- and a second copy of this switch would be a second
  * thing to be right about a descriptor the first one is wrong about.
  */
+/* Consulted per descriptor write and per draw; getenv scans the environment
+ * every call, so resolve it once. */
+static bool
+cpvk_debug_rt(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("CPVK_DEBUG_RT") != NULL;
+   return v;
+}
+
 /*
  * The storage-image half of a descriptor, resolved from the view.
  *
@@ -298,7 +309,7 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
                       const VkDescriptorImageInfo *ii,
                       const VkDescriptorBufferInfo *bi)
 {
-   if (getenv("CPVK_DEBUG_RT"))
+   if (cpvk_debug_rt())
       fprintf(stderr, "descw flat=%u type=%u ii=%p bi=%p\n", flat, type,
               (const void *)ii, (const void *)bi);
 
@@ -376,7 +387,7 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
          }
       }
 
-      if (getenv("CPVK_DEBUG_RT")) {
+      if (cpvk_debug_rt()) {
          VK_FROM_HANDLE(cpvk_image_view, dv, ii->imageView);
          fprintf(stderr, "desc flat=%u type=%u tex=%p "
                  "samp=%u img=%ux%u\n", flat, type,
@@ -412,7 +423,7 @@ cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
                           uint32_t copyCount,
                           const VkCopyDescriptorSet *pCopies)
 {
-   if (getenv("CPVK_DEBUG_RT"))
+   if (cpvk_debug_rt())
       fprintf(stderr, "updsets n=%u copies=%u\n", writeCount, copyCount);
 
    for (uint32_t w = 0; w < writeCount; w++) {
@@ -812,10 +823,24 @@ static void
 cpvk_plan_batches(struct cpvk_cmd_buffer *cmd)
 {
    const struct cpvk_op *prev = NULL;
+   for (unsigned s = 0; s < cmd->num_scopes; s++) {
+      cmd->scopes[s].planned_draws = 0;
+      cmd->scopes[s].planned_blended_draws = 0;
+      cmd->scopes[s].planned_tris = 0;
+   }
    for (unsigned i = 0; i < cmd->num_ops; i++) {
       struct cpvk_op *op = &cmd->ops[i];
       if (op->kind == CPVK_OP_DRAW) {
          struct cpvk_draw_cmd *d = &op->draw_cmd;
+         if (op->scope_index < cmd->num_scopes) {
+            struct cp_render_scope *sc = &cmd->scopes[op->scope_index];
+            sc->planned_draws++;
+            sc->planned_tris +=
+               (uint64_t)cp_triangles_for_draw(d->call.mode, d->range.count) *
+               MAX2(d->call.instance_count, 1u);
+            if (d->pipeline && d->pipeline->blend.enable)
+               sc->planned_blended_draws++;
+         }
          if (prev && prev->kind == CPVK_OP_DRAW &&
              prev->scope_index == op->scope_index) {
             d->plan_prev = &prev->draw_cmd;
@@ -1478,7 +1503,7 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
           * to write them and the resolve needs in order to find them. */
          fb.color_sample_stride = (unsigned)cimg->sample_stride;
 
-         if (getenv("CPVK_DEBUG_RT"))
+         if (cpvk_debug_rt())
             fprintf(stderr, "rt: %ux%u layer=%u level=%u layers=%u img=%ux%u "
                     "fmt=%u base=%p\n", fb.width, fb.height,
                     view->vk.base_array_layer, view->vk.base_mip_level,
@@ -3411,7 +3436,7 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
       return VK_SUCCESS;
    }
 
-   if (c->samples > 1 && cp->screen->kernels.resolve_samples &&
+   if (c->samples > 1 && cp->dev->kernels.resolve_samples &&
        c->encoding >= 0 && c->width_bytes && c->rows) {
       /*
        * Resolve on the device, with the kernel that already exists.
@@ -3435,7 +3460,7 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
          .encoding = c->encoding,
       };
       void *params[] = { &ra };
-      if (cuLaunchKernel(cp->screen->kernels.resolve_samples,
+      if (cuLaunchKernel(cp->dev->kernels.resolve_samples,
                          (ra.width + 15) / 16, (ra.height + 15) / 16, 1,
                          16, 16, 1, 0, cp->stream, params, NULL) == CUDA_SUCCESS)
          return VK_SUCCESS;
@@ -3447,7 +3472,7 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
    }
 
 
-   if (getenv("CPVK_DEBUG_RT")) {
+   if (cpvk_debug_rt()) {
       /* The first texels of the source, as halves: what the pass just
        * rendered, before this copy places it. */
       uint16_t h[8] = { 0 };
@@ -3461,7 +3486,7 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
    }
 
    if (c->src_w && c->encoding >= 0 && c->dst_encoding >= 0 &&
-       cp->screen->kernels.blit_linear) {
+       cp->dev->kernels.blit_linear) {
       /*
        * A scaling blit, on the device.
        *
@@ -3495,7 +3520,7 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
          .filter_linear = c->filter_linear,
       };
       void *params[] = { &ba };
-      CUresult err = cuLaunchKernel(cp->screen->kernels.blit_linear,
+      CUresult err = cuLaunchKernel(cp->dev->kernels.blit_linear,
                                     (c->dst_w + 15) / 16,
                                     (c->dst_h + 15) / 16, 1,
                                     16, 16, 1, 0, cp->stream, params, NULL);
@@ -3526,7 +3551,7 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
    if (cuMemcpy2DAsync(&m, cp->stream) != CUDA_SUCCESS)
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
-   if (getenv("CPVK_DEBUG_RT")) {
+   if (cpvk_debug_rt()) {
       /* And what landed, read back from the destination this copy just
        * wrote: the face of the cube level, not the offscreen it came from. */
       uint16_t hd[8] = { 0 };

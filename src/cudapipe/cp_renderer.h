@@ -109,15 +109,6 @@ struct cp_batch_key {
    uint32_t num_samplers;
 };
 
-/*
- * The Gallium object, and the renderer inside it.
- *
- * pipe_context comes first because the driver's entry points cast a
- * pipe_context straight to this. Everything the pipeline itself uses lives in
- * cp_context beside it, which is what the native Vulkan driver will construct
- * without a pipe_context existing at all.
- */
-struct cp_gallium;
 struct cp_abuf;
 
 /* A native frontend may stage CPU-written descriptor snapshots separately
@@ -191,9 +182,8 @@ struct cp_context {
    struct cp_abuf *abuf;
    struct cp_abuf_dbg_state abuf_dbg;
 
-   /* The device, not the screen: four fields the pipeline reads, and no
-    * pipe_screen behind them. A Vulkan front end supplies one directly. */
-   struct cp_device *screen;
+   /* The device: the CUDA context, the SM, the loaded kernels. */
+   struct cp_device *dev;
 
    /*
     * Draws held back for merging. `pending` means one or more draws have been
@@ -465,6 +455,18 @@ struct cp_context {
       uint64_t scopes;          /* render scopes begun */
       uint64_t plan_hits;       /* merge answered by the recorded plan */
       uint64_t plan_misses;     /* merge answered dynamically */
+      /*
+       * Where the main thread actually waits, in nanoseconds. perf showed 65%
+       * of its cycles inside libcuda; this splits that between the waits the
+       * algorithm requires (episode counters it must read to decide) and
+       * everything else, which is what decides whether removing a wait is
+       * worth renderer surgery.
+       */
+      uint64_t wait_episode_ns, wait_episode_n;    /* pass-finish drain */
+      uint64_t wait_quads_ns, wait_quads_n;        /* non-composite qcounters */
+      uint64_t wait_peel_ns, wait_peel_n;          /* peel-advance check */
+      uint64_t wait_seg_ns, wait_seg_n;            /* segment composite ctrs */
+      uint64_t wait_upload_ns, wait_upload_n;      /* desc-arena HtoD */
    } plan;
 
    /* GPU-resident pipeline state — managed memory, written by CPU on state

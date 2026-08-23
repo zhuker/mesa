@@ -17,6 +17,7 @@
 #include "vk_common_entrypoints.h"
 #include "vk_sync.h"
 #include "vk_util.h"
+#include "util/os_time.h"
 
 struct cpvk_pending_submit {
    struct cpvk_pending_submit *next;
@@ -204,6 +205,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
        * Upload each recorded arena once instead. The synchronous copy also
        * orders it before both CUDA streams used below. */
       if (cmd->desc_arena_dirty) {
+         int64_t upload_t0 = os_time_get_nano();
          for (unsigned a = 0; a < cmd->num_desc_retired; a++) {
             if (cuMemcpyHtoD(cmd->desc_retired[a].dev,
                              cmd->desc_retired[a].host,
@@ -215,6 +217,9 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
                           cmd->desc_arena_used) != CUDA_SUCCESS)
             return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
          cmd->desc_arena_dirty = false;
+         dev->renderer.plan.wait_upload_ns +=
+            (uint64_t)(os_time_get_nano() - upload_t0);
+         dev->renderer.plan.wait_upload_n++;
       }
 
       /* In record order: a clear after a draw must not run before it. */

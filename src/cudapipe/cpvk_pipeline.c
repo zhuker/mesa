@@ -1325,6 +1325,22 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
          .front_ccw = rs && rs->frontFace == VK_FRONT_FACE_COUNTER_CLOCKWISE,
          .scissor = true,
       };
+      /* The cast below relies on VkCompareOp and cp_compare_func sharing
+       * values. That was a silent agreement; now it is a checked one. */
+      static_assert((int)VK_COMPARE_OP_NEVER == CP_FUNC_NEVER &&
+                    (int)VK_COMPARE_OP_LESS == CP_FUNC_LESS &&
+                    (int)VK_COMPARE_OP_EQUAL == CP_FUNC_EQUAL &&
+                    (int)VK_COMPARE_OP_LESS_OR_EQUAL == CP_FUNC_LEQUAL &&
+                    (int)VK_COMPARE_OP_GREATER == CP_FUNC_GREATER &&
+                    (int)VK_COMPARE_OP_NOT_EQUAL == CP_FUNC_NOTEQUAL &&
+                    (int)VK_COMPARE_OP_GREATER_OR_EQUAL == CP_FUNC_GEQUAL &&
+                    (int)VK_COMPARE_OP_ALWAYS == CP_FUNC_ALWAYS,
+                    "depth_func is a value cast");
+      static_assert((int)VK_CULL_MODE_NONE == CP_FACE_NONE &&
+                    (int)VK_CULL_MODE_FRONT_BIT == CP_FACE_FRONT &&
+                    (int)VK_CULL_MODE_BACK_BIT == CP_FACE_BACK &&
+                    (int)VK_CULL_MODE_FRONT_AND_BACK == CP_FACE_FRONT_AND_BACK,
+                    "cull_face is a value cast");
       const VkPipelineDepthStencilStateCreateInfo *ds = info->pDepthStencilState;
       pipeline->depth = (struct cp_depth_state) {
          .depth_enabled = ds && ds->depthTestEnable,

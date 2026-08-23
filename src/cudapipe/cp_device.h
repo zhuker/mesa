@@ -1,11 +1,8 @@
 /*
  * The device a renderer runs on.
  *
- * Deliberately free of Gallium: a CUDA context, the compiled kernels and the
- * compute capability are everything the draw pipeline reads of a screen -- it
- * does so across 118 sites -- so this is what a Vulkan front end supplies
- * instead of a pipe_screen. cp_screen embeds one; the native driver holds one
- * of its own.
+ * A CUDA context, the compiled kernels and the compute capability:
+ * everything the draw pipeline needs of the device it runs on.
  */
 
 #ifndef CP_DEVICE_H

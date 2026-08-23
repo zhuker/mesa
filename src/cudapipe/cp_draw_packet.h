@@ -27,6 +27,17 @@ struct cp_render_scope {
    struct cp_depth_attachment depth;
    uint32_t attachment_samples;
    uint32_t serial;
+
+   /*
+    * What the recorded pass will ask of this scope, computed by
+    * cpvk_plan_batches() when recording ends. Zero until then. This is the
+    * per-scope half of the record-time plan: a resource decision -- sizing,
+    * path choice, a captured launch sequence -- can read it before the first
+    * draw executes instead of discovering it draw by draw.
+    */
+   uint32_t planned_draws;
+   uint32_t planned_blended_draws;
+   uint64_t planned_tris;
 };
 
 #define CP_RENDER_SCOPE_NONE      UINT32_MAX

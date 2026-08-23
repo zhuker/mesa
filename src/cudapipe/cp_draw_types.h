@@ -1,15 +1,11 @@
 /*
  * What the draw pipeline needs to know about a draw.
  *
- * The pipeline itself -- cp_draw_execute_batch(), 1,973 lines of it -- touches
- * Gallium on sixteen lines, and reads exactly eight fields of
- * pipe_draw_info. This is those eight, so the body can stay as it is while
- * the front end above it changes: the Gallium adapter fills one in from
- * pipe_draw_info, and the native Vulkan driver fills the same one in from a
- * recorded command buffer.
- *
- * The field names are deliberately those of pipe_draw_info, so that
- * introducing this changed no line of the pipeline that reads them.
+ * The field names date from the port, when they were chosen to match
+ * pipe_draw_info so extraction changed no line of the pipeline. Nothing
+ * enforces that correspondence any more -- this driver's recorded command
+ * buffer is the only producer -- so they are just names now, renameable
+ * whenever a better one exists.
  */
 
 #ifndef CP_DRAW_TYPES_H
