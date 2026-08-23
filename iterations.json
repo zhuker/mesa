@@ -35,10 +35,10 @@
   {
    "id": 4,
    "name": "fuse vertex fetch into the generated vertex shader",
-   "verdict": "pending",
-   "old_median_ms": null,
+   "verdict": "reverted",
+   "old_median_ms": 48.05,
    "sweep_hot_ms": null,
-   "note": "target: vertex_fetch 1.52 + VS 0.75 ms/frame, 204 launches each; preserve generic vertex formats, instancing/divisors, draw rows, indexing, and shader ABI; measure before coding"
+   "note": "global-buffer helper ABI regressed partial replay 23.5->48.05ms; trivial VS 20->108 regs, 6->2 blocks/SM. Lane-local form invalid across LLVM local/NVRTC generic pointer ABI. All source reverted. Viable only with separate classic/fused binaries plus address-space-correct local result ABI and occupancy-tier selection."
   }
  ]
 }

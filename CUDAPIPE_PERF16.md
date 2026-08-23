@@ -211,3 +211,36 @@ The huge-tile queue cannot disappear safely: independent CTA consumers require
 its 16 MB / 16-byte-per-item write+read handoff. Therefore this becomes a
 measured opt-in A/B after iteration 4, not a speculative default. Full design:
 `/tmp/perf16/rast-persistent-design.md`.
+
+## Iteration 4 — result: rejected and fully reverted
+
+Fresh trace measured 120,894 exact `cp_vertex_fetch → main` chains in 15 s:
+fetch 1.358 ms/frame, generated VS 0.699 ms, and a CUPTI-inflated traced gap
+of 1.597 ms (~193 pairs/frame). The opportunity was structurally real. The
+capture is 82% direct indexed, 57% instanced and 39% batched, so a hard-coded
+format fast path would not be an acceptable implementation.
+
+Two source-sharing forms failed for different architectural reasons:
+
+1. A lane-local result block preserved one generic fetch implementation and
+   eliminated global scratch, but LLVM NVPTX local pointers crossed into the
+   NVRTC helper as raw addresses rather than correctly converted generic
+   pointers. Compute Sanitizer found invalid local reads. This ABI is invalid.
+2. The established global-buffer ABI was correct and passed 43/43, but linking
+   the generic fetch graph raised a trivial VS from **20→108 registers** and
+   **6→2 blocks/SM**. The old capture's partial median became **48.05 ms**
+   versus 23.42–23.67. `__noinline__` did not isolate allocation. Passing a
+   null runtime helper still carried 108 registers, so it was not an honest
+   revert.
+
+**Why/retry condition:** fusion needs resource isolation first: separate
+classic and fused VS binaries; an address-space-correct lane-result ABI built
+in one NVPTX model; register/occupancy-tier admission per real shader. If CUDA
+12.8 device calls still force union allocation, generate a fetch prologue from
+a declarative format ABI or use a persistent two-phase vertex pipeline. Do not
+copy static format cases into LLVM. The rejected patch is
+`/tmp/perf16/iter4-rejected.patch`; the final source tree is clean.
+
+**Interference:** none because everything was reverted. The lesson applies to
+future helper fusion: a null call path is not resource isolation, and every
+revert control must select a binary without the helper call graph.
