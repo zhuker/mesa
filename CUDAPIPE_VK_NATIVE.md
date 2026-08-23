@@ -564,6 +564,13 @@ After sampler specialisation reached multi-texture shaders, one further
 repetition of each: **7.58 ms** and **24.58 ms**, with both sets of llvmpipe
 sentinels still exactly at their recorded structure.
 
+After the record-time batch plan (`7a6186d0561`), the full set again on that
+exact tree: 600-frame sweep **29.77 ms / 39.98 s** (against 29.79 / 41.51),
+replay medians **7.63 ms** and **24.71 ms**, both sentinel sets bit-exact at
+the recorded structure, and the NVIDIA animated comparison unchanged including
+the standing `gltfscenerendering` exception. The plan is performance-neutral,
+as intended: it moves work off the submit path without changing a decision.
+
 **Replay medians are only comparable within one session.** The architecture
 checkpoint recorded 7.22–7.26 ms for Crossroads; re-measuring that exact
 committed build on the machine in this session gave **7.76 ms**, against this
