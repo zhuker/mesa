@@ -163,10 +163,18 @@
   {
    "id": 20,
    "name": "completed opaque-episode explicit CUDA graph",
+   "verdict": "reverted before implementation",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "5902 opaque episodes/1.31M ops; traced internal gaps 1.373ms/frame, optimistic graph hit ceiling 0.677-0.900ms. 4532 unique command plan generations and zero within-generation recipe reuse; huge graph memory. No old hits, restored."
+  },
+  {
+   "id": 21,
+   "name": "machine-scaled persistent raster stage2/3",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "census exact completed opaque episode recipes/gaps; defer decision-free opaque segment operations and grouped shading into one explicit update-free DAG using episode-owned immutable args and shared scratch epochs. Target normal opaque workload/1-3ms."
+   "note": "implement measured persistent consumer design preserving machine-scaled queue drain: bounded stage2 producers + persistent stage3 consumers with done/publication protocol, not producer-local fusion. Target 4.5ms stage2/3 chain and remove handoff."
   }
  ]
 }

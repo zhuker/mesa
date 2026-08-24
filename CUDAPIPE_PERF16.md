@@ -863,3 +863,34 @@ addresses. Tuner/module/framebuffer/scratch epochs invalidate. No A-buffer, peel
 overflow, side-stream, query, debug or host decision enters this iteration.
 Classic replay is complete fallback before launch; graph-launch failure is device
 loss, never partial replay. Target the 1–3-ms whole-DAG opportunity.
+
+## Iteration 20 — result: opaque graph rejected by reuse and ceiling
+
+Full old: 5,902 opaque episodes, 73,280 segments, 166,694 draws and 1.314M
+joined device operations. All internal opaque gaps sum to 1.373 ms/frame. Even
+an optimistic semantic LRU gives 0.900-ms one-touch / 0.677-ms two-touch hit
+ceiling before launch/cache cost. More decisively, 4,532 submits reuse seven
+command objects but have 4,532 unique plan generations and **zero repeated
+episode recipes within a generation**. Command-owned graphs retired on re-record
+have no old hits. Shared scratch reaches 1.03 GiB old/4.65 GiB multithreading;
+256 large retained graphs measure ~1.46 GiB RSS +632 MiB device. No graph code
+survives. Report: `/tmp/perf16/iter20-report.md`. This closes CUDA Graphs until
+command recording or workload reuse changes materially.
+
+## Iteration 21 — machine-scaled persistent raster stage2/3
+
+The refreshed raster chain remains ~7.4 ms/frame; stage2+stage3 own roughly
+4.5 ms. Iteration 3's clip+s1 fusion wins, but producer-local stage2/3 fusion
+regressed 3.6 ms because each producer warp consumed only its own tiles and
+serialized queue drain. The retained design is different: preserve a bounded
+machine-wide stage2 producer population and a persistent machine-scaled stage3
+consumer population in one launch, using global queue publication and an exact
+done protocol. Consumers steal all tiles, not producer-local work.
+
+Measure queue production/concurrency and choose role counts from SM/resource
+facts. Consumer polling must be bounded/backed off; publication uses release/
+acquire-safe CUDA atomics or kernel-visible fences; overflow and queue reuse stay
+classic. Stable primitive IDs, setup cache tags, direct/A-buffer semantics and
+coverage/depth atomics remain exact. Keep separate stage2/3 as fallback. The
+goal is real device work/latency improvement across the 4.5-ms chain, not merely
+one fewer host call. Full design starts at `/tmp/perf16/rast-persistent-design.md`.
