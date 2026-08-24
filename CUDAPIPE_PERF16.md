@@ -703,3 +703,33 @@ execution ownership become the base for coherent mipmapped/layered CUDA arrays,
 cube/3D/BC views and A-buffer coverage. If still neutral, broad arrays remain
 economically unjustified despite working hardware sampling. Default software
 behavior and `CUDAPIPE_INLINE_FS` remain unchanged until full gates.
+
+## Iteration 15 — result: compound mechanism works, coverage rejection
+
+Same-LLVM hardware execution reaches **88 registers, zero spill, two blocks/SM**
+versus software fused 203/one block. PTX contains `tex.2d` and no software
+sampler, interpolation helper or local traffic. Focused direct chains improve
+18 vs 26–32 µs and A-buffer shade+composite 20 vs 30 µs. But old coverage is
+21,929/157,234 FS launches (**13.9%**): 13.4% direct, 16.0% A-buffer. Paired
+old results HW 23.390/23.342 vs software 23.318/23.353 ms, center **+0.031 ms**
+with opposite pair signs. Production and padded image layouts are fully restored.
+Patch/report: `/tmp/perf16/iter15-rejected.patch`, `iter15-report.md`. Coherent
+arrays still need launch-weighted direct coverage well above 29%; do not fund
+them from this neutral result.
+
+## Iteration 16 — same-LLVM specialized software sampler
+
+The compiler boundary is now the dominant fragment blocker. Hardware proves a
+shader without `cp_sampler.cu` can run at 88 registers, while software remains
+203/236 even with same-LLVM interpolation. Sampler variants cover most hot
+launches but still link an opaque PTX call graph, so literal state cannot remove
+its unused wrap/filter/LOD/format paths from the generated shader allocation.
+
+First build a focused proof: an owned freestanding software-sampler core linked
+as LLVM bitcode into a retained pristine NIR clone, with literal sampler state
+and instruction target embedded before optimization. Require the call and local
+objects to disappear, exact software results, and a real occupancy/instruction
+move on representative old shaders. Only then design retained-NIR lifetime and
+lazy per-state variants. The prize is broad coverage of the ~9-ms FS class and
+a clean path to specialize image encoding/dimension later; a generic inlined
+megafunction that stays 203/236 is rejected before integration.

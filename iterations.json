@@ -123,10 +123,18 @@
   {
    "id": 15,
    "name": "same-LLVM hardware texture execution",
+   "verdict": "reverted",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "same-LLVM HW worked (88 regs, 2 blocks, no spill; focused chains 8-12us faster) but only 13.9% launches hit; old HW 23.366 vs SW23.336 center +0.031ms. Fully restored. Arrays still need >29% direct weighted coverage."
+  },
+  {
+   "id": 16,
+   "name": "same-LLVM specialized software sampler",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "rebuild proven direct tex.2d PITCH2D path as an inline-interpolation LLVM execution, eliminating both software sampler and 190-reg helper floor. Measure exact eligible chain and old; foundation for mipmapped arrays only if compound wins."
+   "note": "prototype owned software sampler core as LLVM bitcode, inline into retained pristine NIR variant with literal sampler state and DCE unused format/filter/address paths. Target dominant 203/236-reg FS across broad launch coverage; resource proof first."
   }
  ]
 }
