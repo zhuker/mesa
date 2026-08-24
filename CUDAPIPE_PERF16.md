@@ -395,3 +395,41 @@ exact-quad standalone interpolator when choosing a bare execution. Software
 sampling remains current/default unless whole-chain A/B says otherwise. This
 execution boundary is also the clean prerequisite for broad CUDA-array texture
 coverage and graph nodes with settled functions.
+
+## Iteration 8 — result: rejected and fully reverted
+
+The mechanism reached its resource goal: 28 eligible hardware modules at 34–79
+registers, 3–6 blocks/SM, no helper/sampler references; focused case 38 regs,
+zero spill, six blocks. Direct admission was only **13.6%**. Full replay center
+was hardware **23.885** vs software **23.818 ms** (+0.067, neutral/slower).
+
+A bounded matched-chain trace proves the operation itself works:
+
+- software FS 25.206 → bare hardware FS 2.688 µs;
+- slim compact 6.410 → compact+interpolate 13.224 µs;
+- whole admitted device chain **33.348 → 17.648 µs** (−15.700 mean, −5.344
+  paired median).
+
+Pre-interpolation consumes ~30% of the mean FS saving; low coverage, not texture
+instructions, rejects the frame result. Break-even is 18.7–28.8% direct
+coverage. Adding multi-mip pure-2D draws predicts ~22%, straddling break-even.
+Even an unrealistic all-direct hardware upper bound is only 0.31–1.05 ms net,
+so coherent CUDA mipmapped arrays are not justified now. Reports:
+`/tmp/perf16/iter8-report.md`, `iter8-decomp.md`; patch reverted.
+
+## Current device-work ranking and iteration 9
+
+Final trace (625 frame markers): generated `main` 8.944 ms/frame; raster chain
+**7.725 ms** (fused clip+s1 direct 1.762, abuf 1.541; stage2 total 1.172;
+stage3 total 3.252); vertex fetch 1.374; remaining A-buffer resolve/sort/scan
+under 1.5. The next multi-ms target is raster work, not enqueue geometry.
+
+Every fused clip+s1 thread carries the polygon clipper's ~5,248-byte stack even
+though wholly-inside triangles take the fast branch. Iteration 9 first measures
+inside/outside/crossing rates. If crossings are sparse, a lightweight
+accept+copy+stage1 kernel handles inside triangles and appends only crossing
+input IDs to a clip worklist; a second heavy clip+stage1 kernel consumes that
+list before unchanged machine-wide stage2/3. Both use the same `cp_clip_one`/
+`cp_rast_small_or_defer` bodies and exact output/active/stable-ID rules. This
+adds a launch but removes the 5-KiB stack from the common grid and is the
+long-term work-distribution pattern needed by more complete clipping.

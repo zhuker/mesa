@@ -67,10 +67,18 @@
   {
    "id": 8,
    "name": "pre-interpolate in compact kernel; bare hardware-texture FS execution",
+   "verdict": "reverted",
+   "old_median_ms": 23.885,
+   "sweep_hot_ms": null,
+   "note": "bare HW FS 34-79 regs/3-6 blocks, but only 13.6% direct hits; full center HW 23.885 vs off 23.818 (+0.067). Trace: admitted chain 33.348->17.648us, texture works; low coverage. Multi-mip predicts ~22% coverage near break-even; full arrays upper bound 0.31-1.05ms, no-go. Reverted."
+  },
+  {
+   "id": 9,
+   "name": "split trivial clip accept from heavy polygon clipping",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "move direct interpolation into existing compact kernel (still 2 launches), use separate abuf interpolate where needed, then run resource-isolated bare FS. Goal: remove 190-reg fs-helper floor from hardware execution while avoiding classic full-frame interpolator."
+   "note": "clip+stage1 owns 3.303ms/frame and every thread carries ~5KiB clipping stack. Measure inside/cross fraction; lightweight accept+copy+stage1 kernel queues only crossing triangles to heavy clip+stage1, preserving IDs/queues."
   }
  ]
 }
