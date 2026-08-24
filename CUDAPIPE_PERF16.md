@@ -575,3 +575,32 @@ the benefit. The tail graph is expected at most 0.5–1 ms and is kept only with
 unprofiled evidence. Its real value is proving the cache/epoch/fallback model
 needed to expand the record-time command plan into update-free whole-batch and
 episode-segment launch DAGs (1–3 ms opportunity).
+
+## Iteration 12 — result: measure-first rejection, source unchanged
+
+Complete old census: 318,454 candidate three-kernel tails but 65,905 exact
+argument/function keys. Reuse-distance p50/p90/p99/max 155/750/25,343/50,857.
+Bounded LRU hit rates are only 69.2–76.5% at 256–4096 entries; even an
+optimistic two-touch ghost policy needs 27,563–43,944 graph instantiations.
+CUDA 12.8 microbench: 14.8–15.1 µs instantiate and 44–46 KiB retained per
+graph+exec, giving 0.27–0.43 ms/frame build cost and 11–183 MiB caches before
+138–149 graph launches/frame. Exact-hit gap ceiling is just 0.63–0.68 ms/frame.
+Per-tail graphs cannot repay churn; no source survives. Report:
+`/tmp/perf16/iter12-report.md`.
+
+Path detail reinforces the architecture: plain fused tails recur well (90.3%
+at 256), but REUSE is 0.87% and A-buffer 68.5%. Whole-batch/segment graphs need
+record-time recipes plus stable command-owned execution storage, not a larger
+context LRU over rotating scratch pointers. Tail rejection does not invalidate
+the 1–3-ms whole-DAG opportunity.
+
+## Iteration 13 — exact fixed-edge all-stage raster migration
+
+Implement the correctness oracle from `fixed-edge-design.md`: signed int32
+window coordinates snapped to eight fractional bits, signed int64 edge planes
+and top-left bias, exact integer sample offsets, and one affine depth/
+barycentric contract shared with FS interpolation. Production cannot mix fixed
+and float stages. Staged modes validate direct fixed coverage first, then exact
+stage1/2 stepping and stage3 min/max classify; mode zero compiles the legacy
+path. The goal is drift-free coverage and conformance that also removes edge
+recomputation and enables valid tile acceptance, estimated 0.5–1.1 ms.

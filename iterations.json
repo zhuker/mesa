@@ -99,10 +99,18 @@
   {
    "id": 12,
    "name": "explicit update-free CUDA graph for raster tail",
+   "verdict": "reverted",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "measure-first stop: 318k chains/65.9k exact keys; LRU hit 69-77%, two-touch still 27k-44k instantiations, 11-183MiB cache, 0.27-0.43ms/frame builds vs 0.63-0.68ms gap ceiling. Source restored. Whole-batch graphs need stable command-owned slots."
+  },
+  {
+   "id": 13,
+   "name": "exact fixed-edge raster oracle and all-stage migration",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "cache exact clip+s1->s2->s3 graph exec by functions/args/allocation epoch; one graph launch replaces three kernel enqueues. Measure key reuse first; classic miss/fallback; foundation for whole-batch record-time graphs."
+   "note": "8-bit snapped subpixel coordinates, int64 biased edges, exact MSAA/top-left, shared stage1-3 and FS barycentric contract. First direct oracle/revert, then stepping and stage3 accept only if exact. Target 0.5-1.1ms raster work."
   }
  ]
 }
