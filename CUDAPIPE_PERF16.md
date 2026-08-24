@@ -894,3 +894,44 @@ classic. Stable primitive IDs, setup cache tags, direct/A-buffer semantics and
 coverage/depth atomics remain exact. Keep separate stage2/3 as fallback. The
 goal is real device work/latency improvement across the 4.5-ms chain, not merely
 one fewer host call. Full design starts at `/tmp/perf16/rast-persistent-design.md`.
+
+## Iteration 21 — result: persistent raster scheduler loses the boundary saving
+
+The exact ordinary two-phase implementation used dynamic machine-wide claims,
+device-scope release/acquire publication and the current shared queues. It passed
+44/44 and focused classic/persistent hashes. The merged direct/A-buffer kernels
+used 56 registers, 92 bytes shared, no spill and allowed 18 blocks/SM.
+
+That resource result did not pay. In an 8-second trace classic stage2+stage3
+used 1,158.61 ms versus 1,298.76 ms merged (+140.15 ms), while complete paired
+gaps offered only ~123.7 ms. Per chain, direct adds 3.894 µs before removing a
+1.642-µs mean gap; A-buffer adds 1.751 µs before removing a 2.853-µs mean gap.
+Old reverse controls were 23.686→23.456 then 23.595→23.603 ms: only 0.111 ms
+aggregate and non-reproducing. The scheduler atomics/work assignment cost more
+than the boundary. Production is restored. Report `/tmp/perf16/iter21-report.md`;
+rejected patch `/tmp/perf16/iter21-rejected.patch`. Do not retry ordinary
+persistent stage2/3 without eliminating dynamic per-item scheduling.
+
+## Iteration 22 — exact out-of-line sampler / per-key execution proof
+
+Generated shader `main` remains 11.1 ms/frame and the 4096x256 class alone is
+7.71 ms/frame. Iteration 18 proved exact canonical software sampling but its
+always-inline two-key modules regressed 5–7%: lower registers duplicated too much
+instruction/code footprint. Phase A therefore changes the mechanism, not the
+coverage claim.
+
+In a detached tree compare current generic callable sampling, the rejected exact
+inline form, a canonical exact **noinline direct-call** helper pruned by operation,
+target, encoding, sRGB and sampler state, and smaller noinline semantic layers.
+Deduplicate identical site/class bodies. Measure real 203/236-register hot shader
+variants by whole launch, executed instructions, code bytes, call-frame local
+traffic and compilation cost. The existing 25-class matrix including fractional
+LOD remains a zero-tolerance gate.
+
+Single-key launches can use one exact module without a row branch (47.64% of the
+fresh timed FS window). If two keys are needed, evaluate one device quad partition
+followed by two reusable per-key modules, rather than another `(shader,key-set)`
+mixed inline module. Counts stay device-resident; slots are disjoint; A-buffer
+composites only after both kernels. All possible host rows must resolve or the
+whole launch uses the generic path. No production edit until a real whole-launch
+win supports at least 1.5 ms gross opportunity.

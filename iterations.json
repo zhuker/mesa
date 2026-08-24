@@ -171,10 +171,18 @@
   {
    "id": 21,
    "name": "machine-scaled persistent raster stage2/3",
+   "verdict": "reverted",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "exact persistent stage2/3 passed44/44 and resource gate (56regs,18 blocks/SM,no spill) but trace classic1158.61ms vs merged1298.76ms; scheduler +140.15ms exceeds complete gap ceiling ~123.7ms. Reverse old only +0.111ms aggregate/nonreproducing. Restored."
+  },
+  {
+   "id": 22,
+   "name": "exact out-of-line sampler and per-key FS dispatch proof",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "implement measured persistent consumer design preserving machine-scaled queue drain: bounded stage2 producers + persistent stage3 consumers with done/publication protocol, not producer-local fusion. Target 4.5ms stage2/3 chain and remove handoff."
+   "note": "detached phase A compares generic callable, rejected exact inline, exact noinline/split helpers, and per-key quad partition on real hot variants. Admit only bit-exact whole-launch win with >=1.5ms gross; no production edit yet."
   }
  ]
 }
