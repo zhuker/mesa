@@ -155,10 +155,18 @@
   {
    "id": 19,
    "name": "stable-recipe whole-batch CUDA graphs",
+   "verdict": "reverted before implementation",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "full old has zero strict safe direct candidates; normal opaque goes to episodes. Samples ceiling <0.5ms and huge scratch. 12-node graph mechanics cheap but wrong unit. Tree restored."
+  },
+  {
+   "id": 20,
+   "name": "completed opaque-episode explicit CUDA graph",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "census pointer-independent command/batch recipe recurrence; allocate stable command-owned execution storage and explicit update-free graph for decision-free direct batch chain. Avoid tail exact-key churn; target 1-3ms of ~5.7ms idle gaps."
+   "note": "census exact completed opaque episode recipes/gaps; defer decision-free opaque segment operations and grouped shading into one explicit update-free DAG using episode-owned immutable args and shared scratch epochs. Target normal opaque workload/1-3ms."
   }
  ]
 }

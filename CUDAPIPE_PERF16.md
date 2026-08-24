@@ -830,3 +830,36 @@ node updates, stale arena pointers or host-dependent A-buffer/peel branches. A
 miss/failure and unsupported batch use the exact classic path. This is the clean
 foundation for later conditional episode graphs and should target 1–3 ms, not
 the already-rejected two-handoff tail ceiling.
+
+## Iteration 19 — result: direct graph has zero old-capture coverage
+
+Full replay: 4,532 command-buffer submits reuse seven mutable native command
+objects; 307,811 batches and 496,497 episode attempts. There are 12,999
+non-appending unblended calls, but **zero strict whole-direct candidates**: 9,250
+are strips, 2,944 points, 664 triangle-list MSAA and 141 other exceptional
+cases. Normal safe triangle-list opaque work is routed into opaque episodes.
+Samples expose only two chains/frame with <0.5-ms absolute and ~0.03–0.06-ms
+normal API ceiling, plus >=446 MiB copied scratch if command-owned. No graph
+source survives. Report: `/tmp/perf16/iter19-report.md`.
+
+The Driver mechanism is not the blocker: 12-node instantiate median is 5.8 µs;
+args copy at node add; same-exec launches order safely on the one stream. The
+unit was wrong. Do not retry direct batch caching.
+
+## Iteration 20 — completed opaque-episode graph
+
+Opaque episodes are the normal decision-free workload. Measure completed episode
+frequency, segment/group/node shape, exact resource/function recipe recurrence,
+small-gap/device time and scratch high-water. If admitted, defer the episode's
+segment operations rather than enqueueing them during append; at finish resolve
+one immutable operation list containing geometry, visibility and grouped shading,
+then send it to either classic or explicit-graph sink. A graph hit launches the
+whole episode DAG once.
+
+The episode owns stable argument/upload bytes; large deterministic draw scratch
+remains shared at fixed base+offset under allocation epochs and the one serialized
+stream, not copied per graph. External resource contents remain dynamic at baked
+addresses. Tuner/module/framebuffer/scratch epochs invalidate. No A-buffer, peel,
+overflow, side-stream, query, debug or host decision enters this iteration.
+Classic replay is complete fallback before launch; graph-launch failure is device
+loss, never partial replay. Target the 1–3-ms whole-DAG opportunity.
