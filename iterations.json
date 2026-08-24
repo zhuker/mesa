@@ -187,10 +187,18 @@
   {
    "id": 23,
    "name": "canonical CUDA mipmapped-array ownership census",
+   "verdict": "reverted before implementation",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "ownership census: 0 explicit dedicated; effective surface-expanded only1.638% direct launches and1.902% FS time, 0.211ms upper; A near zero. 4-ref overflow class fully static but requested tier zero. Restored."
+  },
+  {
+   "id": 24,
+   "name": "epoch-coherent derived hardware texture cache census",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "fresh all-possible-row/image ownership/object/site census joined to FS device time. Existing format-only upper: 80.03% A FS/~2.48ms gross but9.44% direct. Admit only if real ownership intersection retains >=2ms A gross with bounded memory/transfer cost."
+   "note": "retain authoritative linear images and complete software fallback; lazily materialize CUDA array/expanded texture cache keyed by image content epoch, invalidated on every device/host/alias write. Measure broad static refs, rebuild bytes/churn/memory and FS time before code."
   }
  ]
 }

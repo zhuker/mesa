@@ -977,3 +977,54 @@ Direct remains subject to the historical >29% launch screen and cannot pass from
 current format keys alone. If admitted, use canonical deferred CUDA mipmapped arrays
 backed by dedicated VMM allocations, never a stale linear shadow; current linear
 software images remain the complete fallback.
+
+## Iteration 23 — result: canonical array ownership has no real intersection
+
+The full ownership census resolved 157,216 FS launches, 1.152M rows and 8.733M
+site rows with zero missing IDs, disagreement, unresolved or overflow. A delayed
+12-second trace joined 16,255 `fsarr` ranges one-to-one to generated `main`. It
+exposed 2,855.455 ms FS device time over 306 submits.
+
+All 1,799 allocations omit explicit image dedication, so the strict ownership
+intersection is zero. A separate future lazy-allocation/effective-exclusive model
+leaves only 2,048/125,047 direct launches (1.638%) and 7/32,166 A launches. In the
+fresh trace they expose 54.298/2,855.455 ms (1.902%), 0.177 ms/submit raw or a
+labeled 0.211-ms upper on the older 11.1-ms class. A-buffer contributes 0.00083 ms.
+Both >29% direct and >=2-ms gross gates fail.
+
+The alleged dynamic descriptor class was the production specialiser's four-reference
+capacity limit: all 39,167 launches have 11–16 complete static refs, no dynamic index.
+A follow-up enumerated them all; zero requested-tier launches survive companion
+format/target facts. The class is costly (64.1% of fresh direct FS) but ownership
+does not reach it. No array code was written; source/build restored. Report
+`/tmp/perf16/iter23-report.md`; census patch `/tmp/perf16/iter23-census.patch`;
+raw/tables/trace remain under `/tmp/perf16/iter23-*`.
+
+## Iteration 24 — epoch-coherent derived hardware texture cache
+
+Ownership is unnecessarily strict for hardware sampling. Keep the current linear
+image as authoritative Vulkan storage and complete software fallback. Lazily build
+a device-derived CUDA mipmapped-array/texture representation for a view when sampled;
+key it by image content epoch and immutable view/format facts. Every buffer/image
+copy, blit, resolve, clear, attachment/store and storage write invalidates the epoch.
+Host-visible coherent or untracked alias images decline; flushed host writes and
+known interval aliases invalidate conservatively. A stale derived cache is never read.
+Allocation/conversion failure simply uses authoritative linear software sampling.
+This is not canonical ownership and needs no dedicated VkMemory or attachment surface
+backend.
+
+Measure before implementation. Extend the census to simulate lazy cache materialization
+at each exact all-row FS launch, including the recovered 11–16 static references.
+Report cacheable FS time by native RGBA8/R8/RG/RG16F/RGBA16F, BC decode, packed
+A2B10 and injective R11→F16x4 tiers; 2D/cube/3D; exact sampler/site family. Record
+unique cache images/views/objects, retained bytes, rebuilds and conversion bytes per
+submit, reuse distance between invalidations, and allocation/churn ceilings. Mixed
+cache/linear launches retain a complete generic fallback; fast hardware modules admit
+only all-cacheable rows.
+
+Existing format-only upper bounds are 4.841 ms for RGBA8/R8/BC+A2B10+R11 and
+6.718 ms after RG8/RG16F/RGBA16F, but they are exposed FS work, not savings. Admit
+only if the epoch-aware all-row intersection retains >=4 ms exposed work, estimated
+hardware reduction minus rebuild cost >=2 ms, and memory stays bounded. No persistent
+shadow is authoritative: cache contents are discardable and regenerated from linear
+storage.
