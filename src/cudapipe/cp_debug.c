@@ -129,17 +129,20 @@ static const struct cp_flag_def flags[] = {
    { "CUDAPIPE_UPLOAD_STATS", CP_FLAG_BOOL_VALUE, F(upload_stats),
      "count small host-to-device copies, clears, context syncs and upload "
      "ring wraps per call site, and report them at teardown" },
-   { "CUDAPIPE_META_FOLD", CP_FLAG_BOOL_VALUE, F(meta_fold),
-     "carry the vertex stage's vcount and stride in the argument block's own "
-     "scalar area instead of uploading them as their own block" },
-   { "CUDAPIPE_UPLOAD_COALESCE", CP_FLAG_BOOL_VALUE, F(upload_coalesce),
-     "send one host-to-device copy per launch boundary instead of one per "
-     "upload block" },
+   { "CUDAPIPE_NO_META_FOLD", CP_FLAG_BOOL_VALUE, F(no_meta_fold),
+     "upload the vertex stage's vcount and stride as their own block again "
+     "instead of carrying them in the argument block's scalar area" },
+   { "CUDAPIPE_NO_COUNTER_BLOCK", CP_FLAG_BOOL_VALUE, F(no_counter_block),
+     "clear the A-buffer's scalar counters one at a time again instead of "
+     "clearing the whole counter block once per draw or episode" },
+   { "CUDAPIPE_NO_UPLOAD_COALESCE", CP_FLAG_BOOL_VALUE, F(no_upload_coalesce),
+     "send one host-to-device copy per upload block again instead of one per "
+     "launch boundary" },
    { "CUDAPIPE_UPLOAD_FLUSH_FAIL_AT", CP_FLAG_UINT, F(upload_flush_fail_at),
      "fault injection: fail the Nth coalesced upload flush" },
-   { "CUDAPIPE_FETCH_FOLD", CP_FLAG_BOOL_VALUE, F(fetch_fold),
-     "seed the clip and raster queue counters inside cp_vertex_fetch instead "
-     "of as separate device clears" },
+   { "CUDAPIPE_NO_FETCH_FOLD", CP_FLAG_BOOL_VALUE, F(no_fetch_fold),
+     "clear the clip and raster queue counters with their own device clears "
+     "again instead of seeding them inside cp_vertex_fetch" },
    { "CUDAPIPE_NO_OPAQUE_EPISODE", CP_FLAG_BOOL_VALUE,
      F(no_opaque_episode),
      "disable consecutive opaque-run visibility deferral" },

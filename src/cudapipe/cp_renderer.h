@@ -813,6 +813,10 @@ struct cp_abuf {
    /* The single allocation sum3, bsum3 and clist_count are carved out of,
     * so that the per-draw readback is one copy rather than three. */
    CUdeviceptr counters;
+/* sum3[3] | bsum3[2] | clist_count | seg_counts[CP_PASS_MAX_SEGS] |
+ * rec_cursor | list_count | blk_list_count | dbg[CP_ABUF_DBG_COUNTERS] */
+#define CP_ABUF_BLOCK_WORDS \
+   (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS + 3 + CP_ABUF_DBG_COUNTERS)
    unsigned bnb1, bnb2, bnb3, nblocks, quad_width;
    CUdeviceptr quad_prim, quad_mask, peel_mask, quad_block;
    unsigned quad_capacity;

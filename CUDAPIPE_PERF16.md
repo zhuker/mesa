@@ -1161,7 +1161,7 @@ The instrument costs nothing when off: two binaries from one tree, AB/BA on
 both captures, old 17.4166 against 17.4044 and Crossroads 6.2170 against
 6.2246.
 
-### S1 — the vertex stage's two scalars (`CUDAPIPE_META_FOLD`)
+### S1 — the vertex stage's two scalars (`CUDAPIPE_NO_META_FOLD` reverts)
 
 `vcount` and `stride` travelled as their own eight-byte upload, the single most
 frequent host-to-device operation in the driver. They now sit in two more words
@@ -1177,7 +1177,7 @@ also 1.30 µs** — the same price on two workloads whose batch counts differ
 fourfold. That is the per-copy number the rest of the iteration is predicted
 from.
 
-### S2 — the counters the next launches fill (`CUDAPIPE_FETCH_FOLD`)
+### S2 — the counters the next launches fill (`CUDAPIPE_NO_FETCH_FOLD` reverts)
 
 `cp_vertex_fetch` runs once per executed batch, on the same stream, ahead of
 the clipper and the rasterizer, so it seeds the clipper's output counter and
@@ -1195,7 +1195,7 @@ small clears on old are therefore worth at most 0.38 ms and the remaining small
 copies at most 1.16 ms, which is what makes the copy-side mechanism the one to
 build.
 
-### S3 — one copy per launch boundary (`CUDAPIPE_UPLOAD_COALESCE`)
+### S3 — one copy per launch boundary (`CUDAPIPE_NO_UPLOAD_COALESCE` reverts)
 
 `cp_upload_end()` stops copying and records that the staging bytes below
 `upload_offset` are owed; one `cuMemcpyHtoDAsync` per flush point sends the
@@ -1260,3 +1260,69 @@ the site carries a comment so the next person does not re-derive it.
 
 The rule the census suggests: fold an operation for its **count** only when its
 **bytes** are negligible. Counters are; buffer clears are not.
+
+**A coupling to carry forward:** S2's counter seeding lives inside
+`cp_vertex_fetch`, so it exists only while that launch does. Iteration 27
+fuses the fetch into the vertex shader; the seeds must move with it, or S2 is
+silently reverted — the counters would go back to their own clears with
+nothing failing. The seeding site says so in a comment.
+
+### S4 -- one clear for the counter block (`CUDAPIPE_NO_COUNTER_BLOCK` reverts)
+
+The A-buffer's scalar counters were already one allocation for `sum3`,
+`bsum3`, `clist_count`, `seg_counts[64]` and `rec_cursor`; `list_count`,
+`blk_list_count` and the interpolator's debug counters were three more. They
+now share one block, and a draw or an episode clears all of it once instead of
+issuing six to eight clears. The per-pixel arrays keep their own bulk clears: a
+counter whose size depends on the framebuffer does not belong in the block.
+
+| capture | block | control | delta | clears removed |
+|---|---:|---:|---:|---:|
+| old | 17.4079 | 17.4268 | +0.0190 ms | -115.8/frame |
+| Crossroads | 6.1851 | 6.2542 | **+0.0692 ms (+1.11%)** | -68.2/frame |
+
+Old is **neutral within spread** -- the delta is the size of that session's
+control spread, 0.0195 ms. Crossroads is real: twelve times its control spread.
+The prices are 0.16 us per removed clear on old and 1.01 us on Crossroads,
+against S2's 0.66 and 0.75.
+
+**Why they disagree, and it is worth re-testing:** these are per-draw and
+per-episode *fixed* costs. Both captures run a similar number of episodes per
+frame -- 23.0 on old, 16.5 on Crossroads -- but a Crossroads frame is 2.8x
+shorter, so the same fixed cost is nearly three times the share of its frame.
+Old's frame is dominated by work that scales with geometry and fragments.
+**Crossroads is overhead-bound where old is work-bound**, which predicts that
+further fixed-cost removals keep favouring Crossroads while launch-count and
+fragment-side work keep favouring old.
+
+### The shipping default
+
+All four stages are on by default; each has a `CUDAPIPE_NO_*` switch that
+restores its old path exactly. The reverts are verified by operation count, not
+by inspection -- each flag puts back precisely the operations its stage removed,
+and all four together reproduce the original census to the decimal:
+
+| configuration | copies/frame | clears/frame |
+|---|---:|---:|
+| default | 615.32 | 457.08 |
+| `NO_META_FOLD` | 615.32 (blocks +203.7) | 457.07 |
+| `NO_FETCH_FOLD` | 615.32 | 853.11 |
+| `NO_UPLOAD_COALESCE` | 914.06 | 457.07 |
+| `NO_COUNTER_BLOCK` | 615.32 | 572.92 |
+| all four | 1117.78 | 968.94 |
+
+Small operations per frame fall from 1,868.1 to 1,072.4 on old, 43% fewer.
+
+| capture | default | all four reverted | delta |
+|---|---:|---:|---:|
+| old | **16.5021** | 17.4331 | +0.9310 ms (+5.34%) |
+| Crossroads | **6.0467** | 6.2336 | +0.1868 ms (+3.00%) |
+
+Acceptance: the native suite passes 59/59 with the default, with each revert
+alone and with all four; stdout hashes are identical across every replay arm;
+the Crossroads sentinel frames are byte-identical to the ones iteration 24
+accepted, and the old capture's differ by at most 13/255 on a handful of pixels
+-- the same variation two runs of one binary show, and about a thousandth of
+the tolerance the llvmpipe comparison already accepts. The sample sweep
+reproduces iteration 24's verdict exactly, including its one standing
+`gltfscenerendering` nondeterminism exception.

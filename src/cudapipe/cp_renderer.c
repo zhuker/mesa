@@ -434,7 +434,7 @@ cp_upload_begin(struct cp_context *cp, size_t size, void **host_out)
 CUresult
 cp_upload_flush(struct cp_context *cp)
 {
-   if (!cp_debug->upload_coalesce)
+   if (cp_debug->no_upload_coalesce)
       return CUDA_SUCCESS;
 
    /* An open reservation holds the watermark back: its bytes are still being
@@ -514,14 +514,14 @@ cp_upload_end(struct cp_context *cp, CUdeviceptr dst, const void *host,
     * asked for the block, which is this function's return address -- and it
     * wants device operations, so a block whose copy is owed rather than
     * issued is not one of them. */
-   if (cp_smallop_enabled && !cp_debug->upload_coalesce)
+   if (cp_smallop_enabled && cp_debug->no_upload_coalesce)
       cp_smallop_note(__FILE__, __LINE__, __builtin_return_address(0),
                       CP_SMALLOP_HTOD_ASYNC, size);
 
    cp->upload.blocks++;
    if (cp->upload_open && !--cp->upload_open)
       cp->upload_open_lo = SIZE_MAX;
-   if (cp_debug->upload_coalesce)
+   if (!cp_debug->no_upload_coalesce)
       return CUDA_SUCCESS;   /* the copy is owed, not skipped */
 
    return cp_smallop_htod_async_raw(dst, host, size, cp->stream);
@@ -821,7 +821,7 @@ cp_context_cleanup(struct cp_context *cp)
       fprintf(stderr, "cudapipe: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
               " bytes=%" PRIu64 " empty=%" PRIu64 " coalesce=%d\n",
               cp->upload.blocks, cp->upload.flushes, cp->upload.bytes,
-              cp->upload.empty, (int)cp_debug->upload_coalesce);
+              cp->upload.empty, (int)!cp_debug->no_upload_coalesce);
    cp_smallop_report();
    cp_abuf_cleanup(cp->abuf);
    free(cp->abuf);
@@ -1255,13 +1255,17 @@ cp_abuf_setup(struct cp_context *cp, struct cp_abuf *ab, unsigned w, unsigned h)
        * CP_ABUF_COUNTERS covers all six; the existing derived pointers stay
        * offsets into it exactly as they were.
        */
-      if (!cp_abuf_alloc(cp, ab, &ab->counters,
-                         4 * (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS + 1),
-                         "sum3+bsum3+clist_count+seg counts+rec cursor") ||
-          !cp_abuf_alloc(cp, ab, &ab->list_count, 4, "list_count") ||
-          !cp_abuf_alloc(cp, ab, &ab->blk_list_count, 4, "block worklist count") ||
-          !cp_abuf_alloc(cp, ab, &ab->dbg, CP_ABUF_DBG_COUNTERS * 4,
-                         "debug counters"))
+      /*
+       * Every scalar counter the A-buffer owns, in one allocation. The three
+       * that used to be allocated separately -- the two worklist counts and
+       * the interpolator's debug counters -- join the block so that a draw or
+       * an episode can clear all of them with one device operation instead of
+       * six, which is what CUDAPIPE_COUNTER_BLOCK does. The per-pixel arrays
+       * stay where they are: a counter whose size depends on the framebuffer
+       * does not belong here.
+       */
+      if (!cp_abuf_alloc(cp, ab, &ab->counters, 4 * CP_ABUF_BLOCK_WORDS,
+                         "counter block"))
          return false;
 
       ab->sum3 = ab->counters;              /* scan total, fill overflow, long runs */
@@ -1274,6 +1278,12 @@ cp_abuf_setup(struct cp_context *cp, struct cp_abuf *ab, unsigned w, unsigned h)
       ab->seg_counts = ab->counters + 4 * CP_ABUF_COUNTERS;
       ab->rec_cursor = ab->counters +
                        4 * (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS);
+      ab->list_count = ab->counters +
+                       4 * (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS + 1);
+      ab->blk_list_count = ab->counters +
+                           4 * (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS + 2);
+      ab->dbg = ab->counters +
+                4 * (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS + 3);
    }
    if (!ab->events_ready) {
       for (int i = 0; i < (int)ARRAY_SIZE(ab->ev); i++) {
@@ -4866,7 +4876,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          const bool fetch_runs =
             (vs_input_buf || out_vid || out_iid || batch_rows) &&
             total_verts > 0;
-         fetch_fold = cp_debug->fetch_fold && fetch_runs;
+         fetch_fold = !cp_debug->no_fetch_fold && fetch_runs;
 
          /*
           * The clipper's counter, hoisted here from the clip block below so
@@ -4887,6 +4897,12 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          }
 
          if (fetch_fold) {
+            /*
+             * This seeding rides on the fetch launch existing. If the fetch is
+             * ever fused into the vertex shader, the seeds must move with it
+             * or this optimisation is silently reverted -- the counters would
+             * go back to their own clears without anything failing.
+             */
             /* Whichever raster pass this batch takes clears these three words
              * first; the fill relaunch inside a pass still clears its own. */
             vf_args.seed_counts = cp->cur_qset.counts;
@@ -4973,7 +4989,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
           * The shader ABI does not move: args[0] and args[3] are still two
           * device addresses it dereferences.
           */
-         const bool meta_in_block = cp_debug->meta_fold;
+         const bool meta_in_block = !cp_debug->no_meta_fold;
          CUdeviceptr meta_dev = 0;
          if (!meta_in_block) {
             meta_dev = cp_upload(cp, &meta, sizeof(meta));
@@ -5616,9 +5632,17 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * gated ahead of every segment stream. */
       if (!cp->pass.appending) {
          cuMemsetD32Async(ab->counts, 0, n, cp->stream);
-         cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
-         if (ab->recs)
-            cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
+         if (!cp_debug->no_counter_block) {
+            /* One clear for every scalar counter this draw will fill: the
+             * worklist counts, the block counts and the debug counters are
+             * written only by kernels launched further down, so clearing them
+             * here is the same zero at a cheaper price. */
+            cuMemsetD32Async(ab->counters, 0, CP_ABUF_BLOCK_WORDS, cp->stream);
+         } else {
+            cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
+            if (ab->recs)
+               cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
+         }
       }
       if (cp->pass.appending)
          aa.abuf_prim_base = cp->pass.next_prim;
@@ -5845,7 +5869,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * is a prerequisite of the sort as written, not a separate step. --- */
       {
          unsigned nn = (unsigned)n, min2 = 2;
-         cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
+         if (cp_debug->no_counter_block)
+            cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
          void *wp[] = { &ab->counts, &nn, &min2, &ab->list, &ab->list_count };
          CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
                         256, 1, 1, 0, cp->stream, wp, NULL);
@@ -5861,7 +5886,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * rather than serialising behind the shading. */
       if (ab->clist) {
          unsigned nn = (unsigned)n, min1 = 1;
-         cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
+         if (cp_debug->no_counter_block)
+            cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
          void *wp[] = { &ab->counts, &nn, &min1, &ab->clist, &ab->clist_count };
          CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
                         256, 1, 1, 0, cp->stream, wp, NULL);
@@ -5876,7 +5902,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * framebuffer with anything in it rather than all 230,400 blocks.
        */
       unsigned nblocks = ab->nblocks, qw = ab->quad_width;
-      cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
+      if (cp_debug->no_counter_block)
+         cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
       cp_abuf_mark(ab, ab->ev[6], cp->stream);
       {
          void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_list,
@@ -5891,8 +5918,10 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * fragment lists themselves, and for the same reason: the merge has to
        * know where a block's quads go before it can write them. */
       cuMemsetD32Async(ab->blk_counts, 0, nblocks, cp->stream);
-      cuMemsetD32Async(ab->bsum3, 0, 2, cp->stream);
-      cuMemsetD32Async(ab->dbg, 0, CP_ABUF_DBG_COUNTERS, cp->stream);
+      if (cp_debug->no_counter_block) {
+         cuMemsetD32Async(ab->bsum3, 0, 2, cp->stream);
+         cuMemsetD32Async(ab->dbg, 0, CP_ABUF_DBG_COUNTERS, cp->stream);
+      }
       {
          void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
                        &ab->blk_list, &ab->blk_list_count, &ab->blk_counts };
@@ -7498,7 +7527,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          .num_quads = quad_bound,
          .warp_aggregate = false,
       };
-      if (compact)
+      if (compact && cp_debug->no_counter_block)
          cuMemsetD32Async(ab->seg_counts, 0, CP_PASS_MAX_SEGS, cp->stream);
       void *bucket_params[] = { &bucket };
       CP_LAUNCH(cp->dev->kernels.abuf_seg_count,
@@ -7791,8 +7820,10 @@ cp_pass_finish(struct cp_context *cp)
       unsigned max_short = cp_debug->abuf_short_sort_max;
       unsigned min_long = cp_debug->no_abuf_short_sort ? 2 : max_short + 1;
       if (!cp_debug->no_abuf_short_sort) {
-         cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
-         cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
+         if (cp_debug->no_counter_block) {
+            cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
+            cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
+         }
          void *ssp[] = { &ab->frags, &ab->offsets, &ab->counts, &nn,
                          &max_short, &ab->clist, &ab->clist_count,
                          &min_long, &ab->list, &ab->list_count };
@@ -7800,7 +7831,8 @@ cp_pass_finish(struct cp_context *cp)
                         MIN2((nn + 255) / 256, 4096u), 1, 1, 256, 1, 1,
                         0, cp->stream, ssp, NULL);
       } else {
-         cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
+         if (cp_debug->no_counter_block)
+            cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
          void *wp[] = { &ab->counts, &nn, &min_long, &ab->list,
                         &ab->list_count };
          CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
@@ -7812,7 +7844,8 @@ cp_pass_finish(struct cp_context *cp)
                      0, cp->stream, sp, NULL);
       if (cp_debug->no_abuf_short_sort) {
          unsigned min1 = 1;
-         cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
+         if (cp_debug->no_counter_block)
+            cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
          void *cw[] = { &ab->counts, &nn, &min1, &ab->clist,
                         &ab->clist_count };
          CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
@@ -7822,7 +7855,8 @@ cp_pass_finish(struct cp_context *cp)
 
    /* --- the quad stream --- */
    unsigned nblocks = ab->nblocks, qw = ab->quad_width;
-   cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
+   if (cp_debug->no_counter_block)
+      cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
    {
       void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_list,
                     &ab->blk_list_count };
@@ -7831,8 +7865,10 @@ cp_pass_finish(struct cp_context *cp)
                      0, cp->stream, p, NULL);
    }
    cuMemsetD32Async(ab->blk_counts, 0, nblocks, cp->stream);
-   cuMemsetD32Async(ab->bsum3, 0, 2, cp->stream);
-   cuMemsetD32Async(ab->dbg, 0, CP_ABUF_DBG_COUNTERS, cp->stream);
+   if (cp_debug->no_counter_block) {
+      cuMemsetD32Async(ab->bsum3, 0, 2, cp->stream);
+      cuMemsetD32Async(ab->dbg, 0, CP_ABUF_DBG_COUNTERS, cp->stream);
+   }
    {
       void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
                     &ab->blk_list, &ab->blk_list_count, &ab->blk_counts };
@@ -7870,7 +7906,8 @@ cp_pass_finish(struct cp_context *cp)
       cp_pass_fallback(cp, segs, nsegs);
       return;
    }
-   cuMemsetD32Async(ab->seg_counts, 0, CP_PASS_MAX_SEGS, cp->stream);
+   if (cp_debug->no_counter_block)
+      cuMemsetD32Async(ab->seg_counts, 0, CP_PASS_MAX_SEGS, cp->stream);
    struct cp_abuf_seg_args sa = {
       .quad_prim = ab->quad_prim,
       .seg_prim_base = seg_prims_dev,
@@ -8280,10 +8317,17 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
        * them, so a clear that never ran would be read as real counts. */
       CUresult err = cuMemsetD32Async(ab->counts, 0, (size_t)w * h,
                                       cp->stream);
-      if (err == CUDA_SUCCESS)
-         err = cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
-      if (err == CUDA_SUCCESS && ab->recs)
-         err = cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
+      if (err == CUDA_SUCCESS) {
+         if (!cp_debug->no_counter_block) {
+            /* Every scalar counter this episode fills, in one clear. */
+            err = cuMemsetD32Async(ab->counters, 0, CP_ABUF_BLOCK_WORDS,
+                                   cp->stream);
+         } else {
+            err = cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
+            if (err == CUDA_SUCCESS && ab->recs)
+               err = cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
+         }
+      }
       if (err == CUDA_SUCCESS && cp->seg_streams[0]) {
          /* The gate every segment stream waits on. */
          err = cp_upload_flush(cp);
