@@ -459,3 +459,38 @@ This keeps one fused launch, removes large accepted-output writes and stable
 retirement writes, and makes the clipped representation explicit for future
 layered/MRT work. A/B must include the pointer-read cost and retain classic
 contiguous storage as fallback.
+
+## Iteration 10 — result: kept (commit pending review)
+
+Exact slot census found accepted clipping copied **109.96 GB/replay**,
+72.824 MB/frame, averaging 7.929 vec4 slots per vertex. Primitive references
+publish 1.570 MB/frame; true crossings retain 1.864 MB/frame of copies. Net
+accepted writes removed: **~71.253 MB/frame**.
+
+The optional 8-byte table owns one base pointer per fixed/compact primitive ID.
+Inside outputs point at immutable VS storage; crossing outputs publish clipped
+scratch only after all vertices are written; retired stable IDs are null. One
+CUDA-visible resolver feeds raster setup and interpolation. Active IDs, counts,
+stable ordering, queue BUILD/REUSE, episode ranges and tiled replay remain IDs,
+not pointers. Scratch refusal or `CUDAPIPE_NO_PRIM_REFS=1` selects the exact
+contiguous representation. Current `CP_CLIP_MAX_OUT=8`, so stable no-active
+retirement nulls all 7/8 unused fixed entries rather than relying on an old
+four-slot assumption.
+
+**Measured:** old **23.682→23.255 ms** (−0.427, −1.80%), walls agree; direct
+clip+s1 −14.4%, A-buffer clip+s1 −12.1%, downstream kernels neutral. Sweep hot
+sum **28.42→25.99 ms** (−8.6%), wall 39.18→38.09 s; multithreading −29%,
+instancing −17%; Crossroads neutral at 7.427 ms.
+
+**Gates:** child and root build/docs/diff clean; root 43/43 `-j8`; six
+reproducers byte-identical and unchanged across five batching modes plus refs
+revert; Compute Sanitizer zero; both sentinel discriminator sets exact; NVIDIA
+60 calibrated to the standing glTF orbit residual (llvmpipe worse); Gallium
+exact.
+
+**Interference:** adds 16.24 MiB/frame logical worst-capacity scratch request
+and two clip-kernel registers without changing occupancy. Allocation refusal is
+exact fallback. Existing clipped worst-case storage remains for crossings;
+removing it requires a second crossing allocator without remapping stable IDs.
+Stage2/3 queues, graphs and persistent-raster designs are unblocked. Layered/MRT
+can reuse the explicit primitive-base representation.

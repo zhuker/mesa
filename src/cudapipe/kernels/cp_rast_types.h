@@ -72,7 +72,11 @@ struct cp_rasterize_args {
     * only when device-side binning reports overflow. */
    uint64_t path_flag;
    uint32_t path_value;
-   uint64_t positions;      /* Input: screen-space positions (float4 per vertex) */
+   uint64_t positions;      /* Input: contiguous vertex stream fallback */
+   /* Optional uint64_t[max output primitives]. Each nonzero entry is the
+    * device address of that primitive's first vertex slot. Clipped wholly
+    * inside primitives can therefore keep reading immutable VS output. */
+   uint64_t prim_refs;
    uint64_t varyings;       /* Input: varyings from VS */
    uint64_t framebuffer;    /* Output: visibility buffer (uint64 per pixel) */
    uint64_t color_buffer;   /* Output: color buffer (uint32 per pixel, RGBA8) */
@@ -302,6 +306,9 @@ struct cp_clip_args {
    /* Stable mode optionally appends each live fixed-slot ID here.  This keeps
     * primitive IDs ordered while letting rasterization skip retired holes. */
    uint64_t active_ids;      /* Output: uint32[max_triangles], or zero */
+   /* Optional output uint64_t[max_triangles]. Publication happens only after
+    * a crossing output is complete; inside outputs point at vs_out directly. */
+   uint64_t prim_refs;
    uint32_t num_triangles;
    uint32_t num_slots;      /* Position plus varyings, i.e. num_varyings + 1 */
    uint32_t max_triangles;  /* Capacity of `out`, in triangles */
@@ -322,6 +329,10 @@ struct cp_clip_args {
 };
 
 #define CP_CLIP_MAX_OUT 8
+#define CP_CLIP_PRIM_SHIFT 3
+#if CP_CLIP_MAX_OUT != (1u << CP_CLIP_PRIM_SHIFT)
+#error "stable clip IDs require CP_CLIP_MAX_OUT == 1 << CP_CLIP_PRIM_SHIFT"
+#endif
 
 #define CP_MAX_CLIP_SLOTS 16
 
@@ -469,7 +480,8 @@ enum cp_color_encoding {
  */
 struct cp_fs_interp_args {
    uint64_t visbuf;
-   uint64_t positions;      /* Clip-space float4, 3 per triangle */
+   uint64_t positions;      /* Contiguous clip-space stream fallback */
+   uint64_t prim_refs;      /* const uint64_t * primitive bases, or zero */
    uint64_t vs_out;         /* Vertex shader output buffer */
    uint64_t pixel_list;     /* Out: y * width + x for each covered pixel */
    uint64_t counter;        /* Out: number of covered pixels */
@@ -696,6 +708,24 @@ struct cp_abuf_composite_args {
    uint64_t seg_desc;       /* struct cp_seg_desc[segments] */
 };
 
+#ifdef __CUDACC__
+/* Resolve one primitive once, then index its three vertices and slots from the
+ * returned base. `refs` and every entry are device addresses; the host never
+ * dereferences them. Null refs are retired stable slots and are rejected by
+ * callers before any vertex load. */
+static __device__ __forceinline__ const unsigned char *
+cp_primitive_base(uint64_t refs, uint64_t contiguous, uint32_t primitive,
+                  uint32_t vertex_stride)
+{
+   if (refs) {
+      uint64_t base = ((const uint64_t *)(uintptr_t)refs)[primitive];
+      return (const unsigned char *)(uintptr_t)base;
+   }
+   return (const unsigned char *)(uintptr_t)contiguous +
+          (size_t)primitive * 3u * vertex_stride;
+}
+#endif
+
 /* One pass-episode segment's shading arrays, for the composite. */
 struct cp_seg_desc {
    uint64_t fs_out;
@@ -719,7 +749,8 @@ struct cp_seg_desc {
  * in the group's concatenated table.
  */
 struct cp_seg_range {
-   uint64_t positions;      /* the segment's clipped vertex buffer */
+   uint64_t positions;      /* the segment's contiguous fallback stream */
+   uint64_t prim_refs;      /* the segment's primitive-reference table */
    uint64_t draw_slices;    /* struct cp_draw_slice[num_draw_slices], or 0 */
    uint32_t num_draw_slices;
    uint32_t prim_base;      /* first episode-global primitive slot */

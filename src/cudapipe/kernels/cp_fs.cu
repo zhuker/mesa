@@ -44,6 +44,7 @@ struct cp_interp_tri {
    float ndc_z0, ndc_z1, ndc_z2;
    float inv_w0, inv_w1, inv_w2, inv_area;
    int vidx1, vidx2;
+   uint64_t base;
    bool front;
 };
 
@@ -51,12 +52,16 @@ static __device__ __forceinline__ bool
 cp_interp_setup(const struct cp_fs_interp_args *args, uint32_t tri_id,
                 struct cp_interp_tri *tri)
 {
-   const float4 *positions = (const float4 *)(uintptr_t)args->positions;
    uint32_t pos_stride = args->vs_out_stride / 16;
    if (pos_stride == 0) pos_stride = 1;
-   float4 v0 = positions[(tri_id * 3 + 0) * pos_stride];
-   float4 v1 = positions[(tri_id * 3 + 1) * pos_stride];
-   float4 v2 = positions[(tri_id * 3 + 2) * pos_stride];
+   tri->base = (uint64_t)(uintptr_t)cp_primitive_base(
+      args->prim_refs, args->positions, tri_id, args->vs_out_stride);
+   if (!tri->base)
+      return false;
+   const float4 *positions = (const float4 *)(uintptr_t)tri->base;
+   float4 v0 = positions[0 * pos_stride];
+   float4 v1 = positions[1 * pos_stride];
+   float4 v2 = positions[2 * pos_stride];
 
    tri->inv_w0 = 1.0f / v0.w;
    tri->inv_w1 = 1.0f / v1.w;
@@ -143,7 +148,7 @@ cp_interp_pixel_prepared(struct cp_fs_interp_args *args, uint32_t tri_id,
    if (args->frag_coord)
       ((float4 *)(uintptr_t)args->frag_coord)[slot] = fc;
 
-   const char *vs_out = (const char *)(uintptr_t)args->vs_out;
+   const char *vs_out = (const char *)(uintptr_t)tri->base;
    char *fs_in = (char *)(uintptr_t)args->fs_in + (size_t)slot * args->fs_in_stride;
 
    /*
@@ -162,7 +167,7 @@ cp_interp_pixel_prepared(struct cp_fs_interp_args *args, uint32_t tri_id,
          int32_t src = args->input_vs_slot[i];
          if (src >= 0)
             value = *(const float4 *)(vs_out +
-               (size_t)(tri_id * 3) * args->vs_out_stride + src * 16);
+               (size_t)src * 16);
          *(float4 *)(fs_in + i * 16) = value;
       }
 
@@ -170,8 +175,7 @@ cp_interp_pixel_prepared(struct cp_fs_interp_args *args, uint32_t tri_id,
           (uint32_t)args->pntc_input < args->num_fs_inputs) {
          float size = 1.0f;
          if (args->psiz_slot >= 0)
-            size = ((const float4 *)(vs_out +
-               (size_t)(tri_id * 3) * args->vs_out_stride))[args->psiz_slot].x;
+            size = ((const float4 *)vs_out)[args->psiz_slot].x;
          if (!(size > 0.0f))
             size = 1.0f;
          if (size > CP_MAX_POINT_SIZE)
@@ -196,11 +200,11 @@ cp_interp_pixel_prepared(struct cp_fs_interp_args *args, uint32_t tri_id,
 
       if (src >= 0) {
          const float4 *a0 = (const float4 *)(vs_out +
-            (size_t)(tri_id * 3) * args->vs_out_stride + src * 16);
+            (size_t)src * 16);
          const float4 *a1 = (const float4 *)(vs_out +
-            (size_t)(tri_id * 3 + tri->vidx1) * args->vs_out_stride + src * 16);
+            (size_t)tri->vidx1 * args->vs_out_stride + src * 16);
          const float4 *a2 = (const float4 *)(vs_out +
-            (size_t)(tri_id * 3 + tri->vidx2) * args->vs_out_stride + src * 16);
+            (size_t)tri->vidx2 * args->vs_out_stride + src * 16);
 
          value.x = (a0->x * persp0 + a1->x * persp1 + a2->x * persp2) * inv_persp;
          value.y = (a0->y * persp0 + a1->y * persp1 + a2->y * persp2) * inv_persp;
@@ -350,6 +354,7 @@ cp_resolve_seg_range(struct cp_fs_interp_args *args, uint32_t gprim)
       return false;
 
    args->positions = range->positions;
+   args->prim_refs = range->prim_refs;
    args->vs_out = range->positions;
    args->abuf_prim_base = range->prim_base;
    args->draw_slices = range->draw_slices;
@@ -477,6 +482,10 @@ cp_abuf_interpolate_lane(const struct cp_fs_interp_args *source, uint32_t slot)
    CP_QUAD_BCAST(inv_w0); CP_QUAD_BCAST(inv_w1); CP_QUAD_BCAST(inv_w2);
    CP_QUAD_BCAST(inv_area);
    CP_QUAD_BCAST(vidx1); CP_QUAD_BCAST(vidx2);
+   uint32_t base_lo = __shfl_sync(0xFFFFFFFFu, (uint32_t)tri.base, src_lane);
+   uint32_t base_hi = __shfl_sync(0xFFFFFFFFu,
+                                  (uint32_t)(tri.base >> 32), src_lane);
+   tri.base = (uint64_t)base_lo | ((uint64_t)base_hi << 32);
    tri.front = __shfl_sync(0xFFFFFFFFu, (int)tri.front, src_lane) != 0;
    tri_ok = __shfl_sync(0xFFFFFFFFu, (int)tri_ok, src_lane) != 0;
 #undef CP_QUAD_BCAST

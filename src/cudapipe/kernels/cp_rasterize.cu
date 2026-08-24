@@ -218,29 +218,40 @@ clip_poly(float4 *dst, const float4 *src, int n, uint32_t slots, int plane)
    return out_n;
 }
 
-static __device__ __forceinline__ float4 *
-clip_emit(struct cp_clip_args *args, float4 *out, uint32_t slots,
-          uint32_t tri, uint32_t k, uint32_t *id_out)
+static __device__ __forceinline__ bool
+clip_alloc(struct cp_clip_args *args, uint32_t tri, uint32_t k,
+           uint32_t *id_out)
 {
-   /* Stable mode owns its fixed per-triangle range outright, so there is no counter to
-    * contend on and no order to lose; see cp_clip_args::stable. */
+   /* Stable mode owns its fixed per-triangle range outright, so there is no
+    * counter to contend on and no order to lose; see cp_clip_args::stable. */
    uint32_t o = args->stable
       ? tri * CP_CLIP_MAX_OUT + k
       : atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
    *id_out = o;
    if (o >= args->max_triangles)
-      return NULL;
+      return false;
 
-   /* In stable mode o is the primitive's ordered fixed-slot ID.  Append that
-    * ID to a compact worklist instead of making the rasterizer visit the
-    * unused slots beside it.  The append order is deliberately irrelevant:
-    * visibility and A-buffer records retain o, which is the ordering key. */
+   /* In stable mode o is the primitive's ordered fixed-slot ID. Append that
+    * ID to a compact worklist instead of making the rasterizer visit holes. */
    if (args->stable && args->active_ids) {
       uint32_t at = atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
       if (at < args->max_triangles)
          ((uint32_t *)(uintptr_t)args->active_ids)[at] = o;
    }
-   return out + (size_t)o * 3 * slots;
+   return true;
+}
+
+static __device__ __forceinline__ float4 *
+clip_dst(float4 *out, uint32_t slots, uint32_t id)
+{
+   return out + (size_t)id * 3 * slots;
+}
+
+static __device__ __forceinline__ void
+clip_publish_ref(struct cp_clip_args *args, uint32_t id, const float4 *base)
+{
+   if (args->prim_refs)
+      ((uint64_t *)(uintptr_t)args->prim_refs)[id] = (uint64_t)(uintptr_t)base;
 }
 
 /*
@@ -259,9 +270,15 @@ clip_retire(struct cp_clip_args *args, float4 *out, uint32_t slots,
       uint32_t o = tri * CP_CLIP_MAX_OUT + i;
       if (o >= args->max_triangles)
          return;
-      float4 *dst = out + (size_t)o * 3 * slots;
-      dst[0] = dst[slots] = dst[2 * (size_t)slots] =
-         make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+      if (args->prim_refs) {
+         /* Stable raster without active_ids walks every fixed ID. Null makes
+          * the unused slot retire without writing three degenerate vertices. */
+         ((uint64_t *)(uintptr_t)args->prim_refs)[o] = 0;
+      } else {
+         float4 *dst = out + (size_t)o * 3 * slots;
+         dst[0] = dst[slots] = dst[2 * (size_t)slots] =
+            make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+      }
    }
 }
 
@@ -300,9 +317,15 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
    }
 
    if (inside == 3) {
-      float4 *dst = clip_emit(args, out, slots, tri, 0, &id);
-      if (dst) {
-         clip_copy(dst, v, 3 * slots);
+      if (clip_alloc(args, tri, 0, &id)) {
+         if (args->prim_refs) {
+            /* Immutable VS output stays live through every consumer of the
+             * clipped stream, so acceptance is pointer publication only. */
+            clip_publish_ref(args, id, v);
+         } else {
+            float4 *dst = clip_dst(out, slots, id);
+            clip_copy(dst, v, 3 * slots);
+         }
          if (ids)
             ids[emitted] = id;
          emitted++;
@@ -332,13 +355,17 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
    /* Fan-triangulate the clipped polygon, which keeps the original winding. */
    int k = 0;
    for (int i = 1; i + 1 < n; i++) {
-      float4 *dst = clip_emit(args, out, slots, tri, (uint32_t)k, &id);
-      if (!dst)
+      if (!clip_alloc(args, tri, (uint32_t)k, &id))
          break;
       k++;
+      float4 *dst = clip_dst(out, slots, id);
       clip_copy(dst, src, slots);
       clip_copy(dst + slots, src + (size_t)i * slots, slots);
       clip_copy(dst + 2 * slots, src + (size_t)(i + 1) * slots, slots);
+      /* Publish only after all three vertices are complete. A fused caller's
+       * same thread consumes this in program order; later raster/interpolation
+       * launches are ordered by the kernel boundary. */
+      clip_publish_ref(args, id, dst);
       if (ids)
          ids[emitted] = id;
       emitted++;
@@ -407,8 +434,11 @@ static __device__ __forceinline__ bool
 setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
                struct tri_setup *s)
 {
-   float4 *positions = (float4 *)(uintptr_t)args->positions;
    uint32_t pos_stride = args->num_varyings + 1;
+   const float4 *positions = (const float4 *)cp_primitive_base(
+      args->prim_refs, args->positions, tri_id, pos_stride * 16u);
+   if (!positions)
+      return false;
 
    /*
     * The clip rectangle this primitive is bounded by: the batch-wide one, or
@@ -433,9 +463,9 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
       clip_x0 = r.x; clip_y0 = r.y; clip_x1 = r.z; clip_y1 = r.w;
    }
 
-   float4 v0 = positions[(tri_id * 3 + 0) * pos_stride];
-   float4 v1 = positions[(tri_id * 3 + 1) * pos_stride];
-   float4 v2 = positions[(tri_id * 3 + 2) * pos_stride];
+   float4 v0 = positions[0 * pos_stride];
+   float4 v1 = positions[1 * pos_stride];
+   float4 v2 = positions[2 * pos_stride];
 
    float inv_w0 = 1.0f / v0.w;
 
@@ -455,7 +485,7 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
 
       float size = 1.0f;
       if (args->psiz_slot >= 0)
-         size = positions[(tri_id * 3 + 0) * pos_stride + args->psiz_slot].x;
+         size = positions[args->psiz_slot].x;
 
       /* A zero or negative size draws nothing; NaN fails this too. */
       if (!(size > 0.0f))

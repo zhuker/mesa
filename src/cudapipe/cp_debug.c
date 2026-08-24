@@ -162,6 +162,9 @@ static const struct cp_flag_def flags[] = {
      "restore the separate clip and rasterize-stage1 launches instead of "
      "the fused clip+classify kernel; stages 2 and 3 are separate either "
      "way" },
+   { "CUDAPIPE_NO_PRIM_REFS", CP_FLAG_BOOL_VALUE, F(no_prim_refs),
+     "copy every accepted clipped primitive into contiguous scratch instead "
+     "of publishing a reference to immutable vertex-shader output" },
    { "CUDAPIPE_FORCE_PASS_FALLBACK", CP_FLAG_BOOL_VALUE,
      F(force_pass_fallback),
      "make every blended episode take the classic re-execution fallback; the "

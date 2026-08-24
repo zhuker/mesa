@@ -83,10 +83,10 @@
   {
    "id": 10,
    "name": "zero-copy primitive references for trivially accepted clipping",
-   "verdict": "pending",
-   "old_median_ms": null,
-   "sweep_hot_ms": null,
-   "note": "inside primitives point at original VS output; only 1.2% crossings copy into clip storage; rejected stable slots use null refs. Raster/interp resolve one per-primitive pointer. Target clip+s1 3.303ms plus copy bandwidth."
+   "verdict": "kept",
+   "old_median_ms": 23.255,
+   "sweep_hot_ms": 25.99,
+   "note": "zero-copy refs remove ~71.25MB/frame accepted writes; old 23.682->23.255 (-0.427), sweep 28.42->25.99, Crossroads neutral. Direct clip+s1 -14.4%, abuf -12.1%. 43/43, six-mode unchanged, sanitizer clean, sentinels/NVIDIA gates pass."
   }
  ]
 }

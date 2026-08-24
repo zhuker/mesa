@@ -2608,7 +2608,8 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
                    const struct cp_render_scope *scope,
                    const struct cp_draw_call *info,
                    CUdeviceptr visbuf, CUdeviceptr positions,
-                   CUdeviceptr vs_output_buf, unsigned num_triangles,
+                   CUdeviceptr vs_output_buf, CUdeviceptr prim_refs,
+                   unsigned num_triangles,
                    unsigned w, unsigned h, void *color_data,
                    float vp_scale_x, float vp_scale_y,
                    float vp_trans_x, float vp_trans_y,
@@ -2682,6 +2683,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
    struct cp_fs_interp_args interp = {
       .visbuf = visbuf,
       .positions = positions,
+      .prim_refs = prim_refs,
       .vs_out = vs_output_buf,
       .pixel_list = pixel_list,
       .counter = counter,
@@ -3010,7 +3012,8 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
               const struct cp_render_scope *scope,
               const struct cp_draw_call *info,
               struct cp_abuf *ab, CUdeviceptr positions,
-              CUdeviceptr vs_output_buf, unsigned w, unsigned h,
+              CUdeviceptr vs_output_buf, CUdeviceptr prim_refs,
+              unsigned w, unsigned h,
               float vp_scale_x, float vp_scale_y,
               float vp_trans_x, float vp_trans_y,
               uint32_t num_quads, uint32_t num_covered, bool record_colors,
@@ -3091,6 +3094,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
 
    struct cp_fs_interp_args interp = {
       .positions = positions,
+      .prim_refs = prim_refs,
       .vs_out = vs_output_buf,
       .pixel_list = pixel_list,
       .counter = counter,
@@ -3406,6 +3410,7 @@ cp_rast_args_unclip(struct cp_rasterize_args *ra, uint64_t positions,
                     uint32_t num_triangles, uint32_t rect_prim_shift)
 {
    ra->positions = positions;
+   ra->prim_refs = 0;
    ra->tri_count = 0;
    ra->active_ids = 0;
    ra->num_triangles = num_triangles;
@@ -4249,6 +4254,12 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                CUdeviceptr clipped = cp_scratch_alloc_device(
                   cp, (size_t)max_clipped * 3 * out_stride);
                CUdeviceptr clip_count = cp_scratch_alloc_device(cp, 4);
+               /* Exact worst-case table, generation-owned beside the original
+                * VS output and clipped scratch. Refusal keeps clip+copy. */
+               CUdeviceptr prim_refs = !cp_debug->no_prim_refs &&
+                                       !cp_debug->debug_fs
+                  ? cp_scratch_alloc_device(
+                       cp, (size_t)max_clipped * sizeof(uint64_t)) : 0;
 
                /*
                 * Falling through here does not draw nothing, it draws wrong:
@@ -4316,6 +4327,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                      .out = clipped,
                      .out_count = clip_count,
                      .active_ids = active_ids,
+                     .prim_refs = prim_refs,
                      .num_triangles = num_triangles,
                      .num_slots = num_vs_outputs,
                      .max_triangles = max_clipped,
@@ -4350,6 +4362,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                   if (clip_err == CUDA_SUCCESS) {
                      vs_output_buf = clipped;
                      rast_args.positions = clipped;
+                     rast_args.prim_refs = prim_refs;
                      rast_args.tri_count = clip_count;
                      rast_args.active_ids = active_ids;
                      /* active_ids contains fixed IDs up to max_clipped - 1;
@@ -4359,8 +4372,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                         rast_args.num_triangles = max_clipped;
                      rast_num_triangles = max_clipped;
                      if (stable_clip) {
-                        cp->fs_batch.prim_shift = 3;
-                        rast_args.rect_prim_shift = 3;
+                        cp->fs_batch.prim_shift = CP_CLIP_PRIM_SHIFT;
+                        rast_args.rect_prim_shift = CP_CLIP_PRIM_SHIFT;
                      }
                   } else {
                      fprintf(stderr, "cudapipe: clip launch failed (%d)\n",
@@ -5306,8 +5319,10 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * attachment — or, for a shader that exists for its stores rather than
        * for a colour, just the first two. */
       if (color_data || fs_side_effects)
-         cp_shade_fragments(cp, state, &batch->scope, info, visbuf, rast_args.positions, vs_output_buf,
-                            num_triangles, w, h, color_data,
+         cp_shade_fragments(cp, state, &batch->scope, info, visbuf,
+                            rast_args.positions, vs_output_buf,
+                            rast_args.prim_refs, num_triangles, w, h,
+                            color_data,
                             vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
                             retry ? cp->reject : 0,
                             retry ? cp->resolved : 0,
@@ -5373,8 +5388,10 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       if (qcounters[0] && !qcounters[1] && (abuf_prod || !ab->composite)) {
          cp->scratch.used = shade_mark;
          cp->dscratch.used = shade_dmark;
-         shaded = cp_abuf_shade(cp, state, &batch->scope, info, ab, rast_args.positions,
-                                vs_output_buf, w, h, vp_scale_x, vp_scale_y,
+         shaded = cp_abuf_shade(cp, state, &batch->scope, info, ab,
+                                rast_args.positions, vs_output_buf,
+                                rast_args.prim_refs, w, h,
+                                vp_scale_x, vp_scale_y,
                                 vp_trans_x, vp_trans_y, qcounters[0],
                                 abuf_covered,
                                 ab->colors_ready && cp->abuf_dbg.colors,
@@ -6002,6 +6019,7 @@ cp_opaque_finish(struct cp_context *cp)
          struct cp_pass_seg *seg = &segs[s];
          ranges[nranges++] = (struct cp_seg_range) {
             .positions = seg->rast.positions,
+            .prim_refs = seg->rast.prim_refs,
             .draw_slices = seg->slices_dev,
             .num_draw_slices = seg->batch.ndraws,
             .prim_base = seg->prim_base,
@@ -6052,7 +6070,8 @@ cp_opaque_finish(struct cp_context *cp)
       cp->fs_batch.prim_shift = seg->prim_shift;
       cp_shade_fragments(cp, &seg->batch.state, &seg->batch.scope,
                          &seg->batch.info, cp->visbuf, seg->rast.positions,
-                         seg->rast.positions, seg->num_triangles, w, h,
+                         seg->rast.positions, seg->rast.prim_refs,
+                         seg->num_triangles, w, h,
                          color_data, seg->rast.vp_scale_x,
                          seg->rast.vp_scale_y, seg->rast.vp_trans_x,
                          seg->rast.vp_trans_y, 0, 0, 0,
@@ -6593,6 +6612,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          struct cp_pass_seg *seg = &segs[s];
          ranges[nranges++] = (struct cp_seg_range) {
             .positions = seg->rast.positions,
+            .prim_refs = seg->rast.prim_refs,
             .draw_slices = seg->slices_dev,
             .num_draw_slices = seg->batch.ndraws,
             .prim_base = seg->prim_base,
@@ -6629,7 +6649,8 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       shaded = cp_abuf_shade(
          cp, &first->batch.state, &first->batch.scope,
          &first->batch.info, ab, first->rast.positions, first->rast.positions,
-         w, h, first->rast.vp_scale_x, first->rast.vp_scale_y,
+         first->rast.prim_refs, w, h, first->rast.vp_scale_x,
+         first->rast.vp_scale_y,
          first->rast.vp_trans_x, first->rast.vp_trans_y,
          (uint32_t)quad_bound, 0, false, NULL, false, &ti, &ts, &tc, &shade);
       if (!shaded)
@@ -7047,6 +7068,7 @@ cp_pass_finish(struct cp_context *cp)
             struct cp_pass_seg *m = &segs[s];
             ranges[nr++] = (struct cp_seg_range) {
                .positions = m->rast.positions,
+               .prim_refs = m->rast.prim_refs,
                .draw_slices = m->slices_dev,
                .num_draw_slices = m->batch.ndraws,
                .prim_base = m->prim_base,
@@ -7080,7 +7102,7 @@ cp_pass_finish(struct cp_context *cp)
       float ti, ts, tc;
       if (!cp_abuf_shade(cp, &sg->batch.state, &sg->batch.scope,
                          &sg->batch.info, ab, sg->rast.positions,
-                         sg->rast.positions, w, h,
+                         sg->rast.positions, sg->rast.prim_refs, w, h,
                          sg->rast.vp_scale_x, sg->rast.vp_scale_y,
                          sg->rast.vp_trans_x, sg->rast.vp_trans_y,
                          gq, 0, false, NULL, false, &ti, &ts, &tc, &ss)) {
