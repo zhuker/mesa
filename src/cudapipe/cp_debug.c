@@ -132,6 +132,9 @@ static const struct cp_flag_def flags[] = {
    { "CUDAPIPE_META_FOLD", CP_FLAG_BOOL_VALUE, F(meta_fold),
      "carry the vertex stage's vcount and stride in the argument block's own "
      "scalar area instead of uploading them as their own block" },
+   { "CUDAPIPE_FETCH_FOLD", CP_FLAG_BOOL_VALUE, F(fetch_fold),
+     "seed the clip and raster queue counters inside cp_vertex_fetch instead "
+     "of as separate device clears" },
    { "CUDAPIPE_NO_OPAQUE_EPISODE", CP_FLAG_BOOL_VALUE,
      F(no_opaque_episode),
      "disable consecutive opaque-run visibility deferral" },

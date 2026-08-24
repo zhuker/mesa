@@ -4488,6 +4488,11 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
     * The output replaces packed_positions for the rasterizer. */
    /* VS execution */
+   /* Whether cp_vertex_fetch seeded this batch's counters, which decides
+    * whether the launches after it still clear them. Declared here because
+    * the raster passes below are outside the block that sets it. */
+   bool fetch_fold = false;
+
    if (state->vs && state->vs->exec[CP_SHADER_EXEC_CLASSIC].kernel) {
       CP_NVTX_SCOPE("vertex");
       void *vb_data2 = (state->num_vertex_buffers > 0)
@@ -4732,10 +4737,58 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             vf_args.elem_instance_divisor[e] = elem->instance_divisor;
          }
 
+         /*
+          * The clears the launches after this one would each have issued as
+          * their own device operation. The fetch runs once per executed
+          * batch, on this stream, ahead of the clipper and the rasterizer, so
+          * it can write them itself -- but only if it runs at all, and only
+          * for a launch that has a thread zero, so the eager clears stay on
+          * every other path.
+          */
+         const bool fetch_runs =
+            (vs_input_buf || out_vid || out_iid || batch_rows) &&
+            total_verts > 0;
+         fetch_fold = cp_debug->fetch_fold && fetch_runs;
+
+         /*
+          * The clipper's counter, hoisted here from the clip block below so
+          * the fetch can seed it. Four bytes; its seed is not always zero,
+          * and the expression that decides it is reproduced there unchanged.
+          */
+         const unsigned max_clipped_early = num_triangles * CP_CLIP_MAX_OUT;
+         const bool clip_block_runs = screen->kernels.clip_triangles &&
+                                      num_vs_outputs <= CP_MAX_CLIP_SLOTS;
+         bool stable_clip_early = state->blend.enable ||
+            (batch_draws > 1 && state->fs && state->fs->reads_const_bufs);
+         CUdeviceptr clip_count_early = 0, active_ids_early = 0;
+         if (fetch_fold && clip_block_runs) {
+            clip_count_early = cp_scratch_alloc_device(cp, 4);
+            if (stable_clip_early)
+               active_ids_early = cp_scratch_alloc_device(
+                  cp, (size_t)max_clipped_early * sizeof(uint32_t));
+         }
+
+         if (fetch_fold) {
+            /* Whichever raster pass this batch takes clears these three words
+             * first; the fill relaunch inside a pass still clears its own. */
+            vf_args.seed_counts = cp->cur_qset.counts;
+            vf_args.seed_clip_count = clip_count_early;
+            vf_args.clip_seed = stable_clip_early && !active_ids_early
+               ? max_clipped_early : 0u;
+         }
+
          /* Nothing to gather when the shader declares no inputs — but it still
           * runs if the ids are wanted, since deriving those is now its job
           * too and a shader with no inputs may still read gl_VertexIndex. */
          if (vs_input_buf || out_vid || out_iid || batch_rows) {
+            /*
+             * Small by call count, bulk by bytes: this clears about 90 MB a
+             * frame on the old capture, which cuMemsetD8Async does in one
+             * kernel at DRAM speed. Folding it into the gather kernel row by
+             * row was measured at 1.84 ms a frame slower even with 16-byte
+             * stores, so it stays a memset. Only the counters below are worth
+             * folding.
+             */
             if (vs_input_buf)
                cuMemsetD8Async(vs_input_buf, 0, (size_t)total_verts * vs_in_stride, cp->stream);
             void *vf_params[] = { &vf_args };
@@ -4943,7 +4996,9 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                unsigned max_clipped = num_triangles * CP_CLIP_MAX_OUT;
                CUdeviceptr clipped = cp_scratch_alloc_device(
                   cp, (size_t)max_clipped * 3 * out_stride);
-               CUdeviceptr clip_count = cp_scratch_alloc_device(cp, 4);
+               /* Allocated above the fetch when that launch seeded it. */
+               CUdeviceptr clip_count = clip_count_early
+                  ? clip_count_early : cp_scratch_alloc_device(cp, 4);
                /* Exact worst-case table, generation-owned beside the original
                 * VS output and clipped scratch. Refusal keeps clip+copy. */
                CUdeviceptr prim_refs = !cp_debug->no_prim_refs &&
@@ -4997,10 +5052,11 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                    * slots beside the usual one-triangle output.  The clipper
                    * appends live fixed-slot IDs here; allocation failure keeps
                    * the proven hole-filled path as a correctness fallback. */
-                  CUdeviceptr active_ids = stable_clip
-                     ? cp_scratch_alloc_device(
-                          cp, (size_t)max_clipped * sizeof(uint32_t))
-                     : 0;
+                  CUdeviceptr active_ids = active_ids_early ? active_ids_early
+                     : (stable_clip
+                        ? cp_scratch_alloc_device(
+                             cp, (size_t)max_clipped * sizeof(uint32_t))
+                        : 0);
 
                   if (getenv("CPVK_DEBUG_CLIP"))
                      fprintf(stderr, "clip: tris=%u batch_draws=%u stable=%d "
@@ -5008,9 +5064,12 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                              (int)stable_clip,
                              state->fs ? (int)state->fs->reads_const_bufs : -1);
 
-                  cuMemsetD32Async(clip_count,
-                                   stable_clip && !active_ids ? max_clipped : 0,
-                                   1, cp->stream);
+                  /* Seeded by cp_vertex_fetch when the fold is on; the value
+                   * is the same expression either way. */
+                  if (!fetch_fold)
+                     cuMemsetD32Async(clip_count,
+                                      stable_clip && !active_ids ? max_clipped : 0,
+                                      1, cp->stream);
 
                   struct cp_clip_args clip = {
                      .vs_out = vs_output_buf,
@@ -5455,8 +5514,10 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          aa.abuf_capacity = ab->capacity;
          abuf_recs_filled = ab->recs;
       }
-      /* The queue counters the count pass is about to fill. */
-      if (cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream) !=
+      /* The queue counters the count pass is about to fill, unless
+       * cp_vertex_fetch already seeded them for this batch. */
+      if (!fetch_fold &&
+          cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream) !=
           CUDA_SUCCESS) {
          cp_renderer_texture_fatal(cp);
          return;
@@ -5910,7 +5971,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * with the preceding pass's kernels. A reusing pass keeps the counts
        * the first pass arrived at — clearing them would leave stages 2 and 3
        * reading an empty queue. */
-      if (rast_queues.mode != CP_QUEUE_REUSE)
+      if (rast_queues.mode != CP_QUEUE_REUSE &&
+          !(fetch_fold && pass == 0))
          cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream);
 
       /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */

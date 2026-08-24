@@ -1132,3 +1132,82 @@ Evidence: `/tmp/perf16/iter25-mechanism-report.md`,
 `/tmp/perf16/iter25-tworeplay/`, `/tmp/perf16/iter25-tworeplay-report.txt`,
 `/tmp/perf16/iter25-stats2/`, `/tmp/perf16/iter25-gate5.out`, and the negative
 control `/tmp/perf16/iter25-gate-negctl.err`.
+
+
+## Iteration 26 — removing the sub-4 KB device operations
+
+Iteration 25's profile said the old capture spends 3.83 ms a frame with the
+device idle, 69% of it directly behind a small copy or a small clear, and that
+it issues 1,988 operations under 4 KB per frame to move 0.59 MB. The lever is
+the count, not the bytes.
+
+### S0 — count them at the call site
+
+`CUDAPIPE_UPLOAD_STATS` attributes every small copy, clear, context sync and
+upload-ring wrap to its call site with no profiler attached, because CUPTI adds
+host cost to exactly the calls being counted. The census confirms the profile
+and comes in slightly under it: old measures 1,098.3 small copies and 769.8
+small clears per frame, Crossroads 263.5 and 244.8. Six clear sites are 80% of
+old's small clears; six upload sites are 70% of its small copies.
+
+It also retired a suspicion. `cp->scratch.current` is never assigned in the
+native driver, so the upload arena stays on generation 0 and a wrap takes a
+whole-context `cuCtxSynchronize`. That was expected every frame or two. It
+fires 79 times in 1,511 frames on old and never in 1,497 frames on Crossroads,
+because `cp_scratch_reset()` rewinds both offsets at every flush. Generation
+rotation needed no change.
+
+The instrument costs nothing when off: two binaries from one tree, AB/BA on
+both captures, old 17.4166 against 17.4044 and Crossroads 6.2170 against
+6.2246.
+
+### S1 — the vertex stage's two scalars (`CUDAPIPE_META_FOLD`)
+
+`vcount` and `stride` travelled as their own eight-byte upload, the single most
+frequent host-to-device operation in the driver. They now sit in two more words
+of the argument block's own scalar area. Measured alone, identical hashes:
+
+| capture | fold | control | delta | copies removed |
+|---|---:|---:|---:|---:|
+| old | 17.0910 | 17.3560 | +0.2651 ms (+1.53%) | −203.7/frame |
+| Crossroads | 6.1539 | 6.2192 | +0.0654 ms (+1.05%) | −50.3/frame |
+
+**0.2651 ms over 203.7 operations is 1.30 µs each, and 0.0654 ms over 50.3 is
+also 1.30 µs** — the same price on two workloads whose batch counts differ
+fourfold. That is the per-copy number the rest of the iteration is predicted
+from.
+
+### S2 — the counters the next launches fill (`CUDAPIPE_FETCH_FOLD`)
+
+`cp_vertex_fetch` runs once per executed batch, on the same stream, ahead of
+the clipper and the rasterizer, so it seeds the clipper's output counter and
+the three raster queue counters itself.
+
+| capture | fold | control | delta | clears removed |
+|---|---:|---:|---:|---:|
+| old | 17.1152 | 17.3781 | +0.2629 ms (+1.51%) | −396.0/frame |
+| Crossroads | 6.1805 | 6.2485 | +0.0680 ms (+1.09%) | −91.2/frame |
+
+**A removed clear is worth 0.66 µs on old and 0.75 µs on Crossroads, about half
+what a removed copy is worth.** The price is not one constant: a copy costs a
+host call, a device operation and a boundary; a clear costs less. The remaining
+small clears on old are therefore worth at most 0.38 ms and the remaining small
+copies at most 1.16 ms, which is what makes the copy-side mechanism the one to
+build.
+
+### What S2 must not fold, and why
+
+The design also asked for the packed vertex input's pre-clear to move into the
+gather kernel, predicting −600 to −650 operations a frame. Folding all three
+hit that target exactly — clears fell from 968.94 to 369.20 per frame, −599.7 —
+and the frame got **1.8412 ms slower on old and 0.2640 ms slower on
+Crossroads**, with identical output.
+
+That clear is small by call count and bulk by bytes: only 117.4 of its 203.7
+calls a frame are under 4 KB, and it moves about 90 MB a frame, which
+`cuMemsetD8Async` does in one kernel at DRAM speed. Row-by-row inside the
+gather kernel it lost even with 16-byte stores. The losing path was deleted;
+the site carries a comment so the next person does not re-derive it.
+
+The rule the census suggests: fold an operation for its **count** only when its
+**bytes** are negligible. Counters are; buffer clears are not.

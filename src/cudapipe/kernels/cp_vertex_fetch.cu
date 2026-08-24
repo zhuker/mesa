@@ -80,6 +80,24 @@ extern "C" __global__ void
 cp_vertex_fetch(struct cp_vertex_fetch_args args)
 {
    uint32_t v = blockIdx.x * blockDim.x + threadIdx.x;
+
+   /*
+    * The counters the clipper and the rasterizer are about to fill. One
+    * thread writes them; the kernel boundary is what publishes them, exactly
+    * as it published the host's clears. Done before the bounds check below so
+    * that the seeding does not depend on this thread having a vertex.
+    */
+   if (v == 0) {
+      if (args.seed_counts) {
+         uint32_t *counts = (uint32_t *)(uintptr_t)args.seed_counts;
+         counts[0] = 0;
+         counts[1] = 0;
+         counts[2] = 0;
+      }
+      if (args.seed_clip_count)
+         *(uint32_t *)(uintptr_t)args.seed_clip_count = args.clip_seed;
+   }
+
    if (v >= args.num_verts)
       return;
 

@@ -19,7 +19,7 @@ they have.
 
 ## Environment switches
 
-The driver has 84 of them and reads **none** of them with `getenv`. They are
+The driver has 85 of them and reads **none** of them with `getenv`. They are
 declared in one array in `src/gallium/drivers/cudapipe/cp_debug.c`, resolved
 once at screen creation into a read-only `struct cp_debug`, and read as
 `cp_debug->field`.

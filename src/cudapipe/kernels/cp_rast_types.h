@@ -1347,6 +1347,20 @@ struct cp_vertex_fetch_args {
     * batch runs — deferral is the hazard, not merging.
     */
    uint64_t elem_bases;    /* const uint64_t *, rows of CP_VB_TABLE_STRIDE */
+   /*
+    * Small clears the launches after this one need, done here instead of as
+    * their own device operations. This kernel already runs once per executed
+    * batch, on the same stream, before the clipper and the rasterizer, so a
+    * kernel boundary publishes all of them.
+    *
+    * seed_counts: the three raster queue counters, which share one
+    * allocation. seed_clip_count: the clipper's output counter, whose seed is
+    * not always zero.
+    */
+   uint64_t seed_counts;      /* uint32_t[3], or 0 */
+   uint64_t seed_clip_count;  /* uint32_t, or 0 */
+   uint32_t clip_seed;
+   uint32_t pad_seed;
 };
 
 /* uint64 entries per draw in the per-draw vertex-buffer base table. */
