@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-85 switches.
+87 switches.
 
 ## Tracing
 
@@ -50,6 +50,8 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_NO_PASS_EPISODE` | bool (value) | `off` | — | disable pass episodes: consecutive blended batches stop sharing one A-buffer build and drain |
 | `CUDAPIPE_UPLOAD_STATS` | bool (value) | `off` | — | count small host-to-device copies, clears, context syncs and upload ring wraps per call site, and report them at teardown |
 | `CUDAPIPE_META_FOLD` | bool (value) | `off` | — | carry the vertex stage's vcount and stride in the argument block's own scalar area instead of uploading them as their own block |
+| `CUDAPIPE_UPLOAD_COALESCE` | bool (value) | `off` | — | send one host-to-device copy per launch boundary instead of one per upload block |
+| `CUDAPIPE_UPLOAD_FLUSH_FAIL_AT` | uint | `0` | — | fault injection: fail the Nth coalesced upload flush |
 | `CUDAPIPE_FETCH_FOLD` | bool (value) | `off` | — | seed the clip and raster queue counters inside cp_vertex_fetch instead of as separate device clears |
 | `CUDAPIPE_NO_OPAQUE_EPISODE` | bool (value) | `off` | — | disable consecutive opaque-run visibility deferral |
 | `CUDAPIPE_NO_SAMPLER_VARIANT` | bool (value) | `off` | — | disable literal-state fragment sampler variants |

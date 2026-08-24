@@ -138,6 +138,8 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
    cp->cur_qset.setup_cache = cp->rast_setup_cache;
    cp->cur_qset.counts = cp->rast_counts;
 
+   cp->upload_open_lo = SIZE_MAX;
+
    return true;
 
 fail:
@@ -384,11 +386,18 @@ cp_upload_begin_checked(struct cp_context *cp, size_t size, void **host_out,
        * rotates cp->scratch.current, so this is generation 0 wrapping, and
        * the drain is a whole-context stall the frame pays unnamed. */
       cp_smallop_hit(__FILE__, __LINE__, CP_SMALLOP_UPLOAD_WRAP, size);
+      /* Owed bytes first, then the drain, then the rewind: the span names
+       * offsets this is about to hand out again. */
+      *error = cp_upload_flush(cp);
+      if (*error != CUDA_SUCCESS)
+         return 0;
       *error = cuCtxSynchronize();
       if (*error != CUDA_SUCCESS)
          return 0;
       cp->arena_offset = dev_start;
       cp->upload_offset = host_start;
+      cp->upload_flushed = host_start;
+      cp->arena_flushed = dev_start;
       dev_off = dev_start;
       host_off = host_start;
       if (size > dev_slice || size > host_slice)
@@ -398,6 +407,9 @@ cp_upload_begin_checked(struct cp_context *cp, size_t size, void **host_out,
    /* The bounds above make both additions overflow-safe. */
    cp->arena_offset = dev_off + size;
    cp->upload_offset = host_off + size;
+   /* Open until cp_upload_end(): the flush watermark may not pass it. */
+   cp->upload_open++;
+   cp->upload_open_lo = MIN2(cp->upload_open_lo, host_off);
    *host_out = (char *)cp->upload_host + host_off;
    return cp->arena_base + dev_off;
 }
@@ -409,6 +421,89 @@ cp_upload_begin(struct cp_context *cp, size_t size, void **host_out)
    return cp_upload_begin_checked(cp, size, host_out, &ignored);
 }
 
+/*
+ * Send everything the host has written into the staging buffer and not yet
+ * copied. One copy per flush point instead of one per block.
+ *
+ * The span is exact: cp_upload_begin_checked() advances the device and host
+ * offsets by the same size from bases that are both gen*slice, so within a
+ * generation the two differ by a constant and a host span maps to a device
+ * span of the same length. arena_flushed is tracked alongside rather than
+ * recomputed, so the two can never drift silently.
+ */
+CUresult
+cp_upload_flush(struct cp_context *cp)
+{
+   if (!cp_debug->upload_coalesce)
+      return CUDA_SUCCESS;
+
+   /* An open reservation holds the watermark back: its bytes are still being
+    * written, and nothing has been launched that could refer to it. */
+   size_t hi = MIN2(cp->upload_offset, cp->upload_open_lo);
+   if (hi <= cp->upload_flushed) {
+      cp->upload.empty++;
+      return CUDA_SUCCESS;
+   }
+
+   size_t lo = cp->upload_flushed;
+   size_t len = hi - lo;
+   CUresult err;
+   if (cp_debug->upload_flush_fail_at &&
+       cp->upload.flushes + 1 == cp_debug->upload_flush_fail_at) {
+      err = CUDA_ERROR_UNKNOWN;
+   } else {
+      cp_smallop_hit(__FILE__, __LINE__, CP_SMALLOP_HTOD_ASYNC, len);
+      err = cp_smallop_htod_async_raw(cp->arena_base + cp->arena_flushed,
+                                      (const char *)cp->upload_host + lo, len,
+                                      cp->stream);
+   }
+   if (err != CUDA_SUCCESS) {
+      /* A deferred copy fails later than the site that produced the block, so
+       * no site-local refusal is possible any more. It is fatal, as every
+       * other CUDA failure on this path is. */
+      fprintf(stderr, "cudapipe: coalesced upload flush of %zu bytes failed "
+              "(%d); latching device loss\n", len, err);
+      cp_renderer_texture_fatal(cp);
+      return err;
+   }
+   cp->upload_flushed = hi;
+   cp->arena_flushed += len;
+   cp->upload_stream = cp->stream;
+   cp->upload.flushes++;
+   cp->upload.bytes += len;
+   return CUDA_SUCCESS;
+}
+
+/* The one place a kernel is launched, and so the one place the owed span has
+ * to be sent. Nothing in the driver may call cuLaunchKernel directly; the
+ * cp_launch_audit test enforces that. */
+CUresult
+cp_launch(struct cp_context *cp, CUfunction f,
+          unsigned gx, unsigned gy, unsigned gz,
+          unsigned bx, unsigned by, unsigned bz,
+          unsigned shmem, CUstream stream, void **params, void **extra)
+{
+   CUresult err = cp_upload_flush(cp);
+   if (err != CUDA_SUCCESS)
+      return err;
+   return cuLaunchKernel(f, gx, gy, gz, bx, by, bz, shmem, stream,
+                         params, extra);
+}
+
+/*
+ * Switching streams closes the span: a copy issued on one stream orders
+ * nothing on another, so the bytes owed are sent before the switch, on the
+ * stream that will carry the readers reserved so far.
+ */
+void
+cp_stream_set(struct cp_context *cp, CUstream stream)
+{
+   if (cp->stream == stream)
+      return;
+   cp_upload_flush(cp);
+   cp->stream = stream;
+}
+
 /* Send a block reserved above, once the caller has finished writing it. */
 CUresult
 cp_upload_end(struct cp_context *cp, CUdeviceptr dst, const void *host,
@@ -416,10 +511,19 @@ cp_upload_end(struct cp_context *cp, CUdeviceptr dst, const void *host,
 {
    /* Every upload block in the driver arrives here, so counting this line
     * would say only that uploads happen. The census wants the site that
-    * asked for the block, which is this function's return address. */
-   if (cp_smallop_enabled)
+    * asked for the block, which is this function's return address -- and it
+    * wants device operations, so a block whose copy is owed rather than
+    * issued is not one of them. */
+   if (cp_smallop_enabled && !cp_debug->upload_coalesce)
       cp_smallop_note(__FILE__, __LINE__, __builtin_return_address(0),
                       CP_SMALLOP_HTOD_ASYNC, size);
+
+   cp->upload.blocks++;
+   if (cp->upload_open && !--cp->upload_open)
+      cp->upload_open_lo = SIZE_MAX;
+   if (cp_debug->upload_coalesce)
+      return CUDA_SUCCESS;   /* the copy is owed, not skipped */
+
    return cp_smallop_htod_async_raw(dst, host, size, cp->stream);
 }
 
@@ -490,6 +594,9 @@ static bool
 cp_sync_timed(struct cp_context *cp, CUstream stream,
               uint64_t *ns, uint64_t *n)
 {
+   /* Whatever is owed was owed to work this is about to wait for. */
+   if (cp_upload_flush(cp) != CUDA_SUCCESS)
+      return false;
    int64_t t0 = os_time_get_nano();
    CUresult err = cuStreamSynchronize(stream);
    *ns += (uint64_t)(os_time_get_nano() - t0);
@@ -526,10 +633,16 @@ cp_scratch_reset(struct cp_context *cp)
     * uploads land on them.
     */
    if (!cp->batch_uploads_live) {
+      /* The rewind hands these bytes out again, so anything still owed on
+       * them has to go first. The callers have already drained the device,
+       * so the copy this issues is the last reader of the old contents. */
+      cp_upload_flush(cp);
       cp->arena_offset = (size_t)cp->scratch.current *
                          (cp->arena_size / cp->flush_gens);
       cp->upload_offset = (size_t)cp->scratch.current *
                           (cp->upload_size / cp->flush_gens);
+      cp->upload_flushed = cp->upload_offset;
+      cp->arena_flushed = cp->arena_offset;
    }
 }
 
@@ -704,6 +817,11 @@ cp_context_cleanup(struct cp_context *cp)
    cp_hardware_texture_report(cp);
    cp_spec_report(cp);
    cp_plan_report(cp);
+   if (cp_debug->upload_stats)
+      fprintf(stderr, "cudapipe: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
+              " bytes=%" PRIu64 " empty=%" PRIu64 " coalesce=%d\n",
+              cp->upload.blocks, cp->upload.flushes, cp->upload.bytes,
+              cp->upload.empty, (int)cp_debug->upload_coalesce);
    cp_smallop_report();
    cp_abuf_cleanup(cp->abuf);
    free(cp->abuf);
@@ -1975,7 +2093,7 @@ cp_depth_attachment_xfer(struct cp_context *cp,
    };
    cuCtxSetCurrent(cp->dev->cuda_ctx);
    void *params[] = { &args };
-   CUresult err = cuLaunchKernel(fn,
+   CUresult err = cp_launch(cp, fn,
       (args.width + 15) / 16, (args.height + 15) / 16, args.samples,
       16, 16, 1, 0, cp->stream, params, NULL);
    if (err != CUDA_SUCCESS)
@@ -3133,7 +3251,7 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
        * small draw's launch was mostly scheduling idle blocks. 4096 blocks
        * of 256 is far past what fills the machine. */
       cp->hardware_texture.fs_attempts++;
-      CUresult fs_err = cuLaunchKernel(launch_kernel,
+      CUresult fs_err = cp_launch(cp, launch_kernel,
                                        MIN2((num_threads + 255) / 256, 4096u),
                                        1, 1, 256, 1, 1, 0, cp->stream,
                                        fs_params, NULL);
@@ -3400,7 +3518,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       unsigned num_quads = ((w + 1) / 2) * ((h + 1) / 2);
       CUfunction interp_kernel = inshader_interp_dev
          ? screen->kernels.fs_compact : screen->kernels.fs_interpolate;
-      CUresult interp_err = cuLaunchKernel(interp_kernel,
+      CUresult interp_err = cp_launch(cp, interp_kernel,
                                            (num_quads + 255) / 256, 1, 1, 256, 1, 1,
                                            0, cp->stream, interp_params, NULL);
       if (interp_err != CUDA_SUCCESS) {
@@ -3479,7 +3597,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       /* The kernel strides, so the grid is capped: num_pixels is the
        * framebuffer's worst case and the launch was spending more time
        * scheduling idle blocks than writing pixels on small draws. */
-      CUresult wb_err = cuLaunchKernel(screen->kernels.fs_writeback,
+      CUresult wb_err = cp_launch(cp, screen->kernels.fs_writeback,
                      MIN2((num_pixels + 255) / 256, 2048u), 1, 1, 256, 1, 1,
                      0, cp->stream, wb_params, NULL);
       cp_nvtx_pop();   /* writeback */
@@ -3890,7 +4008,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
       unsigned nwork = num_covered ? num_covered : w * h;
       cp_nvtx_push("composite");
       cp_abuf_mark(ab, ab->ev[15], cp->stream);
-      CUresult ce = cuLaunchKernel(screen->kernels.abuf_composite,
+      CUresult ce = cp_launch(cp, screen->kernels.abuf_composite,
                                    (nwork + 255) / 256, 1, 1, 256, 1, 1,
                                    0, cp->stream, p, NULL);
       cp_abuf_mark(ab, ab->ev[16], cp->stream);
@@ -4038,7 +4156,7 @@ cp_flush_pending_clip(struct cp_context *cp, struct cp_device *screen,
       return true;
    clip->pending = false;
    void *params[] = { &clip->args };
-   CUresult err = cuLaunchKernel(screen->kernels.clip_triangles,
+   CUresult err = cp_launch(cp, screen->kernels.clip_triangles,
                                  (clip->args.num_triangles + 63) / 64, 1, 1,
                                  64, 1, 1, 0, cp->stream, params, NULL);
    if (err != CUDA_SUCCESS)
@@ -4974,7 +5092,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
          /* Compiled shaders grid-stride; see the fragment launch. */
-         CUresult vs_err = cuLaunchKernel(
+         CUresult vs_err = cp_launch(cp,
             state->vs->exec[CP_SHADER_EXEC_CLASSIC].kernel,
             MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
             0, cp->stream, vs_params, NULL);
@@ -5102,7 +5220,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                      pending_clip.fs_prim_shift = cp->fs_batch.prim_shift;
                   } else {
                      void *clip_params[] = { &clip };
-                     clip_err = cuLaunchKernel(
+                     clip_err = cp_launch(cp,
                         screen->kernels.clip_triangles,
                         (num_triangles + 63) / 64, 1, 1, 64, 1, 1,
                         0, cp->stream, clip_params, NULL);
@@ -5538,7 +5656,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
           * more SMs). Stages 2 and 3 follow unchanged — see the fused
           * kernel's comment for why they keep their own grids. */
          void *fp[] = { &pending_clip.args, &aa, &rast_queues };
-         CUresult fused_err = cuLaunchKernel(
+         CUresult fused_err = cp_launch(cp,
             screen->kernels.clip_rast_fused_abuf,
             (pending_clip.args.num_triangles + 63) / 64, 1, 1,
             64, 1, 1, 0, cp->stream, fp, NULL);
@@ -5985,7 +6103,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
           * never clips. The queue appends are classic stage 1's, so stages
           * 2 and 3 below read exactly what they always read. */
          void *fp[] = { &pending_clip.args, &rast_args, &rast_queues };
-         rast_err = cuLaunchKernel(screen->kernels.clip_rast_fused,
+         rast_err = cp_launch(cp, screen->kernels.clip_rast_fused,
             (pending_clip.args.num_triangles + 63) / 64, 1, 1, 64, 1, 1,
             0, cp->stream, fp, NULL);
          fused_rast = rast_err == CUDA_SUCCESS;
@@ -6002,7 +6120,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       }
       void *s1_params[] = { &rast_args, &rast_queues };
       if (!fused_rast)
-         rast_err = cuLaunchKernel(screen->kernels.rasterize_stage1,
+         rast_err = cp_launch(cp, screen->kernels.rasterize_stage1,
             (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
             0, cp->stream, s1_params, NULL);
 
@@ -6565,6 +6683,10 @@ cp_pass_seg_stream(struct cp_context *cp, unsigned s)
 static bool
 cp_pass_join(struct cp_context *cp, unsigned nsegs)
 {
+   /* The events below order other streams against this one, so anything owed
+    * on the current stream has to be issued before they are recorded. */
+   if (cp_upload_flush(cp) != CUDA_SUCCESS)
+      return false;
    if (!cp->seg_streams[0])
       return true;
    unsigned used = MIN2(nsegs, (unsigned)CP_PASS_STREAMS);
@@ -6584,6 +6706,8 @@ cp_pass_join(struct cp_context *cp, unsigned nsegs)
 static bool
 cp_pass_broadcast(struct cp_context *cp, unsigned nsegs)
 {
+   if (cp_upload_flush(cp) != CUDA_SUCCESS)
+      return false;
    if (!cp->seg_streams[0])
       return true;
    if (cuEventRecord(cp->pass_gate, cp->stream) != CUDA_SUCCESS) {
@@ -7549,7 +7673,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
       .seg_desc = ngroups > 1 ? descs_dev : 0,
    };
    void *params[] = { &ca };
-   CUresult err = cuLaunchKernel(cp->dev->kernels.abuf_composite,
+   CUresult err = cp_launch(cp, cp->dev->kernels.abuf_composite,
                                  ((size_t)w * h + 255) / 256, 1, 1,
                                  256, 1, 1, 0, cp->stream, params, NULL);
    if (err != CUDA_SUCCESS)
@@ -7636,7 +7760,7 @@ cp_pass_finish(struct cp_context *cp)
       for (unsigned s = 0; s < nsegs; s++) {
          struct cp_pass_seg *sg = &segs[s];
          if (cp->seg_streams[0])
-            cp->stream = cp_pass_seg_stream(cp, s);
+            cp_stream_set(cp, cp_pass_seg_stream(cp, s));
          struct cp_rasterize_args aa = sg->rast;
          aa.abuf_frags = ab->frags;
          aa.abuf_capacity = ab->capacity;
@@ -7656,7 +7780,7 @@ cp_pass_finish(struct cp_context *cp)
                         CLAMP(sg->rast_num_triangles * 8, 512u, 2048u), 1, 1,
                         64, 1, 1, 0, cp->stream, ap, NULL);
       }
-      cp->stream = pass_main;
+      cp_stream_set(cp, pass_main);
       if (!cp_pass_join(cp, nsegs))
          return;
    }
@@ -7889,7 +8013,7 @@ cp_pass_finish(struct cp_context *cp)
       for (unsigned s = 0; s < nsegs; s++)
          members += seg_group[s] == g;
       if (cp->seg_streams[0])
-         cp->stream = cp_pass_seg_stream(cp, g);
+         cp_stream_set(cp, cp_pass_seg_stream(cp, g));
       struct cp_abuf_seg_shade ss = {
          .quad_list = grouped,
          .quad_list_base = group_base[g],
@@ -7994,7 +8118,7 @@ cp_pass_finish(struct cp_context *cp)
          descs[s].num_slots = sq * 4u;
       }
    }
-   cp->stream = pass_main;
+   cp_stream_set(cp, pass_main);
    cp->fs_batch = saved_fs_batch;
    /* A failed join leaves the shading streams unordered against the composite;
     * neither compositing nor re-rendering is safe after it. */
@@ -8033,7 +8157,7 @@ cp_pass_finish(struct cp_context *cp)
    void *p[] = { &ca };
    unsigned nwork = covered ? covered : (unsigned)n;
    cp_nvtx_push("composite");
-   CUresult ce = cuLaunchKernel(screen->kernels.abuf_composite,
+   CUresult ce = cp_launch(cp, screen->kernels.abuf_composite,
                                 (nwork + 255) / 256, 1, 1, 256, 1, 1,
                                 0, cp->stream, p, NULL);
    cp_nvtx_pop();
@@ -8160,8 +8284,12 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
          err = cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
       if (err == CUDA_SUCCESS && ab->recs)
          err = cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
-      if (err == CUDA_SUCCESS && cp->seg_streams[0])
-         err = cuEventRecord(cp->pass_gate, cp->stream);
+      if (err == CUDA_SUCCESS && cp->seg_streams[0]) {
+         /* The gate every segment stream waits on. */
+         err = cp_upload_flush(cp);
+         if (err == CUDA_SUCCESS)
+            err = cuEventRecord(cp->pass_gate, cp->stream);
+      }
       if (err != CUDA_SUCCESS) {
          cp_renderer_texture_fatal(cp);
          return;
@@ -8178,7 +8306,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
          cp_renderer_texture_fatal(cp);
          return;
       }
-      cp->stream = cp->seg_streams[k];
+      cp_stream_set(cp, cp->seg_streams[k]);
       cp->cur_qset = cp->seg_qsets[k];
    }
 
@@ -8186,7 +8314,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
    cp->pass.append_failed = false;
    cp_draw_execute_batch(cp, &cp->batch);
    cp->pass.appending = false;
-   cp->stream = saved_stream;
+   cp_stream_set(cp, saved_stream);
    cp->cur_qset = saved_qset;
 
    if (cp->pass.append_failed) {
@@ -8644,7 +8772,7 @@ cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
 
    cuCtxSetCurrent(screen->cuda_ctx);
    void *params[] = { &args };
-   return cuLaunchKernel(fn,
+   return cp_launch(cp, fn,
       (width + 15) / 16, (height + 15) / 16, 1,
       16, 16, 1,
       0, cp->stream, params, NULL) == CUDA_SUCCESS;

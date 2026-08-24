@@ -259,6 +259,9 @@ if dep_vulkan_loader.found()
     dependencies : dep_vulkan_loader,
     c_args : ['-Wno-error=missing-prototypes'],
     build_by_default : false)
+  test('cp_launch_audit', prog_python,
+       args : [files('tests/cp_launch_audit.py')],
+       suite : 'cudapipe-native')
   test('cpvk_texture_cache_formats_gate', prog_python,
        args : [files('tests/cpvk_texture_cache_formats_gate.py'),
                cpvk_texture_cache_formats_exe],

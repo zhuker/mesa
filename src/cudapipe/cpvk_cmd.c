@@ -1193,9 +1193,9 @@ cpvk_execute_dispatch(struct cpvk_device *dev,
    unsigned bx = MAX2(d->pipeline->local_size[0], (uint16_t)1);
    unsigned by = MAX2(d->pipeline->local_size[1], (uint16_t)1);
    unsigned bz = MAX2(d->pipeline->local_size[2], (uint16_t)1);
-   CUresult err = cuLaunchKernel(exec->kernel, d->grid[0], d->grid[1],
-                                 d->grid[2], bx, by, bz, 0, cp->stream,
-                                 kernel_args, NULL);
+   CUresult err = cp_launch(cp, exec->kernel, d->grid[0], d->grid[1],
+                            d->grid[2], bx, by, bz, 0, cp->stream,
+                            kernel_args, NULL);
    if (err != CUDA_SUCCESS) {
       /* Name it. A submit that returns DEVICE_LOST and says nothing else
        * is indistinguishable from every other way a replay can stop. */
@@ -3492,9 +3492,9 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
          .encoding = c->encoding,
       };
       void *params[] = { &ra };
-      if (cuLaunchKernel(cp->dev->kernels.resolve_samples,
-                         (ra.width + 15) / 16, (ra.height + 15) / 16, 1,
-                         16, 16, 1, 0, cp->stream, params, NULL) == CUDA_SUCCESS)
+      if (cp_launch(cp, cp->dev->kernels.resolve_samples,
+                    (ra.width + 15) / 16, (ra.height + 15) / 16, 1,
+                    16, 16, 1, 0, cp->stream, params, NULL) == CUDA_SUCCESS)
          return VK_SUCCESS;
    }
 
@@ -3552,10 +3552,10 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
          .filter_linear = c->filter_linear,
       };
       void *params[] = { &ba };
-      CUresult err = cuLaunchKernel(cp->dev->kernels.blit_linear,
-                                    (c->dst_w + 15) / 16,
-                                    (c->dst_h + 15) / 16, 1,
-                                    16, 16, 1, 0, cp->stream, params, NULL);
+      CUresult err = cp_launch(cp, cp->dev->kernels.blit_linear,
+                               (c->dst_w + 15) / 16,
+                               (c->dst_h + 15) / 16, 1,
+                               16, 16, 1, 0, cp->stream, params, NULL);
       if (err != CUDA_SUCCESS) {
          fprintf(stderr, "cudapipe: device blit failed: %d\n", err);
          return vk_error(dev, VK_ERROR_DEVICE_LOST);

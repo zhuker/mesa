@@ -1195,6 +1195,55 @@ small clears on old are therefore worth at most 0.38 ms and the remaining small
 copies at most 1.16 ms, which is what makes the copy-side mechanism the one to
 build.
 
+### S3 — one copy per launch boundary (`CUDAPIPE_UPLOAD_COALESCE`)
+
+`cp_upload_end()` stops copying and records that the staging bytes below
+`upload_offset` are owed; one `cuMemcpyHtoDAsync` per flush point sends the
+whole span. The allocator, the alignment, the generations, the device
+addresses, the block contents and the shader ABI are unchanged.
+
+Flush points are every launch (`CP_LAUNCH` and all eighteen former raw
+`cuLaunchKernel` sites now go through `cp_launch()`), every stream switch
+(`cp_stream_set()`, which flushes onto the *old* stream), every wait, every
+event another stream waits on, every arena rewind, and the end of a submit.
+`tests/cp_launch_audit.py` fails the suite if a raw `cuLaunchKernel` appears
+outside the two allowlisted definitions, because a launch that does not flush
+is the one silent bug this mechanism can have.
+
+| capture | coalesced | control | delta | copies removed |
+|---|---:|---:|---:|---:|
+| old | 17.0954 | 17.3933 | +0.2979 ms (+1.71%) | -502.5/frame |
+| Crossroads | 6.2354 | 6.2178 | -0.0176 ms | -115.1/frame |
+
+Crossroads is **neutral within spread**, not a win: both arms vary by about
+0.03 ms across runs. The merge ratio explains it -- only 1.82 blocks per copy
+on old and 1.75 on Crossroads, because every launch is a flush point and this
+driver launches constantly.
+
+**The rule this iteration produced, and the one to carry forward:**
+
+> **Removing an operation outright pays about twice what merging operations at
+> an unchanged boundary pays.** S1 removed a copy *and* its boundary and was
+> worth 1.30 us per operation. S3 merges copies at a boundary that stays where
+> it was, removing the host call and the device operation but not the gap, and
+> is worth 0.59 us. Both numbers are measured, on both captures.
+
+It also predicts its own future: when iteration 27's vertex-chain fusion
+removes 222 launches a frame it removes 222 flush points, the merge ratio
+rises, and S3 should get *better*. If it does not, the boundary model is wrong
+in a way worth knowing.
+
+### S1+S2+S3 together
+
+| capture | all three | control | delta |
+|---|---:|---:|---:|
+| old | 16.5786 | 17.4239 | **+0.8453 ms (+4.85%)** |
+| Crossroads | 6.0926 | 6.2522 | **+0.1597 ms (+2.55%)** |
+
+That is 102% and 138% of the sum of the stages measured separately, so the
+sub-additivity an earlier pair suggested was control drift between sessions,
+not overlap. A control belongs in the same session as its candidate.
+
 ### What S2 must not fold, and why
 
 The design also asked for the packed vertex input's pre-clear to move into the

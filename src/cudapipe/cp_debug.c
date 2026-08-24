@@ -132,6 +132,11 @@ static const struct cp_flag_def flags[] = {
    { "CUDAPIPE_META_FOLD", CP_FLAG_BOOL_VALUE, F(meta_fold),
      "carry the vertex stage's vcount and stride in the argument block's own "
      "scalar area instead of uploading them as their own block" },
+   { "CUDAPIPE_UPLOAD_COALESCE", CP_FLAG_BOOL_VALUE, F(upload_coalesce),
+     "send one host-to-device copy per launch boundary instead of one per "
+     "upload block" },
+   { "CUDAPIPE_UPLOAD_FLUSH_FAIL_AT", CP_FLAG_UINT, F(upload_flush_fail_at),
+     "fault injection: fail the Nth coalesced upload flush" },
    { "CUDAPIPE_FETCH_FOLD", CP_FLAG_BOOL_VALUE, F(fetch_fold),
      "seed the clip and raster queue counters inside cp_vertex_fetch instead "
      "of as separate device clears" },

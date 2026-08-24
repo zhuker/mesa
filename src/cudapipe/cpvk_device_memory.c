@@ -307,6 +307,10 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * stream. The worker publishes Vulkan sync state only after this event;
     * queue submission itself no longer drains CUDA. */
    cp_batch_flush(&dev->renderer);
+   /* No owed upload may outlive the submit that produced it: the event
+    * recorded below is what the queue reports completion on. */
+   if (cp_upload_flush(&dev->renderer) != CUDA_SUCCESS)
+      return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
    dev->prev_draw = NULL;

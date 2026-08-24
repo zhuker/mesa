@@ -115,6 +115,8 @@ struct cp_debug {
    bool upload_stats;
    bool meta_fold;
    bool fetch_fold;
+   bool upload_coalesce;
+   unsigned upload_flush_fail_at;
    bool no_opaque_episode;
    bool no_sampler_variant;
    bool texture_cache;

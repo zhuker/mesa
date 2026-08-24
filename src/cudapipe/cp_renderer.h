@@ -534,6 +534,25 @@ struct cp_context {
     * which restores the drain and the old single-generation behaviour.
     */
    unsigned flush_gens;
+
+   /*
+    * The deferred upload span. cp_upload_end() stops copying and records that
+    * the staging bytes below upload_offset are owed to the device; one copy
+    * per flush point sends the whole span. upload_open_lo holds the watermark
+    * back while a reservation is begun and not yet ended, so half-written
+    * bytes are never sent and no later block overtakes an open one.
+    */
+   size_t upload_flushed;     /* host offset already on the device */
+   size_t arena_flushed;      /* the device offset that pairs with it */
+   size_t upload_open_lo;     /* oldest open reservation, or SIZE_MAX */
+   unsigned upload_open;      /* reservations begun and not yet ended */
+   CUstream upload_stream;    /* the stream the span was flushed on */
+   struct {
+      uint64_t blocks;        /* upload blocks written */
+      uint64_t flushes;       /* copies actually issued */
+      uint64_t bytes;         /* bytes those copies moved */
+      uint64_t empty;         /* flush points with nothing owed */
+   } upload;
    CUevent flush_retire[CP_FLUSH_GENS];
    bool flush_retire_recorded[CP_FLUSH_GENS];
 
@@ -653,7 +672,20 @@ void cp_tile_census_end_pass(struct cp_context *cp);
  * the tools that find the kernel. Synchronous failures, a bad grid or too much
  * shared memory, it does report exactly.
  */
-#define CP_LAUNCH(...) CP_CU_WARN(cuLaunchKernel(__VA_ARGS__), "cuLaunchKernel")
+/*
+ * Every launch is a flush point: a kernel may read any arena block reserved
+ * before it. cp_launch() sends the owed span on the current stream first, so
+ * same-stream ordering puts the copy ahead of the kernel that reads it.
+ */
+CUresult cp_launch(struct cp_context *cp, CUfunction f,
+                   unsigned gx, unsigned gy, unsigned gz,
+                   unsigned bx, unsigned by, unsigned bz,
+                   unsigned shmem, CUstream stream,
+                   void **params, void **extra);
+CUresult cp_upload_flush(struct cp_context *cp);
+void cp_stream_set(struct cp_context *cp, CUstream stream);
+
+#define CP_LAUNCH(...) CP_CU_WARN(cp_launch(cp, __VA_ARGS__), "cuLaunchKernel")
 
 /* Slots the quad stream's own shading pass may use, four per quad. Bounds the
  * fragment shader's input and output buffers, which at five varyings are about
