@@ -733,3 +733,37 @@ move on representative old shaders. Only then design retained-NIR lifetime and
 lazy per-state variants. The prize is broad coverage of the ~9-ms FS class and
 a clean path to specialize image encoding/dimension later; a generic inlined
 megafunction that stays 203/236 is rejected before integration.
+
+## Iteration 16 — result: whole-launch specialization rejected before source
+
+The LLVM sampler proof is strong: same-LLVM interpolation plus literal RGBA8
+sampling compiles to **54 registers** (BC3 56), zero spill/local/helper, versus
+203/236 today. Implicit RGBA8 is bit-exact over 131,072 float words. Explicit
+LOD still differs in 122 words and cannot ship. But a timed 5,437-launch census
+shows current variants cover only 15.2% FS device time; a richer ordered
+per-site sampler+encoding key reaches only **25.85%**, below the 60% gate. No
+production source changed. Report: `/tmp/perf16/iter16-report.md`.
+
+Per-row analysis exposes the architectural opportunity: broad literal keys can
+cover **58.00% total FS time and 94.33% A-buffer FS time**, including 42.80% of
+the expensive 236-register class. Whole-launch agreement hid that because one
+batched shader launch contains several material rows. The narrow proven core
+would cover only 32.02%; broad cube/3D/BC/packed semantics and exact explicit
+LOD remain mandatory.
+
+## Iteration 17 — bounded coherent row-key sampler dispatch
+
+Measure exact row keys and live shaded slots first. If the dominant mixed-row
+launches truly have at most two keys, compile one generated FS execution with
+two literal per-site sampler paths and a quad-coherent row-key-index branch at
+each texture operation. LLVM can allocate mutually exclusive branches at their
+maximum live set rather than linking the opaque generic sampler. The module has
+no generic sampler reference; every row in a launch must map to one admitted
+key or the entire launch uses fused software. Geometry/A-buffer batching, slot
+identity and launch count remain unchanged.
+
+This is preferred over fragment rebucketing as the first mechanism because it
+adds no scan/list/launch work. Cap at two until resource/code-size/compile-time
+and exact-key census justify more. The retained-NIR/key cache remains bounded
+and opt-in. Exact current sampler results, including explicit LOD and all target/
+encoding classes admitted, are non-negotiable.

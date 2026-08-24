@@ -131,10 +131,18 @@
   {
    "id": 16,
    "name": "same-LLVM specialized software sampler",
+   "verdict": "reverted before production",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "proof sampler reaches 54 regs RGBA8/56 BC3, exact implicit; explicit LOD 122/131072 word mismatches. Whole-launch rich key only 25.85% FS time (<60), so no src edits. Per-row broad ceiling 58% overall/94.33% abuf motivates bounded row-key dispatch."
+  },
+  {
+   "id": 17,
+   "name": "bounded per-row LLVM sampler dispatch",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "prototype owned software sampler core as LLVM bitcode, inline into retained pristine NIR variant with literal sampler state and DCE unused format/filter/address paths. Target dominant 203/236-reg FS across broad launch coverage; resource proof first."
+   "note": "measure exact row keys/live slots, then compile up to two per-row literal software sampler paths inside one LLVM FS module; coherent key-index branch, no generic sampler link, whole fused fallback for unmapped rows. Targets 58% FS time/94% abuf ceiling without extra launches."
   }
  ]
 }
