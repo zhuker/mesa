@@ -1178,13 +1178,13 @@ struct cp_tile_pair {
 #ifdef __CUDACC__
 static_assert(sizeof(struct cp_tri_setup) == 80, "cp_tri_setup ABI");
 static_assert(sizeof(struct cp_setup_cache_entry) == 84, "setup-cache ABI");
-static_assert((CP_PRIM_ID_LIMIT & CP_TILE_SETUP_TAG) == 0, "primitive/tag collision");
+static_assert(CP_PRIM_ID_LIMIT <= CP_TILE_SETUP_TAG, "primitive/tag range collision");
 static_assert(CP_SETUP_CACHE_CAPACITY <= CP_TILE_SETUP_INDEX_MASK,
               "setup-cache index does not fit tile tag");
 #else
 _Static_assert(sizeof(struct cp_tri_setup) == 80, "cp_tri_setup ABI");
 _Static_assert(sizeof(struct cp_setup_cache_entry) == 84, "setup-cache ABI");
-_Static_assert((CP_PRIM_ID_LIMIT & CP_TILE_SETUP_TAG) == 0, "primitive/tag collision");
+_Static_assert(CP_PRIM_ID_LIMIT <= CP_TILE_SETUP_TAG, "primitive/tag range collision");
 _Static_assert(CP_SETUP_CACHE_CAPACITY <= CP_TILE_SETUP_INDEX_MASK,
                "setup-cache index does not fit tile tag");
 #endif
@@ -1225,6 +1225,12 @@ struct cp_rast_queues {
    uint32_t setup_capacity;    /* zero selects the complete classic fallback */
    uint32_t mode;              /* CP_QUEUE_* above */
 };
+
+#ifdef __CUDACC__
+static_assert(sizeof(struct cp_rast_queues) == 56, "raster queue launch ABI");
+#else
+_Static_assert(sizeof(struct cp_rast_queues) == 56, "raster queue launch ABI");
+#endif
 
 #define CP_MAX_VERTEX_ELEMENTS_VF 16
 #define CP_MAX_VERTEX_BUFFERS_VF 16

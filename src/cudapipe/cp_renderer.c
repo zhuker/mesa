@@ -5941,8 +5941,9 @@ cp_opaque_tile_visibility(struct cp_context *cp, struct cp_pass_seg *segs,
       aa.path_flag = overflow;
       aa.path_value = 1;
       queues.mode = CP_QUEUE_FILL;
-      cuMemsetD32Async(queues.nontrivial_count, 0, 1, cp->stream);
-      cuMemsetD32Async(queues.huge_count, 0, 1, cp->stream);
+      /* All three counters share this allocation: FILL starts a fresh
+       * nontrivial queue, tile queue and setup-cache generation together. */
+      cuMemsetD32Async(queues.nontrivial_count, 0, 3, cp->stream);
       void *params[] = { &aa, &queues };
       CP_LAUNCH(screen->kernels.rasterize_stage1,
                 DIV_ROUND_UP(segs[s].rast_num_triangles, 256), 1, 1,
