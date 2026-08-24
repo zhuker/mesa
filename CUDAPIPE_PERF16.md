@@ -532,3 +532,28 @@ No-go forms: 32-bit edge values, accumulated float stepping, corner accept
 without top-left bias and all sample offsets, or a partial production rollout.
 The migration improves conformance and enables exact tile acceptance, so it
 follows setup caching. Full design: `/tmp/perf16/fixed-edge-design.md`.
+
+## Iteration 11 — result: kept (commit pending review)
+
+Census shows strong setup reuse: old direct 1.86M setups built 15.74M tiles
+plus 23.23M REUSE executions; A-buffer 3.26M setups built 28.62M tiles. Median
+tiles/setup 4 direct, 6 A-buffer; max 240. A 1024-entry queue-local cache
+covers the measured maximum 776. Publishing only for ≥4 tiles retains 91.9%
+direct and 96.8% A-buffer tile records while avoiding known-poor reuse.
+
+Stage2 publishes an 84-byte immutable setup and tags its index in the existing
+8-byte tile record; overflow stays an untagged primitive ID and recomputes.
+Stage3 restores the original ID and setup once per tile. BUILD/FILL reset the
+third queue counter; REUSE retains cache and tagged tiles together. Main plus
+eight side queues cost **756 KiB**. Allocation failure and
+`CUDAPIPE_NO_SETUP_CACHE=1` are exact classic paths.
+
+**Measured:** stage3 direct −2.45%, A-buffer −2.35%; stage2+3 chain −0.254/
+−0.273 µs per launch. Old **23.295→23.217 ms** (−0.077, −0.33%) in two
+winning interleaved pairs. Crossroads neutral. Warm sample hot sum excluding
+nondeterministic glTF 17.16→17.12; walls 37.69→37.38 s. This is deliberately
+recorded as a small redundant-work removal, not a multi-ms foundation.
+
+**Gates:** worker/root build/docs/diff; root 43/43 and unchanged six-mode
+hashes; huge triangle, huge point, forced capacity overflow, sanitizer, stored
+frames, NVIDIA calibration and both sentinels pass; Gallium exact.

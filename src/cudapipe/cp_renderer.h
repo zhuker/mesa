@@ -285,7 +285,7 @@ struct cp_context {
    CUevent pass_gate;
    bool pass_streams_ready;
    struct cp_queue_set {
-      CUdeviceptr nontrivial, huge_tiles, counts;
+      CUdeviceptr nontrivial, huge_tiles, setup_cache, counts;
    } seg_qsets[CP_PASS_STREAMS];
    /* What cp_draw_execute builds its queue struct from: the context-wide set
     * normally, a segment stream's own during an append. */
@@ -372,9 +372,10 @@ struct cp_context {
    /* Adaptive rasterizer queues (allocated once, reused across draws) */
    CUdeviceptr rast_nontrivial;       /* uint32_t[CP_MAX_NONTRIVIAL] */
    CUdeviceptr rast_huge_tiles;       /* cp_tile_pair[CP_MAX_HUGE_TILES] */
-   /* Both queue counters, adjacent in one allocation so a pass zeroes them
-    * with one cuMemsetD32. rast_counts owns the memory; the two below point
-    * into it and are not freed. */
+   CUdeviceptr rast_setup_cache;       /* cp_setup_cache_entry[CP_SETUP_CACHE_CAPACITY], optional */
+   /* Both queue counters and the setup-cache count are adjacent in one
+    * allocation so a pass zeroes them with one cuMemsetD32. rast_counts owns
+    * the memory; the two named pointers below point into it and are not freed. */
    CUdeviceptr rast_counts;
    CUdeviceptr rast_nontrivial_count; /* atomic uint32_t, = rast_counts[0] */
    CUdeviceptr rast_huge_count;       /* atomic uint32_t, = rast_counts[1] */

@@ -1143,11 +1143,51 @@ struct cp_blit_linear_args {
 #define CP_MAX_NONTRIVIAL    1000000
 #define CP_MAX_HUGE_TILES    2000000
 
+/*
+ * Immutable screen-space setup made once by stage 2 and consumed by every
+ * stage-3 tile of the same huge primitive. uint8_t, rather than C/C++ bool,
+ * keeps the host allocation ABI explicit while preserving the old layout.
+ */
+struct cp_tri_setup {
+   float sx0, sy0, sx1, sy1, sx2, sy2;
+   float ndc_z0, ndc_z1, ndc_z2;
+   float inv_area;
+   uint8_t e0_top_left, e1_top_left, e2_top_left;
+   int32_t ix_min, iy_min, ix_max, iy_max;
+   uint8_t is_point;
+   float pt_x0, pt_y0, pt_x1, pt_y1;
+};
+
+struct cp_setup_cache_entry {
+   uint32_t tri_id;             /* original primitive id for fragment output */
+   struct cp_tri_setup setup;
+};
+
 struct cp_tile_pair {
-   uint32_t tri_id;
+   uint32_t tri_id;             /* primitive id, or CP_TILE_SETUP_TAG | index */
    uint16_t tile_x;
    uint16_t tile_y;
 };
+
+#define CP_PRIM_ID_LIMIT          (1u << 30)
+#define CP_TILE_SETUP_TAG         0x80000000u
+#define CP_TILE_SETUP_INDEX_MASK  0x7fffffffu
+#define CP_SETUP_CACHE_CAPACITY   1024u
+#define CP_SETUP_CACHE_MIN_TILES  4u
+
+#ifdef __CUDACC__
+static_assert(sizeof(struct cp_tri_setup) == 80, "cp_tri_setup ABI");
+static_assert(sizeof(struct cp_setup_cache_entry) == 84, "setup-cache ABI");
+static_assert((CP_PRIM_ID_LIMIT & CP_TILE_SETUP_TAG) == 0, "primitive/tag collision");
+static_assert(CP_SETUP_CACHE_CAPACITY <= CP_TILE_SETUP_INDEX_MASK,
+              "setup-cache index does not fit tile tag");
+#else
+_Static_assert(sizeof(struct cp_tri_setup) == 80, "cp_tri_setup ABI");
+_Static_assert(sizeof(struct cp_setup_cache_entry) == 84, "setup-cache ABI");
+_Static_assert((CP_PRIM_ID_LIMIT & CP_TILE_SETUP_TAG) == 0, "primitive/tag collision");
+_Static_assert(CP_SETUP_CACHE_CAPACITY <= CP_TILE_SETUP_INDEX_MASK,
+               "setup-cache index does not fit tile tag");
+#endif
 
 /*
  * What a pass is allowed to assume about the queues below.
@@ -1170,16 +1210,20 @@ struct cp_tile_pair {
 
 /* Set on a nontrivial-queue entry that stage 2 decomposed into tiles, so that
  * a reusing pass can skip it. Triangle ids are indices into a draw's clipped
- * primitive list, so the top bit is free. */
-#define CP_NT_HUGE       0x80000000u
+ * primitive list, so the top bit is free. The same central tag marks a setup
+ * index in cp_tile_pair, but the words live in disjoint queue formats: stage 2
+ * consumes CP_NT_HUGE and writes CP_TILE_SETUP_TAG for stage 3. */
+#define CP_NT_HUGE       CP_TILE_SETUP_TAG
 
 struct cp_rast_queues {
    uint64_t nontrivial;        /* Device ptr to uint32_t[CP_MAX_NONTRIVIAL] */
    uint64_t nontrivial_count;  /* Device ptr to atomic uint32_t */
    uint64_t huge_tiles;        /* Device ptr to cp_tile_pair[CP_MAX_HUGE_TILES] */
    uint64_t huge_count;        /* Device ptr to atomic uint32_t */
+   uint64_t setup_cache;       /* Device ptr to cp_setup_cache_entry[]; 0 = classic */
+   uint64_t setup_count;       /* Device ptr to atomic uint32_t */
+   uint32_t setup_capacity;    /* zero selects the complete classic fallback */
    uint32_t mode;              /* CP_QUEUE_* above */
-   uint32_t pad;
 };
 
 #define CP_MAX_VERTEX_ELEMENTS_VF 16

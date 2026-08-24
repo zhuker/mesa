@@ -87,9 +87,9 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
 
    /* Adaptive rasterizer queues — allocated once, reused across draws.
     *
-    * The two queue counters share one allocation and sit adjacent, so the
-    * pass loop zeroes both with a single cuMemsetD32 of two words rather than
-    * one call each. They are zeroed once per rasterizer pass and a blended
+    * The two queue counters and the setup-cache count share one allocation,
+    * so the pass loop zeroes all three with one cuMemsetD32 rather than one
+    * call each. They are zeroed once per rasterizer pass and a blended
     * draw runs hundreds of passes, so this is two host calls per pass rather
     * than two bytes of memory. Only the base is freed. */
    if (cuMemAlloc(&cp->rast_nontrivial,
@@ -101,11 +101,19 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
       goto fail;
    cp->rast_nontrivial_count = cp->rast_counts;
    cp->rast_huge_count = cp->rast_counts + sizeof(uint32_t);
+   /* The census maximum was 776 records in a queue generation. 1024 leaves
+    * measured headroom and costs only 84 KiB; refusal is the classic path. */
+   if (!cp_debug->no_setup_cache &&
+       cuMemAlloc(&cp->rast_setup_cache,
+                  (size_t)CP_SETUP_CACHE_CAPACITY *
+                  sizeof(struct cp_setup_cache_entry)) != CUDA_SUCCESS)
+      cp->rast_setup_cache = 0;
 
    /* What cp_draw_execute builds its queue struct from; a pass-episode
     * segment append swaps in its stream's own set and restores this one. */
    cp->cur_qset.nontrivial = cp->rast_nontrivial;
    cp->cur_qset.huge_tiles = cp->rast_huge_tiles;
+   cp->cur_qset.setup_cache = cp->rast_setup_cache;
    cp->cur_qset.counts = cp->rast_counts;
 
    return true;
@@ -528,6 +536,8 @@ cp_context_cleanup(struct cp_context *cp)
       if (cp->flush_retire[i])
          cuEventDestroy(cp->flush_retire[i]);
    for (unsigned i = 0; i < CP_PASS_STREAMS; i++) {
+      if (cp->seg_qsets[i].setup_cache)
+         cuMemFree(cp->seg_qsets[i].setup_cache);
       if (cp->seg_ev[i])
          cuEventDestroy(cp->seg_ev[i]);
       if (cp->seg_streams[i])
@@ -547,6 +557,8 @@ cp_context_cleanup(struct cp_context *cp)
       cuMemFree(cp->rast_counts);
    if (cp->rast_huge_tiles)
       cuMemFree(cp->rast_huge_tiles);
+   if (cp->rast_setup_cache)
+      cuMemFree(cp->rast_setup_cache);
 
    /* The framebuffer-sized buffers and the sampler table are context state,
     * not draw scratch: nothing else frees them, and a Gallium context whose
@@ -4408,6 +4420,9 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       .nontrivial_count = cp->cur_qset.counts,
       .huge_tiles = cp->cur_qset.huge_tiles,
       .huge_count = cp->cur_qset.counts + sizeof(uint32_t),
+      .setup_cache = cp->cur_qset.setup_cache,
+      .setup_count = cp->cur_qset.counts + 2 * sizeof(uint32_t),
+      .setup_capacity = cp->cur_qset.setup_cache ? CP_SETUP_CACHE_CAPACITY : 0,
       .mode = CP_QUEUE_FILL,
    };
 
@@ -4756,7 +4771,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          aa.abuf_capacity = ab->capacity;
          abuf_recs_filled = ab->recs;
       }
-      cuMemsetD32Async(cp->cur_qset.counts, 0, 2, cp->stream);
+      cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream);
       aa.abuf_mode = CP_ABUF_COUNT;
       rast_queues.mode = CP_QUEUE_FILL;
       cp_abuf_mark(ab, ab->ev[0], cp->stream);
@@ -4936,7 +4951,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          CP_LAUNCH(screen->kernels.abuf_fill_recs, 1024, 1, 1, 256, 1, 1,
                         0, cp->stream, fp, NULL);
       } else {
-         cuMemsetD32Async(cp->cur_qset.counts, 0, 2, cp->stream);
+         cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream);
          aa.abuf_mode = CP_ABUF_FILL;
          rast_queues.mode = CP_QUEUE_FILL;
          void *ap[] = { &aa, &rast_queues };
@@ -5197,7 +5212,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * the first pass arrived at — clearing them would leave stages 2 and 3
        * reading an empty queue. */
       if (rast_queues.mode != CP_QUEUE_REUSE)
-         cuMemsetD32Async(cp->cur_qset.counts, 0, 2, cp->stream);
+         cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream);
 
       /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
       cp_nvtx_push("raster");
@@ -5687,7 +5702,7 @@ cp_pass_appendable(struct cp_context *cp)
    if (!ab->frags || ab->grow_to || !ab->shade_slot || !ab->clist)
       return false;
    if (cp->pass.nsegs >= CP_PASS_MAX_SEGS ||
-       cp->pass.next_prim > (1u << 30))
+       cp->pass.next_prim >= CP_PRIM_ID_LIMIT)
       return false;
    if (!cp->pass_segs) {
       cp->pass_segs = calloc(CP_PASS_MAX_SEGS, sizeof(*cp->pass_segs));
@@ -5713,6 +5728,15 @@ cp_pass_appendable(struct cp_context *cp)
                          (size_t)CP_MAX_HUGE_TILES *
                          sizeof(struct cp_tile_pair)) == CUDA_SUCCESS &&
               cuMemAlloc(&cp->seg_qsets[k].counts, 256) == CUDA_SUCCESS;
+      }
+      /* A cache refusal must not disable the side stream or its classic
+       * queues. Each stream owns the same 84-KiB evidence-sized capacity. */
+      if (ok && !cp_debug->no_setup_cache) {
+         for (unsigned k = 0; k < CP_PASS_STREAMS; k++)
+            if (cuMemAlloc(&cp->seg_qsets[k].setup_cache,
+                           (size_t)CP_SETUP_CACHE_CAPACITY *
+                           sizeof(struct cp_setup_cache_entry)) != CUDA_SUCCESS)
+               cp->seg_qsets[k].setup_cache = 0;
       }
       if (!ok) {
          fprintf(stderr, "cudapipe: pass-episode streams unavailable; "
@@ -5745,7 +5769,7 @@ cp_opaque_appendable(struct cp_context *cp,
    }
    if (cp->pass.opaque &&
        (cp->pass.nsegs >= CP_PASS_MAX_SEGS ||
-        cp->pass.next_prim > (1u << 30)))
+        cp->pass.next_prim >= CP_PRIM_ID_LIMIT))
       return false;
    if (!cp->pass_segs) {
       cp->pass_segs = calloc(CP_PASS_MAX_SEGS, sizeof(*cp->pass_segs));
@@ -6794,7 +6818,7 @@ cp_pass_finish(struct cp_context *cp)
          struct cp_rast_queues q = sg->queues;
          q.mode = CP_QUEUE_FILL;
          /* The segment's own queue set, saved with its arguments. */
-         cuMemsetD32Async(q.nontrivial_count, 0, 2, cp->stream);
+         cuMemsetD32Async(q.nontrivial_count, 0, 3, cp->stream);
          void *ap[] = { &aa, &q };
          CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
                         (sg->rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,

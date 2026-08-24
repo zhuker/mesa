@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-65 switches.
+66 switches.
 
 ## Tracing
 
@@ -59,6 +59,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_NO_FUSED_INTERP` | bool (value) | `off` | — | restore the direct shade path's separate cp_fs_interpolate launch instead of the slim compaction plus in-shader interpolation |
 | `CUDAPIPE_NO_FUSED_RAST` | bool (value) | `off` | — | restore the separate clip and rasterize-stage1 launches instead of the fused clip+classify kernel; stages 2 and 3 are separate either way |
 | `CUDAPIPE_NO_PRIM_REFS` | bool (value) | `off` | — | copy every accepted clipped primitive into contiguous scratch instead of publishing a reference to immutable vertex-shader output |
+| `CUDAPIPE_NO_SETUP_CACHE` | bool (value) | `off` | — | recompute huge-primitive setup independently in every stage-3 tile |
 | `CUDAPIPE_FORCE_PASS_FALLBACK` | bool (value) | `off` | — | make every blended episode take the classic re-execution fallback; the output must be identical, which is what makes it a test |
 | `CUDAPIPE_TILE_CENSUS` | uint | `0` | 0&ndash;256 | tile edge in pixels for the blended tile-bin shader census; 0 is off, and it changes no rendering |
 | `CUDAPIPE_TILE_CENSUS_EVERY` | uint | `2000` | 1&ndash;1000000 | report the tile census this often, in episodes |

@@ -165,6 +165,8 @@ static const struct cp_flag_def flags[] = {
    { "CUDAPIPE_NO_PRIM_REFS", CP_FLAG_BOOL_VALUE, F(no_prim_refs),
      "copy every accepted clipped primitive into contiguous scratch instead "
      "of publishing a reference to immutable vertex-shader output" },
+   { "CUDAPIPE_NO_SETUP_CACHE", CP_FLAG_BOOL_VALUE, F(no_setup_cache),
+     "recompute huge-primitive setup independently in every stage-3 tile" },
    { "CUDAPIPE_FORCE_PASS_FALLBACK", CP_FLAG_BOOL_VALUE,
      F(force_pass_fallback),
      "make every blended episode take the classic re-execution fallback; the "

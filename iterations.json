@@ -91,10 +91,10 @@
   {
    "id": 11,
    "name": "cache huge-primitive setup across stage3 tiles",
-   "verdict": "pending",
-   "old_median_ms": null,
-   "sweep_hot_ms": null,
-   "note": "stage3 ~3.3ms/frame recomputes setup_triangle per tile though stage2 already computed it. Measure tiles/setup reuse; cache bounded setup once per huge primitive and encode setup index in tile entry, fallback on capacity."
+   "verdict": "kept",
+   "old_median_ms": 23.217,
+   "sweep_hot_ms": 17.12,
+   "note": "cache setups for >=4 tiles; stage3 direct -2.45%, abuf -2.35%, old 23.295->23.217 (-0.077). 1024 entries/qset, 756KiB total, overflow exact. Sample hot excludes nondet glTF: 17.12 vs17.16; full gates pass."
   }
  ]
 }

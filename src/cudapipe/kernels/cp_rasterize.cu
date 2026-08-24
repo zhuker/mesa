@@ -114,17 +114,6 @@ float_to_sortable_uint(float f)
    return u ^ mask;
 }
 
-struct tri_setup {
-   float sx0, sy0, sx1, sy1, sx2, sy2;
-   float ndc_z0, ndc_z1, ndc_z2;
-   float inv_area;
-   bool e0_top_left, e1_top_left, e2_top_left;
-   int ix_min, iy_min, ix_max, iy_max;
-   /* A point covers this screen-space square instead of the edges above. */
-   bool is_point;
-   float pt_x0, pt_y0, pt_x1, pt_y1;
-};
-
 /*
  * Clipping against the planes that make the perspective divide meaningful,
  * one thread per input triangle.
@@ -432,7 +421,7 @@ cp_queue_used(uint32_t count, uint32_t capacity)
 
 static __device__ __forceinline__ bool
 setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
-               struct tri_setup *s)
+               struct cp_tri_setup *s)
 {
    uint32_t pos_stride = args->num_varyings + 1;
    const float4 *positions = (const float4 *)cp_primitive_base(
@@ -734,7 +723,7 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
  */
 template <bool ABUF>
 static __device__ __forceinline__ void
-rasterize_point(struct cp_rasterize_args *args, struct tri_setup *s,
+rasterize_point(struct cp_rasterize_args *args, struct cp_tri_setup *s,
                 uint32_t tri_id, uint32_t lane, uint32_t stride)
 {
    int bb_w = s->ix_max - s->ix_min + 1;
@@ -766,11 +755,11 @@ rasterize_point(struct cp_rasterize_args *args, struct tri_setup *s,
  * stuck in stage 1.
  */
 static __device__ __forceinline__ void
-cp_broadcast_setup(struct tri_setup *s)
+cp_broadcast_setup(struct cp_tri_setup *s)
 {
    uint32_t *w = (uint32_t *)s;
 #pragma unroll
-   for (int i = 0; i < (int)(sizeof(struct tri_setup) / sizeof(uint32_t)); i++)
+   for (int i = 0; i < (int)(sizeof(struct cp_tri_setup) / sizeof(uint32_t)); i++)
       w[i] = __shfl_sync(0xFFFFFFFF, w[i], 0);
 }
 
@@ -788,7 +777,7 @@ cp_rast_small_or_defer(struct cp_rasterize_args *args,
                        bool append)
 {
 
-   struct tri_setup s;
+   struct cp_tri_setup s;
    if (!setup_triangle(args, tri_id, &s))
       return;
 
@@ -932,7 +921,7 @@ cp_rasterize_stage2_body(struct cp_rasterize_args args, struct cp_rast_queues qu
          continue;
 
       /* Lane 0 does triangle setup for the whole warp. */
-      struct tri_setup s;
+      struct cp_tri_setup s;
       int valid = 0;
 
       if (lane_id == 0)
@@ -974,6 +963,22 @@ cp_rasterize_stage2_body(struct cp_rasterize_args args, struct cp_rast_queues qu
             int num_tiles = (tile_x_max - tile_x_min + 1) *
                             (tile_y_max - tile_y_min + 1);
 
+            /* Publish one immutable setup before any tile refers to it.
+             * The stage-2/stage-3 kernel boundary is the publication barrier. */
+            uint32_t tile_tri_id = tri_id;
+            if (num_tiles >= CP_SETUP_CACHE_MIN_TILES &&
+                queues.setup_cache && queues.setup_capacity) {
+               uint32_t setup_idx = atomicAdd(
+                  (uint32_t *)(uintptr_t)queues.setup_count, 1u);
+               if (setup_idx < queues.setup_capacity) {
+                  struct cp_setup_cache_entry *cache =
+                     (struct cp_setup_cache_entry *)(uintptr_t)queues.setup_cache;
+                  cache[setup_idx].tri_id = tri_id;
+                  cache[setup_idx].setup = s;
+                  tile_tri_id = CP_TILE_SETUP_TAG | setup_idx;
+               }
+            }
+
             uint32_t *huge_counter = (uint32_t *)(uintptr_t)queues.huge_count;
             uint32_t base_idx = atomicAdd(huge_counter, (uint32_t)num_tiles);
 
@@ -984,7 +989,7 @@ cp_rasterize_stage2_body(struct cp_rasterize_args args, struct cp_rast_queues qu
             for (int ty = tile_y_min; ty <= tile_y_max; ty++) {
                for (int tx = tile_x_min; tx <= tile_x_max; tx++) {
                   if (base_idx + idx < CP_MAX_HUGE_TILES) {
-                     huge_queue[base_idx + idx].tri_id = tri_id;
+                     huge_queue[base_idx + idx].tri_id = tile_tri_id;
                      huge_queue[base_idx + idx].tile_x = (uint16_t)(tx * CP_TILE_SIZE);
                      huge_queue[base_idx + idx].tile_y = (uint16_t)(ty * CP_TILE_SIZE);
                   }
@@ -1100,7 +1105,8 @@ cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues qu
     * gives: a point carries a square where a triangle carries edges, and a
     * copy that names fields has to be extended for each new kind.
     */
-   __shared__ struct tri_setup sh_s;
+   __shared__ struct cp_tri_setup sh_s;
+   __shared__ uint32_t sh_tri_id;
    __shared__ int sh_valid;
 
    uint64_t *visbuf = (uint64_t *)(uintptr_t)args.framebuffer;
@@ -1122,11 +1128,28 @@ cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues qu
       __syncthreads();
 
       if (threadIdx.x == 0) {
-         struct tri_setup s;
+         struct cp_tri_setup s;
+         uint32_t original_tri_id = tri_id;
+         bool setup_valid = false;
          sh_valid = 0;
-         if (cp_triangle_id_valid(&args, tri_id) &&
-             setup_triangle(&args, tri_id, &s)) {
+
+         if (tri_id & CP_TILE_SETUP_TAG) {
+            uint32_t setup_idx = tri_id & CP_TILE_SETUP_INDEX_MASK;
+            if (queues.setup_cache && setup_idx < queues.setup_capacity) {
+               const struct cp_setup_cache_entry *cache =
+                  (const struct cp_setup_cache_entry *)(uintptr_t)queues.setup_cache;
+               struct cp_setup_cache_entry cached = cache[setup_idx];
+               original_tri_id = cached.tri_id;
+               s = cached.setup;
+               setup_valid = cp_triangle_id_valid(&args, original_tri_id);
+            }
+         } else if (cp_triangle_id_valid(&args, tri_id)) {
+            setup_valid = setup_triangle(&args, tri_id, &s);
+         }
+
+         if (setup_valid) {
             sh_s = s;
+            sh_tri_id = original_tri_id;
 
             /* A point's square is tested per pixel below; it has no edges to
              * reject a tile with, and its bounding box already selected the
@@ -1172,6 +1195,7 @@ cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues qu
 
       if (!sh_valid)
          continue;
+      tri_id = sh_tri_id;
 
 #if CP_TILE_BOUND
       /*
@@ -2147,7 +2171,7 @@ cp_tile_census_refs(struct cp_rasterize_args rast,
    for (uint32_t work = blockIdx.x * blockDim.x + threadIdx.x; work < n;
         work += gridDim.x * blockDim.x) {
       uint32_t tri = cp_triangle_id(&rast, work);
-      struct tri_setup setup;
+      struct cp_tri_setup setup;
       if (!setup_triangle(&rast, tri, &setup))
          continue;
       uint32_t tx0 = (uint32_t)setup.ix_min / args.tile;
@@ -2317,7 +2341,7 @@ cp_opaque_tile_count(struct cp_opaque_tile_build_args args)
    for (uint32_t work = blockIdx.x * blockDim.x + threadIdx.x; work < n;
         work += gridDim.x * blockDim.x) {
       uint32_t tri = cp_triangle_id(&args.rast, work);
-      struct tri_setup setup;
+      struct cp_tri_setup setup;
       if (!setup_triangle(&args.rast, tri, &setup))
          continue;
       uint32_t tx0 = (uint32_t)setup.ix_min / CP_OPAQUE_TILE_SIZE;
@@ -2338,7 +2362,7 @@ cp_opaque_tile_fill(struct cp_opaque_tile_build_args args)
    for (uint32_t work = blockIdx.x * blockDim.x + threadIdx.x; work < n;
         work += gridDim.x * blockDim.x) {
       uint32_t tri = cp_triangle_id(&args.rast, work);
-      struct tri_setup setup;
+      struct cp_tri_setup setup;
       if (!setup_triangle(&args.rast, tri, &setup))
          continue;
       uint32_t tx0 = (uint32_t)setup.ix_min / CP_OPAQUE_TILE_SIZE;
@@ -2405,7 +2429,7 @@ cp_opaque_tile_raster(struct cp_opaque_tile_raster_args args)
    const struct cp_opaque_tile_ref *refs =
       (const struct cp_opaque_tile_ref *)(uintptr_t)args.tile_refs;
    uint32_t base = ((const uint32_t *)(uintptr_t)args.tile_offsets)[tile];
-   __shared__ struct tri_setup setup;
+   __shared__ struct cp_tri_setup setup;
    __shared__ struct cp_rasterize_args rast;
    __shared__ uint32_t global_prim, local_prim;
    __shared__ int setup_valid;
