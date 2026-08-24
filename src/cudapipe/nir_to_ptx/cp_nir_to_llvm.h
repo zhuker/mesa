@@ -70,7 +70,11 @@ enum cp_shader_exec_mode {
    CP_SHADER_EXEC_HW_INLINE = 3,
    /* Resource-isolated texture ops with the proven fused interpolation helper. */
    CP_SHADER_EXEC_HW_FUSED = 4,
-   CP_SHADER_EXEC_COUNT = 5,
+   /* Vertex stage with the per-lane fetch inlined from the same LLVM module,
+    * so the packed input buffer and its own launch do not exist. Independently
+    * linked, which is what makes selecting the classic binary a real revert. */
+   CP_SHADER_EXEC_VS_FETCH = 5,
+   CP_SHADER_EXEC_COUNT = 6,
 };
 
 /*
@@ -235,9 +239,13 @@ struct cp_shader_binary {
    struct cp_sampler_variant sampler_variants[CP_MAX_SAMPLER_VARIANTS];
    unsigned num_sampler_variants;
 
-   /* This vertex shader's line in the launch census; null for every other
-    * stage. Table-owned, so it outlives the binary. */
+   /* This vertex shader's line in the fused-fetch admission census; null for
+    * every other stage. Table-owned, so it outlives the binary. */
    struct cp_vs_census *vs_census;
+   /* What the fused vertex execution was generated with: the lane array's
+    * slot count and the mask of slots the shader actually reads. */
+   unsigned vs_num_slots;
+   uint32_t vs_live_slots;
 
    /* Which VARYING_SLOT_* each I/O slot carries. */
    unsigned in_location[CP_MAX_IO_SLOTS];
@@ -261,6 +269,7 @@ static inline bool
 cp_shader_has_any_exec(const struct cp_shader_binary *bin)
 {
    return bin && (bin->exec[CP_SHADER_EXEC_CLASSIC].kernel ||
+                  bin->exec[CP_SHADER_EXEC_VS_FETCH].kernel ||
                   bin->exec[CP_SHADER_EXEC_FUSED].kernel ||
                   bin->exec[CP_SHADER_EXEC_INLINE].kernel ||
                   bin->exec[CP_SHADER_EXEC_HW_INLINE].kernel ||

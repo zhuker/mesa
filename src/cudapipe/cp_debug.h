@@ -115,6 +115,10 @@ struct cp_debug {
    bool upload_stats;
    bool no_meta_fold;
    bool no_fetch_fold;
+   bool fused_vfetch;
+   bool no_fused_vfetch;
+   unsigned vfetch_decline_nth;
+   bool vfetch_skip_seed;
    bool no_upload_coalesce;
    bool no_counter_block;
    unsigned upload_flush_fail_at;

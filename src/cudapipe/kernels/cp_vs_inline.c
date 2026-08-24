@@ -59,22 +59,69 @@ cp_vs_float_as_uint(float f)
 
 #define __float_as_uint(f) cp_vs_float_as_uint(f)
 #define CP_VF_INLINE static inline __attribute__((always_inline))
+/* The gather's destination is registers here, not a buffer: nothing memset it
+ * and nothing may be written to it twice under two different types. The
+ * standalone kernel keeps the shape it always had. */
+#define CP_VF_FIXED_SLOTS 1
+#define CP_VF_UNROLL _Pragma("clang loop unroll(full)")
 #include "cp_vf_lane.h"
+#undef CP_VF_UNROLL
+#undef CP_VF_FIXED_SLOTS
 #undef CP_VF_INLINE
 #undef __float_as_uint
 
 /*
  * Linked into the generated vertex shader's module and inlined away before
- * optimisation; `slots` is a function-entry alloca owned by main, which is
- * what lets SROA promote the gathered attributes into registers and delete
- * the packed input buffer entirely. A surviving call in the emitted PTX is a
- * build failure, not a fallback -- that was iteration 4's failure mode.
+ * optimisation. The shader owns the destination -- a function-entry alloca
+ * for the slots, three more for the ids and the row -- which is what lets
+ * SROA promote the gathered attributes into registers and delete the packed
+ * input buffer entirely. A surviving call in the emitted PTX is a build
+ * failure, not a fallback: that was iteration 4's failure mode.
+ *
+ * Three entry points rather than one, because the shape of the call is what
+ * keeps the array promotable. The identity runs once; the gather runs once
+ * per input slot the shader reads, with the element index a constant supplied
+ * by the backend, so nothing indexes the array dynamically.
  */
 __attribute__((always_inline)) int
-cp_vs_fetch_lane(const struct cp_vertex_fetch_args *source, uint32_t v,
-                 unsigned char *slots, uint32_t *out_vertex_id,
-                 uint32_t *out_instance_id, uint32_t *out_row)
+cp_vs_fetch_ids(const struct cp_vertex_fetch_args *source, uint32_t v,
+                uint32_t *out_vertex_id, uint32_t *out_instance_id,
+                uint32_t *out_row)
 {
-   return cp_vf_lane(source, v, slots, out_vertex_id, out_instance_id,
-                     out_row);
+   *out_vertex_id = 0;
+   *out_instance_id = 0;
+   *out_row = 0;
+   return cp_vf_lane_ids(source, v, out_vertex_id, out_instance_id, out_row);
+}
+
+__attribute__((always_inline)) void
+cp_vs_fetch_element(const struct cp_vertex_fetch_args *source, uint32_t e,
+                    uint32_t vertex_id, uint32_t instance_id, uint32_t row,
+                    unsigned char *slot)
+{
+   cp_vf_lane_element(source, e, vertex_id, instance_id, row, slot);
+}
+
+/*
+ * The counter seeds iteration 26 moved onto the fetch launch (cp_vertex_fetch
+ * seeds the clipper's output counter and the three raster queue counters). A
+ * fused draw has no fetch launch, so the seeding rides on this kernel
+ * instead -- one thread of the grid, before the bounds check, so that it does
+ * not depend on that thread having a vertex to shade. Without this, iteration
+ * 26 S2 would be silently reverted for every admitted shader: the counters
+ * would go back to their own clears and nothing would fail.
+ */
+__attribute__((always_inline)) void
+cp_vs_fetch_seed(const struct cp_vertex_fetch_args *source, uint32_t gtid)
+{
+   if (gtid != 0)
+      return;
+   if (source->seed_counts) {
+      uint32_t *counts = (uint32_t *)(uintptr_t)source->seed_counts;
+      counts[0] = 0;
+      counts[1] = 0;
+      counts[2] = 0;
+   }
+   if (source->seed_clip_count)
+      *(uint32_t *)(uintptr_t)source->seed_clip_count = source->clip_seed;
 }

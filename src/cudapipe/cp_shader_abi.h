@@ -133,4 +133,11 @@ static_assert(CPVK_UBO_PUSH_SLOT < CP_MAX_CONST_BUFFERS,
 static_assert(CP_ARG_SLOT_UBO_TABLE < CP_ARG_UBO_BASE,
               "the table pointer is fixed state, below the buffer slots");
 
+/* The fused vertex fetch's argument block, likewise fixed state: a slot that
+ * collided with a constant buffer would hand the gather a UBO pointer. */
+static_assert(CP_ARG_SLOT_VS_FETCH < CP_ARG_UBO_BASE,
+              "the fetch block is fixed state, below the buffer slots");
+static_assert(CP_ARG_SLOT_VS_FETCH != CP_ARG_SLOT_HW_TEX_TABLE,
+              "every fixed argument slot is used by exactly one thing");
+
 #endif /* CP_SHADER_ABI_H */

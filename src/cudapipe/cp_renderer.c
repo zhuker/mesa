@@ -4639,13 +4639,33 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 
          vs_output_buf = cp_scratch_alloc_device(cp, (size_t)total_verts * out_stride);
 
+         /*
+          * Whether this draw's vertex shader gathers its own attributes.
+          *
+          * The decision is per launch and everything below follows it: the
+          * packed input buffer, its clear, the fetch launch, the id arrays and
+          * the batch-row array all exist only for the classic form, and the
+          * counter seeding moves with the launch that carries it. It selects a
+          * different CUfunction from an independently linked module, which is
+          * what makes CUDAPIPE_FUSED_VFETCH=0 a real revert rather than a
+          * skipped call inside the same register allocation.
+          *
+          * CUDAPIPE_DEBUG_VFETCH reads the packed buffer back to the host, so
+          * a draw being traced that way keeps the buffer and the launch.
+          */
+         const bool fused_vfetch =
+            cp_debug->fused_vfetch && !cp_debug->no_fused_vfetch &&
+            !cp_debug->debug_vfetch &&
+            state->vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel &&
+            state->num_vertex_elements <= CP_MAX_VERTEX_ELEMENTS_VF;
+
          /* Build VS input buffer on GPU: the vertex fetch kernel gathers
           * attributes in parallel, one thread per assembled vertex. */
          unsigned vs_in_stride = state->num_vertex_elements * 16;
-         CUdeviceptr vs_input_buf = vs_in_stride
+         CUdeviceptr vs_input_buf = (vs_in_stride && !fused_vfetch)
             ? cp_scratch_alloc_device(cp, (size_t)total_verts * vs_in_stride)
             : 0;
-         if (!vs_output_buf || (vs_in_stride && !vs_input_buf)) {
+         if (!vs_output_buf || (vs_in_stride && !fused_vfetch && !vs_input_buf)) {
             FREE(refs);
             return;
          }
@@ -4702,7 +4722,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          CUdeviceptr vid_buf = vfetch_vid, iid_buf = vfetch_iid;
          CUdeviceptr out_vid = 0, out_iid = 0;
 
-         if (!refs) {
+         if (!refs && !fused_vfetch) {
             /* A batch's assembled vertices span several ranges of the index
              * buffer, so the buffer is no longer the id array for them — the
              * fetch kernel has to publish one. */
@@ -4763,9 +4783,11 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 
             /* One row per assembled vertex, for the shader to pick its
              * uniform bindings and its draw parameters with. Only a shader
-             * that reads either has any use for it. */
-            if (state->vs->reads_const_bufs ||
-                state->vs->reads_draw_params) {
+             * that reads either has any use for it — and a fused shader has
+             * the row in a register, so nobody has to write it down. */
+            if (!fused_vfetch &&
+                (state->vs->reads_const_bufs ||
+                 state->vs->reads_draw_params)) {
                batch_rows = cp_scratch_alloc_device(cp, (size_t)total_verts * 4);
                if (!batch_rows) { FREE(refs); return; }
             }
@@ -4877,7 +4899,16 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          const bool fetch_runs =
             (vs_input_buf || out_vid || out_iid || batch_rows) &&
             total_verts > 0;
-         fetch_fold = !cp_debug->no_fetch_fold && fetch_runs;
+         /*
+          * A fused draw has no fetch launch to seed from, so the seeding rides
+          * on the vertex shader instead — the same kernel, one launch earlier
+          * in the chain, still ahead of the clipper and the rasterizer on this
+          * stream. Without this move, iteration 26 S2 would be silently
+          * reverted for every admitted shader.
+          */
+         const bool vs_runs = total_verts > 0;
+         fetch_fold = !cp_debug->no_fetch_fold &&
+                      (fused_vfetch ? vs_runs : fetch_runs);
 
          /*
           * The clipper's counter, hoisted here from the clip block below so
@@ -4897,12 +4928,23 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                   cp, (size_t)max_clipped_early * sizeof(uint32_t));
          }
 
-         if (fetch_fold) {
+         /*
+          * The negative control for the move: an admitted fused draw that
+          * does not seed, while the host still skips the clears the seeding
+          * replaced. If a following batch renders correctly anyway, this gate
+          * is not covering the counters it claims to.
+          */
+         const bool skip_seed = fused_vfetch && cp_debug->vfetch_skip_seed;
+
+         if (fetch_fold && !skip_seed) {
             /*
-             * This seeding rides on the fetch launch existing. If the fetch is
-             * ever fused into the vertex shader, the seeds must move with it
-             * or this optimisation is silently reverted -- the counters would
-             * go back to their own clears without anything failing.
+             * This seeding rides on a launch existing -- the fetch's when the
+             * shader declined, the fused vertex shader's when it did not. Both
+             * read these fields out of the same block, and moving the job with
+             * the launch is what keeps iteration 26 S2 from being silently
+             * reverted here: the counters would otherwise go back to their own
+             * clears without anything failing. CUDAPIPE_VFETCH_SKIP_SEED is
+             * the control that proves it, and it makes tests fail.
              */
             /* Whichever raster pass this batch takes clears these three words
              * first; the fill relaunch inside a pass still clears its own. */
@@ -4915,7 +4957,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          /* Nothing to gather when the shader declares no inputs — but it still
           * runs if the ids are wanted, since deriving those is now its job
           * too and a shader with no inputs may still read gl_VertexIndex. */
-         if (vs_input_buf || out_vid || out_iid || batch_rows) {
+         if (!fused_vfetch && (vs_input_buf || out_vid || out_iid || batch_rows)) {
             /*
              * Small by call count, bulk by bytes: this clears about 90 MB a
              * frame on the old capture, which cuMemsetD8Async does in one
@@ -5023,8 +5065,19 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
           * CP_ARG_DRAW_PARAM_STRIDE. Same block, same upload. */
          const size_t vs_dp_off = vs_tbl_off +
             (size_t)batch_draws * CP_ARG_UBO_STRIDE * sizeof(uint64_t);
+         /*
+          * The fetch's own argument block, behind the draw-parameter rows and
+          * inside the same upload. It travels today as a by-value kernel
+          * parameter of a launch that is about to stop existing; putting it in
+          * its own copy would hand back the operation this iteration removes,
+          * so it rides in the block the host already builds and sends once.
+          */
          size_t vs_blk_bytes = vs_dp_off +
             (size_t)batch_draws * CP_ARG_DRAW_PARAM_STRIDE * sizeof(uint32_t);
+         const size_t vs_vf_off = fused_vfetch
+            ? (vs_blk_bytes + 15u) & ~(size_t)15u : 0;
+         if (fused_vfetch)
+            vs_blk_bytes = vs_vf_off + sizeof(struct cp_vertex_fetch_args);
 
          void *vs_blk = NULL;
          CUdeviceptr vs_args_dev = cp_upload_begin(cp, vs_blk_bytes, &vs_blk);
@@ -5064,6 +5117,11 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             : (void*)(uintptr_t)(vs_args_dev + vs_scal_off);
          vs_args_host[CP_ARG_SLOT_BATCH_MASK] =
             (void*)(uintptr_t)(vs_args_dev + vs_scal_off + 4);
+         if (fused_vfetch) {
+            memcpy((char *)vs_blk + vs_vf_off, &vf_args, sizeof(vf_args));
+            vs_args_host[CP_ARG_SLOT_VS_FETCH] =
+               (void*)(uintptr_t)(vs_args_dev + vs_vf_off);
+         }
 
          uint32_t *vs_scal = (uint32_t *)((char *)vs_blk + vs_scal_off);
          vs_scal[0] = 0;
@@ -5108,16 +5166,28 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
-         /* Which shader ran, and how often. Nothing recorded a vertex launch
-          * per shader before this, and a per-shader verdict about vertex work
-          * says nothing about a frame unless it can be weighted by the
-          * launches each shader actually receives. */
-         if (state->vs->vs_census)
+         /*
+          * The two forms are two CUfunctions from two independently linked
+          * modules; nothing about one transfers to the other. A fused kernel
+          * launched with a null fetch block would gather from address zero, so
+          * that is an internal error rather than a soft path — there is no
+          * meaningful "fetch disabled" reading of this kernel.
+          */
+         const struct cp_shader_exec *vs_exec = fused_vfetch
+            ? &state->vs->exec[CP_SHADER_EXEC_VS_FETCH]
+            : &state->vs->exec[CP_SHADER_EXEC_CLASSIC];
+         assert(!fused_vfetch || vs_args_host[CP_ARG_SLOT_VS_FETCH]);
+
+         /* Which shader ran, and how often, so that the fused-fetch admission
+          * share can be weighted by launches rather than by shader count. */
+         if (state->vs->vs_census) {
             p_atomic_inc(&state->vs->vs_census->launches);
+            if (fused_vfetch)
+               p_atomic_inc(&state->vs->vs_census->launches_fused);
+         }
 
          /* Compiled shaders grid-stride; see the fragment launch. */
-         CUresult vs_err = cp_launch(cp,
-            state->vs->exec[CP_SHADER_EXEC_CLASSIC].kernel,
+         CUresult vs_err = cp_launch(cp, vs_exec->kernel,
             MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
             0, cp->stream, vs_params, NULL);
 

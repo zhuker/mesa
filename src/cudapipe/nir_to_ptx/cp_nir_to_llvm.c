@@ -46,6 +46,15 @@ cp_warn_inline_missing(void)
 }
 #endif
 
+#ifdef CP_HAVE_VS_INLINE_BC
+#ifndef CP_HAVE_FS_INLINE_BC
+#error "the vertex-fetch bitcode shares the fragment path's link machinery"
+#endif
+static const unsigned char cp_vs_inline_bc[] = {
+#include "cp_vs_inline.bc.inc"
+};
+#endif
+
 /*
  * The fused-fetch admission census.
  *
@@ -212,6 +221,21 @@ struct ntl_context {
    uint32_t inline_live_slots;
    int32_t inline_pntc_input;
    int32_t inline_pos_input;
+
+   /*
+    * The vertex stage with cp_vf_lane inlined from the same LLVM module. The
+    * gathered attributes live in a function-entry alloca that SROA promotes to
+    * registers, and the ids and the batch row come back through three more
+    * that mem2reg removes -- so the packed input buffer, its clear, its stores
+    * and its loads all cease to exist. See kernels/cp_vs_inline.c.
+    */
+   bool vs_fetch;
+   LLVMValueRef vs_fetch_slots;   /* [N x 16 x i8] alloca */
+   LLVMValueRef vs_fetch_vid;     /* i32 alloca */
+   LLVMValueRef vs_fetch_iid;     /* i32 alloca */
+   LLVMValueRef vs_fetch_row;     /* i32 alloca */
+   unsigned vs_num_slots;         /* N, a compile-time constant to the helper */
+   uint32_t vs_live_slots;        /* which slots the shader actually reads */
 
    LLVMBasicBlockRef break_block;
    LLVMBasicBlockRef continue_block;
@@ -435,6 +459,16 @@ emit_batch_row(struct ntl_context *ctx)
 
    assert(ctx->nir->info.stage == MESA_SHADER_VERTEX ||
           ctx->nir->info.stage == MESA_SHADER_FRAGMENT);
+
+   /* The fused vertex execution ran the slice search itself, so the row is
+    * this lane's own value rather than a lookup in an array the separate
+    * fetch kernel wrote. The slots stay filled for the classic binary. */
+   if (ctx->vs_fetch) {
+      LLVMValueRef row = LLVMBuildLoad2(ctx->builder, i32, ctx->vs_fetch_row,
+                                        "batch_draw");
+      LLVMSetAlignment(row, 4);
+      return row;
+   }
 
    LLVMValueRef mask = LLVMBuildLoad2(ctx->builder, i32,
       LLVMBuildBitCast(ctx->builder, cp_arg_slot(ctx, CP_ARG_SLOT_BATCH_MASK),
@@ -699,6 +733,15 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
    }
    case nir_intrinsic_load_vertex_id:
    case nir_intrinsic_load_vertex_id_zero_base: {
+      /* The fused execution already derived it in this lane; the array at
+       * args[5] is not written for such a draw at all. */
+      if (ctx->vs_fetch) {
+         LLVMValueRef vid = LLVMBuildLoad2(ctx->builder, i32,
+                                           ctx->vs_fetch_vid, "vertex_id");
+         LLVMSetAlignment(vid, 4);
+         set_ssa_def(ctx, &instr->def, vid);
+         break;
+      }
       /* Read original vertex_id from args[5] array indexed by thread_id */
       LLVMValueRef bid = emit_workgroup_id(ctx, 0);
       LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
@@ -787,6 +830,14 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       break;
    }
    case nir_intrinsic_load_instance_id: {
+      /* As with the vertex id: the fused execution has it in a register. */
+      if (ctx->vs_fetch) {
+         LLVMValueRef iid = LLVMBuildLoad2(ctx->builder, i32,
+                                           ctx->vs_fetch_iid, "instance_id");
+         LLVMSetAlignment(iid, 4);
+         set_ssa_def(ctx, &instr->def, iid);
+         break;
+      }
       /* Per-vertex instance index, from args[6]; laid out like the vertex-id
        * array above so the same indexing applies. */
       LLVMValueRef bid = emit_workgroup_id(ctx, 0);
@@ -810,16 +861,25 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       unsigned comp = nir_intrinsic_component(instr);
       LLVMValueRef offset_val = get_src(ctx, &instr->src[0]);
 
-      /* The classic/fused ABI reads global fs_in. The inline execution reads
-       * the caller-owned entry alloca filled by the linked interpolation IR. */
-      LLVMValueRef input_ptr =
-         ctx->nir->info.stage == MESA_SHADER_FRAGMENT && ctx->inline_interp
-         ? ctx->inline_fs_inputs : cp_arg_slot(ctx, 2);
+      /*
+       * The classic/fused ABI reads a global array: fs_in for the fragment
+       * stage, the packed vertex-fetch output for the vertex stage. Both
+       * same-LLVM inline executions read the caller-owned entry alloca that
+       * the linked helper filled -- the interpolator's for a fragment shader,
+       * the vertex fetch's for a vertex one.
+       */
+      const bool lane_local_inputs =
+         (ctx->nir->info.stage == MESA_SHADER_FRAGMENT && ctx->inline_interp) ||
+         (ctx->nir->info.stage == MESA_SHADER_VERTEX && ctx->vs_fetch);
+      LLVMValueRef input_ptr = lane_local_inputs
+         ? (ctx->nir->info.stage == MESA_SHADER_FRAGMENT
+               ? ctx->inline_fs_inputs : ctx->vs_fetch_slots)
+         : cp_arg_slot(ctx, 2);
 
       /* Classic inputs are a global array indexed by invocation. Inline
        * inputs are this invocation's one entry alloca, so no vid/stride term. */
       LLVMValueRef byte_off;
-      if (ctx->nir->info.stage == MESA_SHADER_FRAGMENT && ctx->inline_interp) {
+      if (lane_local_inputs) {
          byte_off = LLVMBuildAdd(ctx->builder,
             LLVMConstInt(i32, base * 16 + comp * 4, false),
             LLVMBuildMul(ctx->builder, offset_val,
@@ -3076,6 +3136,47 @@ emit_function(struct ntl_context *ctx)
       LLVMSetAlignment(ctx->inline_fs_inputs, 16);
    }
 
+   if (ctx->vs_fetch) {
+      LLVMTypeRef i8_t = LLVMInt8TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef i32_t = LLVMInt32TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef input_array = LLVMArrayType(i8_t, ctx->vs_num_slots * 16);
+      ctx->vs_fetch_slots = LLVMBuildAlloca(ctx->builder, input_array,
+                                            "vs_fetch_slots");
+      LLVMSetAlignment(ctx->vs_fetch_slots, 16);
+      ctx->vs_fetch_vid = LLVMBuildAlloca(ctx->builder, i32_t, "vs_fetch_vid");
+      ctx->vs_fetch_iid = LLVMBuildAlloca(ctx->builder, i32_t, "vs_fetch_iid");
+      ctx->vs_fetch_row = LLVMBuildAlloca(ctx->builder, i32_t, "vs_fetch_row");
+      LLVMSetAlignment(ctx->vs_fetch_vid, 4);
+      LLVMSetAlignment(ctx->vs_fetch_iid, 4);
+      LLVMSetAlignment(ctx->vs_fetch_row, 4);
+
+      /*
+       * The counter seeds iteration 26 put on the fetch launch. That launch is
+       * gone for this shader, so the seeding comes with it -- one thread of the
+       * grid, before the bounds check, exactly as cp_vertex_fetch does it and
+       * for the same reason: the seeding must not depend on this thread having
+       * a vertex. The counters are consumed by later launches on the same
+       * stream, so this kernel's boundary publishes them.
+       */
+      LLVMTypeRef i8_ptr = LLVMPointerType(i8_t, 0);
+      LLVMValueRef gtid = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder,
+            emit_nvptx_read_sreg(ctx, "llvm.nvvm.read.ptx.sreg.ctaid.x"),
+            LLVMConstInt(i32_t, 256, false), ""),
+         emit_nvptx_read_sreg(ctx, "llvm.nvvm.read.ptx.sreg.tid.x"), "gtid");
+      LLVMTypeRef seed_params[] = { i8_ptr, i32_t };
+      LLVMTypeRef seed_type = LLVMFunctionType(
+         LLVMVoidTypeInContext(ctx->llvm_ctx), seed_params, 2, false);
+      LLVMValueRef seed_fn = LLVMGetNamedFunction(ctx->module,
+                                                  "cp_vs_fetch_seed");
+      if (!seed_fn)
+         seed_fn = LLVMAddFunction(ctx->module, "cp_vs_fetch_seed", seed_type);
+      LLVMValueRef seed_args[] = {
+         cp_arg_slot(ctx, CP_ARG_SLOT_VS_FETCH), gtid,
+      };
+      LLVMBuildCall2(ctx->builder, seed_type, seed_fn, seed_args, 2, "");
+   }
+
    /*
     * Bounds check: the count is on the device, so both grids are sized for the
     * worst case and each thread bounds itself against slot 0 — the vertex
@@ -3143,6 +3244,89 @@ emit_function(struct ntl_context *ctx)
 
       LLVMPositionBuilderAtEnd(ctx->builder, body);
       ctx->virtual_bid = vbid_phi;
+
+      if (ctx->nir->info.stage == MESA_SHADER_VERTEX && ctx->vs_fetch) {
+         /*
+          * The gather, at the top of the body, inlined away before the
+          * optimisation pipeline runs: there is no call in the emitted PTX,
+          * so there is no callee frame whose live set the register allocator
+          * has to union with this shader's. That union is what killed
+          * iteration 4, and the PTX admission below is what proves it is gone.
+          *
+          * N and the live-slot mask are constants, which is the whole trick:
+          * the element loop unrolls with a constant index in each copy, so
+          * the caller-owned array's addresses are constant and SROA promotes
+          * it into registers.
+          */
+         LLVMTypeRef i8_ptr = LLVMPointerType(
+            LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+         LLVMValueRef fetch_args = cp_arg_slot(ctx, CP_ARG_SLOT_VS_FETCH);
+         LLVMBasicBlockRef fetched = LLVMAppendBasicBlockInContext(
+            ctx->llvm_ctx, ctx->function, "vs_fetched");
+
+         /* Which draw, which vertex, which instance: once per lane. */
+         LLVMTypeRef id_params[] = { i8_ptr, i32_t, i8_ptr, i8_ptr, i8_ptr };
+         LLVMTypeRef id_type = LLVMFunctionType(i32_t, id_params, 5, false);
+         LLVMValueRef id_fn = LLVMGetNamedFunction(ctx->module,
+                                                   "cp_vs_fetch_ids");
+         if (!id_fn)
+            id_fn = LLVMAddFunction(ctx->module, "cp_vs_fetch_ids", id_type);
+         LLVMValueRef id_args[] = {
+            fetch_args, vid,
+            LLVMBuildBitCast(ctx->builder, ctx->vs_fetch_vid, i8_ptr, ""),
+            LLVMBuildBitCast(ctx->builder, ctx->vs_fetch_iid, i8_ptr, ""),
+            LLVMBuildBitCast(ctx->builder, ctx->vs_fetch_row, i8_ptr, ""),
+         };
+         LLVMValueRef ok = LLVMBuildCall2(ctx->builder, id_type, id_fn,
+                                          id_args, 5, "vs_fetch_ok");
+         /* Zero only for a lane the fetch declines; today the bounds check
+          * above already excluded those, so this folds away. It is kept
+          * because it is the seam a robust-access fetch needs. */
+         ok = LLVMBuildICmp(ctx->builder, LLVMIntNE, ok,
+                            LLVMConstInt(i32_t, 0, false), "");
+         LLVMBuildCondBr(ctx->builder, ok, fetched, stride_latch);
+         LLVMPositionBuilderAtEnd(ctx->builder, fetched);
+
+         /*
+          * One gather call per input slot the shader reads, with the element
+          * index a constant. That is the unrolling, done here rather than left
+          * to LLVM's unroller: a loop over the elements indexes the slot array
+          * dynamically, a dynamically indexed alloca is local memory, and the
+          * unroller's size heuristic refused the loop for every real capture
+          * shader when it was written that way. A slot the shader never reads
+          * gets no call at all, which the split form cannot do -- today's
+          * fetch kernel gathers every bound element whether it is read or not.
+          */
+         LLVMValueRef gathered_vid = LLVMBuildLoad2(ctx->builder, i32_t,
+                                                    ctx->vs_fetch_vid, "");
+         LLVMValueRef gathered_iid = LLVMBuildLoad2(ctx->builder, i32_t,
+                                                    ctx->vs_fetch_iid, "");
+         LLVMValueRef gathered_row = LLVMBuildLoad2(ctx->builder, i32_t,
+                                                    ctx->vs_fetch_row, "");
+         LLVMTypeRef el_params[] = { i8_ptr, i32_t, i32_t, i32_t, i32_t,
+                                     i8_ptr };
+         LLVMTypeRef el_type = LLVMFunctionType(
+            LLVMVoidTypeInContext(ctx->llvm_ctx), el_params, 6, false);
+         LLVMValueRef el_fn = LLVMGetNamedFunction(ctx->module,
+                                                   "cp_vs_fetch_element");
+         if (!el_fn)
+            el_fn = LLVMAddFunction(ctx->module, "cp_vs_fetch_element",
+                                    el_type);
+         LLVMValueRef slots_base = LLVMBuildBitCast(
+            ctx->builder, ctx->vs_fetch_slots, i8_ptr, "");
+         for (unsigned e = 0; e < ctx->vs_num_slots; e++) {
+            if (!(ctx->vs_live_slots & (1u << e)))
+               continue;
+            LLVMValueRef off = LLVMConstInt(i32_t, e * 16, false);
+            LLVMValueRef slot = LLVMBuildGEP2(ctx->builder,
+               LLVMInt8TypeInContext(ctx->llvm_ctx), slots_base, &off, 1, "");
+            LLVMValueRef el_args[] = {
+               fetch_args, LLVMConstInt(i32_t, e, false),
+               gathered_vid, gathered_iid, gathered_row, slot,
+            };
+            LLVMBuildCall2(ctx->builder, el_type, el_fn, el_args, 6, "");
+         }
+      }
 
       if (ctx->nir->info.stage == MESA_SHADER_FRAGMENT &&
           (ctx->fused_interp || ctx->inline_interp)) {
@@ -3270,9 +3454,23 @@ cp_initialize_nvptx(void)
 }
 
 #ifdef CP_HAVE_FS_INLINE_BC
+/*
+ * Link one embedded bitcode module into the generated shader's module, in the
+ * same LLVMContext, and force-inline its exported helpers away before the
+ * optimisation pipeline runs.
+ *
+ * There is no second compiler and no cross-module pointer: after always-inline
+ * there is no call, no callee frame to union a register allocation with, and
+ * no ABI beyond the frozen struct layouts the helper asserts. A surviving
+ * symbol is a build failure rather than a slower fallback, because a device
+ * call is exactly what iteration 4 measured at 20 -> 108 registers.
+ */
 static bool
-link_and_inline_fs_interp(LLVMModuleRef module, LLVMContextRef llvm_ctx,
-                          int sm_major, int sm_minor)
+link_and_inline_bitcode(LLVMModuleRef module, LLVMContextRef llvm_ctx,
+                        int sm_major, int sm_minor,
+                        const unsigned char *bc, size_t bc_size,
+                        const char *const *symbols, unsigned num_symbols,
+                        const char *what)
 {
    const char triple[] = "nvptx64-nvidia-cuda";
    char cpu[16];
@@ -3287,7 +3485,7 @@ link_and_inline_fs_interp(LLVMModuleRef module, LLVMContextRef llvm_ctx,
    char *error = NULL;
    LLVMTargetRef target = NULL;
    if (LLVMGetTargetFromTriple(triple, &target, &error) != 0) {
-      fprintf(stderr, "cudapipe: inline FS target lookup failed: %s\n",
+      fprintf(stderr, "cudapipe: inline %s target lookup failed: %s\n", what,
               error ? error : "?");
       LLVMDisposeMessage(error);
       return false;
@@ -3303,36 +3501,39 @@ link_and_inline_fs_interp(LLVMModuleRef module, LLVMContextRef llvm_ctx,
    LLVMSetDataLayout(module, layout);
 
    LLVMMemoryBufferRef buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(
-      (const char *)cp_fs_inline_bc, sizeof(cp_fs_inline_bc), "cp_fs_inline.bc");
+      (const char *)bc, bc_size, "cp_inline.bc");
    LLVMModuleRef helper_module = NULL;
    bool ok = LLVMParseBitcodeInContext2(llvm_ctx, buffer, &helper_module) == 0;
    LLVMDisposeMemoryBuffer(buffer);
    if (!ok || !helper_module) {
-      fprintf(stderr, "cudapipe: inline FS LLVM %d bitcode parse failed\n",
-              LLVM_VERSION_MAJOR);
+      fprintf(stderr, "cudapipe: inline %s LLVM %d bitcode parse failed\n",
+              what, LLVM_VERSION_MAJOR);
       goto out;
    }
    if (strcmp(LLVMGetTarget(helper_module), triple) != 0 ||
        strcmp(LLVMGetDataLayoutStr(helper_module), layout) != 0) {
-      fprintf(stderr, "cudapipe: inline FS bitcode target/layout mismatch "
-              "(LLVM %d)\n", LLVM_VERSION_MAJOR);
+      fprintf(stderr, "cudapipe: inline %s bitcode target/layout mismatch "
+              "(LLVM %d)\n", what, LLVM_VERSION_MAJOR);
       LLVMDisposeModule(helper_module);
       ok = false;
       goto out;
    }
    if (LLVMLinkModules2(module, helper_module) != 0) {
-      fprintf(stderr, "cudapipe: inline FS LLVM module link failed\n");
+      fprintf(stderr, "cudapipe: inline %s LLVM module link failed\n", what);
       ok = false;
       goto out;
    }
 
-   LLVMValueRef helper = LLVMGetNamedFunction(module, "cp_fs_inline_lane");
-   if (!helper) {
-      fprintf(stderr, "cudapipe: inline FS helper absent after link\n");
-      ok = false;
-      goto out;
+   for (unsigned s = 0; s < num_symbols; s++) {
+      LLVMValueRef helper = LLVMGetNamedFunction(module, symbols[s]);
+      if (!helper) {
+         fprintf(stderr, "cudapipe: inline %s helper %s absent after link\n",
+                 what, symbols[s]);
+         ok = false;
+         goto out;
+      }
+      LLVMSetLinkage(helper, LLVMInternalLinkage);
    }
-   LLVMSetLinkage(helper, LLVMInternalLinkage);
 
    LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
    LLVMErrorRef pass_error = LLVMRunPasses(
@@ -3343,16 +3544,19 @@ link_and_inline_fs_interp(LLVMModuleRef module, LLVMContextRef llvm_ctx,
    LLVMDisposePassBuilderOptions(opts);
    if (pass_error) {
       char *message = LLVMGetErrorMessage(pass_error);
-      fprintf(stderr, "cudapipe: inline FS LLVM optimization failed: %s\n",
-              message ? message : "?");
+      fprintf(stderr, "cudapipe: inline %s LLVM optimization failed: %s\n",
+              what, message ? message : "?");
       LLVMDisposeErrorMessage(message);
       ok = false;
       goto out;
    }
-   if (LLVMGetNamedFunction(module, "cp_fs_inline_lane")) {
-      fprintf(stderr, "cudapipe: inline FS helper survived forced inlining\n");
-      ok = false;
-      goto out;
+   for (unsigned s = 0; s < num_symbols; s++) {
+      if (LLVMGetNamedFunction(module, symbols[s])) {
+         fprintf(stderr, "cudapipe: inline %s helper %s survived forced "
+                 "inlining\n", what, symbols[s]);
+         ok = false;
+         goto out;
+      }
    }
    ok = true;
 
@@ -3361,6 +3565,30 @@ out:
    LLVMDisposeTargetData(td);
    LLVMDisposeTargetMachine(tm);
    return ok;
+}
+
+static bool
+link_and_inline_fs_interp(LLVMModuleRef module, LLVMContextRef llvm_ctx,
+                          int sm_major, int sm_minor)
+{
+   static const char *const symbols[] = { "cp_fs_inline_lane" };
+   return link_and_inline_bitcode(module, llvm_ctx, sm_major, sm_minor,
+                                  cp_fs_inline_bc, sizeof(cp_fs_inline_bc),
+                                  symbols, ARRAY_SIZE(symbols), "FS");
+}
+#endif
+
+#ifdef CP_HAVE_VS_INLINE_BC
+static bool
+link_and_inline_vs_fetch(LLVMModuleRef module, LLVMContextRef llvm_ctx,
+                         int sm_major, int sm_minor)
+{
+   static const char *const symbols[] = { "cp_vs_fetch_ids",
+                                          "cp_vs_fetch_element",
+                                          "cp_vs_fetch_seed" };
+   return link_and_inline_bitcode(module, llvm_ctx, sm_major, sm_minor,
+                                  cp_vs_inline_bc, sizeof(cp_vs_inline_bc),
+                                  symbols, ARRAY_SIZE(symbols), "VS fetch");
 }
 #endif
 
@@ -4070,7 +4298,7 @@ static struct cp_shader_binary *
 cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
                    const char *sampler_ptx, const char *fs_helper_ptx,
                    bool fused_interp, bool inline_interp,
-                   bool hardware_texture)
+                   bool hardware_texture, bool vs_fetch)
 {
    struct ntl_context ctx = {0};
    ctx.nir = nir;
@@ -4079,6 +4307,7 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    ctx.fused_interp = fused_interp;
    ctx.inline_interp = inline_interp;
    ctx.hardware_texture = hardware_texture;
+   ctx.vs_fetch = vs_fetch && nir->info.stage == MESA_SHADER_VERTEX;
 
    cp_lower_nir(nir);
    if (hardware_texture && !cp_hardware_texture_shader_eligible(nir))
@@ -4141,6 +4370,73 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
             ? cp_hardware_failure_stub(CP_HW_COMPILE_INLINE_FOOTPRINT)
             : NULL;
       }
+   }
+
+   if (ctx.vs_fetch) {
+      /*
+       * N and the live-slot mask, by the same walk the fragment path uses --
+       * with one difference that matters. A vertex shader's inputs are
+       * numbered by attribute location and deliberately not compacted
+       * (cpvk_pipeline.c: "the fetch kernel writes attribute N into slot N"),
+       * so nir->num_inputs does not bound them and the slot count has to come
+       * from the loads themselves.
+       *
+       * Both are functions of the NIR alone -- not of the vertex input state --
+       * which is what lets the fused binary share the shader cache key: the
+       * formats stay runtime data read out of the argument block, exactly as
+       * iteration 4's report demanded.
+       */
+      unsigned slots_used = 0;
+      bool footprint_safe = true;
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_load_input)
+                  continue;
+
+               /* load_input addresses vec4 slots as base + src[0]; an
+                * indirect may select any declared input, so it makes every
+                * slot live rather than excluding one that is read. */
+               if (!nir_src_is_const(intr->src[0])) {
+                  ctx.vs_live_slots = (1u << CP_MAX_VERTEX_ELEMENTS_VF) - 1u;
+                  slots_used = CP_MAX_VERTEX_ELEMENTS_VF;
+                  continue;
+               }
+
+               uint64_t offset = nir_src_as_uint(intr->src[0]);
+               uint64_t first_byte =
+                  ((uint64_t)nir_intrinsic_base(intr) + offset) * 16u +
+                  (uint64_t)nir_intrinsic_component(intr) * 4u;
+               uint64_t bytes =
+                  ((uint64_t)intr->def.num_components * intr->def.bit_size +
+                   7u) / 8u;
+               uint64_t first_slot = first_byte / 16u;
+               uint64_t last_slot = (first_byte + bytes - 1u) / 16u;
+               if (!bytes || last_slot >= CP_MAX_VERTEX_ELEMENTS_VF) {
+                  footprint_safe = false;
+                  continue;
+               }
+               for (uint64_t slot = first_slot; slot <= last_slot; slot++)
+                  ctx.vs_live_slots |= 1u << slot;
+               if (last_slot + 1 > slots_used)
+                  slots_used = (unsigned)last_slot + 1;
+            }
+         }
+      }
+      if (!footprint_safe) {
+         if (cp_debug->shader_stats || cp_debug->dump_ir || cp_debug->dump_ptx)
+            fprintf(stderr, "cudapipe: fused vertex fetch declined: an input "
+                    "load addresses past the %u-slot lane array\n",
+                    CP_MAX_VERTEX_ELEMENTS_VF);
+         return NULL;
+      }
+      /* A shader that reads no attribute still wants the fused execution: it
+       * removes the launch, the ids and the batch row all the same. One slot
+       * keeps the alloca well-formed. */
+      ctx.vs_num_slots = slots_used ? slots_used : 1;
    }
 
    /* After the lowering, which is the NIR the prologue below is generated
@@ -4272,6 +4568,18 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    assert(!inline_interp);
 #endif
 
+#ifdef CP_HAVE_VS_INLINE_BC
+   if (ctx.vs_fetch &&
+       !link_and_inline_vs_fetch(ctx.module, ctx.llvm_ctx, sm_major, sm_minor)) {
+      LLVMDisposeBuilder(ctx.builder);
+      LLVMDisposeModule(ctx.module);
+      LLVMContextDispose(ctx.llvm_ctx);
+      return NULL;
+   }
+#else
+   assert(!ctx.vs_fetch);
+#endif
+
    /* For inline execution this is the optimized, post-link IR: the dump is
     * itself the proof surface for helper removal and local-input promotion. */
    if (cp_debug->dump_ir)
@@ -4330,6 +4638,25 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    bool surviving_inline_helper = strstr(ptx, "cp_fs_inline_lane");
    bool local_memory = strstr(ptx, ".local") || strstr(ptx, "ld.local") ||
                        strstr(ptx, "st.local");
+
+   /*
+    * The one non-negotiable check for the fused vertex execution: a helper
+    * name in the emitted PTX means always-inline did not run, which is a
+    * device call, which is iteration 4's 20 -> 108 register failure. Local
+    * memory is judged against the classic build of the same shader by the
+    * caller, because a vertex shader may already carry a __local_depot from
+    * nir_convert_from_ssa and rejecting those would exclude real shaders for
+    * a pre-existing reason.
+    */
+   if (ctx.vs_fetch && (strstr(ptx, "cp_vs_fetch_ids") ||
+                        strstr(ptx, "cp_vs_fetch_element") ||
+                        strstr(ptx, "cp_vs_fetch_seed"))) {
+      fprintf(stderr, "cudapipe: fused vertex fetch rejected: the lane helper "
+              "survived into the PTX\n");
+      free(ptx);
+      return NULL;
+   }
+
    if (bad_hardware_ptx ||
        (inline_interp && (surviving_inline_helper || local_memory))) {
       if (cp_debug->shader_stats || cp_debug->dump_ir || cp_debug->dump_ptx)
@@ -4365,9 +4692,10 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    }
    enum cp_shader_exec_mode mode = hardware_texture
       ? (inline_interp ? CP_SHADER_EXEC_HW_INLINE : CP_SHADER_EXEC_HW_FUSED)
-      : (inline_interp ? CP_SHADER_EXEC_INLINE
+      : (ctx.vs_fetch ? CP_SHADER_EXEC_VS_FETCH
+                      : (inline_interp ? CP_SHADER_EXEC_INLINE
                        : (fused_interp ? CP_SHADER_EXEC_FUSED
-                                       : CP_SHADER_EXEC_CLASSIC));
+                                       : CP_SHADER_EXEC_CLASSIC)));
    struct cp_shader_exec *exec = &bin->exec[mode];
    exec->ptx_text = ptx;
    exec->ptx_size = ptx_size;
@@ -4377,6 +4705,8 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    bin->nir_num_outputs = nir->num_outputs;
    bin->nir_num_inputs = nir->num_inputs;
    bin->is_fragment = nir->info.stage == MESA_SHADER_FRAGMENT;
+   bin->vs_num_slots = ctx.vs_num_slots;
+   bin->vs_live_slots = ctx.vs_live_slots;
    bin->reads_const_bufs = ctx.reads_const_bufs;
    bin->writes_memory = ctx.writes_memory;
 
@@ -4426,6 +4756,8 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    bool needs_sampler =
       ((!hardware_texture && ctx.uses_tex) || ctx.needs_link) && sampler_ptx;
    const char *stage_name = mesa_shader_stage_name(nir->info.stage);
+   if (ctx.vs_fetch)
+      stage_name = "vertex fused-fetch";
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       stage_name = hardware_texture
          ? (inline_interp ? "fragment hardware inline" : "fragment hardware fused")
@@ -4450,6 +4782,117 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    return bin;
 }
 
+/*
+ * The fused-fetch execution beside the classic vertex binary, and the verdict
+ * on whether it may be used.
+ *
+ * Two independently linked modules, which is what makes selecting the classic
+ * one a real revert: iteration 4's control passed a null helper argument and
+ * skipped the *call* while the linked call graph still forced 108 registers,
+ * so "flag off" was not the old kernel. Here it is a different CUfunction from
+ * a module that has no fetch code in it at all.
+ *
+ * Admission is the occupancy-tier rule iteration 4's report asked for. The
+ * helper-symbol check already happened in the PTX; what is compared here is
+ * against the *classic build of the same shader*, not against zero, because a
+ * vertex shader may already carry a __local_depot for a reason that has
+ * nothing to do with this.
+ */
+static void
+cp_vs_attach_fused_fetch(struct cp_shader_binary *bin,
+                         struct nir_shader *fused_nir, int sm_major,
+                         int sm_minor, const char *sampler_ptx)
+{
+   if (!bin)
+      return;
+   struct cp_vs_census *census = cp_vs_census_claim();
+   bin->vs_census = census;
+   static unsigned vertex_shaders_seen;
+   const unsigned nth = ++vertex_shaders_seen;
+
+   const struct cp_shader_exec *classic = &bin->exec[CP_SHADER_EXEC_CLASSIC];
+   if (census) {
+      census->classic_regs = classic->num_regs;
+      census->classic_spill = classic->spill_bytes;
+      census->classic_blocks = classic->blocks_per_sm;
+      census->verdict = CP_VS_FETCH_NO_BITCODE;
+   }
+
+#ifdef CP_HAVE_VS_INLINE_BC
+   if (cp_debug->no_fused_vfetch) {
+      if (census)
+         census->verdict = CP_VS_FETCH_DISABLED;
+      return;
+   }
+
+   if (!fused_nir || !classic->kernel)
+      return;
+
+   struct cp_shader_binary *fused =
+      cp_compile_nir_one(fused_nir, sm_major, sm_minor, sampler_ptx, NULL,
+                         false, false, false, true);
+   struct cp_shader_exec *fx = fused ? &fused->exec[CP_SHADER_EXEC_VS_FETCH]
+                                     : NULL;
+   if (!fx || !fx->kernel) {
+      if (census)
+         census->verdict = CP_VS_FETCH_COMPILE_FAILED;
+      cp_shader_binary_destroy(fused);
+      return;
+   }
+
+   unsigned classic_local = classic->ptx_text
+      ? cp_count_substring(classic->ptx_text, ".local") : 0;
+   unsigned fused_local = fx->ptx_text
+      ? cp_count_substring(fx->ptx_text, ".local") : 0;
+
+   /*
+    * A shader forced onto the classic path, so that a test can put a declining
+    * draw beside an admitted one in the same command buffer -- and so that a
+    * run can pay the whole cost of the mechanism (the second binary, the
+    * measurement, the per-draw decision) while executing none of it, which is
+    * what separates infrastructure cost from execution cost. Forced here,
+    * after the build, for exactly that reason.
+    */
+   uint8_t verdict = CP_VS_FETCH_ADMITTED;
+   if (cp_debug->vfetch_decline_nth == nth ||
+       cp_debug->vfetch_decline_nth == UINT32_MAX)
+      verdict = CP_VS_FETCH_FORCED_DECLINE;
+   else if (fused_local > classic_local)
+      verdict = CP_VS_FETCH_LOCAL_MEMORY;
+   else if (fx->spill_bytes > classic->spill_bytes)
+      verdict = CP_VS_FETCH_SPILL;
+   else if (fx->blocks_per_sm < classic->blocks_per_sm)
+      verdict = CP_VS_FETCH_OCCUPANCY;
+
+   if (census) {
+      census->verdict = verdict;
+      census->fused_regs = fx->num_regs;
+      census->fused_spill = fx->spill_bytes;
+      census->fused_blocks = fx->blocks_per_sm;
+      census->num_slots = fused->vs_num_slots;
+      census->live_slots = fused->vs_live_slots;
+   }
+   if (cp_debug->shader_stats)
+      fprintf(stderr, "cudapipe: vsfetch verdict %-15s classic regs %3d "
+              "spill %4d blocks/sm %d local %u | fused regs %3d spill %4d "
+              "blocks/sm %d local %u\n", cp_vs_verdict_name(verdict),
+              classic->num_regs, classic->spill_bytes, classic->blocks_per_sm,
+              classic_local, fx->num_regs, fx->spill_bytes, fx->blocks_per_sm,
+              fused_local);
+
+   if (verdict == CP_VS_FETCH_ADMITTED) {
+      bin->exec[CP_SHADER_EXEC_VS_FETCH] = *fx;
+      memset(fx, 0, sizeof(*fx));
+   }
+   cp_shader_binary_destroy(fused);
+#else
+   (void)fused_nir;
+   (void)sm_major;
+   (void)sm_minor;
+   (void)sampler_ptx;
+#endif
+}
+
 static struct cp_shader_binary *
 cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
                         const char *sampler_ptx, const char *fs_helper_ptx,
@@ -4460,22 +4903,19 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
       return NULL;
    if (nir->info.stage != MESA_SHADER_FRAGMENT || !fs_helper_ptx ||
        no_inline_fs) {
+      /* Cloned before the classic build, which lowers its NIR in place. */
+      struct nir_shader *fused_nir = NULL;
+#ifdef CP_HAVE_VS_INLINE_BC
+      if (nir->info.stage == MESA_SHADER_VERTEX && !cp_debug->no_fused_vfetch)
+         fused_nir = nir_shader_clone(NULL, nir);
+#endif
       struct cp_shader_binary *bin =
          cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx, NULL,
-                            false, false, false);
-      /* One census line per vertex binary, so that the launches below can be
-       * attributed to the shader that received them. */
-      if (bin && nir->info.stage == MESA_SHADER_VERTEX) {
-         bin->vs_census = cp_vs_census_claim();
-         if (bin->vs_census) {
-            const struct cp_shader_exec *classic =
-               &bin->exec[CP_SHADER_EXEC_CLASSIC];
-            bin->vs_census->classic_regs = classic->num_regs;
-            bin->vs_census->classic_spill = classic->spill_bytes;
-            bin->vs_census->classic_blocks = classic->blocks_per_sm;
-            bin->vs_census->verdict = CP_VS_FETCH_NO_BITCODE;
-         }
-      }
+                            false, false, false, false);
+      if (nir->info.stage == MESA_SHADER_VERTEX)
+         cp_vs_attach_fused_fetch(bin, fused_nir, sm_major, sm_minor,
+                                  sampler_ptx);
+      ralloc_free(fused_nir);
       return bin;
    }
    if (force_fused_fs || !inline_fs) {
@@ -4486,7 +4926,7 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
          ? NULL : nir_shader_clone(NULL, nir);
       struct cp_shader_binary *fused =
          cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
-                            fs_helper_ptx, true, false, false);
+                            fs_helper_ptx, true, false, false, false);
       if (fused && fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
          ralloc_free(classic_nir);
          return fused;
@@ -4496,7 +4936,7 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
        * correctness if its fused JIT is unavailable. */
       struct cp_shader_binary *classic = classic_nir
          ? cp_compile_nir_one(classic_nir, sm_major, sm_minor, sampler_ptx,
-                              NULL, false, false, false)
+                              NULL, false, false, false, false)
          : NULL;
       ralloc_free(classic_nir);
       return classic;
@@ -4515,18 +4955,18 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
 #endif
    struct cp_shader_binary *fused =
       cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
-                         fs_helper_ptx, true, false, false);
+                         fs_helper_ptx, true, false, false, false);
    if (fused && !fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
       cp_shader_binary_destroy(fused);
       fused = NULL;
    }
    struct cp_shader_binary *classic = !fused && standalone_nir
       ? cp_compile_nir_one(standalone_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, false, false)
+                           NULL, false, false, false, false)
       : NULL;
    struct cp_shader_binary *inlined = inline_nir
       ? cp_compile_nir_one(inline_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, true, false)
+                           NULL, false, true, false, false)
       : NULL;
    ralloc_free(standalone_nir);
    ralloc_free(inline_nir);
@@ -4577,13 +5017,13 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
 #ifdef CP_HAVE_FS_INLINE_BC
    struct cp_shader_binary *hardware = hardware_nir
       ? cp_compile_nir_one(hardware_nir, sm_major, sm_minor, math_ptx, NULL,
-                           false, true, true)
+                           false, true, true, false)
       : NULL;
    struct cp_shader_binary *hardware_fused =
       hardware_fused_nir &&
       (!hardware || !hardware->exec[CP_SHADER_EXEC_HW_INLINE].kernel)
       ? cp_compile_nir_one(hardware_fused_nir, sm_major, sm_minor,
-                           math_ptx, fs_helper_ptx, true, false, true)
+                           math_ptx, fs_helper_ptx, true, false, true, false)
       : NULL;
    if (bin && hardware) {
       bin->hw_compile_failure = hardware->hw_compile_failure;

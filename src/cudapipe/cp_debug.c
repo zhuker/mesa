@@ -143,6 +143,19 @@ static const struct cp_flag_def flags[] = {
    { "CUDAPIPE_NO_FETCH_FOLD", CP_FLAG_BOOL_VALUE, F(no_fetch_fold),
      "clear the clip and raster queue counters with their own device clears "
      "again instead of seeding them inside cp_vertex_fetch" },
+   { "CUDAPIPE_FUSED_VFETCH", CP_FLAG_BOOL_VALUE, F(fused_vfetch),
+     "gather vertex attributes inside the vertex shader, from bitcode inlined "
+     "into it, instead of launching cp_vertex_fetch before it" },
+   { "CUDAPIPE_NO_FUSED_VFETCH", CP_FLAG_BOOL_VALUE, F(no_fused_vfetch),
+     "do not even build the fused vertex execution: the resource-isolated "
+     "control, and the revert once the fusion is the default" },
+   { "CUDAPIPE_VFETCH_DECLINE_NTH", CP_FLAG_UINT, F(vfetch_decline_nth),
+     "fault injection: refuse the fused execution for the Nth vertex shader "
+     "compiled, or for every one at 4294967295, after building it either way" },
+   { "CUDAPIPE_VFETCH_SKIP_SEED", CP_FLAG_BOOL_VALUE, F(vfetch_skip_seed),
+     "fault injection: a fused draw does not seed the clip and raster "
+     "counters, and the host still skips their clears -- the negative control "
+     "for the seeding moving into the fused vertex shader" },
    { "CUDAPIPE_NO_OPAQUE_EPISODE", CP_FLAG_BOOL_VALUE,
      F(no_opaque_episode),
      "disable consecutive opaque-run visibility deferral" },

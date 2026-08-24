@@ -40,8 +40,17 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
    unsigned char *slots = (unsigned char *)(uintptr_t)args.output +
                           (uint64_t)v * args.vs_in_stride;
    uint32_t vertex_id, instance_id, row;
-   if (!cp_vf_lane(&args, v, slots, &vertex_id, &instance_id, &row))
+   if (!cp_vf_lane_ids(&args, v, &vertex_id, &instance_id, &row))
       return;
+
+   /* Every bound element, in a runtime loop: this kernel does not know which
+    * of them the shader reads, and gathering all of them is what it has always
+    * done. The fused execution knows, and emits one call per live slot with
+    * the index a constant, which is where that becomes worth exploiting. */
+   for (uint32_t e = 0; e < args.num_elements &&
+                        e < CP_MAX_VERTEX_ELEMENTS_VF; e++)
+      cp_vf_lane_element(&args, e, vertex_id, instance_id, row,
+                         slots + e * 16);
 
    /* The vertex shader picks its own draw's uniform bindings out of this.
     * Only the derived path resolves a row; the refs path never coexists with

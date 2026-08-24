@@ -416,6 +416,21 @@ struct cp_clip_args {
 #define CP_ARG_SLOT_HW_TEX_TABLE 15
 
 /*
+ * Device address of one struct cp_vertex_fetch_args, for a vertex execution
+ * that gathers its own attributes instead of reading what a separate
+ * cp_vertex_fetch launch packed for it.
+ *
+ * The block travels inside the vertex argument block's own upload -- the same
+ * host-to-device copy that carries the pointer array, the scalar area, the
+ * uniform table and the draw-parameter rows -- so fusing the fetch costs no
+ * new device operation. It is filled by the same host code that filled the
+ * by-value kernel parameter, which is why there is one description of vertex
+ * format semantics and not two. Null for every other execution, and launching
+ * a fused vertex kernel with it null is an internal error, not a soft path.
+ */
+#define CP_ARG_SLOT_VS_FETCH 16
+
+/*
  * One merged draw's slice of the assembled vertex stream.
  *
  * A batch concatenates its draws, so vertex v of the launch belongs to the
