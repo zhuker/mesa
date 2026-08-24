@@ -30,6 +30,18 @@ struct cp_framebuffer_info {
    uint32_t num_color_attachments;
 };
 
+struct cp_cache_convert_args {
+   uint64_t src;
+   uint64_t surface;
+   uint64_t src_pitch;
+   uint64_t src_slice;
+   uint32_t width;
+   uint32_t height;
+   uint32_t depth;
+   uint32_t target; /* 0=2D, 1=2D layered/cube, 2=3D */
+   uint32_t format; /* 1=R11G11B10 -> half4, 2=BC1, 3=BC3 */
+};
+
 struct cp_clear_args {
    uint64_t target;         /* Device pointer to buffer to clear */
    uint32_t width;
@@ -399,6 +411,9 @@ struct cp_clip_args {
  * kernel prepares its own A-buffer input before executing the generated
  * shader body, eliminating the separate interpolation launch. */
 #define CP_ARG_SLOT_FUSED_INTERP 14
+/* Immutable uint64_t[row_count * site_count] CUtexObject table. It exists
+ * only for CP_SHADER_EXEC_HW_INLINE launches. */
+#define CP_ARG_SLOT_HW_TEX_TABLE 15
 
 /*
  * One merged draw's slice of the assembled vertex stream.
@@ -989,6 +1004,9 @@ struct cp_sampler_info {
     * separate samples along. 1 (or 0) means isotropic filtering. */
    float max_anisotropy;
    float border_color[4];
+   uint32_t compare_enable;
+   uint32_t reduction_mode;
+   uint32_t non_seamless_cube;
 };
 
 /*

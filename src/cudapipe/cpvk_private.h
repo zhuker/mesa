@@ -107,6 +107,29 @@ struct cpvk_device {
     * thread can race view creation/destruction on another. */
    simple_mtx_t view_lock;
 
+   /* Native read-only CUDA-array texture cache. The submit worker is the
+    * scheduling owner; the lock also closes host image-bind/destroy races. */
+   simple_mtx_t texture_cache_lock;
+   simple_mtx_t texture_cache_use_lock;
+   uint64_t texture_cache_bytes;
+   struct cpvk_image *texture_cache_images;
+   struct cpvk_image_view **texture_cache_views;
+   size_t texture_cache_view_count, texture_cache_view_cap;
+   void *texture_batch_workspace;
+   size_t texture_batch_workspace_size;
+   struct {
+      uint64_t hits, fallbacks, rebuilds;
+      uint64_t alloc_failures, object_failures;
+      uint64_t arrays, objects;
+      uint64_t peak_bytes;
+      uint64_t event_waits, event_wait_skips, event_wait_overflow;
+      uint64_t resolve_batches, resolve_cells, resolve_unique;
+      uint64_t purges, purge_reclaimed_bytes;
+      uint64_t purge_reclaimed_arrays, purge_reclaimed_objects;
+      uint64_t array_alloc_attempts, object_create_attempts;
+      uint64_t conversion_enqueue_attempts;
+   } texture_cache_stats;
+
    /* The last command draw staged into a pending renderer batch. Merge must be
     * decided before the incoming draw mutates live renderer state. The pointer
     * refers into an immutable command-buffer op array, whose storage is stable
@@ -145,11 +168,22 @@ enum cpvk_memory_kind {
    CPVK_MEM_MANAGED = 2,    /* cuMemAllocManaged: both, and migrating */
 };
 
+struct cpvk_image;
+
+struct cpvk_memory_binding {
+   VkDeviceSize offset, size;
+   void *resource;
+   struct cpvk_image *image; /* NULL for a buffer */
+   struct cpvk_memory_binding *next;
+};
+
 struct cpvk_device_memory {
    struct vk_device_memory vk;
    enum cpvk_memory_kind kind;
    CUdeviceptr dev_ptr;     /* what a kernel dereferences */
    void *host_ptr;          /* what vkMapMemory returns, or NULL */
+   struct cpvk_memory_binding *bindings;
+   bool binding_ledger_failed;
 };
 
 /*
@@ -344,6 +378,7 @@ struct cpvk_draw_cmd {
  * depth test reads from -- the depth image is never written, exactly as under
  * Gallium, where lavapipe's zsbuf only ever set has_zs. */
 struct cpvk_clear {
+   struct cpvk_image *image;
    bool depth;
    float depth_value;
    void *data;
@@ -369,6 +404,7 @@ struct cpvk_clear {
  * here, so one 2D copy covers every case: a buffer is the degenerate one with
  * a single row. */
 struct cpvk_copy {
+   struct cpvk_image *dst_image;
    CUdeviceptr src, dst;
    size_t src_pitch, dst_pitch;
    size_t width_bytes, rows;
@@ -543,7 +579,7 @@ void cpvk_event_unref(struct cpvk_event *event);
 void cpvk_execute_draw_cmd(struct cpvk_device *dev,
                            const struct cp_render_scope *scope,
                            const struct cpvk_draw_cmd *d);
-void cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
+bool cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
 VkResult cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
 void cpvk_batch_break_report(void);
 VkResult cpvk_execute_query(struct cpvk_device *dev,
@@ -618,6 +654,16 @@ struct cpvk_image {
    uint64_t sample_stride;
    uint32_t texel;                 /* enum cp_texel_format */
    int color;                      /* enum cp_color_encoding, -1 if none */
+   struct cpvk_device *dev;
+   VkFormat vk_format;
+   atomic_uint_fast64_t content_epoch;
+   CUevent writer_event;
+   bool writer_event_valid;
+   bool cache_create_eligible;
+   bool cache_alias;
+   struct cpvk_texture_cache *texture_cache;
+   struct cpvk_image *texture_cache_next;
+   struct cpvk_image **texture_cache_prev;
    struct cpvk_image_view *views;
 };
 
@@ -633,12 +679,69 @@ const struct cpvk_format_info *cpvk_format_info(VkFormat format);
 
 struct cpvk_image_view {
    struct vk_image_view vk;
+   struct cpvk_device *dev;
    struct cpvk_image *image;
+   bool cache_swizzle_identity;
+   uint64_t cache_cookie;
    /* Managed cp_texture_info: what a texture handle ultimately points at. */
    CUdeviceptr tex_info;
    struct cp_texture_info *tex_info_host;
    struct cpvk_image_view *image_next;
 };
+
+struct cpvk_texture_object {
+   struct cpvk_image_view *view;
+   unsigned sampler_index;
+   CUtexObject object;
+   struct cpvk_texture_object *next;
+};
+
+struct cpvk_texture_cache {
+   CUmipmappedArray array;
+   CUsurfObject surfaces[CPVK_MAX_MIP_LEVELS];
+   CUevent ready;
+   bool ready_valid;
+   uint64_t scheduled_epoch;
+   uint64_t ready_generation;
+   struct { uint64_t serial, generation; } persistent_waits[9];
+   size_t bytes;
+   struct cpvk_texture_object *objects;
+};
+
+void cpvk_memory_note_bind(struct cpvk_device *dev,
+                           struct cpvk_device_memory *mem,
+                           VkDeviceSize offset, VkDeviceSize size,
+                           void *resource, struct cpvk_image *image);
+void cpvk_memory_note_unbind(struct cpvk_device *dev,
+                             struct cpvk_device_memory *mem,
+                             void *resource);
+
+VKAPI_ATTR VkResult VKAPI_CALL cpvk_DeviceWaitIdle(VkDevice device);
+
+enum cp_texture_cache_result
+cpvk_texture_cache_resolve(void *private_data, uint64_t image_cookie,
+                           uint64_t sampler_cookie, CUstream stream,
+                           uint64_t stream_serial, CUtexObject *object);
+enum cp_texture_cache_result
+cpvk_texture_cache_resolve_batch(void *private_data,
+                                 const uint64_t *image_cookies,
+                                 const uint64_t *sampler_cookies,
+                                 size_t count, CUstream stream,
+                                 uint64_t stream_serial,
+                                 CUtexObject *objects);
+void cpvk_texture_cache_written(void *private_data, uint64_t image_cookie,
+                                CUstream stream);
+void cpvk_texture_cache_fatal(void *private_data);
+bool cpvk_texture_cache_image_written(struct cpvk_image *image,
+                                      CUstream stream);
+void cpvk_texture_cache_image_destroy(struct cpvk_image *image);
+void cpvk_texture_cache_view_destroy(struct cpvk_image_view *view);
+void cpvk_texture_cache_sampler_destroy(struct cpvk_sampler *sampler);
+void cpvk_texture_cache_report(struct cpvk_device *dev);
+enum cp_texture_cache_purge_result
+cpvk_texture_cache_purge(void *private_data);
+void cpvk_texture_cache_use_begin(void *private_data);
+void cpvk_texture_cache_use_end(void *private_data);
 
 VK_DEFINE_HANDLE_CASTS(cpvk_instance, vk.base, VkInstance,
                        VK_OBJECT_TYPE_INSTANCE)

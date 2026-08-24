@@ -82,6 +82,11 @@ struct ntl_context {
     */
    bool reads_const_bufs;
    bool needs_link;   /* pull in cp_sampler.cu for its device helpers */
+   /* This module emits direct texture-object NVVM operations and must never
+    * acquire a cp_sampler.cu declaration or link dependency. */
+   bool hardware_texture;
+   unsigned hardware_texture_site;
+   unsigned hardware_texture_site_count;
 
    /*
     * Set when the shader writes globally visible memory. Gathered from the
@@ -2118,6 +2123,164 @@ cp_tex_flags(const nir_tex_instr *tex)
    return flags;
 }
 
+/* Load the opaque CUtexObject stored in the combined descriptor row. */
+static LLVMValueRef
+cp_hardware_texture_handle(struct ntl_context *ctx)
+{
+   ctx->reads_const_bufs = true;
+   LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
+   LLVMValueRef table = LLVMBuildBitCast(ctx->builder,
+      cp_arg_slot(ctx, CP_ARG_SLOT_HW_TEX_TABLE), LLVMPointerType(i64, 0),
+      "hwtex_table");
+   LLVMValueRef row = emit_batch_row(ctx);
+   LLVMValueRef index = LLVMBuildAdd(ctx->builder,
+      LLVMBuildMul(ctx->builder, row,
+                   LLVMConstInt(i32, ctx->hardware_texture_site_count, false),
+                   ""),
+      LLVMConstInt(i32, ctx->hardware_texture_site++, false), "");
+   index = LLVMBuildZExt(ctx->builder, index, i64, "");
+   LLVMValueRef object = LLVMBuildLoad2(ctx->builder, i64,
+      LLVMBuildGEP2(ctx->builder, i64, table, &index, 1, ""), "hwtex");
+   LLVMSetMetadata(object, ctx->md_invariant_load,
+                   LLVMMDNodeInContext(ctx->llvm_ctx, NULL, 0));
+   return object;
+}
+
+static LLVMValueRef
+cp_tex_src_value(struct ntl_context *ctx, nir_tex_instr *tex,
+                 nir_tex_src_type kind)
+{
+   for (unsigned i = 0; i < tex->num_srcs; i++)
+      if (tex->src[i].src_type == kind)
+         return get_src(ctx, &tex->src[i].src);
+   return NULL;
+}
+
+static LLVMValueRef
+cp_float_component(struct ntl_context *ctx, LLVMValueRef value, unsigned comp)
+{
+   LLVMTypeRef f32 = LLVMFloatTypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
+   if (LLVMGetTypeKind(LLVMTypeOf(value)) == LLVMVectorTypeKind)
+      value = LLVMBuildExtractElement(ctx->builder, value,
+                                      LLVMConstInt(i32, comp, false), "");
+   if (LLVMGetTypeKind(LLVMTypeOf(value)) == LLVMIntegerTypeKind)
+      value = LLVMBuildBitCast(ctx->builder, value, f32, "");
+   return value;
+}
+
+static LLVMValueRef
+cp_quad_derivative(struct ntl_context *ctx, LLVMValueRef value, bool y)
+{
+   LLVMTypeRef f32 = LLVMFloatTypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
+   LLVMValueRef tid = emit_local_invocation_id(ctx, 0);
+   LLVMValueRef quad_base = LLVMBuildAnd(ctx->builder, tid,
+                                         LLVMConstInt(i32, 28, false), "");
+   LLVMValueRef mask = LLVMBuildShl(ctx->builder,
+      LLVMConstInt(i32, 15, false), quad_base, "quad_mask");
+   LLVMTypeRef params[] = { i32, f32, i32, i32 };
+   LLVMTypeRef fn_type = LLVMFunctionType(f32, params, 4, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(ctx->module,
+                                          "llvm.nvvm.shfl.sync.bfly.f32");
+   if (!fn)
+      fn = LLVMAddFunction(ctx->module, "llvm.nvvm.shfl.sync.bfly.f32",
+                           fn_type);
+   LLVMValueRef args[] = {
+      mask, value, LLVMConstInt(i32, y ? 2 : 1, false),
+      LLVMConstInt(i32, 0x1c1f, false),
+   };
+   LLVMValueRef peer = LLVMBuildCall2(ctx->builder, fn_type, fn, args, 4,
+                                      y ? "qy" : "qx");
+   LLVMValueRef high = LLVMBuildICmp(ctx->builder, LLVMIntNE,
+      LLVMBuildAnd(ctx->builder, tid, LLVMConstInt(i32, y ? 2 : 1, false), ""),
+      LLVMConstInt(i32, 0, false), "");
+   LLVMValueRef low_delta = LLVMBuildFSub(ctx->builder, peer, value, "");
+   LLVMValueRef high_delta = LLVMBuildFSub(ctx->builder, value, peer, "");
+   return LLVMBuildSelect(ctx->builder, high, high_delta, low_delta,
+                          y ? "ddy" : "ddx");
+}
+
+/* Emit one static float4 bindless texture-object instruction. The site number
+ * is the immutable column in the row-major handle table uploaded before this
+ * launch. Implicit LOD is expressed as explicit quad gradients: compute-stage
+ * CUDA texture instructions do not infer graphics fragment derivatives. */
+static void
+emit_hardware_tex(struct ntl_context *ctx, nir_tex_instr *tex,
+                  LLVMValueRef coord)
+{
+   LLVMTypeRef f32 = LLVMFloatTypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
+   LLVMValueRef object = cp_hardware_texture_handle(ctx);
+   LLVMValueRef args[10] = { object };
+   unsigned coord_count = tex->sampler_dim == GLSL_SAMPLER_DIM_2D ? 2 : 3;
+   unsigned nargs = 1;
+   for (unsigned i = 0; i < coord_count; i++)
+      args[nargs++] = cp_float_component(ctx, coord, i);
+
+   const char *dim = tex->sampler_dim == GLSL_SAMPLER_DIM_2D ? "2d" :
+                     (tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? "3d" : "cube");
+   const char *mode = "";
+   if (tex->op == nir_texop_txl) {
+      LLVMValueRef lod = cp_tex_src_value(ctx, tex, nir_tex_src_lod);
+      assert(lod);
+      args[nargs++] = cp_float_component(ctx, lod, 0);
+      mode = ".level";
+   } else {
+      LLVMValueRef dx = cp_tex_src_value(ctx, tex, nir_tex_src_ddx);
+      LLVMValueRef dy = cp_tex_src_value(ctx, tex, nir_tex_src_ddy);
+      LLVMValueRef bias = tex->op == nir_texop_txb
+         ? cp_tex_src_value(ctx, tex, nir_tex_src_bias) : NULL;
+      LLVMValueRef scale = NULL;
+      if (bias) {
+         bias = cp_float_component(ctx, bias, 0);
+         scale = build_nvvm_intrinsic(ctx, "llvm.nvvm.ex2.approx.f",
+                                      &bias, 1);
+      }
+      for (unsigned i = 0; i < coord_count; i++) {
+         LLVMValueRef v = dx ? cp_float_component(ctx, dx, i)
+                             : cp_quad_derivative(ctx, args[1 + i], false);
+         if (scale)
+            v = LLVMBuildFMul(ctx->builder, v, scale, "");
+         args[nargs++] = v;
+      }
+      for (unsigned i = 0; i < coord_count; i++) {
+         LLVMValueRef v = dy ? cp_float_component(ctx, dy, i)
+                             : cp_quad_derivative(ctx, args[1 + i], true);
+         if (scale)
+            v = LLVMBuildFMul(ctx->builder, v, scale, "");
+         args[nargs++] = v;
+      }
+      mode = ".grad";
+   }
+
+   LLVMTypeRef params[10];
+   params[0] = i64;
+   for (unsigned i = 1; i < nargs; i++)
+      params[i] = f32;
+   LLVMTypeRef ret = LLVMStructTypeInContext(ctx->llvm_ctx,
+      (LLVMTypeRef[]){ f32, f32, f32, f32 }, 4, false);
+   LLVMTypeRef fn_type = LLVMFunctionType(ret, params, nargs, false);
+   char name[96];
+   snprintf(name, sizeof(name), "llvm.nvvm.tex.unified.%s%s.v4f32.f32",
+            dim, mode);
+   LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, name);
+   if (!fn)
+      fn = LLVMAddFunction(ctx->module, name, fn_type);
+   LLVMValueRef sample = LLVMBuildCall2(ctx->builder, fn_type, fn, args, nargs,
+                                        "hwtex");
+
+   LLVMValueRef vec = LLVMGetUndef(LLVMVectorType(f32, 4));
+   for (unsigned i = 0; i < 4; i++)
+      vec = LLVMBuildInsertElement(ctx->builder, vec,
+         LLVMBuildExtractValue(ctx->builder, sample, i, ""),
+         LLVMConstInt(i32, i, false), "");
+   set_ssa_def(ctx, &tex->def, vec);
+   ctx->uses_tex = true;
+}
+
 /*
  * Texture sampling.
  *
@@ -2178,6 +2341,14 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
       (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
        tex->op == nir_texop_txb || tex->op == nir_texop_txf ||
        tex->op == nir_texop_txf_ms);
+
+   if (ctx->hardware_texture) {
+      /* Shader admission makes both values mandatory. Never link a software
+       * or null-handle branch into this resource-isolated module. */
+      assert(tex_handle && coord);
+      emit_hardware_tex(ctx, tex, coord);
+      return;
+   }
 
    /*
     * textureSize(). Its result is an integer vector, and shaders divide by it
@@ -2458,6 +2629,194 @@ capture_tex_desc_refs(struct nir_shader *nir, struct cp_shader_binary *bin)
          }
       }
    }
+}
+
+static bool
+capture_hw_tex_ref_kind(nir_tex_instr *tex, nir_tex_src_type handle_kind,
+                     nir_tex_src_type array_offset_kind,
+                     struct cp_hw_tex_ref *ref)
+{
+   nir_src *handle = NULL;
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type == handle_kind) {
+         handle = &tex->src[i].src;
+         break;
+      }
+   }
+   if (!handle) {
+      cp_spec_reject_reason = handle_kind == nir_tex_src_sampler_handle
+         ? "the instruction carries no sampler handle"
+         : "the instruction carries no texture handle";
+      return false;
+   }
+
+   nir_instr *parent = nir_def_instr(handle->ssa);
+   uint32_t base_offset = 0;
+   if (parent->type == nir_instr_type_intrinsic &&
+       nir_instr_as_intrinsic(parent)->intrinsic ==
+          nir_intrinsic_load_const_buf_base_addr_cudapipe) {
+      nir_intrinsic_instr *base = nir_instr_as_intrinsic(parent);
+      if (!nir_src_is_const(base->src[0])) {
+         cp_spec_reject_reason = "the constant-buffer slot is not constant";
+         return false;
+      }
+      ref->ubo_slot = nir_src_as_uint(base->src[0]);
+   } else {
+      if (parent->type != nir_instr_type_alu ||
+          nir_instr_as_alu(parent)->op != nir_op_iadd) {
+         cp_spec_reject_reason = "the handle is not base + constant offset";
+         return false;
+      }
+      nir_alu_instr *add = nir_instr_as_alu(parent);
+      nir_src *base_src = NULL, *offset_src = NULL;
+      for (unsigned i = 0; i < 2; i++) {
+         nir_src *src = &add->src[i].src;
+         nir_instr *src_parent = nir_def_instr(src->ssa);
+         if (nir_src_is_const(*src))
+            offset_src = src;
+         else if (src_parent->type == nir_instr_type_intrinsic &&
+                  nir_instr_as_intrinsic(src_parent)->intrinsic ==
+                     nir_intrinsic_load_const_buf_base_addr_cudapipe)
+            base_src = src;
+      }
+      if (!base_src || !offset_src) {
+         cp_spec_reject_reason =
+            "neither operand is a constant-buffer base with a constant offset";
+         return false;
+      }
+      nir_intrinsic_instr *base =
+         nir_instr_as_intrinsic(nir_def_instr(base_src->ssa));
+      if (!nir_src_is_const(base->src[0])) {
+         cp_spec_reject_reason = "the constant-buffer slot is not constant";
+         return false;
+      }
+      ref->ubo_slot = nir_src_as_uint(base->src[0]);
+      base_offset = nir_src_as_uint(*offset_src);
+   }
+
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type != array_offset_kind)
+         continue;
+      if (!nir_src_is_const(tex->src[i].src)) {
+         cp_spec_reject_reason = "the descriptor array offset is dynamic";
+         return false;
+      }
+      uint64_t extra = (uint64_t)nir_src_as_uint(tex->src[i].src) *
+                       CPVK_DESCRIPTOR_SIZE;
+      if (extra > UINT32_MAX - base_offset) {
+         cp_spec_reject_reason = "the descriptor array offset overflows";
+         return false;
+      }
+      base_offset += (uint32_t)extra;
+   }
+   ref->offset = base_offset;
+   return true;
+}
+
+static bool
+capture_hw_tex_site(nir_tex_instr *tex, struct cp_hw_tex_site *ref)
+{
+   if (!capture_hw_tex_ref_kind(tex, nir_tex_src_texture_handle,
+                            nir_tex_src_texture_offset, &ref->image) ||
+       !capture_hw_tex_ref_kind(tex, nir_tex_src_sampler_handle,
+                            nir_tex_src_sampler_offset, &ref->sampler))
+      return false;
+   ref->flags = cp_tex_flags(tex);
+   ref->op = (uint8_t)tex->op;
+   ref->dim = (uint8_t)tex->sampler_dim;
+   ref->coord_components = tex->coord_components;
+   return true;
+}
+
+static void
+capture_hw_tex_sites(struct nir_shader *nir, struct cp_shader_binary *bin)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            int32_t flags = cp_tex_flags(tex);
+            bool sampled = flags >= 0 &&
+               (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
+                tex->op == nir_texop_txb || tex->op == nir_texop_txd);
+            if (!sampled)
+               continue;
+            struct cp_hw_tex_site site = { .flags = flags };
+            cp_spec_reject_reason = NULL;
+            if (!capture_hw_tex_site(tex, &site) ||
+                bin->num_hw_tex_sites >= CP_MAX_HW_TEX_SITES) {
+               bin->hw_tex_dynamic = true;
+               continue;
+            }
+            bin->hw_tex_sites[bin->num_hw_tex_sites++] = site;
+         }
+      }
+   }
+}
+
+/* All-or-nothing static float4 CUDA texture-object execution gate. */
+static bool
+cp_hardware_texture_shader_eligible(struct nir_shader *nir)
+{
+   unsigned sampled = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            bool dim_ok = tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
+                          tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ||
+                          tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
+            if (!dim_ok || tex->is_array || tex->is_shadow || tex->is_sparse ||
+                tex->def.bit_size != 32 || tex->def.num_components != 4 ||
+                nir_alu_type_get_base_type(tex->dest_type) != nir_type_float ||
+                (tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
+                 tex->op != nir_texop_txb && tex->op != nir_texop_txd))
+               return false;
+
+            unsigned ncoord = 0, nlod = 0, nbias = 0, nddx = 0, nddy = 0;
+            for (unsigned i = 0; i < tex->num_srcs; i++) {
+               nir_tex_src_type src = tex->src[i].src_type;
+               ncoord += src == nir_tex_src_coord;
+               nlod += src == nir_tex_src_lod;
+               nbias += src == nir_tex_src_bias;
+               nddx += src == nir_tex_src_ddx;
+               nddy += src == nir_tex_src_ddy;
+               bool allowed = src == nir_tex_src_coord ||
+                  src == nir_tex_src_texture_handle ||
+                  src == nir_tex_src_sampler_handle ||
+                  src == nir_tex_src_texture_offset ||
+                  src == nir_tex_src_sampler_offset ||
+                  (src == nir_tex_src_lod && tex->op == nir_texop_txl) ||
+                  (src == nir_tex_src_bias && tex->op == nir_texop_txb) ||
+                  ((src == nir_tex_src_ddx || src == nir_tex_src_ddy) &&
+                   tex->op == nir_texop_txd);
+               if (!allowed)
+                  return false;
+            }
+            unsigned expected_coord = tex->sampler_dim == GLSL_SAMPLER_DIM_2D
+               ? 2 : 3;
+            if (tex->coord_components != expected_coord || ncoord != 1 ||
+                (tex->op == nir_texop_tex && (nlod || nbias || nddx || nddy)) ||
+                (tex->op == nir_texop_txl &&
+                 (nlod != 1 || nbias || nddx || nddy)) ||
+                (tex->op == nir_texop_txb &&
+                 (nbias != 1 || nlod || nddx || nddy)) ||
+                (tex->op == nir_texop_txd &&
+                 (nddx != 1 || nddy != 1 || nlod || nbias)))
+               return false;
+
+            struct cp_hw_tex_site ref = {0};
+            if (!capture_hw_tex_site(tex, &ref) || sampled >= CP_MAX_HW_TEX_SITES)
+               return false;
+            sampled++;
+         }
+      }
+   }
+   return sampled > 0;
 }
 
 static void
@@ -3081,18 +3440,34 @@ load_shader_module(CUmodule *module, const char *shader_ptx,
                    const char *sampler_ptx, const char *fs_helper_ptx,
                    int max_regs)
 {
-   CUjit_option jit_opts[1];
-   void *jit_vals[1];
+   CUjit_option jit_opts[5];
+   void *jit_vals[5];
+   char error_log[16384] = {0};
+   char info_log[16384] = {0};
    unsigned num_jit = 0;
    if (max_regs > 0) {
       jit_opts[num_jit] = CU_JIT_MAX_REGISTERS;
       jit_vals[num_jit] = (void *)(uintptr_t)max_regs;
       num_jit++;
    }
+   jit_opts[num_jit] = CU_JIT_ERROR_LOG_BUFFER;
+   jit_vals[num_jit++] = error_log;
+   jit_opts[num_jit] = CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES;
+   jit_vals[num_jit++] = (void *)(uintptr_t)sizeof(error_log);
+   jit_opts[num_jit] = CU_JIT_INFO_LOG_BUFFER;
+   jit_vals[num_jit++] = info_log;
+   jit_opts[num_jit] = CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES;
+   jit_vals[num_jit++] = (void *)(uintptr_t)sizeof(info_log);
 
-   if (!sampler_ptx && !fs_helper_ptx)
-      return cuModuleLoadDataEx(module, shader_ptx, num_jit, jit_opts,
-                                jit_vals);
+   if (!sampler_ptx && !fs_helper_ptx) {
+      CUresult err = cuModuleLoadDataEx(module, shader_ptx, num_jit, jit_opts,
+                                       jit_vals);
+      if (err != CUDA_SUCCESS)
+         fprintf(stderr, "cudapipe: CUDA JIT error log:\n%s\ninfo:\n%s\n",
+                 error_log[0] ? error_log : "(empty)",
+                 info_log[0] ? info_log : "(empty)");
+      return err;
+   }
 
    CUlinkState link;
    CUresult err = cuLinkCreate(num_jit, jit_opts, jit_vals, &link);
@@ -3117,6 +3492,10 @@ load_shader_module(CUmodule *module, const char *shader_ptx,
       err = cuLinkComplete(link, &cubin, &cubin_size);
    if (err == CUDA_SUCCESS)
       err = cuModuleLoadData(module, cubin);
+   if (err != CUDA_SUCCESS)
+      fprintf(stderr, "cudapipe: CUDA link/JIT error log:\n%s\ninfo:\n%s\n",
+              error_log[0] ? error_log : "(empty)",
+              info_log[0] ? info_log : "(empty)");
 
    cuLinkDestroy(link);
    return err;
@@ -3555,10 +3934,32 @@ cp_nir_writes_memory(struct nir_shader *nir)
    return false;
 }
 
+static unsigned
+cp_count_substring(const char *text, const char *needle)
+{
+   unsigned count = 0;
+   size_t length = strlen(needle);
+   while ((text = strstr(text, needle))) {
+      count++;
+      text += length;
+   }
+   return count;
+}
+
+static struct cp_shader_binary *
+cp_hardware_failure_stub(enum cp_hw_compile_failure reason)
+{
+   struct cp_shader_binary *bin = CALLOC_STRUCT(cp_shader_binary);
+   if (bin)
+      bin->hw_compile_failure = reason;
+   return bin;
+}
+
 static struct cp_shader_binary *
 cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
                    const char *sampler_ptx, const char *fs_helper_ptx,
-                   bool fused_interp, bool inline_interp)
+                   bool fused_interp, bool inline_interp,
+                   bool hardware_texture)
 {
    struct ntl_context ctx = {0};
    ctx.nir = nir;
@@ -3566,8 +3967,11 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    ctx.sm_minor = sm_minor;
    ctx.fused_interp = fused_interp;
    ctx.inline_interp = inline_interp;
+   ctx.hardware_texture = hardware_texture;
 
    cp_lower_nir(nir);
+   if (hardware_texture && !cp_hardware_texture_shader_eligible(nir))
+      return cp_hardware_failure_stub(CP_HW_COMPILE_INELIGIBLE);
 
    ctx.inline_pntc_input = -1;
    ctx.inline_pos_input = -1;
@@ -3622,7 +4026,9 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
             fprintf(stderr, "cudapipe: inline FS declined: input footprint "
                     "exceeds the %u-slot local interpolation array\n",
                     CP_MAX_FS_INPUTS);
-         return NULL;
+         return hardware_texture
+            ? cp_hardware_failure_stub(CP_HW_COMPILE_INLINE_FOOTPRINT)
+            : NULL;
       }
    }
 
@@ -3631,6 +4037,10 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    ctx.writes_memory = cp_nir_writes_memory(nir);
    struct cp_shader_binary tex_meta = {0};
    capture_tex_desc_refs(nir, &tex_meta);
+   if (hardware_texture) {
+      capture_hw_tex_sites(nir, &tex_meta);
+      ctx.hardware_texture_site_count = tex_meta.num_hw_tex_sites;
+   }
 
    /*
     * nir_convert_from_ssa() turns every remaining phi into a NIR register, and
@@ -3785,14 +4195,51 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
     * survived SROA. Either condition would turn the intended register dataflow
     * back into a memory round trip, so discard this mode and let the isolated
     * fused/classic binaries handle the shader. */
-   if (inline_interp &&
-       (strstr(ptx, "cp_fs_inline_lane") || strstr(ptx, ".local") ||
-        strstr(ptx, "ld.local") || strstr(ptx, "st.local"))) {
+   bool bad_hardware_ptx = false;
+   if (hardware_texture) {
+      unsigned grad_count = cp_count_substring(ptx, "tex.grad.");
+      unsigned level_count = cp_count_substring(ptx, "tex.level.");
+      unsigned tex_count = grad_count + level_count;
+      unsigned expected_level = 0;
+      for (unsigned i = 0; i < tex_meta.num_hw_tex_sites; i++)
+         expected_level += tex_meta.hw_tex_sites[i].op == nir_texop_txl;
+      unsigned dim_count = 0;
+      const char *dims[] = { "tex.grad.2d", "tex.level.2d",
+                             "tex.grad.3d", "tex.level.3d",
+                             "tex.grad.cube", "tex.level.cube" };
+      for (unsigned i = 0; i < ARRAY_SIZE(dims); i++)
+         dim_count += cp_count_substring(ptx, dims[i]);
+      bad_hardware_ptx = strstr(ptx, "cp_tex_sample") ||
+                         strstr(ptx, "cp_sampler_table") ||
+                         tex_count != tex_meta.num_hw_tex_sites ||
+                         level_count != expected_level ||
+                         grad_count != tex_meta.num_hw_tex_sites - expected_level ||
+                         dim_count != tex_meta.num_hw_tex_sites;
+   }
+   bool surviving_inline_helper = strstr(ptx, "cp_fs_inline_lane");
+   bool local_memory = strstr(ptx, ".local") || strstr(ptx, "ld.local") ||
+                       strstr(ptx, "st.local");
+   if (bad_hardware_ptx ||
+       (inline_interp && (surviving_inline_helper || local_memory))) {
       if (cp_debug->shader_stats || cp_debug->dump_ir || cp_debug->dump_ptx)
          fprintf(stderr, "cudapipe: rejected unsafe inline FS PTX "
-                 "(surviving helper or local-memory traffic)\n");
+                 "(helper=%u local=%u texture=%u)\n",
+                 surviving_inline_helper, local_memory, bad_hardware_ptx);
       free(ptx);
-      return NULL;
+      if (!hardware_texture)
+         return NULL;
+      enum cp_hw_compile_failure reason = surviving_inline_helper
+         ? CP_HW_COMPILE_SURVIVING_HELPER
+         : (bad_hardware_ptx ? CP_HW_COMPILE_BAD_TEXTURE_PTX
+                             : CP_HW_COMPILE_LOCAL_MEMORY);
+      struct cp_shader_binary *stub = cp_hardware_failure_stub(reason);
+      if (stub) {
+         stub->num_hw_tex_sites = tex_meta.num_hw_tex_sites;
+         memcpy(stub->hw_tex_sites, tex_meta.hw_tex_sites,
+                sizeof(stub->hw_tex_sites));
+         stub->hw_tex_dynamic = tex_meta.hw_tex_dynamic;
+      }
+      return stub;
    }
 
    if (cp_debug->dump_ptx)
@@ -3805,8 +4252,11 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
       free(ptx);
       return NULL;
    }
-   enum cp_shader_exec_mode mode = inline_interp ? CP_SHADER_EXEC_INLINE :
-      (fused_interp ? CP_SHADER_EXEC_FUSED : CP_SHADER_EXEC_CLASSIC);
+   enum cp_shader_exec_mode mode = hardware_texture
+      ? (inline_interp ? CP_SHADER_EXEC_HW_INLINE : CP_SHADER_EXEC_HW_FUSED)
+      : (inline_interp ? CP_SHADER_EXEC_INLINE
+                       : (fused_interp ? CP_SHADER_EXEC_FUSED
+                                       : CP_SHADER_EXEC_CLASSIC));
    struct cp_shader_exec *exec = &bin->exec[mode];
    exec->ptx_text = ptx;
    exec->ptx_size = ptx_size;
@@ -3822,6 +4272,9 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    bin->num_tex_descs = tex_meta.num_tex_descs;
    memcpy(bin->tex_descs, tex_meta.tex_descs, sizeof(bin->tex_descs));
    bin->tex_descs_dynamic = tex_meta.tex_descs_dynamic;
+   bin->num_hw_tex_sites = tex_meta.num_hw_tex_sites;
+   memcpy(bin->hw_tex_sites, tex_meta.hw_tex_sites, sizeof(bin->hw_tex_sites));
+   bin->hw_tex_dynamic = tex_meta.hw_tex_dynamic;
 
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -3859,11 +4312,14 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
 
    /* Shaders that sample textures, or that call one of the module's device
     * helpers, need it linked in; the rest load their PTX directly. */
-   bool needs_sampler = (ctx.uses_tex || ctx.needs_link) && sampler_ptx;
+   bool needs_sampler =
+      ((!hardware_texture && ctx.uses_tex) || ctx.needs_link) && sampler_ptx;
    const char *stage_name = mesa_shader_stage_name(nir->info.stage);
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
-      stage_name = inline_interp ? "fragment inline" :
-         (fused_interp ? "fragment fused" : "fragment classic");
+      stage_name = hardware_texture
+         ? (inline_interp ? "fragment hardware inline" : "fragment hardware fused")
+         : (inline_interp ? "fragment inline" :
+          (fused_interp ? "fragment fused" : "fragment classic"));
    CUresult err = load_shader_module_tuned(exec, ptx,
                                            needs_sampler ? sampler_ptx : NULL,
                                            fs_helper_ptx,
@@ -3871,6 +4327,8 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
                                            stage_name);
 
    if (err != CUDA_SUCCESS) {
+      if (hardware_texture)
+         bin->hw_compile_failure = CP_HW_COMPILE_JIT;
       const char *err_str = NULL;
       cuGetErrorString(err, &err_str);
       fprintf(stderr, "cudapipe: loading shader module failed (%d: %s)\n",
@@ -3881,17 +4339,18 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    return bin;
 }
 
-struct cp_shader_binary *
-cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
-                      const char *sampler_ptx, const char *fs_helper_ptx,
-                      bool no_inline_fs, bool inline_fs, bool force_fused_fs)
+static struct cp_shader_binary *
+cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
+                        const char *sampler_ptx, const char *fs_helper_ptx,
+                        bool no_inline_fs, bool inline_fs,
+                        bool force_fused_fs)
 {
    if (!nir)
       return NULL;
    if (nir->info.stage != MESA_SHADER_FRAGMENT || !fs_helper_ptx ||
        no_inline_fs)
       return cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx, NULL,
-                                false, false);
+                                false, false, false);
    if (force_fused_fs || !inline_fs) {
       /* cp_compile_nir_one lowers its NIR in place. Preserve a pristine clone
        * before the fused attempt so a failed/default JIT never runs classic
@@ -3900,7 +4359,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
          ? NULL : nir_shader_clone(NULL, nir);
       struct cp_shader_binary *fused =
          cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
-                            fs_helper_ptx, true, false);
+                            fs_helper_ptx, true, false, false);
       if (fused && fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
          ralloc_free(classic_nir);
          return fused;
@@ -3910,7 +4369,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
        * correctness if its fused JIT is unavailable. */
       struct cp_shader_binary *classic = classic_nir
          ? cp_compile_nir_one(classic_nir, sm_major, sm_minor, sampler_ptx,
-                              NULL, false, false)
+                              NULL, false, false, false)
          : NULL;
       ralloc_free(classic_nir);
       return classic;
@@ -3929,18 +4388,18 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
 #endif
    struct cp_shader_binary *fused =
       cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
-                         fs_helper_ptx, true, false);
+                         fs_helper_ptx, true, false, false);
    if (fused && !fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
       cp_shader_binary_destroy(fused);
       fused = NULL;
    }
    struct cp_shader_binary *classic = !fused && standalone_nir
       ? cp_compile_nir_one(standalone_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, false)
+                           NULL, false, false, false)
       : NULL;
    struct cp_shader_binary *inlined = inline_nir
       ? cp_compile_nir_one(inline_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, true)
+                           NULL, false, true, false)
       : NULL;
    ralloc_free(standalone_nir);
    ralloc_free(inline_nir);
@@ -3956,6 +4415,91 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
              sizeof(inlined->exec[CP_SHADER_EXEC_INLINE]));
       cp_shader_binary_destroy(inlined);
    }
+   return bin;
+}
+
+
+struct cp_shader_binary *
+cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
+                      const char *sampler_ptx, const char *math_ptx,
+                      const char *fs_helper_ptx,
+                      bool no_inline_fs, bool inline_fs, bool force_fused_fs,
+                      bool hw_texture)
+{
+   if (!nir)
+      return NULL;
+
+   /* Clone before any software attempt lowers in place. Hardware ownership is
+    * independent of generic inline mode and always starts from pristine FS
+    * NIR. A build without matching inline bitcode quietly skips this clone. */
+   nir_shader *hardware_nir = NULL;
+   nir_shader *hardware_fused_nir = NULL;
+#ifdef CP_HAVE_FS_INLINE_BC
+   if (hw_texture && nir->info.stage == MESA_SHADER_FRAGMENT) {
+      hardware_nir = nir_shader_clone(NULL, nir);
+      hardware_fused_nir = nir_shader_clone(NULL, nir);
+   }
+#else
+   (void)hw_texture;
+#endif
+
+   struct cp_shader_binary *bin = cp_compile_nir_software(
+      nir, sm_major, sm_minor, sampler_ptx, fs_helper_ptx,
+      no_inline_fs, inline_fs, force_fused_fs);
+
+#ifdef CP_HAVE_FS_INLINE_BC
+   struct cp_shader_binary *hardware = hardware_nir
+      ? cp_compile_nir_one(hardware_nir, sm_major, sm_minor, math_ptx, NULL,
+                           false, true, true)
+      : NULL;
+   struct cp_shader_binary *hardware_fused =
+      hardware_fused_nir &&
+      (!hardware || !hardware->exec[CP_SHADER_EXEC_HW_INLINE].kernel)
+      ? cp_compile_nir_one(hardware_fused_nir, sm_major, sm_minor,
+                           math_ptx, fs_helper_ptx, true, false, true)
+      : NULL;
+   if (bin && hardware) {
+      bin->hw_compile_failure = hardware->hw_compile_failure;
+      bin->num_hw_tex_sites = hardware->num_hw_tex_sites;
+      memcpy(bin->hw_tex_sites, hardware->hw_tex_sites,
+             sizeof(bin->hw_tex_sites));
+      bin->hw_tex_dynamic = hardware->hw_tex_dynamic;
+      if (hardware->exec[CP_SHADER_EXEC_HW_INLINE].kernel) {
+         bin->exec[CP_SHADER_EXEC_HW_INLINE] =
+            hardware->exec[CP_SHADER_EXEC_HW_INLINE];
+         memset(&hardware->exec[CP_SHADER_EXEC_HW_INLINE], 0,
+                sizeof(hardware->exec[CP_SHADER_EXEC_HW_INLINE]));
+      }
+   }
+   if (bin && hardware_fused) {
+      bool metadata_match = !bin->num_hw_tex_sites ||
+         (bin->num_hw_tex_sites == hardware_fused->num_hw_tex_sites &&
+          bin->hw_tex_dynamic == hardware_fused->hw_tex_dynamic &&
+          !memcmp(bin->hw_tex_sites, hardware_fused->hw_tex_sites,
+                  sizeof(bin->hw_tex_sites)));
+      if (!bin->num_hw_tex_sites) {
+         bin->num_hw_tex_sites = hardware_fused->num_hw_tex_sites;
+         memcpy(bin->hw_tex_sites, hardware_fused->hw_tex_sites,
+                sizeof(bin->hw_tex_sites));
+         bin->hw_tex_dynamic = hardware_fused->hw_tex_dynamic;
+      }
+      if (hardware_fused->exec[CP_SHADER_EXEC_HW_FUSED].kernel &&
+          metadata_match) {
+         bin->hw_compile_failure = CP_HW_COMPILE_NONE;
+         bin->exec[CP_SHADER_EXEC_HW_FUSED] =
+            hardware_fused->exec[CP_SHADER_EXEC_HW_FUSED];
+         memset(&hardware_fused->exec[CP_SHADER_EXEC_HW_FUSED], 0,
+                sizeof(hardware_fused->exec[CP_SHADER_EXEC_HW_FUSED]));
+      } else {
+         bin->hw_compile_failure = metadata_match
+            ? hardware_fused->hw_compile_failure : CP_HW_COMPILE_OTHER;
+      }
+   }
+   cp_shader_binary_destroy(hardware);
+   cp_shader_binary_destroy(hardware_fused);
+#endif
+   ralloc_free(hardware_nir);
+   ralloc_free(hardware_fused_nir);
    return bin;
 }
 

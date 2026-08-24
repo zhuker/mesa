@@ -1000,31 +1000,50 @@ does not reach it. No array code was written; source/build restored. Report
 `/tmp/perf16/iter23-report.md`; census patch `/tmp/perf16/iter23-census.patch`;
 raw/tables/trace remain under `/tmp/perf16/iter23-*`.
 
-## Iteration 24 — epoch-coherent derived hardware texture cache
+## Iteration 24 — result: kept opt-in hardware texture-cache checkpoint
 
-Ownership is unnecessarily strict for hardware sampling. Keep the current linear
-image as authoritative Vulkan storage and complete software fallback. Lazily build
-a device-derived CUDA mipmapped-array/texture representation for a view when sampled;
-key it by image content epoch and immutable view/format facts. Every buffer/image
-copy, blit, resolve, clear, attachment/store and storage write invalidates the epoch.
-Host-visible coherent or untracked alias images decline; flushed host writes and
-known interval aliases invalidate conservatively. A stale derived cache is never read.
-Allocation/conversion failure simply uses authoritative linear software sampling.
-This is not canonical ownership and needs no dedicated VkMemory or attachment surface
-backend.
+The production path keeps tightly packed linear Vulkan images authoritative and
+lazily materializes disposable CUDA mipmapped arrays and immutable texture objects.
+It keys derived data by image content epoch, resolves every descriptor row before a
+launch, pins cache lifetime through table upload and FS enqueue, and permits software
+fallback only before any FS attempt. Strict same-LLVM HW_INLINE is preferred;
+resource-isolated HW_FUSED recovers helpers/local-memory shaders without weakening
+texture PTX validation. Hardware modes never use software sampler variants or sampler
+globals.
 
-Measure before implementation. Extend the census to simulate lazy cache materialization
-at each exact all-row FS launch, including the recovered 11–16 static references.
-Report cacheable FS time by native RGBA8/R8/RG/RG16F/RGBA16F, BC decode, packed
-A2B10 and injective R11→F16x4 tiers; 2D/cube/3D; exact sampler/site family. Record
-unique cache images/views/objects, retained bytes, rebuilds and conversion bytes per
-submit, reuse distance between invalidations, and allocation/churn ceilings. Mixed
-cache/linear launches retain a complete generic fallback; fast hardware modules admit
-only all-cacheable rows.
+The final format/target matrix covers the observed R8/RG8/RGBA8, RG16, float16,
+A2, R11 and BC1/BC3 2D/cube/3D intersections. Exact gates cover mutation epochs,
+mutable and immutable descriptors, view lifetime, mip ranges, implicit LOD, explicit
+LOD/gradients, runtime `txb` bias, converted R11 cube and BC selectors. The last
+acceptance blocker was a generic `llvm.exp2.f32` emitted for `txb`; NVPTX selected
+an unresolved `exp2f`. It now uses `llvm.nvvm.ex2.approx.f`. A nonconstant SSA bias
+1.0/1.25 selects mip 3 exactly on native HW_FUSED and NVIDIA validation.
 
-Existing format-only upper bounds are 4.841 ms for RGBA8/R8/BC+A2B10+R11 and
-6.718 ms after RG8/RG16F/RGBA16F, but they are exposed FS work, not savings. Admit
-only if the epoch-aware all-row intersection retains >=4 ms exposed work, estimated
-hardware reduction minus rebuild cost >=2 ms, and memory stays bounded. No persistent
-shadow is authoritative: cache contents are discardable and regenerated from linear
-storage.
+Lifetime and fault handling are fail-closed. Descriptor view cookies are monotonic
+IDs; framebuffer mutation tokens remain trusted internal image pointers. Stream
+wait memoization uses monotonic stream serial plus ready generation, never a raw
+`CUstream`. OOM at optional arrays/objects can refuse a whole launch; CUDA context,
+async, enqueue, event, surface, cleanup and purge failures latch device loss. The
+application-SSBO atomic no-replay matrix proves 1024 executions after a post-enqueue fatal
+and zero executions for pre-FS argument/create faults. Serialized final suites pass
+58/58 both default-off and cache-on; focused cache/fault gates pass 14/14.
+
+Final external correctness passes old 10/10 and Crossroads 9/9 readback sentinels.
+Against immutable llvmpipe, old mean RGB is 0.02057..0.47833 with maxima 1815 pixels
+above 32 and 45 above 96; Crossroads is 0.80632..1.38985 with maxima 6250 and 65.
+All 18 stored-60 sample processes exit zero; all automated NVIDIA rows pass except
+the standing `gltfscenerendering` nondeterminism exception, while manual
+`renderheadless` differs by zero pixels above 8 (maximum channel delta 1). All 17
+600-frame offscreen-loop benchmark rows exit zero.
+
+The final old-capture AB/BA medians are 17.2334 and 17.2224 ms cache-on versus
+23.0296 and 23.1026 ms cache-off. Average medians are 17.2279 versus 23.0661 ms:
+a 5.8382-ms hardware mechanism gain. Coverage is 157095/157211 old launches (99.9%)
+and 37680/39822 Crossroads launches (94.6%). The change is kept as the correctness-
+clean opt-in checkpoint, but it does **not** meet the absolute 16 ms goal: 1.228 ms
+remains. The next performance work is iteration25 episode-global tagged raster, whose
+design is recorded separately; it was not implemented here.
+
+Reports and evidence: `/tmp/perf16/iter24-production-review.md`,
+`/tmp/perf16/iter24-report.md`, and
+`/tmp/perf16/iter24-acceptance/final-frozen/`.

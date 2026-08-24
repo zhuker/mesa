@@ -260,6 +260,9 @@ static const unsigned char col1_rgba[4] = { 224,  40, 192, 255 };
 static const unsigned char expect_nearest[4] = {  32, 200,  64, 255 };
 /* LINEAR: 3/4 of column 0 plus 1/4 of column 1, exactly. */
 static const unsigned char expect_linear[4]  = {  80, 160,  96, 255 };
+/* After the mid-command mutation the columns are reversed. */
+static const unsigned char expect_nearest_mutated[4] = { 224,  40, 192, 255 };
+static const unsigned char expect_linear_mutated[4]  = { 176,  80, 160, 255 };
 
 /* Nothing in the frame should ever be this; a missing draw shows up as it. */
 static const unsigned char clear_rgba[4] = { 26, 26, 38, 255 };
@@ -541,46 +544,57 @@ main(int argc, char **argv)
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
       .extent = { TEX_W, TEX_H, 1 }, .mipLevels = 1, .arrayLayers = 1,
-      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
-      .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
-      .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED };
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
    VkImage timg;
    CHECK(vkCreateImage(dev, &timgi, NULL, &timg));
    VkMemoryRequirements treq;
    vkGetImageMemoryRequirements(dev, timg, &treq);
    uint32_t ttype = pick_memory(pdev, treq.memoryTypeBits,
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-   if (ttype == UINT32_MAX)
-      ttype = pick_memory(pdev, treq.memoryTypeBits,
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-   if (ttype == UINT32_MAX) { fprintf(stderr, "no texture memory type\n"); return 1; }
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+   if (ttype == UINT32_MAX) { fprintf(stderr, "no device-local texture memory\n"); return 1; }
    VkMemoryAllocateInfo tmai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                  .allocationSize = treq.size,
                                  .memoryTypeIndex = ttype };
    VkDeviceMemory tmem;
    CHECK(vkAllocateMemory(dev, &tmai, NULL, &tmem));
    CHECK(vkBindImageMemory(dev, timg, tmem, 0));
-   {
-      /* The row pitch is the driver's, not two texels: a linear image may pad
-       * its rows, and assuming it does not puts rows where no sampler looks. */
-      VkImageSubresource sub = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
-      VkSubresourceLayout lay;
-      vkGetImageSubresourceLayout(dev, timg, &sub, &lay);
 
-      void *p;
-      CHECK(vkMapMemory(dev, tmem, 0, VK_WHOLE_SIZE, 0, &p));
-      unsigned char *t = (unsigned char *)p + lay.offset;
-      for (int y = 0; y < TEX_H; y++)
-         for (int x = 0; x < TEX_W; x++)
-            memcpy(t + (size_t)y * lay.rowPitch + (size_t)x * 4,
-                   x ? col1_rgba : col0_rgba, 4);
-      VkMappedMemoryRange flush = {
-         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-         .memory = tmem, .size = VK_WHOLE_SIZE };
-      CHECK(vkFlushMappedMemoryRanges(dev, 1, &flush));
-      vkUnmapMemory(dev, tmem);
-   }
+   /* A separate host staging allocation is load-bearing for the hardware
+    * texture-cache test: sampled LINEAR/host images intentionally fall back. */
+   VkBuffer tstage;
+   VkDeviceMemory tstage_mem;
+   VkBufferCreateInfo tsbi = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = 2 * TEX_W * TEX_H * 4,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
+   CHECK(vkCreateBuffer(dev, &tsbi, NULL, &tstage));
+   VkMemoryRequirements tsreq;
+   vkGetBufferMemoryRequirements(dev, tstage, &tsreq);
+   uint32_t tstype = pick_memory(pdev, tsreq.memoryTypeBits,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+   if (tstype == UINT32_MAX) { fprintf(stderr, "no staging memory type\n"); return 1; }
+   VkMemoryAllocateInfo tsmai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = tsreq.size, .memoryTypeIndex = tstype };
+   CHECK(vkAllocateMemory(dev, &tsmai, NULL, &tstage_mem));
+   CHECK(vkBindBufferMemory(dev, tstage, tstage_mem, 0));
+   void *tsp;
+   CHECK(vkMapMemory(dev, tstage_mem, 0, VK_WHOLE_SIZE, 0, &tsp));
+   for (int y = 0; y < TEX_H; y++)
+      for (int x = 0; x < TEX_W; x++) {
+         size_t pixel_offset = (size_t)(y * TEX_W + x) * 4;
+         memcpy((char *)tsp + pixel_offset,
+                x ? col1_rgba : col0_rgba, 4);
+         memcpy((char *)tsp + TEX_W * TEX_H * 4 + pixel_offset,
+                x ? col0_rgba : col1_rgba, 4);
+      }
+   VkMappedMemoryRange tsflush = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = tstage_mem, .size = VK_WHOLE_SIZE };
+   CHECK(vkFlushMappedMemoryRanges(dev, 1, &tsflush));
+   vkUnmapMemory(dev, tstage_mem);
    VkImageViewCreateInfo tvci = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
       .image = timg, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = timgi.format,
@@ -746,18 +760,34 @@ main(int argc, char **argv)
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
    CHECK(vkBeginCommandBuffer(cmd, &bi));
 
-   /* The host wrote the texels; hand the image to the fragment stage. */
+   VkImageMemoryBarrier tex_to_transfer = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = timg,
+      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                        0, NULL, 0, NULL, 1, &tex_to_transfer);
+   VkBufferImageCopy tex_upload = {
+      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      .imageExtent = { TEX_W, TEX_H, 1 } };
+   vkCmdCopyBufferToImage(cmd, tstage, timg,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tex_upload);
    VkImageMemoryBarrier tex_to_read = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-      .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
       .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-      .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+      .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
       .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .image = timg,
       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
                         0, NULL, 0, NULL, 1, &tex_to_read);
 
@@ -832,6 +862,28 @@ main(int argc, char **argv)
          .imageExtent = { W, H, 1 } };
       vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                              readback, 1, &copy);
+
+      /* Re-upload authoritative bytes with the two columns reversed. The
+       * remaining expected pixels change, so a stale cache generation fails
+       * visibly; cache stats must also show a second epoch rebuild. */
+      if (pass == 1) {
+         VkImageMemoryBarrier read_to_upload = tex_to_read;
+         read_to_upload.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+         read_to_upload.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+         read_to_upload.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+         read_to_upload.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                              0, NULL, 0, NULL, 1, &read_to_upload);
+         VkBufferImageCopy mutation_upload = tex_upload;
+         mutation_upload.bufferOffset = TEX_W * TEX_H * 4;
+         vkCmdCopyBufferToImage(cmd, tstage, timg,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                1, &mutation_upload);
+         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                              0, NULL, 0, NULL, 1, &tex_to_read);
+      }
    }
 
    VkBufferMemoryBarrier to_host = {
@@ -874,9 +926,13 @@ main(int argc, char **argv)
 
    for (int p = 0; p < NPASS; p++) {
       const unsigned char *frame = mapped + (size_t)p * frame_bytes;
+      const unsigned char *nearest = p < 2 ? expect_nearest
+                                             : expect_nearest_mutated;
+      const unsigned char *linear = p < 2 ? expect_linear
+                                            : expect_linear_mutated;
       const unsigned char *want[NBIND] = {
-         passes[p].binding[0] ? expect_linear : expect_nearest,
-         passes[p].binding[1] ? expect_linear : expect_nearest,
+         passes[p].binding[0] ? linear : nearest,
+         passes[p].binding[1] ? linear : nearest,
       };
       struct scan s[NBIND];
       scan_half(frame, 0, SPLIT_X, want[0], &s[0]);
@@ -923,7 +979,8 @@ main(int argc, char **argv)
           * hand back a texel of the image untouched, LINEAR must hand back
           * something that is neither texel, because it is a blend of both.
           */
-         if (passes[p].binding[b] == 0 && !same(px[b], col0_rgba)) {
+         const unsigned char *nearest_texel = p < 2 ? col0_rgba : col1_rgba;
+         if (passes[p].binding[b] == 0 && !same(px[b], nearest_texel)) {
             printf("FAIL pass %d binding %d is VK_FILTER_NEAREST but did not "
                    "return a texel of the image: it must be column 0 exactly\n",
                    p, b);
@@ -938,7 +995,7 @@ main(int argc, char **argv)
          }
       }
 
-      if (passes[p].binding[0] != passes[p].binding[1]) {
+      if (p < 2 && passes[p].binding[0] != passes[p].binding[1]) {
          const int nb = passes[p].binding[0] ? 1 : 0;   /* the nearest half */
          const int lb = 1 - nb;                          /* the linear half */
          const unsigned char *np = px[nb], *lp = px[lb];
@@ -1030,6 +1087,8 @@ main(int argc, char **argv)
    vkDestroySampler(dev, samplers[1], NULL);
    vkDestroySampler(dev, samplers[0], NULL);
    vkDestroyImageView(dev, tview, NULL);
+   vkDestroyBuffer(dev, tstage, NULL);
+   vkFreeMemory(dev, tstage_mem, NULL);
    vkDestroyImage(dev, timg, NULL);
    vkFreeMemory(dev, tmem, NULL);
    vkDestroyBuffer(dev, readback, NULL);

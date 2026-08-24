@@ -304,6 +304,28 @@ cpvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
 
    image->texel = info ? info->texel : 0;
    image->color = info ? info->color : -1;
+   image->dev = dev;
+   image->vk_format = pCreateInfo->format;
+   image->writer_event = NULL;
+   image->writer_event_valid = false;
+   image->cache_alias = false;
+   image->texture_cache = NULL;
+   image->texture_cache_next = NULL;
+   image->texture_cache_prev = NULL;
+   image->views = NULL;
+   atomic_init(&image->content_epoch, 1);
+   const VkExternalMemoryImageCreateInfo *external =
+      vk_find_struct_const(pCreateInfo->pNext,
+                           EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+   image->cache_create_eligible =
+      !(pCreateInfo->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                              VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                              VK_IMAGE_CREATE_SPARSE_ALIASED_BIT |
+                              VK_IMAGE_CREATE_ALIAS_BIT |
+                              VK_IMAGE_CREATE_PROTECTED_BIT)) &&
+      (!external || !external->handleTypes) &&
+      !(pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+      pCreateInfo->samples == VK_SAMPLE_COUNT_1_BIT;
    cpvk_image_layout(image);
 
    *pImage = cpvk_image_to_handle(image);
@@ -317,8 +339,14 @@ cpvk_DestroyImage(VkDevice _device, VkImage _image,
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_image, image, _image);
 
-   if (image)
+   if (image) {
+      cpvk_memory_note_unbind(dev, image->mem, image);
+      if (cp_debug->texture_cache) {
+         cpvk_DeviceWaitIdle(_device);
+         cpvk_texture_cache_image_destroy(image);
+      }
       vk_image_destroy(&dev->vk, pAllocator, &image->vk);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -349,6 +377,11 @@ cpvk_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount,
 
       image->mem = mem;
       image->offset = pBindInfos[i].memoryOffset;
+      if (image->offset > mem->vk.size ||
+          image->size > mem->vk.size - image->offset)
+         image->cache_alias = true;
+      cpvk_memory_note_bind(dev, mem, image->offset, image->size,
+                            image, image);
       simple_mtx_lock(&dev->view_lock);
       for (struct cpvk_image_view *view = image->views; view;
            view = view->image_next)
@@ -440,7 +473,13 @@ cpvk_CreateImageView(VkDevice _device,
    if (!view)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   view->dev = dev;
    view->image = cpvk_image_from_handle(pCreateInfo->image);
+   view->cache_swizzle_identity =
+      pCreateInfo->components.r == VK_COMPONENT_SWIZZLE_IDENTITY &&
+      pCreateInfo->components.g == VK_COMPONENT_SWIZZLE_IDENTITY &&
+      pCreateInfo->components.b == VK_COMPONENT_SWIZZLE_IDENTITY &&
+      pCreateInfo->components.a == VK_COMPONENT_SWIZZLE_IDENTITY;
    cuCtxSetCurrent(dev->cu_ctx);
    if (cuMemAllocManaged(&view->tex_info, sizeof(struct cp_texture_info),
                          CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
@@ -455,6 +494,32 @@ cpvk_CreateImageView(VkDevice _device,
       view->image_next = view->image->views;
       view->image->views = view;
       simple_mtx_unlock(&dev->view_lock);
+   }
+
+   view->cache_cookie = 0;
+   if (cp_debug->texture_cache) {
+      simple_mtx_lock(&dev->texture_cache_lock);
+      if (dev->texture_cache_view_count == dev->texture_cache_view_cap) {
+         size_t old_cap = dev->texture_cache_view_cap;
+         size_t new_cap = old_cap ? old_cap * 2 : 256;
+         if (new_cap > old_cap &&
+             new_cap <= SIZE_MAX / sizeof(*dev->texture_cache_views)) {
+            void *grown = realloc(dev->texture_cache_views,
+                                  new_cap * sizeof(*dev->texture_cache_views));
+            if (grown) {
+               dev->texture_cache_views = grown;
+               memset(dev->texture_cache_views + old_cap, 0,
+                      (new_cap - old_cap) * sizeof(*dev->texture_cache_views));
+               dev->texture_cache_view_cap = new_cap;
+            }
+         }
+      }
+      if (dev->texture_cache_view_count < dev->texture_cache_view_cap) {
+         size_t slot = dev->texture_cache_view_count++;
+         dev->texture_cache_views[slot] = view;
+         view->cache_cookie = slot + 1;
+      }
+      simple_mtx_unlock(&dev->texture_cache_lock);
    }
 
    if (cp_debug->debug_tex) {
@@ -479,6 +544,10 @@ cpvk_DestroyImageView(VkDevice _device, VkImageView _view,
    VK_FROM_HANDLE(cpvk_image_view, view, _view);
 
    if (view) {
+      if (cp_debug->texture_cache) {
+         cpvk_DeviceWaitIdle(_device);
+         cpvk_texture_cache_view_destroy(view);
+      }
       if (view->image) {
          simple_mtx_lock(&dev->view_lock);
          struct cpvk_image_view **link = &view->image->views;
@@ -564,7 +633,16 @@ cpvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
       .lod_bias = pCreateInfo->mipLodBias,
       .max_anisotropy = pCreateInfo->anisotropyEnable ?
                         pCreateInfo->maxAnisotropy : 0.0f,
+      .compare_enable = pCreateInfo->compareEnable,
+#ifdef VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT
+      .non_seamless_cube =
+         !!(pCreateInfo->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT),
+#endif
    };
+   const VkSamplerReductionModeCreateInfo *reduction =
+      vk_find_struct_const(pCreateInfo->pNext, SAMPLER_REDUCTION_MODE_CREATE_INFO);
+   info.reduction_mode = reduction ? reduction->reductionMode
+                                   : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
    if (pCreateInfo->borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE ||
        pCreateInfo->borderColor == VK_BORDER_COLOR_INT_OPAQUE_WHITE) {
       for (int i = 0; i < 4; i++)

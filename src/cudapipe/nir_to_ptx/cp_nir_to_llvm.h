@@ -10,13 +10,32 @@ struct cp_sampler_info;
 
 #define CP_MAX_IO_SLOTS 32
 #define CP_MAX_TEX_DESCS 8
+#define CP_MAX_HW_TEX_SITES 64
 #define CP_MAX_SAMPLER_VARIANTS 4
 
+/* Existing deduplicated software sampler-specialisation reference. */
 struct cp_tex_desc_ref {
    uint16_t ubo_slot;
    uint16_t reserved;
    uint32_t sampler_offset;
    int32_t flags;
+};
+
+struct cp_hw_tex_ref {
+   uint16_t ubo_slot;
+   uint16_t reserved;
+   uint32_t offset;
+};
+
+/* One static sampled NIR instruction, in immutable hardware table order. */
+struct cp_hw_tex_site {
+   struct cp_hw_tex_ref image;
+   struct cp_hw_tex_ref sampler;
+   int32_t flags;
+   uint8_t op;
+   uint8_t dim;
+   uint8_t coord_components;
+   uint8_t reserved;
 };
 
 /* Launches timed per phase of a shader's register-cap trial, and how many are
@@ -47,7 +66,11 @@ enum cp_shader_exec_mode {
    CP_SHADER_EXEC_CLASSIC = 0,
    CP_SHADER_EXEC_FUSED = 1,
    CP_SHADER_EXEC_INLINE = 2,
-   CP_SHADER_EXEC_COUNT = 3,
+   /* Resource-isolated same-LLVM interpolation plus direct NVVM texture ops. */
+   CP_SHADER_EXEC_HW_INLINE = 3,
+   /* Resource-isolated texture ops with the proven fused interpolation helper. */
+   CP_SHADER_EXEC_HW_FUSED = 4,
+   CP_SHADER_EXEC_COUNT = 5,
 };
 
 /*
@@ -102,6 +125,18 @@ struct cp_sampler_variant {
 
 void cp_shader_exec_swap_build(struct cp_shader_exec *exec);
 
+enum cp_hw_compile_failure {
+   CP_HW_COMPILE_NONE = 0,
+   CP_HW_COMPILE_INELIGIBLE,
+   CP_HW_COMPILE_INLINE_FOOTPRINT,
+   CP_HW_COMPILE_SURVIVING_HELPER,
+   CP_HW_COMPILE_LOCAL_MEMORY,
+   CP_HW_COMPILE_BAD_TEXTURE_PTX,
+   CP_HW_COMPILE_JIT,
+   CP_HW_COMPILE_OTHER,
+   CP_HW_COMPILE_FAILURE_COUNT,
+};
+
 struct cp_shader_binary {
    struct cp_shader_exec exec[CP_SHADER_EXEC_COUNT];
    int sm_major;
@@ -113,6 +148,7 @@ struct cp_shader_binary {
    bool classic_fallback_reported;
    bool fused_fallback_reported;
    bool inline_fallback_reported;
+   bool hw_inline_fallback_reported;
 
    bool uses_tex_3d;
 
@@ -150,6 +186,13 @@ struct cp_shader_binary {
    bool spec_counted;
    bool spec_rejected_reported;
 
+   /* Independent all-or-nothing hardware texture metadata. */
+   unsigned num_hw_tex_sites;
+   struct cp_hw_tex_site hw_tex_sites[CP_MAX_HW_TEX_SITES];
+   bool hw_tex_dynamic;
+   uint8_t hw_compile_failure;
+   bool hw_failure_counted;
+
    struct cp_sampler_variant sampler_variants[CP_MAX_SAMPLER_VARIANTS];
    unsigned num_sampler_variants;
 
@@ -176,7 +219,9 @@ cp_shader_has_any_exec(const struct cp_shader_binary *bin)
 {
    return bin && (bin->exec[CP_SHADER_EXEC_CLASSIC].kernel ||
                   bin->exec[CP_SHADER_EXEC_FUSED].kernel ||
-                  bin->exec[CP_SHADER_EXEC_INLINE].kernel);
+                  bin->exec[CP_SHADER_EXEC_INLINE].kernel ||
+                  bin->exec[CP_SHADER_EXEC_HW_INLINE].kernel ||
+                  bin->exec[CP_SHADER_EXEC_HW_FUSED].kernel);
 }
 
 /* Inline execution needs interpolation scratch. Classic and fused can both
@@ -192,8 +237,10 @@ cp_shader_has_standalone_exec(const struct cp_shader_binary *bin)
  * the shader samples textures. May be NULL for shaders that cannot. */
 struct cp_shader_binary *
 cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
-                      const char *sampler_ptx, const char *fs_helper_ptx,
-                      bool no_inline_fs, bool inline_fs, bool force_fused_fs);
+                      const char *sampler_ptx, const char *math_ptx,
+                      const char *fs_helper_ptx,
+                      bool no_inline_fs, bool inline_fs, bool force_fused_fs,
+                      bool hw_texture);
 
 void
 cp_shader_binary_destroy(struct cp_shader_binary *bin);

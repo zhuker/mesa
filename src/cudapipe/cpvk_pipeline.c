@@ -875,7 +875,8 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       cuCtxSetCurrent(dev->cu_ctx);
       pipeline->bin = cp_compile_nir_to_ptx(
          nir, dev->pdev->sm_major, dev->pdev->sm_minor,
-         uses_tex ? sampler_ptx : NULL, NULL, false, false, false);
+         uses_tex ? sampler_ptx : NULL, NULL, NULL,
+         false, false, false, false);
       if (pipeline->bin)
          pipeline->bin->uses_tex_3d = uses_tex_3d;
       ralloc_free(mem_ctx);
@@ -1165,10 +1166,11 @@ cpvk_compile_stage(struct cpvk_device *dev,
    bool frag = stage->stage == VK_SHADER_STAGE_FRAGMENT_BIT;
    struct cp_shader_binary *bin =
       cp_compile_nir_to_ptx(nir, dev->pdev->sm_major, dev->pdev->sm_minor,
-                            sampler_ptx,
+                            sampler_ptx, dev->cp_dev.kernels.math_ptx,
                             frag ? dev->cp_dev.kernels.fs_helper_ptx : NULL,
                              cp_debug->no_inline_fs, cp_debug->inline_fs,
-                             cp_debug->force_fused_fs);
+                             cp_debug->force_fused_fs,
+                             cp_debug->texture_cache);
    if (bin)
       bin->uses_tex_3d = uses_tex_3d;
    ralloc_free(mem_ctx);

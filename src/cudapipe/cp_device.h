@@ -9,8 +9,22 @@
 #define CP_DEVICE_H
 
 #include <cuda.h>
+#include <stdint.h>
+#include <stdatomic.h>
 
 #include "cp_kernels.h"
+
+enum cp_texture_cache_purge_result {
+   CP_TEXTURE_CACHE_PURGE_NONE,
+   CP_TEXTURE_CACHE_PURGE_RECLAIMED,
+   CP_TEXTURE_CACHE_PURGE_FATAL,
+};
+
+enum cp_texture_cache_result {
+   CP_TEXTURE_CACHE_READY,
+   CP_TEXTURE_CACHE_SOFT_FALLBACK,
+   CP_TEXTURE_CACHE_FATAL,
+};
 
 struct cp_device {
    CUdevice cuda_device;
@@ -19,6 +33,33 @@ struct cp_device {
    int sm_minor;
 
    struct cp_kernels kernels;
+
+   /* Optional native-front-end bridge. Gallium leaves these null. The
+    * renderer passes only immutable descriptor cookies and its exact ordered
+    * stream; CUDA-array ownership stays in the native Vulkan driver. */
+   void *texture_cache_private;
+   atomic_uint_fast64_t next_texture_stream_serial;
+   enum cp_texture_cache_result
+      (*texture_cache_resolve)(void *private_data,
+                               uint64_t view_cookie,
+                               uint64_t sampler_cookie,
+                               CUstream stream, uint64_t stream_serial,
+                               CUtexObject *object);
+   enum cp_texture_cache_result
+      (*texture_cache_resolve_batch)(void *private_data,
+                                     const uint64_t *view_cookies,
+                                     const uint64_t *sampler_cookies,
+                                     size_t count, CUstream stream,
+                                     uint64_t stream_serial,
+                                     CUtexObject *objects);
+   void (*texture_cache_written)(void *private_data, uint64_t image_cookie,
+                                 CUstream stream);
+   void (*texture_cache_fatal)(void *private_data);
+   enum cp_texture_cache_purge_result
+      (*texture_cache_purge)(void *private_data);
+   void (*texture_cache_use_begin)(void *private_data);
+   void (*texture_cache_use_end)(void *private_data);
+
 };
 
 #endif /* CP_DEVICE_H */

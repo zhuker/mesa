@@ -27,6 +27,9 @@ static const char cp_fs_src[] =
 static const char cp_sampler_src[] =
 #include "cp_sampler.cu.inc"
 ;
+static const char cp_math_src[] =
+#include "cp_math.cu.inc"
+;
 
 static const char cp_vertex_fetch_src[] =
 #include "cp_vertex_fetch.cu.inc"
@@ -317,6 +320,8 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
                        "cp_depth_attachment_load");
    cuModuleGetFunction(&k->depth_attachment_store, k->clear_module,
                        "cp_depth_attachment_store");
+   cuModuleGetFunction(&k->cache_convert, k->clear_module,
+                       "cp_cache_convert");
 
    if (!build_module(&k->module, cp_rasterize_src, "cp_rasterize.cu", sm_major, sm_minor))
       goto fail;
@@ -410,10 +415,16 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
     * shader that samples textures, not launched on its own. */
    k->sampler_ptx = compile_sampler_source("cp_sampler.cu", sm_major,
                                            sm_minor, false);
+   if (cp_debug->texture_cache)
+      k->math_ptx = compile_cuda_source(cp_math_src, "cp_math.cu", sm_major,
+                                        sm_minor, true);
    if (!k->sampler_ptx) {
       fprintf(stderr, "cudapipe: failed to compile texture sampler\n");
       goto fail;
    }
+   if (cp_debug->texture_cache && !k->math_ptx)
+      fprintf(stderr, "cudapipe: exact math helper unavailable; sin/cos "
+              "hardware texture modules will fall back\n");
    k->fs_helper_ptx = compile_cuda_source(cp_fs_src, "cp_fs_helper.cu",
                                           sm_major, sm_minor,
                                           true);
@@ -442,6 +453,7 @@ cp_kernels_destroy(struct cp_kernels *k)
    if (k->vfetch_module)
       cuModuleUnload(k->vfetch_module);
    free(k->sampler_ptx);
+   free(k->math_ptx);
    free(k->sampler_3d_ptx);
    free(k->fs_helper_ptx);
    memset(k, 0, sizeof(*k));

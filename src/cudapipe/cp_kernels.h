@@ -17,6 +17,7 @@ struct cp_kernels {
    CUfunction clear_depth_kernel;
    CUfunction depth_attachment_load;
    CUfunction depth_attachment_store;
+   CUfunction cache_convert;
 
    /* Rasterization kernels (3-stage adaptive) */
    CUfunction rasterize_triangles; /* alias for stage1, used by legacy code */
@@ -81,6 +82,7 @@ struct cp_kernels {
    /* Relocatable PTX for the texture sampler, linked into each shader that
     * samples textures. Owned here; see cp_compile_nir_to_ptx(). */
    char *sampler_ptx;
+   char *math_ptx;
    char *sampler_3d_ptx;
    char *fs_helper_ptx;
 

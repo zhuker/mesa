@@ -194,11 +194,11 @@
   },
   {
    "id": 24,
-   "name": "epoch-coherent derived hardware texture cache census",
-   "verdict": "pending",
-   "old_median_ms": null,
-   "sweep_hot_ms": null,
-   "note": "retain authoritative linear images and complete software fallback; lazily materialize CUDA array/expanded texture cache keyed by image content epoch, invalidated on every device/host/alias write. Measure broad static refs, rebuild bytes/churn/memory and FS time before code."
+   "name": "epoch-coherent derived hardware texture cache",
+   "verdict": "kept opt-in",
+   "old_median_ms": 17.2279,
+   "sweep_hot_ms": 19.51,
+   "note": "authoritative linear images plus epoch-keyed disposable CUDA arrays; strict HW-inline + resource-isolated HW-fused. Final old 157095/157211 HW launches, AB/BA 17.2279 vs 23.0661ms (gain5.8382). Correctness: serial58/58 both modes, focused14/14, old10/Cross9 sentinels and stored60 external gates pass (standing gltf exception; renderheadless manual exact within tol). Benchmark600 17 loop rows exit0, sum19.51ms; 16ms goal remains 1.228ms high. Kept opt-in checkpoint; iteration25 owns global raster."
   }
  ]
 }

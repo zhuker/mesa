@@ -36,6 +36,21 @@
  * no Gallium object at all, which is the point: a Vulkan front end calls
  * this with a cp_device and gets a renderer it can draw with.
  */
+static uint64_t
+cp_texture_stream_serial_alloc(struct cp_device *dev)
+{
+   uint_fast64_t old = atomic_load_explicit(
+      &dev->next_texture_stream_serial, memory_order_relaxed);
+   while (old != UINT_FAST64_MAX) {
+      if (atomic_compare_exchange_weak_explicit(
+             &dev->next_texture_stream_serial, &old, old + 1,
+             memory_order_relaxed, memory_order_relaxed))
+         return old + 1;
+   }
+   /* Zero permanently selects safe batch-local wait memoization. */
+   return 0;
+}
+
 bool
 cp_context_init(struct cp_context *cp, struct cp_device *dev)
 {
@@ -50,6 +65,8 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
     * and exactly the behaviour this replaces. */
    if (cuStreamCreate(&cp->stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS)
       goto fail;
+   cp->main_stream = cp->stream;
+   cp->main_stream_serial = cp_texture_stream_serial_alloc(dev);
 
    /* The flush's generation ring; see cp_flush. A failed event creation
     * falls back to the draining flush by leaving flush_retire[0] null. */
@@ -131,6 +148,65 @@ fail:
  * by a one-off allocation and the arena grows to cover it next time rather
  * than moving memory that this draw is already pointing at.
  */
+static void cp_texture_cache_unpin(struct cp_context *cp);
+
+static void
+cp_renderer_texture_fatal(struct cp_context *cp)
+{
+   cp->hardware_texture.fatal = true;
+   cp->device_fatal = true;
+   if (cp->dev->texture_cache_fatal)
+      cp->dev->texture_cache_fatal(cp->dev->texture_cache_private);
+}
+
+static CUresult
+cp_mem_alloc_retry(struct cp_context *cp, CUdeviceptr *ptr, size_t bytes)
+{
+   CUresult err;
+   if (cp->hardware_texture.authoritative_oom_armed) {
+      cp->hardware_texture.authoritative_oom_armed = false;
+      cp->hardware_texture.authoritative_oom_retries++;
+      err = CUDA_ERROR_OUT_OF_MEMORY;
+   } else {
+      err = cuMemAlloc(ptr, bytes);
+   }
+   if (err == CUDA_ERROR_OUT_OF_MEMORY &&
+       !cp->hardware_texture.table_pinned && cp->dev->texture_cache_purge) {
+      enum cp_texture_cache_purge_result purge =
+         cp->dev->texture_cache_purge(cp->dev->texture_cache_private);
+      if (purge == CP_TEXTURE_CACHE_PURGE_FATAL) {
+         cp_renderer_texture_fatal(cp);
+         return CUDA_ERROR_UNKNOWN;
+      }
+      if (purge == CP_TEXTURE_CACHE_PURGE_RECLAIMED)
+         err = cuMemAlloc(ptr, bytes);
+   }
+   if (err != CUDA_SUCCESS && err != CUDA_ERROR_OUT_OF_MEMORY)
+      cp_renderer_texture_fatal(cp);
+   return err;
+}
+
+static CUresult
+cp_mem_alloc_managed_retry(struct cp_context *cp, CUdeviceptr *ptr,
+                           size_t bytes)
+{
+   CUresult err = cuMemAllocManaged(ptr, bytes, CU_MEM_ATTACH_GLOBAL);
+   if (err == CUDA_ERROR_OUT_OF_MEMORY &&
+       !cp->hardware_texture.table_pinned && cp->dev->texture_cache_purge) {
+      enum cp_texture_cache_purge_result purge =
+         cp->dev->texture_cache_purge(cp->dev->texture_cache_private);
+      if (purge == CP_TEXTURE_CACHE_PURGE_FATAL) {
+         cp_renderer_texture_fatal(cp);
+         return CUDA_ERROR_UNKNOWN;
+      }
+      if (purge == CP_TEXTURE_CACHE_PURGE_RECLAIMED)
+         err = cuMemAllocManaged(ptr, bytes, CU_MEM_ATTACH_GLOBAL);
+   }
+   if (err != CUDA_SUCCESS && err != CUDA_ERROR_OUT_OF_MEMORY)
+      cp_renderer_texture_fatal(cp);
+   return err;
+}
+
 void *
 cp_scratch_alloc(struct cp_context *cp, size_t bytes)
 {
@@ -175,7 +251,7 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
    }
    want = MIN2(want, (size_t)CP_SCRATCH_MAX_BYTES);
    CUdeviceptr new_base;
-   CUresult err = cuMemAllocManaged(&new_base, want, CU_MEM_ATTACH_GLOBAL);
+   CUresult err = cp_mem_alloc_managed_retry(cp, &new_base, want);
    if (err != CUDA_SUCCESS) {
       /* Callers treat NULL as "skip this stage", which renders nothing and
        * looks like a shader bug, so say what actually happened. */
@@ -229,7 +305,7 @@ cp_scratch_alloc_device(struct cp_context *cp, size_t bytes)
    want = MIN2(want, (size_t)CP_SCRATCH_MAX_BYTES);
 
    CUdeviceptr new_base;
-   CUresult err = cuMemAlloc(&new_base, want);
+   CUresult err = cp_mem_alloc_retry(cp, &new_base, want);
    if (err != CUDA_SUCCESS) {
       fprintf(stderr, "cudapipe: device scratch grow to %zu bytes failed (%d)\n",
               want, err);
@@ -273,51 +349,64 @@ cp_scratch_alloc_device(struct cp_context *cp, size_t bytes)
  * cannot express that.
  */
 CUdeviceptr
-cp_upload_begin(struct cp_context *cp, size_t size, void **host_out)
+cp_upload_begin_checked(struct cp_context *cp, size_t size, void **host_out,
+                        CUresult *error)
 {
+   *error = CUDA_SUCCESS;
    if (!cp->arena_base || !cp->upload_host || !size)
       return 0;
+   if (cp->arena_offset > SIZE_MAX - 255 ||
+       cp->upload_offset > SIZE_MAX - 255)
+      return 0;
 
-   /* 256 bytes keeps every block on its own cache line and matches the
-    * alignment the constant-buffer path already promises. */
+   /* 256 bytes keeps every block on its own cache line. */
    size_t dev_off = ALIGN_POT(cp->arena_offset, 256);
    size_t host_off = ALIGN_POT(cp->upload_offset, 256);
-
-   /* The ring is partitioned into generations; this epoch owns one slice of
-    * it and the flush rewinds to the next. flush_gens is 1 when the flush
-    * still drains, which makes the slice the whole ring, as before. */
+   if (!cp->flush_gens || cp->scratch.current >= cp->flush_gens)
+      return 0;
    size_t dev_slice = cp->arena_size / cp->flush_gens;
    size_t host_slice = cp->upload_size / cp->flush_gens;
    unsigned gen = cp->scratch.current;
+   size_t dev_start = gen * dev_slice;
+   size_t host_start = gen * host_slice;
+   size_t dev_limit = dev_start + dev_slice;
+   size_t host_limit = host_start + host_slice;
 
-   if (dev_off + size > (gen + 1) * dev_slice ||
-       host_off + size > (gen + 1) * host_slice) {
-      /*
-       * Out of room before a flush came round. Rewinding would let this draw
-       * overwrite staging a previous draw's copy has not read yet, so fall
-       * back to a full drain, after which the whole slice is reusable.
-       */
-      cuCtxSynchronize();
-      cp->arena_offset = gen * dev_slice;
-      cp->upload_offset = gen * host_slice;
-      dev_off = cp->arena_offset;
-      host_off = cp->upload_offset;
+   bool dev_full = dev_off > dev_limit || size > dev_limit - dev_off;
+   bool host_full = host_off > host_limit || size > host_limit - host_off;
+   if (dev_full || host_full) {
+      /* Reuse requires a successful whole-context drain. */
+      *error = cuCtxSynchronize();
+      if (*error != CUDA_SUCCESS)
+         return 0;
+      cp->arena_offset = dev_start;
+      cp->upload_offset = host_start;
+      dev_off = dev_start;
+      host_off = host_start;
       if (size > dev_slice || size > host_slice)
          return 0;
    }
 
+   /* The bounds above make both additions overflow-safe. */
    cp->arena_offset = dev_off + size;
    cp->upload_offset = host_off + size;
    *host_out = (char *)cp->upload_host + host_off;
    return cp->arena_base + dev_off;
 }
 
+CUdeviceptr
+cp_upload_begin(struct cp_context *cp, size_t size, void **host_out)
+{
+   CUresult ignored;
+   return cp_upload_begin_checked(cp, size, host_out, &ignored);
+}
+
 /* Send a block reserved above, once the caller has finished writing it. */
-void
+CUresult
 cp_upload_end(struct cp_context *cp, CUdeviceptr dst, const void *host,
               size_t size)
 {
-   cuMemcpyHtoDAsync(dst, host, size, cp->stream);
+   return cuMemcpyHtoDAsync(dst, host, size, cp->stream);
 }
 
 CUdeviceptr
@@ -350,7 +439,10 @@ cp_scratch_begin(struct cp_context *cp)
        cp->scratch.used > CP_SCRATCH_RECLAIM_BYTES ||
        cp->dscratch.num_overflow >= 5 ||
        cp->dscratch.used > CP_SCRATCH_RECLAIM_BYTES) {
-      cuCtxSynchronize();
+      if (cuCtxSynchronize() != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return;
+      }
       cp_scratch_reset(cp);
    }
 }
@@ -380,14 +472,19 @@ cp_abuf_min_tris(void)
  * arenas that were replaced during growth) and resets the bump pointer.
  * The current arena is kept at its grown size. */
 /* One timed synchronize: the wall time the calling thread spent blocked. */
-static void
+static bool
 cp_sync_timed(struct cp_context *cp, CUstream stream,
               uint64_t *ns, uint64_t *n)
 {
    int64_t t0 = os_time_get_nano();
-   cuStreamSynchronize(stream);
+   CUresult err = cuStreamSynchronize(stream);
    *ns += (uint64_t)(os_time_get_nano() - t0);
    (*n)++;
+   if (err != CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return false;
+   }
+   return true;
 }
 
 void
@@ -496,6 +593,74 @@ cp_plan_report(struct cp_context *cp)
 }
 
 static void
+cp_hardware_texture_report(struct cp_context *cp)
+{
+   if (!cp_debug->texture_cache_stats || !cp->hardware_texture.launches)
+      return;
+   fprintf(stderr, "cudapipe: hardware texture: %" PRIu64 "/%" PRIu64
+           " fragment launches hit (%.1f%%), fallbacks shader=%" PRIu64
+           " descriptor=%" PRIu64 ", direct=%" PRIu64 "/%" PRIu64
+           ", abuffer=%" PRIu64 "/%" PRIu64
+           ", modes inline=%" PRIu64 " fused=%" PRIu64
+           ", register classes",
+           cp->hardware_texture.hits, cp->hardware_texture.launches,
+           100.0 * (double)cp->hardware_texture.hits /
+              (double)cp->hardware_texture.launches,
+           cp->hardware_texture.fallback_shader,
+           cp->hardware_texture.fallback_descriptor,
+           cp->hardware_texture.path_hits[0],
+           cp->hardware_texture.path_launches[0],
+           cp->hardware_texture.path_hits[1],
+           cp->hardware_texture.path_launches[1],
+           cp->hardware_texture.mode_hits[0],
+           cp->hardware_texture.mode_hits[1]);
+   for (unsigned r = 0; r < ARRAY_SIZE(cp->hardware_texture.hit_regs); r++)
+      if (cp->hardware_texture.hit_regs[r])
+         fprintf(stderr, " %u:%" PRIu64, r, cp->hardware_texture.hit_regs[r]);
+   fputc('\n', stderr);
+   for (unsigned m = 0; m < 2; m++) {
+      if (!cp->hardware_texture.mode_hits[m])
+         continue;
+      fprintf(stderr, "cudapipe: hardware texture %s resources: "
+              "avg-spill=%.1f avg-blocks/sm=%.2f regs",
+              m ? "fused" : "inline",
+              (double)cp->hardware_texture.mode_spill_sum[m] /
+                 cp->hardware_texture.mode_hits[m],
+              (double)cp->hardware_texture.mode_blocks_sum[m] /
+                 cp->hardware_texture.mode_hits[m]);
+      for (unsigned rg = 0; rg < 257; rg++)
+         if (cp->hardware_texture.mode_hit_regs[m][rg])
+            fprintf(stderr, " %u:%" PRIu64, rg,
+                    cp->hardware_texture.mode_hit_regs[m][rg]);
+      fputc('\n', stderr);
+   }
+   static const char *reasons[] = {
+      "none/other", "ineligible", "inline-footprint", "surviving-helper",
+      "local-memory", "bad-texture-ptx", "jit", "other"
+   };
+   fprintf(stderr, "cudapipe: hardware texture shader fallback reasons:");
+   for (unsigned i = 0; i < ARRAY_SIZE(reasons); i++)
+      if (cp->hardware_texture.fallback_shader_reason[i])
+         fprintf(stderr, " %s=%" PRIu64 "/%" PRIu64 "-binaries",
+                 reasons[i], cp->hardware_texture.fallback_shader_reason[i],
+                 cp->hardware_texture.fallback_shader_binaries[i]);
+   fputc('\n', stderr);
+   if (cp->hardware_texture.preflight_calls)
+      fprintf(stderr, "cudapipe: hardware texture preflight: calls=%" PRIu64
+              " cells=%" PRIu64 " host_ns=%" PRIu64
+              " avg_us=%.3f ns_per_cell=%.1f authoritative_oom_retries=%" PRIu64
+              "\n",
+              cp->hardware_texture.preflight_calls,
+              cp->hardware_texture.preflight_cells,
+              cp->hardware_texture.preflight_ns,
+              (double)cp->hardware_texture.preflight_ns /
+                 cp->hardware_texture.preflight_calls / 1000.0,
+              (double)cp->hardware_texture.preflight_ns /
+                 cp->hardware_texture.preflight_cells,
+              cp->hardware_texture.authoritative_oom_retries);
+}
+
+static void
 cp_spec_report(struct cp_context *cp)
 {
    if (!cp_debug->spec_stats || !cp->spec.launches)
@@ -518,7 +683,11 @@ cp_context_cleanup(struct cp_context *cp)
       return;
 
    cuCtxSetCurrent(cp->dev->cuda_ctx);
-   cuCtxSynchronize();
+   if (cuCtxSynchronize() != CUDA_SUCCESS)
+      cp_renderer_texture_fatal(cp);
+   /* Release the exclusive cache-use lifetime even on a poisoned context. */
+   cp_texture_cache_unpin(cp);
+   cp_hardware_texture_report(cp);
    cp_spec_report(cp);
    cp_plan_report(cp);
    cp_abuf_cleanup(cp->abuf);
@@ -575,6 +744,8 @@ cp_context_cleanup(struct cp_context *cp)
       *owned[i] = 0;
    }
 
+   free(cp->hardware_texture.resolve_workspace);
+   cp->hardware_texture.resolve_workspace = NULL;
    free(cp->pass_segs);
    free(cp->pass_group_ubos);
 }
@@ -870,10 +1041,11 @@ cp_abuf_free(CUdeviceptr *p)
 }
 
 static bool
-cp_abuf_alloc(struct cp_abuf *ab, CUdeviceptr *p, size_t bytes,
+cp_abuf_alloc(struct cp_context *cp, struct cp_abuf *ab,
+              CUdeviceptr *p, size_t bytes,
               const char *what)
 {
-   CUresult e = cuMemAlloc(p, bytes);
+   CUresult e = cp_mem_alloc_retry(cp, p, bytes);
    if (e != CUDA_SUCCESS) {
       fprintf(stderr, "abuffer: cuMemAlloc(%s, %zu) failed (%d); disabled\n",
               what, bytes, e);
@@ -911,7 +1083,7 @@ cp_abuf_alloc(struct cp_abuf *ab, CUdeviceptr *p, size_t bytes,
  * rather than disabling the path, since the next render pass is likely smaller.
  */
 bool
-cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
+cp_abuf_setup(struct cp_context *cp, struct cp_abuf *ab, unsigned w, unsigned h)
 {
    if (!cp_abuf_enabled(ab))
       return false;
@@ -950,12 +1122,12 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
        * CP_ABUF_COUNTERS covers all six; the existing derived pointers stay
        * offsets into it exactly as they were.
        */
-      if (!cp_abuf_alloc(ab, &ab->counters,
+      if (!cp_abuf_alloc(cp, ab, &ab->counters,
                          4 * (CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS + 1),
                          "sum3+bsum3+clist_count+seg counts+rec cursor") ||
-          !cp_abuf_alloc(ab, &ab->list_count, 4, "list_count") ||
-          !cp_abuf_alloc(ab, &ab->blk_list_count, 4, "block worklist count") ||
-          !cp_abuf_alloc(ab, &ab->dbg, CP_ABUF_DBG_COUNTERS * 4,
+          !cp_abuf_alloc(cp, ab, &ab->list_count, 4, "list_count") ||
+          !cp_abuf_alloc(cp, ab, &ab->blk_list_count, 4, "block worklist count") ||
+          !cp_abuf_alloc(cp, ab, &ab->dbg, CP_ABUF_DBG_COUNTERS * 4,
                          "debug counters"))
          return false;
 
@@ -995,14 +1167,14 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
       cp_abuf_free(&ab->sum1x);
       cp_abuf_free(&ab->sum2);
       cp_abuf_free(&ab->sum2x);
-      if (!cp_abuf_alloc(ab, &ab->counts, nb, "counts") ||
-          !cp_abuf_alloc(ab, &ab->offsets, nb, "offsets") ||
-          !cp_abuf_alloc(ab, &ab->cursor, nb, "cursor") ||
-          !cp_abuf_alloc(ab, &ab->list, nb, "list") ||
-          !cp_abuf_alloc(ab, &ab->sum1, nb1 * 4, "sum1") ||
-          !cp_abuf_alloc(ab, &ab->sum1x, nb1 * 4, "sum1x") ||
-          !cp_abuf_alloc(ab, &ab->sum2, nb2 * 4, "sum2") ||
-          !cp_abuf_alloc(ab, &ab->sum2x, nb2 * 4, "sum2x"))
+      if (!cp_abuf_alloc(cp, ab, &ab->counts, nb, "counts") ||
+          !cp_abuf_alloc(cp, ab, &ab->offsets, nb, "offsets") ||
+          !cp_abuf_alloc(cp, ab, &ab->cursor, nb, "cursor") ||
+          !cp_abuf_alloc(cp, ab, &ab->list, nb, "list") ||
+          !cp_abuf_alloc(cp, ab, &ab->sum1, nb1 * 4, "sum1") ||
+          !cp_abuf_alloc(cp, ab, &ab->sum1x, nb1 * 4, "sum1x") ||
+          !cp_abuf_alloc(cp, ab, &ab->sum2, nb2 * 4, "sum2") ||
+          !cp_abuf_alloc(cp, ab, &ab->sum2x, nb2 * 4, "sum2x"))
          return false;
 
       free(ab->h_counts);
@@ -1034,13 +1206,13 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
       cp_abuf_free(&ab->bsum1x);
       cp_abuf_free(&ab->bsum2);
       cp_abuf_free(&ab->bsum2x);
-      if (!cp_abuf_alloc(ab, &ab->blk_counts, bb, "block counts") ||
-          !cp_abuf_alloc(ab, &ab->blk_offsets, bb, "block offsets") ||
-          !cp_abuf_alloc(ab, &ab->blk_list, bb, "block worklist") ||
-          !cp_abuf_alloc(ab, &ab->bsum1, bnb1 * 4, "block sum1") ||
-          !cp_abuf_alloc(ab, &ab->bsum1x, bnb1 * 4, "block sum1x") ||
-          !cp_abuf_alloc(ab, &ab->bsum2, bnb2 * 4, "block sum2") ||
-          !cp_abuf_alloc(ab, &ab->bsum2x, bnb2 * 4, "block sum2x"))
+      if (!cp_abuf_alloc(cp, ab, &ab->blk_counts, bb, "block counts") ||
+          !cp_abuf_alloc(cp, ab, &ab->blk_offsets, bb, "block offsets") ||
+          !cp_abuf_alloc(cp, ab, &ab->blk_list, bb, "block worklist") ||
+          !cp_abuf_alloc(cp, ab, &ab->bsum1, bnb1 * 4, "block sum1") ||
+          !cp_abuf_alloc(cp, ab, &ab->bsum1x, bnb1 * 4, "block sum1x") ||
+          !cp_abuf_alloc(cp, ab, &ab->bsum2, bnb2 * 4, "block sum2") ||
+          !cp_abuf_alloc(cp, ab, &ab->bsum2x, bnb2 * 4, "block sum2x"))
          return false;
       free(ab->h_blk_counts);
       free(ab->h_blk_offsets);
@@ -1059,7 +1231,7 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
     * verify with falls back to compositing — and then this has to appear. */
    if (ab->composite) {
       if (!ab->clist &&
-          !cp_abuf_alloc(ab, &ab->clist, ab->cap_pixels * sizeof(uint32_t),
+          !cp_abuf_alloc(cp, ab, &ab->clist, ab->cap_pixels * sizeof(uint32_t),
                          "composite worklist"))
          return false;
       /* clist_count is carved out of ab->counters above, so that the
@@ -1071,12 +1243,12 @@ cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h)
       size_t deepb = CP_ABUF_DEEP_PIXELS * CP_BLEND_LAYERS * sizeof(uint32_t);
       ab->cap_log_pixels = 0;
       cp_abuf_free(&ab->log);
-      if (!cp_abuf_alloc(ab, &ab->log, logb, "peel log"))
+      if (!cp_abuf_alloc(cp, ab, &ab->log, logb, "peel log"))
          return false;
       if (!ab->deep_log &&
-          (!cp_abuf_alloc(ab, &ab->deep_list,
+          (!cp_abuf_alloc(cp, ab, &ab->deep_list,
                           CP_ABUF_DEEP_PIXELS * 4, "deep list") ||
-           !cp_abuf_alloc(ab, &ab->deep_log, deepb, "deep peel log")))
+           !cp_abuf_alloc(cp, ab, &ab->deep_log, deepb, "deep peel log")))
          return false;
       free(ab->h_log);
       ab->h_log = malloc(logb);
@@ -1189,7 +1361,7 @@ cp_abuf_cleanup(struct cp_abuf *ab)
  * caller then decides whether this particular draw still fits.
  */
 bool
-cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
+cp_abuf_size_arrays(struct cp_context *cp, struct cp_abuf *ab, uint32_t total)
 {
    bool grow = ab->frags &&
       (double)total > (double)ab->capacity * CP_ABUF_GROW_AT;
@@ -1238,10 +1410,10 @@ cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
    ab->capacity = ab->quad_capacity = 0;
    ab->colors_ready = false;
 
-   if (!cp_abuf_alloc(ab, &ab->frags, want * sizeof(uint32_t), "fragments"))
+   if (!cp_abuf_alloc(cp, ab, &ab->frags, want * sizeof(uint32_t), "fragments"))
       return false;
    if (!cp_debug->no_abuf_append &&
-       !cp_abuf_alloc(ab, &ab->recs, want * sizeof(uint64_t),
+       !cp_abuf_alloc(cp, ab, &ab->recs, want * sizeof(uint64_t),
                       "fragment records"))
       return false;
    ab->capacity = (unsigned)want;
@@ -1252,18 +1424,18 @@ cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
     * which is what lets these be allocated from a count the host already has,
     * instead of draining the device again to ask how many the merge produced.
     */
-   if (!cp_abuf_alloc(ab, &ab->quad_prim, want * sizeof(uint32_t),
+   if (!cp_abuf_alloc(cp, ab, &ab->quad_prim, want * sizeof(uint32_t),
                       "quad primitives") ||
-       !cp_abuf_alloc(ab, &ab->quad_mask, want, "quad masks") ||
-       !cp_abuf_alloc(ab, &ab->quad_block, want * sizeof(uint32_t),
+       !cp_abuf_alloc(cp, ab, &ab->quad_mask, want, "quad masks") ||
+       !cp_abuf_alloc(cp, ab, &ab->quad_block, want * sizeof(uint32_t),
                       "quad blocks") ||
        /* Only the composite reads this one, and only the comparison against
         * the peel loop reads the other. */
        (ab->composite &&
-        !cp_abuf_alloc(ab, &ab->shade_slot, want * sizeof(uint32_t),
+        !cp_abuf_alloc(cp, ab, &ab->shade_slot, want * sizeof(uint32_t),
                        "shading slots")) ||
        (ab->verify &&
-        !cp_abuf_alloc(ab, &ab->peel_mask, want * sizeof(uint32_t),
+        !cp_abuf_alloc(cp, ab, &ab->peel_mask, want * sizeof(uint32_t),
                        "peel masks")))
       return false;
    ab->quad_capacity = (unsigned)want;
@@ -1317,10 +1489,10 @@ cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total)
                  CP_ABUF_MAX_COLOR_BYTES / (1024.0 * 1024.0));
          return true;
       }
-      if (!cp_abuf_alloc(ab, &ab->colors_abuf, cb, "colours (abuf)") ||
-          !cp_abuf_alloc(ab, &ab->writes_abuf, wb, "writes (abuf)") ||
-          !cp_abuf_alloc(ab, &ab->colors_peel, cb, "colours (peel)") ||
-          !cp_abuf_alloc(ab, &ab->writes_peel, wb, "writes (peel)"))
+      if (!cp_abuf_alloc(cp, ab, &ab->colors_abuf, cb, "colours (abuf)") ||
+          !cp_abuf_alloc(cp, ab, &ab->writes_abuf, wb, "writes (abuf)") ||
+          !cp_abuf_alloc(cp, ab, &ab->colors_peel, cb, "colours (peel)") ||
+          !cp_abuf_alloc(cp, ab, &ab->writes_peel, wb, "writes (peel)"))
          return false;
       free(ab->h_colors_abuf);
       free(ab->h_colors_peel);
@@ -2275,6 +2447,16 @@ cp_tune_after(struct cp_context *cp, struct cp_shader_exec *exec,
    cp_tune_after_ctx(cp, &c, timed);
 }
 
+static void
+cp_texture_attachment_written(struct cp_context *cp,
+                              const struct cp_fb_desc *fb)
+{
+   if (!fb || !fb->texture_cookie || !cp->dev->texture_cache_written)
+      return;
+   cp->dev->texture_cache_written(cp->dev->texture_cache_private,
+                                  fb->texture_cookie, cp->stream);
+}
+
 /*
  * Launch the compiled fragment shader over a prepared input buffer.
  *
@@ -2296,6 +2478,294 @@ cp_host_ptr(const struct cp_context *cp, uint64_t addr)
     * visible. Native addresses not in a map use the same fallback for null
     * pages and other context-lifetime managed storage. */
    return (const void *)(uintptr_t)addr;
+}
+
+static const void *
+cp_host_range(const struct cp_context *cp, uint64_t base, size_t offset,
+              size_t size)
+{
+   if (base > UINT64_MAX - offset)
+      return NULL;
+   uint64_t address = base + offset;
+   for (unsigned i = 0; i < cp->num_host_maps; i++) {
+      const struct cp_host_map *m = &cp->host_maps[i];
+      if (address >= m->dev && address - m->dev <= m->size &&
+          size <= m->size - (address - m->dev))
+         return (const char *)m->host + (address - m->dev);
+   }
+   /* Native descriptors must belong to a registered immutable arena. Gallium
+    * uses managed allocations and has no native cache bridge. */
+   if (cp->dev->texture_cache_private)
+      return NULL;
+   return (const void *)(uintptr_t)address;
+}
+
+static bool
+cp_shader_exec_is_hardware(enum cp_shader_exec_mode mode)
+{
+   return mode == CP_SHADER_EXEC_HW_INLINE ||
+          mode == CP_SHADER_EXEC_HW_FUSED;
+}
+
+static void
+cp_texture_cache_unpin(struct cp_context *cp)
+{
+   if (cp->hardware_texture.table_pinned &&
+       cp->dev->texture_cache_use_end) {
+      cp->dev->texture_cache_use_end(cp->dev->texture_cache_private);
+      cp->hardware_texture.table_pinned = false;
+   }
+}
+
+static uint64_t
+cp_texture_stream_serial(const struct cp_context *cp)
+{
+   if (cp->stream == cp->main_stream)
+      return cp->main_stream_serial;
+   for (unsigned i = 0; i < CP_PASS_STREAMS; i++)
+      if (cp->stream == cp->seg_streams[i])
+         return cp->seg_stream_serial[i];
+   return 0; /* Unknown streams get only batch-local wait memoization. */
+}
+
+static bool
+cp_texture_cache_available(struct cp_context *cp,
+                           const struct cp_draw_state *state,
+                           struct cp_shader_binary *fs, bool abuffer)
+{
+   cp_texture_cache_unpin(cp);
+   cp->hardware_texture.table_dev = 0;
+   cp->hardware_texture.table_rows = 0;
+   cp->hardware_texture.table_sites = 0;
+   if (cp->device_fatal) {
+      cp->hardware_texture.fatal = true;
+      return false;
+   }
+   cp->hardware_texture.fatal = false;
+   if (!cp_debug->texture_cache ||
+       !cp->dev->texture_cache_resolve)
+      return false;
+   if (!cp->dev->texture_cache_use_begin ||
+       !cp->dev->texture_cache_use_end) {
+      cp_renderer_texture_fatal(cp);
+      return false;
+   }
+
+   unsigned path = abuffer ? 1 : 0;
+   cp->hardware_texture.launches++;
+   cp->hardware_texture.path_launches[path]++;
+   cp->hardware_texture.launch_mode =
+      fs->exec[CP_SHADER_EXEC_HW_INLINE].kernel
+      ? CP_SHADER_EXEC_HW_INLINE : CP_SHADER_EXEC_HW_FUSED;
+   struct cp_shader_exec *exec = &fs->exec[cp->hardware_texture.launch_mode];
+   if (!exec->kernel || !fs->num_hw_tex_sites || fs->hw_tex_dynamic) {
+      cp->hardware_texture.fallback_shader++;
+      unsigned reason = MIN2(fs->hw_compile_failure,
+                             ARRAY_SIZE(cp->hardware_texture.fallback_shader_reason) - 1);
+      cp->hardware_texture.fallback_shader_reason[reason]++;
+      if (!fs->hw_failure_counted) {
+         cp->hardware_texture.fallback_shader_binaries[reason]++;
+         fs->hw_failure_counted = true;
+         if (cp_debug->shader_stats)
+            fprintf(stderr, "cudapipe: hardware texture missing binary "
+                    "reason=%u sites=%u dynamic=%u fs=%p\n", reason,
+                    fs->num_hw_tex_sites, fs->hw_tex_dynamic, (void *)fs);
+      }
+      return false;
+   }
+
+   const uint64_t *tbl = cp->fs_batch.ubos;
+   unsigned rows = (tbl && fs->reads_const_bufs)
+      ? MAX2(cp->fs_batch.ndraws, 1u) : 1;
+   cp->hardware_texture.preflight_attempts++;
+   if (cp_debug->texture_cache_fail_authoritative_alloc_at_preflight ==
+       cp->hardware_texture.preflight_attempts) {
+      cp->hardware_texture.authoritative_oom_armed = true;
+      size_t grow = cp->dscratch.size <= CP_SCRATCH_MAX_BYTES - 256
+         ? cp->dscratch.size + 256 : 0;
+      size_t old_used = cp->dscratch.used;
+      if (!grow || !cp_scratch_alloc_device(cp, grow)) {
+         if (cp->device_fatal)
+            return false;
+         cp->hardware_texture.fallback_descriptor++;
+         return false;
+      }
+      /* Keep the real grown authoritative arena, but do not consume dummy
+       * bytes after the one-shot purge/retry probe. */
+      cp->dscratch.used = old_used;
+   }
+   if (cp_debug->texture_cache_purge_at_preflight ==
+          cp->hardware_texture.preflight_attempts &&
+       cp->dev->texture_cache_purge) {
+      enum cp_texture_cache_purge_result purge =
+         cp->dev->texture_cache_purge(cp->dev->texture_cache_private);
+      if (purge == CP_TEXTURE_CACHE_PURGE_FATAL) {
+         cp_renderer_texture_fatal(cp);
+         return false;
+      }
+   }
+
+   if (!fs->num_hw_tex_sites ||
+       rows > SIZE_MAX / fs->num_hw_tex_sites) {
+      cp->hardware_texture.fallback_descriptor++;
+      return false;
+   }
+   size_t count = (size_t)rows * fs->num_hw_tex_sites;
+   if (count > SIZE_MAX / sizeof(uint64_t)) {
+      cp->hardware_texture.fallback_descriptor++;
+      return false;
+   }
+   if (count > cp->hardware_texture.resolve_workspace_cells) {
+      if (count > SIZE_MAX / (3 * sizeof(uint64_t))) {
+         cp->hardware_texture.fallback_descriptor++;
+         return false;
+      }
+      uint64_t *grown = realloc(cp->hardware_texture.resolve_workspace,
+                                count * 3 * sizeof(uint64_t));
+      if (!grown) {
+         cp->hardware_texture.fallback_descriptor++;
+         return false;
+      }
+      cp->hardware_texture.resolve_workspace = grown;
+      cp->hardware_texture.resolve_workspace_cells = count;
+   }
+   uint64_t *objects = cp->hardware_texture.resolve_workspace;
+   uint64_t *image_cookies = objects + count;
+   uint64_t *sampler_cookies = image_cookies + count;
+
+   if (cp->dev->texture_cache_use_begin) {
+      cp->dev->texture_cache_use_begin(cp->dev->texture_cache_private);
+      cp->hardware_texture.table_pinned = true;
+   }
+   int64_t preflight_start = cp_debug->plan_stats ? os_time_get_nano() : 0;
+   bool use = true;
+   for (unsigned row_index = 0; row_index < rows && use; row_index++) {
+      const uint64_t *row = tbl
+         ? tbl + (size_t)row_index * CP_ARG_UBO_STRIDE : NULL;
+      for (unsigned site = 0; site < fs->num_hw_tex_sites; site++) {
+         const struct cp_hw_tex_site *ref = &fs->hw_tex_sites[site];
+         if (ref->image.ubo_slot >= CP_ARG_UBO_STRIDE ||
+             ref->sampler.ubo_slot >= CP_ARG_UBO_STRIDE) {
+            use = false;
+            break;
+         }
+         uint64_t image_base = row ? row[ref->image.ubo_slot]
+            : (uint64_t)(uintptr_t)state->fs_ubos[ref->image.ubo_slot];
+         uint64_t sampler_base = row ? row[ref->sampler.ubo_slot]
+            : (uint64_t)(uintptr_t)state->fs_ubos[ref->sampler.ubo_slot];
+         const void *image_field = cp_host_range(cp, image_base,
+            (size_t)ref->image.offset +
+               offsetof(struct cpvk_descriptor, image_cookie),
+            sizeof(uint64_t));
+         const void *sampler_field = cp_host_range(cp, sampler_base,
+            (size_t)ref->sampler.offset +
+               offsetof(struct cpvk_descriptor, sampler_cookie),
+            sizeof(uint64_t));
+         uint64_t image_cookie = 0, sampler_cookie = 0;
+         if (image_field)
+            memcpy(&image_cookie, image_field, sizeof(image_cookie));
+         if (sampler_field)
+            memcpy(&sampler_cookie, sampler_field, sizeof(sampler_cookie));
+         size_t index = (size_t)row_index * fs->num_hw_tex_sites + site;
+         image_cookies[index] = image_cookie;
+         sampler_cookies[index] = sampler_cookie;
+         if (!image_cookie || !sampler_cookie) {
+            use = false;
+            break;
+         }
+      }
+   }
+
+   enum cp_texture_cache_result resolve_result =
+      CP_TEXTURE_CACHE_SOFT_FALLBACK;
+   if (use && cp->dev->texture_cache_resolve_batch) {
+      resolve_result = cp->dev->texture_cache_resolve_batch(
+         cp->dev->texture_cache_private, image_cookies, sampler_cookies,
+         count, cp->stream, cp_texture_stream_serial(cp),
+         (CUtexObject *)objects);
+      use = resolve_result == CP_TEXTURE_CACHE_READY;
+   } else if (use) {
+      resolve_result = CP_TEXTURE_CACHE_READY;
+      for (size_t i = 0; i < count; i++) {
+         resolve_result = cp->dev->texture_cache_resolve(
+            cp->dev->texture_cache_private, image_cookies[i],
+            sampler_cookies[i], cp->stream, cp_texture_stream_serial(cp),
+            (CUtexObject *)&objects[i]);
+         if (resolve_result != CP_TEXTURE_CACHE_READY) {
+            use = false;
+            break;
+         }
+      }
+   }
+   cp->hardware_texture.fatal = resolve_result == CP_TEXTURE_CACHE_FATAL;
+   cp->device_fatal |= cp->hardware_texture.fatal;
+   if (preflight_start) {
+      cp->hardware_texture.preflight_ns +=
+         os_time_get_nano() - preflight_start;
+      cp->hardware_texture.preflight_calls++;
+      cp->hardware_texture.preflight_cells += count;
+   }
+   /* FORCE_FUSED_FS is the same-binary control. It deliberately performs the
+    * lazy cache/object work above, then keeps the complete software module. */
+   if (!use) {
+      cp_texture_cache_unpin(cp);
+      cp->hardware_texture.fallback_descriptor++;
+      return false;
+   }
+
+   void *upload = NULL;
+   size_t bytes = count * sizeof(*objects);
+   CUresult begin_err = CUDA_SUCCESS;
+   CUdeviceptr table_dev =
+      cp_upload_begin_checked(cp, bytes, &upload, &begin_err);
+   if (!table_dev) {
+      cp_texture_cache_unpin(cp);
+      if (begin_err != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return false;
+      }
+      cp->hardware_texture.fallback_descriptor++;
+      return false;
+   }
+   memcpy(upload, objects, bytes);
+   cp->hardware_texture.table_upload_calls++;
+   CUresult upload_err =
+      cp_debug->texture_cache_fail_table_upload_at ==
+         cp->hardware_texture.table_upload_calls
+      ? CUDA_ERROR_INVALID_VALUE
+      : cp_upload_end(cp, table_dev, upload, bytes);
+   if (upload_err != CUDA_SUCCESS) {
+      cp_texture_cache_unpin(cp);
+      if (cp_debug->texture_cache_stats)
+         fprintf(stderr, "cudapipe: hardware texture fatal table upload=%d "
+                 "before fragment attempt, fs_attempts=%" PRIu64 "\n",
+                 upload_err, cp->hardware_texture.fs_attempts);
+      cp->hardware_texture.fatal = true;
+      cp->device_fatal = true;
+      if (cp->dev->texture_cache_fatal)
+         cp->dev->texture_cache_fatal(cp->dev->texture_cache_private);
+      return false;
+   }
+
+   cp->hardware_texture.table_dev = table_dev;
+   cp->hardware_texture.table_rows = rows;
+   cp->hardware_texture.table_sites = fs->num_hw_tex_sites;
+   if (cp_debug->force_fused_fs) {
+      cp_texture_cache_unpin(cp);
+      return false;
+   }
+   cp->hardware_texture.hits++;
+   cp->hardware_texture.path_hits[path]++;
+   cp->hardware_texture.mode_hits[
+      cp->hardware_texture.launch_mode == CP_SHADER_EXEC_HW_FUSED]++;
+   unsigned hw_mode =
+      cp->hardware_texture.launch_mode == CP_SHADER_EXEC_HW_FUSED;
+   unsigned regs = MIN2(MAX2(exec->num_regs, 0), 256);
+   cp->hardware_texture.hit_regs[regs]++;
+   cp->hardware_texture.mode_hit_regs[hw_mode][regs]++;
+   cp->hardware_texture.mode_spill_sum[hw_mode] += MAX2(exec->spill_bytes, 0);
+   cp->hardware_texture.mode_blocks_sum[hw_mode] += MAX2(exec->blocks_per_sm, 0);
+   return true;
 }
 
 static bool
@@ -2321,12 +2791,21 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
          fs->classic_fallback_reported = true;
       }
    }
-   if (!base_exec->kernel)
+   if (!base_exec->kernel) {
+      cp_texture_cache_unpin(cp);
       return false;
+   }
    enum cp_shader_exec_mode exec_mode =
-      base_exec == &fs->exec[CP_SHADER_EXEC_INLINE] ? CP_SHADER_EXEC_INLINE :
-      (base_exec == &fs->exec[CP_SHADER_EXEC_FUSED]
-       ? CP_SHADER_EXEC_FUSED : CP_SHADER_EXEC_CLASSIC);
+      base_exec == &fs->exec[CP_SHADER_EXEC_HW_INLINE]
+      ? CP_SHADER_EXEC_HW_INLINE
+      : (base_exec == &fs->exec[CP_SHADER_EXEC_HW_FUSED]
+         ? CP_SHADER_EXEC_HW_FUSED
+         : (base_exec == &fs->exec[CP_SHADER_EXEC_INLINE]
+            ? CP_SHADER_EXEC_INLINE
+            : (base_exec == &fs->exec[CP_SHADER_EXEC_FUSED]
+               ? CP_SHADER_EXEC_FUSED : CP_SHADER_EXEC_CLASSIC)));
+   if (!cp_shader_exec_is_hardware(exec_mode))
+      cp_texture_cache_unpin(cp);
 
    /*
     * The argument block, and behind it the per-draw uniform table the shader
@@ -2356,8 +2835,8 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
     * case.
     */
    struct cp_sampler_info resolved_samplers[CP_MAX_TEX_DESCS];
-   bool samplers_resolved = !cp_debug->no_sampler_variant &&
-      fs->num_tex_descs >= 1 && fs->num_tex_descs <= CP_MAX_TEX_DESCS &&
+   bool samplers_resolved = !cp_shader_exec_is_hardware(exec_mode) &&
+      !cp_debug->no_sampler_variant && fs->num_tex_descs >= 1 && fs->num_tex_descs <= CP_MAX_TEX_DESCS &&
       !fs->tex_descs_dynamic && tbl_src;
    for (unsigned i = 0; i < fs->num_tex_descs && samplers_resolved; i++) {
       const struct cp_tex_desc_ref *ref = &fs->tex_descs[i];
@@ -2421,22 +2900,26 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
       sampler_variant->exec[exec_mode].kernel
       ? &sampler_variant->exec[exec_mode] : base_exec;
    bool use_sampler_variant = launch_exec != base_exec;
+   if (cp_shader_exec_is_hardware(exec_mode))
+      assert(!use_sampler_variant);
 
    /*
     * Specialisation is invisible when it stops working, so count it. A
     * shader whose sampler handles the specialiser could not match still
     * renders correctly and simply launches the generic kernel.
     */
-   cp->spec.launches++;
-   if (use_sampler_variant)
-      cp->spec.specialised++;
-   if (!fs->spec_counted) {
-      fs->spec_counted = true;
-      cp->spec.shaders++;
-      if (fs->num_tex_instrs > fs->num_tex_descs || fs->tex_descs_dynamic)
-         cp->spec.shaders_unmatched++;
-      if (fs->num_tex_instrs && !fs->num_tex_descs)
-         cp->spec.shaders_unmatchable++;
+   if (!cp_shader_exec_is_hardware(exec_mode)) {
+      cp->spec.launches++;
+      if (use_sampler_variant)
+         cp->spec.specialised++;
+      if (!fs->spec_counted) {
+         fs->spec_counted = true;
+         cp->spec.shaders++;
+         if (fs->num_tex_instrs > fs->num_tex_descs || fs->tex_descs_dynamic)
+            cp->spec.shaders_unmatched++;
+         if (fs->num_tex_instrs && !fs->num_tex_descs)
+            cp->spec.shaders_unmatchable++;
+      }
    }
 
    CUmodule launch_module = launch_exec->module;
@@ -2468,9 +2951,27 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
       (size_t)rows * CP_ARG_UBO_STRIDE * sizeof(uint64_t);
 
    void *fs_blk = NULL;
-   CUdeviceptr fs_args_dev = cp_upload_begin(cp, fs_blk_bytes, &fs_blk);
-   if (!fs_args_dev)
+   CUresult begin_err;
+   bool inject_begin = cp_shader_exec_is_hardware(exec_mode) &&
+      cp_debug->texture_cache_fail_fs_arg_begin &&
+      !cp->hardware_texture.fail_fs_arg_begin_done;
+   if (inject_begin)
+      cp->hardware_texture.fail_fs_arg_begin_done = true;
+   CUdeviceptr fs_args_dev = inject_begin ? 0 :
+      cp_upload_begin_checked(cp, fs_blk_bytes, &fs_blk, &begin_err);
+   if (inject_begin)
+      begin_err = CUDA_ERROR_INVALID_VALUE;
+   if (!fs_args_dev) {
+      if (begin_err != CUDA_SUCCESS) {
+         if (inject_begin && cp_debug->texture_cache_stats)
+            fprintf(stderr, "cudapipe: injected fatal hardware FS-argument "
+                    "reservation before FS attempts=%" PRIu64 "\n",
+                    cp->hardware_texture.fs_attempts);
+         cp_renderer_texture_fatal(cp);
+      }
+      cp_texture_cache_unpin(cp);
       return false;
+   }
    memset(fs_blk, 0, fs_blk_bytes);
 
    void **fs_args_host = (void **)fs_blk;
@@ -2488,6 +2989,9 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
       fs->writes_memory ? (void *)(uintptr_t)coverage : NULL;
    fs_args_host[CP_ARG_SLOT_FUSED_INTERP] =
       (void *)(uintptr_t)fused_interp;
+   fs_args_host[CP_ARG_SLOT_HW_TEX_TABLE] =
+      (void *)(uintptr_t)(cp_shader_exec_is_hardware(exec_mode)
+                          ? cp->hardware_texture.table_dev : 0);
    fs_args_host[CP_ARG_SLOT_UBO_TABLE] =
       (void *)(uintptr_t)(fs_args_dev + fs_tbl_off);
    fs_args_host[CP_ARG_SLOT_BATCH_ROWS] = batch_rows
@@ -2517,7 +3021,18 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
       fs_args_host[18 + i] =
          (void *)(uintptr_t)fs_tbl[i];
 
-   cp_upload_end(cp, fs_args_dev, fs_blk, fs_blk_bytes);
+   CUresult args_upload_err =
+      cp_upload_end(cp, fs_args_dev, fs_blk, fs_blk_bytes);
+   if (args_upload_err != CUDA_SUCCESS) {
+      cp_texture_cache_unpin(cp);
+      if (cp_shader_exec_is_hardware(exec_mode)) {
+         cp->hardware_texture.fatal = true;
+         cp->device_fatal = true;
+         if (cp->dev->texture_cache_fatal)
+            cp->dev->texture_cache_fatal(cp->dev->texture_cache_private);
+      }
+      return false;
+   }
 
    if (cp_debug->debug_tex) {
       fprintf(stderr, "cudapipe: sampler table %p (%u entries) for FS module\n",
@@ -2535,7 +3050,7 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
     * draw of a dozen triangles is limited by how fast the host can issue
     * calls rather than by anything the device does.
     */
-   {
+   if (!cp_shader_exec_is_hardware(exec_mode)) {
       CUdeviceptr sym;
       size_t sym_size;
       bool *globals_resolved = &launch_exec->globals_resolved;
@@ -2585,8 +3100,11 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
        * here, both as built and capped, and the faster build kept. A sampler
        * variant carries its own trial: the base's verdict was measured on
        * the generic sampler path and does not transfer. */
-      const char *mode_name = exec_mode == CP_SHADER_EXEC_INLINE ? "inline" :
-         (exec_mode == CP_SHADER_EXEC_FUSED ? "fused" : "classic");
+      const char *mode_name = exec_mode == CP_SHADER_EXEC_HW_INLINE
+         ? "hardware inline"
+         : (exec_mode == CP_SHADER_EXEC_HW_FUSED ? "hardware fused" :
+            (exec_mode == CP_SHADER_EXEC_INLINE ? "inline" :
+            (exec_mode == CP_SHADER_EXEC_FUSED ? "fused" : "classic")));
       char tune_what[48];
       snprintf(tune_what, sizeof(tune_what), "%s %s",
                use_sampler_variant ? "sampler variant" : "shader", mode_name);
@@ -2599,13 +3117,36 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
        * is device-side and num_threads is the framebuffer's worst case, so a
        * small draw's launch was mostly scheduling idle blocks. 4096 blocks
        * of 256 is far past what fills the machine. */
+      cp->hardware_texture.fs_attempts++;
       CUresult fs_err = cuLaunchKernel(launch_kernel,
                                        MIN2((num_threads + 255) / 256, 4096u),
                                        1, 1, 256, 1, 1, 0, cp->stream,
                                        fs_params, NULL);
+      cp_texture_cache_unpin(cp);
       if (fs_err != CUDA_SUCCESS) {
          fprintf(stderr, "cudapipe: fragment shader launch failed (%d)\n",
                  fs_err);
+         if (cp_shader_exec_is_hardware(exec_mode)) {
+            cp->hardware_texture.fatal = true;
+            cp->device_fatal = true;
+            if (cp->dev->texture_cache_fatal)
+               cp->dev->texture_cache_fatal(cp->dev->texture_cache_private);
+         }
+         return false;
+      }
+      if (cp_shader_exec_is_hardware(exec_mode) &&
+          cp_debug->texture_cache_fail_after_fs_enqueue &&
+          !cp->hardware_texture.fail_after_fs_done) {
+         cp->hardware_texture.fail_after_fs_done = true;
+         if (cuStreamSynchronize(cp->stream) != CUDA_SUCCESS) {
+            cp_renderer_texture_fatal(cp);
+            return false;
+         }
+         if (cp_debug->texture_cache_stats)
+            fprintf(stderr, "cudapipe: injected fatal after one hardware FS "
+                    "enqueue, fs_attempts=%" PRIu64 "\n",
+                    cp->hardware_texture.fs_attempts);
+         cp_renderer_texture_fatal(cp);
          return false;
       }
       cp_tune_after(cp, launch_exec, tune_what, timed);
@@ -2786,13 +3327,20 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
     */
    CUdeviceptr inshader_interp_dev = 0;
    enum cp_shader_exec_mode inshader_mode = CP_SHADER_EXEC_CLASSIC;
-   bool allow_inshader = !cp_debug->no_inline_fs &&
-      (!cp_debug->no_fused_interp || cp_debug->force_fused_fs) &&
-      screen->kernels.fs_compact &&
+   bool compact_available = screen->kernels.fs_compact &&
       !cp_kernels_instrumented();
+   bool use_hw_inline = compact_available &&
+      cp_texture_cache_available(cp, state, fs, false);
+   if (cp->hardware_texture.fatal)
+      return;
+   bool allow_inshader = compact_available &&
+      (use_hw_inline || (!cp_debug->no_inline_fs &&
+       (!cp_debug->no_fused_interp || cp_debug->force_fused_fs)));
    if (allow_inshader) {
-      if (cp_debug->inline_fs && !cp_debug->force_fused_fs &&
-          fs->exec[CP_SHADER_EXEC_INLINE].kernel)
+      if (use_hw_inline)
+         inshader_mode = cp->hardware_texture.launch_mode;
+      else if (cp_debug->inline_fs && !cp_debug->force_fused_fs &&
+               fs->exec[CP_SHADER_EXEC_INLINE].kernel)
          inshader_mode = CP_SHADER_EXEC_INLINE;
       else if (fs->exec[CP_SHADER_EXEC_FUSED].kernel) {
          inshader_mode = CP_SHADER_EXEC_FUSED;
@@ -2842,6 +3390,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
                                            0, cp->stream, interp_params, NULL);
       if (interp_err != CUDA_SUCCESS) {
          fprintf(stderr, "cudapipe: fs_interpolate launch failed (%d)\n", interp_err);
+         cp_texture_cache_unpin(cp);
          return;
       }
    }
@@ -2915,10 +3464,18 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       /* The kernel strides, so the grid is capped: num_pixels is the
        * framebuffer's worst case and the launch was spending more time
        * scheduling idle blocks than writing pixels on small draws. */
-      CP_LAUNCH(screen->kernels.fs_writeback,
+      CUresult wb_err = cuLaunchKernel(screen->kernels.fs_writeback,
                      MIN2((num_pixels + 255) / 256, 2048u), 1, 1, 256, 1, 1,
                      0, cp->stream, wb_params, NULL);
       cp_nvtx_pop();   /* writeback */
+      if (wb_err != CUDA_SUCCESS) {
+         fprintf(stderr, "cudapipe: FS writeback launch failed (%d)\n", wb_err);
+         cp->device_fatal = true;
+         if (cp->dev->texture_cache_fatal)
+            cp->dev->texture_cache_fatal(cp->dev->texture_cache_private);
+         return;
+      }
+      cp_texture_attachment_written(cp, &scope->fb);
    }
    cp_stage_end(cp, CP_STAGE_WRITEBACK);
 
@@ -3214,11 +3771,16 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
       return false;
 
    enum cp_shader_exec_mode abuf_mode = CP_SHADER_EXEC_CLASSIC;
-   bool allow_inshader = !cp_debug->no_inline_fs &&
-      (!cp_debug->no_fused_abuf_interp || cp_debug->force_fused_fs);
+   bool use_hw_inline = cp_texture_cache_available(cp, state, fs, true);
+   if (cp->hardware_texture.fatal)
+      return false;
+   bool allow_inshader = use_hw_inline || (!cp_debug->no_inline_fs &&
+      (!cp_debug->no_fused_abuf_interp || cp_debug->force_fused_fs));
    if (allow_inshader) {
-      if (cp_debug->inline_fs && !cp_debug->force_fused_fs &&
-          fs->exec[CP_SHADER_EXEC_INLINE].kernel)
+      if (use_hw_inline)
+         abuf_mode = cp->hardware_texture.launch_mode;
+      else if (cp_debug->inline_fs && !cp_debug->force_fused_fs &&
+               fs->exec[CP_SHADER_EXEC_INLINE].kernel)
          abuf_mode = CP_SHADER_EXEC_INLINE;
       else if (fs->exec[CP_SHADER_EXEC_FUSED].kernel) {
          abuf_mode = CP_SHADER_EXEC_FUSED;
@@ -3322,6 +3884,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
          fprintf(stderr, "abuffer: cp_abuf_composite launch failed (%d)\n", ce);
          return false;
       }
+      cp_texture_attachment_written(cp, &scope->fb);
    }
 
    /*
@@ -3785,6 +4348,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * segment reclaims and the rest allocate beyond. */
    if (!cp->pass.appending || cp->pass.nsegs == 0)
       cp_scratch_begin(cp);
+   if (cp->device_fatal)
+      return;
 
    /*
     * The batch's uploads have survived the reclaim above; everything this
@@ -4744,7 +5309,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             fprintf(stderr, "abuffer: the colour format has no encoding — "
                     "skipped\n");
       } else {
-         abuf = cp_abuf_setup(ab, w, h);
+         abuf = cp_abuf_setup(cp, ab, w, h);
       }
    }
 
@@ -4802,9 +5367,15 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       ab->grow_to = 0;
       /* cuMemFree already blocks until the device has finished; the drain is
        * written out so that this does not rest on that. */
-      cuStreamSynchronize(cp->stream);
-      if (!cp_abuf_size_arrays(ab, want))
+      if (cuStreamSynchronize(cp->stream) != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return;
+      }
+      if (!cp_abuf_size_arrays(cp, ab, want)) {
+         if (cp->device_fatal)
+            return;
          abuf = false;
+      }
    }
 
    if (abuf) {
@@ -4941,8 +5512,12 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          /* The final prefix-add clamps runs against the fragment array and
           * records overflow while it already has every offset in registers. */
       } else {
-         cuStreamSynchronize(cp->stream);
-         cuMemcpyDtoH(&abuf_total, ab->sum3, sizeof(uint32_t));
+         if (cuStreamSynchronize(cp->stream) != CUDA_SUCCESS ||
+             cuMemcpyDtoH(&abuf_total, ab->sum3, sizeof(uint32_t)) !=
+                CUDA_SUCCESS) {
+            cp_renderer_texture_fatal(cp);
+            return;
+         }
 
          /* Whether the arrays are big enough for this draw, and whether they
           * should be made bigger before the next one. Both live in one place;
@@ -4954,9 +5529,11 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
           * refills by rasterizing. These are the bootstrap and the
           * non-compositing modes; every hot draw takes the clamp branch. */
          abuf_recs_filled = 0;
-         if (!cp_abuf_size_arrays(ab, abuf_total))
+         if (!cp_abuf_size_arrays(cp, ab, abuf_total)) {
+            if (cp->device_fatal)
+               return;
             abuf = false;
-         else if (abuf_total > ab->capacity) {
+         } else if (abuf_total > ab->capacity) {
             /* The growth was capped or refused and the draw outran what is
              * there. Correct and slow rather than wrong: the peel loop renders
              * it. */
@@ -5159,13 +5736,17 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          abuf_covered = 0;   /* the composite covers the framebuffer */
       } else if (ab->composite) {
          uint32_t ctr[CP_ABUF_COUNTERS] = { 0 };
-         cp_sync_timed(cp, cp->stream, &cp->plan.wait_seg_ns,
-                       &cp->plan.wait_seg_n);
+         if (!cp_sync_timed(cp, cp->stream, &cp->plan.wait_seg_ns,
+                            &cp->plan.wait_seg_n))
+            return;
          /* One copy: sum3, bsum3 and clist_count are contiguous. The last of
           * them is free rather than merely cheap now — the composite's grid is
           * the covered pixels rather than the framebuffer, which on a sample
           * covering 4% of it is 140 blocks instead of 3,600. */
-         cuMemcpyDtoH(ctr, ab->counters, sizeof(ctr));
+         if (cuMemcpyDtoH(ctr, ab->counters, sizeof(ctr)) != CUDA_SUCCESS) {
+            cp_renderer_texture_fatal(cp);
+            return;
+         }
          const uint32_t *c3 = &ctr[0];
          const uint32_t *q = &ctr[3];
          abuf_covered = ctr[5];
@@ -5423,8 +6004,9 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                         0, cp->stream, pa_params, NULL);
 
          if (pass + 1 >= interval_start + check_interval) {
-            cp_sync_timed(cp, cp->stream, &cp->plan.wait_peel_ns,
-                          &cp->plan.wait_peel_n);
+            if (!cp_sync_timed(cp, cp->stream, &cp->plan.wait_peel_ns,
+                               &cp->plan.wait_peel_n))
+               return;
             if (!*(volatile uint32_t *)(uintptr_t)cp->peel_any)
                break;
             interval_start = pass + 1;
@@ -5448,9 +6030,14 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       uint32_t qcounters[2] = { abuf_quads, 0 };
       uint32_t dbg[CP_ABUF_DBG_COUNTERS] = { 0 };
       if (!ab->composite) {
-         cp_sync_timed(cp, cp->stream, &cp->plan.wait_quads_ns,
-                       &cp->plan.wait_quads_n);
-         cuMemcpyDtoH(qcounters, ab->bsum3, sizeof(qcounters));
+         if (!cp_sync_timed(cp, cp->stream, &cp->plan.wait_quads_ns,
+                            &cp->plan.wait_quads_n))
+            return;
+         if (cuMemcpyDtoH(qcounters, ab->bsum3,
+                          sizeof(qcounters)) != CUDA_SUCCESS) {
+            cp_renderer_texture_fatal(cp);
+            return;
+         }
       }
 
       /*
@@ -5735,8 +6322,11 @@ cp_batch_record_packet(struct cp_context *cp,
  */
 
 static bool
-cp_pass_appendable(struct cp_context *cp)
+cp_pass_appendable(struct cp_context *cp,
+                   const struct cp_draw_batch *batch)
 {
+   if (batch->state.fs && batch->state.fs->writes_memory)
+      return false;
    struct cp_device *screen = cp->dev;
    struct cp_abuf *ab = cp->abuf;
 
@@ -5798,6 +6388,9 @@ cp_pass_appendable(struct cp_context *cp)
                          (size_t)CP_MAX_HUGE_TILES *
                          sizeof(struct cp_tile_pair)) == CUDA_SUCCESS &&
               cuMemAlloc(&cp->seg_qsets[k].counts, 256) == CUDA_SUCCESS;
+         if (cp->seg_streams[k])
+            cp->seg_stream_serial[k] =
+               cp_texture_stream_serial_alloc(cp->dev);
       }
       /* A cache refusal must not disable the side stream or its classic
        * queues. Each stream owns the same 84-KiB evidence-sized capacity. */
@@ -5884,6 +6477,21 @@ cp_pass_broadcast(struct cp_context *cp, unsigned nsegs)
 }
 
 
+static bool
+cp_pass_can_retry(struct cp_context *cp)
+{
+   if (cp->device_fatal)
+      return false;
+   if (cp->hardware_texture.fs_attempts == cp->pass.hw_attempt_start)
+      return true;
+   fprintf(stderr, "cudapipe: refusing episode retry after FS attempt; "
+           "latching device loss\n");
+   cp->device_fatal = true;
+   if (cp->dev->texture_cache_fatal)
+      cp->dev->texture_cache_fatal(cp->dev->texture_cache_private);
+   return false;
+}
+
 /* The episode could not deliver; render every segment the classic way, in
  * submission order, from its snapshot. Rasterization is idempotent — the
  * abandoned lists were never read by anything that draws. */
@@ -5891,6 +6499,8 @@ static void
 cp_pass_fallback(struct cp_context *cp, struct cp_pass_seg *segs,
                  unsigned nsegs)
 {
+   if (!cp_pass_can_retry(cp))
+      return;
    /* The abandoned episode's kernels may still be in flight on the side
     * streams, writing the shared lists the re-execution is about to clear. */
    cp_pass_join(cp, nsegs);
@@ -6052,6 +6662,12 @@ cp_opaque_finish(struct cp_context *cp)
       return;
 
    struct cp_pass_seg *segs = cp->pass_segs;
+   for (unsigned s = 0; s < nsegs; s++) {
+      if (segs[s].batch.state.fs && segs[s].batch.state.fs->writes_memory) {
+         cp_pass_fallback(cp, segs, nsegs);
+         return;
+      }
+   }
    unsigned w = cp->pass.w, h = cp->pass.h;
    cp->pass.nsegs = 0;
    cp->pass.next_prim = 0;
@@ -6750,6 +7366,16 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          (uint32_t)quad_bound, 0, false, NULL, false, &ti, &ts, &tc, &shade);
       if (!shaded)
          break;
+      if (group == 0 &&
+          cp_debug->texture_cache_fail_after_bounded_group0) {
+         if (cp_debug->texture_cache_stats)
+            fprintf(stderr, "cudapipe: injected bounded fatal after group0, "
+                    "fs_attempt_delta=%" PRIu64 "\n",
+                    cp->hardware_texture.fs_attempts - cp->pass.hw_attempt_start);
+         cp_renderer_texture_fatal(cp);
+         shaded = false;
+         break;
+      }
       group_shades[group] = shade;
       for (unsigned s = 0; s < nsegs; s++) {
          if (seg_group[s] != group)
@@ -6804,6 +7430,8 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
    if (err != CUDA_SUCCESS)
       fprintf(stderr, "abuffer: bounded grouped composite launch failed "
               "(%d)\n", err);
+   else
+      cp_texture_attachment_written(cp, fb);
    return err == CUDA_SUCCESS;
 }
 
@@ -6976,6 +7604,8 @@ cp_pass_finish(struct cp_context *cp)
 
    if (cp_pass_finish_bounded_groups(cp, segs, nsegs, w, h))
       return;
+   if (!cp_pass_can_retry(cp))
+      return;
 
    /* --- bucket the quads by segment, before the drain so the counts ride
     * it --- */
@@ -7008,10 +7638,15 @@ cp_pass_finish(struct cp_context *cp)
 
    /* --- the drain: the six counters and the per-segment quad counts --- */
    uint32_t ctr[CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS] = { 0 };
-   cp_sync_timed(cp, cp->stream, &cp->plan.wait_episode_ns,
-                 &cp->plan.wait_episode_n);
-   cuMemcpyDtoH(ctr, ab->counters,
-                sizeof(uint32_t) * (CP_ABUF_COUNTERS + nsegs));
+   if (!cp_sync_timed(cp, cp->stream, &cp->plan.wait_episode_ns,
+                      &cp->plan.wait_episode_n))
+      return;
+   if (cuMemcpyDtoH(ctr, ab->counters,
+                    sizeof(uint32_t) * (CP_ABUF_COUNTERS + nsegs)) !=
+       CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return;
+   }
 
    uint32_t total = ctr[0], fill_over = ctr[1];
    uint32_t quads = ctr[3], quad_over = ctr[4], covered = ctr[5];
@@ -7204,6 +7839,15 @@ cp_pass_finish(struct cp_context *cp)
          failed = true;
          break;
       }
+      if (g == 0 && cp_debug->texture_cache_fail_after_main_group0) {
+         if (cp_debug->texture_cache_stats)
+            fprintf(stderr, "cudapipe: injected main fatal after group0, "
+                    "fs_attempt_delta=%" PRIu64 "\n",
+                    cp->hardware_texture.fs_attempts - cp->pass.hw_attempt_start);
+         cp_renderer_texture_fatal(cp);
+         failed = true;
+         break;
+      }
       /* Per-segment descs, as offsets into the group's dense arrays: the
        * composite still resolves by segment, so quad_seg and the bucketing
        * kernels never learned about groups. */
@@ -7265,6 +7909,8 @@ cp_pass_finish(struct cp_context *cp)
       fprintf(stderr, "abuffer: episode composite launch failed (%d); "
               "re-rendering segment by segment\n", ce);
       cp_pass_fallback(cp, segs, nsegs);
+   } else {
+      cp_texture_attachment_written(cp, fb);
    }
 }
 
@@ -7277,6 +7923,8 @@ cp_pass_record_segment(struct cp_context *cp,
                        unsigned rast_num_triangles, unsigned num_triangles,
                        const struct cp_draw_batch *batch)
 {
+   if (!cp->pass.nsegs)
+      cp->pass.hw_attempt_start = cp->hardware_texture.fs_attempts;
    struct cp_pass_seg *sg = &cp->pass_segs[cp->pass.nsegs];
 
    sg->rast = *aa;
@@ -7364,7 +8012,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
     */
    if (cp->pass.nsegs == 0) {
       unsigned w = fb->width, h = fb->height;
-      if (!w || !h || !cp_abuf_setup(ab, w, h)) {
+      if (!w || !h || !cp_abuf_setup(cp, ab, w, h)) {
          cp_pass_finish(cp);
          cp_draw_execute_batch(cp, &cp->batch);
          return;
@@ -7495,7 +8143,7 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
       }
    }
 
-   if (blended && cp_pass_appendable(cp)) {
+   if (blended && cp_pass_appendable(cp, &cp->batch)) {
       cp_pass_append(cp, ndraws);
       return;
    }
@@ -7627,21 +8275,20 @@ cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
       cp->peel_next = 0;
 
       cuCtxSetCurrent(cp->dev->cuda_ctx);
-      CUresult e1 = cuMemAlloc(&cp->visbuf,
+      CUresult e1 = cp_mem_alloc_retry(cp, &cp->visbuf,
                                cp->fb_cap_px_samples * sizeof(uint64_t));
-      CUresult e2 = cuMemAlloc(&cp->depthbuf,
+      CUresult e2 = cp_mem_alloc_retry(cp, &cp->depthbuf,
                                cp->fb_cap_px_samples * sizeof(uint32_t));
-      CP_CU_WARN(cuMemAlloc(&cp->reject,
+      CP_CU_WARN(cp_mem_alloc_retry(cp, &cp->reject,
                             cp->fb_cap_px * CP_DISCARD_LAYERS * sizeof(uint32_t)),
                  "cuMemAlloc(reject)");
-      CP_CU_WARN(cuMemAlloc(&cp->resolved, cp->fb_cap_px), "cuMemAlloc(resolved)");
-      CP_CU_WARN(cuMemAlloc(&cp->peel_next, cp->fb_cap_px * sizeof(uint32_t)),
+      CP_CU_WARN(cp_mem_alloc_retry(cp, &cp->resolved, cp->fb_cap_px), "cuMemAlloc(resolved)");
+      CP_CU_WARN(cp_mem_alloc_retry(cp, &cp->peel_next, cp->fb_cap_px * sizeof(uint32_t)),
                  "cuMemAlloc(peel_next)");
       /* Managed, because the host reads it between passes to decide
        * whether another one is worth launching. */
       if (!cp->peel_any)
-         cuMemAllocManaged(&cp->peel_any, sizeof(uint32_t),
-                           CU_MEM_ATTACH_GLOBAL);
+         cp_mem_alloc_managed_retry(cp, &cp->peel_any, sizeof(uint32_t));
       if (e1 != CUDA_SUCCESS || e2 != CUDA_SUCCESS)
          fprintf(stderr, "cudapipe: visbuf/depthbuf alloc %zu px x %u samples "
                  "failed (%d, %d)\n", cp->fb_cap_px, samples, e1, e2);
@@ -7842,9 +8489,8 @@ cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
 
    cuCtxSetCurrent(screen->cuda_ctx);
    void *params[] = { &args };
-   cuLaunchKernel(fn,
+   return cuLaunchKernel(fn,
       (width + 15) / 16, (height + 15) / 16, 1,
       16, 16, 1,
-      0, cp->stream, params, NULL);
-   return true;
+      0, cp->stream, params, NULL) == CUDA_SUCCESS;
 }

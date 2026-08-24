@@ -184,6 +184,7 @@ struct cp_context {
 
    /* The device: the CUDA context, the SM, the loaded kernels. */
    struct cp_device *dev;
+   bool device_fatal; /* native callback latched a fatal CUDA/cache error */
 
    /*
     * Draws held back for merging. `pending` means one or more draws have been
@@ -229,6 +230,7 @@ struct cp_context {
       bool append_failed;           /* the append could not take the path */
       bool opaque;                  /* shared-visbuf opaque run, not A-buffer */
       unsigned w, h;                /* the episode's framebuffer */
+      uint64_t hw_attempt_start;
    } pass;
 
    /* A merged shading group's concatenated fs-UBO rows, staged here before
@@ -325,6 +327,9 @@ struct cp_context {
     * yet depends on it being isolated.
     */
    CUstream stream;
+   CUstream main_stream;
+   uint64_t main_stream_serial;
+   uint64_t seg_stream_serial[CP_PASS_STREAMS];
 
    /*
     * Per-stage draw timing under CUDAPIPE_DEBUG_TIME, on CUDA events recorded
@@ -429,6 +434,37 @@ struct cp_context {
       uint64_t shaders_unmatched;    /* some sampler handle was not matchable */
       uint64_t shaders_unmatchable;  /* samples textures, matched none at all */
    } spec;
+
+   struct {
+      uint64_t launches;
+      uint64_t hits;
+      uint64_t fallback_shader;
+      uint64_t fallback_descriptor;
+      uint64_t fallback_shader_reason[8];
+      uint64_t fallback_shader_binaries[8];
+      uint64_t path_launches[2];       /* direct, A-buffer */
+      uint64_t path_hits[2];
+      uint64_t mode_hits[2]; /* strict inline, helper-fused */
+      uint64_t hit_regs[257];          /* 256 is the overflow bucket */
+      uint64_t mode_hit_regs[2][257];
+      uint64_t mode_spill_sum[2];
+      uint64_t mode_blocks_sum[2];
+      uint64_t fs_attempts;
+      CUdeviceptr table_dev;
+      unsigned table_rows;
+      unsigned table_sites;
+      bool fatal;
+      bool table_pinned;
+      unsigned launch_mode;
+      uint64_t *resolve_workspace;
+      size_t resolve_workspace_cells;
+      uint64_t preflight_ns, preflight_calls, preflight_cells;
+      uint64_t table_upload_calls, preflight_attempts;
+      uint64_t authoritative_oom_retries;
+      bool authoritative_oom_armed;
+      bool fail_after_fs_done;
+      bool fail_fs_arg_begin_done;
+   } hardware_texture;
 
    /*
     * What deciding one draw at a time costs, reported under
@@ -784,8 +820,10 @@ void cp_abuf_report(struct cp_abuf *ab);
 void cp_abuf_cleanup(struct cp_abuf *ab);
 void cp_abuf_scan(struct cp_context *cp, struct cp_device *screen, struct cp_abuf *ab, unsigned n);
 void cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen, CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x, CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3, unsigned n, unsigned nb1, unsigned nb2, unsigned nb3, CUdeviceptr clamp_counts, uint32_t clamp_capacity, CUdeviceptr clamp_overflow);
-bool cp_abuf_setup(struct cp_abuf *ab, unsigned w, unsigned h);
-bool cp_abuf_size_arrays(struct cp_abuf *ab, uint32_t total);
+bool cp_abuf_setup(struct cp_context *cp, struct cp_abuf *ab,
+                   unsigned w, unsigned h);
+bool cp_abuf_size_arrays(struct cp_context *cp, struct cp_abuf *ab,
+                         uint32_t total);
 void cp_abuf_verify(struct cp_abuf *ab, unsigned w, unsigned h, uint32_t total, unsigned passes_run, unsigned deep_n, uint32_t overflow, uint32_t long_runs);
 void cp_abuf_verify_quads(struct cp_abuf *ab, unsigned w, unsigned h, uint32_t total_frags, uint32_t total_quads, unsigned passes_run, uint32_t quad_overflow, const uint32_t *dbg);
 void cp_census_dump(const char *what, unsigned draw_seq, unsigned peel_seq, unsigned num_triangles, unsigned num_samples, const uint32_t *counts, unsigned w, unsigned h);
@@ -927,8 +965,10 @@ enum cp_stage {
 void *cp_scratch_alloc(struct cp_context *cp, size_t size);
 CUdeviceptr cp_scratch_alloc_device(struct cp_context *cp, size_t size);
 CUdeviceptr cp_upload_begin(struct cp_context *cp, size_t size, void **host);
-void cp_upload_end(struct cp_context *cp, CUdeviceptr dst, const void *host,
-                   size_t size);
+CUdeviceptr cp_upload_begin_checked(struct cp_context *cp, size_t size,
+                                    void **host, CUresult *error);
+CUresult cp_upload_end(struct cp_context *cp, CUdeviceptr dst,
+                       const void *host, size_t size);
 CUdeviceptr cp_upload(struct cp_context *cp, const void *data, size_t size);
 void cp_scratch_begin(struct cp_context *cp);
 void cp_scratch_reset(struct cp_context *cp);

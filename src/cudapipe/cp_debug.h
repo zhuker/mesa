@@ -90,6 +90,7 @@ struct cp_debug {
    bool debug_draw;
    bool debug_tex;
    bool spec_stats;
+   bool texture_cache_stats;
    bool plan_stats;
    bool debug_vfetch;
    bool debug_work;
@@ -113,6 +114,18 @@ struct cp_debug {
    bool no_pass_episode;
    bool no_opaque_episode;
    bool no_sampler_variant;
+   bool texture_cache;
+   unsigned texture_cache_fail_table_upload_at;
+   unsigned texture_cache_purge_at_preflight;
+   unsigned texture_cache_fail_authoritative_alloc_at_preflight;
+   bool texture_cache_fail_after_bounded_group0;
+   bool texture_cache_fail_after_main_group0;
+   bool texture_cache_fail_after_fs_enqueue;
+   unsigned texture_cache_fail_array_alloc_at;
+   unsigned texture_cache_fail_object_create_at;
+   unsigned texture_cache_fail_conversion_enqueue_at;
+   bool texture_cache_fail_fs_arg_begin;
+   unsigned texture_cache_fail_create_stage;
    bool no_abuf_short_sort;
    bool no_abuf_warp_bucket;
    unsigned abuf_short_sort_max;

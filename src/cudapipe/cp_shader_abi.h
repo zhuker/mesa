@@ -86,11 +86,14 @@ struct cpvk_descriptor {
     * index into cp_sampler_table, or a storage image's layer stride.
     */
    uint32_t sampler_index_or_img_stride;
-   uint8_t  pad1[8];
+   /* Host-only immutable sampler cookie. This overlaps storage-image padding
+    * and is ignored by every software/CUDA descriptor consumer. */
+   uint64_t sampler_cookie;            /* +32 struct cpvk_sampler * */
    uint32_t base_offset;              /* +40 storage image only */
    uint8_t  pad2[4];
    uint64_t texture_info;             /* +48 struct cp_texture_info * */
-   uint8_t  pad3[8];
+   /* Host-only immutable image-view cookie. CUDA kernels never read it. */
+   uint64_t image_cookie;              /* +56, 1-based stable device view ID */
 };
 
 /* The row's size and the three offsets CUDA code reads. A kernel indexes rows
@@ -114,8 +117,12 @@ static_assert(offsetof(struct cpvk_descriptor, height) == 12, "descriptor ABI");
 static_assert(offsetof(struct cpvk_descriptor, depth) == 14, "descriptor ABI");
 static_assert(offsetof(struct cpvk_descriptor, row_stride) == 24,
               "descriptor ABI");
+static_assert(offsetof(struct cpvk_descriptor, sampler_cookie) == 32,
+              "hardware texture host metadata");
 static_assert(offsetof(struct cpvk_descriptor, base_offset) == 40,
               "descriptor ABI");
+static_assert(offsetof(struct cpvk_descriptor, image_cookie) == 56,
+              "hardware texture host metadata");
 
 /* The argument block and the per-draw table must describe the same number of
  * slots, or a batched draw reads a neighbouring draw's descriptors. */

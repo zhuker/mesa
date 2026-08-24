@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-69 switches.
+82 switches.
 
 ## Tracing
 
@@ -26,6 +26,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_DEBUG_TEX` | bool (presence) | `off` | — | trace sampler and texture-handle setup |
 | `CUDAPIPE_PLAN_STATS` | bool (value) | `off` | — | report at teardown what deciding one draw at a time costs: batch keys built, pairwise merge tests, flushes, pass episodes closed and every reactive reallocation, with per-scope averages |
 | `CUDAPIPE_SPEC_STATS` | bool (value) | `off` | — | report at teardown how many fragment launches used a sampler-specialised kernel, and which shaders sample textures the specialiser could not match; a silent drop to zero is a performance regression with no error |
+| `CUDAPIPE_TEXTURE_CACHE_STATS` | bool (value) | `off` | — | report hardware-texture fragment execution hits and software fallbacks |
 | `CUDAPIPE_DEBUG_VFETCH` | bool (presence) | `off` | — | dump what the GPU vertex fetch gathered; syncs, so debug-only |
 | `CUDAPIPE_DEBUG_WORK` | bool (presence) | `off` | — | report how much of the shading launch did work; syncs |
 | `CUDAPIPE_DEBUG_DISCARD` | bool (presence) | `off` | — | report covered and discarded fragment counts per pass; syncs |
@@ -49,6 +50,18 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_NO_PASS_EPISODE` | bool (value) | `off` | — | disable pass episodes: consecutive blended batches stop sharing one A-buffer build and drain |
 | `CUDAPIPE_NO_OPAQUE_EPISODE` | bool (value) | `off` | — | disable consecutive opaque-run visibility deferral |
 | `CUDAPIPE_NO_SAMPLER_VARIANT` | bool (value) | `off` | — | disable literal-state fragment sampler variants |
+| `CUDAPIPE_TEXTURE_CACHE` | bool (value) | `off` | — | opt in to same-LLVM direct CUDA hardware-texture fragment execution |
+| `CUDAPIPE_TEXTURE_CACHE_FAIL_TABLE_UPLOAD_AT` | uint | `0` | — | fault injection: fail the Nth hardware texture table upload enqueue |
+| `CUDAPIPE_TEXTURE_CACHE_PURGE_AT_PREFLIGHT` | uint | `0` | — | fault injection: purge derived textures before the Nth HW preflight |
+| `CUDAPIPE_TEXTURE_CACHE_FAIL_AUTHORITATIVE_ALLOC_AT_PREFLIGHT` | uint | `0` | — | fault injection: OOM one renderer allocation at the Nth HW preflight |
+| `CUDAPIPE_TEXTURE_CACHE_FAIL_AFTER_BOUNDED_GROUP0` | bool (value) | `off` | — | fault injection: latch fatal after bounded episode FS group zero |
+| `CUDAPIPE_TEXTURE_CACHE_FAIL_AFTER_MAIN_GROUP0` | bool (value) | `off` | — | fault injection: latch fatal after main episode FS group zero |
+| `CUDAPIPE_TEXTURE_CACHE_FAIL_AFTER_FS_ENQUEUE` | bool (value) | `off` | — | fault injection: sync then latch fatal after one hardware FS enqueue |
+| `CUDAPIPE_TEXTURE_CACHE_FAIL_ARRAY_ALLOC_AT` | uint | `0` | — | fault injection: OOM the Nth derived CUDA array allocation |
+| `CUDAPIPE_TEXTURE_CACHE_FAIL_OBJECT_CREATE_AT` | uint | `0` | — | fault injection: OOM the Nth CUDA texture-object creation |
+| `CUDAPIPE_TEXTURE_CACHE_FAIL_CONVERSION_ENQUEUE_AT` | uint | `0` | — | fault injection: fail the Nth converted-cache kernel enqueue fatally |
+| `CUDAPIPE_TEXTURE_CACHE_FAIL_FS_ARG_BEGIN` | bool (value) | `off` | — | fault injection: fail first hardware FS-argument reservation fatally |
+| `CUDAPIPE_TEXTURE_CACHE_FAIL_CREATE_STAGE` | uint | `0` | — | fault injection: fail cache create stage 1=event or 2=surface |
 | `CUDAPIPE_NO_ABUF_SHORT_SORT` | bool (value) | `off` | — | disable the single-thread short A-buffer run sorter |
 | `CUDAPIPE_NO_ABUF_WARP_BUCKET` | bool (value) | `off` | — | disable warp-aggregated A-buffer segment bucketing atomics |
 | `CUDAPIPE_ABUF_SHORT_SORT_MAX` | uint | `16` | 2&ndash;64 | largest A-buffer run sorted by one thread |

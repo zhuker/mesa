@@ -237,7 +237,14 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             cp_render_scope_end(&dev->renderer);
             break;
          case CPVK_OP_CLEAR:
-            cpvk_execute_clear(dev, &cmd->ops[o].clear);
+            if (!cpvk_execute_clear(dev, &cmd->ops[o].clear))
+               return cpvk_submit_abort(dev,
+                  vk_error(dev, VK_ERROR_DEVICE_LOST));
+            if (cmd->ops[o].clear.image &&
+                !cpvk_texture_cache_image_written(cmd->ops[o].clear.image,
+                                                  dev->renderer.stream))
+               return cpvk_submit_abort(dev,
+                  vk_error(dev, VK_ERROR_DEVICE_LOST));
             break;
          case CPVK_OP_QUERY: {
             VkResult r = cpvk_execute_query(dev, &cmd->ops[o].query);
@@ -249,6 +256,11 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             VkResult r = cpvk_execute_copy(dev, &cmd->ops[o].copy);
             if (r != VK_SUCCESS)
                return cpvk_submit_abort(dev, r);
+            if (cmd->ops[o].copy.dst_image &&
+                !cpvk_texture_cache_image_written(cmd->ops[o].copy.dst_image,
+                                                  dev->renderer.stream))
+               return cpvk_submit_abort(dev,
+                  vk_error(dev, VK_ERROR_DEVICE_LOST));
             break;
          }
          case CPVK_OP_DRAW: {
@@ -278,6 +290,9 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             break;
          }
          }
+         if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
+            return cpvk_submit_abort(dev,
+               vk_error(dev, VK_ERROR_DEVICE_LOST));
       }
    }
 
@@ -285,6 +300,8 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * stream. The worker publishes Vulkan sync state only after this event;
     * queue submission itself no longer drains CUDA. */
    cp_batch_flush(&dev->renderer);
+   if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
+      return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
    dev->prev_draw = NULL;
    dev->prev_scope = NULL;
    dev->prev_draw_valid = false;
@@ -391,6 +408,7 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->cp_dev.cuda_ctx = dev->cu_ctx;
    dev->cp_dev.sm_major = pdev->sm_major;
    dev->cp_dev.sm_minor = pdev->sm_minor;
+   atomic_init(&dev->cp_dev.next_texture_stream_serial, 0);
    if (!cp_kernels_init(&dev->cp_dev.kernels, pdev->sm_major, pdev->sm_minor,
                          pdev->vk.disk_cache)) {
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
@@ -416,6 +434,23 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    simple_mtx_init(&dev->shader_cache_lock, mtx_plain);
    simple_mtx_init(&dev->view_lock, mtx_plain);
+   simple_mtx_init(&dev->texture_cache_lock, mtx_plain);
+   simple_mtx_init(&dev->texture_cache_use_lock, mtx_plain);
+   dev->texture_cache_images = NULL;
+   dev->texture_cache_views = NULL;
+   dev->texture_cache_view_count = dev->texture_cache_view_cap = 0;
+   dev->texture_batch_workspace = NULL;
+   dev->texture_batch_workspace_size = 0;
+   dev->texture_cache_bytes = 0;
+   memset(&dev->texture_cache_stats, 0, sizeof(dev->texture_cache_stats));
+   dev->cp_dev.texture_cache_private = dev;
+   dev->cp_dev.texture_cache_resolve = cpvk_texture_cache_resolve;
+   dev->cp_dev.texture_cache_resolve_batch = cpvk_texture_cache_resolve_batch;
+   dev->cp_dev.texture_cache_written = cpvk_texture_cache_written;
+   dev->cp_dev.texture_cache_fatal = cpvk_texture_cache_fatal;
+   dev->cp_dev.texture_cache_purge = cpvk_texture_cache_purge;
+   dev->cp_dev.texture_cache_use_begin = cpvk_texture_cache_use_begin;
+   dev->cp_dev.texture_cache_use_end = cpvk_texture_cache_use_end;
    shader_lock_initialized = true;
 
    if (!cp_context_init(&dev->renderer, &dev->cp_dev)) {
@@ -444,6 +479,8 @@ fail_stream:
    if (shader_lock_initialized) {
       simple_mtx_destroy(&dev->shader_cache_lock);
       simple_mtx_destroy(&dev->view_lock);
+      simple_mtx_destroy(&dev->texture_cache_lock);
+      simple_mtx_destroy(&dev->texture_cache_use_lock);
    }
    if (kernels_initialized)
       cp_kernels_destroy(&dev->cp_dev.kernels);
@@ -475,6 +512,7 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    cpvk_batch_break_report();
    cp_context_cleanup(&dev->renderer);
+   cpvk_texture_cache_report(dev);
    for (unsigned i = 0; i < dev->num_shaders; i++)
       cp_shader_binary_destroy(dev->shader_cache[i].bin);
    free(dev->shader_cache);
@@ -483,8 +521,14 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       cuMemFree(dev->null_desc);
    if (dev->null_data)
       cuMemFree(dev->null_data);
+   free(dev->texture_cache_views);
+   dev->texture_cache_views = NULL;
+   free(dev->texture_batch_workspace);
+   dev->texture_batch_workspace = NULL;
    simple_mtx_destroy(&dev->shader_cache_lock);
    simple_mtx_destroy(&dev->view_lock);
+   simple_mtx_destroy(&dev->texture_cache_lock);
+   simple_mtx_destroy(&dev->texture_cache_use_lock);
 
    cuCtxDestroy(dev->cu_ctx);
 
@@ -521,32 +565,51 @@ cpvk_AllocateMemory(VkDevice _device,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    mem->kind = pAllocateInfo->memoryTypeIndex;
+   mem->bindings = NULL;
+   mem->binding_ledger_failed = false;
    size_t size = pAllocateInfo->allocationSize;
    CUresult err;
 
    cuCtxSetCurrent(dev->cu_ctx);
+   bool retried_after_purge = false;
+retry_cuda_allocation:
    switch (mem->kind) {
    case CPVK_MEM_DEVICE:
       err = cuMemAlloc(&mem->dev_ptr, size);
       mem->host_ptr = NULL;
       break;
    case CPVK_MEM_HOST:
-      /* Host-visible Vulkan allocations can contain hot UBO/SSBO data.  A
-       * permanently mapped cuMemAllocHost allocation makes every shader read
-       * cross PCIe; managed memory remains directly mappable but can settle on
-       * the GPU between host accesses. */
+      /* Host-visible Vulkan allocations can contain hot UBO/SSBO data. A
+       * cache purge is allowed to reclaim optional device arrays first. */
       err = cuMemAllocManaged(&mem->dev_ptr, size, CU_MEM_ATTACH_GLOBAL);
       mem->host_ptr = err == CUDA_SUCCESS
          ? (void *)(uintptr_t)mem->dev_ptr : NULL;
       break;
    default:
       err = cuMemAllocManaged(&mem->dev_ptr, size, CU_MEM_ATTACH_GLOBAL);
-      mem->host_ptr = (void *)(uintptr_t)mem->dev_ptr;
+      mem->host_ptr = err == CUDA_SUCCESS
+         ? (void *)(uintptr_t)mem->dev_ptr : NULL;
       break;
+   }
+   if (err == CUDA_ERROR_OUT_OF_MEMORY && !retried_after_purge) {
+      enum cp_texture_cache_purge_result purge =
+         cpvk_texture_cache_purge(dev);
+      if (purge == CP_TEXTURE_CACHE_PURGE_FATAL) {
+         vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+      }
+      if (purge == CP_TEXTURE_CACHE_PURGE_RECLAIMED) {
+         retried_after_purge = true;
+         goto retry_cuda_allocation;
+      }
    }
 
    if (err != CUDA_SUCCESS) {
       vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+      if (err != CUDA_ERROR_OUT_OF_MEMORY)
+         cpvk_texture_cache_fatal(dev);
+      if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
 
@@ -567,6 +630,79 @@ cpvk_AllocateMemory(VkDevice _device,
    return VK_SUCCESS;
 }
 
+void
+cpvk_memory_note_bind(struct cpvk_device *dev, struct cpvk_device_memory *mem,
+                      VkDeviceSize offset, VkDeviceSize size,
+                      void *resource, struct cpvk_image *image)
+{
+   if (!cp_debug->texture_cache || !mem || !size)
+      return;
+   simple_mtx_lock(&dev->texture_cache_lock);
+   bool overflow = offset > UINT64_MAX - size;
+   VkDeviceSize end = overflow ? UINT64_MAX : offset + size;
+   if (image && (overflow || mem->binding_ledger_failed))
+      image->cache_alias = true;
+   /* A legal rebind of the same resource replaces its old interval; it is not
+    * an alias with itself. */
+   struct cpvk_memory_binding **old_link = &mem->bindings;
+   while (*old_link) {
+      if ((*old_link)->resource == resource) {
+         struct cpvk_memory_binding *dead = *old_link;
+         *old_link = dead->next;
+         free(dead);
+         continue;
+      }
+      old_link = &(*old_link)->next;
+   }
+   for (struct cpvk_memory_binding *b = mem->bindings; b; b = b->next) {
+      VkDeviceSize bend = b->offset > UINT64_MAX - b->size
+         ? UINT64_MAX : b->offset + b->size;
+      if (offset < bend && b->offset < end) {
+         if (image)
+            image->cache_alias = true;
+         if (b->image)
+            b->image->cache_alias = true;
+      }
+   }
+   struct cpvk_memory_binding *binding = calloc(1, sizeof(*binding));
+   if (!binding) {
+      mem->binding_ledger_failed = true;
+      if (image)
+         image->cache_alias = true;
+      for (struct cpvk_memory_binding *b = mem->bindings; b; b = b->next)
+         if (b->image)
+            b->image->cache_alias = true;
+   } else {
+      binding->offset = offset;
+      binding->size = size;
+      binding->resource = resource;
+      binding->image = image;
+      binding->next = mem->bindings;
+      mem->bindings = binding;
+   }
+   simple_mtx_unlock(&dev->texture_cache_lock);
+}
+
+void
+cpvk_memory_note_unbind(struct cpvk_device *dev,
+                        struct cpvk_device_memory *mem, void *resource)
+{
+   if (!cp_debug->texture_cache || !mem || !resource)
+      return;
+   simple_mtx_lock(&dev->texture_cache_lock);
+   struct cpvk_memory_binding **link = &mem->bindings;
+   while (*link) {
+      if ((*link)->resource == resource) {
+         struct cpvk_memory_binding *dead = *link;
+         *link = dead->next;
+         free(dead);
+         continue;
+      }
+      link = &(*link)->next;
+   }
+   simple_mtx_unlock(&dev->texture_cache_lock);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
                 const VkAllocationCallbacks *pAllocator)
@@ -578,6 +714,20 @@ cpvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
       return;
 
    cuCtxSetCurrent(dev->cu_ctx);
+   if (cp_debug->texture_cache && mem->bindings)
+      cpvk_DeviceWaitIdle(_device);
+   while (mem->bindings) {
+      struct cpvk_memory_binding *binding = mem->bindings;
+      struct cpvk_memory_binding *next = binding->next;
+      if (binding->image) {
+         cpvk_texture_cache_image_destroy(binding->image);
+         binding->image->mem = NULL;
+      } else if (binding->resource) {
+         ((struct cpvk_buffer *)binding->resource)->mem = NULL;
+      }
+      free(binding);
+      mem->bindings = next;
+   }
    cuMemFree(mem->dev_ptr);
 
    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
@@ -646,6 +796,7 @@ cpvk_DestroyBuffer(VkDevice _device, VkBuffer _buffer,
    if (!buffer)
       return;
 
+   cpvk_memory_note_unbind(dev, buffer->mem, buffer);
    vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
 }
 
@@ -675,6 +826,8 @@ cpvk_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
 
       buffer->mem = mem;
       buffer->offset = pBindInfos[i].memoryOffset;
+      cpvk_memory_note_bind(cpvk_device_from_handle(_device), mem,
+                            buffer->offset, buffer->vk.size, buffer, NULL);
       if (mem && pBindInfos[i].memoryOffset + buffer->vk.size > mem->vk.size)
          fprintf(stderr, "cudapipe: buffer of %llu bytes bound at %llu into an "
                  "allocation of %llu -- it does not fit\n",

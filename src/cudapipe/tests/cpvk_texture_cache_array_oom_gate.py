@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""OOM one disposable CUDA array and require whole-launch soft fallback."""
+import os
+import re
+import subprocess
+import sys
+
+env = os.environ.copy()
+env["CUDAPIPE_TEXTURE_CACHE"] = "1"
+env["CUDAPIPE_TEXTURE_CACHE_STATS"] = "1"
+env["CUDAPIPE_TEXTURE_CACHE_FAIL_ARRAY_ALLOC_AT"] = "1"
+run = subprocess.run([sys.argv[1]], env=env, text=True,
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+sys.stdout.write(run.stdout)
+sys.stderr.write(run.stderr)
+if run.returncode:
+    raise SystemExit(run.returncode)
+if "PASS binding 0 and binding 1" not in run.stdout:
+    raise SystemExit("derived-array OOM changed exact pixels")
+hw = re.search(r"hardware texture: (\d+)/(\d+) fragment launches hit .*"
+               r"fallbacks shader=(\d+) descriptor=(\d+)", run.stderr)
+res = re.search(r"texture cache resources: hits=(\d+) fallbacks=(\d+) "
+                r"rebuilds=(\d+).*arrays=(\d+) objects=(\d+) "
+                r"alloc_failures=(\d+)", run.stderr)
+if not hw or tuple(map(int, hw.groups())) != (3, 4, 0, 1):
+    raise SystemExit("derived-array OOM was not one whole-launch soft fallback")
+if not res or tuple(map(int, res.groups())) != (6, 1, 2, 1, 2, 1):
+    raise SystemExit("derived-array OOM cache resource counts changed")

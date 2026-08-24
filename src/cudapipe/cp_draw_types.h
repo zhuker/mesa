@@ -115,6 +115,7 @@ struct cp_fb_desc {
    void *color;                     /* base address, NULL for depth-only */
    int color_encoding;              /* enum cp_color_encoding, -1 = unsupported */
    unsigned color_sample_stride;
+   uint64_t texture_cookie;          /* native cpvk_image_view, Gallium zero */
    bool has_zs;
 };
 

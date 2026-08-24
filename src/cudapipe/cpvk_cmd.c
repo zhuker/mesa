@@ -197,6 +197,9 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
             if (layout->immutable[d])
                set->host[d].sampler_index_or_img_stride =
                   layout->immutable_sampler[d];
+            if (layout->immutable[d])
+               set->host[d].sampler_cookie =
+                  (uint64_t)layout->immutable_sampler[d] + 1;
          }
       }
 
@@ -319,6 +322,9 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
    /* A rewritten descriptor is a new kind; drop any storage-image view the
     * previous write left behind. */
    set->views[flat] = NULL;
+   set->host[flat].image_cookie = 0;
+   if (!set->immutable[flat])
+      set->host[flat].sampler_cookie = 0;
 
    switch (type) {
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
@@ -357,10 +363,12 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
       if (ii->imageView) {
          VK_FROM_HANDLE(cpvk_image_view, view, ii->imageView);
          set->host[flat].texture_info = view ? view->tex_info : 0;
+         set->host[flat].image_cookie = view ? view->cache_cookie : 0;
       }
       if (ii->sampler && !set->immutable[flat]) {
          VK_FROM_HANDLE(cpvk_sampler, samp, ii->sampler);
          set->host[flat].sampler_index_or_img_stride = samp ? samp->index : 0;
+         set->host[flat].sampler_cookie = samp ? (uint64_t)samp->index + 1 : 0;
       }
 
       /*
@@ -407,6 +415,7 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
          set->views[flat] = view;
          set->has_storage_views = true;
          cpvk_storage_image_row(&set->host[flat], view);
+         set->host[flat].image_cookie = view ? view->cache_cookie : 0;
       }
 
       break;
@@ -488,12 +497,15 @@ cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
             continue;
          uint32_t immutable_sampler =
             dst->host[df].sampler_index_or_img_stride;
+         uint64_t immutable_sampler_cookie = dst->host[df].sampler_cookie;
          dst->host[df] = descriptors[e];
          dst->addrs[df] = addrs[e];
          dst->views[df] = views[e];
          dst->has_storage_views |= views[e] != NULL;
-         if (dst->immutable[df])
+         if (dst->immutable[df]) {
             dst->host[df].sampler_index_or_img_stride = immutable_sampler;
+            dst->host[df].sampler_cookie = immutable_sampler_cookie;
+         }
       }
       free(descriptors);
       free(addrs);
@@ -1504,6 +1516,9 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          /* How far apart the samples are, which the renderer needs in order
           * to write them and the resolve needs in order to find them. */
          fb.color_sample_stride = (unsigned)cimg->sample_stride;
+         /* Trusted internal mutation token, not a descriptor cookie. Its lifetime
+          * follows Vulkan command-resource lifetime rules. */
+         fb.texture_cookie = (uint64_t)(uintptr_t)view->image;
 
          if (cpvk_debug_rt())
             fprintf(stderr, "rt: %ux%u layer=%u level=%u layers=%u img=%ux%u "
@@ -1589,6 +1604,7 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          uint64_t offset_y = (uint64_t)pRenderingInfo->renderArea.offset.y;
          uint64_t offset_x = (uint64_t)pRenderingInfo->renderArea.offset.x;
          cmd->depth_resolve = (struct cpvk_copy) {
+            .dst_image = rimg,
             .src = depth.data + offset_y * depth.row_stride + offset_x * bpp,
             .dst = rimg->mem->dev_ptr + rimg->offset +
                    rimg->level_offset[rlevel] +
@@ -1670,6 +1686,7 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
             rimg->row_stride[rlevel] +
          (uint64_t)pRenderingInfo->renderArea.offset.x * bpp;
       cmd->resolve = (struct cpvk_copy) {
+         .dst_image = rimg,
          .src = (CUdeviceptr)(uintptr_t)fb.color + src_offset,
          .dst = rimg->mem->dev_ptr + rimg->offset + dst_offset,
          .src_pitch = cimg->row_stride[color_level],
@@ -1721,6 +1738,7 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       if (!op)
          return;
       op->clear = (struct cpvk_clear) {
+         .image = cimg,
          .data = fb.color,
          .offset =
             (uint64_t)pRenderingInfo->renderArea.offset.y *
@@ -1950,7 +1968,7 @@ cpvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
 }
 
 /* A recorded clear, at submit. */
-void
+bool
 cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c)
 {
    struct cp_context *cp = &dev->renderer;
@@ -1960,21 +1978,24 @@ cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c)
 
    if (c->depth) {
       uint32_t value[4] = { cp_depth_to_sortable(c->depth_value) };
+      bool ok = true;
       for (unsigned s = 0; s < MAX2(c->samples, 1u); s++)
-         cp_clear_rect(cp,
+         ok &= cp_clear_rect(cp,
                        (void *)(uintptr_t)(cp->depthbuf +
                                            s * c->sample_stride),
                        c->offset, c->width, c->height, c->stride,
                        c->pixel_size, value, true);
-      cp->depthbuf_cleared = true;
-      return;
+      cp->depthbuf_cleared = ok;
+      return ok;
    }
 
    /* Once per sample plane. */
+   bool ok = true;
    for (unsigned s = 0; s < MAX2(c->samples, 1u); s++)
-      cp_clear_rect(cp, (char *)c->data + s * c->sample_stride, c->offset,
+      ok &= cp_clear_rect(cp, (char *)c->data + s * c->sample_stride, c->offset,
                     c->width, c->height, c->stride, c->pixel_size, c->value,
                     false);
+   return ok;
 }
 
 /* ------------------------------------------------------------- batching */
@@ -2771,6 +2792,7 @@ cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
          if (!c)
             return;
          *c = (struct cpvk_copy) {
+            .dst_image = dst,
             .src = sb + src_plane + src_xy,
             .dst = db + dst_plane + dst_xy,
             .src_pitch = sp,
@@ -2843,6 +2865,7 @@ cpvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
             if (!c)
                return;
             *c = (struct cpvk_copy) {
+               .dst_image = img,
                .src = buf->mem->dev_ptr + buf->offset + r->bufferOffset +
                       ((size_t)l * depth + z) * src_slice,
                .dst = ib +
@@ -3023,6 +3046,7 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
                           dst->level_size[r->dstSubresource.mipLevel];
 
       *c = (struct cpvk_copy) {
+         .dst_image = dst,
          .src = sb + bs_layer + (size_t)r->srcOffsets[0].y * sp +
                 (size_t)r->srcOffsets[0].x * sbpp,
          .dst = db + bd_layer + (size_t)r->dstOffsets[0].y * dp +
@@ -3109,6 +3133,7 @@ cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
       if (!c)
          return;
       *c = (struct cpvk_copy) {
+         .dst_image = dst,
          .src = sb + (size_t)r->srcOffset.y * sp + (size_t)r->srcOffset.x * sbpp,
          .dst = db + (size_t)r->dstOffset.y * dp + (size_t)r->dstOffset.x * dbpp,
          .src_pitch = sp,

@@ -33,6 +33,7 @@ libcudapipe_vk_files = files(
   'cpvk_cmd.c',
   'cpvk_sync.c',
   'cpvk_image.c',
+  'cpvk_texture_cache.c',
 )
 
 # The renderer, the flag registry, the kernel loader and the NIR-to-PTX
@@ -102,7 +103,7 @@ endif
 # NVRTC compiles the kernels from source at runtime, so stringify each .cu
 # into a C string the driver can hand it.
 cpvk_kernel_incs = []
-foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_fs.cu',
+foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_math.cu', 'cp_fs.cu',
                   'cp_vertex_fetch.cu', 'cp_rast_types.h', 'cp_fs_interp.h']
   cpvk_kernel_incs += custom_target(
     'cpvk_' + kernel + '.inc',
@@ -218,6 +219,9 @@ if dep_vulkan_loader.found()
     'cpvk_rtt',
     'cpvk_sampler_array',
     'cpvk_sampler_two_bindings',
+    'cpvk_texture_cache_descriptors',
+    'cpvk_texture_cache_ops',
+    'cpvk_texture_cache_no_replay',
     'cpvk_secondary_descriptor',
     'cpvk_push_stages',
     'cpvk_smoke',
@@ -239,6 +243,86 @@ if dep_vulkan_loader.found()
          suite : 'cudapipe-native',
          env : cpvk_test_env,
          timeout : 120,
+         is_parallel : false,
          depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+    if test_name == 'cpvk_sampler_two_bindings'
+      cpvk_texture_cache_test_exe = test_exe
+    endif
+    if test_name == 'cpvk_texture_cache_no_replay'
+      cpvk_texture_cache_no_replay_exe = test_exe
+    endif
   endforeach
+  cpvk_texture_cache_formats_exe = executable(
+    'cpvk_texture_cache_formats',
+    files('tests/cpvk_texture_cache_formats.c'),
+    dependencies : dep_vulkan_loader,
+    c_args : ['-Wno-error=missing-prototypes'],
+    build_by_default : false)
+  test('cpvk_texture_cache_formats_gate', prog_python,
+       args : [files('tests/cpvk_texture_cache_formats_gate.py'),
+               cpvk_texture_cache_formats_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  test('cpvk_texture_cache_gate', prog_python,
+       args : [files('tests/cpvk_texture_cache_gate.py'),
+               cpvk_texture_cache_test_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  test('cpvk_texture_cache_fault_gate', prog_python,
+       args : [files('tests/cpvk_texture_cache_fault_gate.py'),
+               cpvk_texture_cache_test_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  test('cpvk_texture_cache_purge_gate', prog_python,
+       args : [files('tests/cpvk_texture_cache_purge_gate.py'),
+               cpvk_texture_cache_test_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  test('cpvk_texture_cache_oom_gate', prog_python,
+       args : [files('tests/cpvk_texture_cache_oom_gate.py'),
+               cpvk_texture_cache_test_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  test('cpvk_texture_cache_array_oom_gate', prog_python,
+       args : [files('tests/cpvk_texture_cache_array_oom_gate.py'),
+               cpvk_texture_cache_test_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  test('cpvk_texture_cache_object_oom_gate', prog_python,
+       args : [files('tests/cpvk_texture_cache_object_oom_gate.py'),
+               cpvk_texture_cache_test_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  test('cpvk_texture_cache_conversion_fault_gate', prog_python,
+       args : [files('tests/cpvk_texture_cache_conversion_fault_gate.py'),
+               cpvk_texture_cache_formats_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  test('cpvk_texture_cache_no_replay_fault',
+       cpvk_texture_cache_no_replay_exe,
+       args : ['--fault'],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  test('cpvk_texture_cache_fs_arg_fault_gate', prog_python,
+       args : [files('tests/cpvk_texture_cache_fs_arg_fault_gate.py'),
+               cpvk_texture_cache_no_replay_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  test('cpvk_texture_cache_create_fault_gate', prog_python,
+       args : [files('tests/cpvk_texture_cache_create_fault_gate.py'),
+               cpvk_texture_cache_no_replay_exe,
+               cpvk_texture_cache_formats_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
 endif
