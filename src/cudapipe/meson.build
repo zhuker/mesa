@@ -92,6 +92,27 @@ if dep_llvm.version().version_compare('>=18.0.0')
       command : [prog_python, files('kernels/bin_to_inc.py'), '@INPUT@', '@OUTPUT@'],
     )
     cpvk_fs_inline_args += '-DCP_HAVE_FS_INLINE_BC'
+    # The same substitution for the vertex fetch: one lane routine, compiled a
+    # second time to bitcode so the generated vertex shader can inline it.
+    cpvk_vs_inline_bc = custom_target(
+      'cpvk_vs_inline.bc',
+      input : ['kernels/cp_vs_inline.c', 'kernels/cp_vf_lane.h',
+               'kernels/cp_rast_types.h'],
+      output : 'cp_vs_inline.bc',
+      command : [cpvk_clang,
+        '-target', 'nvptx64-nvidia-cuda', '-march=sm_86', '--cuda-feature=+ptx75',
+        '-O1', '-ffreestanding', '-nostdlib', '-ffp-contract=off',
+        '-emit-llvm', '-c', '@INPUT0@',
+        '-I' + meson.current_source_dir() + '/kernels', '-o', '@OUTPUT@'],
+    )
+    cpvk_vs_inline_inc = custom_target(
+      'cpvk_vs_inline.bc.inc',
+      input : cpvk_vs_inline_bc,
+      output : 'cp_vs_inline.bc.inc',
+      command : [prog_python, files('kernels/bin_to_inc.py'), '@INPUT@', '@OUTPUT@'],
+    )
+    cpvk_fs_inline_inc = [cpvk_fs_inline_inc, cpvk_vs_inline_inc]
+    cpvk_fs_inline_args += '-DCP_HAVE_VS_INLINE_BC'
   else
     warning('cudapipe: matching clang-' + cpvk_llvm_major +
             ' not found; building with fused/classic fragment interpolation')
@@ -105,7 +126,8 @@ endif
 # into a C string the driver can hand it.
 cpvk_kernel_incs = []
 foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_math.cu', 'cp_fs.cu',
-                  'cp_vertex_fetch.cu', 'cp_rast_types.h', 'cp_fs_interp.h']
+                  'cp_vertex_fetch.cu', 'cp_rast_types.h', 'cp_fs_interp.h',
+                  'cp_vf_lane.h']
   cpvk_kernel_incs += custom_target(
     'cpvk_' + kernel + '.inc',
     input : ['kernels/' + kernel],
