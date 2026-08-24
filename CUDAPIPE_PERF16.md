@@ -1047,3 +1047,88 @@ design is recorded separately; it was not implemented here.
 Reports and evidence: `/tmp/perf16/iter24-production-review.md`,
 `/tmp/perf16/iter24-report.md`, and
 `/tmp/perf16/iter24-acceptance/final-frozen/`.
+
+
+## Iteration 25 — episode-global tagged A-buffer stage 3 (COUNT only)
+
+An opt-in `CUDAPIPE_EPISODE_RASTER=1` mechanism replaces the per-segment
+A-buffer COUNT stage 3 of a pass episode with one global tagged launch. Stage 2
+publishes each segment's exact `cp_rasterize_args` from the device into a
+job table, reserves the whole tile run of a triangle with one 64-bit
+`atomicAdd`, and appends `{tri_id, tile_x, tile_y, job_id, flags}` pairs to a
+separate episode-lifetime queue. The eight per-stream classic queue sets are
+never deferred, and the setup cache is disabled for admitted COUNT work so a
+tagged pair always names a raw primitive. Admission requires the record array
+and `abuf_fill_recs`, so FILL keeps its existing linear replay.
+
+The host enqueues the single stage 3 straight behind the checked producer
+join: no synchronisation, no tail read, no job upload. Exactly one decision
+follows, at the latest point at which nothing has been shaded — before the
+bounded-group path's first shade, or at the main path's existing drain.
+Overflow is bounded and re-renders the whole episode classically before any
+fragment shader; corruption (bad job id, flags, setup tag, misaligned tile,
+invalid primitive, tile outside the producer's own bounding box) latches
+device loss. Pre-producer OOM is a soft refusal; every failure after a
+producer has published is fatal.
+
+Gates prove two full 64-job episodes, job id 63 produced and consumed, exact
+capacity admitted, capacity+1 falling back before any FS and then retiring the
+overflow by growing in the same context, recordless and allocation-refusal
+exclusions, and five deterministic fault seams. A negative control confirms the
+state-leak gate: with the `pending` reset removed, a following classic episode
+validates the abandoned counters and re-renders segments it had already drawn.
+Output is bit-identical to llvmpipe and to the classic chain, and the native
+suite passes 59/59 both default-off and mechanism-on.
+
+The mechanism works and removes launches, but it does not pay. Corrected
+two-replay AB/BA medians, paired submits, same binary on and off:
+
+| capture | mechanism | control | delta |
+|---|---|---|---|
+| old | 17.4509 ms | 17.4501 ms | -0.0008 ms (-0.004%) |
+| Crossroads | 6.2784 ms | 6.2501 ms | -0.0283 ms (-0.452%) |
+
+Stdout hashes are identical on both captures, so this is purely a cost result.
+
+The cause is measured, not inferred. On the old capture the mechanism removes
+123.8 classic COUNT stage 3 launches per frame and adds 11.6, a net 112 fewer
+launches per frame; on Crossroads it removes only 22.4 and adds 7.2, because
+that capture's episodes average 1.36 segments. Splitting the decision wait by
+call site shows where the saving goes:
+
+| capture | bounded checks | bounded wait | main checks | main wait |
+|---|---|---|---|---|
+| old | 2581 | 630.3 ms (244 us each, 0.417 ms/frame) | 14932 | 2.0 ms |
+| Crossroads | 2442 | 556.1 ms (228 us each, 0.371 ms/frame) | 8333 | 1.2 ms |
+
+The main path's check is free because that path already drained. The bounded
+group path did not: it ran entirely asynchronously, and the mechanism's one
+required decision introduces a full synchronisation there, worth about the
+same as the launches it removes. The per-segment COUNT stage 3 launches were
+also already spread over eight side streams, so merging them onto the main
+stream serialises work that had been concurrent.
+
+Verdict: **rejected as neutral, and the mechanism code was reverted.** It is
+not a correctness risk, but it has no route to a win while the bounded-group
+path must synchronise once per episode, and a neutral result does not justify
+carrying a device ABI, a second stage-2/stage-3 kernel pair and six switches.
+A future attempt has to prove the overflow and corruption bounds on the device
+so that path keeps its asynchrony; it should restart from the design and gates
+recorded here rather than from scratch.
+
+What survives in the tree is the fail-closed hardening this iteration exposed
+on the default path, which is independent of the mechanism: `cp_pass_join()`
+and `cp_pass_broadcast()` now report failure and every caller stops, so a
+failed join can no longer be followed by a composite, a re-render or a rollback
+re-execution; the episode's shared-list clears and its gate event in
+`cp_pass_append()` are checked; the rollback rechecks `device_fatal` before
+re-executing the batch; and the A-buffer count pass checks the queue-counter
+clear it depends on.
+
+The reverted mechanism diff is kept at `/tmp/perf16/iter25-full-mechanism.patch`
+(and the pre-revert renderer at `/tmp/perf16/iter25-cp_renderer.c.mechanism`).
+
+Evidence: `/tmp/perf16/iter25-mechanism-report.md`,
+`/tmp/perf16/iter25-tworeplay/`, `/tmp/perf16/iter25-tworeplay-report.txt`,
+`/tmp/perf16/iter25-stats2/`, `/tmp/perf16/iter25-gate5.out`, and the negative
+control `/tmp/perf16/iter25-gate-negctl.err`.

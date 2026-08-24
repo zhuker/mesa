@@ -199,6 +199,14 @@
    "old_median_ms": 17.2279,
    "sweep_hot_ms": 19.51,
    "note": "authoritative linear images plus epoch-keyed disposable CUDA arrays; strict HW-inline + resource-isolated HW-fused. Final old 157095/157211 HW launches, AB/BA 17.2279 vs 23.0661ms (gain5.8382). Correctness: serial58/58 both modes, focused14/14, old10/Cross9 sentinels and stored60 external gates pass (standing gltf exception; renderheadless manual exact within tol). Benchmark600 17 loop rows exit0, sum19.51ms; 16ms goal remains 1.228ms high. Kept opt-in checkpoint; iteration25 owns global raster."
+  },
+  {
+   "id": 25,
+   "name": "episode-global tagged A-buffer stage3 (COUNT only), opt-in",
+   "verdict": "rejected (neutral); mechanism reverted",
+   "old_median_ms": 17.4509,
+   "sweep_hot_ms": null,
+   "note": "one tagged stage3 per pass episode replaces the per-segment COUNT stage3s; device-published job table, one uint64 reservation atomic per triangle, separate episode-lifetime queue (classic 8 qsets untouched). Corrected two-replay AB/BA paired-submit medians: old 17.4509 vs 17.4501 (-0.0008ms, -0.004%), Crossroads 6.2784 vs 6.2501 (-0.0283ms, -0.452%); stdout hashes identical both captures. Removes 123.8 classic COUNT stage3 launches/frame on old (net -112) and only 22.4 on Crossroads (1.36 segs/episode). Cause measured: the one required pre-FS decision costs 244us x2581 = 0.417ms/frame on old and 228us x2442 = 0.371ms/frame on Crossroads, all of it in the bounded-group path which previously never synchronised (main-path check 2.0/1.2ms total); merging also serialises 8 side streams onto the main stream. Correctness clean: 59/59 native default-off and mechanism-on, gate proves 2x64-job episodes, job63 consumed, exact capacity, capacity+1 pre-FS fallback then same-context growth, 5 fault seams, state-leak negative control, output bit-identical to llvmpipe. Mechanism REVERTED from the tree (no route to a win until the bounded path's bounds are proven on the device); diff kept at /tmp/perf16/iter25-full-mechanism.patch. Retained on the default path: checked cp_pass_join/cp_pass_broadcast with every caller stopping on failure, checked episode clears and gate event in cp_pass_append, rollback device_fatal recheck, and no composite/re-render after a failed join. Native suite 58/58 after the revert."
   }
  ]
 }
