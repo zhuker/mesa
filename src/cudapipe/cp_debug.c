@@ -211,6 +211,19 @@ static const struct cp_flag_def flags[] = {
      F(abuf_short_sort_max),
      "largest A-buffer run sorted by one thread", .dflt = 16,
      .has_range = true, .lo = 2, .hi = 64 },
+   { "CUDAPIPE_NO_ABUF_FUSE_SCAN", CP_FLAG_BOOL_VALUE, F(no_abuf_fuse_scan),
+     "restore the three- or five-launch A-buffer prefix sum instead of the "
+     "fused reduce plus finish, and its separate fill-cursor clear" },
+   { "CUDAPIPE_NO_ABUF_FUSE_QUAD", CP_FLAG_BOOL_VALUE, F(no_abuf_fuse_quad),
+     "restore the A-buffer quad build's separate block worklist, counting "
+     "pass, three-launch scan and blk_counts clear" },
+   { "CUDAPIPE_ABUF_FUSE_CHECK", CP_FLAG_BOOL_VALUE, F(abuf_fuse_check),
+     "run the classic A-buffer scan and quad count beside the fused ones and "
+     "compare every element on the device; gate only, never timed" },
+   { "CUDAPIPE_ABUF_FUSE_BREAK", CP_FLAG_UINT, F(abuf_fuse_break),
+     "negative control for the fusion check: 1 drops the block base in the "
+     "fused scan, 2 stops the fused quad count writing an uncovered zero",
+     .has_range = true, .lo = 0, .hi = 2 },
    { "CUDAPIPE_FLUSH_DRAIN", CP_FLAG_BOOL_VALUE, F(flush_drain),
      "restore the draining flush: cp_flush waits for the whole device and "
      "rewinds the arenas in place instead of ping-ponging generations" },

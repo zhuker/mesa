@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-93 switches.
+97 switches.
 
 ## Tracing
 
@@ -76,6 +76,10 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_NO_ABUF_SHORT_SORT` | bool (value) | `off` | — | disable the single-thread short A-buffer run sorter |
 | `CUDAPIPE_NO_ABUF_WARP_BUCKET` | bool (value) | `off` | — | disable warp-aggregated A-buffer segment bucketing atomics |
 | `CUDAPIPE_ABUF_SHORT_SORT_MAX` | uint | `16` | 2&ndash;64 | largest A-buffer run sorted by one thread |
+| `CUDAPIPE_NO_ABUF_FUSE_SCAN` | bool (value) | `off` | — | restore the three- or five-launch A-buffer prefix sum instead of the fused reduce plus finish, and its separate fill-cursor clear |
+| `CUDAPIPE_NO_ABUF_FUSE_QUAD` | bool (value) | `off` | — | restore the A-buffer quad build's separate block worklist, counting pass, three-launch scan and blk_counts clear |
+| `CUDAPIPE_ABUF_FUSE_CHECK` | bool (value) | `off` | — | run the classic A-buffer scan and quad count beside the fused ones and compare every element on the device; gate only, never timed |
+| `CUDAPIPE_ABUF_FUSE_BREAK` | uint | `0` | 0&ndash;2 | negative control for the fusion check: 1 drops the block base in the fused scan, 2 stops the fused quad count writing an uncovered zero |
 | `CUDAPIPE_FLUSH_DRAIN` | bool (value) | `off` | — | restore the draining flush: cp_flush waits for the whole device and rewinds the arenas in place instead of ping-ponging generations |
 | `CUDAPIPE_NO_SEG_MERGE` | bool (value) | `off` | — | disable merged shading groups: every episode segment shades in its own launch group, as before |
 | `CUDAPIPE_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |

@@ -1455,6 +1455,140 @@ cp_abuf_scan_add(uint32_t *data, const uint32_t *sums, uint32_t n,
 }
 
 /*
+ * ---------------------------------------------------------------------------
+ * The same scan in two launches instead of three or five
+ * ---------------------------------------------------------------------------
+ *
+ * `cp_abuf_scan_block` + `cp_abuf_scan_add` need one level per 512 elements
+ * and an add-back per level, so a 921,600-pixel scan costs five launches. The
+ * pair below costs two for any n, and produces bit-identical offsets.
+ *
+ * The host picks one tiling and every kernel here shares it:
+ *
+ *     ept  = max(1, ceil(n / (512*512)))     elements per thread
+ *     grid = ceil(n / (512*ept))             <= 512, by that choice of ept
+ *
+ * `grid <= 512` is the whole trick: the array of per-block sums is small
+ * enough that *every* block can scan all of it itself, in shared memory, and
+ * read out both its own exclusive base and the grand total without waiting for
+ * or talking to any other block. There is no queue, no claiming and no
+ * residency here — each block still has a static index range and one exit.
+ * The redundant top-level scan is ~512 loads out of a 2 KB array that every
+ * block reads, which is L2-resident by the second block.
+ */
+extern "C" __global__ void
+cp_abuf_scan_reduce(const uint32_t *in, uint32_t *sums, uint32_t n,
+                    uint32_t ept)
+{
+   __shared__ uint32_t red[CP_ABUF_SCAN_BLOCK];
+   uint32_t tid = threadIdx.x;
+   uint32_t base = blockIdx.x * (CP_ABUF_SCAN_BLOCK * ept);
+
+   uint32_t acc = 0;
+   for (uint32_t j = 0; j < ept; j++) {
+      uint32_t i = base + j * CP_ABUF_SCAN_BLOCK + tid;
+      if (i < n)
+         acc += in[i];
+   }
+
+   red[tid] = acc;
+   __syncthreads();
+   for (uint32_t off = CP_ABUF_SCAN_BLOCK >> 1; off; off >>= 1) {
+      if (tid < off)
+         red[tid] += red[tid + off];
+      __syncthreads();
+   }
+   if (tid == 0)
+      sums[blockIdx.x] = red[0];
+}
+
+/*
+ * The other half: the block's base out of the redundant top scan, then the
+ * block's own tile in `ept` rounds of the same Hillis-Steele scan
+ * `cp_abuf_scan_block` runs, writing the final offsets straight out.
+ *
+ * `zero`, when given, is cleared over the same n. It is the fill cursor, whose
+ * memset was a separate 3.7 MB device operation immediately after this one.
+ *
+ * `counts`/`capacity`/`overflow` are `cp_abuf_scan_add`'s clamp, carried over
+ * unchanged except that the grand total it tests is already in a register.
+ * `break_mode` is the negative control and is 0 in every shipping path.
+ */
+extern "C" __global__ void
+cp_abuf_scan_finish(const uint32_t *in, uint32_t *out, const uint32_t *sums,
+                    uint32_t nsums, uint32_t n, uint32_t ept,
+                    uint32_t *total_out, uint32_t *zero, uint32_t *counts,
+                    uint32_t capacity, uint32_t *overflow, uint32_t break_mode)
+{
+   __shared__ uint32_t buf[2][CP_ABUF_SCAN_BLOCK];
+   __shared__ uint32_t sh_base, sh_total;
+   uint32_t tid = threadIdx.x;
+
+   /* The top level, redundantly, in every block. */
+   uint32_t s = tid < nsums ? sums[tid] : 0u;
+   int pin = 0;
+   buf[pin][tid] = s;
+   __syncthreads();
+   for (uint32_t off = 1; off < CP_ABUF_SCAN_BLOCK; off <<= 1) {
+      uint32_t x = buf[pin][tid];
+      if (tid >= off)
+         x += buf[pin][tid - off];
+      pin ^= 1;
+      buf[pin][tid] = x;
+      __syncthreads();
+   }
+   if (tid == blockIdx.x)
+      sh_base = buf[pin][tid] - s;
+   if (tid == CP_ABUF_SCAN_BLOCK - 1)
+      sh_total = buf[pin][tid];
+   __syncthreads();
+
+   uint32_t run = break_mode == 1u ? 0u : sh_base;
+   uint32_t total = sh_total;
+   if (total_out && blockIdx.x == 0 && tid == 0)
+      *total_out = total;
+
+   uint32_t base = blockIdx.x * (CP_ABUF_SCAN_BLOCK * ept);
+   for (uint32_t j = 0; j < ept; j++) {
+      uint32_t i = base + j * CP_ABUF_SCAN_BLOCK + tid;
+      uint32_t v = i < n ? in[i] : 0u;
+
+      __syncthreads();
+      pin = 0;
+      buf[pin][tid] = v;
+      __syncthreads();
+      for (uint32_t off = 1; off < CP_ABUF_SCAN_BLOCK; off <<= 1) {
+         uint32_t x = buf[pin][tid];
+         if (tid >= off)
+            x += buf[pin][tid - off];
+         pin ^= 1;
+         buf[pin][tid] = x;
+         __syncthreads();
+      }
+
+      uint32_t incl = buf[pin][tid];
+      uint32_t off_i = run + incl - v;
+      if (i < n) {
+         out[i] = off_i;
+         if (zero)
+            zero[i] = 0u;
+         /* Identical to cp_abuf_scan_add's clamp, including the counter it
+          * reports into: a run that cannot fit is cut and the difference is
+          * the same overflow the drain's verdict already reads. */
+         if (counts && total > capacity) {
+            uint32_t c = counts[i];
+            uint32_t room = off_i < capacity ? capacity - off_i : 0u;
+            if (c > room) {
+               counts[i] = room;
+               atomicAdd(overflow, c - room);
+            }
+         }
+      }
+      run += buf[pin][CP_ABUF_SCAN_BLOCK - 1];
+   }
+}
+
+/*
  * Pixels with at least `min_count` fragments. Only 4.6% of the framebuffer is
  * covered at all, so this turns a grid over every pixel into a grid over the
  * ~40,000 that have anything in them.
@@ -1926,6 +2060,140 @@ cp_abuf_quad_fill(const uint32_t *frags, const uint32_t *offsets,
       cp_abuf_merge_block(frags, offsets, counts, width, height, quad_width, b,
                           quad_prim, quad_mask, quad_peel_mask, quad_block,
                           shade_slot, blk_offsets[b], capacity, overflow);
+   }
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The same quad build in three launches instead of six
+ * ---------------------------------------------------------------------------
+ *
+ * `block_worklist` compacts the covered blocks, `quad_count` merges them into
+ * `blk_counts`, a three-launch scan turns those into `blk_offsets`, and
+ * `quad_fill` merges again at those offsets — six launches and a 0.9 MB memset
+ * of `blk_counts` beforehand.
+ *
+ * The pair below is laid out on the scan's own tiling of `nblocks`, so the
+ * counting pass can both replace the compaction (it tests coverage itself,
+ * from the four counts `block_worklist` was reading anyway) and produce the
+ * scan's per-block sums (its tile *is* the scan's tile). What is left is
+ * count -> `cp_abuf_scan_finish` -> fill.
+ *
+ * `blk_counts` is written for **every** b < nblocks, zero included, which is
+ * what retires the memset. That is the property `CUDAPIPE_ABUF_FUSE_CHECK`
+ * proves by pre-filling the array with a sentinel and counting survivors,
+ * rather than by reading the index arithmetic.
+ */
+extern "C" __global__ void
+cp_abuf_quad_count_all(const uint32_t *frags, const uint32_t *offsets,
+                       const uint32_t *counts, uint32_t width, uint32_t height,
+                       uint32_t quad_width, uint32_t nblocks,
+                       uint32_t *blk_counts, uint32_t *sums, uint32_t ept,
+                       uint32_t break_mode)
+{
+   __shared__ uint32_t red[CP_ABUF_SCAN_BLOCK];
+   uint32_t tid = threadIdx.x;
+   uint32_t base = blockIdx.x * (CP_ABUF_SCAN_BLOCK * ept);
+
+   uint32_t acc = 0;
+   for (uint32_t j = 0; j < ept; j++) {
+      uint32_t b = base + j * CP_ABUF_SCAN_BLOCK + tid;
+      if (b >= nblocks)
+         continue;
+
+      uint32_t qx = (b % quad_width) * 2;
+      uint32_t qy = (b / quad_width) * 2;
+      uint32_t any = 0;
+      for (int i = 0; i < 4; i++) {
+         uint32_t x = qx + (i & 1), y = qy + (i >> 1);
+         if (x < width && y < height)
+            any |= counts[(size_t)y * width + x];
+      }
+
+      uint32_t c = 0;
+      if (any)
+         c = cp_abuf_merge_block(frags, offsets, counts, width, height,
+                                 quad_width, b, NULL, NULL, NULL, NULL, NULL,
+                                 0, 0, NULL);
+      /* break_mode 2 is the negative control: leave the uncovered entry
+       * alone, which is exactly what a missing memset would look like. */
+      if (any || break_mode != 2u)
+         blk_counts[b] = c;
+      acc += c;
+   }
+
+   red[tid] = acc;
+   __syncthreads();
+   for (uint32_t off = CP_ABUF_SCAN_BLOCK >> 1; off; off >>= 1) {
+      if (tid < off)
+         red[tid] += red[tid + off];
+      __syncthreads();
+   }
+   if (tid == 0 && sums)
+      sums[blockIdx.x] = red[0];
+}
+
+/*
+ * The fill, over every block rather than over the compacted list. A block with
+ * no quads is one load and a return; a block with quads runs the identical
+ * merge at the identical offset.
+ */
+extern "C" __global__ void
+cp_abuf_quad_fill_all(const uint32_t *frags, const uint32_t *offsets,
+                      const uint32_t *counts, uint32_t width, uint32_t height,
+                      uint32_t quad_width, uint32_t nblocks,
+                      const uint32_t *blk_counts, const uint32_t *blk_offsets,
+                      uint32_t *quad_prim, unsigned char *quad_mask,
+                      uint32_t *quad_peel_mask, uint32_t *quad_block,
+                      uint32_t *shade_slot, uint32_t capacity,
+                      uint32_t *overflow)
+{
+   uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+   if (b >= nblocks || !blk_counts[b])
+      return;
+   cp_abuf_merge_block(frags, offsets, counts, width, height, quad_width, b,
+                       quad_prim, quad_mask, quad_peel_mask, quad_block,
+                       shade_slot, blk_offsets[b], capacity, overflow);
+}
+
+/*
+ * The equivalence gate. Never launched unless CUDAPIPE_ABUF_FUSE_CHECK is set,
+ * so it costs nothing in any timed or shipping run.
+ *
+ * out[0] elements that differ, out[1] entries never written (still the
+ * sentinel), out[2] blocks where "has quads" disagrees with "is covered".
+ */
+extern "C" __global__ void
+cp_abuf_fuse_cmp(const uint32_t *a, const uint32_t *b, uint32_t n,
+                 uint32_t sentinel, uint32_t check_sentinel, uint32_t *out)
+{
+   uint32_t stride = gridDim.x * blockDim.x;
+   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+      if (a[i] != b[i])
+         atomicAdd(out, 1u);
+      if (check_sentinel && a[i] == sentinel)
+         atomicAdd(out + 1, 1u);
+   }
+}
+
+extern "C" __global__ void
+cp_abuf_fuse_cover(const uint32_t *counts, uint32_t width, uint32_t height,
+                   uint32_t quad_width, uint32_t nblocks,
+                   const uint32_t *blk_counts, uint32_t *out)
+{
+   uint32_t stride = gridDim.x * blockDim.x;
+   for (uint32_t b = blockIdx.x * blockDim.x + threadIdx.x; b < nblocks;
+        b += stride) {
+      uint32_t qx = (b % quad_width) * 2;
+      uint32_t qy = (b / quad_width) * 2;
+      uint32_t any = 0;
+      for (int i = 0; i < 4; i++) {
+         uint32_t x = qx + (i & 1), y = qy + (i >> 1);
+         if (x < width && y < height)
+            any |= counts[(size_t)y * width + x];
+      }
+      if ((any != 0u) != (blk_counts[b] != 0u))
+         atomicAdd(out + 2, 1u);
    }
 }
 

@@ -361,6 +361,14 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
 
    cuModuleGetFunction(&k->abuf_scan_block, k->module, "cp_abuf_scan_block");
    cuModuleGetFunction(&k->abuf_scan_add, k->module, "cp_abuf_scan_add");
+   cuModuleGetFunction(&k->abuf_scan_reduce, k->module, "cp_abuf_scan_reduce");
+   cuModuleGetFunction(&k->abuf_scan_finish, k->module, "cp_abuf_scan_finish");
+   cuModuleGetFunction(&k->abuf_quad_count_all, k->module,
+                       "cp_abuf_quad_count_all");
+   cuModuleGetFunction(&k->abuf_quad_fill_all, k->module,
+                       "cp_abuf_quad_fill_all");
+   cuModuleGetFunction(&k->abuf_fuse_cmp, k->module, "cp_abuf_fuse_cmp");
+   cuModuleGetFunction(&k->abuf_fuse_cover, k->module, "cp_abuf_fuse_cover");
    cuModuleGetFunction(&k->abuf_worklist, k->module, "cp_abuf_worklist");
    cuModuleGetFunction(&k->abuf_sort, k->module, "cp_abuf_sort");
    cuModuleGetFunction(&k->abuf_sort_short, k->module,

@@ -496,6 +496,7 @@ cp_launch(struct cp_context *cp, CUfunction f,
    CUresult err = cp_upload_flush(cp);
    if (err != CUDA_SUCCESS)
       return err;
+   cp->launches++;
    return cuLaunchKernel(f, gx, gy, gz, bx, by, bz, shmem, stream,
                          params, extra);
 }
@@ -721,6 +722,10 @@ cp_plan_report(struct cp_context *cp)
               cp->plan.wait_peel_ns / 1e6, cp->plan.wait_peel_n,
               cp->plan.wait_seg_ns / 1e6, cp->plan.wait_seg_n,
               cp->plan.wait_upload_ns / 1e6, cp->plan.wait_upload_n);
+   fprintf(stderr, "cudapipe: kernel launches: %" PRIu64 " over %" PRIu64
+           " episodes and %" PRIu64 " render scopes (%.1f per episode)\n",
+           cp->launches, cp->plan.pass_finishes, cp->plan.scopes,
+           (double)cp->launches / (double)MAX2(cp->plan.pass_finishes, 1u));
    if (cp->plan.plan_hits + cp->plan.plan_misses)
       fprintf(stderr, "cudapipe: batch plan answered %" PRIu64 " of %" PRIu64
               " merge decisions (%.1f%%)\n", cp->plan.plan_hits,
@@ -840,6 +845,11 @@ cp_context_cleanup(struct cp_context *cp)
               cp->upload.blocks, cp->upload.flushes, cp->upload.bytes,
               cp->upload.empty, (int)!cp_debug->no_upload_coalesce);
    cp_smallop_report();
+   cp_abuf_fuse_report();
+   if (cp->fuse_check) {
+      cuMemFree(cp->fuse_check);
+      cp->fuse_check = 0;
+   }
    cp_abuf_cleanup(cp->abuf);
    free(cp->abuf);
    cp->abuf = NULL;
@@ -1676,16 +1686,133 @@ cp_abuf_size_arrays(struct cp_context *cp, struct cp_abuf *ab, uint32_t total)
    return true;
 }
 
-/* counts -> offsets, exclusive, three levels. The grand total is left in
- * sums[0] of the top level on the device. Used over the pixels for the
- * fragment lists and over the 2x2 blocks for the quads. */
+/*
+ * The tiling the fused scan uses, and the fused quad count with it.
+ *
+ *     ept  = ceil(n / (512*512))   elements per thread, at least one
+ *     grid = ceil(n / (512*ept))
+ *
+ * `grid <= CP_ABUF_SCAN_BLOCK` follows: 512*512*ept >= n by the choice of ept,
+ * so ceil(n/(512*ept)) <= 512. That is the property the fusion rests on — the
+ * array of per-block sums is small enough for every block to scan all of it
+ * itself — and it holds for every n, with nothing sized to a bound and no
+ * buffer resized. `s1` already holds nb1 = ceil(n/512) >= grid words.
+ */
 void
-cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen,
-               CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x,
-               CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3,
-               unsigned n, unsigned nb1, unsigned nb2, unsigned nb3,
-               CUdeviceptr clamp_counts, uint32_t clamp_capacity,
-               CUdeviceptr clamp_overflow)
+cp_abuf_scan_tiling(unsigned n, unsigned *ept, unsigned *grid)
+{
+   unsigned e = DIV_ROUND_UP(n, CP_ABUF_SCAN_BLOCK * CP_ABUF_SCAN_BLOCK);
+   unsigned g;
+   if (!e)
+      e = 1;
+   g = DIV_ROUND_UP(n, CP_ABUF_SCAN_BLOCK * e);
+   if (!g)
+      g = 1;
+   assert(g <= CP_ABUF_SCAN_BLOCK);
+   *ept = e;
+   *grid = g;
+}
+
+bool
+cp_abuf_fuse_scan_ready(struct cp_device *screen)
+{
+   return !cp_debug->no_abuf_fuse_scan && screen->kernels.abuf_scan_reduce &&
+          screen->kernels.abuf_scan_finish;
+}
+
+bool
+cp_abuf_fuse_quad_ready(struct cp_device *screen)
+{
+   return !cp_debug->no_abuf_fuse_quad && screen->kernels.abuf_quad_count_all &&
+          screen->kernels.abuf_quad_fill_all &&
+          screen->kernels.abuf_scan_finish;
+}
+
+/*
+ * The equivalence gate's census. Only ever touched when
+ * CUDAPIPE_ABUF_FUSE_CHECK is set; the counters are read at teardown by
+ * cp_abuf_fuse_report(), which is what a gate run looks at.
+ */
+static uint64_t cp_fuse_scans, cp_fuse_quads, cp_fuse_bad_elems;
+static uint64_t cp_fuse_bad_total, cp_fuse_unwritten, cp_fuse_bad_cover;
+
+void
+cp_abuf_fuse_report(void)
+{
+   if (!cp_debug->abuf_fuse_check || !(cp_fuse_scans + cp_fuse_quads))
+      return;
+   fprintf(stderr,
+           "cudapipe: abuf fusion check: %" PRIu64 " scans and %" PRIu64
+           " quad builds compared against the classic chain element by "
+           "element; %" PRIu64 " differing elements, %" PRIu64
+           " differing totals, %" PRIu64 " entries never written, %" PRIu64
+           " coverage violations\n",
+           cp_fuse_scans, cp_fuse_quads, cp_fuse_bad_elems, cp_fuse_bad_total,
+           cp_fuse_unwritten, cp_fuse_bad_cover);
+}
+
+static CUdeviceptr
+cp_abuf_fuse_counters(struct cp_context *cp)
+{
+   if (!cp->fuse_check) {
+      if (cuMemAlloc(&cp->fuse_check, 8 * sizeof(uint32_t)) != CUDA_SUCCESS) {
+         cp->fuse_check = 0;
+         return 0;
+      }
+      cuMemsetD32(cp->fuse_check, 0, 8);
+   }
+   return cp->fuse_check;
+}
+
+/*
+ * Read the gate's four counters, fold them into the census and clear them.
+ * This synchronises, which is exactly why it is behind a flag: a gate run is
+ * never a timed run.
+ */
+static void
+cp_abuf_fuse_tally(struct cp_context *cp, const char *what)
+{
+   uint32_t c[4] = { 0, 0, 0, 0 };
+   if (!cp->fuse_check)
+      return;
+   if (cuStreamSynchronize(cp->stream) != CUDA_SUCCESS ||
+       cuMemcpyDtoH(c, cp->fuse_check, sizeof(c)) != CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return;
+   }
+   cp_fuse_bad_elems += c[0];
+   cp_fuse_unwritten += c[1];
+   cp_fuse_bad_cover += c[2];
+   cp_fuse_bad_total += c[3];
+   if (c[0] | c[1] | c[2] | c[3])
+      fprintf(stderr, "cudapipe: abuf fusion check FAILED (%s): %u differing "
+              "elements, %u never written, %u coverage violations, %u "
+              "differing totals\n", what, c[0], c[1], c[2], c[3]);
+   cuMemsetD32Async(cp->fuse_check, 0, 4, cp->stream);
+}
+
+/* Count the elements of `a` that differ from `b`, and — when asked — the ones
+ * still holding the sentinel, meaning nothing wrote them. */
+static void
+cp_abuf_fuse_cmp(struct cp_context *cp, struct cp_device *screen,
+                 CUdeviceptr a, CUdeviceptr b, unsigned n, uint32_t sentinel,
+                 bool check_sentinel, CUdeviceptr counters)
+{
+   uint32_t sent = sentinel, chk = check_sentinel;
+   if (!screen->kernels.abuf_fuse_cmp || !counters)
+      return;
+   void *p[] = { &a, &b, &n, &sent, &chk, &counters };
+   CP_LAUNCH(screen->kernels.abuf_fuse_cmp, MIN2(DIV_ROUND_UP(n, 256u), 1024u),
+             1, 1, 256, 1, 1, 0, cp->stream, p, NULL);
+}
+
+static void
+cp_abuf_scan_classic(struct cp_context *cp, struct cp_device *screen,
+                     CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1,
+                     CUdeviceptr s1x, CUdeviceptr s2, CUdeviceptr s2x,
+                     CUdeviceptr s3, unsigned n, unsigned nb1, unsigned nb2,
+                     unsigned nb3, CUdeviceptr clamp_counts,
+                     uint32_t clamp_capacity, CUdeviceptr clamp_overflow)
 {
    if (nb1 <= CP_ABUF_SCAN_BLOCK) {
       void *p0[] = { &in, &out, &s1, &n };
@@ -1730,9 +1857,96 @@ cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen,
    }
 }
 
+/* The second half of the fused scan, on its own: the quad build's counting
+ * pass has already produced the block sums, so that scan needs only this. */
+void
+cp_abuf_scan_finish_only(struct cp_context *cp, struct cp_device *screen,
+                         CUdeviceptr in, CUdeviceptr out, CUdeviceptr sums,
+                         unsigned nsums, unsigned n, unsigned ept,
+                         CUdeviceptr total, CUdeviceptr zero,
+                         CUdeviceptr clamp_counts, uint32_t clamp_capacity,
+                         CUdeviceptr clamp_overflow)
+{
+   unsigned brk = cp_debug->abuf_fuse_break;
+   void *p[] = { &in, &out, &sums, &nsums, &n, &ept, &total, &zero,
+                 &clamp_counts, &clamp_capacity, &clamp_overflow, &brk };
+   CP_LAUNCH(screen->kernels.abuf_scan_finish, nsums, 1, 1,
+                  CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, p, NULL);
+}
+
+/*
+ * counts -> offsets, exclusive. The grand total is left on the device in
+ * `s3`. Used over the pixels for the fragment lists and over the 2x2 blocks
+ * for the quads.
+ *
+ * Two launches when the fusion is on, three or five when it is not. `zero`,
+ * when given, is an array of n words cleared in the same pass — the fill
+ * cursor, whose memset used to follow this call. It is only passed where no
+ * reallocation can happen between the scan and the fill.
+ */
+void
+cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen,
+               CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x,
+               CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3,
+               unsigned n, unsigned nb1, unsigned nb2, unsigned nb3,
+               CUdeviceptr clamp_counts, uint32_t clamp_capacity,
+               CUdeviceptr clamp_overflow, CUdeviceptr zero)
+{
+   unsigned ept, grid;
+
+   if (!cp_abuf_fuse_scan_ready(screen)) {
+      cp_abuf_scan_classic(cp, screen, in, out, s1, s1x, s2, s2x, s3, n, nb1,
+                           nb2, nb3, clamp_counts, clamp_capacity,
+                           clamp_overflow);
+      if (zero)
+         cuMemsetD32Async(zero, 0, n, cp->stream);
+      return;
+   }
+
+   cp_abuf_scan_tiling(n, &ept, &grid);
+
+   /*
+    * The gate. The classic chain runs first, into shadow buffers, with its
+    * clamp disabled so that it cannot disturb the counts the fused chain is
+    * about to read; the fused chain then runs into the live buffers and every
+    * offset and the grand total are compared on the device. The reassociation
+    * is over uint32 counts, so equality is exact by construction — this is
+    * not a tolerance.
+    */
+   CUdeviceptr sh_out = 0, sh1 = 0, sh1x = 0, sh2 = 0, sh2x = 0, sh3 = 0;
+   CUdeviceptr counters = 0;
+   if (cp_debug->abuf_fuse_check && n) {
+      counters = cp_abuf_fuse_counters(cp);
+      sh_out = cp_scratch_alloc_device(cp, (size_t)n * 4);
+      sh1 = cp_scratch_alloc_device(cp, (size_t)MAX2(nb1, 1u) * 4);
+      sh1x = cp_scratch_alloc_device(cp, (size_t)MAX2(nb1, 1u) * 4);
+      sh2 = cp_scratch_alloc_device(cp, (size_t)MAX2(nb2, 1u) * 4);
+      sh2x = cp_scratch_alloc_device(cp, (size_t)MAX2(nb2, 1u) * 4);
+      sh3 = cp_scratch_alloc_device(cp, (size_t)MAX2(nb3, 1u) * 4);
+      if (counters && sh_out && sh1 && sh1x && sh2 && sh2x && sh3)
+         cp_abuf_scan_classic(cp, screen, in, sh_out, sh1, sh1x, sh2, sh2x,
+                              sh3, n, nb1, nb2, nb3, 0, 0, 0);
+      else
+         sh_out = 0;
+   }
+
+   void *pr[] = { &in, &s1, &n, &ept };
+   CP_LAUNCH(screen->kernels.abuf_scan_reduce, grid, 1, 1,
+                  CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, pr, NULL);
+   cp_abuf_scan_finish_only(cp, screen, in, out, s1, grid, n, ept, s3, zero,
+                            clamp_counts, clamp_capacity, clamp_overflow);
+
+   if (sh_out) {
+      cp_abuf_fuse_cmp(cp, screen, out, sh_out, n, 0, false, counters);
+      cp_abuf_fuse_cmp(cp, screen, s3, sh3, 1, 0, false, counters + 3 * 4);
+      cp_fuse_scans++;
+      cp_abuf_fuse_tally(cp, "scan");
+   }
+}
+
 void
 cp_abuf_scan(struct cp_context *cp, struct cp_device *screen,
-             struct cp_abuf *ab, unsigned n)
+             struct cp_abuf *ab, unsigned n, CUdeviceptr zero)
 {
    /* The bootstrap count runs before the fragment array exists.  Preserve its
     * counts and offsets so that, after sizing the array from the total, the
@@ -1741,7 +1955,144 @@ cp_abuf_scan(struct cp_context *cp, struct cp_device *screen,
    unsigned capacity = ab->frags ? ab->capacity : ~0u;
    cp_abuf_scan_n(cp, screen, ab->counts, ab->offsets, ab->sum1, ab->sum1x,
                   ab->sum2, ab->sum2x, ab->sum3, n, ab->nb1, ab->nb2, ab->nb3,
-                  ab->counts, capacity, ab->overflow);
+                  ab->counts, capacity, ab->overflow, zero);
+}
+
+/*
+ * The quad build: how many distinct primitives each 2x2 block holds, where
+ * each block's quads go, and the merge that writes them.
+ *
+ * Classically that is a compaction pass, a counting pass, a three-launch
+ * prefix sum and a filling pass, behind a 0.9 MB clear of blk_counts. Fused
+ * it is three launches and no clear, because the counting pass takes over
+ * both the compaction (it tests coverage itself, from the four counts the
+ * compaction was reading anyway, and writes the zero the clear used to write)
+ * and the scan's reduce (its tile is the scan's tile). Both forms leave
+ * exactly the same blk_counts, blk_offsets, quad arrays and quad total.
+ */
+static void
+cp_abuf_quad_build(struct cp_context *cp, struct cp_device *screen,
+                   struct cp_abuf *ab, unsigned w, unsigned h)
+{
+   unsigned nblocks = ab->nblocks, qw = ab->quad_width;
+
+   if (cp_debug->no_counter_block) {
+      cuMemsetD32Async(ab->bsum3, 0, 2, cp->stream);
+      cuMemsetD32Async(ab->dbg, 0, CP_ABUF_DBG_COUNTERS, cp->stream);
+   }
+
+   if (!cp_abuf_fuse_quad_ready(screen)) {
+      if (cp_debug->no_counter_block)
+         cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
+      cp_abuf_mark(ab, ab->ev[6], cp->stream);
+      {
+         void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_list,
+                       &ab->blk_list_count };
+         CP_LAUNCH(screen->kernels.abuf_block_worklist,
+                        (nblocks + 255) / 256, 1, 1, 256, 1, 1,
+                        0, cp->stream, p, NULL);
+      }
+      cp_abuf_mark(ab, ab->ev[7], cp->stream);
+      cuMemsetD32Async(ab->blk_counts, 0, nblocks, cp->stream);
+      {
+         void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
+                       &ab->blk_list, &ab->blk_list_count, &ab->blk_counts };
+         /* 32 threads a block, not 256: there are only ~8,100 covered blocks,
+          * and a wide thread block packs them into a few dozen CUDA blocks
+          * that occupy a fraction of the SMs. */
+         CP_LAUNCH(screen->kernels.abuf_quad_count, 1024, 1, 1, 32, 1, 1,
+                        0, cp->stream, p, NULL);
+      }
+      cp_abuf_mark(ab, ab->ev[9], cp->stream);
+      cp_abuf_scan_n(cp, screen, ab->blk_counts, ab->blk_offsets, ab->bsum1,
+                     ab->bsum1x, ab->bsum2, ab->bsum2x, ab->bsum3, nblocks,
+                     ab->bnb1, ab->bnb2, ab->bnb3, 0, 0, 0, 0);
+      {
+         void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
+                       &ab->blk_list, &ab->blk_list_count, &ab->blk_offsets,
+                       &ab->quad_prim, &ab->quad_mask, &ab->peel_mask,
+                       &ab->quad_block, &ab->shade_slot, &ab->quad_capacity,
+                       &ab->quad_overflow };
+         CP_LAUNCH(screen->kernels.abuf_quad_fill, 1024, 1, 1, 32, 1, 1,
+                        0, cp->stream, p, NULL);
+      }
+      cp_abuf_mark(ab, ab->ev[10], cp->stream);
+      cp_abuf_mark(ab, ab->ev[8], cp->stream);
+      return;
+   }
+
+   unsigned ept, grid;
+   cp_abuf_scan_tiling(nblocks, &ept, &grid);
+
+   /*
+    * The gate: the classic compaction and count first, into a shadow array,
+    * and the live array pre-filled with a sentinel so that an entry the fused
+    * count fails to write is counted rather than inferred from the index
+    * arithmetic. Retiring the memset means every one of the nblocks entries
+    * must be written every episode, including the tail of the last tile.
+    */
+   CUdeviceptr counters = 0, sh_counts = 0;
+   if (cp_debug->abuf_fuse_check && nblocks) {
+      counters = cp_abuf_fuse_counters(cp);
+      sh_counts = cp_scratch_alloc_device(cp, (size_t)nblocks * 4);
+      if (counters && sh_counts) {
+         cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
+         void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_list,
+                       &ab->blk_list_count };
+         CP_LAUNCH(screen->kernels.abuf_block_worklist,
+                        (nblocks + 255) / 256, 1, 1, 256, 1, 1,
+                        0, cp->stream, p, NULL);
+         cuMemsetD32Async(sh_counts, 0, nblocks, cp->stream);
+         void *q[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
+                       &ab->blk_list, &ab->blk_list_count, &sh_counts };
+         CP_LAUNCH(screen->kernels.abuf_quad_count, 1024, 1, 1, 32, 1, 1,
+                        0, cp->stream, q, NULL);
+         cuMemsetD32Async(ab->blk_counts, 0xFFFFFFFFu, nblocks, cp->stream);
+      } else {
+         sh_counts = 0;
+      }
+   }
+
+   cp_abuf_mark(ab, ab->ev[6], cp->stream);
+   {
+      unsigned brk = cp_debug->abuf_fuse_break;
+      void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
+                    &nblocks, &ab->blk_counts, &ab->bsum1, &ept, &brk };
+      CP_LAUNCH(screen->kernels.abuf_quad_count_all, grid, 1, 1,
+                     CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, p, NULL);
+   }
+   cp_abuf_mark(ab, ab->ev[7], cp->stream);
+   cp_abuf_mark(ab, ab->ev[9], cp->stream);
+
+   cp_abuf_scan_finish_only(cp, screen, ab->blk_counts, ab->blk_offsets,
+                            ab->bsum1, grid, nblocks, ept, ab->bsum3, 0,
+                            0, 0, 0);
+   {
+      void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
+                    &nblocks, &ab->blk_counts, &ab->blk_offsets,
+                    &ab->quad_prim, &ab->quad_mask, &ab->peel_mask,
+                    &ab->quad_block, &ab->shade_slot, &ab->quad_capacity,
+                    &ab->quad_overflow };
+      CP_LAUNCH(screen->kernels.abuf_quad_fill_all,
+                     DIV_ROUND_UP(nblocks, 256u), 1, 1, 256, 1, 1,
+                     0, cp->stream, p, NULL);
+   }
+   cp_abuf_mark(ab, ab->ev[10], cp->stream);
+   cp_abuf_mark(ab, ab->ev[8], cp->stream);
+
+   if (sh_counts) {
+      cp_abuf_fuse_cmp(cp, screen, ab->blk_counts, sh_counts, nblocks,
+                       0xFFFFFFFFu, true, counters);
+      if (screen->kernels.abuf_fuse_cover) {
+         void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_counts,
+                       &counters };
+         CP_LAUNCH(screen->kernels.abuf_fuse_cover,
+                        MIN2(DIV_ROUND_UP(nblocks, 256u), 1024u), 1, 1,
+                        256, 1, 1, 0, cp->stream, p, NULL);
+      }
+      cp_fuse_quads++;
+      cp_abuf_fuse_tally(cp, "quad build");
+   }
 }
 
 
@@ -5841,8 +6192,12 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          return;
       }
 
-      /* --- step 2: prefix sum --- */
-      cp_abuf_scan(cp, screen, ab, (unsigned)n);
+      /* --- step 2: prefix sum ---
+       *
+       * The fill cursor is not folded in here: cp_abuf_size_arrays() can
+       * replace ab->cursor between this scan and this path's fill, so the
+       * clear has to stay where it is, after that decision. */
+      cp_abuf_scan(cp, screen, ab, (unsigned)n, 0);
       cp_abuf_mark(ab, ab->ev[2], cp->stream);
 
       /*
@@ -6022,51 +6377,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * mask). Blocks first, so that the merge visits the ~4% of the
        * framebuffer with anything in it rather than all 230,400 blocks.
        */
-      unsigned nblocks = ab->nblocks, qw = ab->quad_width;
-      if (cp_debug->no_counter_block)
-         cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
-      cp_abuf_mark(ab, ab->ev[6], cp->stream);
-      {
-         void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_list,
-                       &ab->blk_list_count };
-         CP_LAUNCH(screen->kernels.abuf_block_worklist,
-                        (nblocks + 255) / 256, 1, 1, 256, 1, 1,
-                        0, cp->stream, p, NULL);
-      }
-      cp_abuf_mark(ab, ab->ev[7], cp->stream);
-
-      /* Counting pass, prefix sum, filling pass — the same shape as the
-       * fragment lists themselves, and for the same reason: the merge has to
-       * know where a block's quads go before it can write them. */
-      cuMemsetD32Async(ab->blk_counts, 0, nblocks, cp->stream);
-      if (cp_debug->no_counter_block) {
-         cuMemsetD32Async(ab->bsum3, 0, 2, cp->stream);
-         cuMemsetD32Async(ab->dbg, 0, CP_ABUF_DBG_COUNTERS, cp->stream);
-      }
-      {
-         void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
-                       &ab->blk_list, &ab->blk_list_count, &ab->blk_counts };
-         /* 32 threads a block, not 256: there are only ~8,100 covered blocks,
-          * and a wide thread block packs them into a few dozen CUDA blocks
-          * that occupy a fraction of the SMs. */
-         CP_LAUNCH(screen->kernels.abuf_quad_count, 1024, 1, 1, 32, 1, 1,
-                        0, cp->stream, p, NULL);
-      }
-      cp_abuf_mark(ab, ab->ev[9], cp->stream);
-      cp_abuf_scan_n(cp, screen, ab->blk_counts, ab->blk_offsets, ab->bsum1,
-                     ab->bsum1x, ab->bsum2, ab->bsum2x, ab->bsum3, nblocks,
-                     ab->bnb1, ab->bnb2, ab->bnb3, 0, 0, 0);
-      {
-         void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
-                       &ab->blk_list, &ab->blk_list_count, &ab->blk_offsets,
-                       &ab->quad_prim, &ab->quad_mask, &ab->peel_mask,
-                       &ab->quad_block, &ab->shade_slot, &ab->quad_capacity,
-                       &ab->quad_overflow };
-         CP_LAUNCH(screen->kernels.abuf_quad_fill, 1024, 1, 1, 32, 1, 1,
-                        0, cp->stream, p, NULL);
-      }
-      cp_abuf_mark(ab, ab->ev[10], cp->stream);
-      cp_abuf_mark(ab, ab->ev[8], cp->stream);
+      cp_abuf_quad_build(cp, screen, ab, w, h);
 
       /*
        * Whether this draw is rendered by the A-buffer rather than merely
@@ -6967,8 +7278,7 @@ cp_opaque_tile_visibility(struct cp_context *cp, struct cp_pass_seg *segs,
 
    cp_abuf_scan_n(cp, screen, counts, offsets, s1, s1x, s2, s2x, s3,
                   ntiles, nb1, nb2, nb3, counts,
-                  CP_MAX_OPAQUE_TILE_REFS, overflow);
-   cuMemsetD32Async(cursors, 0, ntiles, cp->stream);
+                  CP_MAX_OPAQUE_TILE_REFS, overflow, cursors);
    for (unsigned s = 0; s < nsegs; s++) {
       struct cp_opaque_tile_build_args args = {
          .rast = segs[s].rast,
@@ -7885,12 +8195,16 @@ cp_pass_finish(struct cp_context *cp)
    if (!cp_pass_join(cp, nsegs))
       return;
 
-   /* --- scan the accumulated counts, clamp the runs to the array --- */
-   cp_abuf_scan(cp, screen, ab, (unsigned)n);
+   /* --- scan the accumulated counts, clamp the runs to the array ---
+    *
+    * The fill cursor's clear rides in the same pass: nothing between here and
+    * the fill can replace ab->cursor, and the clear was a 3.7 MB device
+    * operation of its own immediately behind a kernel that already writes one
+    * word per pixel. */
+   CUstream pass_main = cp->stream;
+   cp_abuf_scan(cp, screen, ab, (unsigned)n, ab->cursor);
 
    /* --- fill --- */
-   CUstream pass_main = cp->stream;
-   cuMemsetD32Async(ab->cursor, 0, n, cp->stream);
    if (ab->recs && screen->kernels.abuf_fill_recs) {
       /* Single-pass build: every segment's count already appended its
        * records (ab->recs cannot change mid-episode — a pending growth
@@ -7975,41 +8289,9 @@ cp_pass_finish(struct cp_context *cp)
    }
 
    /* --- the quad stream --- */
-   unsigned nblocks = ab->nblocks, qw = ab->quad_width;
-   if (cp_debug->no_counter_block)
-      cuMemsetD32Async(ab->blk_list_count, 0, 1, cp->stream);
-   {
-      void *p[] = { &ab->counts, &w, &h, &qw, &nblocks, &ab->blk_list,
-                    &ab->blk_list_count };
-      CP_LAUNCH(screen->kernels.abuf_block_worklist,
-                     (nblocks + 255) / 256, 1, 1, 256, 1, 1,
-                     0, cp->stream, p, NULL);
-   }
-   cuMemsetD32Async(ab->blk_counts, 0, nblocks, cp->stream);
-   if (cp_debug->no_counter_block) {
-      cuMemsetD32Async(ab->bsum3, 0, 2, cp->stream);
-      cuMemsetD32Async(ab->dbg, 0, CP_ABUF_DBG_COUNTERS, cp->stream);
-   }
-   {
-      void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
-                    &ab->blk_list, &ab->blk_list_count, &ab->blk_counts };
-      CP_LAUNCH(screen->kernels.abuf_quad_count, 1024, 1, 1, 32, 1, 1,
-                     0, cp->stream, p, NULL);
-   }
-   cp_abuf_scan_n(cp, screen, ab->blk_counts, ab->blk_offsets, ab->bsum1,
-                  ab->bsum1x, ab->bsum2, ab->bsum2x, ab->bsum3, nblocks,
-                  ab->bnb1, ab->bnb2, ab->bnb3, 0, 0, 0);
-   {
-      void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
-                    &ab->blk_list, &ab->blk_list_count, &ab->blk_offsets,
-                    &ab->quad_prim, &ab->quad_mask, &ab->peel_mask,
-                    &ab->quad_block, &ab->shade_slot, &ab->quad_capacity,
-                    &ab->quad_overflow };
-      CP_LAUNCH(screen->kernels.abuf_quad_fill, 1024, 1, 1, 32, 1, 1,
-                     0, cp->stream, p, NULL);
-   }
+   cp_abuf_quad_build(cp, screen, ab, w, h);
 
-   cp_tile_census_quads(cp, segs, nsegs, w, h);
+cp_tile_census_quads(cp, segs, nsegs, w, h);
 
    if (cp_pass_finish_bounded_groups(cp, segs, nsegs, w, h))
       return;

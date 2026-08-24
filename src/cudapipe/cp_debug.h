@@ -140,6 +140,10 @@ struct cp_debug {
    bool no_abuf_short_sort;
    bool no_abuf_warp_bucket;
    unsigned abuf_short_sort_max;
+   bool no_abuf_fuse_scan;
+   bool no_abuf_fuse_quad;
+   bool abuf_fuse_check;
+   unsigned abuf_fuse_break;
    bool flush_drain;
    bool no_seg_merge;
    bool no_abuf_append;

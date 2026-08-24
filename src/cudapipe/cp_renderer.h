@@ -181,6 +181,16 @@ struct cp_context {
     * context's device instead of to process-global state. */
    struct cp_abuf *abuf;
    struct cp_abuf_dbg_state abuf_dbg;
+   /* Every kernel launch this renderer issued, counted at cp_launch() — the
+    * one place a launch can happen. Iteration 28 needs it because the launch
+    * count is the thing a fusion changes, and a profiler cannot be used to
+    * count launches without adding host cost to each one. Printed by
+    * CUDAPIPE_PLAN_STATS. */
+   uint64_t launches;
+   /* Four device counters the A-buffer fusion's equivalence gate reports
+    * into. Allocated on first use and only when CUDAPIPE_ABUF_FUSE_CHECK is
+    * set, so nothing in a shipping or a timed run touches it. */
+   CUdeviceptr fuse_check;
 
    /* The device: the CUDA context, the SM, the loaded kernels. */
    struct cp_device *dev;
@@ -864,8 +874,13 @@ bool cp_abuf_enabled(struct cp_abuf *ab);
 void cp_abuf_mark(struct cp_abuf *ab, CUevent ev, CUstream stream);
 void cp_abuf_report(struct cp_abuf *ab);
 void cp_abuf_cleanup(struct cp_abuf *ab);
-void cp_abuf_scan(struct cp_context *cp, struct cp_device *screen, struct cp_abuf *ab, unsigned n);
-void cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen, CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x, CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3, unsigned n, unsigned nb1, unsigned nb2, unsigned nb3, CUdeviceptr clamp_counts, uint32_t clamp_capacity, CUdeviceptr clamp_overflow);
+void cp_abuf_scan(struct cp_context *cp, struct cp_device *screen, struct cp_abuf *ab, unsigned n, CUdeviceptr zero);
+void cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen, CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x, CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3, unsigned n, unsigned nb1, unsigned nb2, unsigned nb3, CUdeviceptr clamp_counts, uint32_t clamp_capacity, CUdeviceptr clamp_overflow, CUdeviceptr zero);
+void cp_abuf_scan_tiling(unsigned n, unsigned *ept, unsigned *grid);
+bool cp_abuf_fuse_scan_ready(struct cp_device *screen);
+bool cp_abuf_fuse_quad_ready(struct cp_device *screen);
+void cp_abuf_scan_finish_only(struct cp_context *cp, struct cp_device *screen, CUdeviceptr in, CUdeviceptr out, CUdeviceptr sums, unsigned nsums, unsigned n, unsigned ept, CUdeviceptr total, CUdeviceptr zero, CUdeviceptr clamp_counts, uint32_t clamp_capacity, CUdeviceptr clamp_overflow);
+void cp_abuf_fuse_report(void);
 bool cp_abuf_setup(struct cp_context *cp, struct cp_abuf *ab,
                    unsigned w, unsigned h);
 bool cp_abuf_size_arrays(struct cp_context *cp, struct cp_abuf *ab,

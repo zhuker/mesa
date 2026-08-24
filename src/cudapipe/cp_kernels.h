@@ -42,6 +42,12 @@ struct cp_kernels {
    /* A-buffer build, and the peel-loop log its verification compares against. */
    CUfunction abuf_scan_block;
    CUfunction abuf_scan_add;
+   CUfunction abuf_scan_reduce;
+   CUfunction abuf_scan_finish;
+   CUfunction abuf_quad_count_all;
+   CUfunction abuf_quad_fill_all;
+   CUfunction abuf_fuse_cmp;
+   CUfunction abuf_fuse_cover;
    CUfunction abuf_worklist;
    CUfunction abuf_sort;
    CUfunction abuf_sort_short;
