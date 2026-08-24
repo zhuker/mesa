@@ -335,3 +335,38 @@ and any precision mismatch. Measure actual *sample execution* coverage before
 enabling; descriptor-update coverage alone is not enough. Hardware linear
 weights use Vulkan-compatible 8 fractional bits, but external reference tests
 and Vulkan tolerances—not native byte identity—are the correctness authority.
+
+## Iteration 6 — result: rejected and fully reverted
+
+The direct NVVM hardware-texture execution was correct and honestly isolated:
+`tex.2d` in registers, no `cp_sampler.cu`, aligned PITCH2D storage, retained
+(view,sampler) objects, descriptor-copy/lifetime handling, and focused nearest/
+linear/repeat/clamp tests. Runtime coverage was only **21,991/156,159 FS
+launches (14.1%)**. Uncapped eligible modules moved 203→190 registers but stayed
+at one block/SM; full replay hardware center **23.724** vs software **23.504 ms**
+(+0.220).
+
+The required capped follow-up reached **126 registers / 2 blocks/SM** for all
+28 eligible modules, with 104–136 bytes local/spill. Interleaved pairs canceled:
+−0.083 then +0.089 ms; centers hardware **23.608**, software **23.605 ms**
+(+0.003, +0.014%). The 14.1% subset is too small and spills consume its gain.
+Both prototypes were reverted. Patches: `/tmp/perf16/iter6-rejected.patch` and
+`iter6-capped-followup.patch`.
+
+**Retry condition:** primary CUDA mipmapped-array representation or coherent
+array backing for multi-mip, cube, 3D and BC resources, plus interpolation in
+the same LLVM address-space model so hardware shaders do not retain the
+190-register helper floor. Only then does capability-tagged hardware execution
+cover enough of the 8.16-ms FS class. Graph nodes must key on execution and
+texture-object generation.
+
+## Iteration 7 — (next) occupancy-sized persistent FS grid
+
+The direct grid-4096 class is **4.838 ms/frame, 95.1% of direct FS**. Every
+launch starts 1,048,576 physical lanes, while the exact compact count remains
+on device and the shader already strides virtual block IDs. Instrument counts
+without a host sync, then A/B 1–8 resident waves based on SM count and the
+selected execution's blocks/SM. Keep **4096 as the hard upper cap and fallback**.
+The design changes scheduling only: ABI, order, shader function, and useful
+invocations remain identical. Admission must account for sampler-variant and
+register-cap execution changes; a fixed magic block count is only a probe.

@@ -51,10 +51,18 @@
   {
    "id": 6,
    "name": "hardware texture-object execution for admitted 2D descriptors",
+   "verdict": "reverted",
+   "old_median_ms": 23.608,
+   "sweep_hot_ms": null,
+   "note": "isolated PITCH2D hardware path hit 14.1%; uncapped 203->190 regs still 1 block and lost +0.220ms. Independent cap reached 126 regs/2 blocks with 104B+ spill, but interleaved center HW 23.608 vs off 23.605 (+0.003ms neutral). Fully reverted. Needs broad mipmapped arrays/cube/3D/BC plus same-LLVM interpolation."
+  },
+  {
+   "id": 7,
+   "name": "occupancy-sized persistent fragment launch grid",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "remove cp_sampler.cu from compatible textured FS executions using direct NVVM/PTX texture ops and cached per-(view,sampler,mip) CUtexObjects; software fallback for unsupported; measure actual capture sample coverage first"
+   "note": "95.1% direct FS time uses gridX=4096; useful compact count is device-side and kernel already grid-strides. Measure actual counts, A/B 1-8 resident waves, retain 4096 as hard upper cap and exact fallback."
   }
  ]
 }
