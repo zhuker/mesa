@@ -95,6 +95,14 @@
    "old_median_ms": 23.217,
    "sweep_hot_ms": 17.12,
    "note": "cache setups for >=4 tiles; stage3 direct -2.45%, abuf -2.35%, old 23.295->23.217 (-0.077). 1024 entries/qset, 756KiB total, overflow exact. Sample hot excludes nondet glTF: 17.12 vs17.16; full gates pass."
+  },
+  {
+   "id": 12,
+   "name": "explicit update-free CUDA graph for raster tail",
+   "verdict": "pending",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "cache exact clip+s1->s2->s3 graph exec by functions/args/allocation epoch; one graph launch replaces three kernel enqueues. Measure key reuse first; classic miss/fallback; foundation for whole-batch record-time graphs."
   }
  ]
 }

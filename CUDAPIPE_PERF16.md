@@ -557,3 +557,21 @@ recorded as a small redundant-work removal, not a multi-ms foundation.
 **Gates:** worker/root build/docs/diff; root 43/43 and unchanged six-mode
 hashes; huge triangle, huge point, forced capacity overflow, sanitizer, stored
 frames, NVIDIA calibration and both sentinels pass; Gallium exact.
+
+## Iteration 12 — explicit update-free raster-tail CUDA Graph
+
+The graph trace ceiling is ~3.29 ms/frame of sub-20-µs device-idle gaps; the
+raster tail's two handoffs contribute ~0.81 ms/frame traced. Start with a
+mechanism whose ownership is exact: explicit graph nodes for fused clip+s1 →
+stage2 → stage3 (plain and A-buffer specializations), cached only when concrete
+CUfunctions, by-value argument bytes, queue set and allocation/scratch epoch all
+match. Hits perform one `cuGraphLaunch` and no node updates. Misses build lazily
+or run classic; instrumentation/revert/error paths stay classic. Modules are
+context-lifetime kernels; graph execs retire with the renderer generation.
+
+Measure exact-key reuse before code. Do not use whole-stream capture, stale
+rotating pointers, host/event nodes, or per-submit `SetParams` calls that erase
+the benefit. The tail graph is expected at most 0.5–1 ms and is kept only with
+unprofiled evidence. Its real value is proving the cache/epoch/fallback model
+needed to expand the record-time command plan into update-free whole-batch and
+episode-segment launch DAGs (1–3 ms opportunity).
