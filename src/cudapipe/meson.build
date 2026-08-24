@@ -274,6 +274,26 @@ if dep_vulkan_loader.found()
     if test_name == 'cpvk_texture_cache_no_replay'
       cpvk_texture_cache_no_replay_exe = test_exe
     endif
+    if test_name == 'cpvk_fixed_edge'
+      cpvk_seed_canary_exe = test_exe
+    endif
+  endforeach
+
+  # The vertex fetch, in the shapes neither replay capture contains: every
+  # conversion class, a sparse set of attribute locations, a per-instance
+  # attribute with a non-zero firstInstance, and one shader on the classic
+  # path beside a fused one in the same command buffer. One executable, one
+  # mode per test, each checking its own pixels against the format.
+  cpvk_vfetch_exe = executable('cpvk_vfetch', files('tests/cpvk_vfetch.c'),
+                               dependencies : dep_vulkan_loader,
+                               c_args : ['-Wno-error=missing-prototypes'],
+                               build_by_default : false)
+  foreach vfetch_mode : ['formats', 'sparse', 'divisor', 'decline']
+    test('cpvk_vfetch_' + vfetch_mode, cpvk_vfetch_exe,
+         args : [vfetch_mode],
+         suite : 'cudapipe-native', env : cpvk_test_env, timeout : 120,
+         is_parallel : false,
+         depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
   endforeach
   cpvk_texture_cache_formats_exe = executable(
     'cpvk_texture_cache_formats',
@@ -284,6 +304,18 @@ if dep_vulkan_loader.found()
   test('cp_launch_audit', prog_python,
        args : [files('tests/cp_launch_audit.py')],
        suite : 'cudapipe-native')
+  # The two forms of the fetch must agree, in every state the flags allow.
+  test('cpvk_vfetch_gate', prog_python,
+       args : [files('tests/cpvk_vfetch_gate.py'), cpvk_vfetch_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 300,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
+  # And the seeding the fused kernel inherited must be load-bearing.
+  test('cpvk_vfetch_seed_gate', prog_python,
+       args : [files('tests/cpvk_vfetch_seed_gate.py'), cpvk_seed_canary_exe],
+       suite : 'cudapipe-native', env : cpvk_test_env, timeout : 300,
+       is_parallel : false,
+       depends : [libvulkan_cudapipe_native, cpvk_devenv_icd])
   test('cpvk_texture_cache_formats_gate', prog_python,
        args : [files('tests/cpvk_texture_cache_formats_gate.py'),
                cpvk_texture_cache_formats_exe],
