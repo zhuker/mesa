@@ -1359,25 +1359,35 @@ environment and writes `arms.txt`, so a default-on stage is measured as
 ## Iteration 27 — the vertex fetch inlined into the vertex shader
 
 **Result: kept, default on, `CUDAPIPE_NO_FUSED_VFETCH=1` reverts.**
-Old capture **16.5013 → 15.9726 ms** (+0.5287 ms, +3.20%), Crossroads
-**6.0758 → 5.9831 ms** (+0.0927 ms, +1.53%).
+Old capture **16.5119 → 16.0194 ms** (+0.4925 ms, +2.98%), Crossroads
+**6.0715 → 5.9928 ms** (+0.0787 ms, +1.30%), on the decisive alternating
+measurement below. The old capture ends this iteration *at* 16 ms rather than
+under it.
 
-**Three sessions, and the goal is met on the median of them rather than
-comfortably.** The mechanism was measured three times against its own revert,
-each time AB/BA on both captures in one session:
+**The old capture now sits *at* 16 ms, not below it.** Three AB/BA sessions
+put the default arm at 15.9448, 15.9726 and 16.0544, which is a spread wide
+enough that the target could be claimed or missed depending on which session
+was quoted. The decisive measurement settles it: six runs per arm, strictly
+alternating default and reverted, one session, one binary, exclusive GPU
+(`/tmp/perf16/iter27-decisive`, `cp_decisive_ab.sh`).
 
-| session | default | reverted | delta |
-|---|---:|---:|---:|
-| opt-in flag | 15.9448 | 16.4571 | +0.5122 |
-| after the flip | 15.9726 | 16.5013 | +0.5287 |
-| at the committed HEAD | 16.0544 | 16.5178 | +0.4634 |
+| arm | runs (ms) | median | IQR | range |
+|---|---|---:|---|---|
+| default | 15.9337 16.0557 16.0340 16.0344 15.9967 16.0047 | **16.0194** | [15.9987, 16.0343] | [15.9337, 16.0557] |
+| reverted | 16.5541 16.4981 16.5912 16.5201 16.5038 16.5030 | 16.5119 | [16.5032, 16.5456] | [16.4981, 16.5912] |
 
-The default arm spans 15.94–16.05 with a median of **15.9726**, so the log's
-target — a paired-submit median at or below 16 ms on the old capture — is
-reached, but by about the width of the session-to-session spread. The delta is
-the robust number and it reproduces: **+0.46 to +0.53 ms**, with the reverted
-arm landing within 0.02 ms of the 16.5021 this branch stood at. Quote the
-delta; treat 15.97 as "at 16 ms", not as headroom below it.
+**The default arm's interquartile range straddles 16.0 and four of its six
+runs are at or above it.** The goal of this log is therefore *reached at the
+line and not safely*: quote 16.02, not 15.97, and do not treat the difference
+as headroom. What is robust is the delta — paired run against adjacent run it
+is +0.4424 to +0.6203 with a median of **+0.5027 ms**, and the median-of-
+medians difference is +0.4925 (+2.98%) — and the reverted arm, which lands
+within 0.01 ms of the 16.5021 this branch stood at.
+
+Crossroads, four runs per arm the same way: default median **5.9928**
+(IQR [5.9764, 6.0037]), reverted 6.0715 (IQR [6.0621, 6.0822]), delta
++0.0787 ms (+1.30%). Every run of all twenty produced the same stdout hash as
+every other run of its capture.
 
 `cp_vertex_fetch` ran once per executed batch, immediately before the
 generated vertex shader, over the same vertices, on the same stream, and
