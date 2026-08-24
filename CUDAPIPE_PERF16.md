@@ -1326,3 +1326,32 @@ accepted, and the old capture's differ by at most 13/255 on a handful of pixels
 the tolerance the llvmpipe comparison already accepts. The sample sweep
 reproduces iteration 24's verdict exactly, including its one standing
 `gltfscenerendering` nondeterminism exception.
+
+### Two things future acceptance runs need to know
+
+**The old capture's sentinel frames are not deterministic, and that is not a
+regression.** Dumping the ten readback sentinels of
+`headless_streamer_20260814T155742.gfxr` twice, from one binary with one set of
+flags, produces six frames that differ. They differ by a mean absolute delta of
+0.00003 and at most 13/255 on a handful of pixels. The llvmpipe envelope
+iteration 24 accepted for this capture is a mean of 0.0206 to 0.4783 with up to
+1815 pixels over 32 and 45 over 96, so the run-to-run variation is about a
+thousandth of the tolerance that already passes. Crossroads, by contrast, is
+byte-identical run to run.
+
+**The correct test on the old capture is therefore the external llvmpipe
+envelope, not frame-to-frame equality**, and a frame-to-frame difference there
+is evidence of nothing until its magnitude is compared against that envelope.
+Four dump sets are kept as the demonstration:
+`/tmp/perf16/iter26-acceptance/frames/old` (default),
+`.../frames/old-again` (default, second run),
+`.../frames/old-revert` (all four stages reverted) and the frozen
+`/tmp/perf16/iter24-acceptance/final-frozen/frames/old`. The same six frames
+differ in every pairing, including default against default.
+
+**Measuring a default-on change needs the reverts on the control arm.**
+`cp_two_replay_ab.sh` puts `CAND` on the candidate arm and calls a positive
+delta a win, so putting the revert switches in `CAND` yields correct medians
+under an inverted verdict. The harness now takes `CTRL` for control-arm
+environment and writes `arms.txt`, so a default-on stage is measured as
+`CAND="" CTRL="CUDAPIPE_NO_...=1 ..."` and the sign stays right.
