@@ -4791,10 +4791,25 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             .stride = stride,
          };
 
-         CUdeviceptr meta_dev = cp_upload(cp, &meta, sizeof(meta));
-         if (!meta_dev) {
-            FREE(refs);
-            return;
+         /*
+          * Or not in a block at all. The argument block below already carries
+          * a scalar area for the batch row and its mask, and already hands the
+          * shader device addresses into itself, so two more words there hold
+          * these two scalars just as well -- and the eight-byte copy that
+          * carried them was the single most frequent host-to-device operation
+          * in the driver, 203.7 of them per frame on the old capture.
+          *
+          * The shader ABI does not move: args[0] and args[3] are still two
+          * device addresses it dereferences.
+          */
+         const bool meta_in_block = cp_debug->meta_fold;
+         CUdeviceptr meta_dev = 0;
+         if (!meta_in_block) {
+            meta_dev = cp_upload(cp, &meta, sizeof(meta));
+            if (!meta_dev) {
+               FREE(refs);
+               return;
+            }
          }
 
          /*
@@ -4811,8 +4826,11 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
           * out of step.
           */
          const size_t vs_args_bytes = 64 * sizeof(void *);
-         const size_t vs_scal_off = vs_args_bytes;   /* row 0, then the mask */
-         const size_t vs_tbl_off = vs_args_bytes + 16;
+         const size_t vs_scal_off = vs_args_bytes;   /* row 0, then the mask,
+                                                      * then vcount and stride
+                                                      * when they are folded */
+         const size_t vs_scal_bytes = meta_in_block ? 32 : 16;
+         const size_t vs_tbl_off = vs_args_bytes + vs_scal_bytes;
          /* The per-draw parameter rows behind the uniform table — see
           * CP_ARG_DRAW_PARAM_STRIDE. Same block, same upload. */
          const size_t vs_dp_off = vs_tbl_off +
@@ -4829,10 +4847,16 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          memset(vs_blk, 0, vs_blk_bytes);
 
          void **vs_args_host = (void **)vs_blk;
-         vs_args_host[0] = (void*)(uintptr_t)(meta_dev + offsetof(struct cp_vs_meta, vcount));
+         vs_args_host[0] = meta_in_block
+            ? (void*)(uintptr_t)(vs_args_dev + vs_scal_off + 8)
+            : (void*)(uintptr_t)(meta_dev +
+                                 offsetof(struct cp_vs_meta, vcount));
          vs_args_host[1] = NULL;
          vs_args_host[2] = (void*)(uintptr_t)vs_input_buf;
-         vs_args_host[3] = (void*)(uintptr_t)(meta_dev + offsetof(struct cp_vs_meta, stride));
+         vs_args_host[3] = meta_in_block
+            ? (void*)(uintptr_t)(vs_args_dev + vs_scal_off + 12)
+            : (void*)(uintptr_t)(meta_dev +
+                                 offsetof(struct cp_vs_meta, stride));
          vs_args_host[4] = (void*)(uintptr_t)vs_output_buf;
          vs_args_host[5] = (void*)(uintptr_t)vid_buf;
          vs_args_host[6] = (void*)(uintptr_t)iid_buf;
@@ -4853,9 +4877,13 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          vs_args_host[CP_ARG_SLOT_BATCH_MASK] =
             (void*)(uintptr_t)(vs_args_dev + vs_scal_off + 4);
 
-         ((uint32_t *)((char *)vs_blk + vs_scal_off))[0] = 0;
-         ((uint32_t *)((char *)vs_blk + vs_scal_off))[1] =
-            batch_rows ? 0xFFFFFFFFu : 0u;
+         uint32_t *vs_scal = (uint32_t *)((char *)vs_blk + vs_scal_off);
+         vs_scal[0] = 0;
+         vs_scal[1] = batch_rows ? 0xFFFFFFFFu : 0u;
+         if (meta_in_block) {
+            vs_scal[2] = meta.vcount;
+            vs_scal[3] = meta.stride;
+         }
 
          uint64_t *vs_tbl = (uint64_t *)((char *)vs_blk + vs_tbl_off);
          for (unsigned d = 0; d < batch_draws; d++) {

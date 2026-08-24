@@ -113,6 +113,7 @@ struct cp_debug {
    bool no_abuf_batch;
    bool no_pass_episode;
    bool upload_stats;
+   bool meta_fold;
    bool no_opaque_episode;
    bool no_sampler_variant;
    bool texture_cache;
