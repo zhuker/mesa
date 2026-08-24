@@ -1691,3 +1691,191 @@ exactly as before unless someone sets the variable — and its only purpose is t
 be re-measured on a machine whose block scheduler is not free. Delete it the day
 the fragment launch stops grid-striding, because then it would be a way to drop
 work.
+
+## Iteration 28 item 4 — the A-buffer support chain fused
+
+`CUDAPIPE_PERF16.md`'s iteration-28 profile ranked this fourth: 251.3
+launches/frame over `scan`, `sort`, the worklists, the quad count/fill and
+`fill_recs` for 1.30 ms/frame of device time, estimated at 0.20–0.40 ms of
+frame time at the measured price of under 1 µs per removed same-stream launch.
+
+The chain was re-derived from the source before anything was changed.
+`CP_ABUF_SCAN_BLOCK` is 512 and the old capture is 1280x720, so the pixel scan
+(n = 921,600, nb1 = 1800) takes `cp_abuf_scan_n`'s five-launch three-level
+branch and the quad-block scan (n = nblocks = 230,400, bnb1 = 450) takes its
+three-launch branch. One pass episode issues fifteen launches and two large
+clears. The predicted split — 3+2 per episode `scan_block` and 2+1 `scan_add`
+against 16.3 episodes/frame, so 81.5 and 48.9 — reproduces the profile's
+measured 80.4 and 47.8, which is what established that the code being changed
+is the code that was profiled.
+
+### The mechanism, in two static per-episode fusions
+
+**S1, the scan in two launches instead of five (or three).** One tiling is
+computed on the host and shared by every kernel that touches it:
+`ept = max(1, ceil(n / (512*512)))` elements per thread and
+`grid = ceil(n / (512*ept))`, which makes `grid <= 512` for every n by
+construction. That bound is the whole mechanism: the array of per-block sums
+is then small enough that *every* block can scan all of it itself, in shared
+memory, and read out both its own exclusive base and the grand total without
+waiting for or communicating with any other block.
+
+* `cp_abuf_scan_reduce` writes one block sum per block.
+* `cp_abuf_scan_finish` does the redundant top-level scan, then walks its own
+  tile in `ept` rounds of the same 512-wide Hillis-Steele scan
+  `cp_abuf_scan_block` already ran, and writes the final offsets directly.
+  `cp_abuf_scan_add`'s clamp is carried over unchanged; the grand total it
+  tests is now a register rather than a load.
+
+The redundant top scan sums **uint32 counts**, so the reassociation is exact:
+the fused total is bit-identical to the classic one by construction, not
+within a tolerance. Global traffic falls from 2n reads + 2n writes to 2n reads
++ n writes. An optional `zero` argument folds the 3.7 MB fill-cursor clear into
+the same pass — only on the episode path, because `cp_abuf_size_arrays()` can
+replace `ab->cursor` between the standalone path's scan and its fill.
+
+**S2, the quad build in three launches instead of six.**
+`cp_abuf_quad_count_all` is laid out on exactly the S1 tiling of `nblocks`, one
+thread per 2x2 block. It tests coverage itself, from the four counts
+`cp_abuf_block_worklist` was reading anyway, so the compaction pass disappears;
+it writes `blk_counts[b] = 0` for an uncovered block, so the 0.9 MB clear
+disappears; and because its tile *is* the scan's tile it block-reduces its own
+counts into `bsum1`, so that scan's reduce disappears too. What is left is the
+count, `cp_abuf_scan_finish`, and `cp_abuf_quad_fill_all`, which skips a block
+whose `blk_counts` is zero and otherwise runs the identical merge at the
+identical offset. Parallelism goes up rather than down: the classic count is
+1024 blocks of 32 threads grid-striding an ~8,100-entry list, the fused count
+is 450 blocks of 512 threads with at most one merge per thread.
+
+### Why this is none of the shapes already rejected
+
+* **Not iteration 21.** Every kernel keeps a static grid, a static
+  index-to-work mapping and one exit. No persistent residency, no per-item
+  claiming, no stealing, no queue publication and no done protocol.
+  `scan_finish` recomputes the top-level scan per block precisely so that no
+  block ever waits on another.
+* **Not iteration 25.** No host synchronisation is added on any path. The
+  episode's one drain stays where it was, reads the same six counters plus the
+  per-segment quad counts, and the bounded-group path's asynchrony is
+  untouched. Nothing is merged across segments and no new pre-FS decision
+  exists. Iteration 25 removed 112 launches/frame and gained nothing because
+  one mandatory wait cancelled it; there is no such wait here.
+* **Not bound-based sizing.** No buffer changes size and nothing is sized to a
+  worst case. `s1` already holds `nb1 = ceil(n/512) >= grid` words. The episode
+  drain that buys the exact quad count is untouched.
+* Overflow and corruption are still detected before any fragment shader: the
+  clamp, the fill's `overflow` and `quad_overflow` are computed by the same
+  arithmetic in the same order and read by the same drain at the same point.
+
+### Gates, all before any timing
+
+`CUDAPIPE_ABUF_FUSE_CHECK=1` runs the classic chain first into shadow buffers,
+with its clamp disabled so it cannot disturb the counts the fused chain then
+reads, runs the fused chain into the live buffers, and compares on the device:
+every offset, the grand total, every `blk_counts` entry, and the invariant
+`cp_abuf_quad_fill_all`'s skip rests on — `blk_counts[b] != 0` if and only if
+block b is covered. Full coverage of `blk_counts`, which is what retiring its
+clear requires, is proved rather than argued: the live array is pre-filled with
+a sentinel and survivors are counted.
+
+| gate | result |
+|---|---|
+| old capture, whole replay | **23,814 scans and 23,814 quad builds compared; 0 differing elements, 0 differing totals, 0 entries never written, 0 coverage violations** |
+| Crossroads, whole replay | **13,310 and 13,310; all four counters 0** |
+| native suite, fusion on | 65/65 |
+| native suite, both reverts | 65/65 |
+| old sentinels vs llvmpipe | inside the accepted envelope on all ten frames; four byte-identical to the frozen reference and six differing by ≤0.00005 mean and ±1 pixel over 32, which is the old capture's documented run-to-run nondeterminism |
+| Crossroads sentinels | **byte-identical to the frozen reference, 9 of 9** |
+| stdout hashes, all sixteen timed runs | identical per capture |
+
+The negative controls have teeth. `CUDAPIPE_ABUF_FUSE_BREAK=1` drops the block
+base in `scan_finish`; `=2` stops the fused count writing an uncovered zero,
+which is exactly what a missing clear looks like. On the old capture the first
+reports 60,208,448 differing elements and the second 1,691,296 differing,
+1,691,296 never written and 1,691,296 coverage violations. Both also destroy
+the output: with the check off, break 1 produces four sentinel frames with a
+mean channel error of 60.5 and 440,741 pixels over 32 — against an envelope of
+0.02–0.48 and at most 1,815 — and then latches device loss, and break 2 latches
+device loss before the first sentinel frame is written at all.
+
+### What the frame stops doing, counted by the driver
+
+A launch counter at `cp_launch()` — the one place a launch can happen — and
+the iteration-26 call-site census, both profiler-free:
+
+| capture | arm | launches/frame | clears/frame | launches removed | clears removed | MB of clear traffic removed |
+|---|---|---:|---:|---:|---:|---:|
+| old | classic | 1405.4 | 262.8 | — | — | — |
+| old | S1 only | 1345.8 | 251.2 | 59.6 | 11.6 | 36.9 |
+| old | S2 only | 1358.1 | 247.0 | 47.3 | 15.8 | 13.1 |
+| old | **both** | **1314.2** | **235.4** | **91.1** | **27.4** | **49.9** |
+| Crossroads | classic | 396.1 | 116.9 | — | — | — |
+| Crossroads | **both** | **346.0** | **100.8** | **50.1** | **16.1** | **27.3** |
+
+The two halves overlap on the block scan, so their launch removals are
+sub-additive: 59.6 + 47.3 = 106.9 against 91.1 together.
+
+### Timing
+
+Two independent sessions of the four-arm alternating harness, both captures,
+palindromic arm order within each capture so a monotone drift cancels. Session 1
+ran the fusions opt-in; session 2 ran them as the shipping default with the
+`NO_*` reverts on the other arms. `CUDAPIPE_ABUF_FUSE_CHECK` was unset in all
+sixteen runs, which `arms.txt` records — the gate synchronises, so a timed run
+with it on would silently invert the result.
+
+| capture | arm | session 1 | session 2 | pooled mean of 4 | delta vs classic |
+|---|---|---:|---:|---:|---:|
+| old | classic | 15.9831 | 15.9561 | 15.9696 | — |
+| old | S1 only | 15.8890 | 15.9762 | 15.9326 | +0.0370 (1.1 σ) |
+| old | S2 only | 15.8687 | 15.8606 | 15.8647 | **+0.1049 (3.6 σ)** |
+| old | **both** | 15.7606 | 15.7370 | **15.7488** | **+0.2208 ms, +1.38% (6.3 σ)** |
+| Crossroads | classic | 5.9725 | 5.9644 | 5.9685 | — |
+| Crossroads | S1 only | 5.9634 | 5.9476 | 5.9555 | +0.0130 (1.0 σ) |
+| Crossroads | S2 only | 5.9410 | 5.9239 | 5.9325 | +0.0360 (2.7 σ) |
+| Crossroads | **both** | 5.8619 | 5.8936 | **5.8777** | **+0.0907 ms, +1.52% (6.8 σ)** |
+
+**The pair is worth 0.2208 ms on the old capture and 0.0907 ms on Crossroads,**
+reproduced to 0.003 ms across two sessions on old. It lands at the bottom of
+the item's 0.20–0.40 ms band and at the top of my own 0.15–0.25 ms forecast.
+
+Which half paid, asked because the halves are independent: **S2 paid and S1
+alone did not resolve.** S1 alone is +0.094 in one session and −0.020 in the
+other on old — 1.1 σ over four runs — and +0.013 on Crossroads. S2 alone is
++0.105 and +0.036, consistent in both sessions. Yet together they are +0.221,
+more than the +0.142 the two halves sum to, while removing *fewer* launches
+than the two halves sum to. The pair is what makes the episode's whole
+support chain a short static sequence; neither half does that alone. What is
+not claimed is a per-launch price: 91.1 launches and 27.4 clears for 0.2208 ms
+is 1.86 µs per device operation, well above the under-1-µs launch price,
+because the clears that went also carried 49.9 MB/frame and the compaction
+pass over 230,400 blocks stopped running.
+
+### Flags
+
+`CUDAPIPE_NO_ABUF_FUSE_SCAN` and `CUDAPIPE_NO_ABUF_FUSE_QUAD` revert S1 and S2
+independently; both fusions are on by default. `CUDAPIPE_ABUF_FUSE_CHECK` is
+the equivalence gate and `CUDAPIPE_ABUF_FUSE_BREAK` its negative control. The
+registry is 97 flags.
+
+Evidence under `/tmp/perf16/iter28-item4/`: `design.md`, `gate-old.log`,
+`gate-cross.log`, `gate-old-default.log`, `gate-cross-default.log`,
+`gate-old-break{1,2}.log`, `frames/` (sentinel dumps for the fused build and
+both breaks), `census-{old,cross}-{off,scan,quad,both}.log`,
+`timing1/`, `timing2/`, `ab4.sh`, `ab4_default.sh`.
+
+## The direct path's one-fragment-per-pixel invariant is measured FALSE
+
+Recorded here because it outlives the work that found it. The parked
+iteration-28 item 3 (fusing `cp_fs_writeback` into the fragment shader) rested
+on the invariant that on the direct path a pixel is claimed by at most one
+fragment within a launch. An explicit checked invariant measured it **false on
+the old capture: 6,343,098 second claimants of a pixel inside a single
+launch.** The item was parked for that reason and for that reason only — the
+check existed, so the assumption was measured instead of believed.
+
+This matters beyond that fusion: any later work that assumes a direct-path
+pixel is written once per launch is assuming something this capture disproves
+six million times a frame-set. Full context is in
+`/tmp/perf16/iter28-item3/README.md`, with `wip.patch` beside it; the agent
+that produced them has been retired and those two files are the only record.
