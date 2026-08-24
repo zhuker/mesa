@@ -111,6 +111,14 @@
    "old_median_ms": null,
    "sweep_hot_ms": null,
    "note": "production rejected: fixed mode4 +0.740ms vs legacy and +0.225ms vs fixed direct despite exact oracle/path matrix. Production restored. Retain cpvk_fixed_edge shared-edge CPU oracle; shadow census was not completed."
+  },
+  {
+   "id": 14,
+   "name": "same-LLVM fragment interpolation and shader",
+   "verdict": "pending",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "compile interpolation helper to LLVM18 bitcode, link+always-inline into NIR module, use kernel-local input SSA/storage rather than global fs_in. Preserve classic separate chain. Foundation for broad resource-isolated texture path; measure resources and full chain first."
   }
  ]
 }

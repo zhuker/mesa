@@ -624,3 +624,29 @@ a one-pixel on-edge scissor. Legacy passes exactly. The current oracle does not
 yet cover MSAA, cull/front-face permutations, clipped fan seams or depth ties;
 the requested shadow scene census was not completed and no claims depend on it.
 Full report: `/tmp/perf16/iter13-report.md`.
+
+## Iteration 14 — same-LLVM fragment interpolation and shader
+
+The generated fragment class remains roughly 9 ms/frame. Its current fused
+form links NVRTC interpolation PTX into the NIR-generated LLVM/PTX shader. A
+hardware-texture-only shader was 34–79 registers, but linking that helper raised
+it to 190; software-sampler builds remain 126–236 registers. Nulling the helper
+does not isolate its call graph, while a separate interpolator pays a launch and
+global `fs_in` round trip.
+
+Build the interpolation helper as LLVM 18 NVPTX bitcode from one owned source,
+link it into the generated NIR module before optimization, force inline it, and
+target a kernel-local input array/SSA values rather than global `fs_in`. Preserve
+quad/helper semantics, direct and A-buffer segment resolution, batch rows,
+points, perspective/front-facing/FragCoord and shader-memory helper masks. The
+classic separate interpolate → bare shader chain is the exact fallback and
+resource-isolated control. Do not pass an LLVM-local pointer across an NVRTC
+boundary (iteration 4's invalid ABI).
+
+Admit only if an LLVM-toolchain proof shows stable bitcode parsing/linking and
+the focused module removes the external interpolation symbol. Compare complete
+compact/interpolate → FS → writeback chains, resource counts and old replay,
+not FS registers alone. Even a modest direct win is architectural: the same
+module permits dead varying elimination and is prerequisite to combining the
+proven-fast bare hardware texture instruction with broad image coverage without
+the 190-register helper floor.
