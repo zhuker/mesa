@@ -5412,7 +5412,12 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          aa.abuf_capacity = ab->capacity;
          abuf_recs_filled = ab->recs;
       }
-      cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream);
+      /* The queue counters the count pass is about to fill. */
+      if (cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream) !=
+          CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return;
+      }
       aa.abuf_mode = CP_ABUF_COUNT;
       rast_queues.mode = CP_QUEUE_FILL;
       cp_abuf_mark(ab, ab->ev[0], cp->stream);
@@ -6452,28 +6457,42 @@ cp_pass_seg_stream(struct cp_context *cp, unsigned s)
 }
 
 /* Join every side stream a finished phase used back into the main stream. */
-static void
+static bool
 cp_pass_join(struct cp_context *cp, unsigned nsegs)
 {
    if (!cp->seg_streams[0])
-      return;
+      return true;
    unsigned used = MIN2(nsegs, (unsigned)CP_PASS_STREAMS);
    for (unsigned k = 0; k < used; k++) {
-      cuEventRecord(cp->seg_ev[k], cp->seg_streams[k]);
-      cuStreamWaitEvent(cp->stream, cp->seg_ev[k], 0);
+      /* An unjoined side stream is not a slow episode, it is an unordered
+       * one: everything after this point reads what those streams wrote. */
+      if (cuEventRecord(cp->seg_ev[k], cp->seg_streams[k]) != CUDA_SUCCESS ||
+          cuStreamWaitEvent(cp->stream, cp->seg_ev[k], 0) != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return false;
+      }
    }
+   return true;
 }
 
 /* The reverse: gate every side stream behind the main stream's tail. */
-static void
+static bool
 cp_pass_broadcast(struct cp_context *cp, unsigned nsegs)
 {
    if (!cp->seg_streams[0])
-      return;
-   cuEventRecord(cp->pass_gate, cp->stream);
+      return true;
+   if (cuEventRecord(cp->pass_gate, cp->stream) != CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return false;
+   }
    unsigned used = MIN2(nsegs, (unsigned)CP_PASS_STREAMS);
    for (unsigned k = 0; k < used; k++)
-      cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0);
+      if (cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0) !=
+          CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return false;
+      }
+   return true;
 }
 
 
@@ -6503,7 +6522,8 @@ cp_pass_fallback(struct cp_context *cp, struct cp_pass_seg *segs,
       return;
    /* The abandoned episode's kernels may still be in flight on the side
     * streams, writing the shared lists the re-execution is about to clear. */
-   cp_pass_join(cp, nsegs);
+   if (!cp_pass_join(cp, nsegs))
+      return;
 
    struct cp_fs_batch saved_fs_batch = cp->fs_batch;
    for (unsigned s = 0; s < nsegs; s++) {
@@ -7483,7 +7503,8 @@ cp_pass_finish(struct cp_context *cp)
 
    /* The segments' count phases ran on the side streams; the scan reads
     * across all of them. */
-   cp_pass_join(cp, nsegs);
+   if (!cp_pass_join(cp, nsegs))
+      return;
 
    /* --- scan the accumulated counts, clamp the runs to the array --- */
    cp_abuf_scan(cp, screen, ab, (unsigned)n);
@@ -7505,7 +7526,8 @@ cp_pass_finish(struct cp_context *cp)
    } else {
       /* One relaunch per segment from its saved arguments, fanned back out
        * over the side streams behind the scan. */
-      cp_pass_broadcast(cp, nsegs);
+      if (!cp_pass_broadcast(cp, nsegs))
+         return;
       for (unsigned s = 0; s < nsegs; s++) {
          struct cp_pass_seg *sg = &segs[s];
          if (cp->seg_streams[0])
@@ -7530,7 +7552,8 @@ cp_pass_finish(struct cp_context *cp)
                         64, 1, 1, 0, cp->stream, ap, NULL);
       }
       cp->stream = pass_main;
-      cp_pass_join(cp, nsegs);
+      if (!cp_pass_join(cp, nsegs))
+         return;
    }
 
    /* --- sort, both worklists --- */
@@ -7747,7 +7770,8 @@ cp_pass_finish(struct cp_context *cp)
    }
 
    /* --- shade each group densely over its slice of the quads, fanned out --- */
-   cp_pass_broadcast(cp, nsegs);
+   if (!cp_pass_broadcast(cp, nsegs))
+      return;
    struct cp_fs_batch saved_fs_batch = cp->fs_batch;
    struct cp_seg_desc descs[CP_PASS_MAX_SEGS];
    memset(descs, 0, sizeof(descs));
@@ -7867,7 +7891,10 @@ cp_pass_finish(struct cp_context *cp)
    }
    cp->stream = pass_main;
    cp->fs_batch = saved_fs_batch;
-   cp_pass_join(cp, nsegs);
+   /* A failed join leaves the shading streams unordered against the composite;
+    * neither compositing nor re-rendering is safe after it. */
+   if (!cp_pass_join(cp, nsegs))
+      return;
    if (failed) {
       cp_pass_fallback(cp, segs, nsegs);
       return;
@@ -8013,23 +8040,39 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
    if (cp->pass.nsegs == 0) {
       unsigned w = fb->width, h = fb->height;
       if (!w || !h || !cp_abuf_setup(cp, ab, w, h)) {
+         /* A refusal falls back; a latched device loss must not. */
+         if (cp->device_fatal)
+            return;
          cp_pass_finish(cp);
          cp_draw_execute_batch(cp, &cp->batch);
          return;
       }
-      cuMemsetD32Async(ab->counts, 0, (size_t)w * h, cp->stream);
-      cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
-      if (ab->recs)
-         cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
-      if (cp->seg_streams[0])
-         cuEventRecord(cp->pass_gate, cp->stream);
+      /* The episode's shared lists. Every segment below accumulates into
+       * them, so a clear that never ran would be read as real counts. */
+      CUresult err = cuMemsetD32Async(ab->counts, 0, (size_t)w * h,
+                                      cp->stream);
+      if (err == CUDA_SUCCESS)
+         err = cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
+      if (err == CUDA_SUCCESS && ab->recs)
+         err = cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
+      if (err == CUDA_SUCCESS && cp->seg_streams[0])
+         err = cuEventRecord(cp->pass_gate, cp->stream);
+      if (err != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return;
+      }
    }
 
    CUstream saved_stream = cp->stream;
    struct cp_queue_set saved_qset = cp->cur_qset;
    if (cp->seg_streams[0]) {
       unsigned k = cp->pass.nsegs % CP_PASS_STREAMS;
-      cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0);
+      /* The gate is what orders this segment behind the clears above. */
+      if (cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0) !=
+          CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return;
+      }
       cp->stream = cp->seg_streams[k];
       cp->cur_qset = cp->seg_qsets[k];
    }
@@ -8042,13 +8085,20 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
    cp->cur_qset = saved_qset;
 
    if (cp->pass.append_failed) {
+      if (cp->device_fatal)
+         return;
       /* The failed append may have run vertex work and uploads on its side
        * stream before backing out; when it was the would-be first segment,
        * cp_pass_finish below returns without joining anything, and the flush
        * fence — recorded on the main stream only — would not cover it. Join
        * every side stream so it always does. */
-      cp_pass_join(cp, CP_PASS_STREAMS);
+      if (!cp_pass_join(cp, CP_PASS_STREAMS))
+         return;
       cp_pass_finish(cp);
+      /* The episode this rollback closed may have latched device loss; the
+       * batch must not be re-executed onto a poisoned context. */
+      if (cp->device_fatal)
+         return;
       cp_draw_execute_batch(cp, &cp->batch);
    }
 }
