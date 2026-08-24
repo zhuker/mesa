@@ -117,6 +117,7 @@ struct cp_debug {
    bool no_fetch_fold;
    bool fused_vfetch;
    bool no_fused_vfetch;
+   unsigned fs_grid_waves;
    unsigned vfetch_decline_nth;
    bool vfetch_skip_seed;
    bool no_upload_coalesce;

@@ -184,6 +184,16 @@ struct cp_context {
 
    /* The device: the CUDA context, the SM, the loaded kernels. */
    struct cp_device *dev;
+   /* Multiprocessors on it, read once at init. Grids that fill the machine
+    * once and then grid-stride are sized from this and from the execution's
+    * own measured blocks per SM. */
+   int sm_count;
+   /* What the fragment grid actually cost: launches, and the blocks scheduled
+    * across them. A grid-sizing change that does not move these did not reach
+    * the launches it was aimed at, which is the first thing to check before
+    * believing a neutral result. */
+   uint64_t fs_launches;
+   uint64_t fs_blocks;
    bool device_fatal; /* native callback latched a fatal CUDA/cache error */
 
    /*

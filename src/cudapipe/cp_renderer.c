@@ -64,6 +64,16 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
    /* Allocate the persistent device-only arenas and queues. */
    cuCtxSetCurrent(cp->dev->cuda_ctx);
 
+   /*
+    * How many multiprocessors this device has, for grids that are sized to
+    * fill the machine rather than to cover the worst case. Asked once, of the
+    * device this context runs on, because a process may hold several.
+    */
+   cp->sm_count = 0;
+   cuDeviceGetAttribute(&cp->sm_count,
+                        CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                        dev->cuda_device);
+
    /* Every frame-path launch, memset and copy goes here; see cp_context.h for
     * why it is a default-flagged stream rather than a non-blocking one. If it
     * cannot be created the field stays zero, which is the legacy NULL stream
@@ -817,6 +827,12 @@ cp_context_cleanup(struct cp_context *cp)
    cp_hardware_texture_report(cp);
    cp_spec_report(cp);
    cp_vs_census_report();
+   if (cp_debug->shader_stats && cp->fs_launches)
+      fprintf(stderr, "cudapipe: fragment grid: %" PRIu64 " launches, %" PRIu64
+              " blocks, %.1f blocks/launch, %d SMs, waves=%u\n",
+              cp->fs_launches, cp->fs_blocks,
+              (double)cp->fs_blocks / (double)cp->fs_launches, cp->sm_count,
+              cp_debug->fs_grid_waves);
    cp_plan_report(cp);
    if (cp_debug->upload_stats)
       fprintf(stderr, "cudapipe: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
@@ -3261,9 +3277,36 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
        * is device-side and num_threads is the framebuffer's worst case, so a
        * small draw's launch was mostly scheduling idle blocks. 4096 blocks
        * of 256 is far past what fills the machine. */
+      unsigned fs_blocks = MIN2((num_threads + 255) / 256, 4096u);
+
+      /*
+       * And 4096 is still far past it. The count this grid bounds itself
+       * against is device-side, so the host cannot size the grid to the work
+       * without a readback -- but it does not need to, because the kernel
+       * grid-strides: a grid that fills the machine once covers any count at
+       * all, in more iterations rather than in more blocks. NCU measured 12.05
+       * waves per SM on this launch with 65% of them running under 50
+       * instructions per thread, which is eleven waves of blocks scheduled to
+       * discover they have nothing to do.
+       *
+       * The occupancy comes from the execution being launched, not from a
+       * constant: a 40-register shader and a 126-register one do not fit the
+       * same number of blocks, and this iteration's own census showed vertex
+       * shaders spread over 3 to 6 blocks per SM for the same reason. 4096
+       * stays the hard upper bound, so this can only ever shrink the grid.
+       */
+      if (cp_debug->fs_grid_waves && cp->sm_count > 0) {
+         unsigned per_sm = launch_exec->blocks_per_sm > 0
+            ? (unsigned)launch_exec->blocks_per_sm : 1u;
+         unsigned fill = (unsigned)cp->sm_count * per_sm *
+                         cp_debug->fs_grid_waves;
+         fs_blocks = MIN2(fs_blocks, MAX2(fill, 1u));
+      }
+
       cp->hardware_texture.fs_attempts++;
-      CUresult fs_err = cp_launch(cp, launch_kernel,
-                                       MIN2((num_threads + 255) / 256, 4096u),
+      cp->fs_launches++;
+      cp->fs_blocks += fs_blocks;
+      CUresult fs_err = cp_launch(cp, launch_kernel, fs_blocks,
                                        1, 1, 256, 1, 1, 0, cp->stream,
                                        fs_params, NULL);
       cp_texture_cache_unpin(cp);

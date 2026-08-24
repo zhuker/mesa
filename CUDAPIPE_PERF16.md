@@ -1599,3 +1599,95 @@ Artifacts: `/tmp/perf16/iter27-s1-tworeplay` (opt-in A/B),
 `/tmp/perf16/iter27-census-old2.stderr` and `-cross.stderr` (admission),
 `/tmp/perf16/iter27-acceptance/` (sentinels),
 `/tmp/perf16/iter27-sweep/` (sweep).
+
+### Two measurements taken after the fusion landed
+
+**The upload merge ratio rose exactly as iteration 26 S3 predicted, and the
+residual is not a merge problem.** S3's model was that every launch is a flush
+point, so removing launches should merge the uploads that sat on either side of
+one. Removing 194.3 launches a frame does that, measured from one binary with
+the mechanism on and off (old capture, 1,511 frames):
+
+| arm | blocks/frame | copies/frame | blocks per copy | empty flush points/frame | carried |
+|---|---:|---:|---:|---:|---:|
+| default | 914.07 | 423.31 | **2.159** | 1362.08 | 23.7% |
+| reverted | 914.06 | 615.31 | 1.486 | 1364.35 | 31.1% |
+
+The same upload blocks exist in both arms, as they must: the fusion removes
+launches, not uploads. The ratio rose 45%.
+
+Two things about that number. S3 recorded 1.82, from a census whose block count
+was 1,688,964 against today's 1,381,144 for the same 929,7xx flushes — about
+307,800 fewer blocks, suspiciously close to the 307,811 vertex-fetch launches,
+so something that contributed a block per fetch launch is no longer counted.
+**Quote the same-binary comparison above, not the 1.82.**
+
+And the answer to "is there more to get from smarter flush placement" is **no**,
+which the census settles rather than argues: there are 1,785 flush points a
+frame and only 423 of them carry anything, so 76% are already an empty
+predicate. The 914 blocks that exist are spread over the 423 carrying points at
+2.16 each, and merging further would mean deferring an upload past a launch
+boundary — where the launch on the other side is what reads it. The remaining
+copies are one per boundary that carries data. **The lever is removing the
+boundary, not flushing more cleverly.**
+
+**Sizing the fragment grid to the machine instead of to the framebuffer is
+neutral, and that refutes the candidate rather than deferring it.** The direct
+fragment launch covers the framebuffer's worst case and caps at 4,096 blocks,
+which on these captures it always hits; the shader grid-strides, and NCU
+measured 12.05 waves per SM with 65% of launches running under 50 instructions
+per thread. The obvious reading is that eleven of those twelve waves are blocks
+scheduled to discover they have nothing to do.
+
+`CUDAPIPE_FS_GRID_WAVES=W` caps the grid at `SMs × blocks_per_sm × W` instead —
+occupancy taken from the execution being launched, since a 40-register shader
+and a 126-register one do not fit the same number of blocks, with 4,096 kept as
+the hard upper bound. It reaches the launches it is aimed at, by the census this
+change also adds:
+
+| setting | FS launches | blocks | blocks/launch |
+|---|---:|---:|---:|
+| 0 (today) | 157,215 | 502,548,728 | 3196.6 |
+| 1 | 157,212 | 39,147,304 | **249.0** |
+| 4 | 157,217 | 147,941,756 | 941.0 |
+
+That is 104.0 fragment launches a frame and **306,686 fewer blocks scheduled per
+frame** at `W=1`. The frame does not move. Cycling the settings and repeating
+the cycle so drift is shared by all of them, three cycles on old and two on
+Crossroads, every median lands inside the within-setting spread:
+
+| waves | old median | vs today | Crossroads median | vs today |
+|---|---:|---:|---:|---:|
+| 0 | 15.9899 | — | 5.9786 | — |
+| 1 | 15.9903 | −0.0005 | 5.9662 | +0.0124 |
+| 2 | 15.9720 | +0.0179 | 5.9668 | +0.0118 |
+| 4 | 15.9344 | +0.0555 | 5.9903 | −0.0117 |
+| 8 | 16.0472 | −0.0573 | 5.9692 | +0.0095 |
+
+`W=1` alone spans 15.9465–16.0075, so the whole column is one distribution.
+**The result to keep is the bound it puts on the thing everyone assumes:
+306,686 scheduled blocks a frame cost less than 0.06 ms, which is under 0.2 ns
+for an idle 256-thread block on this GPU.** A block that reads a device-side
+count and exits is free. The NCU instruction mix is real; the conclusion that
+the grid was the cost is not.
+
+Where the time is instead, measured with nothing attached (nvidia-smi at 5 Hz
+across whole replays): **75.2% GPU utilisation at `W=0` and 72.1% at `W=1`** —
+about a quarter of the replay has no kernel resident at all, and shrinking the
+grids does not change it. That is consistent with this iteration's win coming
+from removing host-side launches and boundaries, and inconsistent with idle
+blocks being where the next 0.15–0.25 ms was going to come from.
+
+The flag stays at `0`, which is today's behaviour byte for byte, for the same
+reason `CUDAPIPE_LAUNCH_BOUNDS` stays: re-measuring this on different hardware
+should cost one command, not a re-implementation. The fragment-grid census
+stays because it is what proves a grid change reached the launches it aimed at.
+
+**This is deliberately not what happened to iteration 26's S2b, and the
+difference is the point.** S2b changed behaviour and lost 1.84 ms, so the path
+was deleted and only a comment was left; a kept switch there would have been a
+loaded gun. This one is byte-identical at its default — the grid is computed
+exactly as before unless someone sets the variable — and its only purpose is to
+be re-measured on a machine whose block scheduler is not free. Delete it the day
+the fragment launch stops grid-striding, because then it would be a way to drop
+work.

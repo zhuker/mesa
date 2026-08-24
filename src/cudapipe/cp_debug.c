@@ -149,6 +149,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAPIPE_NO_FUSED_VFETCH", CP_FLAG_BOOL_VALUE, F(no_fused_vfetch),
      "do not even build the fused vertex execution: the resource-isolated "
      "control, and the revert once the fusion is the default" },
+   { "CUDAPIPE_FS_GRID_WAVES", CP_FLAG_UINT, F(fs_grid_waves),
+     "size the fragment grid to fill the machine this many times over and let "
+     "it grid-stride, instead of covering the framebuffer's worst case; 0 "
+     "keeps the 4096-block cap, which is the only bound either way" },
    { "CUDAPIPE_VFETCH_DECLINE_NTH", CP_FLAG_UINT, F(vfetch_decline_nth),
      "fault injection: refuse the fused execution for the Nth vertex shader "
      "compiled, or for every one at 4294967295, after building it either way" },
