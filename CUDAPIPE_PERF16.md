@@ -684,3 +684,22 @@ removed only from the `/tmp` probe link), and that ICD runs `cpvk_tri`.
 probes; sanitizer; six reproducers over batching modes and default/inline/force/
 classic precedence; stored60/NVIDIA/sentinels; docs/diff; Gallium exact. Root
 mode hashes remain unchanged. Report: `/tmp/perf16/iter14-report.md`.
+
+## Iteration 15 — same-LLVM hardware texture execution
+
+Iterations 6/8 proved the hardware operation itself: admitted bare `tex.2d`
+chains saved 15.7 µs mean / 5.34 µs median, but only 13–14% of launches hit and
+the separately linked interpolation helper imposed 190 registers (or 126 plus
+104-byte spills). Iteration 14 removes that second blocker. Rebuild the
+resource-isolated 2D single-mip PITCH2D execution with the hardware intrinsic
+and same-LLVM interpolation in one module. The software fused module remains
+complete fallback when any shader instruction, descriptor row, image layout or
+sampler state is unsupported.
+
+This phase deliberately reuses the proven narrow image/object lifetime model.
+It must show a two-block/no-spill resource class and a complete-chain/old replay
+win before expanding storage. If admitted, its descriptor-handle ABI and
+execution ownership become the base for coherent mipmapped/layered CUDA arrays,
+cube/3D/BC views and A-buffer coverage. If still neutral, broad arrays remain
+economically unjustified despite working hardware sampling. Default software
+behavior and `CUDAPIPE_INLINE_FS` remain unchanged until full gates.

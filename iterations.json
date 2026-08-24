@@ -119,6 +119,14 @@
    "old_median_ms": 23.217,
    "sweep_hot_ms": null,
    "note": "same-LLVM LLVM18/clang bitcode interpolation proven; no helper/local/fs_in traffic. Inline 38/65 shaders, focused direct -25.3%, abuf -16.4%, but old neutral vs fused and opt-in ownership +8.34s/+110.6MB. Default remains fused; INLINE_FS=1 enables. Full correctness/review/static/no-clang gates pass."
+  },
+  {
+   "id": 15,
+   "name": "same-LLVM hardware texture execution",
+   "verdict": "pending",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "rebuild proven direct tex.2d PITCH2D path as an inline-interpolation LLVM execution, eliminating both software sampler and 190-reg helper floor. Measure exact eligible chain and old; foundation for mipmapped arrays only if compound wins."
   }
  ]
 }
