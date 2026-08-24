@@ -767,3 +767,36 @@ adds no scan/list/launch work. Cap at two until resource/code-size/compile-time
 and exact-key census justify more. The retained-NIR/key cache remains bounded
 and opt-in. Exact current sampler results, including explicit LOD and all target/
 encoding classes admitted, are non-negotiable.
+
+## Iteration 17 — result: exact coverage/resource pass, numerical rejection
+
+The complete old census observes 157,229 FS launches, 21.475 billion live slots
+and **zero row disagreement in 5.369 billion quads**. Two exact live row keys
+cover 91.38% of slots (97.06% A-buffer). A fresh timed window gives 57.57% total
+FS time and **98.25% A-buffer FS time**; four cached key sets/shader retain
+93.38% A-buffer time. A mixed RGBA8-nearest/BC3-linear two-key module is **64
+registers, zero spill/local, four blocks/SM**, with valid four-lane derivative
+shuffle masks.
+
+Production is nevertheless rejected: the literal core differs from current
+software in 122/131,072 explicit-LOD float words. Every mismatch is positive
+fractional/trilinear; integer levels are exact. Fixed 4.81 output proves Clang
+uses the expected RN FMA of independently exact mip results, while NVRTC's
+in-context optimizer produces another operation tree. No tolerance is accepted
+and no production source changed. Report: `/tmp/perf16/iter17-report.md`.
+
+## Iteration 18 — canonical mip blend, then A-buffer-first row sampler
+
+First define the sampler's fractional mip blend explicitly in the one shared
+semantic source using a round-to-nearest FMA, and force the existing NVRTC path
+to the same operation. Require zero implicit/explicit/bias vector differences,
+then run reference/stored gates for the tiny canonical output change relative to
+the old optimizer. This is a numeric contract, not an approximation.
+
+Before renderer work, census **all host rows admitted to each launch**, not only
+historically live slots. A sampler-only module has no generic device arm, so a
+third possible host key must reject the entire specialized launch unless a real
+fallback/partition exists. If cap two still owns the A-buffer opportunity, build
+only A-buffer SW-inline variants initially: bounded two-key modules and four
+sets/shader, exact row-key map, direct path unchanged fused. This targets the
+93–98% A-buffer FS class with no geometry split or extra launch.

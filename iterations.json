@@ -139,10 +139,18 @@
   {
    "id": 17,
    "name": "bounded per-row LLVM sampler dispatch",
+   "verdict": "reverted before production",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "exact census: cap2 91.38% slots, 98.25% abuf FS time; two-key 64 regs/4 blocks/no spill. Rejected because explicit fractional LOD mismatches 122/131072 words; integer mips exact. No production edits."
+  },
+  {
+   "id": 18,
+   "name": "canonical trilinear math and A-buffer row sampler",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "measure exact row keys/live slots, then compile up to two per-row literal software sampler paths inside one LLVM FS module; coherent key-index branch, no generic sampler link, whole fused fallback for unmapped rows. Targets 58% FS time/94% abuf ceiling without extra launches."
+   "note": "force one explicit RN-FMA mip blend in NVRTC+LLVM and require zero vector mismatches/reference gates; census all host rows; if admitted implement cap2 same-LLVM sampler variants for A-buffer first (93-98% time opportunity), direct fused fallback."
   }
  ]
 }
