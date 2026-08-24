@@ -604,3 +604,23 @@ and float stages. Staged modes validate direct fixed coverage first, then exact
 stage1/2 stepping and stage3 min/max classify; mode zero compiles the legacy
 path. The goal is drift-free coverage and conformance that also removes edge
 recomputation and enables valid tile acceptance, estimated 0.5–1.1 ms.
+
+## Iteration 13 — result: production rejected; oracle retained
+
+The all-stage implementation was exact on its focused contract: Q8/int64 modes
+0–4 passed the shared-edge CPU oracle, all forced stage/path variants, identical
+`cpvk_tri`, and mode0/mode4 native 44/44. It nevertheless failed both paired
+performance controls. Mode4 versus legacy regressed **+0.827/+0.653 ms**
+(center **+0.740 ms/frame**); mode4 versus direct fixed mode1 regressed
+**+0.231/+0.220 ms** (center **+0.225 ms**). Int64 issue/register cost and the
+recurrence/classifier cost exceed the removed float evaluations. Production
+fixed code and flag are fully restored; rejected patch:
+`/tmp/perf16/iter13-fixed-rejected.patch`.
+
+Retain `cpvk_fixed_edge`: two additive triangles form a 176×176 quad whose
+shared diagonal crosses pixel centers and nine 64×64 tiles. Its independent
+Q8 RN-even/int64/top-left CPU oracle detects cracks and double ownership, plus
+a one-pixel on-edge scissor. Legacy passes exactly. The current oracle does not
+yet cover MSAA, cull/front-face permutations, clipped fan seams or depth ties;
+the requested shadow scene census was not completed and no claims depend on it.
+Full report: `/tmp/perf16/iter13-report.md`.

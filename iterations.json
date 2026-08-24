@@ -107,10 +107,10 @@
   {
    "id": 13,
    "name": "exact fixed-edge raster oracle and all-stage migration",
-   "verdict": "pending",
+   "verdict": "reverted",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "8-bit snapped subpixel coordinates, int64 biased edges, exact MSAA/top-left, shared stage1-3 and FS barycentric contract. First direct oracle/revert, then stepping and stage3 accept only if exact. Target 0.5-1.1ms raster work."
+   "note": "production rejected: fixed mode4 +0.740ms vs legacy and +0.225ms vs fixed direct despite exact oracle/path matrix. Production restored. Retain cpvk_fixed_edge shared-edge CPU oracle; shadow census was not completed."
   }
  ]
 }
