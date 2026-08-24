@@ -54,7 +54,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_NO_UPLOAD_COALESCE` | bool (value) | `off` | — | send one host-to-device copy per upload block again instead of one per launch boundary |
 | `CUDAPIPE_UPLOAD_FLUSH_FAIL_AT` | uint | `0` | — | fault injection: fail the Nth coalesced upload flush |
 | `CUDAPIPE_NO_FETCH_FOLD` | bool (value) | `off` | — | clear the clip and raster queue counters with their own device clears again instead of seeding them inside cp_vertex_fetch |
-| `CUDAPIPE_FUSED_VFETCH` | bool (value) | `off` | — | gather vertex attributes inside the vertex shader, from bitcode inlined into it, instead of launching cp_vertex_fetch before it |
+| `CUDAPIPE_FUSED_VFETCH` | bool (value) | `on` | — | gather vertex attributes inside the vertex shader, from bitcode inlined into it, instead of launching cp_vertex_fetch before it |
 | `CUDAPIPE_NO_FUSED_VFETCH` | bool (value) | `off` | — | do not even build the fused vertex execution: the resource-isolated control, and the revert once the fusion is the default |
 | `CUDAPIPE_VFETCH_DECLINE_NTH` | uint | `0` | — | fault injection: refuse the fused execution for the Nth vertex shader compiled, or for every one at 4294967295, after building it either way |
 | `CUDAPIPE_VFETCH_SKIP_SEED` | bool (value) | `off` | — | fault injection: a fused draw does not seed the clip and raster counters, and the host still skips their clears -- the negative control for the seeding moving into the fused vertex shader |

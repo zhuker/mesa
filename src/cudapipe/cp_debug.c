@@ -145,7 +145,7 @@ static const struct cp_flag_def flags[] = {
      "again instead of seeding them inside cp_vertex_fetch" },
    { "CUDAPIPE_FUSED_VFETCH", CP_FLAG_BOOL_VALUE, F(fused_vfetch),
      "gather vertex attributes inside the vertex shader, from bitcode inlined "
-     "into it, instead of launching cp_vertex_fetch before it" },
+     "into it, instead of launching cp_vertex_fetch before it", .dflt = 1 },
    { "CUDAPIPE_NO_FUSED_VFETCH", CP_FLAG_BOOL_VALUE, F(no_fused_vfetch),
      "do not even build the fused vertex execution: the resource-isolated "
      "control, and the revert once the fusion is the default" },
