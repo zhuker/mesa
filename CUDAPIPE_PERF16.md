@@ -513,3 +513,22 @@ In parallel, design an exact subpixel/fixed-edge representation shared by stages
 MSAA positions, cull/bbox and barycentrics must be one owned definition that
 enables drift-free incremental edges and valid tile accept/reject. That is the
 larger multi-ms raster architecture if setup caching is bounded.
+
+## Exact fixed-edge raster roadmap (analysis during iteration 11)
+
+A fixed rasterizer is viable only as one shared all-stage definition, not a
+stage-local optimization. Use signed int32 window coordinates snapped to eight
+fractional bits; signed int64 unbiased/biased edge planes; exact integer MSAA
+offsets; one top-left bias definition; and a canonical affine depth/barycentric
+helper consumed by rasterization and FS interpolation/front-facing. Build a
+direct fixed oracle first, then stage1 stepping, stage2 stepping, and stage3
+integer min/max accept/reject behind modes whose zero value compiles the
+byte-for-byte float path. Never mix fixed stage1 with float later stages: that
+changes shared-edge ownership and can create cracks.
+
+The expected gain is **0.5–1.1 ms (7–15% of the ~7.4-ms raster chain)**, not a
+16-ms solution alone, because stage3's winning pixels still issue atomicMin.
+No-go forms: 32-bit edge values, accumulated float stepping, corner accept
+without top-left bias and all sample offsets, or a partial production rollout.
+The migration improves conformance and enables exact tile acceptance, so it
+follows setup caching. Full design: `/tmp/perf16/fixed-edge-design.md`.
