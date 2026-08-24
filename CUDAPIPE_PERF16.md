@@ -433,3 +433,29 @@ list before unchanged machine-wide stage2/3. Both use the same `cp_clip_one`/
 `cp_rast_small_or_defer` bodies and exact output/active/stable-ID rules. This
 adds a launch but removes the 5-KiB stack from the common grid and is the
 long-term work-distribution pattern needed by more complete clipping.
+
+## Iteration 9 — result: rejected and fully reverted
+
+No-sync census: 401,856,992 input triangles, **71.898% inside**, **26.886%
+common-plane reject**, **1.217% crossing**; samples were 99.795% trivial. The
+split achieved lightweight 47–48 regs/96-B local versus heavy 56–58 regs/
+5,248-B, and clip hashes were exact. It nevertheless lost: accept→crossing
+gaps 1.92/2.53 µs, device sums direct 30.992→41.021 and A-buffer
+12.401→14.804 µs; old center **23.592→24.443 ms (+0.850, +3.6%)**. The current
+fast branch already avoids touching polygon arrays; a worklist, second launch,
+and duplicate classification only add work. Patch reverted:
+`/tmp/perf16/iter9-rejected.patch`. A later persistent lightweight/heavy worker
+scheduler must use epochs/device queues and integrate stage2 to pay for itself.
+
+## Iteration 10 — zero-copy primitive references
+
+The useful census suggests a different clip redesign: do not copy the 71.9%
+wholly-inside outputs at all. Allocate an 8-byte primitive-reference table:
+inside IDs point directly at their original VS triangle, true crossing outputs
+point at clipped scratch, rejected stable slots are null. Raster setup and
+fragment interpolation resolve one pointer per primitive; all later math and
+ID/queue rules remain unchanged. Only 1.2% crossings copy 3×slots×16 bytes.
+This keeps one fused launch, removes large accepted-output writes and stable
+retirement writes, and makes the clipped representation explicit for future
+layered/MRT work. A/B must include the pointer-read cost and retain classic
+contiguous storage as fallback.

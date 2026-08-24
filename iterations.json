@@ -75,10 +75,18 @@
   {
    "id": 9,
    "name": "split trivial clip accept from heavy polygon clipping",
+   "verdict": "reverted",
+   "old_median_ms": 24.443,
+   "sweep_hot_ms": null,
+   "note": "98.783% trivial (71.898 inside,26.886 reject,1.217 cross), resource split worked but extra launch/worklist/reclassification raised device direct 30.992->41.021us, abuf 12.401->14.804us and replay +0.850ms. Reverted. Needs one persistent heterogeneous scheduler, not two kernels."
+  },
+  {
+   "id": 10,
+   "name": "zero-copy primitive references for trivially accepted clipping",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "clip+stage1 owns 3.303ms/frame and every thread carries ~5KiB clipping stack. Measure inside/cross fraction; lightweight accept+copy+stage1 kernel queues only crossing triangles to heavy clip+stage1, preserving IDs/queues."
+   "note": "inside primitives point at original VS output; only 1.2% crossings copy into clip storage; rejected stable slots use null refs. Raster/interp resolve one per-primitive pointer. Target clip+s1 3.303ms plus copy bandwidth."
   }
  ]
 }
