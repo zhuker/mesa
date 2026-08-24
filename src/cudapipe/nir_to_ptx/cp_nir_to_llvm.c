@@ -3,8 +3,11 @@
 
 #include "compiler/nir/nir.h"
 #include "util/u_memory.h"
+#include "util/u_atomic.h"
 #include "kernels/cp_rast_types.h"
 #include "cp_shader_abi.h"
+
+#include <inttypes.h>
 
 #include <llvm-c/Core.h>
 #include <llvm/Config/llvm-config.h>
@@ -42,6 +45,114 @@ cp_warn_inline_missing(void)
            "bitcode was not built; using fused helper binary\n");
 }
 #endif
+
+/*
+ * The fused-fetch admission census.
+ *
+ * A verdict counted per shader says nothing about a frame: one shader may take
+ * two launches and another two hundred. The share this iteration's arithmetic
+ * needs is launch-weighted, and nothing recorded a vertex launch per shader
+ * before this, so the counter is bumped where the vertex kernel is launched
+ * and the compile-time verdict is written beside it here.
+ *
+ * Slots are claimed out of a fixed table and never freed: a pipeline may be
+ * destroyed long before the report is printed, and a census that had to be
+ * kept in step with binary lifetime would be a second ownership problem for a
+ * diagnostic.
+ */
+#define CP_VS_CENSUS_SLOTS 256u
+static struct cp_vs_census cp_vs_census_table[CP_VS_CENSUS_SLOTS];
+static unsigned cp_vs_census_used;
+
+struct cp_vs_census *
+cp_vs_census_claim(void)
+{
+   unsigned idx = p_atomic_inc_return(&cp_vs_census_used) - 1u;
+   return idx < CP_VS_CENSUS_SLOTS ? &cp_vs_census_table[idx] : NULL;
+}
+
+static const char *
+cp_vs_verdict_name(unsigned verdict)
+{
+   switch (verdict) {
+   case CP_VS_FETCH_ADMITTED:          return "admitted";
+   case CP_VS_FETCH_NO_BITCODE:        return "no-bitcode";
+   case CP_VS_FETCH_DISABLED:          return "disabled";
+   case CP_VS_FETCH_TOO_MANY_INPUTS:   return "too-many-inputs";
+   case CP_VS_FETCH_COMPILE_FAILED:    return "compile-failed";
+   case CP_VS_FETCH_HELPER_SURVIVED:   return "helper-survived";
+   case CP_VS_FETCH_LOCAL_MEMORY:      return "local-memory";
+   case CP_VS_FETCH_SPILL:             return "spill";
+   case CP_VS_FETCH_OCCUPANCY:         return "lost-a-block";
+   case CP_VS_FETCH_FORCED_DECLINE:    return "forced-decline";
+   default:                            return "not-a-vertex-shader";
+   }
+}
+
+void
+cp_vs_census_report(void)
+{
+   if (!cp_debug->shader_stats)
+      return;
+   unsigned n = MIN2(p_atomic_read(&cp_vs_census_used), CP_VS_CENSUS_SLOTS);
+   if (!n)
+      return;
+
+   uint64_t launches = 0, admitted_launches = 0, fused_launches = 0;
+   uint64_t verdict_launches[CP_VS_FETCH_VERDICT_COUNT] = { 0 };
+   unsigned verdict_shaders[CP_VS_FETCH_VERDICT_COUNT] = { 0 };
+   double classic_regs = 0.0, fused_regs = 0.0;
+   uint64_t compared = 0, lost_block_launches = 0, won_block_launches = 0;
+
+   for (unsigned i = 0; i < n; i++) {
+      const struct cp_vs_census *c = &cp_vs_census_table[i];
+      unsigned v = MIN2((unsigned)c->verdict,
+                        (unsigned)CP_VS_FETCH_VERDICT_COUNT - 1u);
+      launches += c->launches;
+      fused_launches += c->launches_fused;
+      verdict_launches[v] += c->launches;
+      verdict_shaders[v]++;
+      if (v == CP_VS_FETCH_ADMITTED)
+         admitted_launches += c->launches;
+      if (c->fused_regs) {
+         compared += c->launches;
+         classic_regs += (double)c->classic_regs * (double)c->launches;
+         fused_regs += (double)c->fused_regs * (double)c->launches;
+         if (c->fused_blocks < c->classic_blocks)
+            lost_block_launches += c->launches;
+         else if (c->fused_blocks > c->classic_blocks)
+            won_block_launches += c->launches;
+      }
+      fprintf(stderr, "cudapipe: vsfetch shader %2u launches %8" PRIu64
+              " fused %8" PRIu64 " N %2u live 0x%04x  classic regs %3d "
+              "spill %4d blocks/sm %d  fused regs %3d spill %4d blocks/sm %d"
+              "  %s\n", i, c->launches, c->launches_fused, c->num_slots,
+              c->live_slots, c->classic_regs, c->classic_spill,
+              c->classic_blocks, c->fused_regs, c->fused_spill,
+              c->fused_blocks, cp_vs_verdict_name(v));
+   }
+
+   fprintf(stderr, "cudapipe: vsfetch census: %u vertex shaders, %" PRIu64
+           " launches, admitted share A=%.4f by launch (%.4f by shader), "
+           "fused launches %" PRIu64 " (%.4f)\n", n, launches,
+           launches ? (double)admitted_launches / (double)launches : 0.0,
+           (double)verdict_shaders[CP_VS_FETCH_ADMITTED] / (double)n,
+           fused_launches,
+           launches ? (double)fused_launches / (double)launches : 0.0);
+   fprintf(stderr, "cudapipe: vsfetch verdicts:");
+   for (unsigned v = 0; v < CP_VS_FETCH_VERDICT_COUNT; v++)
+      if (verdict_shaders[v])
+         fprintf(stderr, " %s=%u/%" PRIu64 "-launches",
+                 cp_vs_verdict_name(v), verdict_shaders[v],
+                 verdict_launches[v]);
+   fputc('\n', stderr);
+   if (compared)
+      fprintf(stderr, "cudapipe: vsfetch launch-weighted regs: classic %.1f "
+              "fused %.1f over %" PRIu64 " launches; blocks/sm lost by %"
+              PRIu64 " launches, gained by %" PRIu64 "\n",
+              classic_regs / (double)compared, fused_regs / (double)compared,
+              compared, lost_block_launches, won_block_launches);
+}
 
 /* Argument slots per launch; the host fills this array — see cp_context.c. */
 #define CP_MAX_ARG_SLOTS 64
@@ -4348,9 +4459,25 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
    if (!nir)
       return NULL;
    if (nir->info.stage != MESA_SHADER_FRAGMENT || !fs_helper_ptx ||
-       no_inline_fs)
-      return cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx, NULL,
-                                false, false, false);
+       no_inline_fs) {
+      struct cp_shader_binary *bin =
+         cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx, NULL,
+                            false, false, false);
+      /* One census line per vertex binary, so that the launches below can be
+       * attributed to the shader that received them. */
+      if (bin && nir->info.stage == MESA_SHADER_VERTEX) {
+         bin->vs_census = cp_vs_census_claim();
+         if (bin->vs_census) {
+            const struct cp_shader_exec *classic =
+               &bin->exec[CP_SHADER_EXEC_CLASSIC];
+            bin->vs_census->classic_regs = classic->num_regs;
+            bin->vs_census->classic_spill = classic->spill_bytes;
+            bin->vs_census->classic_blocks = classic->blocks_per_sm;
+            bin->vs_census->verdict = CP_VS_FETCH_NO_BITCODE;
+         }
+      }
+      return bin;
+   }
    if (force_fused_fs || !inline_fs) {
       /* cp_compile_nir_one lowers its NIR in place. Preserve a pristine clone
        * before the fused attempt so a failed/default JIT never runs classic

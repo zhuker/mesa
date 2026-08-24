@@ -816,6 +816,7 @@ cp_context_cleanup(struct cp_context *cp)
    cp_texture_cache_unpin(cp);
    cp_hardware_texture_report(cp);
    cp_spec_report(cp);
+   cp_vs_census_report();
    cp_plan_report(cp);
    if (cp_debug->upload_stats)
       fprintf(stderr, "cudapipe: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
@@ -5107,6 +5108,13 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
+         /* Which shader ran, and how often. Nothing recorded a vertex launch
+          * per shader before this, and a per-shader verdict about vertex work
+          * says nothing about a frame unless it can be weighted by the
+          * launches each shader actually receives. */
+         if (state->vs->vs_census)
+            p_atomic_inc(&state->vs->vs_census->launches);
+
          /* Compiled shaders grid-stride; see the fragment launch. */
          CUresult vs_err = cp_launch(cp,
             state->vs->exec[CP_SHADER_EXEC_CLASSIC].kernel,

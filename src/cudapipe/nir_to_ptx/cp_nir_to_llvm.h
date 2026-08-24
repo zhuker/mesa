@@ -74,6 +74,45 @@ enum cp_shader_exec_mode {
 };
 
 /*
+ * Why a vertex shader did or did not get a fused-fetch execution. The census
+ * below weights these by the launches each shader actually receives, because a
+ * verdict counted per shader says nothing about the frame.
+ */
+enum cp_vs_fetch_verdict {
+   CP_VS_FETCH_NOT_A_VERTEX_SHADER = 0,
+   CP_VS_FETCH_ADMITTED,
+   CP_VS_FETCH_NO_BITCODE,       /* built without a matching clang */
+   CP_VS_FETCH_DISABLED,         /* CUDAPIPE_NO_FUSED_VFETCH */
+   CP_VS_FETCH_TOO_MANY_INPUTS,  /* more input slots than the fetch can gather */
+   CP_VS_FETCH_COMPILE_FAILED,   /* codegen, link or JIT refused */
+   CP_VS_FETCH_HELPER_SURVIVED,  /* iteration 4's failure mode: a real call */
+   CP_VS_FETCH_LOCAL_MEMORY,     /* new .local against the classic build */
+   CP_VS_FETCH_SPILL,            /* more spill than the classic build */
+   CP_VS_FETCH_OCCUPANCY,        /* fewer blocks per SM than the classic build */
+   CP_VS_FETCH_FORCED_DECLINE,   /* CUDAPIPE_VFETCH_DECLINE_NTH, for the tests */
+   CP_VS_FETCH_VERDICT_COUNT,
+};
+
+/*
+ * One vertex shader's line in the admission census. Allocated once per
+ * compiled vertex binary out of a fixed table and never freed, so that a
+ * launch counter can be bumped without caring whether the pipeline that owns
+ * the binary still exists at teardown.
+ */
+struct cp_vs_census {
+   uint64_t launches;        /* vertex launches, whichever execution ran */
+   uint64_t launches_fused;  /* of those, run by the fused execution */
+   int classic_regs, classic_spill, classic_blocks;
+   int fused_regs, fused_spill, fused_blocks;
+   unsigned num_slots;       /* N: input slots the fused gather may fill */
+   uint32_t live_slots;      /* which of them the shader actually reads */
+   uint8_t verdict;          /* enum cp_vs_fetch_verdict */
+};
+
+struct cp_vs_census *cp_vs_census_claim(void);
+void cp_vs_census_report(void);
+
+/*
  * One independently linked execution of a shader.  A fragment shader owns a
  * classic execution whose PTX has no fused-interpolation reference and a
  * fused execution which links cp_fs.cu.  Module resources, register-cap
@@ -195,6 +234,10 @@ struct cp_shader_binary {
 
    struct cp_sampler_variant sampler_variants[CP_MAX_SAMPLER_VARIANTS];
    unsigned num_sampler_variants;
+
+   /* This vertex shader's line in the launch census; null for every other
+    * stage. Table-owned, so it outlives the binary. */
+   struct cp_vs_census *vs_census;
 
    /* Which VARYING_SLOT_* each I/O slot carries. */
    unsigned in_location[CP_MAX_IO_SLOTS];
