@@ -1360,8 +1360,24 @@ environment and writes `arms.txt`, so a default-on stage is measured as
 
 **Result: kept, default on, `CUDAPIPE_NO_FUSED_VFETCH=1` reverts.**
 Old capture **16.5013 → 15.9726 ms** (+0.5287 ms, +3.20%), Crossroads
-**6.0758 → 5.9831 ms** (+0.0927 ms, +1.53%). The goal of this log — a
-paired-submit median at or below 16 ms on the old capture — is reached.
+**6.0758 → 5.9831 ms** (+0.0927 ms, +1.53%).
+
+**Three sessions, and the goal is met on the median of them rather than
+comfortably.** The mechanism was measured three times against its own revert,
+each time AB/BA on both captures in one session:
+
+| session | default | reverted | delta |
+|---|---:|---:|---:|
+| opt-in flag | 15.9448 | 16.4571 | +0.5122 |
+| after the flip | 15.9726 | 16.5013 | +0.5287 |
+| at the committed HEAD | 16.0544 | 16.5178 | +0.4634 |
+
+The default arm spans 15.94–16.05 with a median of **15.9726**, so the log's
+target — a paired-submit median at or below 16 ms on the old capture — is
+reached, but by about the width of the session-to-session spread. The delta is
+the robust number and it reproduces: **+0.46 to +0.53 ms**, with the reverted
+arm landing within 0.02 ms of the 16.5021 this branch stood at. Quote the
+delta; treat 15.97 as "at 16 ms", not as headroom below it.
 
 `cp_vertex_fetch` ran once per executed batch, immediately before the
 generated vertex shader, over the same vertices, on the same stream, and
