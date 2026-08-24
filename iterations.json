@@ -147,10 +147,18 @@
   {
    "id": 18,
    "name": "canonical trilinear math and A-buffer row sampler",
+   "verdict": "reverted",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "all correctness/coverage/resource gates passed (93.38% abuf time, 62-122 regs) but hot old regressed 23.434->24.605 (+5.0%), standing +6.64%, wall +13.77%. Fully restored. Instruction/code cost dominates occupancy."
+  },
+  {
+   "id": 19,
+   "name": "stable-recipe whole-batch CUDA graphs",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "force one explicit RN-FMA mip blend in NVRTC+LLVM and require zero vector mismatches/reference gates; census all host rows; if admitted implement cap2 same-LLVM sampler variants for A-buffer first (93-98% time opportunity), direct fused fallback."
+   "note": "census pointer-independent command/batch recipe recurrence; allocate stable command-owned execution storage and explicit update-free graph for decision-free direct batch chain. Avoid tail exact-key churn; target 1-3ms of ~5.7ms idle gaps."
   }
  ]
 }

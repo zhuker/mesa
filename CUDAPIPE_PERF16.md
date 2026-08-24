@@ -800,3 +800,33 @@ fallback/partition exists. If cap two still owns the A-buffer opportunity, build
 only A-buffer SW-inline variants initially: bounded two-key modules and four
 sets/shader, exact row-key map, direct path unchanged fused. This targets the
 93–98% A-buffer FS class with no geometry split or extra launch.
+
+## Iteration 18 — result: exact broad sampler rejected by hot execution
+
+Canonical mip math, all-host cap-two admission, 25-class exact shared core,
+retained NIR/cache ownership and full correctness all pass. Real variants admit
+up to eight/nine texture sites at 92–104 registers, zero spill; cap-two/four-set
+coverage owns 93.38% A-buffer FS time. Yet old replay regresses fused 23.434 to
+inline 24.605 ms (**+5.00%**), after-first-100 +5.29%, standing policy +6.64%,
+and wall +13.77%. The larger duplicated instruction/code footprint dominates
+the occupancy gain. Production is fully restored. Report/patch:
+`/tmp/perf16/iter18-report.md`, `iter18-rejected-production.patch`. Do not retry
+same-LLVM software sampling without an instruction-count redesign.
+
+## Iteration 19 — stable-recipe whole-batch CUDA Graphs
+
+Tail graphs were rejected because rotating transient pointers produced 65,905
+exact keys and 27–44k instantiations for only 0.6–0.7 ms ceiling. The trace still
+contains ~5.7 ms/frame of device-idle gaps, and an immutable direct batch spans
+fetch → VS → clip/raster → compact/interpolate → FS → writeback with many launch
+handoffs. The graph unit must move up to that batch/decision-free segment.
+
+Measure pointer-independent record-time recipe recurrence and command-buffer
+reuse first. If admitted, give a recipe bounded command-owned execution storage
+with stable device addresses and owned host argument bytes; build one explicit,
+update-free graph per allocation/function epoch. Graph hits contain kernel,
+memset and required memcpy nodes and launch once. No stream capture, per-submit
+node updates, stale arena pointers or host-dependent A-buffer/peel branches. A
+miss/failure and unsupported batch use the exact classic path. This is the clean
+foundation for later conditional episode graphs and should target 1–3 ms, not
+the already-rejected two-handoff tail ceiling.
