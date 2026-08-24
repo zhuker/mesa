@@ -115,10 +115,10 @@
   {
    "id": 14,
    "name": "same-LLVM fragment interpolation and shader",
-   "verdict": "pending",
-   "old_median_ms": null,
+   "verdict": "kept opt-in",
+   "old_median_ms": 23.217,
    "sweep_hot_ms": null,
-   "note": "compile interpolation helper to LLVM18 bitcode, link+always-inline into NIR module, use kernel-local input SSA/storage rather than global fs_in. Preserve classic separate chain. Foundation for broad resource-isolated texture path; measure resources and full chain first."
+   "note": "same-LLVM LLVM18/clang bitcode interpolation proven; no helper/local/fs_in traffic. Inline 38/65 shaders, focused direct -25.3%, abuf -16.4%, but old neutral vs fused and opt-in ownership +8.34s/+110.6MB. Default remains fused; INLINE_FS=1 enables. Full correctness/review/static/no-clang gates pass."
   }
  ]
 }

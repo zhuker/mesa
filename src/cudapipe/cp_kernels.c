@@ -44,6 +44,10 @@ static const char cp_rast_types_src[] =
 #include "cp_rast_types.h.inc"
 ;
 
+static const char cp_fs_interp_src[] =
+#include "cp_fs_interp.h.inc"
+;
+
 /*
  * Whether the debug instrumentation is compiled into the kernels at all.
  *
@@ -85,11 +89,11 @@ static char *
 compile_cuda_source(const char *source, const char *name, int sm_major,
                     int sm_minor, bool relocatable)
 {
-   const char *header_srcs[] = { cp_rast_types_src };
-   const char *header_names[] = { "cp_rast_types.h" };
+   const char *header_srcs[] = { cp_rast_types_src, cp_fs_interp_src };
+   const char *header_names[] = { "cp_rast_types.h", "cp_fs_interp.h" };
 
    nvrtcProgram prog;
-   nvrtcResult res = nvrtcCreateProgram(&prog, source, name, 1,
+   nvrtcResult res = nvrtcCreateProgram(&prog, source, name, 2,
                                         header_srcs, header_names);
    if (res != NVRTC_SUCCESS) {
       fprintf(stderr, "cudapipe: nvrtcCreateProgram failed: %d\n", res);
@@ -160,6 +164,7 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
       blob_write_string(&key_blob, name);
       blob_write_string(&key_blob, source);
       blob_write_string(&key_blob, cp_rast_types_src);
+      blob_write_string(&key_blob, cp_fs_interp_src);
       for (unsigned i = 0; i < num_opts; i++)
          blob_write_string(&key_blob, opts[i]);
       if (!key_blob.out_of_memory) {

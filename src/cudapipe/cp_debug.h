@@ -121,6 +121,9 @@ struct cp_debug {
    bool no_abuf_append;
    bool no_fused_abuf_interp;
    bool no_fused_interp;
+   bool no_inline_fs;
+   bool inline_fs;
+   bool force_fused_fs;
    bool no_fused_rast;
    bool no_prim_refs;
    bool no_setup_cache;

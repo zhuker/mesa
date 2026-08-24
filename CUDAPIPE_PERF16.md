@@ -650,3 +650,37 @@ not FS registers alone. Even a modest direct win is architectural: the same
 module permits dead varying elimination and is prerequisite to combining the
 proven-fast bare hardware texture instruction with broad image coverage without
 the 190-register helper floor.
+
+## Iteration 14 — result: architecture kept opt-in, fused remains default
+
+The mechanism is real: a matching build-time Clang emits deterministic NVPTX
+LLVM bitcode from the shared interpolation source; the generated NIR module
+links it, forces it inline and promotes its live input slots to SSA. Strict
+admission rejects any surviving helper or PTX local-memory traffic. Admitted
+PTX has no interpolation call, no local depot and no global `fs_in` route. It
+admits 38/65 old-capture FS modules; the remaining 27 use proven fused PTX.
+Untextured resource use falls fused 190→inline 72 registers. Software-sampled
+modules stay at 203/236 because the sampler is now the sole resource floor.
+
+Complete focused chains improve **25.3% direct** and **16.4% A-buffer**. An
+opt-in 600-frame hot sum was 25.39 versus forced fused 26.13 ms, but old replay
+23.240/23.231 is neutral against the standing fused 23.217 ms. More importantly,
+opt-in dual ownership costs **+8.34 s cold/warm replay wall and +110.6 MiB host
+RSS** across 65 shaders (+~20 MiB device). Therefore the clean adoption policy
+is: fused-only remains default; `CUDAPIPE_INLINE_FS=1` builds fused+inline for
+experiments and the forthcoming resource-isolated hardware texture path;
+`FORCE_FUSED_FS` is the reproducible fused control; `NO_INLINE_FS` is the
+resource-isolated classic control. No default frame-time claim is made.
+
+Review hardened constant/dynamic input-array footprints, frozen bitcode ABI,
+convergent initialized quad shuffles, transactional sampler variants, quiet
+expected fallback, standalone-capable pipeline admission and pristine NIR on
+fused JIT failure. Inline requires LLVM ≥18 plus matching optional Clang; without
+it all parse/link/pass references compile out. Exact-version static LLVM module
+deps link successfully (the distro's unrelated missing Polly archives were
+removed only from the `/tmp` probe link), and that ICD runs `cpvk_tri`.
+
+**Gates:** worker/root 44/44; inline focus and input array/matrix/indirect
+probes; sanitizer; six reproducers over batching modes and default/inline/force/
+classic precedence; stored60/NVIDIA/sentinels; docs/diff; Gallium exact. Root
+mode hashes remain unchanged. Report: `/tmp/perf16/iter14-report.md`.

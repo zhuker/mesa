@@ -1095,7 +1095,9 @@ cpvk_execute_dispatch(struct cpvk_device *dev,
                        const struct cpvk_dispatch *d)
 {
    struct cp_shader_binary *bin = d->pipeline->bin;
-   if (!bin || !bin->kernel)
+   struct cp_shader_exec *exec = bin
+      ? &bin->exec[CP_SHADER_EXEC_CLASSIC] : NULL;
+   if (!exec || !exec->kernel)
       return VK_SUCCESS;
 
    /* A linked sampler reads its state table through module globals. Graphics
@@ -1103,34 +1105,34 @@ cpvk_execute_dispatch(struct cpvk_device *dev,
     * publish the same table and explicitly leave derivatives disabled. Do not
     * query an untextured module: cuModuleGetGlobal triggers its lazy JIT and
     * moved a one-second cost into the first measured compute frame. */
-   if (bin->sampler_ptx) {
-      if (!bin->globals_resolved) {
+   if (exec->sampler_ptx) {
+      if (!exec->globals_resolved) {
          CUdeviceptr sym;
          size_t sym_size;
-         if (cuModuleGetGlobal(&sym, &sym_size, bin->module,
+         if (cuModuleGetGlobal(&sym, &sym_size, exec->module,
                                "cp_sampler_table") == CUDA_SUCCESS)
-            bin->sym_sampler_table = sym;
-         if (cuModuleGetGlobal(&sym, &sym_size, bin->module,
+            exec->sym_sampler_table = sym;
+         if (cuModuleGetGlobal(&sym, &sym_size, exec->module,
                                "cp_quad_derivs") == CUDA_SUCCESS)
-            bin->sym_quad_derivs = sym;
-         bin->last_sampler_table = ~(uint64_t)0;
-         bin->last_quad_derivs = -1;
-         bin->globals_resolved = true;
+            exec->sym_quad_derivs = sym;
+         exec->last_sampler_table = ~(uint64_t)0;
+         exec->last_quad_derivs = -1;
+         exec->globals_resolved = true;
       }
-      if (dev->renderer.sampler_table && bin->sym_sampler_table &&
-          bin->last_sampler_table != (uint64_t)dev->renderer.sampler_table) {
+      if (dev->renderer.sampler_table && exec->sym_sampler_table &&
+          exec->last_sampler_table != (uint64_t)dev->renderer.sampler_table) {
          uint64_t addr = (uint64_t)dev->renderer.sampler_table;
-         if (cuMemcpyHtoD(bin->sym_sampler_table, &addr, sizeof(addr)) !=
+         if (cuMemcpyHtoD(exec->sym_sampler_table, &addr, sizeof(addr)) !=
              CUDA_SUCCESS)
             return vk_error(dev, VK_ERROR_DEVICE_LOST);
-         bin->last_sampler_table = addr;
+         exec->last_sampler_table = addr;
       }
-      if (bin->sym_quad_derivs && bin->last_quad_derivs != 0) {
+      if (exec->sym_quad_derivs && exec->last_quad_derivs != 0) {
          int off = 0;
-         if (cuMemcpyHtoD(bin->sym_quad_derivs, &off, sizeof(off)) !=
+         if (cuMemcpyHtoD(exec->sym_quad_derivs, &off, sizeof(off)) !=
              CUDA_SUCCESS)
             return vk_error(dev, VK_ERROR_DEVICE_LOST);
-         bin->last_quad_derivs = 0;
+         exec->last_quad_derivs = 0;
       }
    }
 
@@ -1176,7 +1178,7 @@ cpvk_execute_dispatch(struct cpvk_device *dev,
    unsigned bx = MAX2(d->pipeline->local_size[0], (uint16_t)1);
    unsigned by = MAX2(d->pipeline->local_size[1], (uint16_t)1);
    unsigned bz = MAX2(d->pipeline->local_size[2], (uint16_t)1);
-   CUresult err = cuLaunchKernel(bin->kernel, d->grid[0], d->grid[1],
+   CUresult err = cuLaunchKernel(exec->kernel, d->grid[0], d->grid[1],
                                  d->grid[2], bx, by, bz, 0, cp->stream,
                                  kernel_args, NULL);
    if (err != CUDA_SUCCESS) {
@@ -2091,7 +2093,9 @@ cpvk_batch_structural(struct cpvk_device *dev, const struct cp_render_scope *sco
    struct cp_context *cp = &dev->renderer;
    const struct cpvk_pipeline *p = d->pipeline;
 
-   if (!p || !p->vs || !p->vs->kernel || !p->fs || !p->fs->kernel)
+   if (!p || !p->vs ||
+       !p->vs->exec[CP_SHADER_EXEC_CLASSIC].kernel ||
+       !cp_shader_has_standalone_exec(p->fs))
       return false;
    if (d->call.mode != MESA_PRIM_TRIANGLES)
       return false;

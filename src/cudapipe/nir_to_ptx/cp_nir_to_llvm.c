@@ -7,10 +7,16 @@
 #include "cp_shader_abi.h"
 
 #include <llvm-c/Core.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 #include <llvm-c/Analysis.h>
+#ifdef CP_HAVE_FS_INLINE_BC
+#include <llvm-c/BitReader.h>
+#include <llvm-c/Linker.h>
+#include <llvm-c/Error.h>
 #include <llvm-c/Transforms/PassBuilder.h>
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +28,20 @@
  * back to a default that emits unloadable PTX. Raise this only alongside the
  * PTX ISA version in the target machine's feature string below. */
 #define CP_MAX_PTX_SM 86
+
+#ifdef CP_HAVE_FS_INLINE_BC
+static const unsigned char cp_fs_inline_bc[] = {
+#include "cp_fs_inline.bc.inc"
+};
+#else
+static once_flag cp_inline_missing_once = ONCE_FLAG_INIT;
+static void
+cp_warn_inline_missing(void)
+{
+   fprintf(stderr, "cudapipe: inline FS unavailable: matching clang "
+           "bitcode was not built; using fused helper binary\n");
+}
+#endif
 
 /* Argument slots per launch; the host fills this array — see cp_context.c. */
 #define CP_MAX_ARG_SLOTS 64
@@ -70,6 +90,12 @@ struct ntl_context {
     * same NIR. See cp_nir_writes_memory().
     */
    bool writes_memory;
+   bool fused_interp;
+   bool inline_interp;
+   LLVMValueRef inline_fs_inputs;
+   uint32_t inline_live_slots;
+   int32_t inline_pntc_input;
+   int32_t inline_pos_input;
 
    LLVMBasicBlockRef break_block;
    LLVMBasicBlockRef continue_block;
@@ -668,28 +694,39 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       unsigned comp = nir_intrinsic_component(instr);
       LLVMValueRef offset_val = get_src(ctx, &instr->src[0]);
 
-      /* Input ptr is at args[2] (after grid_info at 0, reserved at 1) */
-      LLVMValueRef input_ptr = cp_arg_slot(ctx, 2);
+      /* The classic/fused ABI reads global fs_in. The inline execution reads
+       * the caller-owned entry alloca filled by the linked interpolation IR. */
+      LLVMValueRef input_ptr =
+         ctx->nir->info.stage == MESA_SHADER_FRAGMENT && ctx->inline_interp
+         ? ctx->inline_fs_inputs : cp_arg_slot(ctx, 2);
 
-      /* Compute byte offset: vertex_id * vertex_stride + base * 16 + comp * 4 + offset * 16 */
-      LLVMValueRef bid2 = emit_workgroup_id(ctx, 0);
-      LLVMValueRef tid2 = emit_local_invocation_id(ctx, 0);
-      LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
-         LLVMBuildMul(ctx->builder, bid2, LLVMConstInt(i32, 256, false), ""), tid2, "");
-
-      /* Read stride from args[3]. Invariant for the same reason the slot it
-       * came from is: the host writes it before the launch. */
-      LLVMTypeRef i32_ptr = LLVMPointerType(i32, 0);
-      LLVMValueRef stride = LLVMBuildLoad2(ctx->builder, i32,
-         LLVMBuildBitCast(ctx->builder, cp_arg_slot(ctx, 3), i32_ptr, ""), "stride");
-      LLVMSetMetadata(stride, ctx->md_invariant_load,
-                      LLVMMDNodeInContext(ctx->llvm_ctx, NULL, 0));
-
-      LLVMValueRef byte_off = LLVMBuildAdd(ctx->builder,
-         LLVMBuildAdd(ctx->builder,
-            LLVMBuildMul(ctx->builder, vid, stride, ""),
-            LLVMConstInt(i32, base * 16 + comp * 4, false), ""),
-         LLVMBuildMul(ctx->builder, offset_val, LLVMConstInt(i32, 16, false), ""), "");
+      /* Classic inputs are a global array indexed by invocation. Inline
+       * inputs are this invocation's one entry alloca, so no vid/stride term. */
+      LLVMValueRef byte_off;
+      if (ctx->nir->info.stage == MESA_SHADER_FRAGMENT && ctx->inline_interp) {
+         byte_off = LLVMBuildAdd(ctx->builder,
+            LLVMConstInt(i32, base * 16 + comp * 4, false),
+            LLVMBuildMul(ctx->builder, offset_val,
+                         LLVMConstInt(i32, 16, false), ""), "");
+      } else {
+         LLVMValueRef bid2 = emit_workgroup_id(ctx, 0);
+         LLVMValueRef tid2 = emit_local_invocation_id(ctx, 0);
+         LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
+            LLVMBuildMul(ctx->builder, bid2,
+                         LLVMConstInt(i32, 256, false), ""), tid2, "");
+         LLVMTypeRef i32_ptr = LLVMPointerType(i32, 0);
+         LLVMValueRef stride = LLVMBuildLoad2(ctx->builder, i32,
+            LLVMBuildBitCast(ctx->builder, cp_arg_slot(ctx, 3), i32_ptr, ""),
+            "stride");
+         LLVMSetMetadata(stride, ctx->md_invariant_load,
+                         LLVMMDNodeInContext(ctx->llvm_ctx, NULL, 0));
+         byte_off = LLVMBuildAdd(ctx->builder,
+            LLVMBuildAdd(ctx->builder,
+               LLVMBuildMul(ctx->builder, vid, stride, ""),
+               LLVMConstInt(i32, base * 16 + comp * 4, false), ""),
+            LLVMBuildMul(ctx->builder, offset_val,
+                         LLVMConstInt(i32, 16, false), ""), "");
+      }
 
       LLVMValueRef elem_ptr = LLVMBuildGEP2(ctx->builder,
          LLVMInt8TypeInContext(ctx->llvm_ctx), input_ptr, &byte_off, 1, "");
@@ -2561,6 +2598,14 @@ emit_function(struct ntl_context *ctx)
       LLVMGetMDKindIDInContext(ctx->llvm_ctx, "invariant.load",
                                strlen("invariant.load"));
 
+   if (ctx->inline_interp) {
+      LLVMTypeRef i8_t = LLVMInt8TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef input_array = LLVMArrayType(i8_t, CP_MAX_FS_INPUTS * 16);
+      ctx->inline_fs_inputs = LLVMBuildAlloca(
+         ctx->builder, input_array, "inline_fs_inputs");
+      LLVMSetAlignment(ctx->inline_fs_inputs, 16);
+   }
+
    /*
     * Bounds check: the count is on the device, so both grids are sized for the
     * worst case and each thread bounds itself against slot 0 — the vertex
@@ -2629,32 +2674,64 @@ emit_function(struct ntl_context *ctx)
       LLVMPositionBuilderAtEnd(ctx->builder, body);
       ctx->virtual_bid = vbid_phi;
 
-      if (ctx->nir->info.stage == MESA_SHADER_FRAGMENT) {
+      if (ctx->nir->info.stage == MESA_SHADER_FRAGMENT &&
+          (ctx->fused_interp || ctx->inline_interp)) {
          LLVMTypeRef i8_ptr = LLVMPointerType(
             LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
          LLVMValueRef interp = cp_arg_slot(ctx, CP_ARG_SLOT_FUSED_INTERP);
-         LLVMValueRef enabled = LLVMBuildICmp(ctx->builder, LLVMIntNE, interp,
-            LLVMConstNull(i8_ptr), "fused_interp_enabled");
          LLVMBasicBlockRef call_interp = LLVMAppendBasicBlockInContext(
-            ctx->llvm_ctx, ctx->function, "fused_interp");
+            ctx->llvm_ctx, ctx->function,
+            ctx->inline_interp ? "inline_interp" : "fused_interp");
          LLVMBasicBlockRef after_interp = LLVMAppendBasicBlockInContext(
-            ctx->llvm_ctx, ctx->function, "fused_interp_done");
-         LLVMBuildCondBr(ctx->builder, enabled, call_interp, after_interp);
+            ctx->llvm_ctx, ctx->function,
+            ctx->inline_interp ? "inline_interp_done" : "fused_interp_done");
 
-         LLVMPositionBuilderAtEnd(ctx->builder, call_interp);
-         LLVMTypeRef params[] = { i8_ptr, i32_t };
-         LLVMTypeRef helper_type = LLVMFunctionType(i32_t, params, 2, false);
-         LLVMValueRef helper = LLVMGetNamedFunction(
-            ctx->module, "cp_abuf_interpolate_lane");
-         if (!helper)
-            helper = LLVMAddFunction(ctx->module, "cp_abuf_interpolate_lane",
-                                     helper_type);
-         LLVMValueRef helper_args[] = { interp, vid };
-         LLVMValueRef valid = LLVMBuildCall2(ctx->builder, helper_type, helper,
-                                              helper_args, 2, "interp_valid");
-         valid = LLVMBuildICmp(ctx->builder, LLVMIntNE, valid,
-                              LLVMConstInt(i32_t, 0, false), "");
-         LLVMBuildCondBr(ctx->builder, valid, after_interp, stride_latch);
+         if (ctx->inline_interp) {
+            /* Inline executions are selected only for the compact/direct or
+             * merged A-buffer chains, both of which always supply this block. */
+            LLVMBuildBr(ctx->builder, call_interp);
+            LLVMPositionBuilderAtEnd(ctx->builder, call_interp);
+            LLVMTypeRef params[] = { i8_ptr, i32_t, i8_ptr, i32_t, i32_t,
+                                     i32_t, i32_t };
+            LLVMTypeRef helper_type = LLVMFunctionType(i32_t, params, 7, false);
+            LLVMValueRef helper = LLVMGetNamedFunction(
+               ctx->module, "cp_fs_inline_lane");
+            if (!helper)
+               helper = LLVMAddFunction(ctx->module, "cp_fs_inline_lane",
+                                        helper_type);
+            LLVMValueRef helper_args[] = {
+               interp, vid,
+               LLVMBuildBitCast(ctx->builder, ctx->inline_fs_inputs, i8_ptr, ""),
+               LLVMConstInt(i32_t, MIN2(ctx->nir->num_inputs,
+                                       CP_MAX_FS_INPUTS), false),
+               LLVMConstInt(i32_t, ctx->inline_live_slots, false),
+               LLVMConstInt(i32_t, (uint32_t)ctx->inline_pntc_input, false),
+               LLVMConstInt(i32_t, (uint32_t)ctx->inline_pos_input, false),
+            };
+            LLVMValueRef valid = LLVMBuildCall2(ctx->builder, helper_type, helper,
+                                                 helper_args, 7, "interp_valid");
+            valid = LLVMBuildICmp(ctx->builder, LLVMIntNE, valid,
+                                 LLVMConstInt(i32_t, 0, false), "");
+            LLVMBuildCondBr(ctx->builder, valid, after_interp, stride_latch);
+         } else {
+            LLVMValueRef enabled = LLVMBuildICmp(ctx->builder, LLVMIntNE, interp,
+               LLVMConstNull(i8_ptr), "fused_interp_enabled");
+            LLVMBuildCondBr(ctx->builder, enabled, call_interp, after_interp);
+            LLVMPositionBuilderAtEnd(ctx->builder, call_interp);
+            LLVMTypeRef params[] = { i8_ptr, i32_t };
+            LLVMTypeRef helper_type = LLVMFunctionType(i32_t, params, 2, false);
+            LLVMValueRef helper = LLVMGetNamedFunction(
+               ctx->module, "cp_abuf_interpolate_lane");
+            if (!helper)
+               helper = LLVMAddFunction(ctx->module, "cp_abuf_interpolate_lane",
+                                        helper_type);
+            LLVMValueRef helper_args[] = { interp, vid };
+            LLVMValueRef valid = LLVMBuildCall2(ctx->builder, helper_type, helper,
+                                                 helper_args, 2, "interp_valid");
+            valid = LLVMBuildICmp(ctx->builder, LLVMIntNE, valid,
+                                 LLVMConstInt(i32_t, 0, false), "");
+            LLVMBuildCondBr(ctx->builder, valid, after_interp, stride_latch);
+         }
          LLVMPositionBuilderAtEnd(ctx->builder, after_interp);
       }
 
@@ -2721,6 +2798,101 @@ cp_initialize_nvptx(void)
    LLVMInitializeNVPTXTargetMC();
    LLVMInitializeNVPTXAsmPrinter();
 }
+
+#ifdef CP_HAVE_FS_INLINE_BC
+static bool
+link_and_inline_fs_interp(LLVMModuleRef module, LLVMContextRef llvm_ctx,
+                          int sm_major, int sm_minor)
+{
+   const char triple[] = "nvptx64-nvidia-cuda";
+   char cpu[16];
+   int llvm_major = sm_major, llvm_minor = sm_minor;
+   if (llvm_major * 10 + llvm_minor > CP_MAX_PTX_SM) {
+      llvm_major = CP_MAX_PTX_SM / 10;
+      llvm_minor = CP_MAX_PTX_SM % 10;
+   }
+   snprintf(cpu, sizeof(cpu), "sm_%d%d", llvm_major, llvm_minor);
+   call_once(&cp_nvptx_once, cp_initialize_nvptx);
+
+   char *error = NULL;
+   LLVMTargetRef target = NULL;
+   if (LLVMGetTargetFromTriple(triple, &target, &error) != 0) {
+      fprintf(stderr, "cudapipe: inline FS target lookup failed: %s\n",
+              error ? error : "?");
+      LLVMDisposeMessage(error);
+      return false;
+   }
+   LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
+      target, triple, cpu, "+ptx75", LLVMCodeGenLevelDefault,
+      LLVMRelocDefault, LLVMCodeModelDefault);
+   if (!tm)
+      return false;
+   LLVMTargetDataRef td = LLVMCreateTargetDataLayout(tm);
+   char *layout = LLVMCopyStringRepOfTargetData(td);
+   LLVMSetTarget(module, triple);
+   LLVMSetDataLayout(module, layout);
+
+   LLVMMemoryBufferRef buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(
+      (const char *)cp_fs_inline_bc, sizeof(cp_fs_inline_bc), "cp_fs_inline.bc");
+   LLVMModuleRef helper_module = NULL;
+   bool ok = LLVMParseBitcodeInContext2(llvm_ctx, buffer, &helper_module) == 0;
+   LLVMDisposeMemoryBuffer(buffer);
+   if (!ok || !helper_module) {
+      fprintf(stderr, "cudapipe: inline FS LLVM %d bitcode parse failed\n",
+              LLVM_VERSION_MAJOR);
+      goto out;
+   }
+   if (strcmp(LLVMGetTarget(helper_module), triple) != 0 ||
+       strcmp(LLVMGetDataLayoutStr(helper_module), layout) != 0) {
+      fprintf(stderr, "cudapipe: inline FS bitcode target/layout mismatch "
+              "(LLVM %d)\n", LLVM_VERSION_MAJOR);
+      LLVMDisposeModule(helper_module);
+      ok = false;
+      goto out;
+   }
+   if (LLVMLinkModules2(module, helper_module) != 0) {
+      fprintf(stderr, "cudapipe: inline FS LLVM module link failed\n");
+      ok = false;
+      goto out;
+   }
+
+   LLVMValueRef helper = LLVMGetNamedFunction(module, "cp_fs_inline_lane");
+   if (!helper) {
+      fprintf(stderr, "cudapipe: inline FS helper absent after link\n");
+      ok = false;
+      goto out;
+   }
+   LLVMSetLinkage(helper, LLVMInternalLinkage);
+
+   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+   LLVMErrorRef pass_error = LLVMRunPasses(
+      module,
+      "always-inline,function(sroa,mem2reg,sccp,simplifycfg,loop-unroll,"
+      "sccp,sroa,mem2reg,gvn,dse,adce,simplifycfg),globaldce",
+      tm, opts);
+   LLVMDisposePassBuilderOptions(opts);
+   if (pass_error) {
+      char *message = LLVMGetErrorMessage(pass_error);
+      fprintf(stderr, "cudapipe: inline FS LLVM optimization failed: %s\n",
+              message ? message : "?");
+      LLVMDisposeErrorMessage(message);
+      ok = false;
+      goto out;
+   }
+   if (LLVMGetNamedFunction(module, "cp_fs_inline_lane")) {
+      fprintf(stderr, "cudapipe: inline FS helper survived forced inlining\n");
+      ok = false;
+      goto out;
+   }
+   ok = true;
+
+out:
+   LLVMDisposeMessage(layout);
+   LLVMDisposeTargetData(td);
+   LLVMDisposeTargetMachine(tm);
+   return ok;
+}
+#endif
 
 static char *
 compile_module_to_ptx(LLVMModuleRef module, int sm_major, int sm_minor, size_t *out_size)
@@ -2972,23 +3144,28 @@ measure_shader_cost(CUfunction fn, struct cp_shader_cost *cost)
 
 static int cp_pick_reg_cap(void);
 
-bool
-cp_shader_build_sampler_variant(struct cp_shader_binary *bin,
-                                const char *sampler_ptx,
-                                const struct cp_sampler_info *states,
-                                unsigned num_states)
+static bool
+cp_shader_build_sampler_variant_exec(struct cp_shader_binary *bin,
+                                     struct cp_sampler_variant *variant,
+                                     const char *sampler_ptx,
+                                     enum cp_shader_exec_mode mode)
 {
-   if (!bin || !sampler_ptx || !states || !num_states ||
-       bin->num_sampler_variants >= CP_MAX_SAMPLER_VARIANTS)
-      return false;
-   if (cp_shader_find_sampler_variant(bin, states, num_states))
+   struct cp_shader_exec *base = &bin->exec[mode];
+   struct cp_shader_exec *exec = &variant->exec[mode];
+   if (exec->kernel)
       return true;
+   if (!base->kernel || !base->ptx_text)
+      return false;
 
+   /* A base shader's runtime tuning verdict does not transfer to a specialised
+    * sampler binary.  Start variants as built (except for an explicit static
+    * policy), then give this execution its own trial below. */
+   int initial_cap = (cp_debug->max_registers || cp_debug->regcap_static)
+      ? base->reg_cap : 0;
    CUmodule module = NULL;
    CUfunction kernel = NULL;
-   if (load_shader_module(&module, bin->ptx_text, sampler_ptx,
-                          bin->fs_helper_ptx,
-                          bin->reg_cap) != CUDA_SUCCESS)
+   if (load_shader_module(&module, base->ptx_text, sampler_ptx,
+                          base->fs_helper_ptx, initial_cap) != CUDA_SUCCESS)
       return false;
    if (cuModuleGetFunction(&kernel, module, "main") != CUDA_SUCCESS) {
       cuModuleUnload(module);
@@ -2997,59 +3174,48 @@ cp_shader_build_sampler_variant(struct cp_shader_binary *bin,
 
    struct cp_shader_cost cost;
    measure_shader_cost(kernel, &cost);
-   struct cp_sampler_variant *variant =
-      &bin->sampler_variants[bin->num_sampler_variants];
-   variant->states = malloc((size_t)num_states * sizeof(*states));
-   if (!variant->states) {
-      cuModuleUnload(module);
-      return false;
-   }
-   memcpy(variant->states, states, (size_t)num_states * sizeof(*states));
-   variant->num_states = num_states;
-   variant->module = module;
-   variant->kernel = kernel;
-   variant->regs = cost.regs;
-   variant->spill_bytes = cost.spill;
-   variant->blocks_per_sm = cost.blocks;
-   variant->reg_cap = bin->reg_cap;
-   variant->last_sampler_table = ~(uint64_t)0;
-   variant->last_quad_derivs = -1;
-   variant->tune_done = true;
+   exec->ptx_text = base->ptx_text; /* borrowed from the base execution */
+   exec->ptx_size = base->ptx_size;
+   exec->module = module;
+   exec->kernel = kernel;
+   exec->num_regs = cost.regs;
+   exec->spill_bytes = cost.spill;
+   exec->blocks_per_sm = cost.blocks;
+   exec->reg_cap = initial_cap;
+   exec->fs_helper_ptx = base->fs_helper_ptx;
+   exec->last_sampler_table = ~(uint64_t)0;
+   exec->last_quad_derivs = -1;
+   exec->tune_done = true;
 
-   /*
-    * The variant's own register-cap candidacy, judged on the variant. The
-    * build above inherited the base's cap, but the base's trial timed the
-    * generic sampler path and this build inlines its sampler: different
-    * register pressure, different verdict. Same rule as
-    * load_shader_module_tuned -- register-bound below the target, and the cap
-    * must actually buy a block -- and the same runtime trial then decides.
-    */
    if (!cp_debug->no_regcap && !cp_debug->max_registers &&
-       !cp_debug->regcap_static && !bin->reg_cap &&
+       !cp_debug->regcap_static && !initial_cap &&
        cost.blocks >= 1 && cost.blocks < CP_SHADER_TARGET_BLOCKS) {
       int cap = cp_pick_reg_cap();
       if (cap > 0 && cap < cost.regs) {
          CUmodule alt = NULL;
          CUfunction alt_fn = NULL;
          struct cp_shader_cost alt_cost = {0};
-         if (load_shader_module(&alt, bin->ptx_text, sampler_ptx,
-                                bin->fs_helper_ptx, cap) == CUDA_SUCCESS &&
+         if (load_shader_module(&alt, base->ptx_text, sampler_ptx,
+                                base->fs_helper_ptx, cap) == CUDA_SUCCESS &&
              cuModuleGetFunction(&alt_fn, alt, "main") == CUDA_SUCCESS)
             measure_shader_cost(alt_fn, &alt_cost);
          if (alt_fn && alt_cost.blocks > cost.blocks) {
-            variant->alt_module = alt;
-            variant->alt_kernel = alt_fn;
-            variant->alt_regs = alt_cost.regs;
-            variant->alt_spill_bytes = alt_cost.spill;
-            variant->alt_blocks_per_sm = alt_cost.blocks;
-            variant->alt_reg_cap = cap;
-            variant->alt_last_sampler_table = ~(uint64_t)0;
-            variant->alt_last_quad_derivs = -1;
-            variant->tune_cap = cap;
-            variant->tune_done = false;
+            exec->alt_module = alt;
+            exec->alt_kernel = alt_fn;
+            exec->alt_regs = alt_cost.regs;
+            exec->alt_spill_bytes = alt_cost.spill;
+            exec->alt_blocks_per_sm = alt_cost.blocks;
+            exec->alt_reg_cap = cap;
+            exec->alt_last_sampler_table = ~(uint64_t)0;
+            exec->alt_last_quad_derivs = -1;
+            exec->tune_cap = cap;
+            exec->tune_done = false;
             if (cp_debug->shader_stats)
-               fprintf(stderr, "cudapipe: sampler variant regs %3d blocks/sm "
-                       "%d -> cap %d: regs %3d blocks/sm %d  on trial\n",
+               fprintf(stderr, "cudapipe: sampler variant %-7s regs %3d "
+                       "blocks/sm %d -> cap %d: regs %3d blocks/sm %d  "
+                       "on trial\n",
+                       mode == CP_SHADER_EXEC_INLINE ? "inline" :
+                       (mode == CP_SHADER_EXEC_FUSED ? "fused" : "classic"),
                        cost.regs, cost.blocks, cap, alt_cost.regs,
                        alt_cost.blocks);
          } else if (alt) {
@@ -3058,29 +3224,47 @@ cp_shader_build_sampler_variant(struct cp_shader_binary *bin,
       }
    }
 
-   bin->num_sampler_variants++;
    return true;
 }
 
-void
-cp_sampler_variant_swap_build(struct cp_sampler_variant *v)
+bool
+cp_shader_build_sampler_variant(struct cp_shader_binary *bin,
+                                const char *sampler_ptx,
+                                const struct cp_sampler_info *states,
+                                unsigned num_states,
+                                enum cp_shader_exec_mode mode)
 {
-   if (!v->alt_module)
-      return;
+   if (!bin || !sampler_ptx || !states || !num_states)
+      return false;
 
-#define CP_SWAP(type, a, b) do { type tmp = (a); (a) = (b); (b) = tmp; } while (0)
-   CP_SWAP(CUmodule, v->module, v->alt_module);
-   CP_SWAP(CUfunction, v->kernel, v->alt_kernel);
-   CP_SWAP(int, v->regs, v->alt_regs);
-   CP_SWAP(int, v->spill_bytes, v->alt_spill_bytes);
-   CP_SWAP(int, v->blocks_per_sm, v->alt_blocks_per_sm);
-   CP_SWAP(int, v->reg_cap, v->alt_reg_cap);
-   CP_SWAP(bool, v->globals_resolved, v->alt_globals_resolved);
-   CP_SWAP(CUdeviceptr, v->sym_sampler_table, v->alt_sym_sampler_table);
-   CP_SWAP(CUdeviceptr, v->sym_quad_derivs, v->alt_sym_quad_derivs);
-   CP_SWAP(uint64_t, v->last_sampler_table, v->alt_last_sampler_table);
-   CP_SWAP(int, v->last_quad_derivs, v->alt_last_quad_derivs);
-#undef CP_SWAP
+   struct cp_sampler_variant *variant =
+      cp_shader_find_sampler_variant(bin, states, num_states);
+   bool new_variant = !variant;
+   if (new_variant) {
+      if (bin->num_sampler_variants >= CP_MAX_SAMPLER_VARIANTS)
+         return false;
+      variant = &bin->sampler_variants[bin->num_sampler_variants];
+      variant->states = malloc((size_t)num_states * sizeof(*states));
+      if (!variant->states)
+         return false;
+      memcpy(variant->states, states, (size_t)num_states * sizeof(*states));
+      variant->num_states = num_states;
+   }
+
+   if (!cp_shader_build_sampler_variant_exec(bin, variant, sampler_ptx,
+                                              mode)) {
+      /* An existing variant may already own successful executions for other
+       * modes; leave those intact. A new one is not visible until its first
+       * execution succeeds, so roll its provisional key back completely. */
+      if (new_variant) {
+         free(variant->states);
+         memset(variant, 0, sizeof(*variant));
+      }
+      return false;
+   }
+   if (new_variant)
+      bin->num_sampler_variants++;
+   return true;
 }
 
 struct cp_sampler_variant *
@@ -3095,10 +3279,11 @@ cp_shader_find_sampler_variant(struct cp_shader_binary *bin,
       if (variant->num_states == num_states &&
           !memcmp(variant->states, states,
                   (size_t)num_states * sizeof(*states)))
-         return &bin->sampler_variants[i];
+         return variant;
    }
    return NULL;
 }
+
 
 /* Rebuild an already-loaded shader with a different register cap, in place.
  *
@@ -3112,16 +3297,16 @@ cp_shader_find_sampler_variant(struct cp_shader_binary *bin,
  * Returns false and leaves the shader exactly as it was if anything fails,
  * including the JIT declining the cap.
  */
-bool
-cp_shader_set_reg_cap(struct cp_shader_binary *bin, int max_regs)
+static bool
+cp_shader_exec_set_reg_cap(struct cp_shader_exec *exec, int max_regs)
 {
-   if (!bin || !bin->ptx_text || bin->reg_cap == max_regs)
+   if (!exec || !exec->ptx_text || exec->reg_cap == max_regs)
       return false;
 
    CUmodule mod = NULL;
    CUfunction fn = NULL;
-   if (load_shader_module(&mod, bin->ptx_text, bin->sampler_ptx,
-                          bin->fs_helper_ptx,
+   if (load_shader_module(&mod, exec->ptx_text, exec->sampler_ptx,
+                          exec->fs_helper_ptx,
                           max_regs) != CUDA_SUCCESS)
       return false;
    if (cuModuleGetFunction(&fn, mod, "main") != CUDA_SUCCESS) {
@@ -3132,20 +3317,20 @@ cp_shader_set_reg_cap(struct cp_shader_binary *bin, int max_regs)
    struct cp_shader_cost cost;
    measure_shader_cost(fn, &cost);
 
-   cuModuleUnload(bin->module);
-   bin->module = mod;
-   bin->kernel = fn;
-   bin->num_regs = cost.regs;
-   bin->spill_bytes = cost.spill;
-   bin->blocks_per_sm = cost.blocks;
-   bin->reg_cap = max_regs;
+   cuModuleUnload(exec->module);
+   exec->module = mod;
+   exec->kernel = fn;
+   exec->num_regs = cost.regs;
+   exec->spill_bytes = cost.spill;
+   exec->blocks_per_sm = cost.blocks;
+   exec->reg_cap = max_regs;
 
    /* The sampler reads its table and its quad-derivative flag through globals
     * of the module, so both addresses and both cached values belong to the
     * module that has just been thrown away. */
-   bin->globals_resolved = false;
-   bin->sym_sampler_table = 0;
-   bin->sym_quad_derivs = 0;
+   exec->globals_resolved = false;
+   exec->sym_sampler_table = 0;
+   exec->sym_quad_derivs = 0;
 
    return true;
 }
@@ -3205,7 +3390,7 @@ cp_pick_reg_cap(void)
 }
 
 static CUresult
-load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
+load_shader_module_tuned(struct cp_shader_exec *exec, const char *ptx,
                          const char *sampler_ptx, const char *fs_helper_ptx,
                          bool is_fragment,
                          const char *stage)
@@ -3215,23 +3400,23 @@ load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
    const int use_static = cp_debug->regcap_static;
    const bool stats = cp_debug->shader_stats;
 
-   bin->sampler_ptx = sampler_ptx;
-   bin->fs_helper_ptx = fs_helper_ptx;
+   exec->sampler_ptx = sampler_ptx;
+   exec->fs_helper_ptx = fs_helper_ptx;
 
-   CUresult err = load_shader_module(&bin->module, ptx, sampler_ptx,
+   CUresult err = load_shader_module(&exec->module, ptx, sampler_ptx,
                                      fs_helper_ptx, forced);
    if (err != CUDA_SUCCESS)
       return err;
-   err = cuModuleGetFunction(&bin->kernel, bin->module, "main");
+   err = cuModuleGetFunction(&exec->kernel, exec->module, "main");
    if (err != CUDA_SUCCESS)
       return err;
 
    struct cp_shader_cost cost;
-   measure_shader_cost(bin->kernel, &cost);
-   bin->num_regs = cost.regs;
-   bin->spill_bytes = cost.spill;
-   bin->blocks_per_sm = cost.blocks;
-   bin->reg_cap = forced;
+   measure_shader_cost(exec->kernel, &cost);
+   exec->num_regs = cost.regs;
+   exec->spill_bytes = cost.spill;
+   exec->blocks_per_sm = cost.blocks;
+   exec->reg_cap = forced;
 
    const char *why = NULL;
    if (forced)
@@ -3263,12 +3448,12 @@ load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
    }
 
    if (use_static) {
-      bool ok = cp_shader_set_reg_cap(bin, cap);
+      bool ok = cp_shader_exec_set_reg_cap(exec, cap);
       if (stats)
          fprintf(stderr, "cudapipe: shader %-21s regs %3d spill %4d "
                  "blocks/sm %d  static cap %d -> regs %3d spill %4d "
                  "blocks/sm %d\n", stage, cost.regs, cost.spill, cost.blocks,
-                 cap, bin->num_regs, bin->spill_bytes, bin->blocks_per_sm);
+                 cap, exec->num_regs, exec->spill_bytes, exec->blocks_per_sm);
       (void)ok;
       return CUDA_SUCCESS;
    }
@@ -3303,15 +3488,15 @@ load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
       return CUDA_SUCCESS;
    }
 
-   bin->tune_cap = cap;
-   bin->alt_module = alt;
-   bin->alt_kernel = alt_fn;
-   bin->alt_regs = alt_cost.regs;
-   bin->alt_spill_bytes = alt_cost.spill;
-   bin->alt_blocks_per_sm = alt_cost.blocks;
-   bin->alt_reg_cap = cap;
-   bin->alt_last_sampler_table = ~(uint64_t)0;
-   bin->alt_last_quad_derivs = -1;
+   exec->tune_cap = cap;
+   exec->alt_module = alt;
+   exec->alt_kernel = alt_fn;
+   exec->alt_regs = alt_cost.regs;
+   exec->alt_spill_bytes = alt_cost.spill;
+   exec->alt_blocks_per_sm = alt_cost.blocks;
+   exec->alt_reg_cap = cap;
+   exec->alt_last_sampler_table = ~(uint64_t)0;
+   exec->alt_last_quad_derivs = -1;
 
    if (stats)
       fprintf(stderr, "cudapipe: shader %-21s regs %3d spill %4d blocks/sm %d "
@@ -3323,26 +3508,26 @@ load_shader_module_tuned(struct cp_shader_binary *bin, const char *ptx,
 }
 
 void
-cp_shader_swap_build(struct cp_shader_binary *bin)
+cp_shader_exec_swap_build(struct cp_shader_exec *exec)
 {
-   if (!bin->alt_module)
+   if (!exec->alt_module)
       return;
 
 #define CP_SWAP(type, a, b) do { type tmp = (a); (a) = (b); (b) = tmp; } while (0)
-   CP_SWAP(CUmodule, bin->module, bin->alt_module);
-   CP_SWAP(CUfunction, bin->kernel, bin->alt_kernel);
-   CP_SWAP(int, bin->num_regs, bin->alt_regs);
-   CP_SWAP(int, bin->spill_bytes, bin->alt_spill_bytes);
-   CP_SWAP(int, bin->blocks_per_sm, bin->alt_blocks_per_sm);
-   CP_SWAP(int, bin->reg_cap, bin->alt_reg_cap);
+   CP_SWAP(CUmodule, exec->module, exec->alt_module);
+   CP_SWAP(CUfunction, exec->kernel, exec->alt_kernel);
+   CP_SWAP(int, exec->num_regs, exec->alt_regs);
+   CP_SWAP(int, exec->spill_bytes, exec->alt_spill_bytes);
+   CP_SWAP(int, exec->blocks_per_sm, exec->alt_blocks_per_sm);
+   CP_SWAP(int, exec->reg_cap, exec->alt_reg_cap);
    /* The sampler's table and quad-derivative flag are globals of a module, so
     * the resolved addresses and the last values written to them belong to the
     * build that was launched, not to the shader. */
-   CP_SWAP(bool, bin->globals_resolved, bin->alt_globals_resolved);
-   CP_SWAP(CUdeviceptr, bin->sym_sampler_table, bin->alt_sym_sampler_table);
-   CP_SWAP(CUdeviceptr, bin->sym_quad_derivs, bin->alt_sym_quad_derivs);
-   CP_SWAP(uint64_t, bin->last_sampler_table, bin->alt_last_sampler_table);
-   CP_SWAP(int, bin->last_quad_derivs, bin->alt_last_quad_derivs);
+   CP_SWAP(bool, exec->globals_resolved, exec->alt_globals_resolved);
+   CP_SWAP(CUdeviceptr, exec->sym_sampler_table, exec->alt_sym_sampler_table);
+   CP_SWAP(CUdeviceptr, exec->sym_quad_derivs, exec->alt_sym_quad_derivs);
+   CP_SWAP(uint64_t, exec->last_sampler_table, exec->alt_last_sampler_table);
+   CP_SWAP(int, exec->last_quad_derivs, exec->alt_last_quad_derivs);
 #undef CP_SWAP
 }
 
@@ -3370,16 +3555,76 @@ cp_nir_writes_memory(struct nir_shader *nir)
    return false;
 }
 
-struct cp_shader_binary *
-cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
-                      const char *sampler_ptx, const char *fs_helper_ptx)
+static struct cp_shader_binary *
+cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
+                   const char *sampler_ptx, const char *fs_helper_ptx,
+                   bool fused_interp, bool inline_interp)
 {
    struct ntl_context ctx = {0};
    ctx.nir = nir;
    ctx.sm_major = sm_major;
    ctx.sm_minor = sm_minor;
+   ctx.fused_interp = fused_interp;
+   ctx.inline_interp = inline_interp;
 
    cp_lower_nir(nir);
+
+   ctx.inline_pntc_input = -1;
+   ctx.inline_pos_input = -1;
+   if (inline_interp) {
+      nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+         if (var->data.location == VARYING_SLOT_PNTC)
+            ctx.inline_pntc_input = (int32_t)var->data.driver_location;
+         if (var->data.location == VARYING_SLOT_POS)
+            ctx.inline_pos_input = (int32_t)var->data.driver_location;
+      }
+      bool input_footprint_safe = nir->num_inputs <= CP_MAX_FS_INPUTS;
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_load_input)
+                  continue;
+
+               /* load_input addresses vec4 slots as base + src[0], then adds
+                * the component byte offset. Arrays and matrices therefore do
+                * not necessarily read `base` itself. Keep the interpolation
+                * writes in exact agreement with the emitted address. */
+               if (!nir_src_is_const(intr->src[0])) {
+                  /* A valid indirect can select any declared input. */
+                  ctx.inline_live_slots = (1u << CP_MAX_FS_INPUTS) - 1u;
+                  continue;
+               }
+
+               uint64_t offset = nir_src_as_uint(intr->src[0]);
+               uint64_t first_byte =
+                  ((uint64_t)nir_intrinsic_base(intr) + offset) * 16u +
+                  (uint64_t)nir_intrinsic_component(intr) * 4u;
+               uint64_t bytes =
+                  ((uint64_t)intr->def.num_components * intr->def.bit_size +
+                   7u) / 8u;
+               uint64_t first_slot = first_byte / 16u;
+               uint64_t last_slot = (first_byte + bytes - 1u) / 16u;
+               if (!bytes || last_slot >= CP_MAX_FS_INPUTS ||
+                   last_slot >= nir->num_inputs) {
+                  input_footprint_safe = false;
+                  continue;
+               }
+               for (uint64_t slot = first_slot; slot <= last_slot; slot++)
+                  ctx.inline_live_slots |= 1u << slot;
+            }
+         }
+      }
+      if (!input_footprint_safe) {
+         if (cp_debug->shader_stats || cp_debug->dump_ir || cp_debug->dump_ptx)
+            fprintf(stderr, "cudapipe: inline FS declined: input footprint "
+                    "exceeds the %u-slot local interpolation array\n",
+                    CP_MAX_FS_INPUTS);
+         return NULL;
+      }
+   }
 
    /* After the lowering, which is the NIR the prologue below is generated
     * for and the NIR the flag on the binary has to describe. */
@@ -3494,6 +3739,20 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
       return NULL;
    }
 
+#ifdef CP_HAVE_FS_INLINE_BC
+   if (inline_interp &&
+       !link_and_inline_fs_interp(ctx.module, ctx.llvm_ctx, sm_major, sm_minor)) {
+      LLVMDisposeBuilder(ctx.builder);
+      LLVMDisposeModule(ctx.module);
+      LLVMContextDispose(ctx.llvm_ctx);
+      return NULL;
+   }
+#else
+   assert(!inline_interp);
+#endif
+
+   /* For inline execution this is the optimized, post-link IR: the dump is
+    * itself the proof surface for helper removal and local-input promotion. */
    if (cp_debug->dump_ir)
       LLVMDumpModule(ctx.module);
 
@@ -3520,6 +3779,22 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    if (!ptx)
       return NULL;
 
+   /* The inline route is admitted only when its caller-owned input array was
+    * completely promoted. A surviving helper name means always-inline failed;
+    * PTX local memory means the array (or another address-taken temporary)
+    * survived SROA. Either condition would turn the intended register dataflow
+    * back into a memory round trip, so discard this mode and let the isolated
+    * fused/classic binaries handle the shader. */
+   if (inline_interp &&
+       (strstr(ptx, "cp_fs_inline_lane") || strstr(ptx, ".local") ||
+        strstr(ptx, "ld.local") || strstr(ptx, "st.local"))) {
+      if (cp_debug->shader_stats || cp_debug->dump_ir || cp_debug->dump_ptx)
+         fprintf(stderr, "cudapipe: rejected unsafe inline FS PTX "
+                 "(surviving helper or local-memory traffic)\n");
+      free(ptx);
+      return NULL;
+   }
+
    if (cp_debug->dump_ptx)
       fprintf(stderr, "cudapipe: generated PTX (%zu bytes):\n%s\n", ptx_size, ptx);
    if (cp_debug->dump_nir)
@@ -3530,13 +3805,17 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
       free(ptx);
       return NULL;
    }
-   bin->ptx_text = ptx;
-   bin->ptx_size = ptx_size;
+   enum cp_shader_exec_mode mode = inline_interp ? CP_SHADER_EXEC_INLINE :
+      (fused_interp ? CP_SHADER_EXEC_FUSED : CP_SHADER_EXEC_CLASSIC);
+   struct cp_shader_exec *exec = &bin->exec[mode];
+   exec->ptx_text = ptx;
+   exec->ptx_size = ptx_size;
    bin->sm_major = sm_major;
    bin->sm_minor = sm_minor;
    bin->shared_size = nir->info.shared_size;
    bin->nir_num_outputs = nir->num_outputs;
    bin->nir_num_inputs = nir->num_inputs;
+   bin->is_fragment = nir->info.stage == MESA_SHADER_FRAGMENT;
    bin->reads_const_bufs = ctx.reads_const_bufs;
    bin->writes_memory = ctx.writes_memory;
 
@@ -3581,11 +3860,15 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    /* Shaders that sample textures, or that call one of the module's device
     * helpers, need it linked in; the rest load their PTX directly. */
    bool needs_sampler = (ctx.uses_tex || ctx.needs_link) && sampler_ptx;
-   CUresult err = load_shader_module_tuned(bin, ptx,
+   const char *stage_name = mesa_shader_stage_name(nir->info.stage);
+   if (nir->info.stage == MESA_SHADER_FRAGMENT)
+      stage_name = inline_interp ? "fragment inline" :
+         (fused_interp ? "fragment fused" : "fragment classic");
+   CUresult err = load_shader_module_tuned(exec, ptx,
                                            needs_sampler ? sampler_ptx : NULL,
                                            fs_helper_ptx,
                                            nir->info.stage == MESA_SHADER_FRAGMENT,
-                                           mesa_shader_stage_name(nir->info.stage));
+                                           stage_name);
 
    if (err != CUDA_SUCCESS) {
       const char *err_str = NULL;
@@ -3598,29 +3881,115 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    return bin;
 }
 
+struct cp_shader_binary *
+cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
+                      const char *sampler_ptx, const char *fs_helper_ptx,
+                      bool no_inline_fs, bool inline_fs, bool force_fused_fs)
+{
+   if (!nir)
+      return NULL;
+   if (nir->info.stage != MESA_SHADER_FRAGMENT || !fs_helper_ptx ||
+       no_inline_fs)
+      return cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx, NULL,
+                                false, false);
+   if (force_fused_fs || !inline_fs) {
+      /* cp_compile_nir_one lowers its NIR in place. Preserve a pristine clone
+       * before the fused attempt so a failed/default JIT never runs classic
+       * lowering a second time over the already-lowered shader. */
+      nir_shader *classic_nir = force_fused_fs
+         ? NULL : nir_shader_clone(NULL, nir);
+      struct cp_shader_binary *fused =
+         cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
+                            fs_helper_ptx, true, false);
+      if (fused && fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
+         ralloc_free(classic_nir);
+         return fused;
+      }
+      cp_shader_binary_destroy(fused);
+      /* FORCE is an exact execution control. The normal default still keeps
+       * correctness if its fused JIT is unavailable. */
+      struct cp_shader_binary *classic = classic_nir
+         ? cp_compile_nir_one(classic_nir, sm_major, sm_minor, sampler_ptx,
+                              NULL, false, false)
+         : NULL;
+      ralloc_free(classic_nir);
+      return classic;
+   }
+
+   /* Opt-in ownership keeps the two binaries needed for correctness: the
+    * inline module, and the proven fused module which can also run after the
+    * standalone interpolator when scratch allocation refuses the in-shader
+    * path. The exact classic binary is built only by NO_INLINE_FS, above. */
+   nir_shader *standalone_nir = nir_shader_clone(NULL, nir);
+#ifdef CP_HAVE_FS_INLINE_BC
+   nir_shader *inline_nir = nir_shader_clone(NULL, nir);
+#else
+   nir_shader *inline_nir = NULL;
+   call_once(&cp_inline_missing_once, cp_warn_inline_missing);
+#endif
+   struct cp_shader_binary *fused =
+      cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
+                         fs_helper_ptx, true, false);
+   if (fused && !fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
+      cp_shader_binary_destroy(fused);
+      fused = NULL;
+   }
+   struct cp_shader_binary *classic = !fused && standalone_nir
+      ? cp_compile_nir_one(standalone_nir, sm_major, sm_minor, sampler_ptx,
+                           NULL, false, false)
+      : NULL;
+   struct cp_shader_binary *inlined = inline_nir
+      ? cp_compile_nir_one(inline_nir, sm_major, sm_minor, sampler_ptx,
+                           NULL, false, true)
+      : NULL;
+   ralloc_free(standalone_nir);
+   ralloc_free(inline_nir);
+
+   struct cp_shader_binary *bin = fused ? fused : classic;
+   if (!bin) {
+      cp_shader_binary_destroy(inlined);
+      return NULL;
+   }
+   if (inlined && inlined != bin) {
+      bin->exec[CP_SHADER_EXEC_INLINE] = inlined->exec[CP_SHADER_EXEC_INLINE];
+      memset(&inlined->exec[CP_SHADER_EXEC_INLINE], 0,
+             sizeof(inlined->exec[CP_SHADER_EXEC_INLINE]));
+      cp_shader_binary_destroy(inlined);
+   }
+   return bin;
+}
+
+
+static void
+cp_shader_exec_destroy(struct cp_shader_exec *exec, bool free_ptx)
+{
+   if (exec->module)
+      cuModuleUnload(exec->module);
+   if (exec->alt_module)
+      cuModuleUnload(exec->alt_module);
+   if (exec->tune.events_made) {
+      for (unsigned e = 0; e < CP_TUNE_SAMPLES; e++) {
+         cuEventDestroy(exec->tune.start[e]);
+         cuEventDestroy(exec->tune.stop[e]);
+      }
+   }
+   if (free_ptx)
+      free(exec->ptx_text);
+   memset(exec, 0, sizeof(*exec));
+}
+
 void
 cp_shader_binary_destroy(struct cp_shader_binary *bin)
 {
    if (!bin)
       return;
-   if (bin->module)
-      cuModuleUnload(bin->module);
-   if (bin->alt_module)
-      cuModuleUnload(bin->alt_module);
+   for (unsigned mode = 0; mode < CP_SHADER_EXEC_COUNT; mode++)
+      cp_shader_exec_destroy(&bin->exec[mode], true);
    for (unsigned i = 0; i < bin->num_sampler_variants; i++) {
       struct cp_sampler_variant *v = &bin->sampler_variants[i];
-      if (v->module)
-         cuModuleUnload(v->module);
-      if (v->alt_module)
-         cuModuleUnload(v->alt_module);
-      if (v->tune.events_made) {
-         for (unsigned e = 0; e < CP_TUNE_SAMPLES; e++) {
-            cuEventDestroy(v->tune.start[e]);
-            cuEventDestroy(v->tune.stop[e]);
-         }
-      }
+      for (unsigned mode = 0; mode < CP_SHADER_EXEC_COUNT; mode++)
+         cp_shader_exec_destroy(&v->exec[mode], false);
       free(v->states);
    }
-   free(bin->ptx_text);
    FREE(bin);
 }

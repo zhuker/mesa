@@ -157,6 +157,16 @@ static const struct cp_flag_def flags[] = {
      F(no_fused_interp),
      "restore the direct shade path's separate cp_fs_interpolate launch "
      "instead of the slim compaction plus in-shader interpolation" },
+   { "CUDAPIPE_NO_INLINE_FS", CP_FLAG_BOOL_VALUE, F(no_inline_fs),
+     "restore separate interpolation plus the resource-isolated classic "
+     "fragment binary instead of same-LLVM inline interpolation" },
+   { "CUDAPIPE_INLINE_FS", CP_FLAG_BOOL_VALUE, F(inline_fs),
+     "opt in to same-LLVM fragment interpolation; default stays on the "
+     "pre-inline fused path because dual module ownership is expensive" },
+   { "CUDAPIPE_FORCE_FUSED_FS", CP_FLAG_BOOL_VALUE, F(force_fused_fs),
+     "force pre-inline fused interpolation execution with its isolated tuner "
+     "(overrides NO_FUSED flags; "
+     "NO_INLINE_FS takes precedence)" },
    { "CUDAPIPE_NO_FUSED_RAST", CP_FLAG_BOOL_VALUE,
      F(no_fused_rast),
      "restore the separate clip and rasterize-stage1 launches instead of "

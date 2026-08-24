@@ -49,11 +49,61 @@ libcudapipe_vk_shared = files(
   'nir_to_ptx/cp_nir_to_llvm.c',
 )
 
+# The inline fragment interpolator is LLVM bitcode built by the clang whose
+# major version matches Mesa's LLVM dependency. It is embedded at build time;
+# the driver never runs a compiler subprocess.
+cpvk_llvm_major = dep_llvm.version().split('.')[0]
+cpvk_fs_inline_inc = []
+cpvk_fs_inline_args = []
+cpvk_fs_inline_deps = []
+if dep_llvm.version().version_compare('>=18.0.0')
+  cpvk_clang = find_program('clang-' + cpvk_llvm_major, required : false)
+  if cpvk_clang.found()
+    if cpvk_clang.version().split('.')[0] != cpvk_llvm_major
+      error('cudapipe inline FS needs clang ' + cpvk_llvm_major +
+            ' to match LLVM ' + dep_llvm.version())
+    endif
+    cpvk_fs_inline_deps += dependency(
+      'llvm',
+      method : host_machine.system() == 'windows' ? 'auto' : 'config-tool',
+      version : '=' + dep_llvm.version(),
+      modules : ['bitreader', 'linker', 'passes', 'ipo', 'nvptx'],
+      required : true,
+      static : not _shared_llvm,
+      include_type : 'system',
+    )
+    cpvk_fs_inline_bc = custom_target(
+      'cpvk_fs_inline.bc',
+      input : ['kernels/cp_fs_inline.c', 'kernels/cp_fs_interp.h',
+               'kernels/cp_rast_types.h'],
+      output : 'cp_fs_inline.bc',
+      command : [cpvk_clang,
+        '-target', 'nvptx64-nvidia-cuda', '-march=sm_86', '--cuda-feature=+ptx75',
+        '-O1', '-ffreestanding', '-nostdlib', '-ffp-contract=off',
+        '-emit-llvm', '-c', '@INPUT0@',
+        '-I' + meson.current_source_dir() + '/kernels', '-o', '@OUTPUT@'],
+    )
+    cpvk_fs_inline_inc = custom_target(
+      'cpvk_fs_inline.bc.inc',
+      input : cpvk_fs_inline_bc,
+      output : 'cp_fs_inline.bc.inc',
+      command : [prog_python, files('kernels/bin_to_inc.py'), '@INPUT@', '@OUTPUT@'],
+    )
+    cpvk_fs_inline_args += '-DCP_HAVE_FS_INLINE_BC'
+  else
+    warning('cudapipe: matching clang-' + cpvk_llvm_major +
+            ' not found; building with fused/classic fragment interpolation')
+  endif
+else
+  warning('cudapipe: LLVM ' + dep_llvm.version() +
+          ' is too old for linked inline fragment interpolation; using fused/classic')
+endif
+
 # NVRTC compiles the kernels from source at runtime, so stringify each .cu
 # into a C string the driver can hand it.
 cpvk_kernel_incs = []
 foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_fs.cu',
-                  'cp_vertex_fetch.cu', 'cp_rast_types.h']
+                  'cp_vertex_fetch.cu', 'cp_rast_types.h', 'cp_fs_interp.h']
   cpvk_kernel_incs += custom_target(
     'cpvk_' + kernel + '.inc',
     input : ['kernels/' + kernel],
@@ -77,15 +127,15 @@ endif
 libcudapipe_vk = static_library(
   'cudapipe_vk',
   [libcudapipe_vk_files, libcudapipe_vk_shared, cpvk_entrypoints,
-   cpvk_kernel_incs],
-  c_args : cpvk_nvtx_args,
+   cpvk_kernel_incs, cpvk_fs_inline_inc],
+  c_args : [cpvk_nvtx_args, cpvk_fs_inline_args],
   include_directories : [inc_include, inc_src, inc_util,
                          include_directories('.'),
                          include_directories('nir_to_ptx'),
                          include_directories('../compiler/nir')],
   dependencies : [idep_vulkan_runtime, idep_vulkan_util, idep_vulkan_wsi,
-                  idep_mesautil, idep_nir, dep_llvm, dep_cuda_vk, dep_nvrtc,
-                  dep_nvjitlink],
+                  idep_mesautil, idep_nir, dep_llvm, cpvk_fs_inline_deps,
+                  dep_cuda_vk, dep_nvrtc, dep_nvjitlink],
   gnu_symbol_visibility : 'hidden',
 )
 

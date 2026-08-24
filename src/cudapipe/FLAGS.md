@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-66 switches.
+69 switches.
 
 ## Tracing
 
@@ -57,6 +57,9 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |
 | `CUDAPIPE_NO_FUSED_ABUF_INTERP` | bool (value) | `off` | — | launch A-buffer interpolation separately instead of calling it from the generated fragment shader; performance experiment only |
 | `CUDAPIPE_NO_FUSED_INTERP` | bool (value) | `off` | — | restore the direct shade path's separate cp_fs_interpolate launch instead of the slim compaction plus in-shader interpolation |
+| `CUDAPIPE_NO_INLINE_FS` | bool (value) | `off` | — | restore separate interpolation plus the resource-isolated classic fragment binary instead of same-LLVM inline interpolation |
+| `CUDAPIPE_INLINE_FS` | bool (value) | `off` | — | opt in to same-LLVM fragment interpolation; default stays on the pre-inline fused path because dual module ownership is expensive |
+| `CUDAPIPE_FORCE_FUSED_FS` | bool (value) | `off` | — | force pre-inline fused interpolation execution with its isolated tuner (overrides NO_FUSED flags; NO_INLINE_FS takes precedence) |
 | `CUDAPIPE_NO_FUSED_RAST` | bool (value) | `off` | — | restore the separate clip and rasterize-stage1 launches instead of the fused clip+classify kernel; stages 2 and 3 are separate either way |
 | `CUDAPIPE_NO_PRIM_REFS` | bool (value) | `off` | — | copy every accepted clipped primitive into contiguous scratch instead of publishing a reference to immutable vertex-shader output |
 | `CUDAPIPE_NO_SETUP_CACHE` | bool (value) | `off` | — | recompute huge-primitive setup independently in every stage-3 tile |

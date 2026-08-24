@@ -875,12 +875,13 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       cuCtxSetCurrent(dev->cu_ctx);
       pipeline->bin = cp_compile_nir_to_ptx(
          nir, dev->pdev->sm_major, dev->pdev->sm_minor,
-         uses_tex ? sampler_ptx : NULL, NULL);
+         uses_tex ? sampler_ptx : NULL, NULL, false, false, false);
       if (pipeline->bin)
          pipeline->bin->uses_tex_3d = uses_tex_3d;
       ralloc_free(mem_ctx);
 
-      if (!pipeline->bin || !pipeline->bin->kernel) {
+      if (!pipeline->bin ||
+          !pipeline->bin->exec[CP_SHADER_EXEC_CLASSIC].kernel) {
          cpvk_pipeline_unref(pipeline);
          if (first_error == VK_SUCCESS)
             first_error = vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
@@ -1165,7 +1166,9 @@ cpvk_compile_stage(struct cpvk_device *dev,
    struct cp_shader_binary *bin =
       cp_compile_nir_to_ptx(nir, dev->pdev->sm_major, dev->pdev->sm_minor,
                             sampler_ptx,
-                            frag ? dev->cp_dev.kernels.fs_helper_ptx : NULL);
+                            frag ? dev->cp_dev.kernels.fs_helper_ptx : NULL,
+                             cp_debug->no_inline_fs, cp_debug->inline_fs,
+                             cp_debug->force_fused_fs);
    if (bin)
       bin->uses_tex_3d = uses_tex_3d;
    ralloc_free(mem_ctx);
@@ -1176,11 +1179,18 @@ cpvk_compile_stage(struct cpvk_device *dev,
     * slower. Keep larger dynamic shaders eligible: multisampling crosses this
     * boundary and benefits from the extra resident block. */
    if (bin && frag && !getenv("CPVK_KEEP_SMALL_DYNAMIC_REGCAP") &&
-       bin->tune_cap && bin->tex_descs_dynamic && !bin->num_tex_descs &&
-       bin->ptx_size < 6 * 1024)
-      bin->tune_cap = 0;
+       bin->tex_descs_dynamic && !bin->num_tex_descs) {
+      for (unsigned mode = 0; mode < CP_SHADER_EXEC_COUNT; mode++) {
+         struct cp_shader_exec *exec = &bin->exec[mode];
+         if (exec->tune_cap && exec->ptx_size < 6 * 1024)
+            exec->tune_cap = 0;
+      }
+   }
 
-   if (!bin || !bin->kernel) {
+   bool loaded = bin && (frag
+      ? cp_shader_has_standalone_exec(bin)
+      : bin->exec[CP_SHADER_EXEC_CLASSIC].kernel != NULL);
+   if (!loaded) {
       cp_shader_binary_destroy(bin);
       *result = VK_ERROR_INITIALIZATION_FAILED;
       return NULL;

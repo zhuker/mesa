@@ -2247,39 +2247,31 @@ cp_tune_after_ctx(struct cp_context *cp, const struct cp_tune_ctx *c, bool timed
 }
 
 static void
-cp_tune_swap_shader(void *obj) { cp_shader_swap_build(obj); }
-static void
-cp_tune_swap_variant(void *obj) { cp_sampler_variant_swap_build(obj); }
+cp_tune_swap_exec(void *obj) { cp_shader_exec_swap_build(obj); }
 
 static struct cp_tune_ctx
-cp_tune_ctx_shader(struct cp_shader_binary *fs)
+cp_tune_ctx_exec(struct cp_shader_exec *exec, const char *what)
 {
-   return (struct cp_tune_ctx) { &fs->tune, fs->tune_cap, &fs->tune_done,
-                                 &fs->num_regs, cp_tune_swap_shader, fs,
-                                 "shader" };
-}
-
-static struct cp_tune_ctx
-cp_tune_ctx_variant(struct cp_sampler_variant *v)
-{
-   return (struct cp_tune_ctx) { &v->tune, v->tune_cap, &v->tune_done,
-                                 &v->regs, cp_tune_swap_variant, v,
-                                 "sampler variant" };
+   return (struct cp_tune_ctx) { &exec->tune, exec->tune_cap,
+                                 &exec->tune_done, &exec->num_regs,
+                                 cp_tune_swap_exec, exec, what };
 }
 
 static bool
-cp_tune_before(struct cp_context *cp, struct cp_shader_binary *fs)
+cp_tune_before(struct cp_context *cp, struct cp_shader_exec *exec,
+               const char *what)
 {
-   if (cp_debug->no_regcap || !fs->tune_cap || fs->tune_done)
+   if (cp_debug->no_regcap || !exec->tune_cap || exec->tune_done)
       return false;
-   struct cp_tune_ctx c = cp_tune_ctx_shader(fs);
+   struct cp_tune_ctx c = cp_tune_ctx_exec(exec, what);
    return cp_tune_before_ctx(cp, &c);
 }
 
 static void
-cp_tune_after(struct cp_context *cp, struct cp_shader_binary *fs, bool timed)
+cp_tune_after(struct cp_context *cp, struct cp_shader_exec *exec,
+              const char *what, bool timed)
 {
-   struct cp_tune_ctx c = cp_tune_ctx_shader(fs);
+   struct cp_tune_ctx c = cp_tune_ctx_exec(exec, what);
    cp_tune_after_ctx(cp, &c, timed);
 }
 
@@ -2309,6 +2301,7 @@ cp_host_ptr(const struct cp_context *cp, uint64_t addr)
 static bool
 cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
                     struct cp_shader_binary *fs,
+                    enum cp_shader_exec_mode mode,
                     CUdeviceptr counter, CUdeviceptr fs_in,
                     unsigned fs_in_stride, CUdeviceptr fs_out,
                     CUdeviceptr frag_coord, CUdeviceptr discard_mask,
@@ -2317,6 +2310,24 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
                     CUevent ev_before,
                     CUdeviceptr batch_rows)
 {
+   struct cp_shader_exec *base_exec = &fs->exec[mode];
+   if (!base_exec->kernel && mode == CP_SHADER_EXEC_CLASSIC &&
+       fs->exec[CP_SHADER_EXEC_FUSED].kernel) {
+      base_exec = &fs->exec[CP_SHADER_EXEC_FUSED];
+      if (!fs->classic_fallback_reported) {
+         fprintf(stderr, "cudapipe: bare fragment binary unavailable; "
+                 "classic interpolation is using the fused binary with its "
+                 "helper disabled (not an isolated A/B)\n");
+         fs->classic_fallback_reported = true;
+      }
+   }
+   if (!base_exec->kernel)
+      return false;
+   enum cp_shader_exec_mode exec_mode =
+      base_exec == &fs->exec[CP_SHADER_EXEC_INLINE] ? CP_SHADER_EXEC_INLINE :
+      (base_exec == &fs->exec[CP_SHADER_EXEC_FUSED]
+       ? CP_SHADER_EXEC_FUSED : CP_SHADER_EXEC_CLASSIC);
+
    /*
     * The argument block, and behind it the per-draw uniform table the shader
     * indexes into — one upload, because the block holds the table's device
@@ -2388,22 +2399,28 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
    struct cp_sampler_variant *sampler_variant = samplers_resolved
       ? cp_shader_find_sampler_variant(fs, resolved_samplers,
                                        fs->num_tex_descs) : NULL;
-   if (samplers_resolved && !sampler_variant &&
-       fs->num_sampler_variants < CP_MAX_SAMPLER_VARIANTS &&
-       (!fs->tune_cap || fs->tune_done)) {
+   bool variant_missing_exec = !sampler_variant ||
+      !sampler_variant->exec[exec_mode].kernel;
+   if (samplers_resolved && variant_missing_exec &&
+       (sampler_variant ||
+        fs->num_sampler_variants < CP_MAX_SAMPLER_VARIANTS) &&
+       (!base_exec->tune_cap || base_exec->tune_done)) {
       char *sampler_ptx = cp_compile_sampler_variant(cp->dev->sm_major,
                                                      cp->dev->sm_minor,
                                                      resolved_samplers,
                                                      fs->uses_tex_3d);
       if (sampler_ptx) {
          cp_shader_build_sampler_variant(fs, sampler_ptx, resolved_samplers,
-                                         fs->num_tex_descs);
+                                         fs->num_tex_descs, exec_mode);
          free(sampler_ptx);
       }
       sampler_variant = cp_shader_find_sampler_variant(
          fs, resolved_samplers, fs->num_tex_descs);
    }
-   bool use_sampler_variant = sampler_variant != NULL;
+   struct cp_shader_exec *launch_exec = sampler_variant &&
+      sampler_variant->exec[exec_mode].kernel
+      ? &sampler_variant->exec[exec_mode] : base_exec;
+   bool use_sampler_variant = launch_exec != base_exec;
 
    /*
     * Specialisation is invisible when it stops working, so count it. A
@@ -2422,10 +2439,9 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
          cp->spec.shaders_unmatchable++;
    }
 
-   CUmodule launch_module = use_sampler_variant
-      ? sampler_variant->module : fs->module;
-   CUfunction launch_kernel = use_sampler_variant
-      ? sampler_variant->kernel : fs->kernel;
+   CUmodule launch_module = launch_exec->module;
+   CUfunction launch_kernel = launch_exec->kernel;
+
    if (cp_debug->debug_tex && !fs->tex_descs_reported) {
       fs->tex_descs_reported = true;
       fprintf(stderr, "cudapipe: FS sampler refs=%u dynamic=%u rows=%u\n",
@@ -2522,16 +2538,11 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
    {
       CUdeviceptr sym;
       size_t sym_size;
-      bool *globals_resolved = use_sampler_variant
-         ? &sampler_variant->globals_resolved : &fs->globals_resolved;
-      CUdeviceptr *sym_sampler_table = use_sampler_variant
-         ? &sampler_variant->sym_sampler_table : &fs->sym_sampler_table;
-      CUdeviceptr *sym_quad_derivs = use_sampler_variant
-         ? &sampler_variant->sym_quad_derivs : &fs->sym_quad_derivs;
-      uint64_t *last_sampler_table = use_sampler_variant
-         ? &sampler_variant->last_sampler_table : &fs->last_sampler_table;
-      int *last_quad_derivs = use_sampler_variant
-         ? &sampler_variant->last_quad_derivs : &fs->last_quad_derivs;
+      bool *globals_resolved = &launch_exec->globals_resolved;
+      CUdeviceptr *sym_sampler_table = &launch_exec->sym_sampler_table;
+      CUdeviceptr *sym_quad_derivs = &launch_exec->sym_quad_derivs;
+      uint64_t *last_sampler_table = &launch_exec->last_sampler_table;
+      int *last_quad_derivs = &launch_exec->last_quad_derivs;
       if (!*globals_resolved) {
          if (cuModuleGetGlobal(&sym, &sym_size, launch_module,
                                "cp_sampler_table") == CUDA_SUCCESS)
@@ -2574,19 +2585,16 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
        * here, both as built and capped, and the faster build kept. A sampler
        * variant carries its own trial: the base's verdict was measured on
        * the generic sampler path and does not transfer. */
-      bool timed;
-      struct cp_tune_ctx vctx;
-      bool tune_variant = use_sampler_variant && !cp_debug->no_regcap &&
-                          sampler_variant->tune_cap &&
-                          !sampler_variant->tune_done;
-      if (tune_variant) {
-         vctx = cp_tune_ctx_variant(sampler_variant);
-         timed = cp_tune_before_ctx(cp, &vctx);
-         /* The swap may retarget the launch below to the other build. */
-         launch_kernel = sampler_variant->kernel;
-      } else {
-         timed = use_sampler_variant ? false : cp_tune_before(cp, fs);
-      }
+      const char *mode_name = exec_mode == CP_SHADER_EXEC_INLINE ? "inline" :
+         (exec_mode == CP_SHADER_EXEC_FUSED ? "fused" : "classic");
+      char tune_what[48];
+      snprintf(tune_what, sizeof(tune_what), "%s %s",
+               use_sampler_variant ? "sampler variant" : "shader", mode_name);
+      bool timed = cp_tune_before(cp, launch_exec, tune_what);
+      /* A pending swap retargets this launch to the execution's own alternate,
+       * never to the other interpolation mode. */
+      launch_kernel = launch_exec->kernel;
+
       /* Compiled shaders grid-stride now, so the launch is capped: the count
        * is device-side and num_threads is the framebuffer's worst case, so a
        * small draw's launch was mostly scheduling idle blocks. 4096 blocks
@@ -2600,10 +2608,7 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
                  fs_err);
          return false;
       }
-      if (tune_variant)
-         cp_tune_after_ctx(cp, &vctx, timed);
-      else if (!use_sampler_variant)
-         cp_tune_after(cp, fs, timed);
+      cp_tune_after(cp, launch_exec, tune_what, timed);
    }
    return true;
 }
@@ -2632,11 +2637,15 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
    struct cp_device *screen = cp->dev;
    struct cp_shader_binary *fs = state->fs;
 
-   if (!fs || !fs->kernel || !vs_output_buf || !state->vs ||
+   bool have_fs = cp_shader_has_standalone_exec(fs);
+   if (!have_fs || !vs_output_buf || !state->vs ||
        !screen->kernels.fs_interpolate || !screen->kernels.fs_writeback) {
       if (cp_debug->debug_draw)
-         fprintf(stderr, "  no fragment stage: fs=%p kernel=%p vs_out=%p vs=%p\n",
-                 (void *)fs, fs ? (void *)fs->kernel : NULL,
+         fprintf(stderr, "  no fragment stage: fs=%p classic=%p fused=%p inline=%p "
+                 "vs_out=%p vs=%p\n", (void *)fs,
+                 fs ? (void *)fs->exec[CP_SHADER_EXEC_CLASSIC].kernel : NULL,
+                 fs ? (void *)fs->exec[CP_SHADER_EXEC_FUSED].kernel : NULL,
+                 fs ? (void *)fs->exec[CP_SHADER_EXEC_INLINE].kernel : NULL,
                  (void *)(uintptr_t)vs_output_buf, (void *)state->vs);
       return;
    }
@@ -2775,18 +2784,46 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
     * the compaction does not produce), or when the per-quad primitive array
     * or the argument upload is refused.
     */
-   CUdeviceptr fused_interp_dev = 0;
-   if (!cp_debug->no_fused_interp && screen->kernels.fs_compact &&
-       !cp_kernels_instrumented()) {
+   CUdeviceptr inshader_interp_dev = 0;
+   enum cp_shader_exec_mode inshader_mode = CP_SHADER_EXEC_CLASSIC;
+   bool allow_inshader = !cp_debug->no_inline_fs &&
+      (!cp_debug->no_fused_interp || cp_debug->force_fused_fs) &&
+      screen->kernels.fs_compact &&
+      !cp_kernels_instrumented();
+   if (allow_inshader) {
+      if (cp_debug->inline_fs && !cp_debug->force_fused_fs &&
+          fs->exec[CP_SHADER_EXEC_INLINE].kernel)
+         inshader_mode = CP_SHADER_EXEC_INLINE;
+      else if (fs->exec[CP_SHADER_EXEC_FUSED].kernel) {
+         inshader_mode = CP_SHADER_EXEC_FUSED;
+         if (cp_debug->inline_fs && !cp_debug->force_fused_fs &&
+             (cp_debug->shader_stats || cp_debug->dump_ir ||
+              cp_debug->dump_ptx) && !fs->inline_fallback_reported) {
+            fprintf(stderr, "cudapipe: inline fragment binary unavailable; "
+                    "using proven fused helper binary\n");
+            fs->inline_fallback_reported = true;
+         }
+      }
+   }
+   if (allow_inshader && inshader_mode == CP_SHADER_EXEC_CLASSIC &&
+       !fs->fused_fallback_reported) {
+      fprintf(stderr, "cudapipe: in-shader interpolation unavailable; "
+              "using classic standalone interpolation\n");
+      fs->fused_fallback_reported = true;
+   }
+   if (inshader_mode != CP_SHADER_EXEC_CLASSIC) {
       CUdeviceptr prim_list = cp_scratch_alloc_device(cp, max_pixels);
       if (prim_list) {
          interp.out_prim_list = prim_list;
          interp.fused_direct = 1;
-         fused_interp_dev = cp_upload(cp, &interp, sizeof(interp));
-         if (!fused_interp_dev) {
+         inshader_interp_dev = cp_upload(cp, &interp, sizeof(interp));
+         if (!inshader_interp_dev) {
             interp.out_prim_list = 0;
             interp.fused_direct = 0;
+            inshader_mode = CP_SHADER_EXEC_CLASSIC;
          }
+      } else {
+         inshader_mode = CP_SHADER_EXEC_CLASSIC;
       }
    }
 
@@ -2798,7 +2835,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       /* One thread per 2x2 quad, and the shader then runs four threads per
        * quad so it can difference across one. */
       unsigned num_quads = ((w + 1) / 2) * ((h + 1) / 2);
-      CUfunction interp_kernel = fused_interp_dev
+      CUfunction interp_kernel = inshader_interp_dev
          ? screen->kernels.fs_compact : screen->kernels.fs_interpolate;
       CUresult interp_err = cuLaunchKernel(interp_kernel,
                                            (num_quads + 255) / 256, 1, 1, 256, 1, 1,
@@ -2815,9 +2852,12 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
     * early for threads beyond it. This avoids a sync just to read the count. */
    unsigned num_pixels = max_pixels;
 
-   if (!cp_fs_launch_shader(cp, state, fs, counter, fs_in, fs_in_stride, fs_out,
-                            frag_coord, discard_mask, front_face, coverage,
-                            fused_interp_dev, num_pixels, 0, batch_rows))
+   enum cp_shader_exec_mode fs_mode = inshader_interp_dev
+      ? inshader_mode : CP_SHADER_EXEC_CLASSIC;
+   if (!cp_fs_launch_shader(cp, state, fs, fs_mode, counter, fs_in,
+                            fs_in_stride, fs_out, frag_coord, discard_mask,
+                            front_face, coverage, inshader_interp_dev, num_pixels,
+                            0, batch_rows))
       return;
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
@@ -3039,7 +3079,8 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
    *t_interp = 0.0f;
    *t_shade = 0.0f;
    *t_composite = 0.0f;
-   if (!fs || !fs->kernel || !vs_output_buf || !state->vs ||
+   bool have_fs = cp_shader_has_standalone_exec(fs);
+   if (!have_fs || !vs_output_buf || !state->vs ||
        !screen->kernels.abuf_interpolate || !num_quads)
       return false;
    if (composite && (!screen->kernels.abuf_composite || !ab->shade_slot ||
@@ -3172,7 +3213,32 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
    if (!interp_dev)
       return false;
 
-   if (cp_debug->no_fused_abuf_interp) {
+   enum cp_shader_exec_mode abuf_mode = CP_SHADER_EXEC_CLASSIC;
+   bool allow_inshader = !cp_debug->no_inline_fs &&
+      (!cp_debug->no_fused_abuf_interp || cp_debug->force_fused_fs);
+   if (allow_inshader) {
+      if (cp_debug->inline_fs && !cp_debug->force_fused_fs &&
+          fs->exec[CP_SHADER_EXEC_INLINE].kernel)
+         abuf_mode = CP_SHADER_EXEC_INLINE;
+      else if (fs->exec[CP_SHADER_EXEC_FUSED].kernel) {
+         abuf_mode = CP_SHADER_EXEC_FUSED;
+         if (cp_debug->inline_fs && !cp_debug->force_fused_fs &&
+             (cp_debug->shader_stats || cp_debug->dump_ir ||
+              cp_debug->dump_ptx) && !fs->inline_fallback_reported) {
+            fprintf(stderr, "cudapipe: inline fragment binary unavailable; "
+                    "using proven fused helper binary\n");
+            fs->inline_fallback_reported = true;
+         }
+      }
+   }
+   bool use_fused_interp = abuf_mode != CP_SHADER_EXEC_CLASSIC;
+   if (allow_inshader && !use_fused_interp && !fs->fused_fallback_reported) {
+      fprintf(stderr, "cudapipe: in-shader interpolation unavailable; "
+              "using classic standalone interpolation\n");
+      fs->fused_fallback_reported = true;
+   }
+
+   if (!use_fused_interp) {
       void *interp_params[] = { &interp };
       CUfunction kernel = seg && seg->ranges
          ? screen->kernels.abuf_interpolate_ranges
@@ -3181,10 +3247,12 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
                 cp->stream, interp_params, NULL);
    }
 
-   if (!cp_fs_launch_shader(cp, state, fs, counter, fs_in, fs_in_stride, fs_out,
-                            frag_coord, discard_mask, front_face, coverage,
-                            cp_debug->no_fused_abuf_interp ? 0 : interp_dev,
-                            num_slots,
+   enum cp_shader_exec_mode fs_mode = use_fused_interp
+      ? abuf_mode : CP_SHADER_EXEC_CLASSIC;
+   if (!cp_fs_launch_shader(cp, state, fs, fs_mode, counter, fs_in,
+                            fs_in_stride, fs_out, frag_coord, discard_mask,
+                            front_face, coverage,
+                            use_fused_interp ? interp_dev : 0, num_slots,
                             ab->timing ? ab->ev[13] : 0, batch_rows))
       return false;
    cp_abuf_mark(ab, ab->ev[14], cp->stream);
@@ -3728,7 +3796,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * positions from gl_VertexIndex, which is how a fullscreen pass is drawn.
     * A batch carries its own snapshot of the bindings, so the live state —
     * which the next draw may have rebound over — is not consulted for one. */
-   bool has_vs = state->vs && state->vs->kernel &&
+   bool has_vs = state->vs &&
+      state->vs->exec[CP_SHADER_EXEC_CLASSIC].kernel &&
                  (vb_table != NULL ||
                   (state->num_vertex_buffers > 0 && state->vb_base[0]) ||
                   state->num_vertex_elements == 0);
@@ -3839,7 +3908,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
     * The output replaces packed_positions for the rasterizer. */
    /* VS execution */
-   if (state->vs && state->vs->kernel) {
+   if (state->vs && state->vs->exec[CP_SHADER_EXEC_CLASSIC].kernel) {
       CP_NVTX_SCOPE("vertex");
       void *vb_data2 = (state->num_vertex_buffers > 0)
          ? (void *)(uintptr_t)state->vb_base[0] : NULL;
@@ -4244,7 +4313,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          void *vs_arg_ptr = (void*)(uintptr_t)vs_args_dev;
          void *vs_params[] = { &vs_arg_ptr };
          /* Compiled shaders grid-stride; see the fragment launch. */
-         CUresult vs_err = cuLaunchKernel(state->vs->kernel,
+         CUresult vs_err = cuLaunchKernel(
+            state->vs->exec[CP_SHADER_EXEC_CLASSIC].kernel,
             MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
             0, cp->stream, vs_params, NULL);
 
