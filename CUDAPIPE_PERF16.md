@@ -935,3 +935,45 @@ mixed inline module. Counts stay device-resident; slots are disjoint; A-buffer
 composites only after both kernels. All possible host rows must resolve or the
 whole launch uses the generic path. No production edit until a real whole-launch
 win supports at least 1.5 ms gross opportunity.
+
+## Iteration 22 — result: noinline exact sampler still expands real shaders
+
+The canonical exact noinline class helper passes all 25 classes and 3,276,800
+words, including fractional LOD, with zero mismatches. A trivial one-site RGBA8
+shader remains 54 registers. Real multi-site variants do not isolate: 143–182
+registers, 112–136 bytes caller stack/local, and only 48/83 variants retain two
+blocks/SM. A real two-key/nine-site module reaches 345,675-byte PTX, 298,944-byte
+cubin and 225,536-byte `main` SASS.
+
+Every unprofiled old control loses: cap-one direct+A-buffer +1.28/+1.45 ms;
+cap-two direct+A-buffer +0.70/+0.95 ms; cap-two A-buffer-only +0.97/+1.03 ms.
+Quad partition itself would cost only ~0.1 ms/frame, but cap-one modules with no
+partition or row branch already regress. Exact inline and exact noinline software
+sampler specialization are both closed. Report `/tmp/perf16/iter22-phaseA-report.md`;
+prototype `/tmp/perf16/iter22-phaseA.patch` in a detached tree. Retry requires
+fewer executed sampling instructions, not another helper boundary.
+
+## Iteration 23 — canonical CUDA mipmapped-array ownership census
+
+Hardware texture operations are the qualitatively different sampler path. Existing
+exact-row evidence gives only an ownership-agnostic upper bound: complete 2D
+RGBA8/R8/BC1/BC3-class A-buffer launches cover 545.292/681.332 ms (80.03%) of
+A FS time and an estimated 2.48 ms/frame gross, while direct coverage is only
+9.44% (~0.75 ms). RGBA8/R8 without BC is ~1.59 ms gross. Design:
+`/tmp/perf16/cuda-array-design.md`.
+
+Before ownership code, take a fresh census joining every possible descriptor row
+to stable image/view/sampler/memory IDs and a delayed Nsys FS range. Separate:
+(1) array ownership eligibility (optimal, sampled/transfer-only, nonalias, supported
+format/target, dedicated/nonhost memory); (2) exact view+sampler texture-object
+semantics; and (3) hardware NIR site/intrinsic support. Record tiling, usage,
+mips/layers, bind intervals, view format/range/swizzle, transfer/attachment/storage
+history and candidate bytes. Report launch/grid/live-slot/device-time funnels by
+reject reason. Live rows are only an upper bound; all possible rows decide.
+
+Admit the A-buffer alternative only if the full ownership∩object∩site intersection
+still contributes >=2.0 ms/frame gross and memory/transfer/object cost is bounded.
+Direct remains subject to the historical >29% launch screen and cannot pass from
+current format keys alone. If admitted, use canonical deferred CUDA mipmapped arrays
+backed by dedicated VMM allocations, never a stale linear shadow; current linear
+software images remain the complete fallback.

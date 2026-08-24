@@ -179,10 +179,18 @@
   {
    "id": 22,
    "name": "exact out-of-line sampler and per-key FS dispatch proof",
+   "verdict": "reverted before production",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "exact noinline class helpers bit-exact 25-class matrix but real multisite 143-182regs,112-136B stack/local, up to299KiB cubin/226KiB main SASS. All old arms regress +0.70..+1.45ms. Detached only; closes software sampler specialization."
+  },
+  {
+   "id": 23,
+   "name": "canonical CUDA mipmapped-array ownership census",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "detached phase A compares generic callable, rejected exact inline, exact noinline/split helpers, and per-key quad partition on real hot variants. Admit only bit-exact whole-launch win with >=1.5ms gross; no production edit yet."
+   "note": "fresh all-possible-row/image ownership/object/site census joined to FS device time. Existing format-only upper: 80.03% A FS/~2.48ms gross but9.44% direct. Admit only if real ownership intersection retains >=2ms A gross with bounded memory/transfer cost."
   }
  ]
 }
