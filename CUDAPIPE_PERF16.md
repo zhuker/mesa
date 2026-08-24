@@ -1879,3 +1879,65 @@ pixel is written once per launch is assuming something this capture disproves
 six million times a frame-set. Full context is in
 `/tmp/perf16/iter28-item3/README.md`, with `wip.patch` beside it; the agent
 that produced them has been retired and those two files are the only record.
+
+### The 18-sample sweep
+
+60-frame offscreen sweep against the immutable NVIDIA reference, run twice —
+once at the shipping default and once with both reverts — and compared frame by
+frame. Every sample reads `ok` except the two standing documented exceptions,
+`gltfscenerendering` REGRESSED and `renderheadless` missing, and the fused and
+reverted builds produce **the same numbers for the regressing sample**
+(15694 at frame 0, worst 59925 at frame 47, in both). The regression is
+pre-existing and this iteration neither caused nor widened it. Three samples
+differ between the two builds by a single count at the tolerance boundary
+(`bloom` 4/5, `multithreading` 2049/2046, `vulkanscene` 25/24), which is those
+samples' own frame-to-frame variation.
+
+### The standing default, stated as a distribution
+
+Deltas answer "did it help". They do not answer "is the frame under 16 ms",
+because the last time this line was approached the median said 15.97 while the
+middle half of the run medians straddled 16.0. So the shipping default was
+measured alone, no arms and no flags but the base environment, in one session:
+
+| old capture, run medians (ms) | Crossroads |
+|---|---|
+| 15.7200, 15.7544, 15.7614, 15.7483, 15.7245, 15.7911 | 5.9007, 5.8984, 5.8980, 5.8569 |
+
+| capture | median of run medians | IQR of run medians | full range |
+|---|---:|---:|---:|
+| old | **15.7514** | **[15.7305, 15.7596]** | [15.7200, 15.7911] |
+| Crossroads | **5.8982** | [5.8877, 5.8990] | [5.8569, 5.9007] |
+
+**The interquartile range sits clearly under 16.0, and so does the whole
+range**: the slowest of six runs is 15.7911, leaving 0.21 ms of margin at the
+worst observed run rather than at the median. All six old runs and all four
+Crossroads runs produced one stdout hash per capture. The objective is met on
+the terms it was set.
+
+### Two findings that outlive this item
+
+**The value was in making the chain short and static, not in either fusion.**
+S1 alone did not resolve on the old capture — +0.094 ms in one session and
+−0.020 in the other, 1.1 σ over four runs — while S2 alone paid +0.105
+consistently. Together they are +0.221, more than the +0.142 the halves sum to,
+while removing **fewer** launches than the halves sum to (91.1 against
+59.6 + 47.3 = 106.9, because they overlap on the block scan). A forecast that
+adds up per-fusion savings will therefore be wrong in both directions at once.
+What the pair changes that neither half changes is the shape of the episode:
+fifteen launches and two large clears become nine launches and none, which is a
+short static sequence the host can issue without stopping to think. That is
+also the first result in this line of work where the whole is worth more than
+the parts; iteration 26 measured its removals as additive, and they were.
+
+**The price of a removed device operation is not the launch price when the
+operation also carried work.** 0.2208 ms over 91.1 removed launches and 27.4
+removed clears is **1.86 µs per device operation**, roughly twice the under-1-µs
+price iteration 27 measured for a same-stream launch. The difference is not
+noise and it is not a better launch: the clears that went were 49.9 MB/frame of
+bandwidth, and the compaction pass over 230,400 blocks stopped running
+altogether. Forecasting with the launch price alone under-counts a fusion that
+also deletes a pass or a large clear, and over-counts one that deletes a bare
+launch. Both corrections belong in the price table
+(`/tmp/perf16/iter27-vsfusion/handoff.md`), which currently lists only the
+per-operation prices.
