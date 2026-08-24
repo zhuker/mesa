@@ -370,3 +370,28 @@ selected execution's blocks/SM. Keep **4096 as the hard upper cap and fallback**
 The design changes scheduling only: ABI, order, shader function, and useful
 invocations remain identical. Admission must account for sampler-variant and
 register-cap execution changes; a fixed magic block count is only a probe.
+
+## Iteration 7 — result: rejected and fully reverted
+
+Stats recorded 156,154 FS launches with zero drops. Direct grid4096 exact count
+was p50 **3,108**, p90 68,972, p95 231,868, p99 923,520, mean 46,196: only
+**4.406%** of first-wave lanes useful (base 2.417%, sampler variants 12.190%).
+A-buffer sizing was 99.96% useful. Despite the striking waste, unprofiled grids
+340/680/1024/1360/2048 measured 23.645/23.558/23.610/23.632/23.724 ms against
+4096 controls 23.629/23.596/23.544. Best delta −0.16% is below control spread.
+Idle blocks retire cheaply; persistent striding does not reduce useful work and
+can reduce tail parallelism. No default was justified; patch reverted at
+`/tmp/perf16/iter7-rejected.patch`. The 4096 cap remains.
+
+## Iteration 8 — compact interpolation before a bare hardware FS
+
+Hardware texture PTX alone needs 42 registers; linking `cp_fs.cu` raises it to
+190, and capping reaches 126 only by spilling 104–136 bytes. Avoid that union
+without restoring iteration 5's full-frame interpolator: extend the existing
+`cp_fs_compact` launch to perform the same per-quad interpolation and write the
+established `fs_in` ABI for only its compacted slots, then launch a truly bare
+hardware FS. The direct chain stays two launches. A-buffer uses its existing
+exact-quad standalone interpolator when choosing a bare execution. Software
+sampling remains current/default unless whole-chain A/B says otherwise. This
+execution boundary is also the clean prerequisite for broad CUDA-array texture
+coverage and graph nodes with settled functions.

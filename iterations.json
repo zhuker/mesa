@@ -59,10 +59,18 @@
   {
    "id": 7,
    "name": "occupancy-sized persistent fragment launch grid",
+   "verdict": "reverted",
+   "old_median_ms": 23.58,
+   "sweep_hot_ms": null,
+   "note": "exact direct grid4096 counts p50 3108, mean 46196, only 4.406% initial lanes useful; abuf 99.96%. Fixed 340-2048 grids all within 0.16% of 4096 control spread; no justified auto policy. Reverted."
+  },
+  {
+   "id": 8,
+   "name": "pre-interpolate in compact kernel; bare hardware-texture FS execution",
    "verdict": "pending",
    "old_median_ms": null,
    "sweep_hot_ms": null,
-   "note": "95.1% direct FS time uses gridX=4096; useful compact count is device-side and kernel already grid-strides. Measure actual counts, A/B 1-8 resident waves, retain 4096 as hard upper cap and exact fallback."
+   "note": "move direct interpolation into existing compact kernel (still 2 launches), use separate abuf interpolate where needed, then run resource-isolated bare FS. Goal: remove 190-reg fs-helper floor from hardware execution while avoiding classic full-frame interpolator."
   }
  ]
 }
