@@ -1355,3 +1355,221 @@ delta a win, so putting the revert switches in `CAND` yields correct medians
 under an inverted verdict. The harness now takes `CTRL` for control-arm
 environment and writes `arms.txt`, so a default-on stage is measured as
 `CAND="" CTRL="CUDAPIPE_NO_...=1 ..."` and the sign stays right.
+
+## Iteration 27 — the vertex fetch inlined into the vertex shader
+
+**Result: kept, default on, `CUDAPIPE_NO_FUSED_VFETCH=1` reverts.**
+Old capture **16.5013 → 15.9726 ms** (+0.5287 ms, +3.20%), Crossroads
+**6.0758 → 5.9831 ms** (+0.0927 ms, +1.53%). The goal of this log — a
+paired-submit median at or below 16 ms on the old capture — is reached.
+
+`cp_vertex_fetch` ran once per executed batch, immediately before the
+generated vertex shader, over the same vertices, on the same stream, and
+handed its result over through a global buffer nothing else read. That launch,
+its 90 MB pre-clear and the upload flush it forced are gone for any vertex
+shader whose fused build is admitted: the per-lane gather is linked into the
+shader as NVPTX bitcode in the same `LLVMContext`, force-inlined before
+optimisation, and its results live in a function-entry alloca that SROA
+promotes to registers. `kernels/cp_vf_lane.h` is the only description of vertex
+format semantics in the driver; the standalone kernel and the shader both
+compile it, so the two forms cannot drift.
+
+Iteration 4 tried this and was rejected at 48.05 ms against a 23.42 ms base,
+for two reasons that no longer apply: it passed an LLVM `alloca` pointer to an
+NVRTC-compiled helper (two address-space models, one pointer), and when it
+retreated to a device call the link unioned the register allocation — a
+trivial vertex shader went 20 → 108 registers and `__noinline__` did not help.
+Here there is no second compiler and no call in the emitted PTX at all. The
+admission gate is measured, not assumed, and a declining shader keeps its
+classic binary and its separate fetch launch permanently.
+
+### The finding that decides whether this works at all
+
+**A loop over the elements cannot be left to LLVM's unroller.** The first
+working form passed `N` and a live-slot mask as constants and gathered in a
+loop bounded by `N`, with `#pragma clang loop unroll(full)` on it — the shape
+the fragment interpolator uses. LLVM refused to unroll it for every real
+capture shader (the body is a whole conversion tree; the pragma loses to the
+size heuristic), the slot array was then indexed dynamically, and a
+dynamically indexed alloca is local memory: every shader came back with a
+`__local_depot` of exactly `N * 16` bytes. Launch-weighted admission in that
+form was **A = 0.1081**.
+
+Emitting the unrolled sequence from the backend instead — one
+`cp_vs_fetch_element` call per live slot, with the element index an
+`LLVMConstInt` — removed all of it. Two smaller rules fell out of the same
+work and are in the header's comments:
+
+* **never write a slot as bytes in one path and as words in another.** SROA
+  will not split a partition with conflicting access types, and it takes the
+  whole array to memory when it refuses. The fused build uses one word-based
+  shape for every 32-bit-per-component format; the standalone kernel keeps its
+  three-branch copy, which is why that path is a `#ifdef` and not a rewrite.
+* **a fixed bound with a `continue` unrolls; a fixed bound with a `break` does
+  not.** The inner component loops run to four and skip, rather than exiting
+  early on the runtime channel count.
+
+The zero fill has to happen in the helper: the classic caller's slots read zero
+because the host memset the buffer, and registers have no such history. Missing
+it is silent wrong geometry, not a crash — §3.7 of the design predicted exactly
+that and `cpvk_vfetch formats` is the test for it.
+
+### Admission, measured before any performance claim
+
+`CUDAPIPE_SHADER_STATS=1` now prints a per-shader census weighted by **vertex
+launches**, which nothing recorded before this iteration: a verdict counted per
+shader says nothing about a frame when one shader takes two launches and
+another two hundred.
+
+| capture | shaders | launches | A by launch | A by shader | declines |
+|---|---:|---:|---:|---:|---|
+| old | 48 | 307,811 | **0.9538** | 0.8125 | 9 shaders / 14,228 launches, all `lost-a-block` |
+| Crossroads | 19 | 75,243 | **0.8838** | 0.7895 | 4 shaders / 8,746 launches, all `lost-a-block` |
+
+No shader on either capture declined for a surviving helper symbol, for new
+local memory or for spill: the only decline reason that occurs is losing a
+block per SM, which is a shader being heavy rather than the inline being
+fragile. Launch-weighted registers on old: classic 53.7 → fused 55.7. The
+`instancing` sample — the one the design worried about, because
+`nir_opt_move_to_top` hoists vertex-input loads on purpose — admits all three
+of its shaders and its 4.42-million-vertex rock shader goes **120 → 104
+registers at the same occupancy**. The hoisting is harmless now: what it hoists
+reads registers.
+
+### What the frame stops doing
+
+Old capture, per frame over 1,511 frames (`CUDAPIPE_UPLOAD_STATS=1`,
+`/tmp/perf16/iter27-census/old-{0,1}.stderr`):
+
+| operation | classic | fused | delta |
+|---|---:|---:|---:|
+| vertex-fetch launches | 194.3 | 0 | **−194.3** |
+| `cuMemsetD8Async` | 457.07 | 262.78 | **−194.3**, and −84.9 MB/frame |
+| `cuMemcpyHtoDAsync` | 615.31 | 423.31 | **−192.0** (the fetch launch was a flush point) |
+| upload-ring wraps | 0.05 | 0.05 | unchanged |
+
+### The launch price, corrected
+
+Iteration 26 priced a removed small copy at 1.30 µs, a removed small clear at
+0.66 µs and a copy merged at an unchanged boundary at 0.59 µs. This design
+*assumed* a removed same-stream launch was worth 1.4–2.2 µs and predicted
+0.65 ms × A = 0.62 ms on old. The measurement is **0.512 ms** in the opt-in
+A/B and **0.529 ms** with the flip, i.e. 0.537–0.554 ms per unit admission —
+at or just below the bottom of the design's own 0.55–0.85 band.
+
+Holding iteration 26's prices fixed, the removed clears and merged copies
+account for 0.128 + 0.113 = 0.241 ms and the 84.9 MB never written for about
+0.065 ms, which leaves roughly **0.13–0.21 ms for 194.3 removed launches plus
+the whole `vs_in` round trip — under 1 µs per launch**. That split is
+arithmetic over the census, not a measured decomposition; the
+`CUDAPIPE_VFETCH_KEEP_VSIN` attribution switch the design proposed was not
+built, because it needs the fused kernel to store `vs_in` as well and that is
+more codegen for a number this arithmetic already bounds.
+
+**Take 0.6–1.0 µs, not 1.4–2.2 µs, as the price of a removed same-stream
+launch on this capture.** Iteration 3's 1.96–3.19 µs included a device-work
+reduction that this fusion does not have. The consequence is concrete and
+should be applied before the next design is written: iteration 25's
+opportunity 3, the A-buffer support-chain fusion at ~180 launches/frame, drops
+from an expected 0.3–0.6 ms to roughly **0.11–0.18 ms**, which no longer
+obviously pays for its risk.
+
+### Sweep, and the one sample that regressed
+
+600-frame offscreen sweep, hot sum **25.28 → 22.59 ms (−10.6%)**:
+`instancing` 4.54 → 2.06 (−55%), `pushconstants` 0.20 → 0.13,
+`vulkanscene` 0.72 → 0.65, `bloom` 1.15 → 1.12, everything else flat.
+
+`pbribl` regresses **0.47–0.49 → 0.51–0.52 ms**, reproducibly, over three
+paired repeats. Its host-side operation counts all *fall* with the fusion
+(copies 5.47 → 4.10, clears 4.10 → 2.73 per frame, 39.9 → 27.8 GB of clear
+traffic), all four of its vertex shaders admit, and three of the four lose
+registers, so the 0.03 ms is not in the host work this iteration removes.
+
+**Attributed as far as it is cheap to.** Three arms in one session, three
+repeats each: (a) fused, (b) `NO_FUSED_VFETCH`, and (c)
+`CUDAPIPE_VFETCH_DECLINE_NTH=4294967295` — the second binary built, its
+registers measured, the per-draw decision taken, and every shader then forced
+onto the classic path, so the arm pays the mechanism's infrastructure and
+executes none of it.
+
+| arm | ms/frame | wall s |
+|---|---:|---:|
+| (a) fused | 0.51–0.52 | 1.76–1.87 |
+| (b) reverted | 0.48–0.49 | 1.70 |
+| (c) built, measured, not executed | 0.47–0.48 | 1.73–1.74 |
+
+**(c) matches (b), not (a)**, so the cost is in executing the fused kernel on
+this workload (or in its larger per-draw argument block), not in the second
+binary, the admission measurement or the decision — those cost 0.03–0.04 s of
+process wall time and nothing per frame. That bounds it; it is still not
+explained.
+
+This is a **literal miss of the design's rejection criterion 6** ("any sample
+in the 600-frame sweep regressing more than 2%"), and it is kept deliberately:
+0.03 ms on a 0.5 ms sample against −2.5 ms on `instancing`, −0.53 ms on the old
+capture and −0.09 ms on Crossroads, with every correctness gate intact. The
+criterion was not forgotten; it was weighed.
+
+### Gates
+
+Native suite **65/65** in the default state and in the reverted state — the 59
+existing tests plus four new `cpvk_vfetch` modes and two gates. Six batch
+reproducers byte-identical across five `CUDAPIPE_BATCH_MAX` modes crossed with
+default/reverted (30 runs, one hash). Crossroads sentinel frames
+**byte-identical** to iteration 24's frozen reference; the old capture's
+differ by at most 51/255 on one pixel of two frames, which is the run-to-run
+class that reference already shows and a thousandth of the llvmpipe envelope.
+The 60-frame NVIDIA comparison reproduces iteration 24's verdict exactly,
+including the two standing exceptions (`gltfscenerendering` REGRESSED,
+`renderheadless` missing). `cp_launch_audit`, both `FLAGS.md` checks,
+`git diff --check` and the empty `src/gallium` diff all clean.
+
+Four new tests exist because neither capture can reach these cases — iteration
+4's census found no divisored attribute anywhere in them, and each conversion
+class appears in one shape only:
+
+* `cpvk_vfetch formats` — one attribute per conversion class at one to four
+  components, a BGRA swizzle, three halves on a two-byte boundary (the
+  byte-at-a-time path), a 32-bit pair off a sixteen-byte boundary, every
+  `fill_w` case, drawn indexed with a non-zero `firstIndex` and `vertexOffset`
+  over a buffer whose first vertex is poison. Passes on classic, on fused and
+  on llvmpipe.
+* `cpvk_vfetch sparse` — locations 0, 3 and 7 bound, only location 3 read, with
+  the other two holding values that fail the test if the shader is handed them.
+* `cpvk_vfetch divisor` — two per-instance attributes, four instances,
+  `firstInstance = 2`. It also documented a driver gap: this driver maps
+  `VK_VERTEX_INPUT_RATE_INSTANCE` to divisor 1 and does not implement
+  `VK_EXT_vertex_attribute_divisor`, so a divisor above one is **unreachable
+  through the API** — the kernel path exists and nothing can select it. Now in
+  `CUDAPIPE_HANDOFF.md` with the other conformance gaps.
+* `cpvk_vfetch decline` — the instanced draw into the left half and the sparse
+  draw into the right, one render pass, one submit, with
+  `CUDAPIPE_VFETCH_DECLINE_NTH` forcing one of the two shaders onto the classic
+  path. This is the mixed-mode case per-shader admission creates in every real
+  frame, and all five flag states are byte-identical.
+
+**The seeding negative control matters most of the four gates.** Iteration 26
+S2 seeds the clip and raster counters inside `cp_vertex_fetch`; if that job had
+not moved into the fused kernel, nothing would fail — the counters would go
+back to being cleared by the launches that consume them and the frames would
+still be right, while this iteration reported a saving that included S2's.
+`CUDAPIPE_VFETCH_SKIP_SEED=1` puts the driver in exactly that state, and three
+of the existing tests then fail. `cpvk_vfetch_seed_gate` requires the canary to
+pass seeded and to **fail** unseeded, so the gate cannot pass vacuously.
+
+### Flags
+
+| flag | meaning |
+|---|---|
+| `CUDAPIPE_FUSED_VFETCH` | default **1**; gather inside the vertex shader for admitted shaders |
+| `CUDAPIPE_NO_FUSED_VFETCH` | the revert: the second binary is not even built, so the classic path is the only linked call graph |
+| `CUDAPIPE_VFETCH_DECLINE_NTH` | fault injection: the Nth vertex shader compiled declines |
+| `CUDAPIPE_VFETCH_SKIP_SEED` | fault injection: an admitted fused draw does not seed, and the host still skips the clears |
+
+Artifacts: `/tmp/perf16/iter27-s1-tworeplay` (opt-in A/B),
+`/tmp/perf16/iter27-flip-tworeplay` (default vs revert),
+`/tmp/perf16/iter27-census/` (operation census),
+`/tmp/perf16/iter27-census-old2.stderr` and `-cross.stderr` (admission),
+`/tmp/perf16/iter27-acceptance/` (sentinels),
+`/tmp/perf16/iter27-sweep/` (sweep).

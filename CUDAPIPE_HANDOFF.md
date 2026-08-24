@@ -708,6 +708,22 @@ smooth.
    to look if a depth-fighting artefact appears. `CUDAPIPE_NO_BATCH=1`
    distinguishes it from anything else in one run.
 
+17. **Vertex attribute divisors above one are unreachable, not implemented.**
+   `cpvk_pipeline.c` maps `VK_VERTEX_INPUT_RATE_INSTANCE` to divisor 1 and
+   ignores `VkPipelineVertexInputDivisorStateCreateInfoEXT` entirely;
+   `VK_EXT_vertex_attribute_divisor` is not advertised. The fetch itself
+   handles an arbitrary divisor — `kernels/cp_vf_lane.h` computes
+   `start_instance + instance_id / divisor` and both the standalone kernel and
+   the fused vertex shader read that divisor out of the argument block at
+   runtime — so the gap is entirely in pipeline state: nothing can select a
+   divisor above one, and a program that asks for one silently gets one.
+   Closing it is a `pDivisorDescriptions` walk into `velem[].instance_divisor`
+   plus the extension advertisement; `cpvk_vfetch divisor` covers the
+   divisor-1 path with a non-zero `firstInstance` and is where the coverage for
+   a larger divisor would go. Found by writing that test in iteration 27,
+   which is also when it was established that neither replay capture contains a
+   divisored attribute at all.
+
 ## Lessons that cost the most to learn
 
 **An unimplemented operation that returns zero destroys everything downstream.**
