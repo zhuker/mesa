@@ -494,3 +494,22 @@ exact fallback. Existing clipped worst-case storage remains for crossings;
 removing it requires a second crossing allocator without remapping stable IDs.
 Stage2/3 queues, graphs and persistent-raster designs are unblocked. Layered/MRT
 can reuse the explicit primitive-base representation.
+
+## Iteration 11 — cache huge-primitive setup across stage3 tiles
+
+Stage3 remains ~3.3 ms/frame and invokes `setup_triangle()` once per 64×64
+tile, repeating position/reference loads, perspective divides, cull/bounds and
+edge setup that stage2 already performed once before enumerating those tiles.
+Measure huge primitives and tiles-per-setup first. If reuse is material, retain a
+bounded setup record per huge primitive in the queue generation and encode its
+index in the existing 32-bit tile `tri_id` word (the high bit is already outside
+the driver's <2^30 primitive range). Stage3 loads the cached setup; capacity
+overflow keeps the old tri ID and recomputes. Queue BUILD/REUSE and eight side
+streams own separate generations. This preserves independent machine-wide
+stage3 CTAs and adds no host decision/readback.
+
+In parallel, design an exact subpixel/fixed-edge representation shared by stages
+1–3. The goal is not a fast approximate rasterizer: snapping, top-left bias,
+MSAA positions, cull/bbox and barycentrics must be one owned definition that
+enables drift-free incremental edges and valid tile accept/reject. That is the
+larger multi-ms raster architecture if setup caching is bounded.

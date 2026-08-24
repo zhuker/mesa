@@ -87,6 +87,14 @@
    "old_median_ms": 23.255,
    "sweep_hot_ms": 25.99,
    "note": "zero-copy refs remove ~71.25MB/frame accepted writes; old 23.682->23.255 (-0.427), sweep 28.42->25.99, Crossroads neutral. Direct clip+s1 -14.4%, abuf -12.1%. 43/43, six-mode unchanged, sanitizer clean, sentinels/NVIDIA gates pass."
+  },
+  {
+   "id": 11,
+   "name": "cache huge-primitive setup across stage3 tiles",
+   "verdict": "pending",
+   "old_median_ms": null,
+   "sweep_hot_ms": null,
+   "note": "stage3 ~3.3ms/frame recomputes setup_triangle per tile though stage2 already computed it. Measure tiles/setup reuse; cache bounded setup once per huge primitive and encode setup index in tile entry, fallback on capacity."
   }
  ]
 }
