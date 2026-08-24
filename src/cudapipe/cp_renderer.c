@@ -27,6 +27,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* Last, because it intercepts the CUDA entry points to take the iteration 26
+ * census. Nothing below this line calls them unwrapped. */
+#include "cp_smallop_tele.h"
+
 /*
  * Bring a renderer up on a device.
  *
@@ -55,6 +59,7 @@ bool
 cp_context_init(struct cp_context *cp, struct cp_device *dev)
 {
    cp->dev = dev;
+   cp_smallop_enabled = cp_debug->upload_stats;
 
    /* Allocate the persistent device-only arenas and queues. */
    cuCtxSetCurrent(cp->dev->cuda_ctx);
@@ -375,7 +380,10 @@ cp_upload_begin_checked(struct cp_context *cp, size_t size, void **host_out,
    bool dev_full = dev_off > dev_limit || size > dev_limit - dev_off;
    bool host_full = host_off > host_limit || size > host_limit - host_off;
    if (dev_full || host_full) {
-      /* Reuse requires a successful whole-context drain. */
+      /* Reuse requires a successful whole-context drain. The native ICD never
+       * rotates cp->scratch.current, so this is generation 0 wrapping, and
+       * the drain is a whole-context stall the frame pays unnamed. */
+      cp_smallop_hit(__FILE__, __LINE__, CP_SMALLOP_UPLOAD_WRAP, size);
       *error = cuCtxSynchronize();
       if (*error != CUDA_SUCCESS)
          return 0;
@@ -406,7 +414,13 @@ CUresult
 cp_upload_end(struct cp_context *cp, CUdeviceptr dst, const void *host,
               size_t size)
 {
-   return cuMemcpyHtoDAsync(dst, host, size, cp->stream);
+   /* Every upload block in the driver arrives here, so counting this line
+    * would say only that uploads happen. The census wants the site that
+    * asked for the block, which is this function's return address. */
+   if (cp_smallop_enabled)
+      cp_smallop_note(__FILE__, __LINE__, __builtin_return_address(0),
+                      CP_SMALLOP_HTOD_ASYNC, size);
+   return cp_smallop_htod_async_raw(dst, host, size, cp->stream);
 }
 
 CUdeviceptr
@@ -690,6 +704,7 @@ cp_context_cleanup(struct cp_context *cp)
    cp_hardware_texture_report(cp);
    cp_spec_report(cp);
    cp_plan_report(cp);
+   cp_smallop_report();
    cp_abuf_cleanup(cp->abuf);
    free(cp->abuf);
    cp->abuf = NULL;

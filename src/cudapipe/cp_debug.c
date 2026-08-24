@@ -126,6 +126,9 @@ static const struct cp_flag_def flags[] = {
    { "CUDAPIPE_NO_PASS_EPISODE", CP_FLAG_BOOL_VALUE, F(no_pass_episode),
      "disable pass episodes: consecutive blended batches stop sharing one "
      "A-buffer build and drain" },
+   { "CUDAPIPE_UPLOAD_STATS", CP_FLAG_BOOL_VALUE, F(upload_stats),
+     "count small host-to-device copies, clears, context syncs and upload "
+     "ring wraps per call site, and report them at teardown" },
    { "CUDAPIPE_NO_OPAQUE_EPISODE", CP_FLAG_BOOL_VALUE,
      F(no_opaque_episode),
      "disable consecutive opaque-run visibility deferral" },

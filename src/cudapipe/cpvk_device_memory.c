@@ -19,6 +19,9 @@
 #include "vk_util.h"
 #include "util/os_time.h"
 
+/* Last: intercepts the CUDA entry points for the iteration 26 census. */
+#include "cp_smallop_tele.h"
+
 struct cpvk_pending_submit {
    struct cpvk_pending_submit *next;
    CUevent done;
@@ -140,6 +143,10 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
    struct cpvk_device *dev =
       container_of(vk_queue->base.device, struct cpvk_device, vk);
+
+   /* The census divides by this: these captures submit twice per frame, which
+    * is the same paired-submit convention every timing number here uses. */
+   cp_smallop_hit(__FILE__, __LINE__, CP_SMALLOP_SUBMIT, 0);
 
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);

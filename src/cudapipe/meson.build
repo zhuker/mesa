@@ -45,6 +45,7 @@ libcudapipe_vk_files = files(
 # side of it.
 libcudapipe_vk_shared = files(
   'cp_debug.c',
+  'cp_smallop_tele.c',
   'cp_kernels.c',
   'cp_renderer.c',
   'nir_to_ptx/cp_nir_to_llvm.c',
