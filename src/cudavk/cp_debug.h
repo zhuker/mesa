@@ -32,6 +32,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <cuda.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -46,6 +48,57 @@ extern "C" {
 struct cp_opt_int {
    bool set;
    int  value;
+};
+
+/*
+ * How a thread that is waiting for the GPU behaves. This is the three-way CUDA
+ * context scheduling choice, kept whole rather than reduced to a bool, because
+ * the interesting comparison is three-armed and `auto` is not a fourth
+ * behaviour but a heuristic that picks one of the others.
+ *
+ * `auto` is CUDA's default, what this driver has always used, and what it
+ * keeps: with one context and more logical processors than contexts it
+ * resolves to SPIN, which is what makes this driver's ~17 waits a frame cheap.
+ *
+ * Measured on both captures, arms alternated in one session, pixels identical:
+ *
+ *   arm       old frame   Crossroads   host CPU (old)
+ *   auto      15.7446     5.8608       36.37 s, 103%   <- default
+ *   blocking  16.5989     6.0260       17.66 s,  48%
+ *   yield     15.8460     5.8588       36.32 s, 103%
+ *
+ * So on an idle machine `blocking` costs 5.43% of the frame and gives back 51%
+ * of the host CPU. The obvious next thought -- that this is the trade to make
+ * when a co-located consumer wants those cores -- was measured on this same
+ * machine with 16 and then 32 concurrent CPU-side PyTorch trainers, and it is
+ * **wrong in both directions**:
+ *
+ *   saturated, old capture:  auto 42.94 ms   blocking 84.95 ms  (+97.8%)
+ *   saturated, Crossroads:   auto 24.26 ms   blocking 46.55 ms  (+91.9%)
+ *
+ * `blocking` roughly doubles the frame under contention, with disjoint ranges,
+ * because each of the ~17 waits a frame now ends in a kernel wake-up behind a
+ * full runqueue. And it saves no CPU there: the CPU *rate* falls but the replay
+ * runs 62% longer, so total CPU-seconds are equal or worse. The "half a core
+ * given back" is an idle-machine artefact. Nor does the competitor benefit --
+ * best case +2.6%, negative on the other capture -- because one spinning wait
+ * thread is one core of thirty-two.
+ *
+ * So: `blocking` is for an otherwise idle machine only. Under contention the
+ * arm that actually returns CPU is `yield`, which is frame-neutral to faster
+ * there (42.59 ms vs 42.94 old, 18.08 vs 24.26 Crossroads) with CPU per frame
+ * down 17-20% -- the exact opposite of its idle behaviour, where it is a spin
+ * with syscall overhead that saves nothing. Neither becomes the default: each
+ * wins only in the condition the other loses.
+ *
+ * Full record and the caveats, including that "moderate" load already fills
+ * every physical core on this 16-core SMT2 part: DEAD_ENDS.md entry 16.
+ */
+enum cp_ctx_sched {
+   CP_CTX_SCHED_AUTO = 0,
+   CP_CTX_SCHED_SPIN,
+   CP_CTX_SCHED_YIELD,
+   CP_CTX_SCHED_BLOCKING,
 };
 
 /* Residency scheme for the small-allocation arena. Kept as an enum rather than
@@ -181,6 +234,10 @@ struct cp_debug {
 
    /* Draw batching. */
    unsigned batch_max;
+
+   /* CUDA context. */
+   int      ctx_sched;           /* enum cp_ctx_sched */
+   bool     ctx_check;
 
    /* Small-allocation arena. */
    int      small_alloc;         /* enum cp_arena_mode */

@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-97 switches.
+100 switches.
 
 ## Tracing
 
@@ -97,6 +97,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_TILED_OPAQUE` | bool (value) | `off` | — | use the experimental opaque episode sort-middle tile rasterizer |
 | `CUDAVK_TILED_OPAQUE_CENSUS` | bool (value) | `off` | — | collect opaque tile population statistics without changing rendering |
 | `CUDAVK_UNSAFE_NO_OVERFLOW` | bool (value) | `off` | — | skip episode overflow readback and assume fragment/quad arrays fit; unsafe diagnostic only |
+| `CUDAVK_UNSAFE_FORCE_OPAQUE` | bool (value) | `off` | — | force every draw's blend state to disabled and let the result reach an opaque episode; renders wrong output, diagnostic upper bound for the cost of the blended path |
 | `CUDAVK_NO_BATCH` | bool (presence) | `off` | — | disable draw batching entirely |
 | `CUDAVK_NO_BINCACHE` | bool (presence) | `off` | — | disable the compiled-kernel binary cache |
 
@@ -117,6 +118,13 @@ deliberately: someone's script sets one of these to 0 today.
 | variable | type | default | range | meaning |
 |---|---|---|---|---|
 | `CUDAVK_BATCH_MAX` | uint | `128` | 1&ndash;128 | cap draws per batch; 1 must stay bit-identical to NO_BATCH |
+
+## CUDA context
+
+| variable | type | default | range | meaning |
+|---|---|---|---|---|
+| `CUDAVK_CTX_SCHED` | enum | `auto` | — | GPU-wait behaviour: auto \| spin \| yield \| blocking; blocking only helps on an idle machine, yield only under CPU contention |
+| `CUDAVK_CTX_CHECK` | bool (presence) | `off` | — | verify every CUDA call runs in this device's context; names the caller that escaped an entry-point scope |
 
 ## Small-allocation arena
 

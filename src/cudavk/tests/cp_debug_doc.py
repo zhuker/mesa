@@ -108,6 +108,28 @@ def split_entries(body):
     return entries
 
 
+def enum_default_name(text, fields, dflt_const):
+    """Map a CP_FLAG_ENUM default constant to the name a user types.
+
+    `.values = foo` names a `struct cp_flag_value foo[]` table in the same
+    file, whose entries pair the accepted spelling with the constant. Look the
+    default up there so the documented default is always one of the documented
+    choices.
+    """
+    values_m = re.search(r"\.values\s*=\s*(\w+)", fields)
+    if not values_m:
+        return dflt_const.lower()
+    table_m = re.search(r"struct cp_flag_value %s\[\]\s*=\s*\{(.*?)\n\};"
+                        % re.escape(values_m.group(1)), text, re.S)
+    if not table_m:
+        return dflt_const.lower()
+    for name, const in re.findall(r'\{\s*"([^"]+)"\s*,\s*([A-Za-z0-9_]+)\s*\}',
+                                  table_m.group(1)):
+        if const == dflt_const:
+            return name
+    return dflt_const.lower()
+
+
 def parse():
     text = SOURCE.read_text()
     m = re.search(r"static const struct cp_flag_def flags\[\]\s*=\s*\{(.*?)\n\};",
@@ -158,7 +180,12 @@ def parse():
                 if ctype == "CP_FLAG_BOOL_VALUE":
                     default = "on" if default not in ("0", "") else "off"
                 elif ctype == "CP_FLAG_ENUM":
-                    default = default.replace("CP_ARENA_", "").lower()
+                    # Print the spelling a user would type, not the C constant.
+                    # The values table is the authority: find the entry whose
+                    # constant matches the default and use its string. Falling
+                    # back to a hardcoded prefix strip was wrong the moment a
+                    # second enum flag existed.
+                    default = enum_default_name(text, fields, default)
             else:
                 default = "off" if ctype == "CP_FLAG_BOOL_VALUE" else "0"
 

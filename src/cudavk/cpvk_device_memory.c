@@ -404,9 +404,22 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->pdev = pdev;
    atomic_init(&dev->device_lost, false);
 
-   /* CUDA 12.8: cuCtxCreate takes three arguments. Code written against
-    * CUDA 13's four-argument form does not compile here. */
-   if (cuCtxCreate(&dev->cu_ctx, 0, pdev->cu_dev) != CUDA_SUCCESS) {
+   /*
+    * CUDA 12.8: cuCtxCreate takes three arguments. Code written against
+    * CUDA 13's four-argument form does not compile here.
+    *
+    * Flags zero is CU_CTX_SCHED_AUTO, which is what this has always used and
+    * stays the default. CUDAVK_CTX_SCHED overrides it; see cp_debug.h for why
+    * the choice matters once anything else on the machine wants the CPU.
+    */
+   unsigned ctx_flags = 0;
+   switch (cp_debug->ctx_sched) {
+   case CP_CTX_SCHED_SPIN:     ctx_flags = CU_CTX_SCHED_SPIN; break;
+   case CP_CTX_SCHED_YIELD:    ctx_flags = CU_CTX_SCHED_YIELD; break;
+   case CP_CTX_SCHED_BLOCKING: ctx_flags = CU_CTX_SCHED_BLOCKING_SYNC; break;
+   default:                    ctx_flags = CU_CTX_SCHED_AUTO; break;
+   }
+   if (cuCtxCreate(&dev->cu_ctx, ctx_flags, pdev->cu_dev) != CUDA_SUCCESS) {
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_device;
    }

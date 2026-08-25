@@ -57,6 +57,14 @@ struct cp_flag_def {
    const struct cp_flag_value *values;   /* CP_FLAG_ENUM */
 };
 
+static const struct cp_flag_value ctx_scheds[] = {
+   { "auto",     CP_CTX_SCHED_AUTO },
+   { "spin",     CP_CTX_SCHED_SPIN },
+   { "yield",    CP_CTX_SCHED_YIELD },
+   { "blocking", CP_CTX_SCHED_BLOCKING },
+   { NULL, 0 },
+};
+
 static const struct cp_flag_value arena_modes[] = {
    { "advise",     CP_ARENA_ADVISE },
    { "pinned",     CP_ARENA_PINNED },
@@ -310,6 +318,15 @@ static const struct cp_flag_def flags[] = {
      "cap draws per batch; 1 must stay bit-identical to NO_BATCH",
      .dflt = CP_MAX_BATCH_DRAWS, .has_range = true, .lo = 1,
      .hi = CP_MAX_BATCH_DRAWS, .empty_is_unset = true },
+
+   /* ---- CUDA context ---- */
+   { "CUDAVK_CTX_SCHED", CP_FLAG_ENUM, F(ctx_sched),
+     "GPU-wait behaviour: auto | spin | yield | blocking; blocking only helps on "
+     "an idle machine, yield only under CPU contention",
+     .dflt = CP_CTX_SCHED_AUTO, .values = ctx_scheds },
+   { "CUDAVK_CTX_CHECK", CP_FLAG_BOOL_PRESENCE, F(ctx_check),
+     "verify every CUDA call runs in this device's context; names the caller "
+     "that escaped an entry-point scope" },
 
    /* ---- small-allocation arena ---- */
    { "CUDAVK_SMALL_ALLOC", CP_FLAG_ENUM, F(small_alloc),

@@ -61,6 +61,7 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 13 | Narrow hardware texture paths | 6, 8, 15 | REFUTED, then **superseded** | 13.6–14.1% coverage; iteration 24 reached 99.9% |
 | 14 | Vertex fetch fused as a device link | 4 | REFUTED, then **superseded** | 48.05 ms; iteration 27's bitcode inline paid +0.49 ms |
 | 15 | Fragment writeback fused into the shader | 28 item 3 | **PARKED** | wrong frames; the central invariant is measured FALSE |
+| 16 | Blocking-sync context to coexist with an ML pipeline | interop | REFUTED | +97.8% frame under load, and it saves no CPU there either |
 
 ---
 
@@ -808,6 +809,74 @@ and the meson bitcode `custom_target` did not list the new shared header in its
 `input`, so header edits silently did not rebuild the bitcode.
 
 ---
+
+## 16. Blocking-sync CUDA context to coexist with a co-located ML pipeline — REFUTED
+
+Prompted by the CUDA interop work: the driver is to feed frames to a PyTorch
+pipeline on the same host, so the spinning wait threads looked like stolen
+cores.
+
+**Tried.** `CUDAVK_CTX_SCHED`, a registry flag selecting the CUDA context
+scheduling mode: `auto` (the shipping default, and with one context and 32
+logical processors it resolves to `CU_CTX_SCHED_SPIN`), `spin`, `yield`,
+`blocking` (`CU_CTX_SCHED_BLOCKING_SYNC`). Measured on both captures, arms
+alternated in one session, three pairs per arm per capture, 54 runs across
+three load conditions. Competitor: N single-threaded CPU-side PyTorch trainers
+with `CUDA_VISIBLE_DEVICES=""`, so it never touches the GPU. Pixels identical
+throughout — one stdout sha256 per capture across every arm and every load.
+
+**Promising because.** The driver is blocked ~12.4 ms of a 15.74 ms frame
+(`PERFORMANCE.md`), and on an idle machine `blocking` really does give back
+51% of host CPU, about half a core. The inference was that a contended machine
+would make that trade obviously correct.
+
+**Measured.** Frame ms, delta against `auto`:
+
+| load | capture | auto | blocking | yield |
+|---|---|---:|---:|---:|
+| idle | old | 15.74 | 16.60 (+5.4%) | 15.64 (−0.6%) |
+| idle | Crossroads | 5.86 | 6.03 (+2.8%) | 5.86 (0.0%) |
+| moderate (16) | old | 33.46 | 33.78 (+1.0%) | 33.75 (+0.9%) |
+| moderate (16) | Crossroads | 13.59 | 13.77 (+1.3%) | 11.64 (−14.4%) |
+| saturated (32) | old | 42.94 | **84.95 (+97.8%)** | 42.59 (−0.8%) |
+| saturated (32) | Crossroads | 24.26 | **46.55 (+91.9%)** | 18.08 (−25.5%) |
+
+**Mechanism.** The prediction was backwards on both halves.
+
+- **`blocking` gets worse under contention, not better.** At saturation it
+  roughly doubles the frame, ranges fully disjoint (old: auto 41.2–46.2,
+  blocking 82.0–87.9). Each of the ~17 waits a frame ends in a kernel wake-up,
+  and a wake-up behind a full runqueue is not a fixed cost. Spinning is what
+  makes seventeen waits a frame affordable.
+- **It saves no CPU there either.** The CPU *rate* drops (86% → 55%) but the
+  replay runs 62% longer, so total CPU-seconds are equal on old (91.7 vs 90.8)
+  and worse on Crossroads (44.6 vs 37.2). "Half a core given back" is an
+  idle-machine artefact.
+- **The competitor never benefits.** Best case +2.6% throughput, negative on
+  the other capture. One spinning wait thread is one core of thirty-two, and a
+  16- or 32-way trainer cannot see it. The premise needs a 4–8 core host to be
+  testable at all.
+- **`yield` inverts too, in the useful direction.** At idle it is a spin with
+  syscall overhead — frame-neutral, saves nothing, moves 10 s of user time into
+  system time. Under saturation it is the arm that returns CPU: frame-neutral
+  on old, 25% faster on Crossroads, CPU per frame down 17–20%.
+
+**Kept anyway.** The flag stays, with corrected guidance: `blocking` for an
+otherwise idle machine, `yield` under contention, `auto` everywhere else. Each
+arm wins only in the condition the other loses, so none of them can be the
+default.
+
+**Caveats.** This is a 9950X3D: 16 physical cores, SMT2, so "moderate" at 16
+workers already fills every physical core and frame time doubles against idle
+before any arm is varied — at moderate load no arm separates on the old
+capture. n=3 per cell. One moderate-load `blocking` run was anomalously fast
+(19.5 / 36.5 / 33.8 ms), so no claim rests on that median.
+
+**Retry if.** The host is small enough that one core matters — 4 to 8 logical
+processors, not 32 — or the block count per frame falls far enough that
+wake-up latency stops being multiplied by seventeen. The second is the real
+condition, and it is the same one that makes most of `PERFORMANCE.md`
+interesting.
 
 ## The rules these produced
 
