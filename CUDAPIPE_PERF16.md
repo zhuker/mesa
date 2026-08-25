@@ -71,7 +71,7 @@ The frame's dominant cost is 1,789 near-serialized launches; the shade path is
 three launches per batch (interpolate → fs → writeback) with a full
 global-memory round-trip (`fs_in`/`fs_out`) between each. The A-buffer path
 already fuses interpolation *into* the generated shader
-(`CUDAPIPE_NO_FUSED_ABUF_INTERP` is the revert switch), so the mechanism has
+(`CUDAVK_NO_FUSED_ABUF_INTERP` is the revert switch), so the mechanism has
 an in-tree precedent. Plan: extend the fused form to the direct path,
 starting with interpolate→fs; writeback second. Expected: −2 launches and −1
 buffer round-trip per shade, ~204 batches/frame here.
@@ -115,7 +115,7 @@ is independent but small; it stays parked until the sequential chain is done.
 
 Old median **24.42 → 24.14/24.18 ms** (−1.2%), sweep 30.41 → 29.81
 (gltfscenerendering 9.39 → 9.00). All gates pass, including six-mode batch
-hashes (five batching modes + `CUDAPIPE_NO_FUSED_INTERP=1`) and both llvmpipe
+hashes (five batching modes + `CUDAVK_NO_FUSED_INTERP=1`) and both llvmpipe
 sentinel sets at their recorded envelopes to the digit.
 
 **Why so small, in numbers:** the direct chain is 7.0 ms/frame of GPU busy,
@@ -148,7 +148,7 @@ irreducible.
 bodies and execute them in one 64-thread-block kernel. Clipping still allocates
 stable compact output IDs. Stage 1 still rasterizes small primitives in place
 and appends nontrivial work to the unchanged global queue. Stages 2 and 3 stay
-machine-wide queue consumers. `CUDAPIPE_NO_FUSED_RAST=1` restores the classic
+machine-wide queue consumers. `CUDAVK_NO_FUSED_RAST=1` restores the classic
 chain. Instrumented and non-adjacent segment-replay paths refuse fusion.
 
 **Measured result:** old median **23.421/23.672 ms** vs **24.070 ms** with the
@@ -472,7 +472,7 @@ Inside outputs point at immutable VS storage; crossing outputs publish clipped
 scratch only after all vertices are written; retired stable IDs are null. One
 CUDA-visible resolver feeds raster setup and interpolation. Active IDs, counts,
 stable ordering, queue BUILD/REUSE, episode ranges and tiled replay remain IDs,
-not pointers. Scratch refusal or `CUDAPIPE_NO_PRIM_REFS=1` selects the exact
+not pointers. Scratch refusal or `CUDAVK_NO_PRIM_REFS=1` selects the exact
 contiguous representation. Current `CP_CLIP_MAX_OUT=8`, so stable no-active
 retirement nulls all 7/8 unused fixed entries rather than relying on an old
 four-slot assumption.
@@ -546,7 +546,7 @@ Stage2 publishes an 84-byte immutable setup and tags its index in the existing
 Stage3 restores the original ID and setup once per tile. BUILD/FILL reset the
 third queue counter; REUSE retains cache and tagged tiles together. Main plus
 eight side queues cost **756 KiB**. Allocation failure and
-`CUDAPIPE_NO_SETUP_CACHE=1` are exact classic paths.
+`CUDAVK_NO_SETUP_CACHE=1` are exact classic paths.
 
 **Measured:** stage3 direct −2.45%, A-buffer −2.35%; stage2+3 chain −0.254/
 −0.273 µs per launch. Old **23.295→23.217 ms** (−0.077, −0.33%) in two
@@ -667,7 +667,7 @@ opt-in 600-frame hot sum was 25.39 versus forced fused 26.13 ms, but old replay
 23.240/23.231 is neutral against the standing fused 23.217 ms. More importantly,
 opt-in dual ownership costs **+8.34 s cold/warm replay wall and +110.6 MiB host
 RSS** across 65 shaders (+~20 MiB device). Therefore the clean adoption policy
-is: fused-only remains default; `CUDAPIPE_INLINE_FS=1` builds fused+inline for
+is: fused-only remains default; `CUDAVK_INLINE_FS=1` builds fused+inline for
 experiments and the forthcoming resource-isolated hardware texture path;
 `FORCE_FUSED_FS` is the reproducible fused control; `NO_INLINE_FS` is the
 resource-isolated classic control. No default frame-time claim is made.
@@ -702,7 +702,7 @@ win before expanding storage. If admitted, its descriptor-handle ABI and
 execution ownership become the base for coherent mipmapped/layered CUDA arrays,
 cube/3D/BC views and A-buffer coverage. If still neutral, broad arrays remain
 economically unjustified despite working hardware sampling. Default software
-behavior and `CUDAPIPE_INLINE_FS` remain unchanged until full gates.
+behavior and `CUDAVK_INLINE_FS` remain unchanged until full gates.
 
 ## Iteration 15 — result: compound mechanism works, coverage rejection
 
@@ -1051,7 +1051,7 @@ Reports and evidence: `/tmp/perf16/iter24-production-review.md`,
 
 ## Iteration 25 — episode-global tagged A-buffer stage 3 (COUNT only)
 
-An opt-in `CUDAPIPE_EPISODE_RASTER=1` mechanism replaces the per-segment
+An opt-in `CUDAVK_EPISODE_RASTER=1` mechanism replaces the per-segment
 A-buffer COUNT stage 3 of a pass episode with one global tagged launch. Stage 2
 publishes each segment's exact `cp_rasterize_args` from the device into a
 job table, reserves the whole tile run of a triangle with one 64-bit
@@ -1143,7 +1143,7 @@ the count, not the bytes.
 
 ### S0 — count them at the call site
 
-`CUDAPIPE_UPLOAD_STATS` attributes every small copy, clear, context sync and
+`CUDAVK_UPLOAD_STATS` attributes every small copy, clear, context sync and
 upload-ring wrap to its call site with no profiler attached, because CUPTI adds
 host cost to exactly the calls being counted. The census confirms the profile
 and comes in slightly under it: old measures 1,098.3 small copies and 769.8
@@ -1161,7 +1161,7 @@ The instrument costs nothing when off: two binaries from one tree, AB/BA on
 both captures, old 17.4166 against 17.4044 and Crossroads 6.2170 against
 6.2246.
 
-### S1 — the vertex stage's two scalars (`CUDAPIPE_NO_META_FOLD` reverts)
+### S1 — the vertex stage's two scalars (`CUDAVK_NO_META_FOLD` reverts)
 
 `vcount` and `stride` travelled as their own eight-byte upload, the single most
 frequent host-to-device operation in the driver. They now sit in two more words
@@ -1177,7 +1177,7 @@ also 1.30 µs** — the same price on two workloads whose batch counts differ
 fourfold. That is the per-copy number the rest of the iteration is predicted
 from.
 
-### S2 — the counters the next launches fill (`CUDAPIPE_NO_FETCH_FOLD` reverts)
+### S2 — the counters the next launches fill (`CUDAVK_NO_FETCH_FOLD` reverts)
 
 `cp_vertex_fetch` runs once per executed batch, on the same stream, ahead of
 the clipper and the rasterizer, so it seeds the clipper's output counter and
@@ -1195,7 +1195,7 @@ small clears on old are therefore worth at most 0.38 ms and the remaining small
 copies at most 1.16 ms, which is what makes the copy-side mechanism the one to
 build.
 
-### S3 — one copy per launch boundary (`CUDAPIPE_NO_UPLOAD_COALESCE` reverts)
+### S3 — one copy per launch boundary (`CUDAVK_NO_UPLOAD_COALESCE` reverts)
 
 `cp_upload_end()` stops copying and records that the staging bytes below
 `upload_offset` are owed; one `cuMemcpyHtoDAsync` per flush point sends the
@@ -1267,7 +1267,7 @@ fuses the fetch into the vertex shader; the seeds must move with it, or S2 is
 silently reverted — the counters would go back to their own clears with
 nothing failing. The seeding site says so in a comment.
 
-### S4 -- one clear for the counter block (`CUDAPIPE_NO_COUNTER_BLOCK` reverts)
+### S4 -- one clear for the counter block (`CUDAVK_NO_COUNTER_BLOCK` reverts)
 
 The A-buffer's scalar counters were already one allocation for `sum3`,
 `bsum3`, `clist_count`, `seg_counts[64]` and `rec_cursor`; `list_count`,
@@ -1297,7 +1297,7 @@ fragment-side work keep favouring old.
 
 ### The shipping default
 
-All four stages are on by default; each has a `CUDAPIPE_NO_*` switch that
+All four stages are on by default; each has a `CUDAVK_NO_*` switch that
 restores its old path exactly. The reverts are verified by operation count, not
 by inspection -- each flag puts back precisely the operations its stage removed,
 and all four together reproduce the original census to the decimal:
@@ -1354,11 +1354,11 @@ differ in every pairing, including default against default.
 delta a win, so putting the revert switches in `CAND` yields correct medians
 under an inverted verdict. The harness now takes `CTRL` for control-arm
 environment and writes `arms.txt`, so a default-on stage is measured as
-`CAND="" CTRL="CUDAPIPE_NO_...=1 ..."` and the sign stays right.
+`CAND="" CTRL="CUDAVK_NO_...=1 ..."` and the sign stays right.
 
 ## Iteration 27 — the vertex fetch inlined into the vertex shader
 
-**Result: kept, default on, `CUDAPIPE_NO_FUSED_VFETCH=1` reverts.**
+**Result: kept, default on, `CUDAVK_NO_FUSED_VFETCH=1` reverts.**
 Old capture **16.5119 → 16.0194 ms** (+0.4925 ms, +2.98%), Crossroads
 **6.0715 → 5.9928 ms** (+0.0787 ms, +1.30%), on the decisive alternating
 measurement below. The old capture ends this iteration *at* 16 ms rather than
@@ -1442,7 +1442,7 @@ that and `cpvk_vfetch formats` is the test for it.
 
 ### Admission, measured before any performance claim
 
-`CUDAPIPE_SHADER_STATS=1` now prints a per-shader census weighted by **vertex
+`CUDAVK_SHADER_STATS=1` now prints a per-shader census weighted by **vertex
 launches**, which nothing recorded before this iteration: a verdict counted per
 shader says nothing about a frame when one shader takes two launches and
 another two hundred.
@@ -1464,7 +1464,7 @@ reads registers.
 
 ### What the frame stops doing
 
-Old capture, per frame over 1,511 frames (`CUDAPIPE_UPLOAD_STATS=1`,
+Old capture, per frame over 1,511 frames (`CUDAVK_UPLOAD_STATS=1`,
 `/tmp/perf16/iter27-census/old-{0,1}.stderr`):
 
 | operation | classic | fused | delta |
@@ -1488,7 +1488,7 @@ account for 0.128 + 0.113 = 0.241 ms and the 84.9 MB never written for about
 0.065 ms, which leaves roughly **0.13–0.21 ms for 194.3 removed launches plus
 the whole `vs_in` round trip — under 1 µs per launch**. That split is
 arithmetic over the census, not a measured decomposition; the
-`CUDAPIPE_VFETCH_KEEP_VSIN` attribution switch the design proposed was not
+`CUDAVK_VFETCH_KEEP_VSIN` attribution switch the design proposed was not
 built, because it needs the fused kernel to store `vs_in` as well and that is
 more codegen for a number this arithmetic already bounds.
 
@@ -1514,7 +1514,7 @@ registers, so the 0.03 ms is not in the host work this iteration removes.
 
 **Attributed as far as it is cheap to.** Three arms in one session, three
 repeats each: (a) fused, (b) `NO_FUSED_VFETCH`, and (c)
-`CUDAPIPE_VFETCH_DECLINE_NTH=4294967295` — the second binary built, its
+`CUDAVK_VFETCH_DECLINE_NTH=4294967295` — the second binary built, its
 registers measured, the per-draw decision taken, and every shader then forced
 onto the classic path, so the arm pays the mechanism's infrastructure and
 executes none of it.
@@ -1541,7 +1541,7 @@ criterion was not forgotten; it was weighed.
 
 Native suite **65/65** in the default state and in the reverted state — the 59
 existing tests plus four new `cpvk_vfetch` modes and two gates. Six batch
-reproducers byte-identical across five `CUDAPIPE_BATCH_MAX` modes crossed with
+reproducers byte-identical across five `CUDAVK_BATCH_MAX` modes crossed with
 default/reverted (30 runs, one hash). Crossroads sentinel frames
 **byte-identical** to iteration 24's frozen reference; the old capture's
 differ by at most 51/255 on one pixel of two frames, which is the run-to-run
@@ -1568,10 +1568,10 @@ class appears in one shape only:
   `VK_VERTEX_INPUT_RATE_INSTANCE` to divisor 1 and does not implement
   `VK_EXT_vertex_attribute_divisor`, so a divisor above one is **unreachable
   through the API** — the kernel path exists and nothing can select it. Now in
-  `CUDAPIPE_HANDOFF.md` with the other conformance gaps.
+  `CUDAVK_HANDOFF.md` with the other conformance gaps.
 * `cpvk_vfetch decline` — the instanced draw into the left half and the sparse
   draw into the right, one render pass, one submit, with
-  `CUDAPIPE_VFETCH_DECLINE_NTH` forcing one of the two shaders onto the classic
+  `CUDAVK_VFETCH_DECLINE_NTH` forcing one of the two shaders onto the classic
   path. This is the mixed-mode case per-shader admission creates in every real
   frame, and all five flag states are byte-identical.
 
@@ -1580,7 +1580,7 @@ S2 seeds the clip and raster counters inside `cp_vertex_fetch`; if that job had
 not moved into the fused kernel, nothing would fail — the counters would go
 back to being cleared by the launches that consume them and the frames would
 still be right, while this iteration reported a saving that included S2's.
-`CUDAPIPE_VFETCH_SKIP_SEED=1` puts the driver in exactly that state, and three
+`CUDAVK_VFETCH_SKIP_SEED=1` puts the driver in exactly that state, and three
 of the existing tests then fail. `cpvk_vfetch_seed_gate` requires the canary to
 pass seeded and to **fail** unseeded, so the gate cannot pass vacuously.
 
@@ -1588,10 +1588,10 @@ pass seeded and to **fail** unseeded, so the gate cannot pass vacuously.
 
 | flag | meaning |
 |---|---|
-| `CUDAPIPE_FUSED_VFETCH` | default **1**; gather inside the vertex shader for admitted shaders |
-| `CUDAPIPE_NO_FUSED_VFETCH` | the revert: the second binary is not even built, so the classic path is the only linked call graph |
-| `CUDAPIPE_VFETCH_DECLINE_NTH` | fault injection: the Nth vertex shader compiled declines |
-| `CUDAPIPE_VFETCH_SKIP_SEED` | fault injection: an admitted fused draw does not seed, and the host still skips the clears |
+| `CUDAVK_FUSED_VFETCH` | default **1**; gather inside the vertex shader for admitted shaders |
+| `CUDAVK_NO_FUSED_VFETCH` | the revert: the second binary is not even built, so the classic path is the only linked call graph |
+| `CUDAVK_VFETCH_DECLINE_NTH` | fault injection: the Nth vertex shader compiled declines |
+| `CUDAVK_VFETCH_SKIP_SEED` | fault injection: an admitted fused draw does not seed, and the host still skips the clears |
 
 Artifacts: `/tmp/perf16/iter27-s1-tworeplay` (opt-in A/B),
 `/tmp/perf16/iter27-flip-tworeplay` (default vs revert),
@@ -1639,7 +1639,7 @@ measured 12.05 waves per SM with 65% of launches running under 50 instructions
 per thread. The obvious reading is that eleven of those twelve waves are blocks
 scheduled to discover they have nothing to do.
 
-`CUDAPIPE_FS_GRID_WAVES=W` caps the grid at `SMs × blocks_per_sm × W` instead —
+`CUDAVK_FS_GRID_WAVES=W` caps the grid at `SMs × blocks_per_sm × W` instead —
 occupancy taken from the execution being launched, since a 40-register shader
 and a 126-register one do not fit the same number of blocks, with 4,096 kept as
 the hard upper bound. It reaches the launches it is aimed at, by the census this
@@ -1679,7 +1679,7 @@ from removing host-side launches and boundaries, and inconsistent with idle
 blocks being where the next 0.15–0.25 ms was going to come from.
 
 The flag stays at `0`, which is today's behaviour byte for byte, for the same
-reason `CUDAPIPE_LAUNCH_BOUNDS` stays: re-measuring this on different hardware
+reason `CUDAVK_LAUNCH_BOUNDS` stays: re-measuring this on different hardware
 should cost one command, not a re-implementation. The fragment-grid census
 stays because it is what proves a grid change reached the launches it aimed at.
 
@@ -1694,7 +1694,7 @@ work.
 
 ## Iteration 28 item 4 — the A-buffer support chain fused
 
-`CUDAPIPE_PERF16.md`'s iteration-28 profile ranked this fourth: 251.3
+`CUDAVK_PERF16.md`'s iteration-28 profile ranked this fourth: 251.3
 launches/frame over `scan`, `sort`, the worklists, the quad count/fill and
 `fill_recs` for 1.30 ms/frame of device time, estimated at 0.20–0.40 ms of
 frame time at the measured price of under 1 µs per removed same-stream launch.
@@ -1769,7 +1769,7 @@ is 450 blocks of 512 threads with at most one merge per thread.
 
 ### Gates, all before any timing
 
-`CUDAPIPE_ABUF_FUSE_CHECK=1` runs the classic chain first into shadow buffers,
+`CUDAVK_ABUF_FUSE_CHECK=1` runs the classic chain first into shadow buffers,
 with its clamp disabled so it cannot disturb the counts the fused chain then
 reads, runs the fused chain into the live buffers, and compares on the device:
 every offset, the grand total, every `blk_counts` entry, and the invariant
@@ -1788,7 +1788,7 @@ a sentinel and survivors are counted.
 | Crossroads sentinels | **byte-identical to the frozen reference, 9 of 9** |
 | stdout hashes, all sixteen timed runs | identical per capture |
 
-The negative controls have teeth. `CUDAPIPE_ABUF_FUSE_BREAK=1` drops the block
+The negative controls have teeth. `CUDAVK_ABUF_FUSE_BREAK=1` drops the block
 base in `scan_finish`; `=2` stops the fused count writing an uncovered zero,
 which is exactly what a missing clear looks like. On the old capture the first
 reports 60,208,448 differing elements and the second 1,691,296 differing,
@@ -1820,7 +1820,7 @@ sub-additive: 59.6 + 47.3 = 106.9 against 91.1 together.
 Two independent sessions of the four-arm alternating harness, both captures,
 palindromic arm order within each capture so a monotone drift cancels. Session 1
 ran the fusions opt-in; session 2 ran them as the shipping default with the
-`NO_*` reverts on the other arms. `CUDAPIPE_ABUF_FUSE_CHECK` was unset in all
+`NO_*` reverts on the other arms. `CUDAVK_ABUF_FUSE_CHECK` was unset in all
 sixteen runs, which `arms.txt` records — the gate synchronises, so a timed run
 with it on would silently invert the result.
 
@@ -1853,9 +1853,9 @@ pass over 230,400 blocks stopped running.
 
 ### Flags
 
-`CUDAPIPE_NO_ABUF_FUSE_SCAN` and `CUDAPIPE_NO_ABUF_FUSE_QUAD` revert S1 and S2
-independently; both fusions are on by default. `CUDAPIPE_ABUF_FUSE_CHECK` is
-the equivalence gate and `CUDAPIPE_ABUF_FUSE_BREAK` its negative control. The
+`CUDAVK_NO_ABUF_FUSE_SCAN` and `CUDAVK_NO_ABUF_FUSE_QUAD` revert S1 and S2
+independently; both fusions are on by default. `CUDAVK_ABUF_FUSE_CHECK` is
+the equivalence gate and `CUDAVK_ABUF_FUSE_BREAK` its negative control. The
 registry is 97 flags.
 
 Evidence under `/tmp/perf16/iter28-item4/`: `design.md`, `gate-old.log`,
@@ -1945,7 +1945,7 @@ per-operation prices.
 ## The hardware texture path is the default now
 
 Iteration 24 kept the hardware texture cache opt-in, and every measurement in
-this document from that point on was taken with `CUDAPIPE_TEXTURE_CACHE=1` in
+this document from that point on was taken with `CUDAVK_TEXTURE_CACHE=1` in
 the base environment. That made the headline numbers real and reproducible but
 not what the driver did out of the box — a distinction this document did not
 draw, and should have. Measured at `ab7b431611a`, old capture, paired-submit
@@ -1956,7 +1956,7 @@ medians:
 | driver as it shipped, no flags | 21.90 / 21.96 ms | 22.59 ms |
 | with the cache enabled | 15.76 / 15.80 ms | 16.03 ms |
 
-The flag is now inverted: `CUDAPIPE_NO_TEXTURE_CACHE` reverts, the path is on
+The flag is now inverted: `CUDAVK_NO_TEXTURE_CACHE` reverts, the path is on
 by default, and `cp_debug->texture_cache` is derived from it in
 `apply_couplings()` so no use site changed. The justification is that the
 enabled path is the better-tested one — it passed a full acceptance battery in
@@ -1964,7 +1964,7 @@ iteration 24 and has been the measured configuration ever since.
 
 Measured after the flip, same binary both arms, identical stdout hashes:
 
-| capture | default | `CUDAPIPE_NO_TEXTURE_CACHE=1` |
+| capture | default | `CUDAVK_NO_TEXTURE_CACHE=1` |
 |---|---:|---:|
 | old | **15.8194 / 15.7279 ms** | 21.9152 / 21.9127 ms |
 | Crossroads | **5.8737 / 5.8801 ms** | 7.1203 ms |
@@ -1976,6 +1976,6 @@ sentinels are 9 of 9 byte-identical to the frozen iteration-24 reference; the
 old capture's sentinels are inside its documented run-to-run class (5 of 10
 identical, worst mean 0.000067, max 7 of 255).
 
-The gates that used to set `CUDAPIPE_TEXTURE_CACHE=1` now clear
-`CUDAPIPE_NO_TEXTURE_CACHE` instead, so they still test the hardware path
+The gates that used to set `CUDAVK_TEXTURE_CACHE=1` now clear
+`CUDAVK_NO_TEXTURE_CACHE` instead, so they still test the hardware path
 deliberately rather than by inheriting an ambient variable.

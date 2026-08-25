@@ -222,7 +222,7 @@ option(
   'cudavk',
   type : 'boolean',
   value : false,
-  description : 'Build the CUDA Vulkan driver (src/cudapipe). Needs a CUDA ' +
+  description : 'Build the CUDA Vulkan driver (src/cudavk). Needs a CUDA ' +
                 'toolkit and an NVIDIA GPU. Off by default, and deliberately ' +
                 'not part of vulkan-drivers=auto/all: nothing should acquire ' +
                 'it without asking. Fork-local, which is also why it is a ' +

@@ -19,7 +19,7 @@ captures to completion. The final validated native DSO has SHA-256
 
 ### Boundary and source layout
 
-`src/cudapipe/` is the native ICD and the Gallium-free renderer/backend shared
+`src/cudavk/` is the native ICD and the Gallium-free renderer/backend shared
 with the existing adapter. `src/gallium/drivers/cudapipe/` is deliberately
 untouched: it is byte-identical to branch point `e2e966953d7`. Do not make a
 native fix by editing that directory.
@@ -37,7 +37,7 @@ The important files are:
 | `cp_renderer.[ch]` | shared draw renderer: batching, clipping, rasterization, A-buffer/peel paths, pass episodes, arenas and shader launches |
 | `cp_kernels.[ch]`, `kernels/` | NVRTC compilation, persistent source/options-keyed PTX caching and CUDA kernels, including the lazy 3D sampler variant |
 | `nir_to_ptx/` | the shared NIR→LLVM/NVPTX backend and loaded shader binaries |
-| `tests/cpvk_*.c` | 39 small native differential/regression programs, including descriptor semantics, per-stage push constants, static viewport/scissor, synchronization state, asynchronous query availability, recorded-object lifetime, secondary descriptor ownership, headless WSI and concurrent-device A-buffer stress; they are a Meson suite (`meson test -C build-cudapipe --suite cudapipe-native`) that runs against the generated development ICD |
+| `tests/cpvk_*.c` | 39 small native differential/regression programs, including descriptor semantics, per-stage push constants, static viewport/scissor, synchronization state, asynchronous query availability, recorded-object lifetime, secondary descriptor ownership, headless WSI and concurrent-device A-buffer stress; they are a Meson suite (`meson test -C build-cudapipe --suite cudavk`) that runs against the generated development ICD |
 
 The native `cpvk_device` owns one CUDA context, one `cp_device` containing the
 kernel modules, and one `cp_context` renderer with its ordered graphics/compute
@@ -304,10 +304,10 @@ From `/home/alexzhukov/mesa`:
 
 ```bash
 export PATH="$PWD/venv/bin:$PATH"
-ninja -C build-cudapipe src/cudapipe/libvulkan_cudapipe_native.so
+ninja -C build-cudapipe src/cudavk/libvulkan_cudavk.so
 
 export LD_LIBRARY_PATH="$HOME/vulkan-sdk/1.4.357.1/x86_64/lib"
-export VK_DRIVER_FILES="$PWD/build-cudapipe/src/cudapipe/cudapipe_native_devenv_icd.x86_64.json"
+export VK_DRIVER_FILES="$PWD/build-cudapipe/src/cudavk/cudavk_devenv_icd.x86_64.json"
 ```
 
 The Gallium comparison ICD is:
@@ -332,7 +332,7 @@ src/gallium/drivers/cudapipe/tests/cp_perf_run.sh \
 Use `BENCH=1` for performance and inspect `_bench.csv`/`wall_s`; omit it to
 write correctness frames. The current standalone native test executables were
 built under `/tmp/cpvk-tests`, which is only a session artifact. Their sources
-are in `src/cudapipe/tests`; integrating reproducible build/run rules is an
+are in `src/cudavk/tests`; integrating reproducible build/run rules is an
 explicit next step.
 
 ## Exact validated state
@@ -346,8 +346,8 @@ unchanged.
 
 ### Standalone and sample gates
 
-- 43/43 tests in the `cudapipe-native` Meson suite pass:
-  `meson test -C build-cudapipe --suite cudapipe-native`. They cover descriptor
+- 43/43 tests in the `cudavk` Meson suite pass:
+  `meson test -C build-cudapipe --suite cudavk`. They cover descriptor
   semantics (sparse bindings, copies, immutable samplers, graphics/compute
   independence), per-stage push constants, static viewport/scissor,
   asynchronous query availability, negative synchronization state,
@@ -379,7 +379,7 @@ unchanged.
   independently tested corrected `texture3d` result matches NVIDIA; Gallium's
   one-slice filtering is knowingly wrong.
 - The six batch reproducers are byte-identical in default, no-batch,
-  `CUDAPIPE_BATCH_MAX=1`, no-pass and forced-fallback modes:
+  `CUDAVK_BATCH_MAX=1`, no-pass and forced-fallback modes:
   `e2ced6cb150b67d3`, `cab20de2d74b1bb3`, `7f57f68ea59ac0de`,
   `baff13435350b962`, `3dca5ecba53a70ee`, `7f57f68ea59ac0de`.
 - The 600-frame BENCH sweep sums to **29.79 ms** hot means and **41.51 s**
@@ -417,7 +417,7 @@ so nothing about the Gallium driver constrains this one.
 
 The specialiser bakes one sampler state into a variant kernel with `#define`s,
 recognising sampler handles by an exact NIR shape. That fails silently: images
-stay correct and a frame simply gets slower. `CUDAPIPE_SPEC_STATS` reports
+stay correct and a frame simply gets slower. `CUDAVK_SPEC_STATS` reports
 launches specialised, shaders seen, unmatched handles and — when a handle is
 rejected — the reason.
 
@@ -461,7 +461,7 @@ op at a time anyway, with a pairwise merge test against `dev->prev_draw` and a
 `cp_pass_finish()` call wherever an episode might have closed. The data is
 Vulkan-shaped; the decision-making is still Gallium-shaped.
 
-`CUDAPIPE_PLAN_STATS` measures what that costs. Crossroads, 1,496 frames:
+`CUDAVK_PLAN_STATS` measures what that costs. Crossroads, 1,496 frames:
 
 | | total | per frame |
 |---|---:|---:|
@@ -517,7 +517,7 @@ What the corrected measurements support:
   merge decisions with counters byte-identical to the dynamic walk. A buffer
   submitted N times pays for its partition once, and the partition exists as
   data before execution — the precondition for a CUDA-graph-shaped backend.
-- **Batch breaks, attributed** (`CUDAPIPE_PLAN_STATS` tallies the failing key
+- **Batch breaks, attributed** (`CUDAVK_PLAN_STATS` tallies the failing key
   component): on the old capture, fragment shader 143,962, vertex shader
   72,146, index buffer 44,626, rasterizer 1,764. Push constants are absent
   because their contents merge by default (`CPVK_KEEP_PUSHKEY` is the revert
@@ -627,7 +627,7 @@ newest last:
 - `49e641edd7f` — the native tests as a Meson suite, plus the four new tests
   and the two corrected ones;
 - `875bdcff994` — `buffer.length()`, which crashed the process before;
-- `5acc6e60e2e` — `CUDAPIPE_SPEC_STATS`, and the native driver's own
+- `5acc6e60e2e` — `CUDAVK_SPEC_STATS`, and the native driver's own
   `FLAGS.md` generator, since the existing one checked the Gallium registry;
 - `abb23e1a5e6` — descriptor-array and sampler-array tests, and the three
   array-dynamic-indexing feature bits they showed were implemented but
@@ -866,16 +866,16 @@ continue staging explicit paths rather than using `git add -A`.
   ownership arbitration around process-global pointers.
 - `apiVersion`, extension bits and feature bits are promises, not ways to ask
   applications what they happen to use.
-- Native NVTX is conditional at compile time. `src/cudapipe/meson.build` must
+- Native NVTX is conditional at compile time. `src/cudavk/meson.build` must
   define `CP_HAVE_NVTX` when `nvtx3/nvToolsExt.h` is available or profiling
   silently loses all stage ranges.
 - Differential Vulkan tests must themselves be portable. Use optimal-tiled 3D
   images with staging; NVIDIA is allowed to reject linear-tiled 3D images.
 - Keep the shared debug registry authoritative. Presence flags and value flags
-  differ, and `CUDAPIPE_DEBUG_DRAW=0` is still *on* when the flag is a presence
-  flag. Use `CUDAPIPE_HELP=1` rather than guessing.
+  differ, and `CUDAVK_DEBUG_DRAW=0` is still *on* when the flag is a presence
+  flag. Use `CUDAVK_HELP=1` rather than guessing.
 
-Do not retry these without new evidence: global `CUDAPIPE_NO_REGCAP=1`, API
+Do not retry these without new evidence: global `CUDAVK_NO_REGCAP=1`, API
 1.3 by version edit, serial/one-block clipping, a generic sampler wrapper that
 contains both 2D and 3D paths, host-side frame-path blits/resolves, broad
 pass-episode changes, refusing a pipeline whose stencil state is unimplemented,
@@ -922,7 +922,7 @@ In order:
    0 of 4 launches even with register tuning forced, while `texture` with one
    descriptor specialises and `gltfscenerendering` with two now does. Its
    sampler indices read back as zero for both bindings under
-   `CUDAPIPE_DEBUG_TEX`, which is what a failed host mapping of the descriptor
+   `CUDAVK_DEBUG_TEX`, which is what a failed host mapping of the descriptor
    row looks like, so the suspicion is `cp_host_ptr` over an arena this test's
    four descriptor sets land in. Until it is understood, that test guards the
    fallback rather than the specialised path.
@@ -992,7 +992,7 @@ written. Both price at zero:
 
 - **Pass-wide draw reordering.** With the whole render pass visible, opaque
   draws could be regrouped by shader, since opaque visibility resolves by
-  `atomicMin` and is order-free. Measured with `CUDAPIPE_DEBUG_PASSSEQ` over
+  `atomicMin` and is order-free. Measured with `CUDAVK_DEBUG_PASSSEQ` over
   both replays: opaque geometry groups today (consecutive equal `(vs, fs)`)
   versus if freely reordered (distinct `(vs, fs)`) are **6,027 vs 6,027** on
   Crossroads and **32,387 vs 32,387** on the old capture. Exactly equal, in
@@ -1040,7 +1040,7 @@ is the one the tiling prototype lost.
 
 ## Shape
 
-`src/cudapipe/` — a Vulkan driver on `src/vulkan/runtime`, the nvk/radv/turnip
+`src/cudavk/` — a Vulkan driver on `src/vulkan/runtime`, the nvk/radv/turnip
 shape. Kept:
 
 - `spirv_to_nir` and the whole NIR→PTX backend, unchanged;
@@ -1070,7 +1070,7 @@ before layering behaviour on it — is the whole plan:
 
    That slice also found a real bug in the native driver: `cp_debug_init()` was
    never called, so all 59 environment switches read as their zero value rather
-   than what the environment asked for. `CUDAPIPE_HELP=1` now prints the same
+   than what the environment asked for. `CUDAVK_HELP=1` now prints the same
    table from either ICD.
 
    **Second slice: the draw description.** Measured before touching anything —
@@ -1153,7 +1153,7 @@ before layering behaviour on it — is the whole plan:
    not merge today, so instead it holds an opaque blob the front end fills and
    the batcher only `memcmp`s — the adapter puts CSO structs in, the native
    driver will put a pipeline handle and dynamic state in, and neither changes
-   what merges for the other. `CUDAPIPE_DEBUG_BATCHDIFF` still names the piece
+   what merges for the other. `CUDAVK_DEBUG_BATCHDIFF` still names the piece
    of state that broke a batch, through a field table the front end supplies.
 
    **Tenth slice: a bug the gate could not catch.** The segment snapshot was
@@ -1161,9 +1161,9 @@ before layering behaviour on it — is the whole plan:
    draw path had started reading, so a segment re-executed by
    `cp_pass_fallback` would have gathered with whatever layout was live. No
    sample reaches that path and neither capture's overflow enters it, so
-   `CUDAPIPE_FORCE_PASS_FALLBACK=1` now makes every episode take it: the check
+   `CUDAVK_FORCE_PASS_FALLBACK=1` now makes every episode take it: the check
    is that the forced result equals the *classic* path, and `particlesystem`
-   is bit-identical to `CUDAPIPE_NO_ABUFFER=1`.
+   is bit-identical to `CUDAVK_NO_ABUFFER=1`.
 
    **Eleventh slice: `struct cp_context` contains no Gallium type at all.**
    The framebuffer state, the CSO copies and the element array moved into
@@ -1178,7 +1178,7 @@ before layering behaviour on it — is the whole plan:
    Gallium references in `cp_context.c`: **334 → 267**, all of them now in the
    entry points, the resource and sampler-view paths, and the two
    `PIPE_FORMAT` tables the native driver already replaces.
-2. **Milestone 1 — enumerate.** ✅ done. `src/cudapipe` builds a second ICD;
+2. **Milestone 1 — enumerate.** ✅ done. `src/cudavk` builds a second ICD;
    `tests/cpvk_smoke.c` reports the RTX 5090 as a Vulkan physical device with
    the three memory types session 13 had to negotiate with lavapipe.
    **The split is finished.** `cp_renderer.c` is 6,758 lines and
@@ -1287,7 +1287,7 @@ ICDs coexist, so any frame can be rendered both ways.
 ## Milestone 1, as built
 
 ```
-src/cudapipe/
+src/cudavk/
     meson.build          entrypoints (prefix cpvk), static lib, ICD, devenv json
     cpvk_private.h       instance / physical device / device objects
     cpvk_device.c        instance, enumeration, properties, memory, queues
@@ -1296,7 +1296,7 @@ src/cudapipe/
 ```
 
 ```
-$ VK_DRIVER_FILES=.../cudapipe_native_devenv_icd.x86_64.json cpvk_smoke
+$ VK_DRIVER_FILES=.../cudavk_devenv_icd.x86_64.json cpvk_smoke
 vkEnumeratePhysicalDevices -> 0, count 1
   [0] cudapipe (NVIDIA GeForce RTX 5090)  api 1.0.354  type 2
       3 memory types, 2 heaps, heap0 31.4 GiB
@@ -1328,7 +1328,7 @@ Known gaps at this milestone, recorded rather than discovered later:
 
 ## The end state: shared Mesa back to upstream
 
-The native driver is finished when nothing outside `src/cudapipe/` differs from
+The native driver is finished when nothing outside `src/cudavk/` differs from
 upstream. Measured against `upstream/main` (merge base `0d82e6c4072`), the
 current divergence in shared code is **12 files, 258 insertions** — this is the
 retirement checklist, and every line of it is a thing the native driver owns
@@ -1343,7 +1343,7 @@ instead:
 | `src/gallium/auxiliary/driver_trace/tr_screen.c` (+36) | trace wrappers for the two new screen hooks | gone with the hooks |
 | `src/gallium/auxiliary/target-helpers/sw_helper.h` (+9) | selects the cudapipe gallium driver | gone |
 | `src/gallium/meson.build` (+9), `meson.build`, `meson.options`, `.gitignore` | the gallium driver and target | a `vulkan-drivers` entry for `cudapipe` |
-| `src/gallium/drivers/cudapipe`, `src/gallium/targets/cudapipe` | the driver itself, ~15,500 lines | `src/cudapipe/` |
+| `src/gallium/drivers/cudapipe`, `src/gallium/targets/cudapipe` | the driver itself, ~15,500 lines | `src/cudavk/` |
 
 The `strstr(get_name(), "cudapipe")` in `lvp_execute.c` is worth singling out:
 a driver-name sniff inside a shared frontend, added because Gallium has no way
@@ -1389,7 +1389,7 @@ are built from one tree.
 
 ## Textures: the contract the backend already has
 
-Dumped from the Gallium path (`CUDAPIPE_DUMP_NIR=1` on the `texture` sample),
+Dumped from the Gallium path (`CUDAVK_DUMP_NIR=1` on the `texture` sample),
 because the backend's expectations are not written down anywhere else. The
 fragment shader reaches the sampler like this:
 
@@ -1479,7 +1479,7 @@ a set index this layout maps to a slot nothing filled.
 
 The next step is to dump the compute shader's NIR at that pipeline and read
 which slot it loads, rather than reason about which one it ought to be.
-`CUDAPIPE_DUMP_NIR=1` prints it, but the capture builds many pipelines and the
+`CUDAVK_DUMP_NIR=1` prints it, but the capture builds many pipelines and the
 one that faults has to be identified first -- printing the pipeline pointer
 beside the dispatch would do it.
 
@@ -1603,7 +1603,7 @@ Things that are *not* the cause, each checked rather than assumed:
 
 - **The sampler state.** `texturemipmapgen` creates four samplers and this
   driver translates all four correctly, including the two with `lod 0..10` and
-  the one with `maxAnisotropy 16`. `CUDAPIPE_DEBUG_TEX` prints them.
+  the one with `maxAnisotropy 16`. `CUDAVK_DEBUG_TEX` prints them.
 - **The mip filter.** Box average and point sample give identical results, so
   the filter cannot be what differs.
 - **sRGB.** The format is UNORM.
@@ -1649,7 +1649,7 @@ the skybox behind them is pixel-perfect. That is what the "horizontal band"
 was.
 
 The draws happen -- ten of them, 4,512 triangles each, with the right
-framebuffer, viewport and vertex elements -- and `CUDAPIPE_DEBUG_WORK` reports
+framebuffer, viewport and vertex elements -- and `CUDAVK_DEBUG_WORK` reports
 `shaded=0` for every one. No fragment survives, so the triangles have no
 coverage: the vertices are wrong, not the shading.
 
@@ -1690,7 +1690,7 @@ Excluded by disabling or by reading the actual values, not by argument:
 
 So a correct matrix and correct vertex bindings still produce no coverage. What
 has not been looked at is the vertex shader's output itself. The renderer will
-print it -- `CUDAPIPE_DEBUG_FS` dumps the first vertices -- but that path
+print it -- `CUDAVK_DEBUG_FS` dumps the first vertices -- but that path
 allocates per-pixel buffers for a 1280x720 frame and segfaults on this sample
 before reaching the sphere draws, so it needs a smaller window or a cap before
 it can answer this.
@@ -1700,7 +1700,7 @@ than to the driver.
 
 ### The debug path still dies, and a new gap found on the way
 
-`CUDAPIPE_DEBUG_FS` allocated four buffers scaled by a full frame's pixel
+`CUDAVK_DEBUG_FS` allocated four buffers scaled by a full frame's pixel
 count. They are bounded to 4,096 pixels now, which is more than the eight lines
 it prints and removes an allocation of tens of megabytes per draw. **It did not
 fix the crash**: pbribl still segfaults under that flag and runs fine without
@@ -1840,7 +1840,7 @@ next turns should go.
 
 ## The replay-time gap is draw batching, and nothing else
 
-Measured rather than argued, with the Gallium driver's own `CUDAPIPE_NO_BATCH`
+Measured rather than argued, with the Gallium driver's own `CUDAVK_NO_BATCH`
 switch as the control:
 
     capture       gallium   gallium      native
@@ -1871,7 +1871,7 @@ back. `cp_draw_vbo` in the Gallium adapter is the worked example.
 which it must, because a flush renders what is held back and reads the context
 to do it. But `cpvk_build_batch_key` reads the context for the shaders, the
 vertex elements and the binding counts, so it compares each draw's key against
-a key built from its predecessor. `CUDAPIPE_DEBUG_BATCHDIFF` says it in one
+a key built from its predecessor. `CUDAVK_DEBUG_BATCHDIFF` says it in one
 line: **the first differing byte is always +0**, which is `cp_batch_key::vs`.
 
 That is why batches are one or two draws long and why the state-based key
@@ -1893,7 +1893,7 @@ reverted. What exactly is not yet known.
 
 With the batch decision made by comparing the draws themselves --
 `cpvk_draws_mergeable`, which touches no driver state and so is safe to run
-before the incoming draw is staged -- `CUDAPIPE_DEBUG_BATCHDIFF` names the
+before the incoming draw is staged -- `CUDAVK_DEBUG_BATCHDIFF` names the
 field that breaks every batch in gltfscenerendering:
 
     batchdiff: vertex shader
@@ -1944,7 +1944,7 @@ is the difference between 27.88 ms and 7.13.
 
 ### The per-draw rows are fine; something else breaks the merged frame
 
-`CUDAPIPE_DEBUG_DRAW` prints the batch's vertex-stage rows at flush, and with
+`CUDAVK_DEBUG_DRAW` prints the batch's vertex-stage rows at flush, and with
 the descriptor comparison removed gltfscenerendering merges nine draws whose
 rows are genuinely distinct:
 
@@ -1974,7 +1974,7 @@ it is correct, and it costs the merges the capture would want.
 
 ### Both binding tables are correct, and the merge is still wrong
 
-`CUDAPIPE_DEBUG_DRAW` now prints the fragment rows beside the vertex ones at
+`CUDAVK_DEBUG_DRAW` now prints the fragment rows beside the vertex ones at
 flush. On gltfscenerendering's nine-draw batch both are per-draw and identical
 to each other, which is right for this driver -- both stages read the same
 descriptor sets:
@@ -1988,9 +1988,9 @@ So the tables the shaders index are filled correctly for both stages.
 
 Also excluded, each with one run of an existing flag:
 
-- the sampler-variant specialisation (`CUDAPIPE_NO_SAMPLER_VARIANT=1`): 20.768
+- the sampler-variant specialisation (`CUDAVK_NO_SAMPLER_VARIANT=1`): 20.768
   either way
-- the A-buffer (`CUDAPIPE_NO_ABUFFER=1`): 20.768 either way
+- the A-buffer (`CUDAVK_NO_ABUFFER=1`): 20.768 either way
 
 That leaves the core batched draw path itself. The next step is to reproduce
 it small: two draws, one pipeline, one vertex buffer, differing only in the
@@ -2036,7 +2036,7 @@ So descriptors merge correctly, uniform buffers and combined image samplers
 alike. The descriptor comparison in the merge test is not buying correctness
 for either case.
 
-What it was buying is smaller batches, and `CUDAPIPE_BATCH_MAX` says exactly
+What it was buying is smaller batches, and `CUDAVK_BATCH_MAX` says exactly
 where the real fault is:
 
     batch_max   1      2      3      4      8      64
@@ -2153,7 +2153,7 @@ have not identified. The honest position is that the descriptor comparison is
 required for a reason not yet understood, that it costs batching all of its
 value on captures, and that the search for it should start by diffing the
 sample's draws against this test's rather than by proposing an eighth
-hypothesis: `CUDAPIPE_DEBUG_DRAW` prints the framebuffer, viewport, vertex
+hypothesis: `CUDAVK_DEBUG_DRAW` prints the framebuffer, viewport, vertex
 elements and blend state of every draw in both, and the difference will be in
 that output.
 
@@ -2170,7 +2170,7 @@ gltfscenerendering's draws I have been able to name:
 All of it is byte-identical to lavapipe **with the descriptor comparison
 off**. The sample is 20.768 without it and 0.000 with it.
 
-What is still different, from `CUDAPIPE_DEBUG_DRAW` on both:
+What is still different, from `CUDAVK_DEBUG_DRAW` on both:
 
     property             cpvk_batchtex     gltfscenerendering
     triangles per draw   1                 796 .. 67,763
@@ -2228,7 +2228,7 @@ them, the state changed between batches, or the frames before.
 
 That is a different search from the one this has been, and a more productive
 one to start fresh than to continue: capture the sample's whole command
-stream with CUDAPIPE_DEBUG_DRAW and CUDAPIPE_DEBUG_BATCH and look at what
+stream with CUDAVK_DEBUG_DRAW and CUDAVK_DEBUG_BATCH and look at what
 happens *around* a batch that renders wrongly, rather than at the batch.
 
 The test that established all this is worth more than the answer would have
@@ -2346,7 +2346,7 @@ now the place to do it.
 
 ### pbribl: the fetch is right, the shader outputs zero
 
-`CUDAPIPE_DEBUG_VFETCH` on a sphere draw:
+`CUDAVK_DEBUG_VFETCH` on a sphere draw:
 
     elem0 vb=0 off=0  stride=96 div=0 sz=12
     elem1 vb=0 off=12 stride=96 div=0 sz=12
@@ -2354,7 +2354,7 @@ now the place to do it.
     vfetch v0: e0=[0.130 0.065 -0.989] e1=[0.130 0.065 -0.989] e2=[0.729 0.521 0.000]
 
 A unit-sphere position, the matching normal, and a uv. The vertex fetch is
-correct, the element layout is correct, and `CUDAPIPE_DEBUG_FS` says every
+correct, the element layout is correct, and `CUDAVK_DEBUG_FS` says every
 vertex *output* is zero. So the shader is producing zeros from good inputs.
 
 Its uniform buffer was already verified correct at the descriptor -- the first
@@ -2429,7 +2429,7 @@ Thirteen of eighteen samples are pixel-correct, and both replays are unmoved:
 
 That warning had been in the log since the driver first ran a capture, and I
 read it several turns earlier and wrote it down as unrelated. What found it was
-fixing `CUDAPIPE_DEBUG_FS` so it could print a vertex output on a real sample,
+fixing `CUDAVK_DEBUG_FS` so it could print a vertex output on a real sample,
 and then reading the NIR it pointed at.
 
 ### What is left
@@ -3190,7 +3190,7 @@ that `cp_batch_record` writes.
 
 ### The descriptor key's necessity, bisected: it breaks at three draws, not two
 
-`CUDAPIPE_BATCH_MAX` turns the long-standing open question into a measurement.
+`CUDAVK_BATCH_MAX` turns the long-standing open question into a measurement.
 `gltfscenerendering` with `CPVK_BATCH=1 CPVK_NO_DESC_KEY=1`, mean absolute
 difference against the reference:
 
@@ -3320,13 +3320,13 @@ has nine draws, not three), row width, binding counts, the row binary search,
 What the sample still has that the test does not is its **data**: per-draw
 vertex offsets, materials that differ in pipeline state, and a draw order the
 test does not reproduce. The next diagnostic is not another hypothesis but
-`CUDAPIPE_DEBUG_BATCHDIFF` run on the sample twice -- once with the key and
+`CUDAVK_DEBUG_BATCHDIFF` run on the sample twice -- once with the key and
 once without -- to see exactly which draws merge when it is removed. The
 answer is in that difference and nowhere else.
 
 ### What the descriptor key is actually preventing, counted
 
-`CUDAPIPE_DEBUG_BATCHDIFF` on `gltfscenerendering` at `BATCH_MAX=3`, the same
+`CUDAVK_DEBUG_BATCHDIFF` on `gltfscenerendering` at `BATCH_MAX=3`, the same
 frame each way:
 
     with the key      20 separations: 10 "the draws differ",
@@ -3750,7 +3750,7 @@ front end that decides which draws share one.
 
 ### The largest merge blocker removed, correctness held, time unchanged
 
-`CUDAPIPE_DEBUG_BATCHDIFF` over 25 seconds of the Crossroads replay -- the
+`CUDAVK_DEBUG_BATCHDIFF` over 25 seconds of the Crossroads replay -- the
 workload itself rather than a sample -- gives 38,155 refusals:
 
     vertex offset    13,281   35%
@@ -3931,13 +3931,13 @@ Nothing on the host explains a neutral reflection from a warm cube. Whatever is
 left is device-side: what the fragment shader computes from a correct sampler,
 a correct texture and a correct level.
 
-`CUDAPIPE_DEBUG_FS` prints fragment values and was repaired earlier in this
+`CUDAVK_DEBUG_FS` prints fragment values and was repaired earlier in this
 session, which makes it the instrument for that -- and this driver's history
 says the next step is to use it rather than to reason further.
 
 ### pbribl at the fragment: the inputs are right and the output is genuinely neutral
 
-`CUDAPIPE_DEBUG_FS` on the sphere draws:
+`CUDAVK_DEBUG_FS` on the sphere draws:
 
     fs_in[0] <- vs slot 1 (loc 32)      inWorldPos
     fs_in[1] <- vs slot 2 (loc 33)      inNormal
@@ -4740,7 +4740,7 @@ binding 2 element *i* is `(flat + i) * CPVK_DESCRIPTOR_SIZE`, which lands on
 
 Two candidates tested and eliminated:
 
-- **Specialisation.** `CUDAPIPE_NO_SAMPLER_VARIANT=1`, which stops the driver
+- **Specialisation.** `CUDAVK_NO_SAMPLER_VARIANT=1`, which stops the driver
   baking sampler state into a compiled variant, leaves the sample at 0.456.
 - **`vulkan_resource_reindex`.** It was not handled at all -- NIR emits it for
   each step through a descriptor array -- and implementing it changes nothing,
@@ -5208,7 +5208,7 @@ come down some other way.
 
 ### The launch gap is per draw, not per batch
 
-`CUDAPIPE_DEBUG_DRAW` over a window of the Crossroads replay: 106729 draws
+`CUDAVK_DEBUG_DRAW` over a window of the Crossroads replay: 106729 draws
 against 49862 batch flushes, 2.14 draws per
 flush. Both drivers replay the same capture and therefore the same draws, so
 757 launches a frame against 245 is a difference in **what each draw costs**,
@@ -5506,7 +5506,7 @@ Reverted.
 
 ### Batch length is limited by merge refusals, not by either cap
 
-    CUDAPIPE_BATCH_MAX   default 128   8.78 ms
+    CUDAVK_BATCH_MAX   default 128   8.78 ms
                          32            9.25
                          8            11.41
 
@@ -5636,7 +5636,7 @@ performance A/B taken after it appeared.
 ### The driver now says which CPVK_ switches are in effect
 
 These are plain `getenv` flags rather than entries in `cp_debug.c`'s registry,
-so `CUDAPIPE_HELP=1` does not know about them and nothing announced them. That
+so `CUDAVK_HELP=1` does not know about them and nothing announced them. That
 cost this session more than any bug in the driver: `CPVK_BATCH` and
 `CPVK_BATCH_BLEND` were left set in the driving shell, every process launched
 from it inherited them, and every performance A/B taken afterwards compared a
@@ -5658,7 +5658,7 @@ rather than silently ignored -- which is exactly the shape the failure took.
 18/18 samples run, 17/18 pixel-correct, fourteen unit tests pass.
 
 The proper fix is to move these into the `cp_debug.c` registry, where
-`CUDAPIPE_HELP=1` and the generated `FLAGS.md` would cover them by
+`CUDAVK_HELP=1` and the generated `FLAGS.md` would cover them by
 construction. That belongs with the rest of the front end's consolidation and
 is written down rather than done here.
 
@@ -5702,7 +5702,7 @@ does not have.
 
 ## The A-buffer was costing more than it saved on both captures
 
-`CUDAPIPE_NO_ABUFFER=1` on the native driver: **6.75 ms against 8.79** on
+`CUDAVK_NO_ABUFFER=1` on the native driver: **6.75 ms against 8.79** on
 Crossroads and **21.89 against 31.12** on the older capture. On the Gallium
 driver the same switch costs 4.5x -- 32.40 against 7.14 -- which is what
 `ABUFFER.md` records and what made the native result worth explaining rather
@@ -5711,7 +5711,7 @@ than believing.
 The explanation is that this front end batches blended draws whether or not the
 A-buffer is on, and the Gallium driver's blended batching is part of the
 A-buffer path. Turn the A-buffer off there and the batching goes with it; turn
-it off here and the peel loop runs on batches. `CUDAPIPE_NO_ABUFFER=1
+it off here and the peel loop runs on batches. `CUDAVK_NO_ABUFFER=1
 CPVK_NO_BATCH_BLEND=1` is 13.25 ms, which is the same statement from the other
 side.
 
@@ -6050,7 +6050,7 @@ followed it.
 
 ### The local memory is real, it matters, and the pass that removes it cannot run here
 
-`CUDAPIPE_DUMP_IR` settles what the PTX only hinted at:
+`CUDAVK_DUMP_IR` settles what the PTX only hinted at:
 
     native   2 x `alloca <3 x i32>`      gallium   none
 
@@ -6654,8 +6654,8 @@ understood.
     computeshader         0.59      0.53         0.52      0.41   1.44/1.30/1.29
 
 Turning episodes off helps three of the four and hurts the fourth, which makes
-it a tuning question rather than a defect -- and `CUDAPIPE_NO_PASS_EPISODE` and
-`CUDAPIPE_NO_OPAQUE_EPISODE` are read by the shared renderer, so the Gallium
+it a tuning question rather than a defect -- and `CUDAVK_NO_PASS_EPISODE` and
+`CUDAVK_NO_OPAQUE_EPISODE` are read by the shared renderer, so the Gallium
 driver runs with the same defaults and is faster anyway. Episodes are not what
 separates them.
 
@@ -6760,7 +6760,7 @@ trace of the same sample it names every stage. Both build the same
 `cp_renderer.c`, which has the same nine `cp_nvtx_push`/`pop` sites in each.
 
 The difference was in the build. `src/gallium/drivers/cudapipe/meson.build`
-defines `-DCP_HAVE_NVTX` when the header is present; `src/cudapipe/meson.build`
+defines `-DCP_HAVE_NVTX` when the header is present; `src/cudavk/meson.build`
 never did, and `cp_nvtx.h` compiles every push and pop to nothing without it.
 So the driver's own answer to "every shader is a CUDA kernel called `main`" was
 absent from the native build, and nobody noticed because absence looks exactly

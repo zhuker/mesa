@@ -25,7 +25,7 @@ work and are the place to start on it:
 - `src/gallium/drivers/cudapipe/TODO_CONFORMANCE.md` — what dEQP says, fixed and
   outstanding. Second priority.
 - `src/gallium/drivers/cudapipe/FLAGS.md` — every environment switch the
-  driver reads, generated from the registry in `cp_debug.c`. `CUDAPIPE_HELP=1`
+  driver reads, generated from the registry in `cp_debug.c`. `CUDAVK_HELP=1`
   prints the same table from a running driver.
 
 `tests/GFXRECONSTRUCT.md` is how to capture and replay in the first place,
@@ -363,7 +363,7 @@ reaches the batch key at all.
 
 The peel loop is still there, still correct, and still what runs for any blended
 draw the A-buffer refuses — multisample, depth-writing, more than one colour
-attachment. `CUDAPIPE_NO_ABUFFER=1` puts everything back on it. Its structure is
+attachment. `CUDAVK_NO_ABUFFER=1` puts everything back on it. Its structure is
 worth understanding before touching the blend path: about 260 passes a frame,
 each re-rasterizing and re-shading the whole draw, with `emit_fragment()` called
 960 million times to composite 2.28M fragments.
@@ -487,7 +487,7 @@ same half-open box test rather than with edge functions. A point under
 straight to stage 3 and gets a block per tile, because `CP_POINT_THRESHOLD`
 defaults to the small threshold — a sprite is all bounding box, so the one-warp
 middle path stage 2 offers a triangle is the worst of both for it. Raising
-`CUDAPIPE_POINT_THRESHOLD` puts the middle path back. Every input takes the vertex's own
+`CUDAVK_POINT_THRESHOLD` puts the middle path back. Every input takes the vertex's own
 value, since there is nothing to interpolate between. `gl_PointCoord` is the
 one thing that varies and no vertex shader output drives it, so the
 interpolator writes it from the pixel's position inside the square; helper
@@ -519,7 +519,7 @@ draws that do not overlap themselves.
 
 **This is no longer the default path — see `ABUFFER.md`.** An eligible blended
 draw is rasterized once into per-pixel fragment lists sorted by submission
-index, shaded once and composited once; `CUDAPIPE_NO_ABUFFER=1` puts it back on
+index, shaded once and composited once; `CUDAVK_NO_ABUFFER=1` puts it back on
 the loop above, and draws the A-buffer refuses still take it.
 
 Two things this paragraph used to say are wrong, both measured while building
@@ -657,7 +657,7 @@ smooth.
    is free to contract the products into FMAs differently. The visibility
    buffer resolves by `atomicMin`, so a one-ulp difference flips a tie and a
    different triangle wins the pixel. Moving triangles across the stage 2/3
-   boundary — by lowering `CUDAPIPE_MEDIUM_THRESHOLD` — changes two pixels of
+   boundary — by lowering `CUDAVK_MEDIUM_THRESHOLD` — changes two pixels of
    `gltfscenerendering` for this reason. It is why `CP_POINT_THRESHOLD` is a
    separate constant rather than the medium threshold simply being lowered, and
    any change to the size thresholds or to Phase 3's tiling will keep meeting
@@ -695,7 +695,7 @@ smooth.
    were rare. Merging draws that replay different index ranges made it
    reachable: `bloom` was bit-identical against itself over 60 frames and now
    differs on 4 of them at 1–2 pixels, `vulkanscene` 1/60 → 5/60, appearing at
-   `CUDAPIPE_BATCH_MAX=8` and not at 2. A stable compaction is the fix and it is
+   `CUDAVK_BATCH_MAX=8` and not at 2. A stable compaction is the fix and it is
    worth its own pass; narrowing what merges would only hide it again. Gap 16
    is the same defect seen from the other side.
 16. **Batched draws break a depth tie the other way.** With `LEQUAL` and
@@ -705,7 +705,7 @@ smooth.
    absent: the clipper compacts its output with `atomicAdd`, so triangle order
    is already nondeterministic *within* a draw and the tie was never exact. It
    is still a real difference in what the driver computes, and the first place
-   to look if a depth-fighting artefact appears. `CUDAPIPE_NO_BATCH=1`
+   to look if a depth-fighting artefact appears. `CUDAVK_NO_BATCH=1`
    distinguishes it from anything else in one run.
 
 17. **Vertex attribute divisors above one are unreachable, not implemented.**
@@ -738,7 +738,7 @@ backend, so it became `undef`, so a surface shader's tangent frame was flipped
 by an undefined sign, so every lit surface in a real application lost its direct
 lighting. The frames looked plausible — dim, faintly green — and finding it took
 bisecting one frame to a single draw and dumping every descriptor of it from two
-drivers. `CUDAPIPE_DEBUG_SHADER=1` had been printing
+drivers. `CUDAVK_DEBUG_SHADER=1` had been printing
 `unhandled intrinsic 'load_front_face'` the whole time, behind a variable nobody
 sets until they already suspect the shader.
 
@@ -942,13 +942,13 @@ retried.
 The driver's environment switches are declared in one array in
 `cp_debug.c`, and [`src/gallium/drivers/cudapipe/FLAGS.md`](src/gallium/drivers/cudapipe/FLAGS.md)
 is generated from it — all 43, with each one's type, default and meaning.
-`CUDAPIPE_HELP=1` in front of any Vulkan app prints the same table from the
+`CUDAVK_HELP=1` in front of any Vulkan app prints the same table from the
 running driver, with the value each variable resolved to in that process,
 which is the form to reach for when the question is what a run was actually
 configured to do.
 
 The table that used to be here is gone. It listed the subset somebody
-remembered to write down, it had drifted (it gave `CUDAPIPE_ABUFFER_TIMING=0`
+remembered to write down, it had drifted (it gave `CUDAVK_ABUFFER_TIMING=0`
 as if the timing defaulted on, when it defaults off), and it outlived at least
 one variable it documented. That is what hand-maintained tables do, and it is
 why the generated one replaced it.
@@ -957,7 +957,7 @@ why the generated one replaced it.
 
 Add an entry to `flags[]` in `cp_debug.c` and a field to `struct cp_debug` in
 `cp_debug.h`, then read it as `cp_debug->field`. **Do not call `getenv` in the
-driver**; the registry is what makes `FLAGS.md` and `CUDAPIPE_HELP` correct by
+driver**; the registry is what makes `FLAGS.md` and `CUDAVK_HELP` correct by
 construction, and a read somewhere else is invisible to both.
 
 The field name is the variable name minus `CUDAPIPE_`, lowercased, with no
@@ -988,7 +988,7 @@ src/gallium/drivers/cudapipe/tests/cp_debug_doc.py --check   # fails if stale
 A flag that stops working is invisible, because these are off in every normal
 run and nothing tests them. When changing how one is read, run something with
 it actually set, before and after, and diff the output — that is the only real
-verification available. Note that `CUDAPIPE_DEBUG_FS` cannot be diffed that
+verification available. Note that `CUDAVK_DEBUG_FS` cannot be diffed that
 way: it dumps the shaded-pixel list in GPU scheduling order and hashes
 differently on every run of any build. Check its contract instead — the line
 caps, and that every line is on the requested row.
@@ -1055,6 +1055,6 @@ caps, and that every line is on the requested row.
   this one did not, until a batch cap of one was tried deliberately. The same
   holds for `reads_const_bufs`, which is sound only while
   `emit_const_buf_base()` remains the only reader of `args[18..]`.
-  `CUDAPIPE_BATCH_MAX=1` must stay bit-identical to `CUDAPIPE_NO_BATCH=1`; that
+  `CUDAVK_BATCH_MAX=1` must stay bit-identical to `CUDAVK_NO_BATCH=1`; that
   check separates "deferral is sound" from "merging is sound", which fail
   differently.

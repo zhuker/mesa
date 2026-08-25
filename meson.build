@@ -314,11 +314,11 @@ with_nouveau_vk = _vulkan_drivers.contains('nouveau')
 with_asahi_vk = _vulkan_drivers.contains('asahi')
 with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
 with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
-# The CUDA Vulkan driver (src/cudapipe). Its own option rather than an entry in
+# The CUDA Vulkan driver (src/cudavk). Its own option rather than an entry in
 # vulkan-drivers: it is fork-local, it needs a CUDA toolkit and an NVIDIA GPU to
 # build, and nothing should acquire it from 'auto' or 'all'. It is independent
 # of Gallium; the Gallium-hosted cudapipe driver it grew out of was removed,
-# see CUDAPIPE_GALLIUM_RETIREMENT.md.
+# see CUDAVK_GALLIUM_RETIREMENT.md.
 with_cudavk = get_option('cudavk')
 # It is a Vulkan driver, so it needs Mesa's common Vulkan runtime built even
 # when no driver from the shared vulkan-drivers list was asked for.

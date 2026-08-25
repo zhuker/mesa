@@ -134,7 +134,7 @@ endif
 # common Vulkan runtime, NIR and util -- so it is selected on its own with
 # -Dvulkan-drivers=cudavk and no longer rides on the Gallium driver's option.
 if with_cudavk
-  subdir('cudapipe')
+  subdir('cudavk')
 endif
 # These require libgallium (shared_glapi_lib)
 if with_gallium and (with_glx != 'disabled' or with_egl)

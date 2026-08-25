@@ -35,7 +35,7 @@ OLD=$HOME/headless_streamer_20260814T155742.gfxr
 CROSSROADS=$HOME/headless_streamer_1818_20260817T173522.gfxr
 
 CP_ICD=$MESA/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv_icd.x86_64.json
-CP_NATIVE_ICD=$MESA/build-cudapipe/src/cudapipe/cudapipe_native_devenv_icd.x86_64.json
+CP_NATIVE_ICD=$MESA/build-cudapipe/src/cudavk/cudavk_devenv_icd.x86_64.json
 LVP_ICD=$MESA/build-lvp-release/src/gallium/targets/lavapipe/lvp_devenv_icd.x86_64.json
 NVIDIA_ICD=/usr/share/vulkan/icd.d/nvidia_icd.json
 ```
@@ -99,7 +99,7 @@ starting a validation pass.
 `.cu` file changes the translation unit that every other kernel in that module
 is compiled in, so inlining and floating-point contraction can move in code
 that was not edited. That is precisely the failure behind the watertight
-coverage work in `CUDAPIPE_HANDOFF.md`: contraction broke the edge function's
+coverage work in `CUDAVK_HANDOFF.md`: contraction broke the edge function's
 antisymmetry and cracked a shared edge for its whole length. "Default off" is
 an argument about the new path, not about the old one.
 
@@ -109,18 +109,18 @@ For a performance flag or experimental path, pass the same environment flag
 to both the timing and image replays. For example:
 
 ```bash
-export CUDAPIPE_TILE_BOUND=1
+export CUDAVK_TILE_BOUND=1
 ```
 
 Unset it before producing the flag-off control:
 
 ```bash
-unset CUDAPIPE_TILE_BOUND
+unset CUDAVK_TILE_BOUND
 ```
 
 Do not use `FLAG=0` as a generic way to turn an experiment off. Cudapipe has
 both presence booleans, where `=0` is still **on**, and value booleans. Check
-`CUDAPIPE_HELP=1` or `FLAGS.md` and use `unset` for the control.
+`CUDAVK_HELP=1` or `FLAGS.md` and use `unset` for the control.
 
 Three runs are needed, not two:
 
@@ -269,7 +269,7 @@ NVIDIA replay generated from that same plan remains the acceptance reference.
 Prefer separate git worktrees and build directories so both binaries continue
 to exist and can be alternated. For a dirty tree, save `git status --short`,
 `git diff --binary`, the built library's SHA-256, and all resolved Cudapipe
-flags (`CUDAPIPE_HELP=1`); a commit hash alone does not identify that binary.
+flags (`CUDAVK_HELP=1`); a commit hash alone does not identify that binary.
 
 Run the pair in the same sitting, one GPU job at a time. Do not reuse a baseline
 from a differently versioned GFXReconstruct replay or a machine state that is
@@ -296,7 +296,7 @@ Environment variables are inherited by `cp_gfxr_frames.py replay`. Therefore,
 when testing an opt-in path, prefix or export the flag only for the candidate:
 
 ```bash
-CUDAPIPE_TILE_BOUND=1 \
+CUDAVK_TILE_BOUND=1 \
   $TESTS/cp_gfxr_frames.py replay "$CROSSROADS" \
   /tmp/cp-validation/crossroads/sentinels.json \
   --icd "$CP_ICD" --out /tmp/cp-validation/crossroads/cp-tile-bound \
@@ -503,7 +503,7 @@ DESC="describe the exact candidate and expected effect" \
 For an opt-in path:
 
 ```bash
-CUDAPIPE_TILE_BOUND=1 FRAMES=60 BENCH_FRAMES=600 \
+CUDAVK_TILE_BOUND=1 FRAMES=60 BENCH_FRAMES=600 \
 DESC="tile-bound path correctness and performance" \
   $TESTS/cp_iterate.sh tile-bound-candidate previous-label
 ```
@@ -624,7 +624,7 @@ Triage the first divergence rather than relaxing a threshold:
 4. Inspect the **first** CUDA/NVRTC error. CUDA context faults are sticky, so
    later launch, copy, and teardown failures are usually consequences.
 5. If needed, disable one registered subsystem at a time and save
-   `CUDAPIPE_HELP=1` output for each run. A bisect result without the resolved
+   `CUDAVK_HELP=1` output for each run. A bisect result without the resolved
    flags is not reproducible.
 6. For suspected out-of-bounds, use-after-free, uninitialized-device-memory, or
    synchronization faults, reduce to the smallest sample/replay and run CUDA's
