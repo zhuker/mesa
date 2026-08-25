@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-116 switches.
+117 switches.
 
 ## Tracing
 
@@ -66,6 +66,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_VFETCH_DECLINE_NTH` | uint | `0` | — | fault injection: refuse the fused execution for the Nth vertex shader compiled, or for every one at 4294967295, after building it either way |
 | `CUDAVK_VFETCH_SKIP_SEED` | bool (value) | `off` | — | fault injection: a fused draw does not seed the clip and raster counters, and the host still skips their clears -- the negative control for the seeding moving into the fused vertex shader |
 | `CUDAVK_NO_OPAQUE_EPISODE` | bool (value) | `off` | — | disable consecutive opaque-run visibility deferral |
+| `CUDAVK_OPAQUE_STREAMS` | bool (value) | `off` | — | fan an opaque episode's segments over the pass side streams, the way a blended episode's already are, instead of issuing them back to back on the main stream |
 | `CUDAVK_NO_SAMPLER_VARIANT` | bool (value) | `off` | — | disable literal-state fragment sampler variants |
 | `CUDAVK_NO_TEXTURE_CACHE` | bool (value) | `off` | — | disable direct CUDA hardware-texture fragment execution; fall back to software sampling |
 | `CUDAVK_TEXTURE_CACHE_FAIL_TABLE_UPLOAD_AT` | uint | `0` | — | fault injection: fail the Nth hardware texture table upload enqueue |

@@ -213,6 +213,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_OPAQUE_EPISODE", CP_FLAG_BOOL_VALUE,
      F(no_opaque_episode),
      "disable consecutive opaque-run visibility deferral" },
+   { "CUDAVK_OPAQUE_STREAMS", CP_FLAG_BOOL_VALUE, F(opaque_streams),
+     "fan an opaque episode's segments over the pass side streams, the way a "
+     "blended episode's already are, instead of issuing them back to back on "
+     "the main stream" },
    { "CUDAVK_NO_SAMPLER_VARIANT", CP_FLAG_BOOL_VALUE,
      F(no_sampler_variant),
      "disable literal-state fragment sampler variants" },

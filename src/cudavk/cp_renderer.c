@@ -6997,6 +6997,8 @@ cp_batch_record_packet(struct cp_context *cp,
  * vertex-shader, fragment-shader and vertex-elements binds.
  */
 
+static void cp_pass_streams_init(struct cp_context *cp);
+
 static bool
 cp_pass_appendable(struct cp_context *cp,
                    const struct cp_draw_batch *batch)
@@ -7046,8 +7048,22 @@ cp_pass_appendable(struct cp_context *cp,
          return false;
    }
 
-   /* The side streams and their queue sets, once. Failure leaves every
-    * seg_streams[] entry null and the episode runs on the main stream. */
+   cp_pass_streams_init(cp);
+   return true;
+}
+
+/*
+ * The side streams and their queue sets, once. Failure leaves every
+ * seg_streams[] entry null and the episode runs on the main stream.
+ *
+ * Factored out of cp_pass_appendable() because an opaque episode under
+ * CUDAVK_OPAQUE_STREAMS wants exactly the same eight streams, the same eight
+ * rasterizer queue sets and the same gate event, and it never goes through the
+ * blended admission test that used to be the only place they were built.
+ */
+static void
+cp_pass_streams_init(struct cp_context *cp)
+{
    if (!cp->pass_streams_ready) {
       cp->pass_streams_ready = true;
       bool ok = cuEventCreate(&cp->pass_gate,
@@ -7083,7 +7099,17 @@ cp_pass_appendable(struct cp_context *cp,
          memset(cp->seg_streams, 0, sizeof(cp->seg_streams));
       }
    }
-   return true;
+}
+
+/*
+ * Whether this opaque episode fans its segments out. Off by default: with the
+ * flag clear every predicate below reduces to what it was and the driver
+ * issues exactly the launches it issued before.
+ */
+static bool
+cp_opaque_side_streams(const struct cp_context *cp)
+{
+   return cp_debug->opaque_streams && cp->seg_streams[0];
 }
 
 static bool
@@ -7115,6 +7141,10 @@ cp_opaque_appendable(struct cp_context *cp,
       if (!cp->pass_segs)
          return false;
    }
+   /* An opaque episode that is going to fan out needs the same eight streams
+    * a blended one uses, and blended admission may never have run. */
+   if (cp_debug->opaque_streams)
+      cp_pass_streams_init(cp);
    return true;
 }
 
@@ -7368,6 +7398,12 @@ cp_opaque_finish(struct cp_context *cp)
    cp->pass.nsegs = 0;
    cp->pass.next_prim = 0;
    cp->pass.opaque = false;
+
+   /* The segments rasterized visibility on the side streams; everything below
+    * — the tile pass, the census and the shading — reads across all of them.
+    * An unjoined side stream is not a slow episode, it is an unordered one. */
+   if (cp_opaque_side_streams(cp) && !cp_pass_join(cp, nsegs))
+      return;
 
    if (cp_debug->tiled_opaque &&
        !cp_opaque_tile_visibility(cp, segs, nsegs, w, h)) {
@@ -8782,6 +8818,8 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
       cp_pass_finish(cp);
    }
 
+   bool side = cp_opaque_side_streams(cp);
+
    if (!cp->pass.nsegs) {
       const struct cp_fb_desc *fb = &cp->batch.scope.fb;
       cp->pass.opaque = true;
@@ -8791,19 +8829,70 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
       cuMemsetD32Async(cp->visbuf, 0xFFFFFFFF,
                        (size_t)fb->width * fb->height * 2,
                        cp->stream);
+      if (side) {
+         /*
+          * Two device operations the segments read and neither of them owns.
+          *
+          * The visibility clear above is one. The depth clear is the other,
+          * and it is the one a fan-out breaks: cp_draw_execute_batch() issues
+          * it lazily at the first segment that finds cp->depthbuf_cleared
+          * false, which with side streams means on that segment's stream,
+          * while every other segment reads cp->depthbuf for its depth test on
+          * a stream that has not waited for it. Issuing it here puts it on the
+          * main stream behind the gate, and the latch makes the lazy call a
+          * no-op for every segment.
+          */
+         if (!cp->depthbuf_cleared)
+            cp_clear_depthbuf(cp, 1.0f);
+         /* The gate every segment stream waits on. */
+         if (cp_upload_flush(cp) != CUDA_SUCCESS ||
+             cuEventRecord(cp->pass_gate, cp->stream) != CUDA_SUCCESS) {
+            cp_renderer_texture_fatal(cp);
+            return;
+         }
+      }
    }
 
    unsigned before = cp->pass.nsegs;
+   CUstream saved_stream = cp->stream;
+   struct cp_queue_set saved_qset = cp->cur_qset;
+   if (side) {
+      unsigned k = cp->pass.nsegs % CP_PASS_STREAMS;
+      /* The gate is what orders this segment behind the clears above. */
+      if (cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0) !=
+          CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return;
+      }
+      cp_stream_set(cp, cp->seg_streams[k]);
+      cp->cur_qset = cp->seg_qsets[k];
+   }
+
    cp->pass.appending = true;
    cp->pass.append_failed = false;
    cp_draw_execute_batch(cp, &cp->batch);
    cp->pass.appending = false;
+   if (side) {
+      cp_stream_set(cp, saved_stream);
+      cp->cur_qset = saved_qset;
+   }
 
    if (cp->pass.append_failed || cp->pass.nsegs == before) {
       if (cp_debug->debug_episode)
          fprintf(stderr, "episode-cut: append failed=%d nsegs %u->%u\n",
                  (int)cp->pass.append_failed, before, cp->pass.nsegs);
+      /* A failed append may have run vertex work on its side stream before
+       * backing out; when it was the would-be first segment, cp_pass_finish
+       * below returns without joining anything and the flush fence — recorded
+       * on the main stream only — would not cover it. */
+      if (side && !cp_pass_join(cp, CP_PASS_STREAMS))
+         return;
       cp_pass_finish(cp);
+      /* The rollback may have latched device loss; the batch must not be
+       * re-executed onto a poisoned context. Scoped to the fan-out so that
+       * with the flag clear this path is what it was. */
+      if (side && cp->device_fatal)
+         return;
       cp_draw_execute_batch(cp, &cp->batch);
    }
 }
