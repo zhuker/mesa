@@ -8,7 +8,9 @@
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
 #include "vk_util.h"
+#include "util/build_id.h"
 #include "util/disk_cache.h"
+#include "util/mesa-blake3.h"
 #include "util/u_debug.h"
 
 /*
@@ -100,6 +102,63 @@ cpvk_get_features(struct vk_features *features)
        * of these merely because that core version made them mandatory. */
       .dynamicRendering = true,
    };
+}
+
+/*
+ * The three UUIDs, which were all zero until CUDA interop needed them.
+ *
+ * deviceUUID is the load-bearing one: a CUDA consumer that receives an
+ * exported handle has to decide which of its CUDA devices the memory belongs
+ * to, and the documented way is to match VkPhysicalDeviceIDProperties against
+ * cuDeviceGetUuid. Against the proprietary driver that comparison is exact,
+ * which is what makes it usable as an identity test rather than a hint. Note
+ * that this is cuDeviceGetUuid and not cuDeviceGetUuid_v2: the plain form is
+ * the one measured to match, and _v2 only differs under MIG, which this driver
+ * does not enumerate.
+ *
+ * driverUUID identifies the driver build, so two processes can agree that they
+ * are talking to the same implementation before sharing anything.
+ *
+ * pipelineCacheUUID decides when a serialized pipeline cache is stale. Leaving
+ * it zero meant a cache written by one build was accepted by the next one.
+ */
+static VkResult
+cpvk_init_uuids(struct cpvk_physical_device *pdev,
+                struct cpvk_instance *instance)
+{
+   CUuuid cu_uuid;
+   if (cuDeviceGetUuid(&cu_uuid, pdev->cu_dev) != CUDA_SUCCESS)
+      return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                       "cuDeviceGetUuid failed");
+   STATIC_ASSERT(sizeof(cu_uuid.bytes) == VK_UUID_SIZE);
+   memcpy(pdev->device_uuid, cu_uuid.bytes, VK_UUID_SIZE);
+
+   const struct build_id_note *note =
+      build_id_find_nhdr_for_addr(cpvk_init_uuids);
+   if (!note)
+      return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                       "failed to find build-id");
+   unsigned build_id_len = build_id_length(note);
+   if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH)
+      return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                       "build-id too short; it needs to be a SHA");
+
+   memcpy(pdev->driver_uuid, build_id_data(note), VK_UUID_SIZE);
+
+   /* Build plus device: a cache is invalid if either changes. The compute
+    * capability is in it because the kernels are compiled for it. */
+   blake3_hasher blake3_ctx;
+   uint8_t blake3[BLAKE3_OUT_LEN];
+   STATIC_ASSERT(VK_UUID_SIZE <= sizeof(blake3));
+   _mesa_blake3_init(&blake3_ctx);
+   _mesa_blake3_update(&blake3_ctx, build_id_data(note), build_id_len);
+   _mesa_blake3_update(&blake3_ctx, pdev->device_uuid, VK_UUID_SIZE);
+   _mesa_blake3_update(&blake3_ctx, &pdev->sm_major, sizeof(pdev->sm_major));
+   _mesa_blake3_update(&blake3_ctx, &pdev->sm_minor, sizeof(pdev->sm_minor));
+   _mesa_blake3_final(&blake3_ctx, blake3);
+   memcpy(pdev->cache_uuid, blake3, VK_UUID_SIZE);
+
+   return VK_SUCCESS;
 }
 
 static void
@@ -259,9 +318,9 @@ cpvk_get_properties(const struct cpvk_physical_device *pdev,
 
    snprintf(props->deviceName, sizeof(props->deviceName), "cudavk (%s)",
             pdev->name);
-   memset(props->pipelineCacheUUID, 0, VK_UUID_SIZE);
-   memset(props->deviceUUID, 0, VK_UUID_SIZE);
-   memset(props->driverUUID, 0, VK_UUID_SIZE);
+   memcpy(props->pipelineCacheUUID, pdev->cache_uuid, VK_UUID_SIZE);
+   memcpy(props->deviceUUID, pdev->device_uuid, VK_UUID_SIZE);
+   memcpy(props->driverUUID, pdev->driver_uuid, VK_UUID_SIZE);
 }
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
@@ -329,6 +388,12 @@ cpvk_enumerate_physical_devices(struct vk_instance *vk_instance)
                         CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cu_dev);
    cuDeviceTotalMem(&pdev->vram, cu_dev);
 
+   VkResult result = cpvk_init_uuids(pdev, instance);
+   if (result != VK_SUCCESS) {
+      vk_free(&instance->vk.alloc, pdev);
+      return result;
+   }
+
    struct vk_features features;
    struct vk_properties props;
    cpvk_get_features(&features);
@@ -342,10 +407,9 @@ cpvk_enumerate_physical_devices(struct vk_instance *vk_instance)
    vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch_table, &vk_common_physical_device_entrypoints, false);
 
-   VkResult result =
-      vk_physical_device_init(&pdev->vk, &instance->vk,
-                              &cpvk_device_extensions, &features, &props,
-                              &dispatch_table);
+   result = vk_physical_device_init(&pdev->vk, &instance->vk,
+                                    &cpvk_device_extensions, &features, &props,
+                                    &dispatch_table);
    if (result != VK_SUCCESS) {
       vk_free(&instance->vk.alloc, pdev);
       return result;

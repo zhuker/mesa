@@ -56,6 +56,14 @@ struct cpvk_physical_device {
    int sm_major, sm_minor;
    char name[256];
    size_t vram;
+
+   /* Reported through VkPhysicalDeviceIDProperties. device_uuid is the CUDA
+    * device's own UUID, which is how a CUDA consumer decides that this Vulkan
+    * device and one of its CUDA devices are the same GPU. See
+    * docs/cudavk/CUDA_INTEROP.md. */
+   uint8_t device_uuid[VK_UUID_SIZE];
+   uint8_t driver_uuid[VK_UUID_SIZE];
+   uint8_t cache_uuid[VK_UUID_SIZE];
 };
 
 struct cpvk_pending_submit;
