@@ -4,9 +4,9 @@ This tree is a Mesa fork used for one thing: `src/cudapipe`, a CUDA software
 rasterizer exposed as a Vulkan ICD, built with `-Dcudavk=true`. No other part
 of Mesa is being worked on here.
 
-`src/gallium/drivers/cudapipe` is the older Gallium-hosted driver it replaced.
-It is being removed; nothing new should be built on it. Its tooling has already
-moved to `src/cudapipe/tests`.
+The older Gallium-hosted driver it replaced has been removed. What it was, what
+was lost with it and how to bring it back are in `CUDAPIPE_GALLIUM_RETIREMENT.md`;
+its mechanism documents are kept in `docs/history/gallium/`.
 
 ## Read first
 
@@ -16,7 +16,7 @@ moved to `src/cudapipe/tests`.
   how cost is measured reliably enough to compare, and how to find where the
   time actually goes. Read it before trusting a number from either half.
 
-`CUDAPIPE_PLAN.md` and `src/gallium/drivers/cudapipe/{PERFORMANCE_PLAN,
+`CUDAPIPE_PLAN.md` and `docs/history/gallium/{PERFORMANCE_PLAN,
 PERFORMANCE_PROGRESS,PHASE_1A,INSTANCING,BATCHING,ABUFFER}.md` are records of past
 passes. Their forward-looking sections have been overtaken and say so where
 they have.

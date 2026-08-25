@@ -219,7 +219,6 @@ with_gallium_nouveau = gallium_drivers.contains('nouveau')
 with_gallium_freedreno = gallium_drivers.contains('freedreno')
 with_gallium_softpipe = gallium_drivers.contains('softpipe')
 with_gallium_llvmpipe = gallium_drivers.contains('llvmpipe')
-with_gallium_cudapipe = gallium_drivers.contains('cudapipe')
 with_gallium_vc4 = gallium_drivers.contains('vc4')
 with_gallium_v3d = gallium_drivers.contains('v3d')
 with_gallium_panfrost = gallium_drivers.contains('panfrost')
@@ -318,7 +317,8 @@ with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
 # The CUDA Vulkan driver (src/cudapipe). Its own option rather than an entry in
 # vulkan-drivers: it is fork-local, it needs a CUDA toolkit and an NVIDIA GPU to
 # build, and nothing should acquire it from 'auto' or 'all'. It is independent
-# of Gallium -- the Gallium-hosted cudapipe driver is a separate, older thing.
+# of Gallium; the Gallium-hosted cudapipe driver it grew out of was removed,
+# see CUDAPIPE_GALLIUM_RETIREMENT.md.
 with_cudavk = get_option('cudavk')
 # It is a Vulkan driver, so it needs Mesa's common Vulkan runtime built even
 # when no driver from the shared vulkan-drivers list was asked for.
