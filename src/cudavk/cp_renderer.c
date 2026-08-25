@@ -702,6 +702,17 @@ cp_plan_report(struct cp_context *cp)
               cp->plan.wait_peel_ns / 1e6, cp->plan.wait_peel_n,
               cp->plan.wait_seg_ns / 1e6, cp->plan.wait_seg_n,
               cp->plan.wait_upload_ns / 1e6, cp->plan.wait_upload_n);
+   if (cp->plan.opaque_episodes)
+      fprintf(stderr, "cudavk: opaque episodes: %" PRIu64 " closed, %" PRIu64
+              " segments (%.2f per episode, longest %" PRIu64 "), %" PRIu64
+              " episodes had more than one segment, %" PRIu64
+              " segments could overlap a predecessor, %" PRIu64
+              " episodes ran on the side streams\n",
+              cp->plan.opaque_episodes, cp->plan.opaque_segs,
+              (double)cp->plan.opaque_segs /
+                 (double)MAX2(cp->plan.opaque_episodes, (uint64_t)1),
+              cp->plan.opaque_max_segs, cp->plan.opaque_multiseg,
+              cp->plan.opaque_concurrent, cp->plan.opaque_fanned);
    fprintf(stderr, "cudavk: kernel launches: %" PRIu64 " over %" PRIu64
            " episodes and %" PRIu64 " render scopes (%.1f per episode)\n",
            cp->launches, cp->plan.pass_finishes, cp->plan.scopes,
@@ -7417,6 +7428,17 @@ cp_opaque_finish(struct cp_context *cp)
    cp->pass.nsegs = 0;
    cp->pass.next_prim = 0;
    cp->pass.opaque = false;
+
+   /* Counted in both arms: how much concurrency this episode had to offer. */
+   cp->plan.opaque_episodes++;
+   cp->plan.opaque_segs += nsegs;
+   cp->plan.opaque_concurrent += nsegs - 1;
+   if (nsegs > 1)
+      cp->plan.opaque_multiseg++;
+   if (nsegs > cp->plan.opaque_max_segs)
+      cp->plan.opaque_max_segs = nsegs;
+   if (cp_opaque_side_streams(cp))
+      cp->plan.opaque_fanned++;
 
    /* The segments rasterized visibility on the side streams; everything below
     * — the tile pass, the census and the shading — reads across all of them.

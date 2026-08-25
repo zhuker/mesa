@@ -506,6 +506,21 @@ struct cp_context {
       uint64_t flushes;         /* batches submitted */
       uint64_t pass_finishes;      /* episodes with segments, closed */
       uint64_t pass_finish_calls;  /* attempts, most of them empty */
+      /*
+       * Opaque episodes, and how much concurrency there was to have. An
+       * episode of one segment cannot overlap with anything, so
+       * CUDAVK_OPAQUE_STREAMS buys nothing on it and a bit-identical picture
+       * from such a frame proves nothing about the fan-out. Counted whether
+       * the flag is on or off, so the two arms are comparable.
+       */
+      uint64_t opaque_episodes;    /* opaque episodes closed with segments */
+      uint64_t opaque_segs;        /* segments in them, summed */
+      uint64_t opaque_multiseg;    /* of those episodes, ones with >1 segment */
+      uint64_t opaque_concurrent;  /* segments that were not the first of
+                                    * their episode and so could overlap */
+      uint64_t opaque_max_segs;    /* the longest episode seen */
+      uint64_t opaque_fanned;      /* episodes that actually used the side
+                                    * streams */
       uint64_t scratch_grows;   /* scratch arena reallocations */
       uint64_t arena_grows;     /* descriptor arena reallocations */
       uint64_t fb_reallocs;     /* framebuffer-sized buffer reallocations */
