@@ -163,6 +163,43 @@ struct cpvk_device {
 };
 
 /*
+ * Borrow the calling thread's CUDA context for the rest of this scope.
+ *
+ * Nothing in the CUDA driver API that this driver calls takes a CUcontext --
+ * cuMemAlloc, cuLaunchKernel, cuMemcpyHtoD, cuModuleLoad and cuStreamCreate
+ * all act on whatever context is current on the thread. So an entry point has
+ * to make this device's context current. The context is *thread* state and the
+ * thread belongs to the application, so it also has to give it back: for most
+ * of this driver's life it called cuCtxSetCurrent and simply kept it, which
+ * means a caller mixing CUDA and Vulkan on one thread silently ends up in our
+ * context, and the CUDA Runtime API will adopt a driver context that is
+ * already current -- so a co-located CUDA consumer could allocate inside a
+ * context that dies at vkDestroyDevice.
+ *
+ * Push/pop rather than get/set/restore because it is a stack and therefore
+ * nests: an entry point that calls another restores to ours, and the outermost
+ * restores to the caller's. cleanup() rather than a hand-written pop because
+ * these functions return from many places, including every error path, and a
+ * pop that is missed once leaks a stack entry per call.
+ *
+ * Put this in entry points, not in helpers. Helpers inherit the scope, and
+ * CUDAVK_CTX_CHECK (cp_debug.h) is what proves they do.
+ *
+ * cpvk_submit_worker is the deliberate exception: that thread is the driver's
+ * own, nobody else's context is on it, and it sets its context once at start.
+ */
+static inline void
+cpvk_ctx_leave(const CUresult *pushed)
+{
+   if (*pushed == CUDA_SUCCESS)
+      cuCtxPopCurrent(NULL);
+}
+
+#define CPVK_CTX_SCOPE(dev)                                                   \
+   CUresult _cpvk_ctx_pushed __attribute__((cleanup(cpvk_ctx_leave), unused)) \
+      = cuCtxPushCurrent((dev)->cu_ctx)
+
+/*
  * A memory type index picks the allocator, and the three of them are the split
  * session 13 had to negotiate with lavapipe through two new pipe_screen hooks.
  * Here they are simply what the driver does.
@@ -573,6 +610,13 @@ struct cpvk_cmd_buffer {
    } *desc_retired;
    unsigned num_desc_retired, max_desc_retired;
 };
+/* Recording entry points hold only a command buffer, but they still reach
+ * CUDA -- cpvk_arena_append allocates -- so they need the scope too. */
+static inline struct cpvk_device *
+cpvk_cmd_buffer_device(struct cpvk_cmd_buffer *cmd)
+{
+   return container_of(cmd->vk.base.device, struct cpvk_device, vk);
+}
 
 void cpvk_pipeline_ref(struct cpvk_pipeline *pipeline);
 void cpvk_pipeline_unref(struct cpvk_pipeline *pipeline);

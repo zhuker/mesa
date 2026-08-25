@@ -62,7 +62,6 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
    cp_smallop_enabled = cp_debug->upload_stats;
 
    /* Allocate the persistent device-only arenas and queues. */
-   cuCtxSetCurrent(cp->dev->cuda_ctx);
 
    /*
     * How many multiprocessors this device has, for grids that are sized to
@@ -493,6 +492,7 @@ cp_launch(struct cp_context *cp, CUfunction f,
           unsigned bx, unsigned by, unsigned bz,
           unsigned shmem, CUstream stream, void **params, void **extra)
 {
+   cp_ctx_check("cp_launch", cp->dev->cuda_ctx);
    CUresult err = cp_upload_flush(cp);
    if (err != CUDA_SUCCESS)
       return err;
@@ -824,7 +824,6 @@ cp_context_cleanup(struct cp_context *cp)
    if (!cp || !cp->dev)
       return;
 
-   cuCtxSetCurrent(cp->dev->cuda_ctx);
    if (cuCtxSynchronize() != CUDA_SUCCESS)
       cp_renderer_texture_fatal(cp);
    /* Release the exclusive cache-use lifetime even on a poisoned context. */
@@ -2469,7 +2468,6 @@ cp_depth_attachment_xfer(struct cp_context *cp,
       .stencil_clear = store ? depth->stencil_clear : 0,
       .stencil_value = depth->stencil_value,
    };
-   cuCtxSetCurrent(cp->dev->cuda_ctx);
    void *params[] = { &args };
    CUresult err = cp_launch(cp, fn,
       (args.width + 15) / 16, (args.height + 15) / 16, args.samples,
@@ -2489,7 +2487,6 @@ cp_clear_depthbuf(struct cp_context *cp, float depth)
    uint32_t value = cp_depth_to_sortable(depth);
    size_t count = (size_t)cp->depthbuf_w * cp->depthbuf_h;
 
-   cuCtxSetCurrent(cp->dev->cuda_ctx);
    cuMemsetD32Async(cp->depthbuf, value, count * MAX2(cp->visbuf_samples, 1u), cp->stream);
    cp->depthbuf_cleared = true;
 }
@@ -4689,7 +4686,6 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    if (num_draws == 0 || draws[0].count == 0)
       return;
 
-   cuCtxSetCurrent(screen->cuda_ctx);
 
    bool indexed = info->index_size > 0;
 
@@ -6894,6 +6890,11 @@ cp_batch_order_free(const struct cp_draw_state *state)
 {
    if (state->blend.enable || state->fs->uses_discard)
       return false;
+   /* The renderer's half of the CUDAVK_UNSAFE_FORCE_OPAQUE relaxation; see
+    * cpvk_pipeline_order_free(), which this function has to agree with or the
+    * front end and cp_opaque_appendable() disagree about the same batch. */
+   if (cp_debug->unsafe_force_opaque)
+      return true;
    if (!state->depth.depth_enabled || !state->depth.depth_writemask)
       return false;
    switch (state->depth.depth_func) {
@@ -8187,7 +8188,6 @@ cp_pass_finish(struct cp_context *cp)
       return;
    }
 
-   cuCtxSetCurrent(screen->cuda_ctx);
    CP_NVTX_SCOPEF("episode %u segs", nsegs);
 
    /* The segments' count phases ran on the side streams; the scan reads
@@ -9004,7 +9004,6 @@ cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
       cp->resolved = 0;
       cp->peel_next = 0;
 
-      cuCtxSetCurrent(cp->dev->cuda_ctx);
       CUresult e1 = cp_mem_alloc_retry(cp, &cp->visbuf,
                                cp->fb_cap_px_samples * sizeof(uint64_t));
       CUresult e2 = cp_mem_alloc_retry(cp, &cp->depthbuf,
@@ -9217,7 +9216,6 @@ cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
    };
    memcpy(args.clear_value, value, sizeof(args.clear_value));
 
-   cuCtxSetCurrent(screen->cuda_ctx);
    void *params[] = { &args };
    return cp_launch(cp, fn,
       (width + 15) / 16, (height + 15) / 16, 1,

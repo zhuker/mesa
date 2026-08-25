@@ -277,6 +277,7 @@ cpvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
                  const VkAllocationCallbacks *pAllocator, VkImage *pImage)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    if (wsi_common_is_swapchain_image(pCreateInfo))
       return wsi_common_create_swapchain_image(&dev->pdev->wsi_device,
@@ -338,6 +339,7 @@ cpvk_DestroyImage(VkDevice _device, VkImage _image,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_image, image, _image);
+   CPVK_CTX_SCOPE(dev);
 
    if (image) {
       cpvk_memory_note_unbind(dev, image->mem, image);
@@ -370,6 +372,7 @@ cpvk_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount,
                       const VkBindImageMemoryInfo *pBindInfos)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    for (uint32_t i = 0; i < bindInfoCount; i++) {
       VK_FROM_HANDLE(cpvk_image, image, pBindInfos[i].image);
@@ -467,6 +470,7 @@ cpvk_CreateImageView(VkDevice _device,
                      const VkAllocationCallbacks *pAllocator, VkImageView *pView)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    struct cpvk_image_view *view =
       vk_image_view_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*view));
@@ -480,7 +484,6 @@ cpvk_CreateImageView(VkDevice _device,
       pCreateInfo->components.g == VK_COMPONENT_SWIZZLE_IDENTITY &&
       pCreateInfo->components.b == VK_COMPONENT_SWIZZLE_IDENTITY &&
       pCreateInfo->components.a == VK_COMPONENT_SWIZZLE_IDENTITY;
-   cuCtxSetCurrent(dev->cu_ctx);
    if (cuMemAllocManaged(&view->tex_info, sizeof(struct cp_texture_info),
                          CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
       vk_image_view_destroy(&dev->vk, pAllocator, &view->vk);
@@ -542,6 +545,7 @@ cpvk_DestroyImageView(VkDevice _device, VkImageView _view,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_image_view, view, _view);
+   CPVK_CTX_SCOPE(dev);
 
    if (view) {
       if (cp_debug->texture_cache) {
@@ -558,7 +562,6 @@ cpvk_DestroyImageView(VkDevice _device, VkImageView _view,
          simple_mtx_unlock(&dev->view_lock);
       }
       if (view->tex_info) {
-         cuCtxSetCurrent(dev->cu_ctx);
          cuMemFree(view->tex_info);
          view->tex_info = 0;
          view->tex_info_host = NULL;
@@ -608,6 +611,7 @@ cpvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
                    VkSampler *pSampler)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
    struct cp_context *cp = &dev->renderer;
 
    struct cpvk_sampler *sampler =
@@ -667,7 +671,6 @@ cpvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
          vk_object_free(&dev->vk, pAllocator, sampler);
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
-      cuCtxSetCurrent(dev->cu_ctx);
       if (!cp->sampler_table &&
           cuMemAllocManaged(&cp->sampler_table,
                             CP_MAX_SAMPLERS * sizeof(struct cp_sampler_info),
@@ -698,6 +701,7 @@ cpvk_DestroySampler(VkDevice _device, VkSampler _sampler,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_sampler, sampler, _sampler);
+   CPVK_CTX_SCOPE(dev);
 
    /* The table entry stays: descriptors already written refer to it by index
     * and nothing renumbers them. The table is bounded and per device. */

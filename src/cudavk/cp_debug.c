@@ -18,6 +18,19 @@
 
 #include "util/macros.h"
 
+/*
+ * Loud on purpose, and once per site: a context escape is a correctness bug
+ * whose symptom appears in someone else's library, so it must not scroll past.
+ */
+void
+cp_ctx_check_failed(const char *where, const void *got, const void *want)
+{
+   fprintf(stderr,
+           "cudavk: CONTEXT ESCAPE in %s: current is %p, expected %p. "
+           "That path reaches CUDA without an entry-point CPVK_CTX_SCOPE.\n",
+           where, got, want);
+}
+
 enum cp_flag_type {
    CP_FLAG_BOOL_PRESENCE,  /* set if the variable exists at all, whatever its value */
    CP_FLAG_BOOL_VALUE,     /* atoi(v) != 0 */
@@ -290,6 +303,11 @@ static const struct cp_flag_def flags[] = {
      F(unsafe_no_overflow),
      "skip episode overflow readback and assume fragment/quad arrays fit; "
      "unsafe diagnostic only" },
+   { "CUDAVK_UNSAFE_FORCE_OPAQUE", CP_FLAG_BOOL_VALUE,
+     F(unsafe_force_opaque),
+     "force every draw's blend state to disabled and let the result reach an "
+     "opaque episode; renders wrong output, diagnostic upper bound for the "
+     "cost of the blended path" },
    { "CUDAVK_NO_BATCH", CP_FLAG_BOOL_PRESENCE, F(no_batch),
      "disable draw batching entirely" },
    { "CUDAVK_NO_BINCACHE", CP_FLAG_BOOL_PRESENCE, F(no_bincache),

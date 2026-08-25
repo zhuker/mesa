@@ -77,6 +77,7 @@ cpvk_CreateDescriptorPool(VkDevice _device,
                           VkDescriptorPool *pDescriptorPool)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    struct cpvk_descriptor_pool *pool =
       vk_object_zalloc(&dev->vk, pAllocator, sizeof(*pool),
@@ -101,6 +102,7 @@ cpvk_DestroyDescriptorPool(VkDevice _device, VkDescriptorPool _pool,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_descriptor_pool, pool, _pool);
+   CPVK_CTX_SCOPE(dev);
 
    if (pool) {
       cpvk_descriptor_pool_clear(dev, pool);
@@ -116,6 +118,7 @@ cpvk_AllocateDescriptorSets(VkDevice _device,
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_descriptor_pool, pool,
                   pAllocateInfo->descriptorPool);
+   CPVK_CTX_SCOPE(dev);
 
    uint64_t required[CPVK_DESCRIPTOR_TYPE_COUNT] = {0};
    if (!pool || pAllocateInfo->descriptorSetCount >
@@ -216,6 +219,7 @@ cpvk_FreeDescriptorSets(VkDevice _device, VkDescriptorPool pool,
                         uint32_t count, const VkDescriptorSet *pSets)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    for (uint32_t i = 0; i < count; i++) {
       VK_FROM_HANDLE(cpvk_descriptor_set, set, pSets[i]);
@@ -230,6 +234,7 @@ cpvk_ResetDescriptorPool(VkDevice _device, VkDescriptorPool pool,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_descriptor_pool, desc_pool, pool);
+   CPVK_CTX_SCOPE(dev);
    cpvk_descriptor_pool_clear(dev, desc_pool);
    return VK_SUCCESS;
 }
@@ -526,6 +531,7 @@ cpvk_CreateDescriptorUpdateTemplate(
    VkDescriptorUpdateTemplate *pTemplate)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    struct cpvk_descriptor_update_template *tmpl =
       vk_object_zalloc(&dev->vk, pAllocator,
@@ -550,6 +556,7 @@ cpvk_DestroyDescriptorUpdateTemplate(VkDevice _device,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_descriptor_update_template, tmpl, _tmpl);
+   CPVK_CTX_SCOPE(dev);
 
    if (tmpl)
       vk_object_free(&dev->vk, pAllocator, tmpl);
@@ -787,6 +794,7 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
                         const VkCommandBufferBeginInfo *pBeginInfo)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
    cmd->num_dispatches = 0;
@@ -873,6 +881,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_plan_batches(cmd);
    return vk_command_buffer_end(&cmd->vk);
 }
@@ -884,6 +893,7 @@ cpvk_CmdBindPipeline(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_pipeline, pipeline, _pipeline);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    if (!cpvk_cmd_retain_pipeline(cmd, pipeline)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -929,6 +939,8 @@ cpvk_arena_append(struct cpvk_cmd_buffer *cmd, const void *src, size_t bytes,
       size_t want = MAX2(cmd->desc_arena_size * 2,
                          cmd->desc_arena_used + bytes);
       want = MAX2(want, (size_t)64 * 1024);
+      cp_ctx_check("cpvk_arena_append",
+                   cpvk_cmd_buffer_device(cmd)->cu_ctx);
       CUdeviceptr fresh = 0;
       void *fresh_host = malloc(want);
       /* Recording only writes this mirror and submit performs a synchronous
@@ -1007,6 +1019,7 @@ cpvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_pipeline_layout, layout, pInfo->layout);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    unsigned dyn = 0;
    VkShaderStageFlags graphics_stages =
       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
@@ -1085,6 +1098,7 @@ cpvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
                      uint32_t groupCountZ)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    if (!cmd->compute_pipeline)
       return;
@@ -1321,6 +1335,7 @@ cpvk_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t count,
                         const VkCommandBuffer *pCommandBuffers)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    for (uint32_t i = 0; i < count; i++) {
       VK_FROM_HANDLE(cpvk_cmd_buffer, sec, pCommandBuffers[i]);
@@ -1447,6 +1462,7 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                        const VkRenderingInfo *pRenderingInfo)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    const VkRenderingAttachmentInfo *stencil =
       pRenderingInfo->pStencilAttachment;
@@ -1786,6 +1802,7 @@ cpvk_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
                            const VkDeviceSize *pStrides)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    for (uint32_t i = 0; i < bindingCount; i++) {
       unsigned b = firstBinding + i;
@@ -1803,6 +1820,7 @@ cpvk_CmdPushConstants2(VkCommandBuffer commandBuffer,
                        const VkPushConstantsInfo *pInfo)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    if (pInfo->offset + pInfo->size > CPVK_MAX_PUSH_BYTES)
       return;
@@ -1842,6 +1860,7 @@ cpvk_CmdBindIndexBuffer2(VkCommandBuffer commandBuffer, VkBuffer _buffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_buffer, buf, _buffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    cmd->index_ptr = (buf && buf->mem)
       ? (const void *)(uintptr_t)(buf->mem->dev_ptr + buf->offset + offset)
@@ -1863,6 +1882,7 @@ cpvk_CmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t count,
                              const VkViewport *pViewports)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    if (!count)
       return;
@@ -1889,6 +1909,7 @@ cpvk_CmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t count,
                             const VkRect2D *pScissors)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    if (!count)
       return;
@@ -1956,6 +1977,7 @@ cpvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
              uint32_t firstInstance)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_record_draw_cmd(cmd, vertexCount, firstVertex, instanceCount,
                     firstInstance, 0, false);
 }
@@ -1966,6 +1988,7 @@ cpvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
                     int32_t vertexOffset, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_record_draw_cmd(cmd, indexCount, firstIndex, instanceCount, firstInstance,
                     vertexOffset, true);
 }
@@ -2397,6 +2420,20 @@ cpvk_pipeline_order_free(const struct cpvk_pipeline *p)
 {
    if (!p || p->blend.enable || p->fs->uses_discard)
       return false;
+   /*
+    * CUDAVK_UNSAFE_FORCE_OPAQUE has to relax the depth conditions too, or it
+    * measures the wrong thing. A transparent draw is drawn with depth writes
+    * OFF, so clearing `blend.enable` alone leaves it failing this test, still
+    * classified blended by cpvk_batch_eligible, still routed into
+    * cp_pass_append -- where the segment backs out (cp_renderer.c, the
+    * `!abuf` arm) because nothing is blended any more and the A-buffer is
+    * never set up. It then re-executes classically and pays the vertex stage
+    * twice. That is a back-out penalty, not the price of an opaque world.
+    * Under this flag the draw becomes genuinely order-free so it reaches an
+    * opaque episode. It is a diagnostic; the pixels are wrong either way.
+    */
+   if (cp_debug->unsafe_force_opaque)
+      return true;
    if (!p->depth.depth_enabled || !p->depth.depth_writemask)
       return false;
    switch (p->depth.depth_func) {
@@ -2684,6 +2721,7 @@ cpvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_buffer, src, pInfo->srcBuffer);
    VK_FROM_HANDLE(cpvk_buffer, dst, pInfo->dstBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    if (!src || !dst || !src->mem || !dst->mem)
       return;
@@ -2731,6 +2769,7 @@ cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_image, src, pInfo->srcImage);
    VK_FROM_HANDLE(cpvk_image, dst, pInfo->dstImage);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    for (uint32_t i = 0; i < pInfo->regionCount; i++) {
       const VkImageCopy2 *r = &pInfo->pRegions[i];
@@ -2822,6 +2861,7 @@ cpvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_buffer, buf, pInfo->srcBuffer);
    VK_FROM_HANDLE(cpvk_image, img, pInfo->dstImage);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    if (!buf || !buf->mem)
       return;
@@ -2900,6 +2940,7 @@ cpvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_image, img, pInfo->srcImage);
    VK_FROM_HANDLE(cpvk_buffer, buf, pInfo->dstBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    if (!buf || !buf->mem)
       return;
@@ -2983,6 +3024,7 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_image, src, pInfo->srcImage);
    VK_FROM_HANDLE(cpvk_image, dst, pInfo->dstImage);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    for (uint32_t i = 0; i < pInfo->regionCount; i++) {
       const VkImageBlit2 *r = &pInfo->pRegions[i];
@@ -3077,6 +3119,7 @@ VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdEndRendering(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    /* The colour resolve is ordered before the explicit end marker. */
    if (cmd->resolve_valid) {
@@ -3117,6 +3160,7 @@ cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_image, src, pInfo->srcImage);
    VK_FROM_HANDLE(cpvk_image, dst, pInfo->dstImage);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    for (uint32_t i = 0; i < pInfo->regionCount; i++) {
       const VkImageResolve2 *r = &pInfo->pRegions[i];
@@ -3166,6 +3210,7 @@ cpvk_CreateEvent(VkDevice _device, const VkEventCreateInfo *pCreateInfo,
                  const VkAllocationCallbacks *pAllocator, VkEvent *pEvent)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    struct cpvk_event *event =
       vk_object_zalloc(&dev->vk, pAllocator, sizeof(*event),
@@ -3277,6 +3322,7 @@ cpvk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_event, event, _event);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_record_event(cmd, event, CPVK_OP_EVENT_SET);
 }
 
@@ -3286,6 +3332,7 @@ cpvk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_event, event, _event);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_record_event(cmd, event, CPVK_OP_EVENT_RESET);
 }
 
@@ -3295,6 +3342,7 @@ cpvk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
                     const VkDependencyInfo *pDependencyInfos)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    for (uint32_t i = 0; i < eventCount; i++) {
       VK_FROM_HANDLE(cpvk_event, event, pEvents[i]);
       cpvk_record_event(cmd, event, CPVK_OP_EVENT_WAIT);
@@ -3307,6 +3355,7 @@ cpvk_CmdSetEvent(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_event, event, _event);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_record_event(cmd, event, CPVK_OP_EVENT_SET);
 }
 
@@ -3316,6 +3365,7 @@ cpvk_CmdResetEvent(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_event, event, _event);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_record_event(cmd, event, CPVK_OP_EVENT_RESET);
 }
 
@@ -3332,6 +3382,7 @@ cpvk_CmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount,
                    const VkImageMemoryBarrier *pImageMemoryBarriers)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    for (uint32_t i = 0; i < eventCount; i++) {
       VK_FROM_HANDLE(cpvk_event, event, pEvents[i]);
       cpvk_record_event(cmd, event, CPVK_OP_EVENT_WAIT);
@@ -3351,6 +3402,7 @@ cpvk_CmdPipelineBarrier(VkCommandBuffer commandBuffer,
                         const VkImageMemoryBarrier *pImageMemoryBarriers)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_op_alloc(cmd, CPVK_OP_BARRIER);
 }
 
@@ -3359,6 +3411,7 @@ cpvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                          const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_op_alloc(cmd, CPVK_OP_BARRIER);
 }
 
@@ -3424,7 +3477,6 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
    /* A copy observes rendering, so whatever is held back has to run first. */
    cp_batch_flush(cp);
 
-   cuCtxSetCurrent(dev->cu_ctx);
 
    /*
     * Refuse a copy that cannot be one. A zero endpoint is an image or buffer
@@ -3609,6 +3661,7 @@ cpvk_CreateQueryPool(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
                      VkQueryPool *pQueryPool)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    struct cpvk_query_pool *pool =
       vk_object_zalloc(&dev->vk, pAllocator, sizeof(*pool),
@@ -3697,6 +3750,7 @@ cpvk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool _pool,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_record_query(cmd, pool, firstQuery, queryCount, true);
 }
 
@@ -3707,6 +3761,7 @@ cpvk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_record_query(cmd, pool, query, 1, false);
 }
 
@@ -3732,6 +3787,7 @@ cpvk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool _pool,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
    cpvk_record_query(cmd, pool, query, 1, false);
 }
 
@@ -3743,6 +3799,7 @@ cpvk_GetQueryPoolResults(VkDevice _device, VkQueryPool _pool,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+   CPVK_CTX_SCOPE(dev);
 
    if (!pool)
       return VK_ERROR_UNKNOWN;

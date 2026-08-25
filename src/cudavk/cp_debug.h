@@ -218,6 +218,7 @@ struct cp_debug {
    bool tiled_opaque;
    bool tiled_opaque_census;
    bool unsafe_no_overflow;
+   bool unsafe_force_opaque;
    bool no_batch;
    bool no_bincache;
    bool no_regcap;
@@ -270,6 +271,37 @@ extern const struct cp_debug *cp_debug;
 
 /* Idempotent. Call before anything reads cp_debug. */
 void cp_debug_init(void);
+
+/*
+ * Context discipline, checkable rather than assumed.
+ *
+ * Every CUDA call in this driver acts on the *current* context: of 606 driver
+ * API entry points in CUDA 12.8 only 36 take a CUcontext, and none of the ones
+ * used here do. So an entry point must make this device's context current, and
+ * -- because that is thread state shared with the caller -- must put the
+ * caller's back. CPVK_CTX_SCOPE in cpvk_private.h does both.
+ *
+ * That works only if every path into CUDA passes through a scoped entry point,
+ * which is a whole-call-graph property no compiler checks. CUDAVK_CTX_CHECK
+ * turns it into a test: the chokepoints call this, and anything reached
+ * without a scope names itself instead of silently allocating in, or
+ * launching into, whatever context the application left current.
+ *
+ * Enable it for a full test run after touching entry points, not in
+ * production: it is a cuCtxGetCurrent per launch.
+ */
+void cp_ctx_check_failed(const char *where, const void *got, const void *want);
+
+static inline void
+cp_ctx_check(const char *where, void *want)
+{
+   if (!cp_debug->ctx_check)
+      return;
+   CUcontext got = NULL;
+   cuCtxGetCurrent(&got);
+   if (got != (CUcontext)want)
+      cp_ctx_check_failed(where, got, want);
+}
 
 #ifdef __cplusplus
 }

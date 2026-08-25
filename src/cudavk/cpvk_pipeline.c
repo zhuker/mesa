@@ -587,6 +587,7 @@ cpvk_CreateDescriptorSetLayout(
    const VkAllocationCallbacks *pAllocator, VkDescriptorSetLayout *pSetLayout)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    /* Sized from the layout, so a legal set of any advertised size is either
     * stored completely or refused; a descriptor is never silently dropped. */
@@ -673,6 +674,7 @@ cpvk_CreatePipelineLayout(VkDevice _device,
                           VkPipelineLayout *pPipelineLayout)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    struct cpvk_pipeline_layout *layout =
       vk_pipeline_layout_zalloc(&dev->vk, sizeof(*layout), pCreateInfo);
@@ -831,6 +833,7 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
                             VkPipeline *pPipelines)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
    VkResult first_error = VK_SUCCESS;
 
    for (uint32_t i = 0; i < count; i++)
@@ -872,7 +875,6 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       bool uses_tex = cpvk_nir_uses_tex(nir);
       bool uses_tex_3d = cpvk_nir_uses_tex_3d(nir);
       const char *sampler_ptx = cpvk_sampler_ptx(dev, uses_tex_3d);
-      cuCtxSetCurrent(dev->cu_ctx);
       pipeline->bin = cp_compile_nir_to_ptx(
          nir, dev->pdev->sm_major, dev->pdev->sm_minor,
          uses_tex ? sampler_ptx : NULL, NULL, NULL,
@@ -1162,7 +1164,6 @@ cpvk_compile_stage(struct cpvk_device *dev,
 
    bool uses_tex_3d = cpvk_nir_uses_tex_3d(nir);
    const char *sampler_ptx = cpvk_sampler_ptx(dev, uses_tex_3d);
-   cuCtxSetCurrent(dev->cu_ctx);
    bool frag = stage->stage == VK_SHADER_STAGE_FRAGMENT_BIT;
    struct cp_shader_binary *bin =
       cp_compile_nir_to_ptx(nir, dev->pdev->sm_major, dev->pdev->sm_minor,
@@ -1240,6 +1241,7 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
                              VkPipeline *pPipelines)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
    VkResult first_error = VK_SUCCESS;
 
    for (uint32_t i = 0; i < count; i++)
@@ -1365,7 +1367,14 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
       if (cb && cb->attachmentCount) {
          const VkPipelineColorBlendAttachmentState *at = &cb->pAttachments[0];
          pipeline->blend = (struct cp_blend_desc) {
-            .enable = at->blendEnable,
+            /*
+             * CUDAVK_UNSAFE_FORCE_OPAQUE is a diagnostic upper bound, not a
+             * fast path: pretending every draw is opaque here is the single
+             * chokepoint every downstream decision (batch eligibility,
+             * A-buffer routing, composite, peel) reads, so the whole blended
+             * machinery disappears at once. The output is wrong on purpose.
+             */
+            .enable = at->blendEnable && !cp_debug->unsafe_force_opaque,
             .colormask = at->colorWriteMask ? at->colorWriteMask : 0xF,
             /*
              * The equation itself, which was missing: only `enable` and the

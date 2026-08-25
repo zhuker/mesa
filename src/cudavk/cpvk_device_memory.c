@@ -128,7 +128,6 @@ cpvk_submit_abort(struct cpvk_device *dev, VkResult result)
    if (result == VK_ERROR_DEVICE_LOST)
       atomic_store_explicit(&dev->device_lost, true, memory_order_release);
    cp_batch_flush(&dev->renderer);
-   cuCtxSetCurrent(dev->cu_ctx);
    cuStreamSynchronize(dev->renderer.stream);
    cpvk_submit_wait_pending(dev);
    cp_scratch_reset(&dev->renderer);
@@ -157,7 +156,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (result != VK_SUCCESS)
       return result;
 
-   cuCtxSetCurrent(dev->cu_ctx);
+   CPVK_CTX_SCOPE(dev);
    mtx_lock(&dev->submit_lock);
    bool retired = dev->submit_head == NULL;
    mtx_unlock(&dev->submit_lock);
@@ -212,6 +211,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
        * Upload each recorded arena once instead. The synchronous copy also
        * orders it before both CUDA streams used below. */
       if (cmd->desc_arena_dirty) {
+         cp_ctx_check("cpvk_queue_submit/desc-upload", dev->cu_ctx);
          int64_t upload_t0 = os_time_get_nano();
          for (unsigned a = 0; a < cmd->num_desc_retired; a++) {
             if (cuMemcpyHtoD(cmd->desc_retired[a].dev,
@@ -228,6 +228,10 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             (uint64_t)(os_time_get_nano() - upload_t0);
          dev->renderer.plan.wait_upload_n++;
       }
+
+      /* Earliest point on the submit path that reaches CUDA, and so where a
+       * missing entry-point scope shows up first. */
+      cp_ctx_check("cpvk_queue_submit/execute", dev->cu_ctx);
 
       /* In record order: a clear after a draw must not run before it. */
       for (unsigned o = 0; o < cmd->num_ops; o++) {
@@ -492,6 +496,11 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_queue;
 
+   /* cuCtxCreate above pushed the new context onto this thread's stack and
+    * left it current. Everything since needed that; the application does not,
+    * so hand the thread back the way it was found. */
+   cuCtxPopCurrent(NULL);
+
    *pDevice = cpvk_device_to_handle(dev);
    return VK_SUCCESS;
 
@@ -512,6 +521,7 @@ fail_stream:
       cuMemFree(dev->null_desc);
    if (dev->null_data)
       cuMemFree(dev->null_data);
+   cuCtxPopCurrent(NULL);
    cuCtxDestroy(dev->cu_ctx);
 fail_device:
    vk_device_finish(&dev->vk);
@@ -528,7 +538,10 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (!dev)
       return;
 
-   cuCtxSetCurrent(dev->cu_ctx);
+   /* Not CPVK_CTX_SCOPE: the scope's pop would run after cuCtxDestroy below
+    * has freed the very context it would pop. Push here, pop by hand at the
+    * one point the context is still alive. */
+   cuCtxPushCurrent(dev->cu_ctx);
    cuCtxSynchronize();
    cpvk_submit_wait_pending(dev);
    cpvk_submit_worker_finish(dev);
@@ -554,6 +567,8 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    simple_mtx_destroy(&dev->texture_cache_lock);
    simple_mtx_destroy(&dev->texture_cache_use_lock);
 
+   /* Restore the caller's context before the push target stops existing. */
+   cuCtxPopCurrent(NULL);
    cuCtxDestroy(dev->cu_ctx);
 
    const VkAllocationCallbacks *alloc = &dev->vk.alloc;
@@ -565,8 +580,8 @@ VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_DeviceWaitIdle(VkDevice _device)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
-   cuCtxSetCurrent(dev->cu_ctx);
    if (cuCtxSynchronize() != CUDA_SUCCESS)
       atomic_store_explicit(&dev->device_lost, true, memory_order_release);
    cpvk_submit_wait_pending(dev);
@@ -581,6 +596,7 @@ cpvk_AllocateMemory(VkDevice _device,
                     VkDeviceMemory *pMem)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    struct cpvk_device_memory *mem =
       vk_device_memory_create(&dev->vk, pAllocateInfo, pAllocator,
@@ -594,7 +610,7 @@ cpvk_AllocateMemory(VkDevice _device,
    size_t size = pAllocateInfo->allocationSize;
    CUresult err;
 
-   cuCtxSetCurrent(dev->cu_ctx);
+   cp_ctx_check("cpvk_AllocateMemory", dev->cu_ctx);
    bool retried_after_purge = false;
 retry_cuda_allocation:
    switch (mem->kind) {
@@ -733,11 +749,11 @@ cpvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_device_memory, mem, _mem);
+   CPVK_CTX_SCOPE(dev);
 
    if (!mem)
       return;
 
-   cuCtxSetCurrent(dev->cu_ctx);
    if (cp_debug->texture_cache && mem->bindings)
       cpvk_DeviceWaitIdle(_device);
    while (mem->bindings) {
@@ -763,6 +779,7 @@ cpvk_MapMemory2(VkDevice _device, const VkMemoryMapInfo *pMemoryMapInfo,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_device_memory, mem, pMemoryMapInfo->memory);
+   CPVK_CTX_SCOPE(dev);
 
    /* A device-local allocation is deliberately not mappable: staging through
     * a host-visible allocation is the caller's job, and hiding that behind a
@@ -800,6 +817,7 @@ cpvk_CreateBuffer(VkDevice _device, const VkBufferCreateInfo *pCreateInfo,
                   const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
+   CPVK_CTX_SCOPE(dev);
 
    struct cpvk_buffer *buffer =
       vk_buffer_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*buffer));
@@ -816,6 +834,7 @@ cpvk_DestroyBuffer(VkDevice _device, VkBuffer _buffer,
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    VK_FROM_HANDLE(cpvk_buffer, buffer, _buffer);
+   CPVK_CTX_SCOPE(dev);
 
    if (!buffer)
       return;

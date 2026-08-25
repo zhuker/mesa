@@ -336,6 +336,7 @@ cpvk_cache_rebuild(struct cpvk_image *image, CUstream stream,
             .format = format->conversion,
          };
          void *params[] = { &args };
+         cp_ctx_check("cpvk_cache_rebuild", dev->cu_ctx);
          dev->texture_cache_stats.conversion_enqueue_attempts++;
          bool inject = cp_debug->texture_cache_fail_conversion_enqueue_at ==
             dev->texture_cache_stats.conversion_enqueue_attempts;
@@ -790,7 +791,9 @@ cpvk_texture_cache_view_destroy(struct cpvk_image_view *view)
    if (!view)
       return;
    struct cpvk_device *dev = view->dev;
-   bool ok = cuCtxSetCurrent(dev->cu_ctx) == CUDA_SUCCESS;
+   /* The entry point's CPVK_CTX_SCOPE already made this device's context
+    * current; this used to set it and fold the result into `ok`. */
+   bool ok = true;
    simple_mtx_lock(&dev->texture_cache_use_lock);
    if (ok)
       ok = cuCtxSynchronize() == CUDA_SUCCESS;
@@ -890,10 +893,6 @@ cpvk_texture_cache_purge(void *private_data)
    struct cpvk_device *dev = private_data;
    if (!dev || !cp_debug->texture_cache)
       return CP_TEXTURE_CACHE_PURGE_NONE;
-   if (cuCtxSetCurrent(dev->cu_ctx) != CUDA_SUCCESS) {
-      cpvk_cache_device_loss(dev);
-      return CP_TEXTURE_CACHE_PURGE_FATAL;
-   }
    simple_mtx_lock(&dev->texture_cache_use_lock);
    simple_mtx_lock(&dev->texture_cache_lock);
    if (cuCtxSynchronize() != CUDA_SUCCESS) {
@@ -930,7 +929,7 @@ cpvk_texture_cache_image_destroy(struct cpvk_image *image)
    if (!image)
       return;
    struct cpvk_device *dev = image->dev;
-   bool ok = cuCtxSetCurrent(dev->cu_ctx) == CUDA_SUCCESS;
+   bool ok = true;
    simple_mtx_lock(&dev->texture_cache_use_lock);
    if (ok)
       ok = cuCtxSynchronize() == CUDA_SUCCESS;
