@@ -6,7 +6,7 @@ of Mesa is being worked on here.
 
 The older Gallium-hosted driver it replaced has been removed. What it was, what
 was lost with it and how to bring it back are in `CUDAVK_GALLIUM_RETIREMENT.md`;
-its mechanism documents are kept in `docs/history/gallium/`.
+its mechanism documents are kept in `docs/cudavk/history/`.
 
 ## Read first
 
@@ -16,7 +16,7 @@ its mechanism documents are kept in `docs/history/gallium/`.
   how cost is measured reliably enough to compare, and how to find where the
   time actually goes. Read it before trusting a number from either half.
 
-`CUDAVK_PLAN.md` and `docs/history/gallium/{PERFORMANCE_PLAN,
+`CUDAVK_PLAN.md` and `docs/cudavk/history/{PERFORMANCE_PLAN,
 PERFORMANCE_PROGRESS,PHASE_1A,INSTANCING,BATCHING,ABUFFER}.md` are records of past
 passes. Their forward-looking sections have been overtaken and say so where
 they have.

@@ -86,7 +86,7 @@ backend before relying on it.
 
 ## Where its documentation went
 
-The mechanism documents were kept, not deleted: `docs/history/gallium/`. They
+The mechanism documents were kept, not deleted: `docs/cudavk/history/`. They
 describe A-buffer construction, batching, pass episodes, instancing and the
 adaptive rasteriser, all of which still exist in the native driver in evolved
 form. The forward-looking plans among them were overtaken and say so.
