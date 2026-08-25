@@ -787,7 +787,7 @@ the evidence behind it.
 | multisampling | sample shading is per fragment only, so `sampleShadingEnable` and `minSampleShading` are ignored. Stencil, multiview, layered draws and depth resolve are rejected rather than approximated |
 | blending | `VK_BLEND_FACTOR_CONSTANT_COLOR` and `CONSTANT_ALPHA` are enumerated and silently return 1.0 |
 | vertex input | attribute divisors above one are unreachable — the pipeline ignores `VkPipelineVertexInputDivisorStateCreateInfoEXT`, though the fetch itself handles an arbitrary divisor |
-| formats | the blit family is `R8G8B8A8_UNORM` and `B8G8R8A8_UNORM`; the copy executor has no host fallback |
+| formats | the blit family is `R8G8B8A8_UNORM` and `B8G8R8A8_UNORM`; the copy executor has no host fallback. `R8G8B8A8_UINT` is the only integer colour format and is renderable and copyable only: there is no `CP_TEXEL_*` decode for it, so it cannot be sampled or blitted, and it is single sample because `cp_resolve_samples` averages and an integer resolve may only take sample zero |
 | WSI | `EXT_headless_surface` only, no platform window-system extension |
 | determinism | the compacting clipper path does not promise stable primitive order, so unblended draws can break a depth tie differently run to run |
 | precision | raster stages 2 and 3 interpolate depth with separately written arithmetic, so a one-ulp difference flips a tie at the boundary; `fexp2`, `flog2` and lowered `fpow` use the NVVM approximate intrinsics |

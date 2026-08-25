@@ -55,6 +55,14 @@ static const struct cpvk_format_info cpvk_formats[] = {
    { VK_FORMAT_B10G11R11_UFLOAT_PACK32, CP_TEXEL_R11G11B10_FLOAT, CP_COLOR_R11G11B10_FLOAT,    false },
    { VK_FORMAT_A2B10G10R10_UNORM_PACK32, CP_TEXEL_A2B10G10R10_UNORM, CP_COLOR_A2B10G10R10_UNORM, false },
    { VK_FORMAT_R5G6B5_UNORM_PACK16, CP_TEXEL_R5G6B5_UNORM,       -1,                           false },
+   /*
+    * The one renderable integer format, and it is renderable only: there is
+    * no CP_TEXEL_* decode for it, so it is a colour attachment and a transfer
+    * end, not a texture. That is what the sampler can honestly do today --
+    * an integer texel would come back through a float filter path -- and the
+    * feature bits below say exactly that and no more.
+    */
+   { VK_FORMAT_R8G8B8A8_UINT,       CP_TEXEL_UNSUPPORTED,        CP_COLOR_R8G8B8A8_UINT,       false },
    { VK_FORMAT_BC1_RGB_UNORM_BLOCK,  CP_TEXEL_DXT1_RGB,           -1,                           false },
    { VK_FORMAT_BC1_RGB_SRGB_BLOCK,   CP_TEXEL_DXT1_RGB,           -1,                           false },
    { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, CP_TEXEL_DXT1_RGBA,          -1,                           false },
@@ -146,11 +154,22 @@ cpvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
       }
       if (cpvk_format_storage(format))
          linear |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
-      if (info->color >= 0)
+      if (info->color >= 0) {
          linear |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-                   VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                    VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+         /*
+          * Blending is a float equation over colours and an integer
+          * attachment has none, which is why Vulkan forbids blendEnable on
+          * one. Not advertising the bit is what makes that refusal the
+          * application's to obey rather than this driver's to discover:
+          * cpvk_pipeline.c clears blend.enable for such an attachment as
+          * well, so an application that ignores it still gets its bits
+          * written rather than blended.
+          */
+         if (!util_format_is_pure_integer(vk_format_to_pipe_format(format)))
+            linear |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+      }
       if (info->depth)
          linear |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
                    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
@@ -189,9 +208,20 @@ cpvk_GetPhysicalDeviceImageFormatProperties2(
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
         VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) != 0;
+   /*
+    * An integer attachment is single sample here. cp_resolve_samples averages
+    * its sample planes, which is the one thing a resolve of an integer
+    * attachment may not do -- Vulkan allows only SAMPLE_ZERO for those -- and
+    * averaging bit patterns would produce a number no shader wrote. Offering
+    * the sample counts and then resolving them wrongly is the failure this
+    * table exists to avoid, so the honest answer is one.
+    */
+   bool integer_color =
+      util_format_is_pure_integer(
+         vk_format_to_pipe_format(pImageFormatInfo->format));
    bool msaa = info && attachment_usage && !other_usage &&
       (info->depth ||
-       (info->color >= 0 &&
+       (info->color >= 0 && !integer_color &&
         vk_format_get_blocksize(pImageFormatInfo->format) == 4));
    if (!info ||
        ((pImageFormatInfo->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&

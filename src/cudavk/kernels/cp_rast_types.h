@@ -501,6 +501,24 @@ enum cp_color_encoding {
    CP_COLOR_R16G16_SFLOAT,
    CP_COLOR_R8_UNORM,
    CP_COLOR_R8G8_UNORM,
+   /*
+    * The one integer encoding. Its channels are not colours, they are
+    * numbers: no sRGB curve, no 0..1 clamp and no rounding, only eight bits
+    * taken as they were written.
+    *
+    * The writeback ABI carries a fragment's output as float[4] and this
+    * encoding does not fight that, because the backend never converts. A
+    * fragment shader whose NIR output is a uint stores it with its own LLVM
+    * type -- `st.v4.u32` in the generated PTX, verified on a uvec4 shader --
+    * so the four words in the colour buffer already hold the integer bit
+    * patterns, and the float[4] they are read back as is a carrier, not a
+    * value. __float_as_uint() recovers exactly what the shader wrote, and
+    * __uint_as_float() puts it back for a masked or composited round trip.
+    * Every step is a bitcast; nothing arithmetic touches these words, which
+    * matters because 0..255 as float bit patterns are denormals and one
+    * multiply would flush them to zero.
+    */
+   CP_COLOR_R8G8B8A8_UINT,
 };
 
 /*

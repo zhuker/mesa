@@ -261,6 +261,7 @@ if dep_vulkan_loader.found()
     'cpvk_tex3d',
     'cpvk_tri',
     'cpvk_ubo',
+    'cpvk_uint_attachment',
     'cpvk_wsi',
   ]
   foreach test_name : cpvk_test_names

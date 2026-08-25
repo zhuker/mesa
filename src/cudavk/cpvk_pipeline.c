@@ -20,6 +20,7 @@
 #include "vk_descriptor_set_layout.h"
 #include "vk_pipeline.h"
 #include "vk_pipeline_layout.h"
+#include "vk_render_pass.h"
 #include "vk_util.h"
 
 #include "cp_nir_options.h"
@@ -1392,6 +1393,31 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
          };
       } else {
          pipeline->blend.colormask = 0xF;
+      }
+
+      /*
+       * Blending into an integer attachment, which Vulkan forbids: the
+       * equation is a float one and the attachment's channels are numbers,
+       * so there is nothing for a factor to mean. The format table does not
+       * advertise COLOR_ATTACHMENT_BLEND_BIT for such a format, which makes
+       * blendEnable there invalid usage rather than a driver decision, and
+       * this is where that decision is made once. Clearing `enable` here
+       * rather than in the writeback is deliberate: `enable` is the single
+       * field batch eligibility, A-buffer routing, composite and the peel
+       * loop all read, so an integer attachment cannot reach any of them
+       * with a half-cleared state. The write mask survives, because masking
+       * channels is a select and not arithmetic.
+       */
+      const VkPipelineRenderingCreateInfo *rendering =
+         vk_get_pipeline_rendering_create_info(info);
+      if (pipeline->blend.enable && rendering &&
+          rendering->colorAttachmentCount > 0 &&
+          util_format_is_pure_integer(vk_format_to_pipe_format(
+             rendering->pColorAttachmentFormats[0]))) {
+         fprintf(stderr, "cudavk: blending is enabled on integer colour "
+                 "format %u, which Vulkan does not allow; ignoring it\n",
+                 rendering->pColorAttachmentFormats[0]);
+         pipeline->blend.enable = false;
       }
 
       /*

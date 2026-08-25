@@ -820,6 +820,7 @@ cp_bytes_per_pixel(uint32_t encoding)
    case CP_COLOR_R16_SFLOAT:         return 2;
    case CP_COLOR_R8G8_UNORM:         return 2;
    case CP_COLOR_R8_UNORM:           return 1;
+   case CP_COLOR_R8G8B8A8_UINT:      return 4;
    default:                          return 4;
    }
 }
@@ -876,6 +877,20 @@ cp_load_dst(const void *ptr, uint32_t encoding, float *out)
       out[0] = cp_unorm8_to_float(v[0]);
       out[1] = cp_unorm8_to_float(v[1]);
       out[2] = 0.0f; out[3] = 1.0f;
+      break;
+   }
+   /*
+    * Integer: each channel comes back as the number it is, carried in the
+    * float slot as a bit pattern rather than converted into one. A write
+    * mask selects between this and the shader's output word for word, so the
+    * unwritten channels keep their exact bytes.
+    */
+   case CP_COLOR_R8G8B8A8_UINT: {
+      uint32_t p = *(const uint32_t *)ptr;
+      out[0] = __uint_as_float(p & 0xFFu);
+      out[1] = __uint_as_float((p >> 8) & 0xFFu);
+      out[2] = __uint_as_float((p >> 16) & 0xFFu);
+      out[3] = __uint_as_float((p >> 24) & 0xFFu);
       break;
    }
    default: {
@@ -968,6 +983,19 @@ cp_store_dst(void *ptr, uint32_t encoding, const float *c)
       uint8_t *v = (uint8_t *)ptr;
       v[0] = (uint8_t)cp_float_to_unorm8(c[0]);
       v[1] = (uint8_t)cp_float_to_unorm8(c[1]);
+      break;
+   }
+   /*
+    * Integer: the low eight bits of each channel's word, and nothing else.
+    * Vulkan says a value that does not fit the attachment is undefined here,
+    * so the mask is the whole conversion -- no clamp, no rounding and no
+    * sRGB curve, all three of which would be arithmetic on a bit pattern.
+    */
+   case CP_COLOR_R8G8B8A8_UINT: {
+      *(uint32_t *)ptr = (__float_as_uint(c[0]) & 0xFFu) |
+                         ((__float_as_uint(c[1]) & 0xFFu) << 8) |
+                         ((__float_as_uint(c[2]) & 0xFFu) << 16) |
+                         ((__float_as_uint(c[3]) & 0xFFu) << 24);
       break;
    }
    default: {
