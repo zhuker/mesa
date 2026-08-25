@@ -41,7 +41,7 @@ set -u
 
 SAMPLE=${1:?usage: cp_gpu_busy.sh SAMPLE [SECONDS] [DRIVER]}
 SECONDS_TARGET=${2:-20}
-DRIVER=${3:-cudapipe}
+DRIVER=${3:-native}
 
 MESA=${MESA:-$HOME/mesa}
 VULKAN=${VULKAN:-$HOME/git/Vulkan}
@@ -56,10 +56,11 @@ TRIM_PCT=${TRIM_PCT:-10}
 MIN_SAMPLES=${MIN_SAMPLES:-60}
 
 case $DRIVER in
+    native)   export VK_ICD_FILENAMES=$MESA/build-cudapipe/src/cudapipe/cudapipe_native_devenv_icd.x86_64.json ;;
     cudapipe) export VK_ICD_FILENAMES=$M/cudapipe/cudapipe_devenv_icd.x86_64.json ;;
     llvmpipe) export VK_ICD_FILENAMES=$M/lavapipe/lvp_devenv_icd.x86_64.json ;;
     nvidia)   ;;
-    *) echo "DRIVER must be cudapipe, llvmpipe or nvidia" >&2; exit 1 ;;
+    *) echo "DRIVER must be native, cudapipe, llvmpipe or nvidia" >&2; exit 1 ;;
 esac
 
 cd "$VULKAN" || exit 1

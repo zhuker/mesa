@@ -51,7 +51,7 @@ AGAINST=${2:-}
 
 MESA=${MESA:-$HOME/mesa}
 VULKAN=${VULKAN:-$HOME/git/Vulkan}
-T=$MESA/src/gallium/drivers/cudapipe/tests
+T=$MESA/src/cudapipe/tests
 M=$MESA/build-cudapipe/src/gallium/targets
 # Two frame counts, because the two passes answer different questions.
 #
@@ -75,11 +75,17 @@ M=$MESA/build-cudapipe/src/gallium/targets
 FRAMES=${FRAMES:-60}
 BENCH_FRAMES=${BENCH_FRAMES:-600}
 
-case ${DRIVER:=cudapipe} in
+# `native` is the CUDA Vulkan driver and the default; `cudapipe` is the older
+# Gallium-hosted one, kept only until it is removed. Everything else about a
+# run is identical between them, which is the point: the same sixty frames and
+# the same six hundred timed ones, through a different ICD.
+NATIVE_ICD=$MESA/build-cudapipe/src/cudapipe/cudapipe_native_devenv_icd.x86_64.json
+case ${DRIVER:=native} in
+    native)   ICD=$NATIVE_ICD ;;
     cudapipe) ICD=$M/cudapipe/cudapipe_devenv_icd.x86_64.json ;;
     llvmpipe) ICD=$M/lavapipe/lvp_devenv_icd.x86_64.json ;;
     nvidia)   ICD= ;;
-    *) echo "DRIVER must be cudapipe, llvmpipe or nvidia" >&2; exit 1 ;;
+    *) echo "DRIVER must be native, cudapipe, llvmpipe or nvidia" >&2; exit 1 ;;
 esac
 
 ROOT=$VULKAN/build/iter

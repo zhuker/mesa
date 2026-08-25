@@ -10,7 +10,7 @@ usage() {
 [[ $# -ge 2 && $# -le 3 ]] || usage
 CAPTURE=$(realpath "$1")
 OUT=$(realpath -m "$2")
-ICD=${3:-${VK_DRIVER_FILES:-$HOME/mesa/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv_icd.x86_64.json}}
+ICD=${3:-${VK_DRIVER_FILES:-$HOME/mesa/build-cudapipe/src/cudapipe/cudapipe_native_devenv_icd.x86_64.json}}
 HERE=$(cd "$(dirname "$0")" && pwd)
 FRAMES="$HERE/cp_gfxr_frames.py"
 REPLAY=${GFXRECON_REPLAY:-$HOME/gfxreconstruct/build/tools/replay/gfxrecon-replay}

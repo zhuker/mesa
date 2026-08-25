@@ -1,14 +1,18 @@
 # cudapipe
 
-This tree is a Mesa fork used for one thing: `src/gallium/drivers/cudapipe`, a
-CUDA software rasterizer exposed as a Vulkan ICD. No other part of Mesa is
-being worked on here.
+This tree is a Mesa fork used for one thing: `src/cudapipe`, a CUDA software
+rasterizer exposed as a Vulkan ICD, built with `-Dcudavk=true`. No other part
+of Mesa is being worked on here.
+
+`src/gallium/drivers/cudapipe` is the older Gallium-hosted driver it replaced.
+It is being removed; nothing new should be built on it. Its tooling has already
+moved to `src/cudapipe/tests`.
 
 ## Read first
 
 - `CUDAPIPE_HANDOFF.md` — what the driver is, how to build and run it, its
   architecture, the known gaps, and the lessons that cost the most to learn.
-- `src/gallium/drivers/cudapipe/tests/TESTING.md` — how correctness is checked,
+- `src/cudapipe/tests/TESTING.md` — how correctness is checked,
   how cost is measured reliably enough to compare, and how to find where the
   time actually goes. Read it before trusting a number from either half.
 
@@ -20,7 +24,7 @@ they have.
 ## Environment switches
 
 The driver has 97 of them and reads **none** of them with `getenv`. They are
-declared in one array in `src/gallium/drivers/cudapipe/cp_debug.c`, resolved
+declared in one array in `src/cudapipe/cp_debug.c`, resolved
 once at screen creation into a read-only `struct cp_debug`, and read as
 `cp_debug->field`.
 
@@ -31,7 +35,7 @@ the one-line meaning, which is what makes `CUDAPIPE_HELP=1` and the generated
 both, and the flags are this driver's debugging surface — the point of the
 registry is that the next person can find them without grep.
 
-- `src/gallium/drivers/cudapipe/FLAGS.md` — all of them, generated.
+- `src/cudapipe/FLAGS.md` — all of them, generated.
 - `CUDAPIPE_HELP=1 <any vulkan app>` — the same table, with what each one
   resolved to in that process.
 - `tests/cp_debug_doc.py --check` — fails if `FLAGS.md` has drifted from the

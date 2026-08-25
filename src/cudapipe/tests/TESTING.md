@@ -92,7 +92,7 @@ which does all of its image work.
 
 ```bash
 cd ~/git/Vulkan
-S="$(grep -v '^#' ~/mesa/src/gallium/drivers/cudapipe/tests/headless_streamer_samples.txt | tr '\n' ' ')"
+S="$(grep -v '^#' ~/mesa/src/cudapipe/tests/headless_streamer_samples.txt | tr '\n' ' ')"
 M=~/mesa/build-cudapipe/src/gallium/targets
 
 SAMPLES="$S" VALIDATION=0 OUT=build/compare/ref      ./run_offscreen.sh
@@ -102,7 +102,7 @@ SAMPLES="$S" VALIDATION=0 OUT=build/compare/llvmpipe \
   VK_ICD_FILENAMES=$M/lavapipe/lvp_devenv_icd.x86_64.json ./run_offscreen.sh
 
 cd build/compare
-python3 ~/mesa/src/gallium/drivers/cudapipe/tests/cp_gallery.py ref cuda llvmpipe \
+python3 ~/mesa/src/cudapipe/tests/cp_gallery.py ref cuda llvmpipe \
     -o three.html --ref-label nvidia --test-label cudapipe --test2-label llvmpipe
 ```
 
@@ -117,7 +117,7 @@ llvmpipe" below.
 cd ~/git/Vulkan
 R=$PWD/build/frames60
 M=~/mesa/build-cudapipe/src/gallium/targets
-T=~/mesa/src/gallium/drivers/cudapipe/tests
+T=~/mesa/src/cudapipe/tests
 
 $T/cp_perf_run.sh nvidia   ""                                          $R/nvidia   60
 $T/cp_perf_run.sh cudapipe $M/cudapipe/cudapipe_devenv_icd.x86_64.json $R/cuda     60

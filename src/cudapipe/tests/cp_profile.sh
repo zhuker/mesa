@@ -70,7 +70,7 @@ FRAMES=${3:-10}
 MESA=${MESA:-$HOME/mesa}
 VULKAN=${VULKAN:-$HOME/git/Vulkan}
 CUDA=${CUDA:-/usr/local/cuda}
-ICD=${ICD:-$MESA/build-cudapipe/src/gallium/targets/cudapipe/cudapipe_devenv_icd.x86_64.json}
+ICD=${ICD:-$MESA/build-cudapipe/src/cudapipe/cudapipe_native_devenv_icd.x86_64.json}
 
 # $CUDA/bin/nsys is a wrapper with the version that shipped with the toolkit
 # hardcoded into it, so a newer Nsight Systems installed beside it is ignored

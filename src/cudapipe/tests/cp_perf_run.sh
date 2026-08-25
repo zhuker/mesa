@@ -48,7 +48,7 @@
 #
 #   R=$PWD/build/frames60
 #   M=$HOME/mesa/build-cudapipe/src/gallium/targets
-#   T=$HOME/mesa/src/gallium/drivers/cudapipe/tests
+#   T=$HOME/mesa/src/cudapipe/tests
 #   $T/cp_perf_run.sh nvidia   ""                                          $R/nvidia   60
 #   $T/cp_perf_run.sh cudapipe $M/cudapipe/cudapipe_devenv_icd.x86_64.json $R/cuda     60
 #   $T/cp_perf_run.sh llvmpipe $M/lavapipe/lvp_devenv_icd.x86_64.json      $R/llvmpipe 60
@@ -65,7 +65,7 @@ set -u
 LABEL=$1; ICD=$2; OUT=$3; FRAMES=$4; BENCH=${5:-0}
 
 VULKAN=${VULKAN:-$HOME/git/Vulkan}
-LIST=${LIST:-$HOME/mesa/src/gallium/drivers/cudapipe/tests/headless_streamer_samples.txt}
+LIST=${LIST:-$HOME/mesa/src/cudapipe/tests/headless_streamer_samples.txt}
 cd "$VULKAN" || exit 1
 BIN=build/bin
 SAMPLES=${SAMPLES:-$(grep -v '^#' "$LIST" | tr '\n' ' ')}
