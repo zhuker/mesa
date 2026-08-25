@@ -1,0 +1,10 @@
+# Run output, not source.
+cpvk_interop_render
+*.o
+f*_slot*_in.png
+f*_slot*_out.png
+f*_slot*_expected.png
+f*_slot*_diff.png
+__pycache__/
+*.pyc
+*.spv
