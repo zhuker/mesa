@@ -78,6 +78,18 @@ static const struct cp_flag_value ctx_scheds[] = {
    { NULL, 0 },
 };
 
+static const struct cp_flag_value scalarize_classes[] = {
+   { "all",   CP_SCALARIZE_ALL },
+   { "none",  CP_SCALARIZE_NONE },
+   { "basic", CP_SCALARIZE_BASIC },
+   { "sel",   CP_SCALARIZE_SEL },
+   { "alu",   CP_SCALARIZE_ALU },
+   { "move",  CP_SCALARIZE_MOVE },
+   { "intr",  CP_SCALARIZE_INTR },
+   { "rest",  CP_SCALARIZE_REST },
+   { NULL, 0 },
+};
+
 static const struct cp_flag_value arena_modes[] = {
    { "advise",     CP_ARENA_ADVISE },
    { "pinned",     CP_ARENA_PINNED },
@@ -138,6 +150,23 @@ static const struct cp_flag_def flags[] = {
      "count fragments per draw; also compiles the instrumented kernels in" },
    { "CUDAVK_NVTX", CP_FLAG_BOOL_PRESENCE, F(nvtx),
      "push an NVTX range around each draw and stage, for nsys" },
+   { "CUDAVK_DEBUG_ROWS", CP_FLAG_BOOL_PRESENCE, F(debug_rows),
+     "trace the per-draw tables a batch builds: fragment UBO slots and the "
+     "vertex slice table the fragment stage searches" },
+   { "CUDAVK_DEBUG_CLIP", CP_FLAG_BOOL_PRESENCE, F(debug_clip),
+     "report what each batch hands the clip stage: triangles, draws, whether "
+     "the stable slot mode is on" },
+   { "CUDAVK_DEBUG_PASS", CP_FLAG_BOOL_PRESENCE, F(debug_pass),
+     "report, for the first three batches only, every condition that decides "
+     "whether a blended batch may join the open pass episode" },
+   { "CUDAVK_DEBUG_EPISODE", CP_FLAG_BOOL_PRESENCE, F(debug_episode),
+     "trace episode boundaries: what appended to an episode and what cut it" },
+   { "CUDAVK_DEBUG_RT", CP_FLAG_BOOL_PRESENCE, F(debug_rt),
+     "trace descriptor writes, the attachments a render pass resolved to, and "
+     "the first texels either side of an image copy; the copies sync" },
+   { "CUDAVK_DEBUG_FACES", CP_FLAG_BOOL_PRESENCE, F(debug_faces),
+     "when a cube descriptor is written, read back the first texel of each of "
+     "its six faces from where the sampler will look; syncs" },
 
    /* ---- subsystem switches ---- */
    { "CUDAVK_NO_ABUFFER", CP_FLAG_BOOL_PRESENCE, F(no_abuffer),
@@ -310,6 +339,22 @@ static const struct cp_flag_def flags[] = {
      "cost of the blended path" },
    { "CUDAVK_NO_BATCH", CP_FLAG_BOOL_PRESENCE, F(no_batch),
      "disable draw batching entirely" },
+   { "CUDAVK_NO_BATCH_BLEND", CP_FLAG_BOOL_PRESENCE, F(no_batch_blend),
+     "batch opaque draws only: a blended draw never joins a batch, so it "
+     "never reaches a pass episode and builds, sorts and peels its own "
+     "A-buffer (23.49 ms against 8.79 on Crossroads)" },
+   { "CUDAVK_NO_MERGE_SCISSOR", CP_FLAG_BOOL_PRESENCE, F(no_merge_scissor),
+     "require an equal scissor before two blended draws merge, as the front "
+     "end did before it trusted the renderer's per-draw rectangles" },
+   { "CUDAVK_KEEP_VOFF", CP_FLAG_BOOL_PRESENCE, F(keep_voff),
+     "put the vertex offset back in the merge key; it is the largest merge "
+     "blocker there is, 13,281 separations of 38,155 on Crossroads" },
+   { "CUDAVK_KEEP_INSTKEY", CP_FLAG_BOOL_PRESENCE, F(keep_instkey),
+     "put the instance count back in the merge key, which the renderer's "
+     "per-draw instance_counts[] row makes unnecessary" },
+   { "CUDAVK_KEEP_PUSHKEY", CP_FLAG_BOOL_PRESENCE, F(keep_pushkey),
+     "put the push-constant block back in the merge key, so draws that push "
+     "different constants stop merging" },
    { "CUDAVK_NO_BINCACHE", CP_FLAG_BOOL_PRESENCE, F(no_bincache),
      "disable the compiled-kernel binary cache" },
 
@@ -327,6 +372,11 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_ABUFFER_LAYERS", CP_FLAG_UINT, F(abuffer_layers),
      "cap A-buffer layers per pixel; 0 uses the built-in limit",
      .empty_is_unset = true },
+   { "CUDAVK_ABUF_MIN_TRIS", CP_FLAG_UINT, F(abuf_min_tris),
+     "triangles a blended batch must have before the A-buffer's fixed cost is "
+     "worth paying; 0, the default, means always, and is deliberate — with "
+     "the bootstrap scan fixed Crossroads measured 10.9 ms at 0 against 33.0 "
+     "at 256", .dflt = 0, .has_range = true, .lo = 0, .hi = UINT32_MAX },
    { "CUDAVK_ABUF_COMPILE", CP_FLAG_OPT_BOOL, F(abuf_compile),
      "force the A-buffer branches in (1) or out (0) of the NVRTC build",
      .empty_is_unset = true },
@@ -380,6 +430,21 @@ static const struct cp_flag_def flags[] = {
      "print each shader's LLVM IR" },
    { "CUDAVK_DUMP_PTX", CP_FLAG_BOOL_PRESENCE, F(dump_ptx),
      "print each shader's generated PTX" },
+   { "CUDAVK_SCALARIZE", CP_FLAG_ENUM, F(scalarize),
+     "which ALU operations to scalarise: all | none | basic | sel | alu | "
+     "move | intr | rest; all is the NULL-filter pass every sample is "
+     "rendered with, and the classes are there to bisect a backend bug",
+     .dflt = CP_SCALARIZE_ALL, .values = scalarize_classes },
+   { "CUDAVK_NO_HOIST_INPUTS", CP_FLAG_BOOL_PRESENCE, F(no_hoist_inputs),
+     "stop hoisting a vertex shader's input loads above the arithmetic that "
+     "consumes them; that hoist is 6.14 against 8.63 ms on instancing" },
+   { "CUDAVK_NO_REG_SSA", CP_FLAG_BOOL_PRESENCE, F(no_reg_ssa),
+     "leave NIR registers alone before the backend, so each becomes an alloca "
+     "and the NVPTX backend gives the kernel a __local_depot" },
+   { "CUDAVK_KEEP_SMALL_DYNAMIC_REGCAP", CP_FLAG_BOOL_PRESENCE,
+     F(keep_small_dynamic_regcap),
+     "keep the tuned register cap on small fragment shaders that call the "
+     "dynamic sampler helper; they cannot amortise its spills" },
 
    /* ---- rasterizer tuning (NVRTC -D options) ---- */
    { "CUDAVK_SMALL_THRESHOLD", CP_FLAG_OPT_INT, F(small_threshold),
@@ -397,6 +462,71 @@ static const struct cp_flag_def flags[] = {
 };
 
 #undef F
+
+/*
+ * Names this driver no longer reads, and what to use instead.
+ *
+ * This exists because a variable that changes nothing looks exactly like a
+ * variable that works. CPVK_BATCH and CPVK_BATCH_BLEND were left exported in
+ * one shell, every process launched from it inherited them, and every A/B run
+ * after that compared a feature against itself. The numbers reproduced, which
+ * is what made them convincing, and they meant nothing. That cost a day.
+ *
+ * A driver whose behaviour an invisible variable can change must say so, and
+ * the only place that can say it is the file that reads the environment. So
+ * the retired names live beside the live ones: `now` is the replacement when
+ * the switch was renamed, and NULL when nothing reads the name at all any
+ * more. Silent when none is set, which is the common case.
+ */
+static const struct {
+   const char *old;
+   const char *now;
+} retired[] = {
+   /* Renamed into the registry: one prefix, one table. */
+   { "CPVK_DEBUG_ROWS",                "CUDAVK_DEBUG_ROWS" },
+   { "CPVK_DEBUG_CLIP",                "CUDAVK_DEBUG_CLIP" },
+   { "CPVK_DEBUG_PASS",                "CUDAVK_DEBUG_PASS" },
+   { "CPVK_DEBUG_EPISODE",             "CUDAVK_DEBUG_EPISODE" },
+   { "CPVK_DEBUG_RT",                  "CUDAVK_DEBUG_RT" },
+   { "CPVK_DEBUG_FACES",               "CUDAVK_DEBUG_FACES" },
+   { "CPVK_ABUF_MIN_TRIS",             "CUDAVK_ABUF_MIN_TRIS" },
+   { "CPVK_NO_BATCH",                  "CUDAVK_NO_BATCH" },
+   { "CPVK_NO_BATCH_BLEND",            "CUDAVK_NO_BATCH_BLEND" },
+   { "CPVK_NO_MERGE_SCISSOR",          "CUDAVK_NO_MERGE_SCISSOR" },
+   { "CPVK_KEEP_VOFF",                 "CUDAVK_KEEP_VOFF" },
+   { "CPVK_KEEP_INSTKEY",              "CUDAVK_KEEP_INSTKEY" },
+   { "CPVK_KEEP_PUSHKEY",              "CUDAVK_KEEP_PUSHKEY" },
+   { "CPVK_SCALARIZE",                 "CUDAVK_SCALARIZE" },
+   { "CPVK_NO_HOIST_INPUTS",           "CUDAVK_NO_HOIST_INPUTS" },
+   { "CPVK_NO_REG_SSA",                "CUDAVK_NO_REG_SSA" },
+   { "CPVK_KEEP_SMALL_DYNAMIC_REGCAP", "CUDAVK_KEEP_SMALL_DYNAMIC_REGCAP" },
+
+   /* No replacement: nothing in the driver reads these at all. The first two
+    * outlived the code that consulted them; CPVK_MERGE_PUSH named the opt-in
+    * for a behaviour that is now the default, so its inverse
+    * CUDAVK_KEEP_PUSHKEY is the switch to reach for and not a rename of it;
+    * the last two are the pair that cost the day above. */
+   { "CPVK_NO_DESC_KEY",  NULL },
+   { "CPVK_DEBUG_PUSH",   NULL },
+   { "CPVK_MERGE_PUSH",   NULL },
+   { "CPVK_BATCH",        NULL },
+   { "CPVK_BATCH_BLEND",  NULL },
+};
+
+static void
+report_retired(void)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(retired); i++) {
+      if (!getenv(retired[i].old))
+         continue;
+      if (retired[i].now)
+         fprintf(stderr, "cudavk: %s is retired and ignored; use %s\n",
+                 retired[i].old, retired[i].now);
+      else
+         fprintf(stderr, "cudavk: %s is retired and ignored\n",
+                 retired[i].old);
+   }
+}
 
 static struct cp_debug debug_state;
 const struct cp_debug *cp_debug = &debug_state;
@@ -669,6 +799,8 @@ cp_debug_init(void)
       parse_one(&flags[i], i);
 
    apply_couplings();
+
+   report_retired();
 
    if (getenv("CUDAVK_HELP"))
       cp_debug_help();

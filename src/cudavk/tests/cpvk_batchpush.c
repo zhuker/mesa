@@ -12,12 +12,20 @@
  * both. Three triangles side by side in three colours; a batch that shades
  * them all from one row draws one triangle in one colour, three times over.
  *
- * It passes today because the push block is part of the merge key and these
- * draws are never merged. Run it with CPVK_MERGE_PUSH=1 -- the switch that
- * removes that key -- and it fails, which is the defect recorded in
- * CUDAVK_VK_NATIVE.md: pushconstants renders 4 coarse colours over 12,961
- * lit pixels where 16 over 51,880 is correct, because every draw is placed at
- * the first one\'s position.
+ * The push block is no longer part of the merge key, so these three draws do
+ * merge, and this test passes with them merged: `CUDAVK_DEBUG_BATCH=1` prints
+ * "batch of 3" and the image is still three triangles in three colours.
+ * That is the whole point of it. `CUDAVK_KEEP_PUSHKEY=1` puts the block back
+ * in the key and separates them again -- three "batch of 1" -- which also
+ * passes and proves nothing, so it is the arm to run only when telling a
+ * merge bug apart from a push-upload bug.
+ *
+ * Merging push blocks is still not free everywhere. The defect recorded in
+ * CUDAVK_VK_NATIVE.md is a *sample*, not this test: pushconstants renders 4
+ * coarse colours over 12,961 lit pixels where 16 over 51,880 is correct,
+ * because every draw is placed at the first one\'s position. This test is the
+ * passing three-draw case that bisection starts from; it does not reproduce
+ * that sample yet.
  *
  * The scaffolding is cpvk_batch\'s.
  */

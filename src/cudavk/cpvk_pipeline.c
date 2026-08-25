@@ -66,35 +66,41 @@ static const struct spirv_to_nir_options cpvk_spirv_options = {
  * emit_alu() now applies the swizzle at any width, so in principle none do.
  * In practice twelve samples render wrong without scalarisation while all
  * fourteen unit tests pass, so something narrower than "vectors" is broken.
- * CPVK_SCALARIZE selects what to keep scalarising, to find out which:
+ * CUDAVK_SCALARIZE selects what to keep scalarising, to find out which:
  *
- *   (unset) everything, which is the behaviour before this existed
+ *   all     everything, which is the behaviour before this existed, and the
+ *           default -- it does not reach this filter at all, it runs
+ *           nir_lower_alu_to_scalar with a NULL one
  *   none    nothing
  *   alu     the arithmetic (fadd/fmul/ffma/...) only
  *   sel     bcsel and the comparisons only
  *   move    mov and the vecN constructors only
+ *
+ * The class is read from the registry rather than passed as the pass's `data`
+ * pointer, because the registry resolved it once at device creation and this
+ * runs per instruction.
  */
 static bool
-cpvk_scalarize_filter(const nir_instr *instr, const void *data)
+cpvk_scalarize_filter(const nir_instr *instr, UNUSED const void *data)
 {
    if (instr->type != nir_instr_type_alu)
       return false;
 
-   const char *which = data;
+   const int which = cp_debug->scalarize;
    const nir_alu_instr *alu = nir_instr_as_alu(instr);
 
-   if (!strcmp(which, "none"))
+   if (which == CP_SCALARIZE_NONE)
       return false;
 
    switch (alu->op) {
    case nir_op_bcsel:
    case nir_op_flt: case nir_op_fge: case nir_op_feq: case nir_op_fneu:
    case nir_op_ilt: case nir_op_ige: case nir_op_ieq: case nir_op_ine:
-      return !strcmp(which, "sel") || !strcmp(which, "alu");
+      return which == CP_SCALARIZE_SEL || which == CP_SCALARIZE_ALU;
 
    case nir_op_mov:
    case nir_op_vec2: case nir_op_vec3: case nir_op_vec4:
-      return !strcmp(which, "move") || !strcmp(which, "alu");
+      return which == CP_SCALARIZE_MOVE || which == CP_SCALARIZE_ALU;
 
    /* Everything that lowers to an LLVM intrinsic, where build_intrinsic()
     * overloads on the type of the first argument only. */
@@ -103,7 +109,7 @@ cpvk_scalarize_filter(const nir_instr *instr, const void *data)
    case nir_op_fpow: case nir_op_ffma: case nir_op_fabs:
    case nir_op_fmin: case nir_op_fmax: case nir_op_ffloor: case nir_op_fceil:
    case nir_op_ftrunc: case nir_op_fround_even: case nir_op_ffract:
-      return !strcmp(which, "intr") || !strcmp(which, "alu");
+      return which == CP_SCALARIZE_INTR || which == CP_SCALARIZE_ALU;
 
    /* Plain LLVM binary operators. */
    case nir_op_fadd: case nir_op_fsub: case nir_op_fmul: case nir_op_fneg:
@@ -111,10 +117,10 @@ cpvk_scalarize_filter(const nir_instr *instr, const void *data)
    case nir_op_iadd: case nir_op_isub: case nir_op_imul: case nir_op_ineg:
    case nir_op_iand: case nir_op_ior: case nir_op_ixor: case nir_op_inot:
    case nir_op_ishl: case nir_op_ishr: case nir_op_ushr:
-      return !strcmp(which, "basic") || !strcmp(which, "alu");
+      return which == CP_SCALARIZE_BASIC || which == CP_SCALARIZE_ALU;
 
    default:
-      return !strcmp(which, "rest") || !strcmp(which, "alu");
+      return which == CP_SCALARIZE_REST || which == CP_SCALARIZE_ALU;
    }
 }
 
@@ -185,12 +191,11 @@ cpvk_optimize_nir(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_cse);
       NIR_PASS(progress, nir, nir_opt_undef);
       NIR_PASS(progress, nir, nir_opt_deref);
-      const char *which = getenv("CPVK_SCALARIZE");
-      if (!which)
+      if (cp_debug->scalarize == CP_SCALARIZE_ALL)
          NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
       else
          NIR_PASS(progress, nir, nir_lower_alu_to_scalar,
-                  cpvk_scalarize_filter, (void *)which);
+                  cpvk_scalarize_filter, NULL);
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
    } while (progress);
 
@@ -276,14 +281,10 @@ cpvk_lower_nir(nir_shader *nir)
     * cudavk ever sees a shader. The capture's shaders use mix(). */
    NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, true);
 
-   {
-      const char *which = getenv("CPVK_SCALARIZE");
-      if (!which)
-         NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
-      else
-         NIR_PASS(_, nir, nir_lower_alu_to_scalar, cpvk_scalarize_filter,
-                  (void *)which);
-   }
+   if (cp_debug->scalarize == CP_SCALARIZE_ALL)
+      NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+   else
+      NIR_PASS(_, nir, nir_lower_alu_to_scalar, cpvk_scalarize_filter, NULL);
 
    NIR_PASS(_, nir, nir_opt_dce);
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
@@ -1140,7 +1141,7 @@ cpvk_compile_stage(struct cpvk_device *dev,
     * global loads (94.4% long-scoreboard stalls, 21% DRAM throughput).  Mesa's
     * existing pass exposes those independent loads just as the Gallium path's
     * lowering does: 6.14 instead of 8.63 ms/frame on that sample. */
-   if (!getenv("CPVK_NO_HOIST_INPUTS") &&
+   if (!cp_debug->no_hoist_inputs &&
        nir->info.stage == MESA_SHADER_VERTEX)
       NIR_PASS(_, nir, nir_opt_move_to_top,
                nir_move_to_top_input_loads_simple);
@@ -1155,7 +1156,7 @@ cpvk_compile_stage(struct cpvk_device *dev,
     * lavapipe handed the shader over. A register becomes an alloca in the
     * LLVM the backend builds.
     */
-   if (!getenv("CPVK_NO_REG_SSA")) {
+   if (!cp_debug->no_reg_ssa) {
       NIR_PASS(_, nir, nir_lower_reg_intrinsics_to_ssa);
       NIR_PASS(_, nir, nir_opt_dce);
    }
@@ -1181,7 +1182,7 @@ cpvk_compile_stage(struct cpvk_device *dev,
     * and chooses the cap there, then texturemipmapgen's orbit makes it 2x
     * slower. Keep larger dynamic shaders eligible: multisampling crosses this
     * boundary and benefits from the extra resident block. */
-   if (bin && frag && !getenv("CPVK_KEEP_SMALL_DYNAMIC_REGCAP") &&
+   if (bin && frag && !cp_debug->keep_small_dynamic_regcap &&
        bin->tex_descs_dynamic && !bin->num_tex_descs) {
       for (unsigned mode = 0; mode < CP_SHADER_EXEC_COUNT; mode++) {
          struct cp_shader_exec *exec = &bin->exec[mode];

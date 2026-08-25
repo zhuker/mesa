@@ -204,7 +204,7 @@ between draws when a later count comes within `CP_ABUF_GROW_AT` (0.75) of
 capacity, up to `CP_ABUF_MAX_GROWTHS` (8) times; a growth is applied by the
 *next* draw, because the draw that asked for it is still reading the arrays a
 resize would free. And a batch too small to pay for the build skips it:
-`CPVK_ABUF_MIN_TRIS` is a triangle-count floor, known before anything is spent.
+`CUDAVK_ABUF_MIN_TRIS` is a triangle-count floor, known before anything is spent.
 It defaults to 0 today, which is deliberate — the corrected bootstrap and the
 zero threshold together are why the renderer does not return to an earlier
 failure mode on Crossroads.
@@ -535,6 +535,8 @@ epoch; if they differ, the array is rebuilt, after a `cuStreamWaitEvent` on the
 writer event so that the rebuild cannot overtake the write. The array is keyed
 by (view cookie, sampler cookie), and the total is capped by
 `CPVK_TEXTURE_CACHE_BUDGET` (384 MiB) with a purge path when it is exceeded.
+That one is a compile-time `#define` in `cpvk_texture_cache.c`, not an
+environment switch: every `CPVK_` *variable* name is retired.
 
 **Admission is transactional and per launch, not per texture read.** Before a
 fragment launch, `cp_texture_cache_available()` walks every static sampled site
@@ -669,9 +671,22 @@ as the texture cache's allocation, conversion and upload failures; and negative
 controls for the checks themselves — `CUDAVK_ABUF_FUSE_BREAK` makes the A-buffer
 fusion's equivalence gate fail on purpose.
 
-A few switches are still read with `getenv` inside `cp_renderer.c`: the
-`CPVK_DEBUG_*` names and `CPVK_ABUF_MIN_TRIS`. They are pre-registry leftovers
-on cold or debug-only paths. Do not add more.
+Nothing in the driver reads the environment outside the registry, and that is
+checked rather than asked for: `tests/cp_no_getenv.py` fails on any `getenv` in
+driver sources, allowing only `cp_debug.c` itself and the separate programs
+under `tests/` and `samples/`. It also catches `debug_get_bool_option` and its
+relatives, which are a `getenv` with a default folded in and hide a switch from
+`CUDAVK_HELP=1` in exactly the same way.
+
+There used to be a second family here. Nineteen `CPVK_*` switches were read
+with `getenv` across `cp_renderer.c`, `cpvk_cmd.c` and `cpvk_pipeline.c`,
+including four on-by-default reverts of the kind this section tells you to add
+— invisible to `FLAGS.md`, unannounced by `CUDAVK_HELP=1`, and one of them,
+`CPVK_NO_BATCH`, a duplicate sitting three lines from the registry field that
+already did the same thing. They are now registry entries under `CUDAVK_`
+names. Their old names live in a retired table in `cp_debug.c` that names the
+replacement on stderr, so a script or a shell still carrying one is told, not
+ignored.
 
 ---
 

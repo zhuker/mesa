@@ -246,17 +246,6 @@ cpvk_ResetDescriptorPool(VkDevice _device, VkDescriptorPool pool,
  * application memory -- and a second copy of this switch would be a second
  * thing to be right about a descriptor the first one is wrong about.
  */
-/* Consulted per descriptor write and per draw; getenv scans the environment
- * every call, so resolve it once. */
-static bool
-cpvk_debug_rt(void)
-{
-   static int v = -1;
-   if (v < 0)
-      v = getenv("CPVK_DEBUG_RT") != NULL;
-   return v;
-}
-
 /*
  * The storage-image half of a descriptor, resolved from the view.
  *
@@ -320,7 +309,7 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
                       const VkDescriptorImageInfo *ii,
                       const VkDescriptorBufferInfo *bi)
 {
-   if (cpvk_debug_rt())
+   if (cp_debug->debug_rt)
       fprintf(stderr, "descw flat=%u type=%u ii=%p bi=%p\n", flat, type,
               (const void *)ii, (const void *)bi);
 
@@ -386,7 +375,7 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
        * image, so the only honest place to ask is when the descriptor that
        * will be sampled is written.
        */
-      if (getenv("CPVK_DEBUG_FACES") && ii->imageView) {
+      if (cp_debug->debug_faces && ii->imageView) {
          VK_FROM_HANDLE(cpvk_image_view, fv, ii->imageView);
          struct cpvk_image *fi = fv ? fv->image : NULL;
          if (fi && fi->mem && fi->vk.array_layers == 6) {
@@ -403,7 +392,7 @@ cpvk_write_descriptor(struct cpvk_descriptor_set *set, unsigned flat,
          }
       }
 
-      if (cpvk_debug_rt()) {
+      if (cp_debug->debug_rt) {
          VK_FROM_HANDLE(cpvk_image_view, dv, ii->imageView);
          fprintf(stderr, "desc flat=%u type=%u tex=%p "
                  "samp=%u img=%ux%u\n", flat, type,
@@ -440,7 +429,7 @@ cpvk_UpdateDescriptorSets(VkDevice _device, uint32_t writeCount,
                           uint32_t copyCount,
                           const VkCopyDescriptorSet *pCopies)
 {
-   if (cpvk_debug_rt())
+   if (cp_debug->debug_rt)
       fprintf(stderr, "updsets n=%u copies=%u\n", writeCount, copyCount);
 
    for (uint32_t w = 0; w < writeCount; w++) {
@@ -1539,7 +1528,7 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
           * follows Vulkan command-resource lifetime rules. */
          fb.texture_cookie = (uint64_t)(uintptr_t)view->image;
 
-         if (cpvk_debug_rt())
+         if (cp_debug->debug_rt)
             fprintf(stderr, "rt: %ux%u layer=%u level=%u layers=%u img=%ux%u "
                     "fmt=%u base=%p\n", fb.width, fb.height,
                     view->vk.base_array_layer, view->vk.base_mip_level,
@@ -2263,7 +2252,7 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
     * The front end was stricter than the renderer, and 3,339 of the
     * Crossroads capture's blended refusals were this.
     */
-   if (getenv("CPVK_NO_MERGE_SCISSOR") || !a->pipeline || !b->pipeline ||
+   if (cp_debug->no_merge_scissor || !a->pipeline || !b->pipeline ||
        !a->pipeline->blend.enable || !b->pipeline->blend.enable)
       CPVK_DIFF(memcmp(&a->scissor, &b->scissor, sizeof(a->scissor)),
                 "scissor");
@@ -2287,9 +2276,9 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
     *
     * It is the single largest merge blocker in the Crossroads capture: 13,281
     * separations of 38,155, ahead of the fragment shader's 12,068.
-    * CPVK_KEEP_VOFF restores it.
+    * CUDAVK_KEEP_VOFF restores it.
     */
-   if (getenv("CPVK_KEEP_VOFF"))
+   if (cp_debug->keep_voff)
       CPVK_DIFF(a->range.index_bias != b->range.index_bias, "vertex offset");
    /*
     * The instance count is *not* a merge condition. The renderer's own
@@ -2301,7 +2290,7 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
     * It was the second largest refusal in the Crossroads capture once the
     * vertex-offset condition stopped masking it: 9,168 of 32,668.
     */
-   if (getenv("CPVK_KEEP_INSTKEY"))
+   if (cp_debug->keep_instkey)
       CPVK_DIFF(a->call.instance_count != b->call.instance_count, "instance count");
    /* Descriptor bindings deliberately differ inside a batch.  The renderer's
     * per-draw UBO rows point at the immutable snapshots owned by this command
@@ -2311,23 +2300,23 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
    CPVK_DIFF(a->vs_push_size != b->vs_push_size ||
              a->fs_push_size != b->fs_push_size, "push constant size");
    /*
-    * The push block is in the key, and it is what stops multithreading and
-    * pushconstants batching: 446.8 draws a frame against the Gallium driver's
-    * 21.9, and 56.7 against 9.2.
+    * The push block is *not* in the key. While it was, it was what stopped
+    * multithreading and pushconstants batching: 446.8 draws a frame against
+    * the Gallium driver's 21.9, and 56.7 against 9.2.
     *
-    * It should not have to be. The block is bound as UBO slot
+    * It does not have to be. The block is bound as UBO slot
     * CPVK_UBO_PUSH_SLOT, each staged draw uploads its own, and the batch
     * snapshots the whole uniform row per draw. cpvk_batchpush merges eleven
     * draws with twelve distinct push blocks and renders byte-identical to
     * that driver, with and without a descriptor UBO beside them.
     *
-    * CPVK_MERGE_PUSH=1 removes it. Those two samples still render wrong with
-    * it, for a reason the test does not yet reproduce -- see
+    * CUDAVK_KEEP_PUSHKEY puts it back. Those two samples still render wrong
+    * when they merge, for a reason the test does not yet reproduce -- see
     * CUDAVK_VK_NATIVE.md. The switch is here so the next attempt can bisect
     * from a passing three-draw case toward the failing sample rather than the
     * other way round.
     */
-   if (getenv("CPVK_KEEP_PUSHKEY"))
+   if (cp_debug->keep_pushkey)
       CPVK_DIFF(memcmp(a->vs_push, b->vs_push, a->vs_push_size) ||
                 memcmp(a->fs_push, b->fs_push, a->fs_push_size),
                 "push constants");
@@ -2492,12 +2481,7 @@ cpvk_batch_eligible(struct cpvk_device *dev,
     * instance_counts[] row per draw. With that removed the same capture
     * replays at 8.81 ms against 9.45 and the heavier one at 31.2 against 34.5,
     * two runs each way, and 17/18 samples stay pixel-correct.
-    *
-    * CPVK_NO_BATCH=1 turns it off again.
     */
-   if (getenv("CPVK_NO_BATCH"))
-      return false;
-
    if (cp_debug->no_batch)
       return false;
    if (!cpvk_batch_structural(dev, scope, d))
@@ -2507,23 +2491,6 @@ cpvk_batch_eligible(struct cpvk_device *dev,
       *blended = false;
       return true;
    }
-   /*
-    * The blended half, which merges through the A-buffer: the order fragments
-    * composite in is decided per pixel rather than by submission order, so
-    * merging is sound in principle. It was left off for want of a test.
-    *
-    * cpvk_batchblend is that test -- cpvk_batchtex with blending on and depth
-    * writes off, nine draws over nine textures at nine depths -- and it is
-    * what this flag is validated against.
-    *
-    * It matters far more than the opaque half. A blended draw that does not
-    * join a batch never reaches an A-buffer pass episode, because the episode
-    * is entered from a batch flush; and without episodes every blended draw
-    * builds, sorts and peels its own A-buffer. Measured on the Crossroads
-    * capture that is 3,381 kernel launches a frame against the Gallium
-    * driver's 245, with cp_peel_advance alone running 109 times a frame
-    * against 0.1.
-    */
    /*
     * The blended half, on by default.
     *
@@ -2538,9 +2505,9 @@ cpvk_batch_eligible(struct cpvk_device *dev,
     * A-buffer pass episode, and without episodes every one of them builds,
     * sorts and peels its own A-buffer.
     *
-    * CPVK_NO_BATCH_BLEND=1 turns it off.
+    * CUDAVK_NO_BATCH_BLEND turns it off.
     */
-   if (!getenv("CPVK_NO_BATCH_BLEND")) {
+   if (!cp_debug->no_batch_blend) {
       *blended = true;
       return true;
    }
@@ -3556,7 +3523,7 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
    }
 
 
-   if (cpvk_debug_rt()) {
+   if (cp_debug->debug_rt) {
       /* The first texels of the source, as halves: what the pass just
        * rendered, before this copy places it. */
       uint16_t h[8] = { 0 };
@@ -3635,7 +3602,7 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
    if (cuMemcpy2DAsync(&m, cp->stream) != CUDA_SUCCESS)
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
-   if (cpvk_debug_rt()) {
+   if (cp_debug->debug_rt) {
       /* And what landed, read back from the destination this copy just
        * wrote: the face of the cube level, not the offscreen it came from. */
       uint16_t hd[8] = { 0 };

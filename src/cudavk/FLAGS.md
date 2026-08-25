@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-100 switches.
+116 switches.
 
 ## Tracing
 
@@ -40,6 +40,12 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_DEBUG_PASSSEQ` | bool (value) | `off` | — | log one line per framebuffer bind and per draw: shaders, blendedness, eligibility — the raw material for pass-structure statistics |
 | `CUDAVK_FRAG_CENSUS` | bool (presence) | `off` | — | count fragments per draw; also compiles the instrumented kernels in |
 | `CUDAVK_NVTX` | bool (presence) | `off` | — | push an NVTX range around each draw and stage, for nsys |
+| `CUDAVK_DEBUG_ROWS` | bool (presence) | `off` | — | trace the per-draw tables a batch builds: fragment UBO slots and the vertex slice table the fragment stage searches |
+| `CUDAVK_DEBUG_CLIP` | bool (presence) | `off` | — | report what each batch hands the clip stage: triangles, draws, whether the stable slot mode is on |
+| `CUDAVK_DEBUG_PASS` | bool (presence) | `off` | — | report, for the first three batches only, every condition that decides whether a blended batch may join the open pass episode |
+| `CUDAVK_DEBUG_EPISODE` | bool (presence) | `off` | — | trace episode boundaries: what appended to an episode and what cut it |
+| `CUDAVK_DEBUG_RT` | bool (presence) | `off` | — | trace descriptor writes, the attachments a render pass resolved to, and the first texels either side of an image copy; the copies sync |
+| `CUDAVK_DEBUG_FACES` | bool (presence) | `off` | — | when a cube descriptor is written, read back the first texel of each of its six faces from where the sampler will look; syncs |
 
 ## Subsystem switches
 
@@ -99,6 +105,11 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_UNSAFE_NO_OVERFLOW` | bool (value) | `off` | — | skip episode overflow readback and assume fragment/quad arrays fit; unsafe diagnostic only |
 | `CUDAVK_UNSAFE_FORCE_OPAQUE` | bool (value) | `off` | — | force every draw's blend state to disabled and let the result reach an opaque episode; renders wrong output, diagnostic upper bound for the cost of the blended path |
 | `CUDAVK_NO_BATCH` | bool (presence) | `off` | — | disable draw batching entirely |
+| `CUDAVK_NO_BATCH_BLEND` | bool (presence) | `off` | — | batch opaque draws only: a blended draw never joins a batch, so it never reaches a pass episode and builds, sorts and peels its own A-buffer (23.49 ms against 8.79 on Crossroads) |
+| `CUDAVK_NO_MERGE_SCISSOR` | bool (presence) | `off` | — | require an equal scissor before two blended draws merge, as the front end did before it trusted the renderer's per-draw rectangles |
+| `CUDAVK_KEEP_VOFF` | bool (presence) | `off` | — | put the vertex offset back in the merge key; it is the largest merge blocker there is, 13,281 separations of 38,155 on Crossroads |
+| `CUDAVK_KEEP_INSTKEY` | bool (presence) | `off` | — | put the instance count back in the merge key, which the renderer's per-draw instance_counts[] row makes unnecessary |
+| `CUDAVK_KEEP_PUSHKEY` | bool (presence) | `off` | — | put the push-constant block back in the merge key, so draws that push different constants stop merging |
 | `CUDAVK_NO_BINCACHE` | bool (presence) | `off` | — | disable the compiled-kernel binary cache |
 
 ## A-buffer
@@ -111,6 +122,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_ABUFFER_TIMING` | bool (value) | `off` | — | per-draw CUDA-event breakdown; costs a drain per draw |
 | `CUDAVK_ABUFFER_DEBUG` | bool (value) | `off` | — | report which draws were eligible for the A-buffer, and why not |
 | `CUDAVK_ABUFFER_LAYERS` | uint | `0` | — | cap A-buffer layers per pixel; 0 uses the built-in limit |
+| `CUDAVK_ABUF_MIN_TRIS` | uint | `0` | &ge; 0 | triangles a blended batch must have before the A-buffer's fixed cost is worth paying; 0, the default, means always, and is deliberate — with the bootstrap scan fixed Crossroads measured 10.9 ms at 0 against 33.0 at 256 |
 | `CUDAVK_ABUF_COMPILE` | bool (optional) | `unset` | — | force the A-buffer branches in (1) or out (0) of the NVRTC build |
 
 ## Draw batching
@@ -148,6 +160,10 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_DUMP_NIR` | bool (presence) | `off` | — | print each shader's NIR |
 | `CUDAVK_DUMP_IR` | bool (presence) | `off` | — | print each shader's LLVM IR |
 | `CUDAVK_DUMP_PTX` | bool (presence) | `off` | — | print each shader's generated PTX |
+| `CUDAVK_SCALARIZE` | enum | `all` | — | which ALU operations to scalarise: all \| none \| basic \| sel \| alu \| move \| intr \| rest; all is the NULL-filter pass every sample is rendered with, and the classes are there to bisect a backend bug |
+| `CUDAVK_NO_HOIST_INPUTS` | bool (presence) | `off` | — | stop hoisting a vertex shader's input loads above the arithmetic that consumes them; that hoist is 6.14 against 8.63 ms on instancing |
+| `CUDAVK_NO_REG_SSA` | bool (presence) | `off` | — | leave NIR registers alone before the backend, so each becomes an alloca and the NVPTX backend gives the kernel a __local_depot |
+| `CUDAVK_KEEP_SMALL_DYNAMIC_REGCAP` | bool (presence) | `off` | — | keep the tuned register cap on small fragment shaders that call the dynamic sampler helper; they cannot amortise its spills |
 
 ## Rasterizer tuning (NVRTC -D options)
 

@@ -97,7 +97,7 @@ export VK_DRIVER_FILES="$PWD/build-cudavk/src/cudavk/cudavk_devenv_icd.x86_64.js
 `VK_ICD_FILENAMES` or any `CUDAVK_*`/`CPVK_*` variable into a reference or
 timing run of another driver.
 
-`CUDAVK_HELP=1 <any vulkan app>` prints all 97 switches with what each one
+`CUDAVK_HELP=1 <any vulkan app>` prints all 116 switches with what each one
 resolved to in that process. `src/cudavk/FLAGS.md` is the same table,
 generated. Note the two boolean kinds: **presence** flags are set by the
 variable existing, so `=0` turns them **on**; **value** flags read the value.

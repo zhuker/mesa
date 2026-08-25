@@ -577,26 +577,6 @@ cp_scratch_begin(struct cp_context *cp)
 }
 
 
-/*
- * Triangles a blended batch must have before the A-buffer's fixed cost is
- * worth paying.  The default is zero: after the bootstrap scan was fixed,
- * Crossroads measured 10.9 ms at zero versus 33.0 ms at 256, while repeated
- * 600-frame sample runs were unchanged within noise.  Keep the override for
- * controlled threshold experiments.
- */
-static unsigned
-cp_abuf_min_tris(void)
-{
-   static int v = -1;
-   if (v < 0) {
-      const char *s = getenv("CPVK_ABUF_MIN_TRIS");
-      v = s ? atoi(s) : 0;
-      if (v < 0)
-         v = 0;
-   }
-   return (unsigned)v;
-}
-
 /* Reset scratch after all GPU work is done. Frees overflow arenas (old
  * arenas that were replaced during growth) and resets the bump pointer.
  * The current arena is kept at its grown size. */
@@ -4661,7 +4641,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    cp->fs_batch.slices = 0;
    cp->fs_batch.prim_shift = 0;
 
-   if (getenv("CPVK_DEBUG_ROWS"))
+   if (cp_debug->debug_rows)
       fprintf(stderr, "exec: batch_draws=%u num_draws=%u fs_tbl=%d "
               "fs_ndraws=%u\n", batch_draws, num_draws, fs_ubo_table ? 1 : 0,
               cp->fs_batch.ndraws);
@@ -5187,7 +5167,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             if (fs_ubo_table)
                cp->fs_batch.slices = slices_dev;
 
-            if (getenv("CPVK_DEBUG_ROWS"))
+            if (cp_debug->debug_rows)
                fprintf(stderr, "slices: n=%u set=%d verts=[%u %u %u]\n",
                        batch_draws, slices_dev ? 1 : 0, slices[0].vert_begin,
                        batch_draws > 1 ? slices[1].vert_begin : 0,
@@ -5660,7 +5640,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                              cp, (size_t)max_clipped * sizeof(uint32_t))
                         : 0);
 
-                  if (getenv("CPVK_DEBUG_CLIP"))
+                  if (cp_debug->debug_clip)
                      fprintf(stderr, "clip: tris=%u batch_draws=%u stable=%d "
                              "reads_cb=%d\n", num_triangles, batch_draws,
                              (int)stable_clip,
@@ -6034,8 +6014,14 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     *
     * So the fixed cost is asked for explicitly, from the triangle count, which
     * is known here before anything has been spent.
+    *
+    * CUDAVK_ABUF_MIN_TRIS is that floor and defaults to zero, which is
+    * deliberate: once the bootstrap scan was fixed Crossroads measured 10.9 ms
+    * with no floor against 33.0 ms at 256, and repeated 600-frame sample runs
+    * were unchanged within noise. The switch stays for threshold experiments.
     */
-   if (abuf && cp_abuf_min_tris() && rast_num_triangles < cp_abuf_min_tris())
+   if (abuf && cp_debug->abuf_min_tris &&
+       rast_num_triangles < cp_debug->abuf_min_tris)
       abuf = false;
 
    /*
@@ -6952,7 +6938,7 @@ cp_batch_record_packet(struct cp_context *cp,
 {
    const struct cp_draw_state *s = &packet->state;
    unsigned n = cp->batch.ndraws;
-   if (getenv("CPVK_DEBUG_ROWS")) {
+   if (cp_debug->debug_rows) {
       fprintf(stderr, "row %u: fs slots", n);
       for (unsigned q = 0; q < 4 && q < s->num_fs_ubos; q++)
          fprintf(stderr, " [%u]=%p", q,
@@ -7020,7 +7006,7 @@ cp_pass_appendable(struct cp_context *cp,
    struct cp_device *screen = cp->dev;
    struct cp_abuf *ab = cp->abuf;
 
-   if (getenv("CPVK_DEBUG_PASS")) {
+   if (cp_debug->debug_pass) {
       static int said;
       if (said++ < 3)
          fprintf(stderr, "pass?: nopass=%d noabufbatch=%d abuf_en=%d dis=%d "
@@ -7110,7 +7096,7 @@ cp_opaque_appendable(struct cp_context *cp,
        !state->fs || state->fs->writes_memory ||
        MAX2(batch->scope.attachment_samples, 1u) != 1 || fb->nr_cbufs != 1 ||
        !fb->color || fb->color_encoding < 0) {
-      if (getenv("CPVK_DEBUG_EPISODE"))
+      if (cp_debug->debug_episode)
          fprintf(stderr, "no-episode: noflag=%d orderfree=%d fs=%d "
                  "writes=%d samples=%u cbufs=%u color=%d enc=%d\n",
                  (int)cp_debug->no_opaque_episode, (int)cp_batch_order_free(state),
@@ -8155,7 +8141,7 @@ cp_pass_finish(struct cp_context *cp)
    if (nsegs)
       cp->plan.pass_finishes++;
 
-   if (nsegs && getenv("CPVK_DEBUG_EPISODE"))
+   if (nsegs && cp_debug->debug_episode)
       fprintf(stderr, "episode: nsegs=%u opaque=%d\n", nsegs,
               (int)cp->pass.opaque);
 
@@ -8692,10 +8678,10 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
     * 32.6 times a frame against 24.3 rasterizations, where the Gallium
     * driver's two are equal.
     */
-   if (cp_abuf_min_tris() &&
+   if (cp_debug->abuf_min_tris &&
        cp_batch_total_triangles(&cp->batch.info, cp->batch.draws, ndraws,
                                 cp->batch.instance_counts)
-          < cp_abuf_min_tris()) {
+          < cp_debug->abuf_min_tris) {
       cp_pass_finish(cp);
       cp_draw_execute_batch(cp, &cp->batch);
       return;
@@ -8786,7 +8772,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
 static void
 cp_opaque_append(struct cp_context *cp, unsigned ndraws)
 {
-   if (getenv("CPVK_DEBUG_EPISODE"))
+   if (cp_debug->debug_episode)
       fprintf(stderr, "append: nsegs=%u opaque=%d ndraws=%u\n",
               cp->pass.nsegs, (int)cp->pass.opaque, ndraws);
 
@@ -8814,7 +8800,7 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    cp->pass.appending = false;
 
    if (cp->pass.append_failed || cp->pass.nsegs == before) {
-      if (getenv("CPVK_DEBUG_EPISODE"))
+      if (cp_debug->debug_episode)
          fprintf(stderr, "episode-cut: append failed=%d nsegs %u->%u\n",
                  (int)cp->pass.append_failed, before, cp->pass.nsegs);
       cp_pass_finish(cp);
@@ -8892,7 +8878,7 @@ void
 cp_batch_flush_why(struct cp_context *cp, const char *why)
 {
    cp_batch_flush_defer_why(cp, why);
-   if (getenv("CPVK_DEBUG_EPISODE") && cp->pass.nsegs)
+   if (cp_debug->debug_episode && cp->pass.nsegs)
       fprintf(stderr, "episode-cut: flush_why=%s nsegs=%u\n", why,
               cp->pass.nsegs);
    cp_pass_finish(cp);
@@ -8913,7 +8899,7 @@ cp_render_scope_begin(struct cp_context *cp, const struct cp_render_scope *scope
 {
    cp->plan.scopes++;
    cp_batch_flush_why(cp, "framebuffer");
-   if (getenv("CPVK_DEBUG_EPISODE"))
+   if (cp_debug->debug_episode)
       fprintf(stderr, "episode-cut: begin_render\n");
    cp_pass_finish(cp);
    cp->pass.scope = *scope;
@@ -8930,7 +8916,7 @@ void
 cp_render_scope_end(struct cp_context *cp)
 {
    cp_batch_flush_why(cp, "render scope end");
-   if (getenv("CPVK_DEBUG_EPISODE"))
+   if (cp_debug->debug_episode)
       fprintf(stderr, "episode-cut: end_render\n");
    cp_pass_finish(cp);
    if (cp->pass.scope.depth.store)

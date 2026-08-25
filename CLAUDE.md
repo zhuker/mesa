@@ -32,9 +32,11 @@ Gallium driver. `docs/cudavk/notes/` holds research that has not been acted on.
 
 ## Environment switches
 
-The driver has 97 of them and reads **none** of them with `getenv`. They are
-declared in one array in `src/cudavk/cp_debug.c`, resolved once at device
-creation into a read-only `struct cp_debug`, and read as `cp_debug->field`.
+The driver has 116 of them and reads **none** of them with `getenv`. They are
+declared in one array in `src/cudavk/cp_debug.c`, resolved **once** by
+`cp_debug_init()` at device creation into a read-only `struct cp_debug`, and
+read as `cp_debug->field` — including on per-draw paths, which is why no site
+re-reads the environment and why no flag can change mid-run.
 
 **A new switch goes in that array. Do not add a `getenv` to the driver.** The
 array is the single source of truth for the name, the parse, the default and
@@ -43,11 +45,26 @@ the one-line meaning, which is what makes `CUDAVK_HELP=1` and the generated
 both, and the flags are this driver's debugging surface — the point of the
 registry is that the next person can find them without grep.
 
+Exactly three places may read the environment, and they are the allowlist in
+`cp_no_getenv.py`: `cp_debug.c`, because it *is* the resolver; and
+`src/cudavk/tests/` and `samples/`, which are separate programs rather than
+part of the ICD. Anywhere else is a bug the check will fail on.
+
+This rule was prose once and prose did not hold it — a second family of 19
+`CPVK_*` switches grew behind it, none of them in `FLAGS.md` and none
+announced by `CUDAVK_HELP=1`, two of them still advertised in comments after
+the code that read them was deleted. They are gone; the check is what keeps
+them gone. Retired names are not silently ignored: `cp_debug.c` carries a
+table of them and says so on stderr, because a stale `CPVK_BATCH` left in one
+shell once made a day of A/B runs compare a feature against itself.
+
 - `src/cudavk/FLAGS.md` — all of them, generated.
 - `CUDAVK_HELP=1 <any vulkan app>` — the same table, with what each one
   resolved to in that process.
 - `src/cudavk/tests/cp_debug_doc.py --check` — fails if `FLAGS.md` has drifted
   from the registry. Run it after touching the array.
+- `src/cudavk/tests/cp_no_getenv.py` — fails if driver code reads the
+  environment outside the registry. Run it after adding one.
 
 Two boolean kinds exist and both are load-bearing: **presence** flags are set
 by the variable existing at all, so `CUDAVK_DEBUG_DRAW=0` turns tracing **on**,

@@ -76,7 +76,14 @@ show". This document is the authority on how gates 1-4 are run and read.
 export PATH="$HOME/mesa/venv/bin:$HOME/vulkan-sdk/1.4.357.1/x86_64/bin:$PATH"
 ./venv/bin/ninja -C build-cudavk
 ./venv/bin/python3 src/cudavk/tests/cp_debug_doc.py --check
+./venv/bin/python3 src/cudavk/tests/cp_no_getenv.py --check
 ```
+
+The second check says `FLAGS.md` still matches the registry. The third says the
+registry is still the only way into the environment: it fails on a `getenv` in
+driver code, allowing only `cp_debug.c`, `tests/` and `samples/`. Both are
+cheap, need no GPU, and exist because the rule they enforce was written in
+prose first and nineteen switches grew around it anyway.
 
 **Use the repository interpreter**, `$MESA/venv/bin/python3`, for every image
 tool. `cp_compare_frames.py` needs numpy and only the venv has it;
@@ -103,7 +110,7 @@ argument about the new path, not about the old one.
 
 ### Flags: three runs, not two
 
-The driver has **97 switches** (`src/cudavk/FLAGS.md`, generated from the
+The driver has **116 switches** (`src/cudavk/FLAGS.md`, generated from the
 registry in `src/cudavk/cp_debug.c`). Two boolean kinds exist and the
 difference bites: **presence** flags are set by the variable existing, so
 `CUDAVK_DEBUG_DRAW=0` turns tracing **on**, and **value** flags read the value.
@@ -736,7 +743,8 @@ The pattern, from the A-buffer fusion (iteration 28 item 4):
 
 Both the check and the break flag belong in the registry
 (`src/cudavk/cp_debug.c`) like everything else, so `CUDAVK_HELP=1` and
-`FLAGS.md` describe them. Run `cp_debug_doc.py --check` after touching it.
+`FLAGS.md` describe them. Run `cp_debug_doc.py --check` after touching it, and
+`cp_no_getenv.py` if you were tempted to read the variable directly instead.
 
 ---
 
@@ -829,8 +837,8 @@ the exact binary before trying a fix.
 
 Before keeping a correctness-sensitive change:
 
-* Build clean; `cp_debug_doc.py --check` passes; one test smoke-run proves
-  NVRTC still compiles the kernels.
+* Build clean; `cp_debug_doc.py --check` and `cp_no_getenv.py --check` pass;
+  one test smoke-run proves NVRTC still compiles the kernels.
 * Baseline and candidate binaries identified: commit, dirty diff, build type,
   library SHA-256, resolved flags.
 * **Native suite 65/65** in the default state and with every new revert flag
@@ -875,7 +883,7 @@ Before keeping a correctness-sensitive change:
 |---|---|
 | `docs/cudavk/WORKFLOW.md` | build, run, the two captures, timing conventions, `cp_iterate.sh`, and the profiling decision tree ("where the time goes") |
 | `docs/cudavk/GFXRECONSTRUCT.md` | capturing, indexing and replaying a real application, and `cp_gfxr_frames.py` in full |
-| `src/cudavk/FLAGS.md` | all 97 switches, generated from the registry |
+| `src/cudavk/FLAGS.md` | all 116 switches, generated from the registry |
 | `docs/cudavk/history/PERF16_ITERATIONS.md` | the iteration record: every acceptance battery quoted here, with its numbers |
 | `docs/cudavk/history/PHASE_1A.md`, `docs/cudavk/history/EPISODES.md` | the passes these rules were learned in |
 | `docs/cudavk/GALLIUM_RETIREMENT.md` | what the removed second frontend was, and why it is no longer available as a cross-check |

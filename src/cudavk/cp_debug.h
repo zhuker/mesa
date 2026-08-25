@@ -101,6 +101,26 @@ enum cp_ctx_sched {
    CP_CTX_SCHED_BLOCKING,
 };
 
+/*
+ * Which ALU operations nir_lower_alu_to_scalar still has to break apart.
+ * `all` is the default and is not a filter at all: it runs the pass with a
+ * NULL filter, which is what this driver did before the switch existed and
+ * what every sample has been rendered with. The named classes exist to
+ * bisect which of them a vector-width backend bug lives in — see
+ * cpvk_scalarize_filter in cpvk_pipeline.c. An unrecognised value falls back
+ * to `none`, the disabled mode, as every enum flag here does.
+ */
+enum cp_scalarize {
+   CP_SCALARIZE_NONE = 0,
+   CP_SCALARIZE_BASIC,
+   CP_SCALARIZE_SEL,
+   CP_SCALARIZE_ALU,
+   CP_SCALARIZE_MOVE,
+   CP_SCALARIZE_INTR,
+   CP_SCALARIZE_REST,
+   CP_SCALARIZE_ALL,
+};
+
 /* Residency scheme for the small-allocation arena. Kept as an enum rather than
  * collapsed to a bool because having the three arms in one binary is the
  * reason that work could be measured at all — it removed build-to-build
@@ -156,6 +176,12 @@ struct cp_debug {
    bool debug_passseq;
    bool frag_census;
    bool nvtx;
+   bool debug_rows;
+   bool debug_clip;
+   bool debug_pass;
+   bool debug_episode;
+   bool debug_rt;
+   bool debug_faces;
 
    /* Tracing, with a value. */
    unsigned debug_fs_vstep;   /* print every Nth pixel; clamped to >= 1 */
@@ -220,6 +246,11 @@ struct cp_debug {
    bool unsafe_no_overflow;
    bool unsafe_force_opaque;
    bool no_batch;
+   bool no_batch_blend;
+   bool no_merge_scissor;
+   bool keep_voff;
+   bool keep_instkey;
+   bool keep_pushkey;
    bool no_bincache;
    bool no_regcap;
    bool regcap_static;
@@ -231,6 +262,7 @@ struct cp_debug {
    bool     abuffer_timing;
    bool     abuffer_debug;
    unsigned abuffer_layers;      /* 0 = unset */
+   unsigned abuf_min_tris;       /* 0 = no floor, and the default */
    struct cp_opt_int abuf_compile;
 
    /* Draw batching. */
@@ -254,6 +286,10 @@ struct cp_debug {
    bool     dump_nir;
    bool     dump_ir;
    bool     dump_ptx;
+   int      scalarize;           /* enum cp_scalarize */
+   bool     no_hoist_inputs;
+   bool     no_reg_ssa;
+   bool     keep_small_dynamic_regcap;
 
    /* Rasterizer tuning. Tri-state: these become NVRTC -D options only when
     * set. Unrelated to the arena despite CUDAVK_SMALL_* naming both. */
