@@ -430,6 +430,70 @@ is its long form.
 
 ---
 
+### Frame timelines, one per iteration
+
+`cp_iterate.sh` answers "did it stay correct while it got faster" over eighteen
+samples at sixty frames. The two captures are the workloads that actually
+matter, and neither the sweep nor the replay harness ever shows you what they
+rendered. `cp_make_timeline.sh` does, for every frame of both captures:
+
+```bash
+src/cudavk/tests/cp_make_timeline.sh ITERATION [ENV=VALUE ...]
+```
+
+It waits for an idle GPU, renders both captures through `cp_gfxr_timeline.sh`,
+and rebuilds the page over all of them:
+
+```
+~/timelines/
+    index.html                  a row per iteration, both captures linked
+    ITERATION/
+        old/index.html          the old capture, every frame
+        cross/index.html        Crossroads, every frame
+```
+
+The label is the same label `cp_iterate.sh` was given. A row in
+`~/timelines/index.html` and a row in `~/git/Vulkan/build/iter/iterations.html`
+are then the same iteration, and the index reads that iteration's `DESC` and
+commit out of its `iteration.json` when it exists. Using a different label here
+buys two half-records that cannot be joined.
+
+Extra arguments are environment assignments handed to both replays, which is
+how an arm is selected — one iteration per arm, not one iteration with two
+meanings:
+
+```bash
+src/cudavk/tests/cp_make_timeline.sh streams-off
+src/cudavk/tests/cp_make_timeline.sh streams-on CUDAVK_OPAQUE_STREAMS=1
+```
+
+Three things are worth knowing before the first run:
+
+- **A pair costs about 12 GB and a few minutes.** Every frame is dumped as a
+  raw readback and encoded to png, 1,510 frames on old and 1,496 on Crossroads.
+  `cp_gfxr_timeline.sh` refuses to write into a directory that already exists,
+  so a re-render wants the old one removed on purpose.
+- **The median on the index page is recomputed, not copied.** It is the
+  paired-submit median — a frame is two `vkQueueSubmit` events,
+  `median(diff(ts[::2])[50:])` — taken from each run's own
+  `timing/submits.txt`, so it follows the same convention as every other number
+  in this document. It is measured while dumping nothing, in the timing replay
+  of the pair.
+- **Both pages must be served over HTTP.** They fetch their data at load time,
+  so a `file://` URL shows an empty page.
+
+```bash
+python3 -m http.server -d ~/timelines 8000   # then http://localhost:8000/index.html
+```
+
+The index is rebuilt from what is on disk rather than appended to, for the
+reason `cp_iter_report.py page` is: an iteration that was rendered and then
+stayed invisible until someone remembered a second command is a record that
+does not describe the work. Run `cp_timeline_index.py` by hand only after
+moving or deleting a directory underneath it.
+
+---
+
 ## 7. The rest of the toolchain
 
 Everything below is in `src/cudavk/tests/`.
@@ -451,6 +515,8 @@ Everything below is in `src/cudavk/tests/`.
 | `cp_cpu_profile.sh` | on-CPU and off-CPU folded stacks for one command |
 | `cp_gfxr_frames.py` | pull rendered frames out of a capture that never presents |
 | `cp_gfxr_timeline.sh` | a clickable frame-time timeline with the frames beside it |
+| `cp_make_timeline.sh` | every frame of both captures for one iteration, as a clickable page |
+| `cp_timeline_index.py` | rebuild `~/timelines/index.html` after moving or deleting an iteration |
 | `cp_capture_requirements.py` | what formats, samplers, stages and extensions a capture requires |
 | `cp_debug_doc.py` | regenerate `FLAGS.md`; `--check` fails if it has drifted |
 | `cp_launch_audit.py` | fail the suite on a raw `cuLaunchKernel` outside the allowlist |
