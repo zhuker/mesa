@@ -130,9 +130,10 @@ endif
 if with_gallium_or_lvp
   subdir('gallium')
 endif
-# The native Vulkan cudapipe driver: independent of Gallium, built beside the
-# Gallium-hosted one so the two can be diffed against each other.
-if with_gallium_cudapipe
+# The CUDA Vulkan driver. It depends on nothing in Gallium -- only on Mesa's
+# common Vulkan runtime, NIR and util -- so it is selected on its own with
+# -Dvulkan-drivers=cudavk and no longer rides on the Gallium driver's option.
+if with_cudavk
   subdir('cudapipe')
 endif
 # These require libgallium (shared_glapi_lib)

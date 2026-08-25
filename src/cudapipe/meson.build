@@ -14,6 +14,12 @@ dep_cuda_vk = declare_dependency(
   ],
 )
 
+# NVRTC compiles the kernels at runtime and nvJitLink links the PTX. Looked up
+# here rather than borrowed from the Gallium driver's meson.build, which this
+# driver used to be built beside: this subdirectory is configured on its own.
+dep_nvrtc = meson.get_compiler('c').find_library('nvrtc', required : false)
+dep_nvjitlink = meson.get_compiler('c').find_library('nvJitLink', required : false)
+
 cpvk_entrypoints = custom_target(
   'cpvk_entrypoints',
   input : [vk_entrypoints_gen, vk_api_xml],
