@@ -1,20 +1,17 @@
 /*
  * cudavk, native Vulkan driver.
  *
- * This is the same CUDA rasterizer backend as the Gallium-hosted driver in
- * src/gallium/drivers/cudavk, with Mesa's common Vulkan runtime in front of
- * it instead of lavapipe and Gallium. It exists because a large fraction of
- * the Gallium-hosted driver is machinery that reconstructs, by watching a
- * stream of state setters, what a Vulkan command buffer already states
- * explicitly: draw batching and its flush discipline, pass episodes and their
- * segment snapshots, the live save/restore around a deferred execute, the
- * fallback replay, and the small-allocation arenas that exist because every
- * descriptor set is backed by its own device allocation.
+ * A CUDA rasterizer behind Mesa's common Vulkan runtime. It grew out of a
+ * Gallium-hosted driver, which has since been removed, and it exists because a
+ * large fraction of that driver was machinery reconstructing, from a stream of
+ * state setters, what a Vulkan command buffer already states explicitly: draw
+ * batching and its flush discipline, pass episodes and their segment
+ * snapshots, the live save/restore around a deferred execute, the fallback
+ * replay, and the small-allocation arenas that existed because every
+ * descriptor set was backed by its own device allocation.
  *
- * See CUDAVK_VK_NATIVE.md for the plan, the evidence, and the staging.
- *
- * Nothing here is wired into rendering yet. The first milestone is the one
- * the original plan set for the Gallium driver: enumerate a device.
+ * docs/cudavk/ARCHITECTURE.md is the map. docs/cudavk/history/VK_NATIVE_DECISIONS.md
+ * keeps the decisions and the evidence behind them.
  */
 
 #ifndef CPVK_PRIVATE_H

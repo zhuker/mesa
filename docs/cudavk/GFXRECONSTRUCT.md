@@ -36,7 +36,7 @@ ninja -C build
 includes `xcb/glx.h`, which isn't installed, and the build fails on it. Nothing
 in this workflow needs OpenXR.
 
-Meson and ninja come from the venv described in `CUDAVK_HANDOFF.md`; put it on
+Meson and ninja come from the venv described in `docs/cudavk/history/HANDOFF.md`; put it on
 `PATH` first if `ninja` isn't found.
 
 For brevity below:

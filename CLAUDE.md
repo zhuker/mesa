@@ -1,32 +1,40 @@
-# cudapipe
+# cudavk
 
-This tree is a Mesa fork used for one thing: `src/cudavk`, a CUDA software
-rasterizer exposed as a Vulkan ICD, built with `-Dcudavk=true`. No other part
-of Mesa is being worked on here.
+This tree is a Mesa fork used for one thing: `src/cudavk`, a CUDA implementation
+of Vulkan exposed as an ICD. No other part of Mesa is being worked on here.
 
-The older Gallium-hosted driver it replaced has been removed. What it was, what
-was lost with it and how to bring it back are in `CUDAVK_GALLIUM_RETIREMENT.md`;
-its mechanism documents are kept in `docs/cudavk/history/`.
+    meson setup build -Dcudavk=true -Dgallium-drivers= -Dvulkan-drivers=
+    ninja -C build
+    export VK_DRIVER_FILES=$PWD/build/src/cudavk/cudavk_devenv_icd.x86_64.json
+
+The Gallium-hosted driver this replaced has been removed. `docs/cudavk/GALLIUM_RETIREMENT.md`
+records what it could do that this cannot, and how to restore it from the
+`gallium-cudapipe-last` tag.
 
 ## Read first
 
-- `CUDAVK_HANDOFF.md` — what the driver is, how to build and run it, its
-  architecture, the known gaps, and the lessons that cost the most to learn.
-- `src/cudavk/tests/TESTING.md` — how correctness is checked,
-  how cost is measured reliably enough to compare, and how to find where the
-  time actually goes. Read it before trusting a number from either half.
+- `CUDAVK.md` — what this is, and which document answers which question.
+- `docs/cudavk/ARCHITECTURE.md` — how the driver works, for changing it.
+- `docs/cudavk/WORKFLOW.md` — how to build, run and measure an iteration.
+- `docs/cudavk/TESTING.md` — how correctness is decided.
+- `docs/cudavk/PERFORMANCE.md` — where the time goes and what removing work costs.
+- `docs/cudavk/DEAD_ENDS.md` — **read before optimising anything.** Fifteen
+  entries: fourteen directions built or probed and closed with measurements,
+  one parked with a known next step. Re-running one of them by accident is the
+  most expensive mistake available here, and one entry exists precisely because
+  a narrow path was rejected on coverage and later paid 5.84 ms once the
+  coverage condition it recorded was met.
+- `docs/cudavk/TODO.md` — what is unfinished, including known correctness gaps.
 
-`CUDAVK_PLAN.md` and `docs/cudavk/history/{PERFORMANCE_PLAN,
-PERFORMANCE_PROGRESS,PHASE_1A,INSTANCING,BATCHING,ABUFFER}.md` are records of past
-passes. Their forward-looking sections have been overtaken and say so where
-they have.
+`docs/cudavk/history/` holds the long-form records: the decision log, the
+iteration-by-iteration performance record, and the documents from the removed
+Gallium driver. `docs/cudavk/notes/` holds research that has not been acted on.
 
 ## Environment switches
 
 The driver has 97 of them and reads **none** of them with `getenv`. They are
-declared in one array in `src/cudavk/cp_debug.c`, resolved
-once at screen creation into a read-only `struct cp_debug`, and read as
-`cp_debug->field`.
+declared in one array in `src/cudavk/cp_debug.c`, resolved once at device
+creation into a read-only `struct cp_debug`, and read as `cp_debug->field`.
 
 **A new switch goes in that array. Do not add a `getenv` to the driver.** The
 array is the single source of truth for the name, the parse, the default and
@@ -38,23 +46,40 @@ registry is that the next person can find them without grep.
 - `src/cudavk/FLAGS.md` — all of them, generated.
 - `CUDAVK_HELP=1 <any vulkan app>` — the same table, with what each one
   resolved to in that process.
-- `tests/cp_debug_doc.py --check` — fails if `FLAGS.md` has drifted from the
-  registry. Run it after touching the array.
+- `src/cudavk/tests/cp_debug_doc.py --check` — fails if `FLAGS.md` has drifted
+  from the registry. Run it after touching the array.
 
 Two boolean kinds exist and both are load-bearing: **presence** flags are set
-by the variable existing at all, so `CUDAVK_DEBUG_DRAW=0` turns tracing
-**on**, and **value** flags read the value, so `=0` turns them off. That is
-not a design, it is what they grew into, and it is preserved on purpose.
-`CUDAVK_HELP=1` says which kind each one is; check before assuming `=0` is
-off.
+by the variable existing at all, so `CUDAVK_DEBUG_DRAW=0` turns tracing **on**,
+and **value** flags read the value, so `=0` turns them off. That is not a
+design, it is what they grew into, and it is preserved on purpose.
+`CUDAVK_HELP=1` says which kind each one is; check before assuming `=0` is off.
 
-`CUDAVK_HANDOFF.md` "Debug" has the mechanics of adding one.
+A flag whose name begins `CUDAVK_NO_` reverts something that is on by default.
+Those are the ones to reach for when bisecting a regression: the four
+small-operation stages, the fused vertex fetch, the two A-buffer chain fusions
+and the hardware texture path all have one.
+
+## Measuring
+
+Read `docs/cudavk/WORKFLOW.md` before quoting a number. Three conventions
+cause wrong answers if they are not known:
+
+- **One frame is two `vkQueueSubmit` events** on both captures, so frame time
+  is the interval between every *other* submit. Measuring every submit
+  understates the frame by about 25%.
+- **Alternate the arms and keep them in one session.** Control drift between
+  sessions has already masqueraded as sub-additivity once.
+- **Any run whose stdout hash changed is invalid until the submit and frame
+  counts are checked.** A replay that dies early produces a fast, meaningless
+  median — this happened and looked like an 8 ms win.
+
+A win on one capture must be measured on the other before it is accepted.
 
 ## Profiling
 
-Ask these in order; `tests/TESTING.md` "Finding where the time goes" is the
-long form, and answering an early question with a later tool is the mistake it
-exists to prevent.
+Ask these in order; `docs/cudavk/WORKFLOW.md` has the long form, and answering
+an early question with a later tool is the mistake it exists to prevent.
 
 | question | tool |
 |---|---|
@@ -67,6 +92,11 @@ exists to prevent.
 instructions on 5% of cycles, with a third of its SMs active. Any claim that a
 sample is "kernel-bound" on a busy percentage alone is unsupported — that
 number only says a kernel was resident.
+
+**The driver is currently host-bound, and that is measured.** It blocks about
+seventeen times a frame and spends about 12.44 ms of a 15.74 ms frame waiting;
+device idle is 4.16 ms, almost exactly host issue time. Removing device
+operations is close to exhausted — see `docs/cudavk/PERFORMANCE.md`.
 
 **Both counter modes need enough frames to be meaningful.** A sample's process
 is mostly shader compilation and teardown; ten frames of `instancing` measures
@@ -99,15 +129,15 @@ it has no way to know either:
 
 - **Whether a frame is host-bound or kernel-bound comes from
   `tests/cp_gpu_busy.sh`, which attaches no profiler.** CUPTI adds host-side
-  cost to every `cuLaunchKernel`, and cudapipe issues thousands per frame, so a
-  traced run manufactures exactly the host-side gap being looked for. A trace of
-  `multithreading` once reported more GPU kernel time per frame than the
-  untraced frame took end to end. See `PHASE_1A.md`.
+  cost to every `cuLaunchKernel`, and cudavk issues over a thousand per frame,
+  so a traced run manufactures exactly the host-side gap being looked for.
 - **Every compiled shader is a CUDA kernel named `main`**, so any per-kernel
   summary — including the skill's own `report-fact --intent kernel_summary` —
-  sums the vertex and fragment stages into one uninterpretable row. Split by
-  grid size: `tests/cp_prof_kernels.py`, or the skill's `report-query` grouped
-  by `gridX`.
+  sums the stages into one uninterpretable row. Split by grid size
+  (`tests/cp_prof_kernels.py`) or by the driver's own NVTX ranges: since the
+  vertex fetch was fused into the vertex shader, the predecessor-kernel trick
+  no longer separates vertex from fragment work, and `--nvtx-include "fs/"` is
+  what does.
 
 `tests/cp_profile.sh` resolves the newest installed nsys itself and records the
 version in its summary. Traces taken with different versions are not comparable

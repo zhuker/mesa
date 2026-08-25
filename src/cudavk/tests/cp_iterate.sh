@@ -75,17 +75,16 @@ M=$MESA/build-cudavk/src/gallium/targets
 FRAMES=${FRAMES:-60}
 BENCH_FRAMES=${BENCH_FRAMES:-600}
 
-# `native` is the CUDA Vulkan driver and the default; `cudavk` is the older
-# Gallium-hosted one, kept only until it is removed. Everything else about a
-# run is identical between them, which is the point: the same sixty frames and
-# the same six hundred timed ones, through a different ICD.
-NATIVE_ICD=$MESA/build-cudavk/src/cudavk/cudavk_devenv_icd.x86_64.json
+# `native` is cudavk itself and the default. `llvmpipe` is lavapipe, which the
+# same build produces and which is the correctness reference; `nvidia` is the
+# system driver, which is the other reference. Everything else about a run is
+# identical between them, which is the point: the same sixty frames and the
+# same six hundred timed ones, through a different ICD.
 case ${DRIVER:=native} in
-    native)   ICD=$NATIVE_ICD ;;
-    cudavk) ICD=$M/cudavk/cudavk_devenv_icd.x86_64.json ;;
+    native)   ICD=$MESA/build-cudavk/src/cudavk/cudavk_devenv_icd.x86_64.json ;;
     llvmpipe) ICD=$M/lavapipe/lvp_devenv_icd.x86_64.json ;;
     nvidia)   ICD= ;;
-    *) echo "DRIVER must be native, cudavk, llvmpipe or nvidia" >&2; exit 1 ;;
+    *) echo "DRIVER must be native, llvmpipe or nvidia" >&2; exit 1 ;;
 esac
 
 ROOT=$VULKAN/build/iter

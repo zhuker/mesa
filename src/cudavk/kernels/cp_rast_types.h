@@ -326,7 +326,8 @@ struct cp_clip_args {
    uint32_t max_triangles;  /* Capacity of `out`, in triangles */
    /*
     * Lay the output out by input triangle rather than compacting it: input
-    * triangle t owns slots 4t..4t+3, and the ones it does not fill are marked
+    * triangle t owns CP_CLIP_MAX_OUT slots starting at t << CP_CLIP_PRIM_SHIFT,
+    * and the ones it does not fill are marked
     * degenerate. A batch's primitive index is then monotone in submission
     * order, which is what the A-buffer sorts on and so what makes merging
     * blended draws into one episode legal at all. Compaction with atomicAdd

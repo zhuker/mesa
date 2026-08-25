@@ -57,10 +57,9 @@ MIN_SAMPLES=${MIN_SAMPLES:-60}
 
 case $DRIVER in
     native)   export VK_ICD_FILENAMES=$MESA/build-cudavk/src/cudavk/cudavk_devenv_icd.x86_64.json ;;
-    cudavk) export VK_ICD_FILENAMES=$M/cudavk/cudavk_devenv_icd.x86_64.json ;;
     llvmpipe) export VK_ICD_FILENAMES=$M/lavapipe/lvp_devenv_icd.x86_64.json ;;
     nvidia)   ;;
-    *) echo "DRIVER must be native, cudavk, llvmpipe or nvidia" >&2; exit 1 ;;
+    *) echo "DRIVER must be native, llvmpipe or nvidia" >&2; exit 1 ;;
 esac
 
 cd "$VULKAN" || exit 1

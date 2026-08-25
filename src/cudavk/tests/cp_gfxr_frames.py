@@ -21,7 +21,7 @@ counter GFXR assigns to every call in the file — and needs, for each dumped
 command, the enclosing vkBeginCommandBuffer and the vkQueueSubmit that submits
 it. All three come out of the index.
 
-See tests/GFXRECONSTRUCT.md for the capture and replay workflow this fits into.
+See docs/cudavk/GFXRECONSTRUCT.md for the capture and replay workflow this fits into.
 """
 
 import argparse
