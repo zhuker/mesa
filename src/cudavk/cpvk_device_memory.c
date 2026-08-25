@@ -263,6 +263,17 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
                return cpvk_submit_abort(dev, r);
             break;
          }
+         case CPVK_OP_FILL: {
+            /* A fill observes rendering the same way a copy does, so whatever
+             * is held back has to run first. */
+            cp_batch_flush(&dev->renderer);
+            const struct cpvk_fill *fl = &cmd->ops[o].fill;
+            if (cuMemsetD32Async(fl->dst, fl->value, fl->words,
+                                 dev->renderer.stream) != CUDA_SUCCESS)
+               return cpvk_submit_abort(dev,
+                  vk_error(dev, VK_ERROR_DEVICE_LOST));
+            break;
+         }
          case CPVK_OP_COPY: {
             VkResult r = cpvk_execute_copy(dev, &cmd->ops[o].copy);
             if (r != VK_SUCCESS)

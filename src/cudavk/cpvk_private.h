@@ -509,6 +509,7 @@ enum cpvk_op_kind {
    CPVK_OP_DRAW,
    CPVK_OP_CLEAR,
    CPVK_OP_COPY,
+   CPVK_OP_FILL,
    /*
     * A dispatch is an op like any other, because it must run where it was
     * recorded. Held in its own array it ran before every copy and draw in the
@@ -526,6 +527,18 @@ struct cpvk_event_op {
    struct cpvk_event *event;
 };
 
+/*
+ * vkCmdFillBuffer: a 32-bit pattern repeated over a range. Its own op rather
+ * than a degenerate copy, because it has no source to read and cuMemsetD32 is
+ * exactly this operation -- the size is a multiple of four and the value is a
+ * word by definition, so nothing has to be widened or split.
+ */
+struct cpvk_fill {
+   CUdeviceptr dst;
+   size_t words;
+   uint32_t value;
+};
+
 struct cpvk_op {
    enum cpvk_op_kind kind;
    /* BEGIN_RENDER/DRAW only; remapped when secondary ops are imported. */
@@ -534,6 +547,7 @@ struct cpvk_op {
       struct cpvk_draw_cmd draw_cmd;
       struct cpvk_clear clear;
       struct cpvk_copy copy;
+      struct cpvk_fill fill;
       struct cpvk_query_op query;
       struct cpvk_dispatch dispatch;
       struct cpvk_event_op event;

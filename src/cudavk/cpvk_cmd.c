@@ -2681,6 +2681,45 @@ cpvk_record_copy(struct cpvk_cmd_buffer *cmd)
    return op ? &op->copy : NULL;
 }
 
+/*
+ * vkCmdFillBuffer.
+ *
+ * Implemented here rather than left to the runtime: vk_common_CmdFillBuffer
+ * forwards to CmdFillMemoryKHR, which this driver does not implement, so the
+ * common path jumps through a null pointer. A driver that means to support
+ * this has to answer the entry point itself.
+ *
+ * VK_WHOLE_SIZE and the round-down to a multiple of four are the spec's, and
+ * both matter to a caller that poisons a buffer before reusing it: the whole
+ * point is that every byte it expects to be overwritten actually is.
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
+                   VkDeviceSize dstOffset, VkDeviceSize size, uint32_t data)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_buffer, dst, dstBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+
+   if (!dst || !dst->mem)
+      return;
+
+   if (size == VK_WHOLE_SIZE)
+      size = dst->vk.size - dstOffset;
+   size &= ~(VkDeviceSize)3;
+   if (!size)
+      return;
+
+   struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_FILL);
+   if (!op)
+      return;
+   op->fill = (struct cpvk_fill) {
+      .dst = dst->mem->dev_ptr + dst->offset + dstOffset,
+      .words = size / 4,
+      .value = data,
+   };
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
                     const VkCopyBufferInfo2 *pInfo)
