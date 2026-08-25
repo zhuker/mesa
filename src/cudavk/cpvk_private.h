@@ -226,6 +226,19 @@ struct cpvk_device_memory {
    void *host_ptr;          /* what vkMapMemory returns, or NULL */
    struct cpvk_memory_binding *bindings;
    bool binding_ledger_failed;
+
+   /*
+    * Set only for an allocation the application asked to export. Ordinary
+    * allocations come from cuMemAlloc, which has no shareable handle; an
+    * exportable one is built from the CUDA virtual memory API instead, so it
+    * carries the physical handle the fd is minted from and the reserved
+    * range that has to be unmapped and freed rather than cuMemFree'd.
+    * vmm_size is the granularity-rounded size, which is what every VMM call
+    * on this allocation must be given.
+    */
+   bool exportable;
+   CUmemGenericAllocationHandle vmm_handle;
+   size_t vmm_size;
 };
 
 /*

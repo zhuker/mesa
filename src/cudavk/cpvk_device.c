@@ -44,6 +44,17 @@ static const struct vk_device_extension_table cpvk_device_extensions = {
    .KHR_swapchain = true,
 
    /*
+    * Export a VkDeviceMemory as a file descriptor a CUDA process can import.
+    * Only the _fd half is named: VK_KHR_external_memory and
+    * VK_KHR_external_memory_capabilities are promoted to Vulkan 1.1, which
+    * this driver already advertises, so their structs and the capability
+    * query are core here and listing them would claim nothing new. The
+    * transport is the part that is platform-specific and therefore still an
+    * extension. See docs/cudavk/CUDA_INTEROP.md.
+    */
+   .KHR_external_memory_fd = true,
+
+   /*
     * Negative viewport height, which this driver already does: the viewport
     * is resolved into a scale and a translate, and a negative height makes
     * the y scale negative, which is the flip. Advertised because the sample
@@ -602,6 +613,36 @@ cpvk_GetPhysicalDeviceExternalBufferProperties(
    const VkPhysicalDeviceExternalBufferInfo *pExternalBufferInfo,
    VkExternalBufferProperties *pExternalBufferProperties)
 {
+   /*
+    * OPAQUE_FD only, and only for buffers. The fd is a CUDA VMM shareable
+    * handle (cpvk_allocate_exportable), so it is opaque in the strict sense:
+    * it is not a dma-buf, it cannot be mmap'd or sized from outside, and only
+    * a CUDA importer on the same device understands it. That is exactly what
+    * OPAQUE_FD promises, and dma-buf is not offered because this hardware
+    * reports DMA_BUF_SUPPORTED=0 (docs/cudavk/notes/CUDA13_UPGRADE.md).
+    *
+    * DEDICATED_ONLY is deliberately not set: one VkDeviceMemory is one CUDA
+    * allocation here and several buffers may be bound into it at offsets,
+    * which is what the interop sample does with its frame and result buffers.
+    *
+    * No usage is refused. Every buffer in this driver is the same flat device
+    * memory whatever it is used for, so there is no usage this could export
+    * and that one it could not.
+    */
+   if (pExternalBufferInfo->handleType ==
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
+      pExternalBufferProperties->externalMemoryProperties =
+         (VkExternalMemoryProperties) {
+            .externalMemoryFeatures =
+               VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT,
+            .exportFromImportedHandleTypes =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+            .compatibleHandleTypes =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+         };
+      return;
+   }
+
    pExternalBufferProperties->externalMemoryProperties =
       (VkExternalMemoryProperties) { 0 };
 }

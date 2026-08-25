@@ -589,6 +589,83 @@ cpvk_DeviceWaitIdle(VkDevice _device)
       ? vk_error(dev, VK_ERROR_DEVICE_LOST) : VK_SUCCESS;
 }
 
+/*
+ * Build an exportable allocation out of the CUDA virtual memory API.
+ *
+ * Four calls where cuMemAlloc is one, because the two things cuMemAlloc fuses
+ * are exactly the two this has to keep apart: cuMemCreate makes the physical
+ * allocation and hands back a handle that can become a file descriptor, and
+ * the virtual address it answers to is reserved and mapped separately.
+ *
+ * The rounding is not optional. VMM allocations are made in units of the
+ * device's minimum granularity -- 2 MiB on this hardware -- and cuMemCreate
+ * refuses a size that is not a multiple of it. Vulkan lets an application ask
+ * for any allocationSize, so the request is rounded up and the surplus simply
+ * belongs to the allocation; every later VMM call has to be given the rounded
+ * size rather than the requested one, which is why it is stored.
+ *
+ * cuMemSetAccess is the step with no cuMemAlloc counterpart and the easiest to
+ * forget: a freshly mapped range is readable and writable by nobody, so
+ * without it every kernel touching this memory faults.
+ */
+static VkResult
+cpvk_allocate_exportable(struct cpvk_device *dev,
+                         struct cpvk_device_memory *mem, size_t size)
+{
+   CUmemAllocationProp prop = {
+      .type = CU_MEM_ALLOCATION_TYPE_PINNED,
+      .location = {
+         .type = CU_MEM_LOCATION_TYPE_DEVICE,
+         .id = dev->pdev->cu_dev,
+      },
+      .requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+   };
+
+   size_t granularity = 0;
+   if (cuMemGetAllocationGranularity(&granularity, &prop,
+                                     CU_MEM_ALLOC_GRANULARITY_MINIMUM)
+       != CUDA_SUCCESS || granularity == 0)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   size_t padded = (size + granularity - 1) / granularity * granularity;
+
+   CUmemGenericAllocationHandle handle = 0;
+   if (cuMemCreate(&handle, padded, &prop, 0) != CUDA_SUCCESS)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   CUdeviceptr ptr = 0;
+   if (cuMemAddressReserve(&ptr, padded, granularity, 0, 0) != CUDA_SUCCESS) {
+      cuMemRelease(handle);
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+
+   if (cuMemMap(ptr, padded, 0, handle, 0) != CUDA_SUCCESS) {
+      cuMemAddressFree(ptr, padded);
+      cuMemRelease(handle);
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+
+   CUmemAccessDesc access = {
+      .location = prop.location,
+      .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+   };
+   if (cuMemSetAccess(ptr, padded, &access, 1) != CUDA_SUCCESS) {
+      cuMemUnmap(ptr, padded);
+      cuMemAddressFree(ptr, padded);
+      cuMemRelease(handle);
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+
+   mem->exportable = true;
+   mem->vmm_handle = handle;
+   mem->vmm_size = padded;
+   mem->dev_ptr = ptr;
+   /* Device memory in the VMM sense: there is no host mapping to hand out,
+    * and CPVK_MEM_DEVICE is already the unmappable kind. */
+   mem->host_ptr = NULL;
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_AllocateMemory(VkDevice _device,
                     const VkMemoryAllocateInfo *pAllocateInfo,
@@ -607,10 +684,42 @@ cpvk_AllocateMemory(VkDevice _device,
    mem->kind = pAllocateInfo->memoryTypeIndex;
    mem->bindings = NULL;
    mem->binding_ledger_failed = false;
+   mem->exportable = false;
+   mem->vmm_handle = 0;
+   mem->vmm_size = 0;
    size_t size = pAllocateInfo->allocationSize;
    CUresult err;
 
    cp_ctx_check("cpvk_AllocateMemory", dev->cu_ctx);
+
+   /*
+    * An allocation the application intends to export cannot come from
+    * cuMemAlloc: that returns a bare address with no handle behind it, and
+    * there is nothing to turn into a file descriptor. The CUDA virtual memory
+    * API splits the two halves apart -- cuMemCreate makes a physical handle
+    * that can be exported, and the address it is mapped at is chosen
+    * separately -- which is exactly the shape Vulkan's export model wants.
+    *
+    * Deciding this here, at allocation time, is not an implementation detail
+    * leaking upward. It is why VkExportMemoryAllocateInfo has to be supplied
+    * before the memory exists in every Vulkan implementation.
+    */
+   const VkExportMemoryAllocateInfo *export_info =
+      vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
+   if (export_info && export_info->handleTypes) {
+      if (export_info->handleTypes !=
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
+         vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+         return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      }
+      VkResult result = cpvk_allocate_exportable(dev, mem, size);
+      if (result != VK_SUCCESS) {
+         vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+         return result;
+      }
+      goto allocated;
+   }
+
    bool retried_after_purge = false;
 retry_cuda_allocation:
    switch (mem->kind) {
@@ -653,6 +762,7 @@ retry_cuda_allocation:
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
 
+allocated:
    /*
     * Vulkan defines ordinary allocation contents as undefined, and clearing
     * them anyway cost the Gallium-hosted driver 1,571 blocking cuMemsetD8
@@ -768,9 +878,57 @@ cpvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
       free(binding);
       mem->bindings = next;
    }
-   cuMemFree(mem->dev_ptr);
+   if (mem->exportable) {
+      /* Unwind cpvk_allocate_exportable in reverse. cuMemFree does not apply:
+       * the address was reserved rather than allocated, and the physical
+       * handle outlives the mapping until it is released. Any fd handed out
+       * by vkGetMemoryFdKHR holds its own reference, so a consumer that still
+       * has one keeps the memory alive past this point. */
+      cuMemUnmap(mem->dev_ptr, mem->vmm_size);
+      cuMemAddressFree(mem->dev_ptr, mem->vmm_size);
+      cuMemRelease(mem->vmm_handle);
+   } else {
+      cuMemFree(mem->dev_ptr);
+   }
 
    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+}
+
+/*
+ * Mint a file descriptor for an exportable allocation.
+ *
+ * Vulkan transfers ownership to the application: it closes the fd, or hands it
+ * to something that does. Calling this twice yields two independent
+ * descriptors for the same memory, which is why the handle is exported afresh
+ * each time rather than cached.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_GetMemoryFdKHR(VkDevice _device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
+                    int *pFd)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+   VK_FROM_HANDLE(cpvk_device_memory, mem, pGetFdInfo->memory);
+   CPVK_CTX_SCOPE(dev);
+
+   if (pGetFdInfo->handleType !=
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   /* Not an error the application can recover from, but it is the one it will
+    * hit if it forgot VkExportMemoryAllocateInfo, so say which. */
+   if (!mem || !mem->exportable)
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "this VkDeviceMemory was not allocated with "
+                       "VkExportMemoryAllocateInfo naming OPAQUE_FD");
+
+   int fd = -1;
+   if (cuMemExportToShareableHandle(&fd, mem->vmm_handle,
+                                    CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                                    0) != CUDA_SUCCESS)
+      return vk_error(dev, VK_ERROR_TOO_MANY_OBJECTS);
+
+   *pFd = fd;
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
