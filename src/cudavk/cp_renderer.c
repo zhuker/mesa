@@ -7109,7 +7109,26 @@ cp_pass_streams_init(struct cp_context *cp)
 static bool
 cp_opaque_side_streams(const struct cp_context *cp)
 {
-   return cp_debug->opaque_streams && cp->seg_streams[0];
+   if (!cp_debug->opaque_streams || !cp->seg_streams[0])
+      return false;
+   /*
+    * Two modes are excluded, not because they would be slow but because they
+    * are not the thing being made concurrent.
+    *
+    * CUDAVK_TILED_OPAQUE routes cp_opaque_finish through one shared tile-ref
+    * arena with one cursor and one overflow word, and its classic-overflow
+    * relaunch loop clears the *shared* nontrivial_count between segments. It
+    * also takes its per-segment record earlier in the draw, so it does not
+    * even mean the same thing by a segment. It stays serial.
+    *
+    * CUDAVK_DEBUG_TIME records CUDA events into one flat array and differences
+    * consecutive pairs. Events recorded on eight streams and differenced
+    * pairwise produce numbers with no meaning, up to and including negative
+    * ones. A blended episode refuses itself for the same reason (ab->timing).
+    */
+   if (cp_debug->tiled_opaque || cp_timing_enabled())
+      return false;
+   return true;
 }
 
 static bool
