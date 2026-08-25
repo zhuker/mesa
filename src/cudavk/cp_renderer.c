@@ -7210,6 +7210,41 @@ cp_pass_join(struct cp_context *cp, unsigned nsegs)
    return true;
 }
 
+/*
+ * Gate one side stream behind everything the main stream has issued so far.
+ *
+ * cp_pass_broadcast() below does this for the whole fan-out at a phase
+ * boundary, once. A segment needs it one stream at a time and at the moment
+ * the segment is issued, because the main stream does not stand still between
+ * segments: every draw the application records leaves its uniform rows owed in
+ * the upload ring — cpvk_prepare_draw() (cpvk_cmd.c:2582) reserves them, and
+ * for this sample that is 11 KiB per segment — and cp_stream_set() sends the
+ * owed span on the stream it is *leaving*, which is the main one.
+ *
+ * A gate recorded once at episode start is therefore behind those bytes rather
+ * than in front of them: the segment's kernels are free to run before the copy
+ * that fills their argument rows has landed, and they read whatever the arena
+ * held before it. That is the multithreading sample losing whole models,
+ * intermittently, and it is not a race between segments — serialising the
+ * segments with cuStreamSynchronize() does not fix it, because the unordered
+ * pair is a main-stream copy against a side-stream kernel.
+ */
+static bool
+cp_pass_gate_stream(struct cp_context *cp, unsigned k)
+{
+   /* The owed span first, then the event: recording it behind the copy is
+    * what makes the wait below cover the copy. */
+   if (cp_upload_flush(cp) != CUDA_SUCCESS)
+      return false;
+   if (cuEventRecord(cp->pass_gate, cp->stream) != CUDA_SUCCESS ||
+       cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0) !=
+          CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return false;
+   }
+   return true;
+}
+
 /* The reverse: gate every side stream behind the main stream's tail. */
 static bool
 cp_pass_broadcast(struct cp_context *cp, unsigned nsegs)
@@ -8890,18 +8925,15 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
           * it lazily at the first segment that finds cp->depthbuf_cleared
           * false, which with side streams means on that segment's stream,
           * while every other segment reads cp->depthbuf for its depth test on
-          * a stream that has not waited for it. Issuing it here puts it on the
-          * main stream behind the gate, and the latch makes the lazy call a
-          * no-op for every segment.
+          * a stream that has not waited for it. Issuing it here puts it on
+          * the main stream, and the latch makes the lazy call a no-op for
+          * every segment.
+          *
+          * Both clears land on the main stream ahead of the gate each segment
+          * records for itself below, so no segment can run before them.
           */
          if (!cp->depthbuf_cleared)
             cp_clear_depthbuf(cp, 1.0f);
-         /* The gate every segment stream waits on. */
-         if (cp_upload_flush(cp) != CUDA_SUCCESS ||
-             cuEventRecord(cp->pass_gate, cp->stream) != CUDA_SUCCESS) {
-            cp_renderer_texture_fatal(cp);
-            return;
-         }
       }
    }
 
@@ -8933,12 +8965,16 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    bool seg_side = side && cp->pass.nsegs > 0;
    if (seg_side) {
       unsigned k = (cp->pass.nsegs - 1) % CP_PASS_STREAMS;
-      /* The gate is what orders this segment behind the clears above. */
-      if (cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0) !=
-          CUDA_SUCCESS) {
-         cp_renderer_texture_fatal(cp);
+      /*
+       * The gate is what orders this segment behind the episode's clears and
+       * behind everything else the main stream has issued since the previous
+       * segment — in particular the upload span this segment's own uniform
+       * rows are sitting in, which cp_stream_set() below is about to send on
+       * the main stream. Recorded here rather than once at episode start, for
+       * the reason cp_pass_gate_stream() gives.
+       */
+      if (!cp_pass_gate_stream(cp, k))
          return;
-      }
       cp_stream_set(cp, cp->seg_streams[k]);
       cp->cur_qset = cp->seg_qsets[k];
    }
