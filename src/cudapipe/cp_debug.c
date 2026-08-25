@@ -166,8 +166,9 @@ static const struct cp_flag_def flags[] = {
    { "CUDAPIPE_NO_SAMPLER_VARIANT", CP_FLAG_BOOL_VALUE,
      F(no_sampler_variant),
      "disable literal-state fragment sampler variants" },
-   { "CUDAPIPE_TEXTURE_CACHE", CP_FLAG_BOOL_VALUE, F(texture_cache),
-     "opt in to same-LLVM direct CUDA hardware-texture fragment execution" },
+   { "CUDAPIPE_NO_TEXTURE_CACHE", CP_FLAG_BOOL_VALUE, F(no_texture_cache),
+     "disable direct CUDA hardware-texture fragment execution; fall back to "
+     "software sampling" },
    { "CUDAPIPE_TEXTURE_CACHE_FAIL_TABLE_UPLOAD_AT", CP_FLAG_UINT,
      F(texture_cache_fail_table_upload_at),
      "fault injection: fail the Nth hardware texture table upload enqueue" },
@@ -492,6 +493,15 @@ apply_couplings(void)
       debug_state.abuffer_composite = !debug_state.abuffer_verify;
    if (debug_state.abuffer_composite)
       debug_state.abuffer_verify = false;
+
+   /*
+    * The hardware texture path is the default. It was opt-in through
+    * iteration 24, which is why the registry carries the revert rather than
+    * the opt-in: the whole driver has been measured with it on since, and the
+    * enabled path is the better-tested one. Deriving it here rather than
+    * inverting sixty use sites keeps the change to one line of behaviour.
+    */
+   debug_state.texture_cache = !debug_state.no_texture_cache;
 }
 
 static const char *

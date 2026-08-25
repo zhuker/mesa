@@ -246,6 +246,7 @@
    15.7911
   ],
   "crossroads_median_ms": 5.8982,
-  "note": "Objective met at iteration 28 item 4. Six runs of the shipping default alone, one session: median 15.7514, IQR [15.7305, 15.7596], slowest run 15.7911, so the whole range is under 16.0. Independently re-verified by the parent agent at 15.7562 and 15.8003 with the accepted stdout hash 17123fdaea46 and the full 3022 submits. Correctness: suite 65/65 default and reverted, whole-replay device-side equivalence gates zero on both captures, Crossroads sentinels byte-identical to the frozen reference, old sentinels inside the llvmpipe envelope, 18-sample NVIDIA sweep shows only the two standing exceptions, src/gallium byte-identical to e2e966953d7."
+  "note": "Objective met at iteration 28 item 4. Six runs of the shipping default alone, one session: median 15.7514, IQR [15.7305, 15.7596], slowest run 15.7911, so the whole range is under 16.0. Independently re-verified by the parent agent at 15.7562 and 15.8003 with the accepted stdout hash 17123fdaea46 and the full 3022 submits. Correctness: suite 65/65 default and reverted, whole-replay device-side equivalence gates zero on both captures, Crossroads sentinels byte-identical to the frozen reference, old sentinels inside the llvmpipe envelope, 18-sample NVIDIA sweep shows only the two standing exceptions, src/gallium byte-identical to e2e966953d7. CORRECTION recorded after the fact: those medians were taken with CUDAPIPE_TEXTURE_CACHE=1, which was opt-in until commit after ab7b431611a; the driver's own default was 21.90 ms. The hardware texture path is now default-on with CUDAPIPE_NO_TEXTURE_CACHE as the revert, so the default measures 15.73-15.82 and the objective is met without any flag.",
+  "default_no_flags_before_flip_ms": 21.93
  }
 }

@@ -1941,3 +1941,41 @@ also deletes a pass or a large clear, and over-counts one that deletes a bare
 launch. Both corrections belong in the price table
 (`/tmp/perf16/iter27-vsfusion/handoff.md`), which currently lists only the
 per-operation prices.
+
+## The hardware texture path is the default now
+
+Iteration 24 kept the hardware texture cache opt-in, and every measurement in
+this document from that point on was taken with `CUDAPIPE_TEXTURE_CACHE=1` in
+the base environment. That made the headline numbers real and reproducible but
+not what the driver did out of the box — a distinction this document did not
+draw, and should have. Measured at `ab7b431611a`, old capture, paired-submit
+medians:
+
+| | old capture | 600-frame sweep |
+|---|---:|---:|
+| driver as it shipped, no flags | 21.90 / 21.96 ms | 22.59 ms |
+| with the cache enabled | 15.76 / 15.80 ms | 16.03 ms |
+
+The flag is now inverted: `CUDAPIPE_NO_TEXTURE_CACHE` reverts, the path is on
+by default, and `cp_debug->texture_cache` is derived from it in
+`apply_couplings()` so no use site changed. The justification is that the
+enabled path is the better-tested one — it passed a full acceptance battery in
+iteration 24 and has been the measured configuration ever since.
+
+Measured after the flip, same binary both arms, identical stdout hashes:
+
+| capture | default | `CUDAPIPE_NO_TEXTURE_CACHE=1` |
+|---|---:|---:|
+| old | **15.8194 / 15.7279 ms** | 21.9152 / 21.9127 ms |
+| Crossroads | **5.8737 / 5.8801 ms** | 7.1203 ms |
+
+Acceptance: native suite 65/65 at the default and 65/65 with the revert; the
+600-frame sweep sums 16.02 ms against 22.59 before; the 60-frame comparison
+against the NVIDIA reference shows only the two standing exceptions; Crossroads
+sentinels are 9 of 9 byte-identical to the frozen iteration-24 reference; the
+old capture's sentinels are inside its documented run-to-run class (5 of 10
+identical, worst mean 0.000067, max 7 of 255).
+
+The gates that used to set `CUDAPIPE_TEXTURE_CACHE=1` now clear
+`CUDAPIPE_NO_TEXTURE_CACHE` instead, so they still test the hardware path
+deliberately rather than by inheriting an ambient variable.

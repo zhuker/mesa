@@ -7,7 +7,7 @@ import sys
 
 no_replay, formats = sys.argv[1:]
 base = os.environ.copy()
-base["CUDAPIPE_TEXTURE_CACHE"] = "1"
+base.pop("CUDAPIPE_NO_TEXTURE_CACHE", None)  # hardware texture path is the default now
 base["CUDAPIPE_TEXTURE_CACHE_STATS"] = "1"
 
 def run(args, stage):

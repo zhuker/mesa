@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 env = os.environ.copy()
-env["CUDAPIPE_TEXTURE_CACHE"] = "1"
+env.pop("CUDAPIPE_NO_TEXTURE_CACHE", None)  # hardware texture path is the default now
 env["CUDAPIPE_TEXTURE_CACHE_STATS"] = "1"
 env["CUDAPIPE_PLAN_STATS"] = "1"
 env["CUDAPIPE_TEXTURE_CACHE_FAIL_AUTHORITATIVE_ALLOC_AT_PREFLIGHT"] = "2"

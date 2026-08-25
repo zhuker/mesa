@@ -440,7 +440,7 @@ run_wrapped(const char *self)
       if (dup2(fds[1], STDERR_FILENO) < 0)
          _exit(126);
       close(fds[1]);
-      setenv("CUDAPIPE_TEXTURE_CACHE", "1", 1);
+      unsetenv("CUDAPIPE_NO_TEXTURE_CACHE");
       setenv("CUDAPIPE_TEXTURE_CACHE_STATS", "1", 1);
       char *const args[] = { (char *)self, "--child", NULL };
       execvp(self, args);

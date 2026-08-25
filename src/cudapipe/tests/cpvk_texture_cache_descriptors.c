@@ -15,7 +15,7 @@
  * load intentionally survives as PTX local memory.  That is a known shape for
  * which cudapipe's strict HW_INLINE admission gate rejects the binary, while
  * the resource-isolated HW_FUSED texture binary is safe.  The outer process
- * enables CUDAPIPE_TEXTURE_CACHE and CUDAPIPE_TEXTURE_CACHE_STATS, captures
+ * enables CUDAPIPE_TEXTURE_CACHE_STATS (the hardware path is the default), captures
  * stderr, and on a cudapipe device requires modes inline=0 and fused=all hits.
  * NVIDIA and llvmpipe ignore those variables and still run the exact pixels.
  *
@@ -301,7 +301,7 @@ run_wrapped(const char *self)
       if (dup2(fds[1], STDERR_FILENO) < 0)
          _exit(126);
       close(fds[1]);
-      setenv("CUDAPIPE_TEXTURE_CACHE", "1", 1);
+      unsetenv("CUDAPIPE_NO_TEXTURE_CACHE");
       setenv("CUDAPIPE_TEXTURE_CACHE_STATS", "1", 1);
       char *const args[] = { (char *)self, "--child", NULL };
       execvp(self, args);

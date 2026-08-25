@@ -125,7 +125,11 @@ struct cp_debug {
    unsigned upload_flush_fail_at;
    bool no_opaque_episode;
    bool no_sampler_variant;
+   /* Derived in apply_couplings() from no_texture_cache: the hardware texture
+    * path is the default, and the registry carries the revert. Every use site
+    * still reads texture_cache, so nothing else had to be inverted. */
    bool texture_cache;
+   bool no_texture_cache;
    unsigned texture_cache_fail_table_upload_at;
    unsigned texture_cache_purge_at_preflight;
    unsigned texture_cache_fail_authoritative_alloc_at_preflight;

@@ -61,7 +61,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAPIPE_VFETCH_SKIP_SEED` | bool (value) | `off` | — | fault injection: a fused draw does not seed the clip and raster counters, and the host still skips their clears -- the negative control for the seeding moving into the fused vertex shader |
 | `CUDAPIPE_NO_OPAQUE_EPISODE` | bool (value) | `off` | — | disable consecutive opaque-run visibility deferral |
 | `CUDAPIPE_NO_SAMPLER_VARIANT` | bool (value) | `off` | — | disable literal-state fragment sampler variants |
-| `CUDAPIPE_TEXTURE_CACHE` | bool (value) | `off` | — | opt in to same-LLVM direct CUDA hardware-texture fragment execution |
+| `CUDAPIPE_NO_TEXTURE_CACHE` | bool (value) | `off` | — | disable direct CUDA hardware-texture fragment execution; fall back to software sampling |
 | `CUDAPIPE_TEXTURE_CACHE_FAIL_TABLE_UPLOAD_AT` | uint | `0` | — | fault injection: fail the Nth hardware texture table upload enqueue |
 | `CUDAPIPE_TEXTURE_CACHE_PURGE_AT_PREFLIGHT` | uint | `0` | — | fault injection: purge derived textures before the Nth HW preflight |
 | `CUDAPIPE_TEXTURE_CACHE_FAIL_AUTHORITATIVE_ALLOC_AT_PREFLIGHT` | uint | `0` | — | fault injection: OOM one renderer allocation at the Nth HW preflight |
