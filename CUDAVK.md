@@ -22,6 +22,7 @@ when the work started.
 | avoid re-implementing something that failed | `docs/cudavk/DEAD_ENDS.md` |
 | know what is unfinished | `docs/cudavk/TODO.md` |
 | check correctness | `docs/cudavk/TESTING.md` |
+| hand frames to CUDA, or share memory with it | `docs/cudavk/CUDA_INTEROP.md` |
 | know what every environment switch does | `src/cudavk/FLAGS.md` (generated) |
 
 `docs/cudavk/history/` keeps the long-form records: the decision log, the
