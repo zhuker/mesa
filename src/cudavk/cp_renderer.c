@@ -7437,13 +7437,24 @@ cp_opaque_finish(struct cp_context *cp)
       cp->plan.opaque_multiseg++;
    if (nsegs > cp->plan.opaque_max_segs)
       cp->plan.opaque_max_segs = nsegs;
-   if (cp_opaque_side_streams(cp))
+   /* Episodes that really put a segment on a side stream. A one-segment
+    * episode under the flag now issues exactly what the flag-off path issues,
+    * so counting it as fanned out would report a fan-out that did not
+    * happen — and this counter is what says whether a sample's regression or
+    * win came from the streams at all. */
+   if (cp_opaque_side_streams(cp) && nsegs > 1)
       cp->plan.opaque_fanned++;
 
    /* The segments rasterized visibility on the side streams; everything below
     * — the tile pass, the census and the shading — reads across all of them.
-    * An unjoined side stream is not a slow episode, it is an unordered one. */
-   if (cp_opaque_side_streams(cp) && !cp_pass_join(cp, nsegs))
+    * An unjoined side stream is not a slow episode, it is an unordered one.
+    *
+    * nsegs - 1 side streams, because segment 0 ran on the main stream and is
+    * already ordered ahead of this point. Joining a stream that carried no
+    * work is not merely wasted: it is the same event record and cross-stream
+    * wait a real join costs, which for a one-segment episode is the whole
+    * price of the fan-out and none of its benefit. */
+   if (cp_opaque_side_streams(cp) && !cp_pass_join(cp, nsegs - 1))
       return;
 
    if (cp_debug->tiled_opaque &&
@@ -8897,8 +8908,31 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    unsigned before = cp->pass.nsegs;
    CUstream saved_stream = cp->stream;
    struct cp_queue_set saved_qset = cp->cur_qset;
-   if (side) {
-      unsigned k = cp->pass.nsegs % CP_PASS_STREAMS;
+   /*
+    * The first segment stays on the main stream, and only segment s > 0 goes
+    * to a side stream — stream s-1, so eight streams still carry the eight
+    * segments that can overlap.
+    *
+    * Segment 0 has nothing to overlap: it is the only work the episode has in
+    * flight, and everything the episode did before it is on the main stream
+    * ahead of it. Moving it to a side stream buys no concurrency and costs two
+    * cross-stream synchronisations, the gate in and the join out, whose
+    * bubbles the segment cannot hide behind anything. Measured at about 32 us
+    * per episode: it is what made the samples whose opaque episodes are all
+    * exactly one segment long — pbribl 0.60 -> 1.35, pushconstants 0.13 ->
+    * 1.13 ms/frame — pay for a fan-out they never used, and it cost the
+    * 600-frame sweep 0.8 ms of hot sum. Those episodes now issue exactly what
+    * the flag-off path issues.
+    *
+    * This is not a special case for one-segment episodes; it is the same
+    * saving on every episode, which pays for one fewer stream hand-off than it
+    * did. The isolation hazard 2 requires is unchanged: segment 0 uses the
+    * context-wide queue set, which no side stream ever touches, and segments
+    * 1..n use their own.
+    */
+   bool seg_side = side && cp->pass.nsegs > 0;
+   if (seg_side) {
+      unsigned k = (cp->pass.nsegs - 1) % CP_PASS_STREAMS;
       /* The gate is what orders this segment behind the clears above. */
       if (cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0) !=
           CUDA_SUCCESS) {
@@ -8913,7 +8947,7 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    cp->pass.append_failed = false;
    cp_draw_execute_batch(cp, &cp->batch);
    cp->pass.appending = false;
-   if (side) {
+   if (seg_side) {
       cp_stream_set(cp, saved_stream);
       cp->cur_qset = saved_qset;
    }
