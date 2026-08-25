@@ -100,14 +100,24 @@ Two framings this list depends on:
 
 ### Tier 0 — cheap, and everything rests on them
 
-1. **Report a real `deviceUUID`.** `cpvk_device.c:263-264` memsets `deviceUUID`
+1. **~~Report a real `deviceUUID`~~ — DONE** (`8f9bba600b5`). All three UUIDs are
+   real, and `deviceUUID` is byte-identical to the proprietary driver's on the
+   same GPU, so a consumer matching by UUID cannot tell them apart.
+   `pipelineCacheUUID` was fixed with it: left at zero it never invalidated, so
+   a cache written by one build was accepted by the next. Original text:
+   `cpvk_device.c:263-264` memsets `deviceUUID`
    and `driverUUID` to zero, and `cuDeviceGetUuid` is never called anywhere.
    Matching `VkPhysicalDeviceIDProperties.deviceUUID` against `cuDeviceGetUuid`
    is how a CUDA consumer identifies which GPU a Vulkan device is, and it was
    verified exact on the proprietary driver. Until this is done, a correct
    consumer cannot identify this driver's device at all. ~5 lines, and the best
    value per line in this section.
-2. **Fix the CUDA context clobber.** `cuCtxSetCurrent` at ~25 sites and no
+2. **~~Fix the CUDA context clobber~~ — DONE** (`b2781c4a7b1`). `CPVK_CTX_SCOPE`
+   at 60 entry points, 23 inner `cuCtxSetCurrent` calls removed, only
+   `cpvk_submit_worker`'s kept. `CUDAVK_CTX_CHECK` makes the coverage testable;
+   removing one scope on purpose both fires it and fails 48 of 49 tests. Frame
+   time unchanged on both captures, hashes identical. Original text:
+   `cuCtxSetCurrent` at ~25 sites and no
    `cuCtxPushCurrent`/`PopCurrent` anywhere (`CUDA_INTEROP.md` §2.5). The CUDA
    Runtime adopts a driver context that is already current, so a co-located
    consumer can allocate inside a context that dies at `vkDestroyDevice`.
@@ -143,7 +153,21 @@ Two framings this list depends on:
    Self-contained, because one `VkDeviceMemory` is exactly one CUDA allocation.
    Watch the 2 MiB VMM granularity, and keep `vkMapMemory` working for
    exportable host-visible types.
-5. **The acceptance test, written alongside item 4.** One binary that renders a
+5. **~~The acceptance test~~ — DONE, and ahead of item 4** (`4b763c7768c`).
+   `src/cudavk/samples/interop/` is a two-process sample: Vulkan renders, a
+   PyTorch process consumes over an exported fd with no copy, and the result
+   comes back into a second shared buffer that Vulkan checks byte for byte. The
+   binary cannot tell which driver it is on; `run_interop.py --icd` chooses.
+   Against the proprietary driver: 5/5 including three negative controls, 1.272
+   ms/frame in timeline mode, 0 of 1048568000 bytes wrong. Against cudavk it
+   SKIPs with exit 3 and says why:
+
+       this driver does not report OPAQUE_FD as exportable for this buffer usage
+         VK_KHR_external_memory_fd : absent
+         externalMemoryFeatures for OPAQUE_FD : 0x0
+
+   **That is the whole of what is left in Tier 1: make item 4 turn those five
+   SKIPs into five PASSes.** Original text: One binary that renders a
    known frame, exports it, imports it in CUDA and prints a hash, selected by
    `VK_DRIVER_FILES`. Run against both ICDs and diff. This is what turns
    "drop-in replacement" into a pass or a fail, and it is how Tier 1 is declared
