@@ -129,7 +129,16 @@ bool cp_kernels_instrumented(void);
 #define CP_PDL_TIER_SCAN   1u
 #define CP_PDL_TIER_RASTER 2u
 #define CP_PDL_TIER_FS     3u
-#define CP_PDL_TIER_MAX    3u
+/*
+ *   4  stage 1, offered at all five rasterizer triples. A DIAGNOSTIC, not a
+ *      default: a queue-counter clear sits in front of stage 1 at some of
+ *      those sites and not at others, and rather than reason about which, the
+ *      predecessor check refuses the blocked ones and the take/decline
+ *      counters report exactly how much of the surface is already clear.
+ *      A declined link is an ordinary launch, so offering it costs nothing.
+ */
+#define CP_PDL_TIER_STAGE1 4u
+#define CP_PDL_TIER_MAX    4u
 unsigned cp_pdl_kernels(int sm_major, int sm_minor);
 
 /* The device's compute capability is all this needs of a screen, so it takes

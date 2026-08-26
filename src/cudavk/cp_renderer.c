@@ -538,9 +538,13 @@ cp_launch_after(struct cp_context *cp, CUfunction f,
 
    uint64_t epoch = cp_pdl_watch ?
       __atomic_load_n(&cp_pdl_epoch, __ATOMIC_RELAXED) : 0;
+   /* CP_PDL_ANY drops the identity comparison and nothing else; see the
+    * macro's comment for why that is sound only for a secondary whose wait is
+    * its first instruction. */
+   bool named = pdl_after == CP_PDL_ANY ? cp->pdl_prev_fn != NULL
+                                        : cp->pdl_prev_fn == pdl_after;
    bool pdl = pdl_after && cp_pdl_watch && !cp->pdl_failed &&
-              cp->dev->kernels.pdl >= pdl_tier &&
-              cp->pdl_prev_fn == pdl_after &&
+              cp->dev->kernels.pdl >= pdl_tier && named &&
               cp->pdl_prev_stream == stream &&
               cp->pdl_prev_epoch == epoch;
 
@@ -6330,8 +6334,13 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          }
       }
       void *ap[] = { &aa, &rast_queues };
+      /* Tier 4, count pass. The queue-counter clear above is skipped whenever
+       * the vertex stage seeded the counters (fetch_fold), and the episode's
+       * clears run for its first segment only, so this site is expected to
+       * take. The clip may or may not be the kernel in front of it. */
       if (!fused_count)
-         CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
+         CP_LAUNCH_AFTER(CP_PDL_ANY, CP_PDL_TIER_STAGE1,
+                        screen->kernels.rasterize_stage1_abuf,
                         (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
                         0, cp->stream, ap, NULL);
       /* Whichever of the two actually filled the queue is the predecessor;
@@ -6493,7 +6502,11 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          aa.abuf_mode = CP_ABUF_FILL;
          rast_queues.mode = CP_QUEUE_FILL;
          void *ap[] = { &aa, &rast_queues };
-         CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
+         /* Tier 4, fill pass. Expected to DECLINE: the counter clear above
+          * is unconditional here, and the 3.7 MB cursor clear is in front of
+          * that. Offered so that the counter says so rather than a comment. */
+         CP_LAUNCH_AFTER(CP_PDL_ANY, CP_PDL_TIER_STAGE1,
+                        screen->kernels.rasterize_stage1_abuf,
                         (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
                         0, cp->stream, ap, NULL);
          CP_LAUNCH_AFTER(screen->kernels.rasterize_stage1_abuf,
@@ -6748,10 +6761,14 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          }
       }
       void *s1_params[] = { &rast_args, &rast_queues };
+      /* Tier 4, plain path. The clear above is skipped for pass 0 under the
+       * fetch fold and for a reusing pass, so pass 0 is expected to take and
+       * every later peel pass to decline. */
       if (!fused_rast)
-         rast_err = cp_launch(cp, screen->kernels.rasterize_stage1,
+         rast_err = cp_launch_after(cp, screen->kernels.rasterize_stage1,
             (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
-            0, cp->stream, s1_params, NULL);
+            0, cp->stream, s1_params, NULL,
+            CP_PDL_ANY, CP_PDL_TIER_STAGE1);
 
       /*
        * Both later stages stride their queue, so any grid is correct and the
@@ -7595,7 +7612,10 @@ cp_opaque_tile_visibility(struct cp_context *cp, struct cp_pass_seg *segs,
        * nontrivial queue, tile queue and setup-cache generation together. */
       cuMemsetD32Async(queues.nontrivial_count, 0, 3, cp->stream);
       void *params[] = { &aa, &queues };
-      CP_LAUNCH(screen->kernels.rasterize_stage1,
+      /* Tier 4, tiled-opaque fallback. Expected to decline: the clear is
+       * unconditional and inside the segment loop. */
+      CP_LAUNCH_AFTER(CP_PDL_ANY, CP_PDL_TIER_STAGE1,
+                screen->kernels.rasterize_stage1,
                 DIV_ROUND_UP(segs[s].rast_num_triangles, 256), 1, 1,
                 256, 1, 1, 0, cp->stream, params, NULL);
       CP_LAUNCH_AFTER(screen->kernels.rasterize_stage1, CP_PDL_TIER_RASTER,
@@ -8551,7 +8571,10 @@ cp_pass_finish(struct cp_context *cp)
          /* The segment's own queue set, saved with its arguments. */
          cuMemsetD32Async(q.nontrivial_count, 0, 3, cp->stream);
          void *ap[] = { &aa, &q };
-         CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
+         /* Tier 4, pass segments. Expected to decline for the same reason as
+          * the tiled fallback: one clear per segment, inside the loop. */
+         CP_LAUNCH_AFTER(CP_PDL_ANY, CP_PDL_TIER_STAGE1,
+                        screen->kernels.rasterize_stage1_abuf,
                         (sg->rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
                         0, cp->stream, ap, NULL);
          /* One segment's three stages are a chain on that segment's own

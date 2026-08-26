@@ -57,6 +57,13 @@
 #else
 #define CP_PDL_WAIT3() do { } while (0)
 #endif
+/* Tier 4, stage 1. Its wait is the kernel's first instruction, which is what
+ * lets its call sites name CP_PDL_ANY as the predecessor. */
+#if CP_PDL >= 4
+#define CP_PDL_WAIT4() CP_PDL_WAIT_INSN()
+#else
+#define CP_PDL_WAIT4() do { } while (0)
+#endif
 
 #define PACK_VISBUF(depth_uint, tri_id) \
    (((uint64_t)(depth_uint) << 32) | (uint64_t)(~(uint32_t)(tri_id)))
@@ -899,6 +906,18 @@ template <bool ABUF>
 static __device__ __forceinline__ void
 cp_rasterize_stage1_body(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
+   /*
+    * Tier 4, and the wait goes first because nothing here is independent of
+    * whatever ran in front of it. The triangle count and the active-id map are
+    * the clipper's output; the vertex positions are the vertex shader's; the
+    * queue counters this kernel appends to are seeded by the vertex shader
+    * under the fetch fold. Which of those three is the immediate predecessor
+    * varies by call site, so the only placement that is correct at all five is
+    * the top. That makes this the no-preamble class -- 0.44 us a link, not
+    * 0.78 -- and the call sites name CP_PDL_ANY accordingly.
+    */
+   CP_PDL_WAIT4();
+
    uint32_t work = blockIdx.x * blockDim.x + threadIdx.x;
    /* After clipping the count lives on the device, so the grid is sized for
     * the worst case and each thread bounds itself. */

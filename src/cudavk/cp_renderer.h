@@ -752,6 +752,24 @@ CUresult cp_upload_flush(struct cp_context *cp);
 void cp_stream_set(struct cp_context *cp, CUstream stream);
 
 #define CP_LAUNCH(...) CP_CU_WARN(cp_launch(cp, __VA_ARGS__), "cuLaunchKernel")
+/*
+ * A predecessor that is any kernel at all, for a secondary whose wait is its
+ * FIRST instruction.
+ *
+ * The named-predecessor check exists to justify hoisting loads above the wait:
+ * a site claims "the kernel in front of me is X", and the loads it moves ahead
+ * of the wait are ones X did not write. A secondary that hoists nothing needs
+ * no such claim -- it only needs the previous item on the stream to be a
+ * kernel rather than a clear or a copy, which is what the epoch and a non-null
+ * predecessor together already prove. So this drops the identity comparison
+ * and nothing else: the stream must still match, the epoch must still not have
+ * moved, and the upload flush must still have issued nothing.
+ *
+ * It must never be used by a site whose secondary executes anything before its
+ * wait. cp_rasterize_stage1 is the only user, and its wait is at offset zero.
+ */
+#define CP_PDL_ANY ((CUfunction)~(uintptr_t)0)
+
 /* `prev` and its tier first for readability at the call site; they are passed
  * last. The tier must be the one whose kernels carry the matching wait. */
 #define CP_LAUNCH_AFTER(prev, tier, ...) \

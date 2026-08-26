@@ -225,8 +225,12 @@ static const struct cp_flag_def flags[] = {
      "stream serialization attribute, so that a kernel may start before its "
      "predecessor on the same stream has drained: 0 none, 1 the A-buffer scan "
      "chain, 2 also the rasterizer stage links, 3 also the fragment writeback "
-     "and the segment scatter. The default is the top level; lower it to "
-     "bisect a regression, and see CUDAVK_NO_PDL for the plain revert. Needs "
+     "and the segment scatter, 4 also offers stage 1, which is a diagnostic "
+     "rather than a default: most of those links are expected to refuse "
+     "themselves and the counters are the measurement. The default is 3; "
+     "lower it to "
+     "bisect a regression, raise it to 4 to measure stage 1, and see "
+     "CUDAVK_NO_PDL for the plain revert. Needs "
      "compute capability 9.0 and CUDA 11.8, and any link whose predecessor "
      "turns out not to be the named kernel falls back to an ordinary launch",
      .dflt = CP_PDL_LEVEL_DEFAULT },
