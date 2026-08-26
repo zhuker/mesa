@@ -334,26 +334,80 @@ sequence number, because a `CUevent` is binary and re-recording races a peer tha
 has not yet waited — and it does not exist on the proprietary driver, so it
 splits the single code path. Measure first.
 
+#### 12. The doorbell: GPU-side synchronisation without an exportable semaphore
+
+Item 11 is closed because CUDA will not take a synchronisation object from us.
+It will take **memory**, which is the one thing sharing already works for — and
+CUDA can wait on memory in hardware. So the missing semaphore can be routed
+around rather than mourned.
+
+    /* consumer, once per slot, enqueued ahead of the frame */
+    cuStreamWaitValue64(op_stream, doorbell, seq, CU_STREAM_WAIT_VALUE_GEQ);
+
+    /* producer, as the last command of the frame */
+    vkCmdFillBuffer(cb, slot_buf, doorbell_off, 4, seq);
+
+`GEQ` is a monotonic comparison, which is exactly a timeline semaphore's, and
+the doorbell is a word inside the buffer already exported over the fd. Nothing
+new has to cross the process boundary. **The producer side needs no new driver
+feature**: `vkCmdFillBuffer` is a stream-ordered device write and lands after
+the render work on the same CUDA stream.
+
+Measured on this machine (`/tmp/interop/doorbell.c`), one context, two streams:
+
+    CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS : 1
+    before the write, the waiting stream    : CUDA_ERROR_NOT_READY, correctly blocked
+    after the write, the waiting stream     : released
+    cuStreamWriteValue64 + cuStreamWaitValue64 : 1795 ns per pair
+
+So it blocks and releases as a semaphore does, at roughly 900 ns an operation.
+Compare the host handshake it would replace: GPU completes, the submit worker
+wakes from `cuEventSynchronize`, signals a condvar, the application thread wakes
+from `vkWaitForFences`, a socket or futex wakes the consumer, and only then is
+CUDA work enqueued. Three thread wake-ups and a launch. **A futex only replaces
+the socket** — one hop of four, perhaps 20 µs — whereas the doorbell removes the
+CPU from the loop entirely, which is the property a real semaphore has and the
+reason to want one.
+
+**The catch, and it is structural rather than incidental.** The consumer must
+enqueue its wait *before* the frame is ready, several frames ahead. A consumer
+that waits for a message and then enqueues has put the CPU back in the loop and
+gained nothing. That is how timeline semaphores are used everywhere, so it is
+not exotic, but it changes the consumer from "receive, then submit" to "keep N
+frames queued, each gated on doorbell >= seq" — and `samples/interop/PROTOCOL.md`
+is written the first way, so the sample cannot demonstrate this without a
+protocol change.
+
+**What is proven and what is not.** Proven: the mechanism, the blocking, the
+release, the cost — in one process, one context, two streams. Not proven, and it
+is the configuration that matters: cross-process, across two CUDA contexts, on
+*imported* memory, with the write coming from `vkCmdFillBuffer` on cudavk's
+stream. Three things could bite — whether the write is visible to another
+context's wait in the right order, whether one device's L2 makes that automatic,
+and whether stream ordering survives the opaque fan-out onto the side streams
+(`CUDAVK_NO_OPAQUE_STREAMS` is the control). Until that experiment is run this
+is a promising mechanism and not a design.
+
 ### Tier 3 — what a drop-in claim forces
 
-12. **Stop hardcoding CUDA device 0** (`cpvk_device.c:314-316`). An inference
+13. **Stop hardcoding CUDA device 0** (`cpvk_device.c:314-316`). An inference
     host has four or eight GPUs. Also listed under "Vulkan surface not
     implemented"; interop is what makes it urgent.
-13. **More than one queue.** `queueCount = 1` in one family
+14. **More than one queue.** `queueCount = 1` in one family
     (`cpvk_device.c:566-569`). Applications commonly use a dedicated transfer
     queue for exactly the readback a frame handover performs.
-14. **Advertise Vulkan 1.2 or 1.3.** Not for interop directly — because
+15. **Advertise Vulkan 1.2 or 1.3.** Not for interop directly — because
     applications written against the proprietary driver routinely *require* it
     at instance creation and refuse to start. Scope it to what the target
     application requests and let item 5 report what is missing.
 
 ### Tier 4 — correctness, with no speedup attached
 
-15. **Bounds-check `bindless_image_store` and `bindless_image_atomic`**
+16. **Bounds-check `bindless_image_store` and `bindless_image_atomic`**
     (correctness item 3). Low priority across two processes, high the moment
     anything is co-located, because the address space then holds the consumer's
     model weights.
-16. **Fix the descriptor upload race** (correctness item 2). Correctness only:
+17. **Fix the descriptor upload race** (correctness item 2). Correctness only:
     `PERFORMANCE.md` measures that wait at 0.011 ms/frame.
 
 ### Not part of this work
