@@ -52,8 +52,31 @@ Numbers are as at HEAD, old capture 15.74 ms/frame, Crossroads 5.87 ms/frame.
 7. **`multithreading` has no diagnosis.** It differs from the reference by a
    small amount and nobody has found out why.
 8. **`gltfscenerendering` is a standing exception** in the 60-frame comparison
-   against NVIDIA. It predates all recent work: the fused and reverted builds
-   produce the same numbers for it, so it is not caused by anything recent.
+   against NVIDIA, and its differing-pixel count **more than doubled once**,
+   which a standing exception is not permission to do. Bisected through
+   `~/git/Vulkan/build/iter/iterations.json`:
+
+   | iteration | commit | frame 0 | worst | at |
+   |---|---|---:|---:|---:|
+   | `step2-native-verify` | `5deebecefd5` | 15695 | 59926 | 47 |
+   | `tc-default-on` | `ab7b431611a` | 16991 | **137025** | 47 |
+
+   Every gated run since -- `fixstreams-off`, `fixstreams-on`, `interop-tier1`
+   -- reports 137025/137026 at frame 47, so it stepped once and has been flat
+   since. It is **not** caused by the interop work or by the opaque-stream
+   fan-out; both post-date it.
+
+   **Exactly one commit separates those two iterations**: `ab7b431611a`,
+   "cudapipe: move the measurement tooling to the driver it measures". It is a
+   file move plus one behavioural line -- `DRIVER=native` became the default in
+   `cp_iterate.sh`, where it had been the Gallium-hosted driver. So the likely
+   explanation is that **the two rows measure different drivers** and nothing
+   regressed: the number stepped because what was compared changed. That is a
+   hypothesis, not a finding. Nobody has re-rendered `5deebecefd5` under the
+   native driver to confirm it, and until somebody does, 59926 must not be
+   quoted as a native-driver baseline. `TESTING.md` asks for frame number,
+   differing-pixel count, maximum delta and coherent regions; the first two are
+   above and the last two are still unrecorded.
 9. **`renderheadless` is missing from the sweep** because it drives its own
    frames, so it is never compared. It is compared by hand instead, which means
    in practice it is compared rarely.
@@ -66,7 +89,7 @@ was never verified against the CUDA backend. See `GALLIUM_RETIREMENT.md` for the
 full delta. The gaps that come up most:
 
 - multiple render targets, layered rendering, input attachments
-- timeline semaphores, multiple queues
+- multiple queues
 - real occlusion and pipeline-statistics queries
 - full stencil state
 - vertex attribute divisors above one -- the kernel handles an arbitrary
@@ -187,27 +210,121 @@ produce against the proprietary driver.*
 
 ### Tier 2 — synchronisation, in dependency order
 
-8. **Store the `CUevent` in the sync object** instead of a boolean, and stop
-   destroying it in the submit worker (`cpvk_device_memory.c:64`). The header of
-   `cpvk_sync.c` already anticipates exactly this, and that header's claim that
-   submission drains the stream is itself stale. Nothing else in this tier is
-   possible first.
-9. **Make wait semaphores a `cuStreamWaitEvent`** rather than the host
-   `vk_sync_wait_many` at `cpvk_device_memory.c:154-156`. Today `vkQueueSubmit`
-   blocks the application thread until the producer finishes, which is a
-   host wait standing in for a GPU dependency. Recovers submit-boundary
-   pipelining; small once item 8 exists.
-10. **Timeline semaphores.** `cpvk_sync.c:116-118` has no
-    `VK_SYNC_FEATURE_TIMELINE`. The largest single item here, and the right
-    primitive for a frame ring.
-11. **`VK_KHR_external_semaphore_fd`**, which with timelines exports to
-    `CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD` and removes the
-    host round trip.
+8. ~~**Store the `CUevent` in the sync object**~~ — **done.** A sync carries a
+   refcounted `struct cpvk_cuevent` (`cpvk_sync.c`), armed by the submit that
+   will signal it and released by whichever of the pending-submit record, a
+   reset or the destroy gets there last. The worker no longer destroys it.
+9. ~~**Make wait semaphores a `cuStreamWaitEvent`**~~ — **done.**
+   `cpvk_queue_submit` waits on the renderer stream when the sync carries an
+   event and falls back to the host wait when it does not, which is the case
+   where nothing has been recorded into it yet. `CUDAVK_NO_GPU_SEM_WAIT`
+   reverts it. Neutral on both captures, which is what it should be: neither
+   capture blocks on a semaphore for long enough to matter.
+10. ~~**Timeline semaphores.**~~ — **done.** One `vk_sync` type serves both
+    kinds: a 64-bit counter, a monotone signal, `VK_SYNC_FEATURE_WAIT_PENDING`
+    and `move`. `VK_KHR_timeline_semaphore` and `timelineSemaphore` are
+    advertised; apiVersion stays 1.1 and the extension form is deliberate.
+    Wait-before-signal works through the runtime's ASSISTED timeline mode
+    rather than by claiming `WAIT_BEFORE_SIGNAL`, which this backend cannot
+    honestly do — there is no way to enqueue a wait for a value nothing has
+    promised. `src/cudavk/tests/cpvk_timeline_semaphore.c` is the test.
+11. **`VK_KHR_external_semaphore_fd` — the export half is impossible, the
+    import half is possible and pointless here.** The two halves are separate
+    entry points, `vkGetSemaphoreFdKHR` and `vkImportSemaphoreFdKHR`, and
+    Vulkan gives them separate capability bits —
+    `VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT` and
+    `..._IMPORTABLE_BIT` — so importable-only is a legal, advertisable state
+    rather than a fudge. Take them one at a time.
 
-Items 8 and 9 are worth doing on their own merits. **Do not start 10 and 11 for
-interop reasons before measuring that the host handshake costs something** — the
-fence wait is needed regardless and a socket round trip is tens of microseconds
-against a 15.74 ms frame.
+    **Import: implementable, unimplemented for want of a producer.** CUDA is
+    fully capable on the imported side — `cuImportExternalSemaphore` then
+    `cuSignalExternalSemaphoresAsync` / `cuWaitExternalSemaphoresAsync`, proven
+    honoured by the probe below. So `vkImportSemaphoreFdKHR` could hand an fd
+    to CUDA and the driver could then wait and signal it on its own streams.
+    What is missing is anyone to create the fd: only a real Vulkan driver, D3D
+    or NvSciSync can mint one, and on the machine cudavk exists to serve it
+    **is** the Vulkan driver, while the CUDA consumer has no export either. It
+    would pay only in a mixed topology where another Vulkan device owns the
+    sync objects. Left undone deliberately; revisit if that case appears.
+
+    **Export: NOT IMPLEMENTABLE, and now MEASURED. Do not attempt it.**
+    A driver built on CUDA has nothing to export.
+
+    The API listing says so: of 606 driver API entry points in `cuda.h` 12.8
+    there is **no call that creates or exports a semaphore**.
+    `cuImportExternalSemaphore` is import-only, and every one of the ten
+    `CUexternalSemaphoreHandleType` values names an object some *other* API
+    made. `cuIpcGetEventHandle` is not a way round it: a 64-byte opaque struct,
+    not a file descriptor, and CUDA-to-CUDA only.
+
+    The docs alone would not settle it — the text for `OPAQUE_FD` says only
+    "a valid file descriptor referencing a synchronization object" and never
+    says who made it, and `TIMELINE_SEMAPHORE_FD` has no per-type paragraph at
+    all. So every plausible fd was offered to it (`/tmp/interop/sem/`):
+
+    | fd offered | as OPAQUE_FD | as TIMELINE_SEMAPHORE_FD |
+    |---|---|---|
+    | NVIDIA Vulkan timeline semaphore (`/dev/nvidiactl`) | **SUCCESS** | **SUCCESS** |
+    | DRM binary syncobj (`anon_inode:syncobj_file`) | 999 | 999 |
+    | DRM timeline syncobj | 999 | 999 |
+    | DRM syncobj, `HANDLE_TO_FD_FLAGS_TIMELINE` | 999 | 999 |
+    | Linux `sync_file` (`EXPORT_SYNC_FILE`) | 999 | 999 |
+    | eventfd, memfd, plain file, `/dev/null`, pipe | 999 | 999 |
+
+    Every non-NVIDIA descriptor fails identically to a plain file, on all four
+    DRM nodes including NVIDIA's own (`nvidia-drm`), 32 of 32 attempts. The
+    export side works fine unprivileged; CUDA simply will not take it.
+
+    **The test that pins down the rule**: a raw `open("/dev/nvidiactl")` fd is
+    also refused with 999 — and that is the very character device the working
+    Vulkan semaphore fd points at, confirmed by `readlink` on both. So the
+    requirement is not the device node, not GPU access and not the DRM driver
+    identity. **The fd must carry a resource-manager object minted inside the
+    NVIDIA kernel driver by the NVIDIA user-mode stack.** `/dev/nvidia0` and
+    `/dev/nvidia-uvm` are refused too.
+
+    And that is the whole asymmetry with memory, in one line: CUDA 12.8 has
+    `cuMemExportToShareableHandle`, so a VMM fd exists for
+    `cuImportExternalMemory` to accept. There is no `cuExportExternalSemaphore`.
+    Import only ever takes what some NVIDIA component exported, and for
+    semaphores CUDA cannot be that component. **Buffers can be shared;
+    synchronisation cannot.**
+
+    Type 9 having no per-type paragraph in the docs hides no looser rule: it
+    behaved exactly like type 1 on every input offered. `sw_sync` could not be
+    tested — debugfs is root-only here — but the gap is covered, because
+    `EXPORT_SYNC_FILE` yields a genuine `anon_inode:sync_file`, the same kernel
+    object type, and CUDA refuses that too.
+
+    Note this also settles the sample: cudavk having timeline semaphores does
+    not make the interop sample's timeline mode pass, because that protocol has
+    the producer *export* two semaphores. 3/5 is the ceiling there.
+
+    A lavapipe-style `SYNC_FD` shim remains possible for Vulkan-to-Vulkan use
+    (`lvp_pipe_sync.c:266` drains the device and returns an already-signalled
+    fd, or `-1`), but CUDA has no `SYNC_FD` handle type, so it buys nothing
+    here.
+
+    So cudavk cannot mint the `TIMELINE_SEMAPHORE_FD` a CUDA consumer would
+    import, and the interop sample's timeline mode cannot pass against this
+    driver. That is a capability gap in the same class as dma-buf export, not
+    a matter of effort. **The host handshake is the supported synchronisation
+    for cudavk interop**, and it is measured cheap: the sample reports 1.440
+    ms/frame host against 1.272 timeline on a driver where both exist, about
+    0.17 ms against a 13.2 ms cudavk frame.
+
+    Items 8 to 10 were worth doing on their own merits — they are
+    Vulkan-internal and do not depend on export, and they are done. Say that
+    precisely, because the pair is easy to confuse: **cudavk has timeline
+    semaphores, and cudavk still cannot pass the interop sample's timeline
+    mode.** The first is a Vulkan feature and part of the drop-in surface; the
+    second needs an exportable fd CUDA will accept, and the table above is what
+    says there is not one.
+
+**Do not start 11 for interop reasons at all** — it is closed. And do not
+reach for external synchronisation before measuring that the host handshake
+costs something: the fence wait is needed regardless and a socket round trip is
+tens of microseconds against a 15.74 ms frame.
 
 There is a cheaper cudavk-only shortcut if the handshake ever does measure: the
 submit event at `cpvk_device_memory.c:329` is already created with

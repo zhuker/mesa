@@ -108,7 +108,7 @@ The native test suite is the fast gate:
 ./venv/bin/meson test -C build-cudavk --suite cudavk
 ```
 
-65 tests, and 65/65 is the state the branch is kept in
+67 tests, and 67/67 is the state the branch is kept in
 (`docs/cudavk/history/PERF16_ITERATIONS.md`, iteration 28). It includes
 `cp_launch_audit`, which fails if a raw `cuLaunchKernel` appears outside the two
 allowlisted definitions. Run `src/cudavk/tests/cp_debug_doc.py --check` after

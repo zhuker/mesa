@@ -234,24 +234,38 @@ host-visible allocation that is mapped and copied. Headless present is a no-op.
 **Do not tap the frame at the swapchain** — it is the wrong place here, and it is
 not exportable at all on the proprietary driver.
 
-### 2.4 Synchronisation: host round trips are the only mechanism
+### 2.4 Synchronisation: CUDA events inside, no exportable semaphore outside
 
 Two stream families, both `CU_STREAM_NON_BLOCKING`: `cp->stream`, one per device
 (`cp_renderer.c:81`), carrying every frame-path launch; and `cp->seg_streams[8]`,
 created lazily for pass episodes (`:7069-7070`), joined with
 `cuEventRecord`/`cuStreamWaitEvent` (`:7157-7180`).
 
-`cpvk_queue_submit` (`cpvk_device_memory.c:141-346`) host-waits its wait
-semaphores (`:154-156`), does a blocking descriptor `cuMemcpyHtoD` (`:214-230`),
-translates recorded ops into CUDA work *at submit time* (`:233-303`), records a
-`CUevent` (`:329-330`) and returns **without draining**. A worker thread
-(`:86`) does `cuEventSynchronize` (`:48`) then signals the `vk_sync` (`:53-56`).
+`cpvk_queue_submit` (`cpvk_device_memory.c:151-410`) makes the renderer stream
+wait for its wait semaphores (`:170-190`), does a blocking descriptor
+`cuMemcpyHtoD` (`:243-259`), translates recorded ops into CUDA work *at submit
+time* (`:262-332`), records a `CUevent` (`:372-373`), arms the syncs it will
+signal with it (`:388-400`) and returns **without draining**. A worker thread
+(`:95`) does `cuEventSynchronize` (`:57`) then publishes the signals (`:65-70`).
 
-`VkFence` and `VkSemaphore` are one `vk_sync` type: mutex, condvar, bool
-(`cpvk_sync.c:17-22`), waited with `cnd_timedwait` (`:76-112`). No `CUevent` is
-stored in them. **No timeline semaphores** (`:116-118`). `VkEvent` is also
-bool+condvar (`cpvk_private.h:314-327`), with `cuLaunchHostFunc` as its device
-half (`cpvk_cmd.c:3408`).
+`VkFence` and `VkSemaphore` are one `vk_sync` type (`cpvk_sync.c:47-59`): a
+64-bit value, a pending value, an epoch, and a **refcounted `CUevent`** shared
+with the submit that recorded it. The event is what makes a queue-submit wait a
+`cuStreamWaitEvent` on the renderer stream instead of a host block; the host
+`cnd_timedwait` remains for a sync with nothing recorded into it, which is a
+real case and not a fallback of convenience. **Timeline semaphores are
+implemented** on the same type (`:385-410`): `VK_SYNC_FEATURE_TIMELINE`,
+`VK_KHR_timeline_semaphore` and `timelineSemaphore` are advertised at
+apiVersion 1.1. `VK_SYNC_FEATURE_WAIT_BEFORE_SIGNAL` is deliberately **not**
+claimed — a CUDA stream cannot be told to wait for a value nothing has promised
+— so the runtime runs this device in ASSISTED timeline mode and holds a
+wait-before-signal submit on its own thread until the promise exists. That
+choice is what the driver's `VK_SYNC_FEATURE_WAIT_PENDING` is for.
+
+None of this is exportable, and that is the ceiling, not an omission: see
+Part 5 and `TODO.md` item 11. `VkEvent` is still bool+condvar
+(`cpvk_private.h:314-327`), with `cuLaunchHostFunc` as its device half
+(`cpvk_cmd.c:3408`).
 
 The driver blocks about 17 times a frame, all read-back-and-decide drains:
 episode drain (`cp_renderer.c:8333-8337`, 9.88/frame, 8.663 ms), peel checks
@@ -519,14 +533,26 @@ you still need one event per ring slot and a sequence number in the message. And
 it does not exist on the proprietary driver, so it splits the code path the rest
 of this document works to keep single.
 
-**Vulkan external semaphores are the portable endpoint.**
+**~~Vulkan external semaphores are the portable endpoint.~~ They are not
+available here, and that is now measured rather than reasoned.**
 `VK_KHR_external_semaphore_fd` on a **timeline** semaphore exports to
 `CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD`, and a monotonic
-counter is exactly the primitive a frame ring wants — no binary re-arm race, and
-both directions expressible on one object. That is the right destination. It is
-also real work here: `cpvk_sync.c:116-118` has no `VK_SYNC_FEATURE_TIMELINE` and
-`VkSemaphore` is a mutex and condvar today. Do not start it before measuring that
-the handshake costs something.
+counter is exactly the primitive a frame ring wants. On the proprietary driver
+that path works: `vkGetSemaphoreFdKHR` yields an fd on `/dev/nvidiactl` and
+`cuImportExternalSemaphore` accepts it both as `TIMELINE_SEMAPHORE_FD` and as
+`OPAQUE_FD`. **No fd this driver could produce is accepted.** Every non-NVIDIA
+descriptor was tried against `cuImportExternalSemaphore` and every one failed
+identically to a plain file, with `CUDA_ERROR_UNKNOWN` (999): a DRM binary
+syncobj, a DRM timeline syncobj, a syncobj created with the TIMELINE flag, a
+Linux `sync_file`, and — as negative controls — an eventfd, a memfd, an
+ordinary file, `/dev/null` and a pipe. The accepted handle is an NVIDIA RM
+object, and CUDA has no call that creates one (§ `TODO.md` item 11). Evidence:
+`/tmp/interop/sem/RESULTS.md`.
+
+The timeline semaphores this driver now implements are Vulkan-internal, and for
+the drop-in surface. They do **not** make the interop sample's timeline mode
+pass, and no amount of driver work will: the missing piece is an export CUDA
+cannot consume. The host handshake above is the supported mechanism.
 
 ---
 

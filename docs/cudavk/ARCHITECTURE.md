@@ -54,7 +54,7 @@ Three facts shape everything else.
 | `cpvk_image.c` | the closed format table, tightly packed mip layout, images, views, texture descriptors, samplers |
 | `cpvk_pipeline.c` | SPIR-V→NIR preparation, descriptor lowering, graphics/compute pipeline compilation, the in-process stage cache |
 | `cpvk_cmd.c` | descriptors, command recording, dynamic rendering, draws, dispatches, copies, blits, resolves, events, queries |
-| `cpvk_sync.c` | binary fences and semaphores; CUDA-event completion publishes signals asynchronously |
+| `cpvk_sync.c` | binary fences and semaphores, and timeline semaphores; one refcounted CUDA event per submit is the completion, on the device and on the host |
 | `cpvk_texture_cache.c` | derived read-only CUDA arrays and texture objects for the hardware texture path |
 | `cp_renderer.[ch]` | the renderer: batching, clipping, rasterization, A-buffer and peel paths, pass episodes, arenas, launches |
 | `cp_kernels.[ch]`, `kernels/` | NVRTC compilation, the PTX disk cache, and the CUDA kernels themselves |
@@ -110,19 +110,32 @@ the primary's active scope.
 
 `vkQueueSubmit` walks the recorded array in order and:
 
-1. publishes the bounded host mappings the sampler specializer and the hardware
+1. makes the renderer stream wait for each wait semaphore that carries a
+   completion event, and host-waits the ones that do not;
+2. publishes the bounded host mappings the sampler specializer and the hardware
    texture preflight read;
-2. uploads dirty descriptor-snapshot arenas from host storage to device-only
+3. uploads dirty descriptor-snapshot arenas from host storage to device-only
    memory, once per recording rather than per draw;
-3. issues draws, dispatches and transfers on the renderer's stream in recorded
+4. issues draws, dispatches and transfers on the renderer's stream in recorded
    order;
-4. flushes any pending renderer batch and finishes any open pass episode;
-5. records a CUDA completion event and returns **without draining the stream**.
+5. flushes any pending renderer batch and finishes any open pass episode;
+6. records a CUDA completion event, arms every sync it will signal with it, and
+   returns **without draining the stream**.
 
 A per-device completion worker waits on those events in queue order and only
-then publishes the submission's signals. That is what makes binary fences and
+then publishes the submission's signals. That is what makes fences and
 semaphores track real GPU completion rather than host progress. Scratch and
 upload generations are rewound only when all earlier submissions have retired.
+
+Step 1 is a GPU dependency expressed as one, which is what a semaphore is. It
+used to be `vk_sync_wait_many` on the application thread before a single
+command was translated. The host wait is still there for the sync that has
+nothing recorded into it — signalled from the host, or by a submit that has not
+been issued yet — and `CUDAVK_NO_GPU_SEM_WAIT` puts everything back on it.
+Step 6 also marks each signalled sync *pending*, which is what makes
+`VK_SYNC_FEATURE_WAIT_PENDING` true and lets the runtime support
+wait-before-signal on timeline semaphores over a driver that cannot (§2.2 of
+`CUDA_INTEROP.md`).
 
 Each recorded draw is resolved by `cpvk_prepare_draw()` into one complete
 immutable `cp_draw_packet`: state, scope, call, index range, scissor, and the
@@ -789,6 +802,7 @@ the evidence behind it.
 | vertex input | attribute divisors above one are unreachable — the pipeline ignores `VkPipelineVertexInputDivisorStateCreateInfoEXT`, though the fetch itself handles an arbitrary divisor |
 | formats | the blit family is `R8G8B8A8_UNORM` and `B8G8R8A8_UNORM`; the copy executor has no host fallback. `R8G8B8A8_UINT` is the only integer colour format and is renderable and copyable only: there is no `CP_TEXEL_*` decode for it, so it cannot be sampled or blitted, and it is single sample because `cp_resolve_samples` averages and an integer resolve may only take sample zero |
 | WSI | `EXT_headless_surface` only, no platform window-system extension |
+| synchronisation | no external semaphore of any kind, and none is possible: CUDA 12.8 can import a semaphore but has no call that creates or exports one. Timeline semaphores are implemented, and their wait-before-signal is the runtime's ASSISTED mode rather than a native `WAIT_BEFORE_SIGNAL` |
 | determinism | the compacting clipper path does not promise stable primitive order, so unblended draws can break a depth tie differently run to run |
 | precision | raster stages 2 and 3 interpolate depth with separately written arithmetic, so a one-ulp difference flips a tie at the boundary; `fexp2`, `flog2` and lowered `fpow` use the NVVM approximate intrinsics |
 | safety | `bindless_image_store` has no bounds check |

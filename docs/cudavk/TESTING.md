@@ -138,15 +138,17 @@ When the new path is already the default, the revert flag goes on the
 ## 4. Gate 1: the native test suite
 
 ```bash
-./venv/bin/meson test -C build-cudavk --suite cudavk                    # all 65
+./venv/bin/meson test -C build-cudavk --suite cudavk                    # all 67
 ./venv/bin/meson test -C build-cudavk --print-errorlogs cpvk_batchblend # one
 ```
 
-**65 tests**, and 65/65 is the state the branch is kept in: 47 C tests, four
-`cpvk_vfetch` modes and fourteen Python gates, counted from the registry in
-`src/cudavk/meson.build`. Iteration 28 recorded 65/65 in the default state and
-65/65 with every revert flag set
-(`docs/cudavk/history/PERF16_ITERATIONS.md`).
+**67 tests**, and 67/67 is the state the branch is kept in: 49 C tests, four
+`cpvk_vfetch` modes, thirteen Python gates and one fault-mode rerun of a C
+test, counted from the registry in `src/cudavk/meson.build`. Iteration 28
+recorded 65/65 in the default state and 65/65 with every revert flag set
+(`docs/cudavk/history/PERF16_ITERATIONS.md`); two tests have been added since,
+and the count here is recounted from the registry rather than carried
+forward.
 
 **Every test is registered `is_parallel : false`, and that is load-bearing.**
 Two CUDA contexts at once produce false OOM and false device-lost, because each
