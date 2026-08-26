@@ -19,6 +19,10 @@
 
 bool cp_smallop_enabled = false;
 
+/* See cp_smallop_tele.h: the PDL predecessor epoch, armed by CUDAVK_PDL. */
+bool cp_pdl_watch = false;
+uint64_t cp_pdl_epoch = 0;
+
 #define CP_SMALLOP_SLOTS 512u
 
 struct cp_smallop_slot {

@@ -87,6 +87,40 @@ cp_kernels_instrumented(void)
 }
 
 /*
+ * Whether the rasterizer module is compiled with the programmatic dependent
+ * launch waits in it.
+ *
+ * Asked here rather than at the launch site because the two have to agree:
+ * CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION lets the secondary
+ * grid start before the primary's writes are visible, so a kernel launched
+ * with it that does NOT execute griddepcontrol.wait reads whatever was in
+ * memory. cp_kernels stores the answer and cp_launch() sets the attribute
+ * only when that field says the wait is in the binary.
+ *
+ * griddepcontrol needs sm_90, and the launch attribute needs a CUDA 11.8
+ * driver. Neither is negotiable, so an older device or driver simply leaves
+ * the flag inert and every launch stays a normal one.
+ */
+bool
+cp_pdl_kernels(int sm_major, int sm_minor)
+{
+   int driver = 0;
+
+   if (!cp_debug->pdl)
+      return false;
+   if (sm_major < 9)
+      return false;
+#if CUDA_VERSION < 11080
+   return false;
+#else
+   (void)sm_minor;
+   if (cuDriverGetVersion(&driver) != CUDA_SUCCESS || driver < 11080)
+      return false;
+   return true;
+#endif
+}
+
+/*
  * Compile a kernel source with NVRTC.
  *
  * When `relocatable` is set the result is device-relocatable PTX suitable for
@@ -125,7 +159,7 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
     * reproduce. Unset means the header's default.
     */
    char small_opt[64], medium_opt[64], point_opt[64], tilebound_opt[64];
-   const char *opts[8];
+   const char *opts[10];
    unsigned num_opts = 0;
    opts[num_opts++] = arch_opt;
    opts[num_opts++] = "--std=c++14";
@@ -133,6 +167,11 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
       opts[num_opts++] = "--relocatable-device-code=true";
    if (cp_kernels_instrumented())
       opts[num_opts++] = "-DCP_ABUF_INSTRUMENT=1";
+   /* Only the rasterizer module holds a PDL secondary. Defining this for the
+    * other five would evict their NVRTC cache entries every time the flag is
+    * flipped, and an A/B that recompiles one side is an A/B about NVRTC. */
+   if (!strcmp(name, "cp_rasterize.cu") && cp_pdl_kernels(sm_major, sm_minor))
+      opts[num_opts++] = "-DCP_PDL=1";
 
    if (cp_debug->small_threshold.set) {
       snprintf(small_opt, sizeof(small_opt), "-DCP_SMALL_THRESHOLD=%d",
@@ -319,6 +358,9 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
 {
    memset(k, 0, sizeof(*k));
    cp_nvrtc_cache = disk_cache;
+   /* Recorded before the modules are built, because it is what decides
+    * whether they are built with the waits in them. */
+   k->pdl = cp_pdl_kernels(sm_major, sm_minor);
 
    if (!build_module(&k->clear_module, cp_clear_src, "cp_clear.cu", sm_major, sm_minor))
       return false;

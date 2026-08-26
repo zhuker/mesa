@@ -18,6 +18,29 @@
  */
 #include "cp_rast_types.h"
 
+/*
+ * Programmatic dependent launch, secondary side.
+ *
+ * CP_PDL is defined by cp_kernels.c only when CUDAVK_PDL is set AND the device
+ * is compute capability 9.0 or later AND the driver is 11.8 or later, so this
+ * module has the waits in it exactly when the host is allowed to set
+ * CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION on a launch of it.
+ *
+ * The intrinsics (cudaGridDependencySynchronize) are not declared by NVRTC
+ * 12.8, so the PTX instruction is written directly. The "memory" clobber is
+ * what stops the compiler sinking a dependent load above the wait; the wait
+ * itself is what makes the predecessor's stores visible.
+ *
+ * A kernel launched WITHOUT the attribute has no prerequisite grid, so the
+ * wait finds nothing in flight and falls through. That is why a declined
+ * launch is still correct.
+ */
+#if CP_PDL
+#define CP_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define CP_PDL_WAIT() do { } while (0)
+#endif
+
 #define PACK_VISBUF(depth_uint, tri_id) \
    (((uint64_t)(depth_uint) << 32) | (uint64_t)(~(uint32_t)(tri_id)))
 #define VISBUF_DEPTH(packed) ((uint32_t)((packed) >> 32))
@@ -1524,6 +1547,35 @@ cp_abuf_scan_finish(const uint32_t *in, uint32_t *out, const uint32_t *sums,
    __shared__ uint32_t sh_base, sh_total;
    uint32_t tid = threadIdx.x;
 
+   /*
+    * Everything this kernel does depends on `sums`, which the reduce (or the
+    * quad count) wrote -- except the fill cursor, which is only ever cleared.
+    * So the clear is the preamble: it is hoisted out of the main loop and run
+    * before the dependency is waited on, which is the one piece of work here
+    * that can overlap the predecessor's tail.
+    *
+    * It is the same n stores to the same array either way, and no path in
+    * this kernel reads `zero`, so the offsets and the total are bit for bit
+    * what the un-hoisted loop produced. The host asserts that `zero` aliases
+    * neither `in`, `out` nor `counts`, which is what makes that true.
+    *
+    * Only under CP_PDL: without the attribute there is nothing to overlap and
+    * the second pass over the index range would be pure loop overhead.
+    */
+#if CP_PDL
+   if (zero) {
+      uint32_t zbase = blockIdx.x * (CP_ABUF_SCAN_BLOCK * ept);
+      for (uint32_t j = 0; j < ept; j++) {
+         uint32_t i = zbase + j * CP_ABUF_SCAN_BLOCK + tid;
+         if (i < n)
+            zero[i] = 0u;
+      }
+      zero = nullptr;
+   }
+#endif
+
+   CP_PDL_WAIT();
+
    /* The top level, redundantly, in every block. */
    uint32_t s = tid < nsums ? sums[tid] : 0u;
    int pin = 0;
@@ -2149,8 +2201,23 @@ cp_abuf_quad_fill_all(const uint32_t *frags, const uint32_t *offsets,
                       uint32_t *overflow)
 {
    uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+   /*
+    * `blk_counts` came from the quad count, two kernels back, which has fully
+    * completed whatever the predecessor is doing -- only the immediately
+    * preceding grid's dependency is relaxed. So the early-out load and the
+    * branch on it are real preamble: they resolve while the scan finish is
+    * still draining. `blk_offsets` is the scan's own output and must not be
+    * touched until the wait.
+    */
+#if CP_PDL
+   bool live = b < nblocks && blk_counts[b];
+   CP_PDL_WAIT();
+   if (!live)
+      return;
+#else
    if (b >= nblocks || !blk_counts[b])
       return;
+#endif
    cp_abuf_merge_block(frags, offsets, counts, width, height, quad_width, b,
                        quad_prim, quad_mask, quad_peel_mask, quad_block,
                        shade_slot, blk_offsets[b], capacity, overflow);

@@ -204,6 +204,7 @@ struct cp_debug {
    unsigned upload_flush_fail_at;
    bool no_opaque_episode;
    bool no_opaque_streams;
+   bool pdl;
    bool no_sampler_variant;
    bool no_gpu_sem_wait;
    /* Derived in apply_couplings() from no_texture_cache: the hardware texture

@@ -61,6 +61,22 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
    cp->dev = dev;
    cp_smallop_enabled = cp_debug->upload_stats;
 
+   /*
+    * Arm the predecessor epoch only when a PDL launch can actually happen:
+    * the flag is on AND the modules were built with the waits. When it is off
+    * the interception in cp_smallop_tele.h is one predictable branch, the
+    * same shape as the upload census next to it. Never cleared, because a
+    * second context on an older device must not switch off the checking the
+    * first one relies on.
+    */
+   if (cp_debug->pdl && dev->kernels.pdl)
+      cp_pdl_watch = true;
+   cp->pdl_prev_fn = NULL;
+   cp->pdl_prev_stream = NULL;
+   cp->pdl_prev_epoch = 0;
+   cp->pdl_taken = cp->pdl_declined = 0;
+   cp->pdl_failed = false;
+
    /* Allocate the persistent device-only arenas and queues. */
 
    /*
@@ -485,20 +501,102 @@ cp_upload_flush(struct cp_context *cp)
 
 /* The one place a kernel is launched, and so the one place the owed span has
  * to be sent. Nothing in the driver may call cuLaunchKernel directly; the
- * cp_launch_audit test enforces that. */
+ * cp_launch_audit test enforces that.
+ *
+ * `pdl_after`, when not null, is the kernel the caller believes is directly in
+ * front of this one on `stream`. It is a claim, not an instruction: the three
+ * conditions below are checked and the attribute is dropped if any of them
+ * fails, so a site that becomes wrong later loses its overlap rather than its
+ * ordering.
+ *
+ *   1. the loaded module carries griddepcontrol.wait in its secondaries
+ *      (cp_kernels.pdl -- capability, driver version and the flag, decided
+ *      once at module build);
+ *   2. the previous launch through here really was `pdl_after`, on this same
+ *      stream;
+ *   3. nothing else has been issued on a stream since: no clear, no copy, no
+ *      event, and in particular not the coalesced upload flush this function
+ *      performs two lines further up, which is the one interposition the
+ *      caller cannot see.
+ *
+ * (3) is deliberately global rather than per stream. It over-refuses when two
+ * threads are submitting at once and never under-refuses, which is the right
+ * way round for a scheduling hint.
+ */
 CUresult
-cp_launch(struct cp_context *cp, CUfunction f,
-          unsigned gx, unsigned gy, unsigned gz,
-          unsigned bx, unsigned by, unsigned bz,
-          unsigned shmem, CUstream stream, void **params, void **extra)
+cp_launch_after(struct cp_context *cp, CUfunction f,
+                unsigned gx, unsigned gy, unsigned gz,
+                unsigned bx, unsigned by, unsigned bz,
+                unsigned shmem, CUstream stream, void **params, void **extra,
+                CUfunction pdl_after)
 {
    cp_ctx_check("cp_launch", cp->dev->cuda_ctx);
    CUresult err = cp_upload_flush(cp);
    if (err != CUDA_SUCCESS)
       return err;
    cp->launches++;
+
+   uint64_t epoch = cp_pdl_watch ?
+      __atomic_load_n(&cp_pdl_epoch, __ATOMIC_RELAXED) : 0;
+   bool pdl = pdl_after && cp_pdl_watch && !cp->pdl_failed &&
+              cp->dev->kernels.pdl &&
+              cp->pdl_prev_fn == pdl_after &&
+              cp->pdl_prev_stream == stream &&
+              cp->pdl_prev_epoch == epoch;
+
+   if (pdl_after) {
+      if (pdl)
+         cp->pdl_taken++;
+      else
+         cp->pdl_declined++;
+   }
+
+   /* This launch is now the predecessor of whatever comes next. */
+   cp->pdl_prev_fn = f;
+   cp->pdl_prev_stream = stream;
+   cp->pdl_prev_epoch = epoch;
+
+#if CUDA_VERSION >= 11080
+   if (pdl) {
+      CUlaunchAttribute attr = {
+         .id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+         .value = { .programmaticStreamSerializationAllowed = 1 },
+      };
+      CUlaunchConfig cfg = {
+         .gridDimX = gx, .gridDimY = gy, .gridDimZ = gz,
+         .blockDimX = bx, .blockDimY = by, .blockDimZ = bz,
+         .sharedMemBytes = shmem, .hStream = stream,
+         .attrs = &attr, .numAttrs = 1,
+      };
+      err = cuLaunchKernelEx(&cfg, f, params, extra);
+      if (err == CUDA_SUCCESS)
+         return CUDA_SUCCESS;
+      /*
+       * Nothing was enqueued: an extended launch that rejects its attribute
+       * fails before submission. Say so once and never ask again -- the
+       * ordinary launch below is the whole fallback, because the wait in the
+       * kernel is inert when no dependency was declared.
+       */
+      fprintf(stderr, "cudavk: cuLaunchKernelEx refused the programmatic "
+              "launch attribute (%d); PDL is off for this context\n", err);
+      cp->pdl_failed = true;
+      cp->pdl_taken--;
+      cp->pdl_declined++;
+   }
+#endif
+
    return cuLaunchKernel(f, gx, gy, gz, bx, by, bz, shmem, stream,
                          params, extra);
+}
+
+CUresult
+cp_launch(struct cp_context *cp, CUfunction f,
+          unsigned gx, unsigned gy, unsigned gz,
+          unsigned bx, unsigned by, unsigned bz,
+          unsigned shmem, CUstream stream, void **params, void **extra)
+{
+   return cp_launch_after(cp, f, gx, gy, gz, bx, by, bz, shmem, stream,
+                          params, extra, NULL);
 }
 
 /*
@@ -717,6 +815,18 @@ cp_plan_report(struct cp_context *cp)
            " episodes and %" PRIu64 " render scopes (%.1f per episode)\n",
            cp->launches, cp->plan.pass_finishes, cp->plan.scopes,
            (double)cp->launches / (double)MAX2(cp->plan.pass_finishes, 1u));
+   /* A PDL run that converted nothing looks exactly like a run without the
+    * flag, so the two counts are the first thing to read before believing
+    * either result. `declined` is a refusal by the checks in
+    * cp_launch_after(), not an error. */
+   if (cp->pdl_taken + cp->pdl_declined)
+      fprintf(stderr, "cudavk: programmatic dependent launches: %" PRIu64
+              " of %" PRIu64 " offered took the attribute (%.1f%%), %" PRIu64
+              " declined%s\n", cp->pdl_taken,
+              cp->pdl_taken + cp->pdl_declined,
+              100.0 * (double)cp->pdl_taken /
+                 (double)(cp->pdl_taken + cp->pdl_declined),
+              cp->pdl_declined, cp->pdl_failed ? ", driver refused" : "");
    if (cp->plan.plan_hits + cp->plan.plan_misses)
       fprintf(stderr, "cudavk: batch plan answered %" PRIu64 " of %" PRIu64
               " merge decisions (%.1f%%)\n", cp->plan.plan_hits,
@@ -1847,21 +1957,28 @@ cp_abuf_scan_classic(struct cp_context *cp, struct cp_device *screen,
    }
 }
 
-/* The second half of the fused scan, on its own: the quad build's counting
- * pass has already produced the block sums, so that scan needs only this. */
+/*
+ * The second half of the fused scan, on its own: the quad build's counting
+ * pass has already produced the block sums, so that scan needs only this.
+ *
+ * `pdl_after` names the kernel the caller has just launched on this stream, or
+ * is null. It is only a claim; cp_launch_after() checks it, and checks that
+ * nothing else reached the stream in between, before the launch may overlap
+ * that predecessor. See cp_launch_after().
+ */
 void
 cp_abuf_scan_finish_only(struct cp_context *cp, struct cp_device *screen,
                          CUdeviceptr in, CUdeviceptr out, CUdeviceptr sums,
                          unsigned nsums, unsigned n, unsigned ept,
                          CUdeviceptr total, CUdeviceptr zero,
                          CUdeviceptr clamp_counts, uint32_t clamp_capacity,
-                         CUdeviceptr clamp_overflow)
+                         CUdeviceptr clamp_overflow, CUfunction pdl_after)
 {
    unsigned brk = cp_debug->abuf_fuse_break;
    void *p[] = { &in, &out, &sums, &nsums, &n, &ept, &total, &zero,
                  &clamp_counts, &clamp_capacity, &clamp_overflow, &brk };
-   CP_LAUNCH(screen->kernels.abuf_scan_finish, nsums, 1, 1,
-                  CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, p, NULL);
+   CP_LAUNCH_AFTER(pdl_after, screen->kernels.abuf_scan_finish, nsums, 1, 1,
+                   CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, p, NULL);
 }
 
 /*
@@ -1920,11 +2037,25 @@ cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen,
          sh_out = 0;
    }
 
+   /*
+    * The fill cursor is cleared inside the finish kernel, and under CUDAVK_PDL
+    * that clear is hoisted in front of the programmatic wait. That is only
+    * equivalent while `zero` is a distinct array: clearing it early would
+    * otherwise destroy the input the scan is about to read.
+    */
+   assert(!zero || (zero != in && zero != out && zero != clamp_counts));
+
    void *pr[] = { &in, &s1, &n, &ept };
    CP_LAUNCH(screen->kernels.abuf_scan_reduce, grid, 1, 1,
                   CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, pr, NULL);
+   /*
+    * The one link this prototype was written for: reduce -> finish, nothing
+    * between them on the stream, ~128 launches a frame on the main stream and
+    * a kernel on both ends.
+    */
    cp_abuf_scan_finish_only(cp, screen, in, out, s1, grid, n, ept, s3, zero,
-                            clamp_counts, clamp_capacity, clamp_overflow);
+                            clamp_counts, clamp_capacity, clamp_overflow,
+                            screen->kernels.abuf_scan_reduce);
 
    if (sh_out) {
       cp_abuf_fuse_cmp(cp, screen, out, sh_out, n, 0, false, counters);
@@ -2054,18 +2185,26 @@ cp_abuf_quad_build(struct cp_context *cp, struct cp_device *screen,
    cp_abuf_mark(ab, ab->ev[7], cp->stream);
    cp_abuf_mark(ab, ab->ev[9], cp->stream);
 
+   /*
+    * count_all -> finish -> fill_all, the same chain with two more links. The
+    * two cp_abuf_mark() calls above are event records, which move the
+    * predecessor epoch, so under CUDAVK_ABUFFER_TIMING the first of these two
+    * links declines itself and the timing stays honest. That is the check
+    * doing its job, not a special case.
+    */
    cp_abuf_scan_finish_only(cp, screen, ab->blk_counts, ab->blk_offsets,
                             ab->bsum1, grid, nblocks, ept, ab->bsum3, 0,
-                            0, 0, 0);
+                            0, 0, 0, screen->kernels.abuf_quad_count_all);
    {
       void *p[] = { &ab->frags, &ab->offsets, &ab->counts, &w, &h, &qw,
                     &nblocks, &ab->blk_counts, &ab->blk_offsets,
                     &ab->quad_prim, &ab->quad_mask, &ab->peel_mask,
                     &ab->quad_block, &ab->shade_slot, &ab->quad_capacity,
                     &ab->quad_overflow };
-      CP_LAUNCH(screen->kernels.abuf_quad_fill_all,
-                     DIV_ROUND_UP(nblocks, 256u), 1, 1, 256, 1, 1,
-                     0, cp->stream, p, NULL);
+      CP_LAUNCH_AFTER(screen->kernels.abuf_scan_finish,
+                      screen->kernels.abuf_quad_fill_all,
+                      DIV_ROUND_UP(nblocks, 256u), 1, 1, 256, 1, 1,
+                      0, cp->stream, p, NULL);
    }
    cp_abuf_mark(ab, ab->ev[10], cp->stream);
    cp_abuf_mark(ab, ab->ev[8], cp->stream);

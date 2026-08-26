@@ -187,6 +187,29 @@ struct cp_context {
     * count launches without adding host cost to each one. Printed by
     * CUDAVK_PLAN_STATS. */
    uint64_t launches;
+
+   /*
+    * The programmatic-dependent-launch predecessor token.
+    *
+    * A launch may only carry CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALI-
+    * ZATION when the thing immediately in front of it on that stream is the
+    * kernel the caller named. cp_launch() records what it launched and where,
+    * together with the small-operation epoch from cp_smallop_tele.h; the next
+    * launch may claim the attribute only if all three still match. A clear, a
+    * copy, an owed upload flush or an event record moves the epoch, so those
+    * cases refuse the attribute without anyone having to remember them.
+    *
+    * pdl_failed latches when the driver rejects an extended launch, and every
+    * launch after it is an ordinary one -- the kernels still carry the wait,
+    * which without the attribute has no prerequisite grid to wait for.
+    */
+   CUfunction pdl_prev_fn;
+   CUstream pdl_prev_stream;
+   uint64_t pdl_prev_epoch;
+   uint64_t pdl_taken;
+   uint64_t pdl_declined;
+   bool pdl_failed;
+
    /* Four device counters the A-buffer fusion's equivalence gate reports
     * into. Allocated on first use and only when CUDAVK_ABUF_FUSE_CHECK is
     * set, so nothing in a shipping or a timed run touches it. */
@@ -717,10 +740,20 @@ CUresult cp_launch(struct cp_context *cp, CUfunction f,
                    unsigned bx, unsigned by, unsigned bz,
                    unsigned shmem, CUstream stream,
                    void **params, void **extra);
+/* The same launch, told which kernel the caller expects to find in front of
+ * it on this stream. See cp_launch_after() for the checks that claim buys. */
+CUresult cp_launch_after(struct cp_context *cp, CUfunction f,
+                         unsigned gx, unsigned gy, unsigned gz,
+                         unsigned bx, unsigned by, unsigned bz,
+                         unsigned shmem, CUstream stream,
+                         void **params, void **extra, CUfunction pdl_after);
 CUresult cp_upload_flush(struct cp_context *cp);
 void cp_stream_set(struct cp_context *cp, CUstream stream);
 
 #define CP_LAUNCH(...) CP_CU_WARN(cp_launch(cp, __VA_ARGS__), "cuLaunchKernel")
+/* `prev` first for readability at the call site; it is passed last. */
+#define CP_LAUNCH_AFTER(prev, ...) \
+   CP_CU_WARN(cp_launch_after(cp, __VA_ARGS__, (prev)), "cuLaunchKernel")
 
 /* Slots the quad stream's own shading pass may use, four per quad. Bounds the
  * fragment shader's input and output buffers, which at five varyings are about
@@ -894,7 +927,7 @@ void cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen, CUdeviceptr
 void cp_abuf_scan_tiling(unsigned n, unsigned *ept, unsigned *grid);
 bool cp_abuf_fuse_scan_ready(struct cp_device *screen);
 bool cp_abuf_fuse_quad_ready(struct cp_device *screen);
-void cp_abuf_scan_finish_only(struct cp_context *cp, struct cp_device *screen, CUdeviceptr in, CUdeviceptr out, CUdeviceptr sums, unsigned nsums, unsigned n, unsigned ept, CUdeviceptr total, CUdeviceptr zero, CUdeviceptr clamp_counts, uint32_t clamp_capacity, CUdeviceptr clamp_overflow);
+void cp_abuf_scan_finish_only(struct cp_context *cp, struct cp_device *screen, CUdeviceptr in, CUdeviceptr out, CUdeviceptr sums, unsigned nsums, unsigned n, unsigned ept, CUdeviceptr total, CUdeviceptr zero, CUdeviceptr clamp_counts, uint32_t clamp_capacity, CUdeviceptr clamp_overflow, CUfunction pdl_after);
 void cp_abuf_fuse_report(void);
 bool cp_abuf_setup(struct cp_context *cp, struct cp_abuf *ab,
                    unsigned w, unsigned h);

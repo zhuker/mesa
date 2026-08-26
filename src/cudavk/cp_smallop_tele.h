@@ -41,6 +41,32 @@ void cp_smallop_note(const char *file, int line, const void *ra,
                      enum cp_smallop_kind kind, size_t bytes);
 void cp_smallop_report(void);
 
+/*
+ * The programmatic-dependent-launch predecessor check rides on the same
+ * interception, because it needs the same fact from the other direction.
+ *
+ * CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION is defined against
+ * "the previous kernel in the stream", so it may only be set on a launch
+ * whose immediate predecessor on that stream really is the kernel the caller
+ * named -- not a clear, not a copy, not an event. Those are exactly the calls
+ * this header already renames, so each of them bumps an epoch and cp_launch()
+ * refuses the attribute when the epoch moved since the predecessor launched.
+ * That turns "no memset can be sitting there" from a claim about the source
+ * into something the code checks.
+ *
+ * Off unless CUDAVK_PDL is set, and then one relaxed increment per small
+ * operation, next to a CUDA call that costs a microsecond.
+ */
+extern bool cp_pdl_watch;
+extern uint64_t cp_pdl_epoch;
+
+static inline void
+cp_pdl_stream_op(void)
+{
+   if (cp_pdl_watch)
+      __atomic_fetch_add(&cp_pdl_epoch, 1, __ATOMIC_RELAXED);
+}
+
 static inline void
 cp_smallop_hit(const char *file, int line, enum cp_smallop_kind kind,
                size_t bytes)
@@ -59,6 +85,7 @@ cp_smallop_htod_async(const char *f, int l, CUdeviceptr dst, const void *src,
                       size_t n, CUstream s)
 {
    cp_smallop_hit(f, l, CP_SMALLOP_HTOD_ASYNC, n);
+   cp_pdl_stream_op();
    return cuMemcpyHtoDAsync(dst, src, n, s);
 }
 
@@ -67,6 +94,7 @@ static inline CUresult
 cp_smallop_htod_async_raw(CUdeviceptr dst, const void *src, size_t n,
                           CUstream s)
 {
+   cp_pdl_stream_op();
    return cuMemcpyHtoDAsync(dst, src, n, s);
 }
 
@@ -90,6 +118,7 @@ cp_smallop_memset32_async(const char *f, int l, CUdeviceptr dst, unsigned v,
                           size_t n, CUstream s)
 {
    cp_smallop_hit(f, l, CP_SMALLOP_MEMSET_ASYNC, n * 4);
+   cp_pdl_stream_op();
    return cuMemsetD32Async(dst, v, n, s);
 }
 
@@ -98,6 +127,7 @@ cp_smallop_memset8_async(const char *f, int l, CUdeviceptr dst,
                          unsigned char v, size_t n, CUstream s)
 {
    cp_smallop_hit(f, l, CP_SMALLOP_MEMSET_ASYNC, n);
+   cp_pdl_stream_op();
    return cuMemsetD8Async(dst, v, n, s);
 }
 
@@ -107,6 +137,32 @@ cp_smallop_memset8(const char *f, int l, CUdeviceptr dst, unsigned char v,
 {
    cp_smallop_hit(f, l, CP_SMALLOP_MEMSET_SYNC, n);
    return cuMemsetD8(dst, v, n);
+}
+
+/*
+ * Not census points: nothing here counts. They exist only so that an event
+ * record, a cross-stream wait or a device-to-host copy invalidates a PDL
+ * predecessor the same way a clear does.
+ */
+static inline CUresult
+cp_pdl_event_record(CUevent e, CUstream s)
+{
+   cp_pdl_stream_op();
+   return cuEventRecord(e, s);
+}
+
+static inline CUresult
+cp_pdl_stream_wait_event(CUstream s, CUevent e, unsigned int flags)
+{
+   cp_pdl_stream_op();
+   return cuStreamWaitEvent(s, e, flags);
+}
+
+static inline CUresult
+cp_pdl_dtoh_async(void *dst, CUdeviceptr src, size_t n, CUstream s)
+{
+   cp_pdl_stream_op();
+   return cuMemcpyDtoHAsync(dst, src, n, s);
 }
 
 static inline CUresult
@@ -125,6 +181,9 @@ cp_smallop_ctxsync(const char *f, int l)
 #undef cuMemsetD8Async
 #undef cuMemsetD8
 #undef cuCtxSynchronize
+#undef cuEventRecord
+#undef cuStreamWaitEvent
+#undef cuMemcpyDtoHAsync
 
 #define cuMemcpyHtoDAsync(d, s, n, st) \
    cp_smallop_htod_async(__FILE__, __LINE__, (d), (s), (n), (st))
@@ -139,5 +198,8 @@ cp_smallop_ctxsync(const char *f, int l)
 #define cuMemsetD8(d, v, n) \
    cp_smallop_memset8(__FILE__, __LINE__, (d), (v), (n))
 #define cuCtxSynchronize() cp_smallop_ctxsync(__FILE__, __LINE__)
+#define cuEventRecord(e, st) cp_pdl_event_record((e), (st))
+#define cuStreamWaitEvent(st, e, fl) cp_pdl_stream_wait_event((st), (e), (fl))
+#define cuMemcpyDtoHAsync(d, s, n, st) cp_pdl_dtoh_async((d), (s), (n), (st))
 
 #endif /* CP_SMALLOP_TELE_H */

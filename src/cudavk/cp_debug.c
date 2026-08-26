@@ -216,6 +216,12 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_OPAQUE_STREAMS", CP_FLAG_BOOL_VALUE, F(no_opaque_streams),
      "issue an opaque episode's segments back to back on the main stream "
      "instead of fanning them over the pass side streams" },
+   { "CUDAVK_PDL", CP_FLAG_BOOL_VALUE, F(pdl),
+     "let a dependent kernel launch before its predecessor in the same stream "
+     "has drained, by compiling griddepcontrol.wait into the dependent and "
+     "launching it with the programmatic stream serialization attribute; "
+     "needs compute capability 9.0 and CUDA 11.8, and falls back to a normal "
+     "launch whenever the predecessor is not the expected kernel" },
    { "CUDAVK_NO_SAMPLER_VARIANT", CP_FLAG_BOOL_VALUE,
      F(no_sampler_variant),
      "disable literal-state fragment sampler variants" },

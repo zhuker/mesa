@@ -8,6 +8,12 @@ struct cp_sampler_info;
 struct cp_tex_desc_ref;
 
 struct cp_kernels {
+   /* The rasterizer module was compiled with griddepcontrol.wait in the
+    * kernels that can be a PDL secondary. Set by cp_kernels_init() from
+    * cp_pdl_kernels(); read by cp_launch() before it may set the programmatic
+    * launch attribute. The two must never disagree. */
+   bool pdl;
+
    CUmodule module;
    CUmodule clear_module;
    CUmodule fs_module;
@@ -98,6 +104,7 @@ struct cp_kernels {
 /* Whether the kernels were compiled with the census and A-buffer verification
  * instrumentation. See cp_kernels.c. */
 bool cp_kernels_instrumented(void);
+bool cp_pdl_kernels(int sm_major, int sm_minor);
 
 /* The device's compute capability is all this needs of a screen, so it takes
  * that and not the screen: the kernels are the same kernels whichever Vulkan
