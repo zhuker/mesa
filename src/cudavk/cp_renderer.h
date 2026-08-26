@@ -43,6 +43,33 @@
 #define CP_PEEL_PREDICT_SLOTS 64
 
 /*
+ * CUDAVK_PEEL_CENSUS. Two instruments, one flag, counters only.
+ *
+ * The predicated schedule measured negative: it removed one check in five and
+ * made the survivors 68% more expensive, because a check that is not taken
+ * leaves the loop issuing further ahead and the next check waits for
+ * everything issued since. The census answers the two questions that decides
+ * whether that is fixable — how often the predictor is right, and whether
+ * removing a host wait at this site can pay at all.
+ *
+ * CP_PEEL_CENSUS_KEYS is the *census's* key table, not the predictor's ring:
+ * it is deliberately much larger, so that the number of distinct draws the
+ * replay presents can be counted independently of whether they fit in
+ * CP_PEEL_PREDICT_SLOTS.
+ */
+#define CP_PEEL_CENSUS_KEYS   4096
+#define CP_PEEL_HIST          11
+
+enum cp_peel_arm {
+   CP_PEEL_ARM_FREE,    /* peel_passes <= CP_PEEL_FREE_MAX: no check at all */
+   CP_PEEL_ARM_EXACT,   /* ring hit, predicted the trip count exactly */
+   CP_PEEL_ARM_LOW,     /* ring hit, predicted low: one extra check, doubling */
+   CP_PEEL_ARM_HIGH,    /* ring hit, predicted high: passes wasted predicated */
+   CP_PEEL_ARM_MISS,    /* ring miss or eviction: today's schedule */
+   CP_PEEL_ARM_COUNT,
+};
+
+/*
  * Draw batching.
  *
  * Consecutive draws that would produce the same pixels in any order are held
@@ -399,6 +426,55 @@ struct cp_context {
       unsigned    num_triangles;
       unsigned    passes;      /* 0 when the slot has never been filled */
    } peel_predict[CP_PEEL_PREDICT_SLOTS];
+
+   /*
+    * CUDAVK_PEEL_CENSUS: everything is accumulated here and printed once at
+    * teardown, so that nothing is written to stderr on a path a frame time is
+    * being taken on. Zero when the flag is off, and nothing below is read.
+    */
+   struct cp_peel_census {
+      uint64_t loops;            /* peel loops entered */
+      uint64_t loops_ineligible; /* of those, ones the predicated schedule
+                                  * declines: appending, instrumented, census */
+      uint64_t checks;           /* convergence checks paid */
+      uint64_t passes;           /* passes run, summed */
+      uint64_t bound_loops;      /* loops that ran to peel_passes */
+      uint64_t arm_loops[CP_PEEL_ARM_COUNT];
+      uint64_t arm_checks[CP_PEEL_ARM_COUNT];
+      uint64_t arm_passes[CP_PEEL_ARM_COUNT];
+      /* What an exact predictor would still have to pay: one confirming check
+       * per loop that converges before its own bound, and the extra checks
+       * CP_PEEL_PREDICT_MAX forces on a loop longer than the cap. */
+      uint64_t oracle_checks;
+      uint64_t oracle_checks_capped;
+      uint64_t trip_hist[CP_PEEL_HIST];   /* passes actually run */
+      uint64_t bound_hist[CP_PEEL_HIST];  /* peel_passes, the loop's own bound */
+      /* The predictor's key, as a population. */
+      uint64_t key_seen, key_repeat, key_stable;
+      uint64_t key_table_evict;  /* census table collisions: distinct is a
+                                  * lower bound when this is nonzero */
+      uint64_t ring_evict;       /* 64-slot ring: a store over a different key */
+      unsigned key_distinct;
+      /* Q2: can a wait removed here pay at all? */
+      uint64_t block_ns;         /* blocked in peel checks */
+      uint64_t gap_ns;           /* host issuing after a peel check, to the
+                                  * next blocking wait of any kind */
+      uint64_t ceiling_ns;       /* sum of min(gap, block): the most a perfect
+                                  * deferral of this site could recover */
+      uint64_t ready;            /* checks where the device was ALREADY idle */
+      uint64_t loop_wall_ns;     /* wall time inside peel loops */
+      uint64_t loop_block_ns;    /* of that, blocked in checks */
+      /* Carried between calls by cp_sync_timed. */
+      uint64_t unblock_ns;
+      uint64_t pending_block;
+      struct cp_peel_key_stat {
+         const void *vs, *fs;
+         unsigned    ntri;
+         unsigned    last_trip;
+         unsigned    seen;
+         unsigned    stable;
+      } keys[CP_PEEL_CENSUS_KEYS];
+   } peel_census;
    unsigned visbuf_w, visbuf_h;
    /*
     * What the five framebuffer-sized buffers were actually allocated for, as

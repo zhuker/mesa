@@ -588,10 +588,46 @@ cp_sync_timed(struct cp_context *cp, CUstream stream,
    /* Whatever is owed was owed to work this is about to wait for. */
    if (cp_upload_flush(cp) != CUDA_SUCCESS)
       return false;
+
+   /*
+    * CUDAVK_PEEL_CENSUS, question 2: what could a removed wait possibly buy?
+    *
+    * A deferral of a wait can recover at most the host work that would have
+    * been issued during it, so the ceiling on this site is
+    * sum over peel checks of min(issue burst that followed it, the wait).
+    * This is the same arithmetic the iteration-29 addendum's P2 proposed for
+    * the episode drain, and it is an *upper* bound in two directions: not
+    * every blocking point in the driver goes through this function, so the
+    * measured burst is if anything too long; and the device work the wait was
+    * waiting for still has to happen, which the bound does not charge for.
+    *
+    * cuStreamQuery answers the cheaper half of the same question: was there
+    * any outstanding device work at all when the host arrived at the check.
+    */
+   const bool pc_on = cp_debug->peel_census;
+   struct cp_peel_census *pc = &cp->peel_census;
+   const bool pc_peel = pc_on && ns == &cp->plan.wait_peel_ns;
+   if (pc_on && pc_peel && cuStreamQuery(stream) == CUDA_SUCCESS)
+      pc->ready++;
+
    int64_t t0 = os_time_get_nano();
+   if (pc_on && pc->pending_block) {
+      uint64_t gap = (uint64_t)t0 - pc->unblock_ns;
+      pc->gap_ns += gap;
+      pc->ceiling_ns += MIN2(gap, pc->pending_block);
+      pc->pending_block = 0;
+   }
    CUresult err = cuStreamSynchronize(stream);
-   *ns += (uint64_t)(os_time_get_nano() - t0);
+   int64_t t1 = os_time_get_nano();
+   *ns += (uint64_t)(t1 - t0);
    (*n)++;
+   if (pc_on) {
+      pc->unblock_ns = (uint64_t)t1;
+      if (pc_peel) {
+         pc->block_ns += (uint64_t)(t1 - t0);
+         pc->pending_block = (uint64_t)(t1 - t0);
+      }
+   }
    if (err != CUDA_SUCCESS) {
       cp_renderer_texture_fatal(cp);
       return false;
@@ -667,6 +703,9 @@ cp_scratch_destroy(struct cp_context *cp)
  * What reconstructing batches and episodes from a stream of draws cost, when
  * the whole pass was in an array the entire time.
  */
+/* Defined beside the peel loop it counts; reported from teardown, here. */
+static void cp_peel_census_report(struct cp_context *cp);
+
 static void
 cp_plan_report(struct cp_context *cp)
 {
@@ -829,6 +868,7 @@ cp_context_cleanup(struct cp_context *cp)
               (double)cp->fs_blocks / (double)cp->fs_launches, cp->sm_count,
               cp_debug->fs_grid_waves);
    cp_plan_report(cp);
+   cp_peel_census_report(cp);
    if (cp_debug->upload_stats)
       fprintf(stderr, "cudavk: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
               " bytes=%" PRIu64 " empty=%" PRIu64 " coalesce=%d\n",
@@ -4661,10 +4701,250 @@ cp_peel_predict_put(struct cp_context *cp, const struct cp_draw_state *state,
 {
    struct cp_peel_predict *p =
       &cp->peel_predict[cp_peel_predict_slot(state, num_triangles)];
+   if (p->passes && (p->vs != state->vs || p->fs != state->fs ||
+                     p->num_triangles != num_triangles))
+      cp->peel_census.ring_evict++;
    p->vs = state->vs;
    p->fs = state->fs;
    p->num_triangles = num_triangles;
    p->passes = passes_run;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * CUDAVK_PEEL_CENSUS
+ * ---------------------------------------------------------------------------
+ *
+ * Instrumentation only. Nothing here launches, allocates or changes a
+ * schedule; with the flag off not one of these functions is called.
+ *
+ * It exists because the predicated schedule measured negative (-0.1096 ms on
+ * the old capture) while plainly engaging: checks fell 1.706 -> 1.381 a frame
+ * and the survivors went from 1.611 to 2.701 ms each. Two questions follow,
+ * and neither of them is answered by another patch.
+ *
+ * Q1. Why was only one check in five removed? Split the loops by which arm of
+ *     the schedule they take, and measure whether the trip count is a function
+ *     of (vs, fs, num_triangles) at all. If it is, the ring is fixable; if it
+ *     is not, no ring tuning saves the design.
+ *
+ * Q2. Can a wait removed at this site pay at all? See cp_sync_timed().
+ *
+ * The census's own arithmetic is deliberately schedule-independent: it
+ * classifies against the same ring the predicated schedule uses, whether or
+ * not that schedule is running. Run it BOTH ways. With the predicated
+ * schedule off the ring is a shadow, the trip count is the classic one, and
+ * "predicted high" is observable; with it on the ring is the live one, the
+ * trip count is the predicated one, and a high prediction is invisible
+ * because the loop simply runs to it. The flag-off run is the honest one for
+ * Q1 for exactly that reason.
+ */
+static unsigned
+cp_peel_hist_bucket(unsigned n)
+{
+   /* 1, 2, 3, 4, 5-6, 7-8, 9-16, 17-32, 33-64, 65-128, 129+ */
+   static const unsigned hi[CP_PEEL_HIST] = { 1, 2, 3, 4, 6, 8, 16, 32, 64,
+                                              128, ~0u };
+   for (unsigned i = 0; i < CP_PEEL_HIST; i++)
+      if (n <= hi[i])
+         return i;
+   return CP_PEEL_HIST - 1;
+}
+
+static const char *
+cp_peel_arm_name(unsigned arm)
+{
+   switch (arm) {
+   case CP_PEEL_ARM_FREE:  return "free (<=CP_PEEL_FREE_MAX)";
+   case CP_PEEL_ARM_EXACT: return "hit, exact";
+   case CP_PEEL_ARM_LOW:   return "hit, predicted LOW";
+   case CP_PEEL_ARM_HIGH:  return "hit, predicted HIGH";
+   default:                return "ring MISS";
+   }
+}
+
+/*
+ * One finished peel loop.
+ *
+ * `predicted` is what the ring said before the loop ran (0 for a miss), `trip`
+ * how many passes it ran, `bound` its own peel_passes, `checks` how many
+ * convergence checks it paid.
+ */
+static void
+cp_peel_census_loop(struct cp_context *cp, const struct cp_draw_state *state,
+                    unsigned num_triangles, unsigned bound, unsigned trip,
+                    unsigned checks, unsigned predicted, bool eligible,
+                    uint64_t wall_ns, uint64_t block_ns)
+{
+   struct cp_peel_census *pc = &cp->peel_census;
+
+   pc->loops++;
+   pc->checks += checks;
+   pc->passes += trip;
+   pc->loop_wall_ns += wall_ns;
+   pc->loop_block_ns += block_ns;
+   if (!eligible)
+      pc->loops_ineligible++;
+   if (trip >= bound)
+      pc->bound_loops++;
+   pc->trip_hist[cp_peel_hist_bucket(trip)]++;
+   pc->bound_hist[cp_peel_hist_bucket(bound)]++;
+
+   unsigned arm = bound <= CP_PEEL_FREE_MAX ? CP_PEEL_ARM_FREE
+                : !predicted                ? CP_PEEL_ARM_MISS
+                : predicted == trip         ? CP_PEEL_ARM_EXACT
+                : predicted <  trip         ? CP_PEEL_ARM_LOW
+                                            : CP_PEEL_ARM_HIGH;
+   pc->arm_loops[arm]++;
+   pc->arm_checks[arm] += checks;
+   pc->arm_passes[arm] += trip;
+
+   /*
+    * What an exact predictor would still have to pay. A loop inside
+    * CP_PEEL_FREE_MAX pays nothing; a loop that converges before its own
+    * bound pays one confirming check; a loop that runs to its bound needs no
+    * check at all, because the bound stops it. The capped figure adds back
+    * the checks CP_PEEL_PREDICT_MAX forces on a loop longer than the cap.
+    *
+    * This is the ceiling for Q1: no ring, however good, removes more checks
+    * than the difference between it and what the loop pays today.
+    */
+   if (bound > CP_PEEL_FREE_MAX) {
+      unsigned exact = trip < bound ? 1 : 0;
+      pc->oracle_checks += exact;
+      unsigned capped = trip <= CP_PEEL_PREDICT_MAX
+         ? exact
+         : (trip - 1) / CP_PEEL_PREDICT_MAX + exact;
+      pc->oracle_checks_capped += capped;
+   }
+
+   /*
+    * Is the trip count a function of the key? Counted in a table far larger
+    * than the ring, so that "the key is unstable" and "the ring is too small"
+    * are two different findings.
+    */
+   uintptr_t h = (uintptr_t)state->vs * 0x9E3779B97F4A7C15ull;
+   h ^= (uintptr_t)state->fs * 0xC2B2AE3D27D4EB4Full;
+   h ^= (uintptr_t)num_triangles * 0x165667B19E3779F9ull;
+   struct cp_peel_key_stat *k =
+      &pc->keys[(unsigned)((h >> 32) % CP_PEEL_CENSUS_KEYS)];
+   pc->key_seen++;
+   if (k->seen && (k->vs != state->vs || k->fs != state->fs ||
+                   k->ntri != num_triangles)) {
+      pc->key_table_evict++;
+      k->seen = 0;
+   }
+   if (!k->seen) {
+      pc->key_distinct++;
+      k->vs = state->vs;
+      k->fs = state->fs;
+      k->ntri = num_triangles;
+   } else {
+      pc->key_repeat++;
+      if (k->last_trip == trip) {
+         pc->key_stable++;
+         k->stable++;
+      }
+   }
+   k->seen++;
+   k->last_trip = trip;
+}
+
+static void
+cp_peel_census_report(struct cp_context *cp)
+{
+   struct cp_peel_census *pc = &cp->peel_census;
+   if (!cp_debug->peel_census || !pc->loops)
+      return;
+
+   double scopes = (double)MAX2(cp->plan.scopes, 1u);
+   unsigned ring_used = 0;
+   for (unsigned i = 0; i < CP_PEEL_PREDICT_SLOTS; i++)
+      if (cp->peel_predict[i].passes)
+         ring_used++;
+
+   fprintf(stderr,
+           "cudavk: PEEL CENSUS (schedule: %s), %" PRIu64 " loops over %"
+           PRIu64 " render scopes, %.2f loops and %.2f checks per scope\n",
+           cp_debug->peel_predicate ? "PREDICATED" : "classic",
+           pc->loops, cp->plan.scopes, pc->loops / scopes,
+           pc->checks / scopes);
+   fprintf(stderr,
+           "cudavk:   %" PRIu64 " checks, %" PRIu64 " passes (%.2f per loop), "
+           "%" PRIu64 " loops ran to their own bound, %" PRIu64
+           " loops the predicated schedule declines\n",
+           pc->checks, pc->passes, (double)pc->passes / (double)pc->loops,
+           pc->bound_loops, pc->loops_ineligible);
+
+   for (unsigned a = 0; a < CP_PEEL_ARM_COUNT; a++)
+      if (pc->arm_loops[a])
+         fprintf(stderr,
+                 "cudavk:   arm %-26s %8" PRIu64 " loops (%5.1f%%), %8" PRIu64
+                 " checks (%5.1f%% of all), %.2f passes/loop\n",
+                 cp_peel_arm_name(a), pc->arm_loops[a],
+                 100.0 * (double)pc->arm_loops[a] / (double)pc->loops,
+                 pc->arm_checks[a],
+                 100.0 * (double)pc->arm_checks[a] /
+                    (double)MAX2(pc->checks, (uint64_t)1),
+                 (double)pc->arm_passes[a] / (double)pc->arm_loops[a]);
+
+   fprintf(stderr,
+           "cudavk:   ORACLE: an exact predictor still pays %" PRIu64
+           " checks (%.3f/scope), %" PRIu64 " with the CP_PEEL_PREDICT_MAX "
+           "cap (%.3f/scope); today's schedule pays %" PRIu64
+           " (%.3f/scope), so at most %.1f%% of the checks are removable\n",
+           pc->oracle_checks, pc->oracle_checks / scopes,
+           pc->oracle_checks_capped, pc->oracle_checks_capped / scopes,
+           pc->checks, pc->checks / scopes,
+           100.0 * (double)(pc->checks - MIN2(pc->checks,
+                                              pc->oracle_checks_capped)) /
+              (double)MAX2(pc->checks, (uint64_t)1));
+
+   static const char *hist_label[CP_PEEL_HIST] = {
+      "1", "2", "3", "4", "5-6", "7-8", "9-16", "17-32", "33-64", "65-128",
+      "129+" };
+   char line[512];
+   int off = snprintf(line, sizeof(line), "cudavk:   trip counts:");
+   for (unsigned i = 0; i < CP_PEEL_HIST && off > 0 && off < (int)sizeof(line);
+        i++)
+      if (pc->trip_hist[i])
+         off += snprintf(line + off, sizeof(line) - off, " %s=%" PRIu64,
+                         hist_label[i], pc->trip_hist[i]);
+   fprintf(stderr, "%s\n", line);
+   off = snprintf(line, sizeof(line), "cudavk:   loop bounds:");
+   for (unsigned i = 0; i < CP_PEEL_HIST && off > 0 && off < (int)sizeof(line);
+        i++)
+      if (pc->bound_hist[i])
+         off += snprintf(line + off, sizeof(line) - off, " %s=%" PRIu64,
+                         hist_label[i], pc->bound_hist[i]);
+   fprintf(stderr, "%s\n", line);
+
+   fprintf(stderr,
+           "cudavk:   keys: %u distinct (vs, fs, tris) in %" PRIu64
+           " loops; %" PRIu64 " repeats, %" PRIu64 " of them with the SAME "
+           "trip count as last time (%.1f%% stable); census-table collisions "
+           "%" PRIu64 "; the %d-entry ring used %u slots with %" PRIu64
+           " evictions\n",
+           pc->key_distinct, pc->key_seen, pc->key_repeat, pc->key_stable,
+           100.0 * (double)pc->key_stable / (double)MAX2(pc->key_repeat,
+                                                         (uint64_t)1),
+           pc->key_table_evict, CP_PEEL_PREDICT_SLOTS, ring_used,
+           pc->ring_evict);
+
+   fprintf(stderr,
+           "cudavk:   Q2 deferral ceiling: blocked %.1f ms in peel checks, "
+           "device ALREADY idle at %" PRIu64 " of %" PRIu64 " of them; host "
+           "issued %.1f ms after a check before its next blocking wait; "
+           "min(issue, block) = %.1f ms total, %.4f ms/scope -- that is the "
+           "MOST any deferral of this site can recover\n",
+           pc->block_ns / 1e6, pc->ready, pc->checks, pc->gap_ns / 1e6,
+           pc->ceiling_ns / 1e6, pc->ceiling_ns / 1e6 / scopes);
+   fprintf(stderr,
+           "cudavk:   peel loops cost %.1f ms of host wall time, %.1f ms of "
+           "it blocked and %.1f ms issuing\n",
+           pc->loop_wall_ns / 1e6, pc->loop_block_ns / 1e6,
+           (double)(pc->loop_wall_ns - MIN2(pc->loop_wall_ns,
+                                            pc->loop_block_ns)) / 1e6);
 }
 
 /*
@@ -6586,13 +6866,23 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * away), and for the census and A-buffer instrumentation, whose records are
     * per pass and would gain entries for passes that ran as no-ops.
     */
-   bool peel_predicate = peel && cp_debug->peel_predicate &&
-                         !cp->pass.appending && !census && !abuf_log &&
-                         !cp_kernels_instrumented() &&
-                         cp->peel_any && cp->peel_prev &&
-                         screen->kernels.peel_pass_flag &&
-                         screen->kernels.peel_clear_visbuf;
+   bool peel_eligible = peel && !cp->pass.appending && !census && !abuf_log &&
+                        !cp_kernels_instrumented() &&
+                        cp->peel_any && cp->peel_prev &&
+                        screen->kernels.peel_pass_flag &&
+                        screen->kernels.peel_clear_visbuf;
+   bool peel_predicate = peel_eligible && cp_debug->peel_predicate;
+   /*
+    * CUDAVK_PEEL_CENSUS keeps the ring warm and classifies the loop even when
+    * the predicated schedule is not running, which is the only configuration
+    * in which "the ring predicted high" is observable at all: with the
+    * schedule on, a high prediction simply becomes the trip count.
+    */
+   const bool pcensus = cp_debug->peel_census;
+   unsigned peel_predicted = 0;
    CUdeviceptr shade_flag = 0;
+   if (peel && (peel_predicate || pcensus) && passes > CP_PEEL_FREE_MAX)
+      peel_predicted = cp_peel_predict_get(cp, state, num_triangles);
    if (peel_predicate) {
       if (passes <= CP_PEEL_FREE_MAX) {
          /*
@@ -6603,15 +6893,16 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
           * the test below never fires.
           */
          check_interval = passes + 1;
-      } else {
-         unsigned predicted = cp_peel_predict_get(cp, state, num_triangles);
-         if (predicted)
-            check_interval = MIN2(MAX2(predicted, 1u),
-                                  (unsigned)CP_PEEL_PREDICT_MAX);
+      } else if (peel_predicted) {
+         check_interval = MIN2(MAX2(peel_predicted, 1u),
+                               (unsigned)CP_PEEL_PREDICT_MAX);
          /* No prediction: today's schedule, which the doubling below resumes
           * from either way. */
       }
    }
+   const uint64_t peel_t0 = peel && pcensus ? (uint64_t)os_time_get_nano() : 0;
+   const uint64_t peel_block0 = cp->plan.wait_peel_ns;
+   const uint64_t peel_checks0 = cp->plan.wait_peel_n;
 
    unsigned passes_run = 0;
    for (unsigned pass = 0; pass < passes; pass++) {
@@ -6857,6 +7148,21 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * arm, or one that never converges — predicts its own bound next time. */
    if (peel_predicate && passes && passes_run == passes)
       cp_peel_predict_put(cp, state, num_triangles, passes);
+
+   /*
+    * CUDAVK_PEEL_CENSUS. The shadow ring is fed here when the predicated
+    * schedule is not running, so that a census pass measures the predictor
+    * against the classic trip count rather than against its own output.
+    */
+   if (peel && passes && pcensus) {
+      if (!peel_predicate)
+         cp_peel_predict_put(cp, state, num_triangles, passes_run);
+      cp_peel_census_loop(cp, state, num_triangles, passes, passes_run,
+                          (unsigned)(cp->plan.wait_peel_n - peel_checks0),
+                          peel_predicted, peel_eligible,
+                          (uint64_t)os_time_get_nano() - peel_t0,
+                          cp->plan.wait_peel_ns - peel_block0);
+   }
 
    /*
     * TEMPORARY: report what the four steps cost, and check the lists against
