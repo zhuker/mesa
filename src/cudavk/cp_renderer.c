@@ -7113,14 +7113,15 @@ cp_pass_streams_init(struct cp_context *cp)
 }
 
 /*
- * Whether this opaque episode fans its segments out. Off by default: with the
- * flag clear every predicate below reduces to what it was and the driver
- * issues exactly the launches it issued before.
+ * Whether this opaque episode fans its segments out. On by default since the
+ * fan-out was measured and gated; CUDAVK_NO_OPAQUE_STREAMS reverts to issuing
+ * every segment back to back on the main stream, and with it set every
+ * predicate below reduces to what it was before the fan-out existed.
  */
 static bool
 cp_opaque_side_streams(const struct cp_context *cp)
 {
-   if (!cp_debug->opaque_streams || !cp->seg_streams[0])
+   if (cp_debug->no_opaque_streams || !cp->seg_streams[0])
       return false;
    /*
     * Two modes are excluded, not because they would be slow but because they
@@ -7173,7 +7174,7 @@ cp_opaque_appendable(struct cp_context *cp,
    }
    /* An opaque episode that is going to fan out needs the same eight streams
     * a blended one uses, and blended admission may never have run. */
-   if (cp_debug->opaque_streams)
+   if (!cp_debug->no_opaque_streams)
       cp_pass_streams_init(cp);
    return true;
 }
