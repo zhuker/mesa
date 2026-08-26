@@ -4757,12 +4757,45 @@ cp_peel_predict_put(struct cp_context *cp, const struct cp_draw_state *state,
  * gaps are shorter than its waits is limited by how little the host has to do,
  * not by how long it blocks, and no deferral scheme changes that.
  */
+/*
+ * The conversion probe (CUDAVK_WAIT_SPIN_US).
+ *
+ * A wait cannot be shortened without a mechanism, but the host's time at that
+ * point can be *lengthened* for nothing, and the slope of frame time against
+ * the delay is the same derivative. dFrame/dDelay near 1 means host time there
+ * is on the critical path; near 0 means the host has slack there and the site
+ * closes the way the peel site did.
+ *
+ * A busy wait on the monotonic clock, deliberately, not a sleep: a sleep
+ * yields the core and changes scheduling, which would measure something else.
+ * os_time_get_nano() is a real call into the vDSO, so nothing here can be
+ * optimised away.
+ *
+ * READ THE DIRECTION CAREFULLY. This measures the cost of *adding* host time.
+ * Recovering wait time is the other direction of the same derivative and the
+ * two are equal only if the system is locally linear. A low slope is therefore
+ * decisive (adding host time is free, so recovering it certainly is); a high
+ * slope proves only the necessary condition. The peel site is the control that
+ * says which world we are in, because its recovery-direction conversion is
+ * already measured at about 11%.
+ */
+static void
+cp_wait_spin(unsigned us)
+{
+   uint64_t end = (uint64_t)os_time_get_nano() + (uint64_t)us * 1000u;
+   while ((uint64_t)os_time_get_nano() < end)
+      ;
+}
+
 uint64_t
 cp_wait_begin(struct cp_context *cp, unsigned site, CUstream stream)
 {
-   if (!cp_debug->wait_census || site >= CP_WAIT_SITES)
+   if ((!cp_debug->wait_census && !cp_debug->wait_spin_us) ||
+       site >= CP_WAIT_SITES)
       return 0;
    struct cp_wait_census *w = &cp->wait_census;
+   if (!cp_debug->wait_census)
+      return (uint64_t)os_time_get_nano();
 
    /* Only a stream wait has a one-call readiness test; a whole-context
     * synchronise has no equivalent, so those sites report no ready count. */
@@ -4789,16 +4822,30 @@ cp_wait_begin(struct cp_context *cp, unsigned site, CUstream stream)
 void
 cp_wait_end(struct cp_context *cp, unsigned site, uint64_t t0)
 {
-   /* t0 == 0 is "the flag was off when this wait began", which is also what a
-    * caller that never called cp_wait_begin() passes. */
-   if (!cp_debug->wait_census || !t0 || site >= CP_WAIT_SITES)
+   /* t0 == 0 is "neither flag was set when this wait began", which is also
+    * what a caller that never called cp_wait_begin() passes. */
+   if (!t0 || site >= CP_WAIT_SITES)
       return;
    struct cp_wait_census *w = &cp->wait_census;
    uint64_t t1 = (uint64_t)os_time_get_nano();
+
+   /*
+    * The injected delay, before the census latches when the host resumed: the
+    * spin is not this wait's blocked time and it is not the next wait's issue
+    * burst either, so neither column is contaminated by it. Running both flags
+    * together is therefore legal, though the ceiling it prints is then the
+    * ceiling of a driver that has been slowed down on purpose.
+    */
+   if (cp_debug->wait_spin_us &&
+       site == (unsigned)cp_debug->wait_spin_site)
+      cp_wait_spin(cp_debug->wait_spin_us);
+
+   if (!cp_debug->wait_census)
+      return;
    struct cp_wait_site_stat *p = &w->site[site];
    p->n++;
    p->block_ns += t1 - t0;
-   w->unblock_ns = t1;
+   w->unblock_ns = (uint64_t)os_time_get_nano();
    w->pending_site = site;
    w->pending_block = t1 - t0;
    w->pending_valid = true;

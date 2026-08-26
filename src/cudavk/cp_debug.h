@@ -243,6 +243,8 @@ struct cp_debug {
    bool force_pass_fallback;
    unsigned tile_census;
    unsigned tile_census_every;
+   unsigned wait_spin_us;
+   int      wait_spin_site;      /* enum cp_wait_site */
    bool wait_census;
    bool peel_census;
    bool peel_predicate;

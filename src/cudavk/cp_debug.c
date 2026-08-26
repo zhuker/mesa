@@ -70,6 +70,19 @@ struct cp_flag_def {
    const struct cp_flag_value *values;   /* CP_FLAG_ENUM */
 };
 
+/* Sites for CUDAVK_WAIT_SPIN_SITE; the order is enum cp_wait_site's. */
+static const struct cp_flag_value wait_sites[] = {
+   { "episode",  0 },
+   { "quads",    1 },
+   { "peel",     2 },
+   { "seg",      3 },
+   { "upload",   4 },
+   { "idle",     5 },
+   { "arena",    6 },
+   { "reclaim",  7 },
+   { NULL, 0 },
+};
+
 static const struct cp_flag_value ctx_scheds[] = {
    { "auto",     CP_CTX_SCHED_AUTO },
    { "spin",     CP_CTX_SCHED_SPIN },
@@ -329,6 +342,15 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_TILE_CENSUS_EVERY", CP_FLAG_UINT, F(tile_census_every),
      "report the tile census this often, in episodes", .dflt = 2000,
      .has_range = true, .lo = 1, .hi = 1000000 },
+   { "CUDAVK_WAIT_SPIN_US", CP_FLAG_UINT, F(wait_spin_us),
+     "busy-wait this many microseconds on the host immediately after the wait "
+     "named by CUDAVK_WAIT_SPIN_SITE returns; the slope of frame time against "
+     "it is that site's conversion from host time to frame time. 0 is off and "
+     "changes nothing", .dflt = 0, .has_range = true, .lo = 0, .hi = 100000 },
+   { "CUDAVK_WAIT_SPIN_SITE", CP_FLAG_ENUM, F(wait_spin_site),
+     "which wait CUDAVK_WAIT_SPIN_US delays after: episode | quads | peel | "
+     "seg | upload | idle | arena | reclaim", .dflt = 0,
+     .values = wait_sites },
    { "CUDAVK_WAIT_CENSUS", CP_FLAG_BOOL_VALUE, F(wait_census),
      "census every host block on the device at teardown: how often the stream "
      "was already idle on arrival, and how much of each wait a perfect "
