@@ -383,6 +383,14 @@ static const struct cp_flag_def flags[] = {
      "worth paying; 0, the default, means always, and is deliberate — with "
      "the bootstrap scan fixed Crossroads measured 10.9 ms at 0 against 33.0 "
      "at 256", .dflt = 0, .has_range = true, .lo = 0, .hi = UINT32_MAX },
+   { "CUDAVK_ABUF_CLIP_BOUND", CP_FLAG_BOOL_VALUE, F(abuf_clip_bound),
+     "bound the per-draw A-buffer fast path by the clip rectangle instead of "
+     "by the whole framebuffer, so the drain-free path admits the scissored "
+     "and viewport-confined draws it refuses today" },
+   { "CUDAVK_ABUF_BOUND_ANY_TRIS", CP_FLAG_BOOL_VALUE,
+     F(abuf_bound_any_tris),
+     "drop the two-triangle condition from the per-draw A-buffer fast path; "
+     "the fragment and quad product tests are what bound it" },
    { "CUDAVK_ABUF_COMPILE", CP_FLAG_OPT_BOOL, F(abuf_compile),
      "force the A-buffer branches in (1) or out (0) of the NVRTC build",
      .empty_is_unset = true },

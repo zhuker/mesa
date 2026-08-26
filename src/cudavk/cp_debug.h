@@ -265,6 +265,8 @@ struct cp_debug {
    bool     abuffer_debug;
    unsigned abuffer_layers;      /* 0 = unset */
    unsigned abuf_min_tris;       /* 0 = no floor, and the default */
+   bool     abuf_clip_bound;
+   bool     abuf_bound_any_tris;
    struct cp_opt_int abuf_compile;
 
    /* Draw batching. */

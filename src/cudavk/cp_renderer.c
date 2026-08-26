@@ -6399,22 +6399,76 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * entry), as do memory-writing shaders (their side-effect gate reads
        * coverage the interpolator never wrote for slots past the total).
        */
+      /*
+       * How much of the framebuffer a fragment of this draw may reach.
+       *
+       * `ab->nblocks` and `n` are the whole framebuffer, which is the loosest
+       * true statement there is about where a fragment lands: at 1280x720 it
+       * is 230,400 blocks, and against the slot budget below that admits no
+       * triangle at all at full-screen size. The exact statement is already
+       * computed on the host and already handed to the rasterizer — the clip
+       * rectangle, framebuffer intersected with the viewport and, when the
+       * state asks for it, the scissor (cp_rasterize_args.clip_x0..clip_y1).
+       * setup_triangle() and the point-sprite setup both clamp the pixel walk
+       * to it, so no fragment of this draw exists outside it, and a batch
+       * carrying per-draw rectangles carries rectangles that were intersected
+       * with this one — subsets, never supersets. So a bound taken over the
+       * clip rectangle is a bound, and it is one or two orders of magnitude
+       * tighter for a scissored UI or post pass.
+       *
+       * Blocks are counted by block index, not by dividing the width: a
+       * rectangle two pixels wide straddling an even boundary touches two
+       * blocks, not one. An empty rectangle (x1 < x0, which the scissor
+       * intersection can produce) draws nothing, so its bound is zero, and
+       * the drain would have found the same zero.
+       */
+      size_t bound_blocks = ab->nblocks;
+      size_t bound_pixels = n;
+      if (cp_debug->abuf_clip_bound) {
+         if (clip_x1 >= clip_x0 && clip_y1 >= clip_y0) {
+            size_t cb = (size_t)(clip_x1 / 2 - clip_x0 / 2 + 1) *
+                        (size_t)(clip_y1 / 2 - clip_y0 / 2 + 1);
+            size_t cpix = (size_t)(clip_x1 - clip_x0 + 1) *
+                          (size_t)(clip_y1 - clip_y0 + 1);
+            bound_blocks = MIN2(cb, (size_t)ab->nblocks);
+            bound_pixels = MIN2(cpix, n);
+         } else {
+            bound_blocks = 0;
+            bound_pixels = 0;
+         }
+      }
+      /*
+       * Two triangles is not the reason this is safe; the product tests are.
+       * The condition predates them and is subsumed by them, but dropping it
+       * widens the admitted set on its own, so it is its own switch and is
+       * measured on its own.
+       */
+      bool bound_tris_ok = cp_debug->abuf_bound_any_tris || num_triangles <= 2;
       bool bounded = ab->composite && !ab->verify && !ab->timing &&
-                     num_triangles <= 2 && cp->fs_batch.ndraws <= 1 &&
+                     bound_tris_ok && cp->fs_batch.ndraws <= 1 &&
                      state->fs && !state->fs->writes_memory &&
-                     (size_t)ab->nblocks * rast_num_triangles * 4 <=
+                     bound_blocks * rast_num_triangles * 4 <=
                         (size_t)(512u << 10) &&
                      /* Clipping triangulates each input polygon; its pieces
                       * do not multiply covered pixels. Stable-slot capacity is
                       * therefore bounded by input triangles, not by the eight
                       * reserved output IDs per input triangle. */
-                     (size_t)num_triangles * n <= ab->capacity &&
-                     (size_t)ab->nblocks * rast_num_triangles <=
-                        ab->quad_capacity;
+                     (size_t)num_triangles * bound_pixels <= ab->capacity &&
+                     bound_blocks * rast_num_triangles <= ab->quad_capacity;
       if (bounded) {
          abuf_prod = true;
-         abuf_quads = (uint32_t)((size_t)ab->nblocks * rast_num_triangles);
-         abuf_covered = 0;   /* the composite covers the framebuffer */
+         abuf_quads = (uint32_t)(bound_blocks * rast_num_triangles);
+         /*
+          * The composite's grid. Zero means "size it to the framebuffer";
+          * the kernel reads the worklist's true length from the device and
+          * its tail threads return, so this is a statement about how much of
+          * the machine to use and never a bound anything depends on. The clip
+          * rectangle is an upper bound on the covered pixels for the same
+          * reason it bounds the quads, so when it is in use it is the better
+          * hint — and it is what keeps a newly admitted scissored draw from
+          * paying a framebuffer-sized composite grid for a corner of it.
+          */
+         abuf_covered = cp_debug->abuf_clip_bound ? (uint32_t)bound_pixels : 0;
       } else if (ab->composite) {
          uint32_t ctr[CP_ABUF_COUNTERS] = { 0 };
          if (!cp_sync_timed(cp, cp->stream, &cp->plan.wait_seg_ns,
