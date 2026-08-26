@@ -72,6 +72,7 @@ hashes. They do not sum to today's number.
 | four small-operation removals | `CUDAVK_NO_META_FOLD`, `CUDAVK_NO_FETCH_FOLD`, `CUDAVK_NO_UPLOAD_COALESCE`, `CUDAVK_NO_COUNTER_BLOCK` | 16.5021 → 17.4331 (+0.9310) | 6.0467 → 6.2336 (+0.1868) |
 | vertex fetch fused into the vertex shader | `CUDAVK_NO_FUSED_VFETCH` | 16.0194 → 16.5119 (+0.4925) | 5.9928 → 6.0715 (+0.0787) |
 | A-buffer scan and quad fusions | `CUDAVK_NO_ABUF_FUSE_SCAN`, `CUDAVK_NO_ABUF_FUSE_QUAD` | 15.7488 → 15.9696 (+0.2208) | 5.8777 → 5.9685 (+0.0907) |
+| programmatic dependent launch | `CUDAVK_NO_PDL` | 12.7690 → 13.2032 (+0.4342) | 5.6948 → 5.8246 (+0.1297) |
 
 Every switch is in the registry (`../../src/cudavk/FLAGS.md`, 97 entries), and
 each of these reverts restores its old path exactly.
@@ -79,6 +80,26 @@ each of these reverts restores its old path exactly.
 The texture-cache row is the largest single lever in the driver, and it is also
 the newest default. It was opt-in through iterations 24 to 28 and every number
 in this document from iteration 24 on was taken with it enabled.
+
+The PDL row is the newest and is the only default here that removes no work at
+all: the same kernels run, with the same grids and the same arguments, in the
+same stream order. What changes is that a dependent kernel may start before its
+predecessor has drained. That row is decisive rather than AB/BA — 6 runs per
+arm on old and 4 on Crossroads, strictly alternating in one session, disjoint
+IQRs, p = 0.0011 and 0.0143 one-sided.
+
+Its three levels are additive, which was checked rather than assumed: measured
+separately the steps are +0.1430, +0.1859 and +0.0637 ms on old, summing to
++0.392 against the direct +0.4342. All three shorten the same episode drain, so
+a shared bottom would have shown as a direct figure *smaller* than the sum.
+
+`CUDAVK_NO_PDL` is the revert and gives back the pre-PDL driver exactly —
+including the one host-side reorder this work needs, which is gated on the
+level being at least 1 for that reason. `CUDAVK_PDL` is a *level* — 0, 1, 2 or
+3 — and lowering it is how a regression is bisected to a group of links without
+rebuilding. Each level compiles in only its own waits, so a level is a binary,
+not just a branch: level 1 is bit for bit the binary level 1 was measured
+with.
 
 ---
 
@@ -164,6 +185,9 @@ has never survived contact with a measurement.
 | bare same-stream launch | **under 1 µs** (take 0.6–1.0) | iteration 27: 0.512–0.529 ms measured, of which 0.241 ms is priced clears and merged copies and 0.065 ms is 84.9 MB never written, leaving 0.13–0.21 ms for 194.3 launches |
 | device operation that also carries bandwidth or a whole pass | **about 1.86 µs** | iteration 28 item 4: 0.2208 ms over 91.1 launches and 27.4 clears, whose clears carried 49.9 MB/frame and whose compaction pass over 230,400 blocks stopped running |
 | idle 256-thread block | **under 0.2 ns** | iteration 27 grid sweep: 306,686 fewer blocks scheduled per frame cost less than 0.06 ms |
+| kernel-to-kernel dependency **overlapped**, secondary with no preamble | **0.44 µs** (old), **0.84 µs** (Crossroads) | PDL level 2 against level 1: +0.1859 ms over 421.50 converted links on old, +0.0686 ms over 81.95 on Crossroads. Every secondary here reads the queue its predecessor filled as its first instruction, so this is the inter-grid gap alone |
+| the same, secondary with one independent global load in front of the wait | **0.78 µs** (old), **1.32 µs** (Crossroads) | PDL level 3 against level 2: +0.0637 ms over 82.10 links on old, +0.0220 ms over 16.66 on Crossroads |
+| the same, secondary with a whole clear hoisted in front of the wait | **3.02 µs** (old), **2.14 µs** (Crossroads) | PDL level 1 against level 0: +0.1430 ms over 47.28 links on old, +0.0570 ms over 26.67 on Crossroads. One link per episode overlaps a 3.7 MB fill-cursor clear that was moved ahead of the wait on purpose |
 
 Three rules come with the table:
 
@@ -183,7 +207,20 @@ Three rules come with the table:
    independent. An earlier apparent sub-additivity was control drift between
    sessions, not overlap.
 
-A fourth rule is about the two captures, not about operations: **Crossroads is
+A fourth rule comes from the three PDL rows, which price a dependency that is
+*overlapped* rather than an operation that is *removed*: **what a converted
+dependency is worth is decided by what the secondary can execute before its
+wait, and that is a property of the kernel, not of the link.** The bare gap is
+0.44 µs — a third of the 1.30 µs for removing a small copy outright, and below
+the bare-launch price, which is what it should be, because the launch still
+happens. One independent load ahead of the wait takes it to 0.78 µs; a hoisted
+clear takes it to 3.02 µs, seven times the bare figure. So the first question
+about a candidate link is not how often it fires but where `ACQBULK` lands in
+its secondary's SASS, and the second is whether the kernel writes an array it
+never reads, which is the one thing that can always be moved in front of the
+wait.
+
+A fifth rule is about the two captures, not about operations: **Crossroads is
 overhead-bound where old is work-bound.** Both run a similar number of episodes
 per frame (23.0 old, 16.5 Crossroads) but a Crossroads frame is 2.8× shorter, so
 a fixed per-episode cost is nearly three times the share of its frame. Fixed-cost

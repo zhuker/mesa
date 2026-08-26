@@ -216,18 +216,20 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_OPAQUE_STREAMS", CP_FLAG_BOOL_VALUE, F(no_opaque_streams),
      "issue an opaque episode's segments back to back on the main stream "
      "instead of fanning them over the pass side streams" },
+   { "CUDAVK_NO_PDL", CP_FLAG_BOOL_VALUE, F(no_pdl),
+     "issue every kernel with an ordinary launch again, so that no dependent "
+     "kernel starts before its predecessor in the same stream has drained; "
+     "the revert for the programmatic dependent launch default" },
    { "CUDAVK_PDL", CP_FLAG_UINT, F(pdl),
-     "let a dependent kernel launch before its predecessor in the same stream "
-     "has drained, by compiling griddepcontrol.wait into the dependent and "
-     "launching it with the programmatic stream serialization attribute; "
-     "needs compute capability 9.0 and CUDA 11.8, and falls back to a normal "
-     "launch whenever the predecessor is not the expected kernel. It is a "
-     "level, not a switch: 1 converts the A-buffer scan chain, 2 adds the "
-     "rasterizer stage links, which have nothing to overlap and so measure "
-     "the inter-grid gap alone, and 3 adds the fragment writeback and the "
-     "segment scatter, which do. Each level compiles in exactly the waits "
-     "its own links need, so 1 is bit for bit what it was before 2 and 3 "
-     "existed" },
+     "how much of the driver runs its dependent kernels with the programmatic "
+     "stream serialization attribute, so that a kernel may start before its "
+     "predecessor on the same stream has drained: 0 none, 1 the A-buffer scan "
+     "chain, 2 also the rasterizer stage links, 3 also the fragment writeback "
+     "and the segment scatter. The default is the top level; lower it to "
+     "bisect a regression, and see CUDAVK_NO_PDL for the plain revert. Needs "
+     "compute capability 9.0 and CUDA 11.8, and any link whose predecessor "
+     "turns out not to be the named kernel falls back to an ordinary launch",
+     .dflt = CP_PDL_LEVEL_DEFAULT },
    { "CUDAVK_NO_SAMPLER_VARIANT", CP_FLAG_BOOL_VALUE,
      F(no_sampler_variant),
      "disable literal-state fragment sampler variants" },
@@ -692,6 +694,44 @@ apply_couplings(void)
     * inverting sixty use sites keeps the change to one line of behaviour.
     */
    debug_state.texture_cache = !debug_state.no_texture_cache;
+
+   /*
+    * Programmatic dependent launch is the default, and the level is the knob
+    * rather than the switch. Two names because they answer two questions and
+    * a level cannot answer both: CUDAVK_NO_PDL is what the house convention
+    * requires -- the one switch that restores the pre-PDL driver, and the one
+    * the default table names -- while CUDAVK_PDL says how much of it to keep.
+    * CUDAVK_PDL=0 means the same thing as the revert and is the natural end of
+    * a bisect; the revert wins over an explicit level, because a reader who
+    * writes NO_PDL=1 means it.
+    */
+   if (debug_state.no_pdl)
+      debug_state.pdl = 0;
+}
+
+/*
+ * CUDAVK_PDL is not a retired name -- it is still read, and every value it
+ * ever took still means the same set of links. What changed is the default
+ * when it is unset, and that is enough to catch someone out: a script written
+ * while PDL was opt-in exports CUDAVK_PDL=1 to mean "on", and now silently
+ * selects LESS than the default instead. That is the same trap the
+ * CUDAVK_OPAQUE_STREAMS entry above exists to close, so it gets the same
+ * treatment -- a line on stderr -- rather than an entry in a table that says
+ * "retired and ignored" about a variable that is neither.
+ *
+ * Only fires when the variable is set, so a bisect says out loud which level
+ * it is on and a default run says nothing.
+ */
+static void
+report_pdl_level(void)
+{
+   if (!flag_was_set("CUDAVK_PDL") || debug_state.no_pdl)
+      return;
+   if (debug_state.pdl < CP_PDL_LEVEL_DEFAULT)
+      fprintf(stderr, "cudavk: CUDAVK_PDL=%u is BELOW the default of %u: "
+              "programmatic dependent launch is partly disabled. Unset it for "
+              "the default, or CUDAVK_NO_PDL=1 to turn it off entirely.\n",
+              debug_state.pdl, (unsigned)CP_PDL_LEVEL_DEFAULT);
 }
 
 static const char *
@@ -826,6 +866,7 @@ cp_debug_init(void)
    apply_couplings();
 
    report_retired();
+   report_pdl_level();
 
    if (getenv("CUDAVK_HELP"))
       cp_debug_help();

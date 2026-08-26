@@ -8288,13 +8288,25 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
           * same zeros to the same words at a different point in an order that
           * already had to hold. Without the move the clear sits between them
           * and the epoch check refuses the link -- correctly.
+          *
+          * It is gated on PDL being on at all, and that is not fussiness.
+          * CUDAVK_NO_PDL is the revert, and a revert that still reorders one
+          * stream operation is not a revert: a reader bisecting a regression
+          * has to get the pre-PDL driver back exactly, or level 0 is a fourth
+          * behaviour rather than the original one. Nothing at level 0 wants
+          * the move -- it exists only to open the level-3 link.
           */
-         cuMemsetD32Async(seg_cursor, 0, nsegs, cp->stream);
+         const bool hoist_cursor_clear =
+            cp->dev->kernels.pdl >= CP_PDL_TIER_SCAN;
+         if (hoist_cursor_clear)
+            cuMemsetD32Async(seg_cursor, 0, nsegs, cp->stream);
 
          void *prefix_params[] = { &prefix };
          CP_LAUNCH(cp->dev->kernels.abuf_seg_prefix,
                    1, 1, 1, 1, 1, 1, 0, cp->stream, prefix_params, NULL);
 
+         if (!hoist_cursor_clear)
+            cuMemsetD32Async(seg_cursor, 0, nsegs, cp->stream);
          bucket.seg_cursor = seg_cursor;
          bucket.seg_base = seg_base_dev;
          bucket.grouped = grouped;

@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-119 switches.
+120 switches.
 
 ## Tracing
 
@@ -67,7 +67,8 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_VFETCH_SKIP_SEED` | bool (value) | `off` | — | fault injection: a fused draw does not seed the clip and raster counters, and the host still skips their clears -- the negative control for the seeding moving into the fused vertex shader |
 | `CUDAVK_NO_OPAQUE_EPISODE` | bool (value) | `off` | — | disable consecutive opaque-run visibility deferral |
 | `CUDAVK_NO_OPAQUE_STREAMS` | bool (value) | `off` | — | issue an opaque episode's segments back to back on the main stream instead of fanning them over the pass side streams |
-| `CUDAVK_PDL` | uint | `0` | — | let a dependent kernel launch before its predecessor in the same stream has drained, by compiling griddepcontrol.wait into the dependent and launching it with the programmatic stream serialization attribute; needs compute capability 9.0 and CUDA 11.8, and falls back to a normal launch whenever the predecessor is not the expected kernel. It is a level, not a switch: 1 converts the A-buffer scan chain, 2 adds the rasterizer stage links, which have nothing to overlap and so measure the inter-grid gap alone, and 3 adds the fragment writeback and the segment scatter, which do. Each level compiles in exactly the waits its own links need, so 1 is bit for bit what it was before 2 and 3 existed |
+| `CUDAVK_NO_PDL` | bool (value) | `off` | — | issue every kernel with an ordinary launch again, so that no dependent kernel starts before its predecessor in the same stream has drained; the revert for the programmatic dependent launch default |
+| `CUDAVK_PDL` | uint | `3` | — | how much of the driver runs its dependent kernels with the programmatic stream serialization attribute, so that a kernel may start before its predecessor on the same stream has drained: 0 none, 1 the A-buffer scan chain, 2 also the rasterizer stage links, 3 also the fragment writeback and the segment scatter. The default is the top level; lower it to bisect a regression, and see CUDAVK_NO_PDL for the plain revert. Needs compute capability 9.0 and CUDA 11.8, and any link whose predecessor turns out not to be the named kernel falls back to an ordinary launch |
 | `CUDAVK_NO_SAMPLER_VARIANT` | bool (value) | `off` | — | disable literal-state fragment sampler variants |
 | `CUDAVK_NO_GPU_SEM_WAIT` | bool (value) | `off` | — | block the submitting thread on a queue-submit wait semaphore instead of making the renderer stream wait on its completion event |
 | `CUDAVK_NO_TEXTURE_CACHE` | bool (value) | `off` | — | disable direct CUDA hardware-texture fragment execution; fall back to software sampling |

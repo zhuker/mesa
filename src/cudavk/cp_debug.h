@@ -34,6 +34,11 @@
 
 #include <cuda.h>
 
+/* The default programmatic-dependent-launch level. Here rather than in the
+ * registry entry so that tests/cp_debug_doc.py resolves it into FLAGS.md
+ * instead of printing a name nobody can look up. */
+#define CP_PDL_LEVEL_DEFAULT 3
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -204,9 +209,15 @@ struct cp_debug {
    unsigned upload_flush_fail_at;
    bool no_opaque_episode;
    bool no_opaque_streams;
-   /* A level: 0 off, 1 the scan chain, 2 the raster and FS tier. See the
-    * registry entry and CP_PDL_TIER_* in cp_kernels.h. */
+   /*
+    * Programmatic dependent launch. `pdl` is a level, not a boolean: 0 off,
+    * 1 the A-buffer scan chain, 2 the rasterizer stage links, 3 the fragment
+    * writeback and the segment scatter. See CP_PDL_TIER_* in cp_kernels.h.
+    * `no_pdl` is the house-convention revert and forces the level to 0 in
+    * apply_couplings().
+    */
    unsigned pdl;
+   bool no_pdl;
    bool no_sampler_variant;
    bool no_gpu_sem_wait;
    /* Derived in apply_couplings() from no_texture_cache: the hardware texture
