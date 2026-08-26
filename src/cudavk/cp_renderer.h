@@ -57,6 +57,36 @@
  * replay presents can be counted independently of whether they fit in
  * CP_PEEL_PREDICT_SLOTS.
  */
+/*
+ * CUDAVK_WAIT_CENSUS. Every place the host thread blocks on the device, and
+ * what a deferral of each could possibly recover.
+ *
+ * The peel census answered that question for one site and closed the lead with
+ * it: the device was never idle when the host arrived (0 of 2,577), the
+ * deferral ceiling was 0.376 ms/frame against 2.756 ms blocked, and blocked
+ * time converted to frame time at about 11%. This is the same two instruments
+ * generalised to every site, which is the probe PERFORMANCE.md section 6 item
+ * 4 asks for before anything is designed at the episode drain.
+ *
+ * The last three sites are not in the plan-stats table at all. They are here
+ * because the ceiling is measured as the gap between one block and the next,
+ * so a blocking call this does not know about is silently counted as host
+ * issue time and inflates the answer.
+ */
+enum cp_wait_site {
+   CP_WAIT_EPISODE,   /* pass-episode drain, cp_renderer.c */
+   CP_WAIT_QUADS,     /* non-composite quad counters */
+   CP_WAIT_PEEL,      /* peel convergence check */
+   CP_WAIT_SEG,       /* segment counters */
+   CP_WAIT_UPLOAD,    /* blocking descriptor-arena copy, per submit */
+   CP_WAIT_IDLE,      /* vkDeviceWaitIdle -> cuCtxSynchronize */
+   CP_WAIT_ARENA,     /* upload-arena rewind */
+   CP_WAIT_RECLAIM,   /* scratch reclaim */
+   CP_WAIT_SITES,
+};
+
+/* The two entry points are declared after struct cp_context, below. */
+
 #define CP_PEEL_CENSUS_KEYS   4096
 #define CP_PEEL_HIST          11
 
@@ -475,6 +505,24 @@ struct cp_context {
          unsigned    stable;
       } keys[CP_PEEL_CENSUS_KEYS];
    } peel_census;
+
+   /* CUDAVK_WAIT_CENSUS: see enum cp_wait_site. Counters only, teardown only. */
+   struct cp_wait_census {
+      struct cp_wait_site_stat {
+         uint64_t n;           /* blocks at this site */
+         uint64_t block_ns;    /* wall time blocked in them */
+         uint64_t ready;       /* the stream was ALREADY idle on arrival */
+         uint64_t gap_ns;      /* host issuing after one, to the next block */
+         uint64_t ceiling_ns;  /* sum of min(gap, block) */
+         uint64_t gap_max;
+         uint64_t gap_bound;   /* gap < block: the host ran out of work first */
+         uint64_t wait_bound;  /* gap >= block: the wait was the binding term */
+      } site[CP_WAIT_SITES];
+      uint64_t unblock_ns;
+      uint64_t pending_block;
+      unsigned pending_site;
+      bool     pending_valid;
+   } wait_census;
    unsigned visbuf_w, visbuf_h;
    /*
     * What the five framebuffer-sized buffers were actually allocated for, as
@@ -1047,6 +1095,13 @@ bool cp_abuf_shade(struct cp_context *cp,
 
 void cp_draw_execute_batch(struct cp_context *cp,
                            const struct cp_draw_batch *batch);
+/* CUDAVK_WAIT_CENSUS: bracket one host block. `stream` is the stream a wait is
+ * taken on, or NULL for a whole-context synchronise, which has no one-call
+ * readiness test. Both return immediately with the flag off, and cp_wait_end()
+ * with a zero `t0` is the "flag was off" case. */
+uint64_t cp_wait_begin(struct cp_context *cp, unsigned site, CUstream stream);
+void     cp_wait_end(struct cp_context *cp, unsigned site, uint64_t t0);
+
 void cp_shade_fragments(struct cp_context *cp,
                         const struct cp_draw_state *state,
                         const struct cp_render_scope *scope,

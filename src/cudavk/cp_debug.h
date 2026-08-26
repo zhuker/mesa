@@ -243,6 +243,7 @@ struct cp_debug {
    bool force_pass_fallback;
    unsigned tile_census;
    unsigned tile_census_every;
+   bool wait_census;
    bool peel_census;
    bool peel_predicate;
    bool tiled_opaque;

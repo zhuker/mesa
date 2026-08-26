@@ -400,7 +400,9 @@ cp_upload_begin_checked(struct cp_context *cp, size_t size, void **host_out,
       *error = cp_upload_flush(cp);
       if (*error != CUDA_SUCCESS)
          return 0;
+      uint64_t wt0 = cp_wait_begin(cp, CP_WAIT_ARENA, NULL);
       *error = cuCtxSynchronize();
+      cp_wait_end(cp, CP_WAIT_ARENA, wt0);
       if (*error != CUDA_SUCCESS)
          return 0;
       cp->arena_offset = dev_start;
@@ -568,7 +570,10 @@ cp_scratch_begin(struct cp_context *cp)
        cp->scratch.used > CP_SCRATCH_RECLAIM_BYTES ||
        cp->dscratch.num_overflow >= 5 ||
        cp->dscratch.used > CP_SCRATCH_RECLAIM_BYTES) {
-      if (cuCtxSynchronize() != CUDA_SUCCESS) {
+      uint64_t wt0 = cp_wait_begin(cp, CP_WAIT_RECLAIM, NULL);
+      CUresult sync_err = cuCtxSynchronize();
+      cp_wait_end(cp, CP_WAIT_RECLAIM, wt0);
+      if (sync_err != CUDA_SUCCESS) {
          cp_renderer_texture_fatal(cp);
          return;
       }
@@ -610,6 +615,18 @@ cp_sync_timed(struct cp_context *cp, CUstream stream,
    if (pc_on && pc_peel && cuStreamQuery(stream) == CUDA_SUCCESS)
       pc->ready++;
 
+   /*
+    * CUDAVK_WAIT_CENSUS. The site is recovered from which counter the caller
+    * passed rather than from a new argument, so that this stays the one place
+    * a stream wait is taken and the four call sites are unchanged.
+    */
+   unsigned wsite = ns == &cp->plan.wait_episode_ns ? CP_WAIT_EPISODE
+                  : ns == &cp->plan.wait_quads_ns   ? CP_WAIT_QUADS
+                  : ns == &cp->plan.wait_peel_ns    ? CP_WAIT_PEEL
+                  : ns == &cp->plan.wait_seg_ns     ? CP_WAIT_SEG
+                                                    : CP_WAIT_SITES;
+   uint64_t wt0 = cp_wait_begin(cp, wsite, stream);
+
    int64_t t0 = os_time_get_nano();
    if (pc_on && pc->pending_block) {
       uint64_t gap = (uint64_t)t0 - pc->unblock_ns;
@@ -619,6 +636,7 @@ cp_sync_timed(struct cp_context *cp, CUstream stream,
    }
    CUresult err = cuStreamSynchronize(stream);
    int64_t t1 = os_time_get_nano();
+   cp_wait_end(cp, wsite, wt0);
    *ns += (uint64_t)(t1 - t0);
    (*n)++;
    if (pc_on) {
@@ -703,8 +721,9 @@ cp_scratch_destroy(struct cp_context *cp)
  * What reconstructing batches and episodes from a stream of draws cost, when
  * the whole pass was in an array the entire time.
  */
-/* Defined beside the peel loop it counts; reported from teardown, here. */
+/* Defined beside the sites they count; reported from teardown, here. */
 static void cp_peel_census_report(struct cp_context *cp);
+static void cp_wait_census_report(struct cp_context *cp);
 
 static void
 cp_plan_report(struct cp_context *cp)
@@ -868,6 +887,7 @@ cp_context_cleanup(struct cp_context *cp)
               (double)cp->fs_blocks / (double)cp->fs_launches, cp->sm_count,
               cp_debug->fs_grid_waves);
    cp_plan_report(cp);
+   cp_wait_census_report(cp);
    cp_peel_census_report(cp);
    if (cp_debug->upload_stats)
       fprintf(stderr, "cudavk: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
@@ -4708,6 +4728,140 @@ cp_peel_predict_put(struct cp_context *cp, const struct cp_draw_state *state,
    p->fs = state->fs;
    p->num_triangles = num_triangles;
    p->passes = passes_run;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * CUDAVK_WAIT_CENSUS
+ * ---------------------------------------------------------------------------
+ *
+ * Two instruments, at every site where the host thread blocks on the device.
+ *
+ * 1. `cuStreamQuery` before the wait. Was there any outstanding device work at
+ *    all when the host arrived? A site that is never ready is device-paced,
+ *    and its blocked time is a symptom of device work rather than a cost that
+ *    can be recovered. The peel site answered 0 of 2,577, which is what closed
+ *    that lead.
+ *
+ * 2. `sum of min(host issue burst after the wait, the wait)`. A deferral
+ *    recovers at most the host work that would have been issued during the
+ *    wait. This is an upper bound, and it is meant to be: a small answer is
+ *    decisive and a large one only says "look closer".
+ *
+ * The burst is measured as the gap from one block to the next, so every
+ * blocking call has to be known or its time is counted as host issue and
+ * inflates the ceiling. The eight sites in enum cp_wait_site are all of them
+ * on the hot path; what is left is debug-only or teardown.
+ *
+ * `gap_bound` versus `wait_bound` is the shape of the answer: a site whose
+ * gaps are shorter than its waits is limited by how little the host has to do,
+ * not by how long it blocks, and no deferral scheme changes that.
+ */
+uint64_t
+cp_wait_begin(struct cp_context *cp, unsigned site, CUstream stream)
+{
+   if (!cp_debug->wait_census || site >= CP_WAIT_SITES)
+      return 0;
+   struct cp_wait_census *w = &cp->wait_census;
+
+   /* Only a stream wait has a one-call readiness test; a whole-context
+    * synchronise has no equivalent, so those sites report no ready count. */
+   if (stream && cuStreamQuery(stream) == CUDA_SUCCESS)
+      w->site[site].ready++;
+
+   uint64_t t0 = (uint64_t)os_time_get_nano();
+   if (w->pending_valid) {
+      uint64_t gap = t0 - w->unblock_ns;
+      struct cp_wait_site_stat *p = &w->site[w->pending_site];
+      p->gap_ns += gap;
+      p->ceiling_ns += MIN2(gap, w->pending_block);
+      if (gap < w->pending_block)
+         p->gap_bound++;
+      else
+         p->wait_bound++;
+      if (gap > p->gap_max)
+         p->gap_max = gap;
+      w->pending_valid = false;
+   }
+   return t0;
+}
+
+void
+cp_wait_end(struct cp_context *cp, unsigned site, uint64_t t0)
+{
+   /* t0 == 0 is "the flag was off when this wait began", which is also what a
+    * caller that never called cp_wait_begin() passes. */
+   if (!cp_debug->wait_census || !t0 || site >= CP_WAIT_SITES)
+      return;
+   struct cp_wait_census *w = &cp->wait_census;
+   uint64_t t1 = (uint64_t)os_time_get_nano();
+   struct cp_wait_site_stat *p = &w->site[site];
+   p->n++;
+   p->block_ns += t1 - t0;
+   w->unblock_ns = t1;
+   w->pending_site = site;
+   w->pending_block = t1 - t0;
+   w->pending_valid = true;
+}
+
+static void
+cp_wait_census_report(struct cp_context *cp)
+{
+   if (!cp_debug->wait_census)
+      return;
+   struct cp_wait_census *w = &cp->wait_census;
+   static const char *name[CP_WAIT_SITES] = {
+      "episode drain", "quad counters", "peel checks", "segment counters",
+      "descriptor upload", "vkDeviceWaitIdle", "upload-arena rewind",
+      "scratch reclaim",
+   };
+   uint64_t tn = 0, tblock = 0, tgap = 0, tceil = 0, tready = 0;
+   for (unsigned s = 0; s < CP_WAIT_SITES; s++) {
+      tn += w->site[s].n;
+      tblock += w->site[s].block_ns;
+      tgap += w->site[s].gap_ns;
+      tceil += w->site[s].ceiling_ns;
+      tready += w->site[s].ready;
+   }
+   if (!tn)
+      return;
+
+   double scopes = (double)MAX2(cp->plan.scopes, 1u);
+   fprintf(stderr,
+           "cudavk: WAIT CENSUS over %" PRIu64 " render scopes. Columns: "
+           "waits, ms blocked, mean ms, READY (stream already idle on "
+           "arrival), ms issued after, CEILING = sum min(issue, block), "
+           "ceiling as %% of blocked, and how often the gap rather than the "
+           "wait was the binding term.\n", cp->plan.scopes);
+   for (unsigned s = 0; s < CP_WAIT_SITES; s++) {
+      struct cp_wait_site_stat *p = &w->site[s];
+      if (!p->n)
+         continue;
+      fprintf(stderr,
+              "cudavk:   %-19s n=%-7" PRIu64 " %8.1f ms  mean %6.3f  "
+              "ready %" PRIu64 "/%" PRIu64 "  gap %7.1f ms (max %.3f)  "
+              "CEILING %7.1f ms = %5.1f%% of blocked, %.4f ms/scope  "
+              "gap-bound %" PRIu64 " wait-bound %" PRIu64 "\n",
+              name[s], p->n, p->block_ns / 1e6,
+              p->block_ns / 1e6 / (double)p->n, p->ready, p->n,
+              p->gap_ns / 1e6, p->gap_max / 1e6, p->ceiling_ns / 1e6,
+              100.0 * (double)p->ceiling_ns / (double)MAX2(p->block_ns,
+                                                           (uint64_t)1),
+              p->ceiling_ns / 1e6 / scopes, p->gap_bound, p->wait_bound);
+   }
+   fprintf(stderr,
+           "cudavk:   TOTAL n=%" PRIu64 " %.1f ms blocked, ready %" PRIu64
+           ", %.1f ms issued between blocks, CEILING %.1f ms = %.1f%% of "
+           "blocked, %.4f ms/scope\n",
+           tn, tblock / 1e6, tready, tgap / 1e6, tceil / 1e6,
+           100.0 * (double)tceil / (double)MAX2(tblock, (uint64_t)1),
+           tceil / 1e6 / scopes);
+   fprintf(stderr,
+           "cudavk:   READ IT THIS WAY: a site with ready=0 is device-paced, "
+           "so its blocked time is a symptom of device work and not a cost. "
+           "The ceiling is the MOST a perfect deferral could recover, before "
+           "the conversion from blocked time to frame time, which was "
+           "measured at about 11%% at the peel site.\n");
 }
 
 /*

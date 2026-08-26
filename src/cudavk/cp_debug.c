@@ -329,6 +329,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_TILE_CENSUS_EVERY", CP_FLAG_UINT, F(tile_census_every),
      "report the tile census this often, in episodes", .dflt = 2000,
      .has_range = true, .lo = 1, .hi = 1000000 },
+   { "CUDAVK_WAIT_CENSUS", CP_FLAG_BOOL_VALUE, F(wait_census),
+     "census every host block on the device at teardown: how often the stream "
+     "was already idle on arrival, and how much of each wait a perfect "
+     "deferral could recover; counters only, changes no rendering" },
    { "CUDAVK_PEEL_CENSUS", CP_FLAG_BOOL_VALUE, F(peel_census),
      "census the peel loop at teardown: which schedule arm each loop takes, "
      "the trip-count distribution, how stable the predictor's key is, and how "

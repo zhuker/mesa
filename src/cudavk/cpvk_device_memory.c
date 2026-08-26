@@ -242,6 +242,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       if (cmd->desc_arena_dirty) {
          cp_ctx_check("cpvk_queue_submit/desc-upload", dev->cu_ctx);
          int64_t upload_t0 = os_time_get_nano();
+         uint64_t wt0 = cp_wait_begin(&dev->renderer, CP_WAIT_UPLOAD, NULL);
          for (unsigned a = 0; a < cmd->num_desc_retired; a++) {
             if (cuMemcpyHtoD(cmd->desc_retired[a].dev,
                              cmd->desc_retired[a].host,
@@ -253,6 +254,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
                           cmd->desc_arena_used) != CUDA_SUCCESS)
             return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
          cmd->desc_arena_dirty = false;
+         cp_wait_end(&dev->renderer, CP_WAIT_UPLOAD, wt0);
          dev->renderer.plan.wait_upload_ns +=
             (uint64_t)(os_time_get_nano() - upload_t0);
          dev->renderer.plan.wait_upload_n++;
@@ -642,7 +644,10 @@ cpvk_DeviceWaitIdle(VkDevice _device)
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    CPVK_CTX_SCOPE(dev);
 
-   if (cuCtxSynchronize() != CUDA_SUCCESS)
+   uint64_t wt0 = cp_wait_begin(&dev->renderer, CP_WAIT_IDLE, NULL);
+   CUresult idle_err = cuCtxSynchronize();
+   cp_wait_end(&dev->renderer, CP_WAIT_IDLE, wt0);
+   if (idle_err != CUDA_SUCCESS)
       atomic_store_explicit(&dev->device_lost, true, memory_order_release);
    cpvk_submit_wait_pending(dev);
    return atomic_load_explicit(&dev->device_lost, memory_order_acquire)
