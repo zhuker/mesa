@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-120 switches.
+122 switches.
 
 ## Tracing
 
@@ -127,6 +127,8 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_ABUF_MIN_TRIS` | uint | `0` | &ge; 0 | triangles a blended batch must have before the A-buffer's fixed cost is worth paying; 0, the default, means always, and is deliberate — with the bootstrap scan fixed Crossroads measured 10.9 ms at 0 against 33.0 at 256 |
 | `CUDAVK_ABUF_CLIP_BOUND` | bool (value) | `off` | — | bound the per-draw A-buffer fast path by the clip rectangle instead of by the whole framebuffer, so the drain-free path admits the scissored and viewport-confined draws it refuses today |
 | `CUDAVK_ABUF_BOUND_ANY_TRIS` | bool (value) | `off` | — | drop the two-triangle condition from the per-draw A-buffer fast path; the fragment and quad product tests are what bound it |
+| `CUDAVK_EPISODE_SIZE_STATS` | bool (value) | `off` | — | record what each episode's shade arrays would cost if they were sized from the scan's fragment total instead of the drained quad count, and report the distribution at teardown; instrumentation only |
+| `CUDAVK_EPISODE_WAIT_SPLIT` | bool (value) | `off` | — | split the episode drain's wait into the device time before and after the A-buffer scan, reported at teardown; adds three event records per episode and no synchronisation |
 | `CUDAVK_ABUF_COMPILE` | bool (optional) | `unset` | — | force the A-buffer branches in (1) or out (0) of the NVRTC build |
 
 ## Draw batching

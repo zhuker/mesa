@@ -267,6 +267,8 @@ struct cp_debug {
    unsigned abuf_min_tris;       /* 0 = no floor, and the default */
    bool     abuf_clip_bound;
    bool     abuf_bound_any_tris;
+   bool     episode_size_stats;
+   bool     episode_wait_split;
    struct cp_opt_int abuf_compile;
 
    /* Draw batching. */

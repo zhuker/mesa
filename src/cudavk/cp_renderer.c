@@ -663,6 +663,267 @@ cp_scratch_destroy(struct cp_context *cp)
  * stopped firing is a slower sweep, which is indistinguishable from a dozen
  * other causes.
  */
+
+/*
+ * The two instrumentation probes for the episode drain, reported at teardown.
+ *
+ * They exist to decide one question before any mechanism is written: the drain
+ * at the end of cp_pass_finish() supplies the exact quad count that sizes the
+ * shade arrays, and the proposal is to take it at the scan instead, where the
+ * exact FRAGMENT total is already on the device. Two things have to be true
+ * for that to be worth anything, and neither has been measured.
+ *
+ *  - SIZE. A quad needs at least one covering fragment, so quads <= total and
+ *    the fragment total is a sound bound. But the shade slot of quad q lane i
+ *    is 4*q + i, dense over quads and not over fragments, so a bound of
+ *    `total` asks for 4*total slots where the drain asks for 4*quads. The
+ *    probe records both, and what the episode's device scratch actually cost,
+ *    so the projected footprint can be compared against the arena the driver
+ *    has. It also counts the episodes the existing capacity/4 admission gate
+ *    in cp_pass_finish_bounded_groups() would refuse at the wider bound.
+ *
+ *  - WAIT. The drain waits for the counts, the scan, the fill, the sort, the
+ *    quad build and the bucketing. A drain at the scan waits for the counts
+ *    and the scan only. The difference is what a move could recover, and it
+ *    is bounded by the wait itself. The probe brackets the two halves with
+ *    events read after the drain has already synchronised the stream, so it
+ *    adds no wait of its own.
+ *
+ * Both are buffered: an fprintf between the drain and the shade would be
+ * timed as part of the thing being measured.
+ */
+static int
+cp_cmp_double(const void *a, const void *b)
+{
+   double x = *(const double *)a, y = *(const double *)b;
+   return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* Median and p90 of an already-collected column; sorts a scratch copy. */
+static void
+cp_episode_quantiles(double *v, unsigned n, double *med, double *p90,
+                     double *max)
+{
+   *med = *p90 = *max = 0.0;
+   if (!n)
+      return;
+   qsort(v, n, sizeof(*v), cp_cmp_double);
+   *med = v[n / 2];
+   *p90 = v[(n * 9) / 10 < n ? (n * 9) / 10 : n - 1];
+   *max = v[n - 1];
+}
+
+static void
+cp_episode_probe_report(struct cp_context *cp)
+{
+   unsigned n = cp->episode_probe.n;
+   if (!n) {
+      if (cp->episode_probe.dropped)
+         fprintf(stderr, "cudavk: episode probe: no episode reached the "
+                 "shade; %u dropped\n", cp->episode_probe.dropped);
+      return;
+   }
+   const struct cp_episode_sample *s = cp->episode_probe.samples;
+   double *col = malloc((size_t)n * sizeof(double));
+   if (!col)
+      return;
+   double med, p90, max;
+
+   if (cp_debug->episode_size_stats) {
+      /*
+       * The ratio the whole question turns on. It is capped at 4 by geometry
+       * — a quad is 2x2 pixels, so it can carry at most four fragments — so a
+       * median near 4 means the drop-in bound asks for nearly four times what
+       * the drain asks for, and a median near 1 would mean it asks for the
+       * same.
+       */
+      for (unsigned i = 0; i < n; i++)
+         col[i] = s[i].quads ? (double)s[i].total / (double)s[i].quads : 0.0;
+      cp_episode_quantiles(col, n, &med, &p90, &max);
+      fprintf(stderr, "cudavk: episode sizing: %u episodes (%u dropped before "
+              "the shade)\n  total/quads: median %.3f p90 %.3f max %.3f "
+              "(4.000 is the geometric cap)\n",
+              n, cp->episode_probe.dropped, med, p90, max);
+
+      for (unsigned i = 0; i < n; i++)
+         col[i] = (double)s[i].quads * 4.0;
+      cp_episode_quantiles(col, n, &med, &p90, &max);
+      fprintf(stderr, "  slots today   (4*quads): median %.0f p90 %.0f "
+              "max %.0f\n", med, p90, max);
+      for (unsigned i = 0; i < n; i++)
+         col[i] = (double)s[i].total * 4.0;
+      cp_episode_quantiles(col, n, &med, &p90, &max);
+      fprintf(stderr, "  slots at bound (4*total): median %.0f p90 %.0f "
+              "max %.0f  (cap %u)\n", med, p90, max,
+              CP_ABUF_MAX_SHADE_SLOTS);
+
+      /*
+       * What the episode's own device scratch cost, and what it would cost at
+       * the wider bound. The projection scales the whole post-drain delta by
+       * total/quads, which over-states it slightly: quad_seg is sized from
+       * quad_capacity and does not scale. Every other post-drain allocation —
+       * grouped, quad_dense and the per-group shade arrays — is linear in the
+       * quad count, so the error is on the safe side.
+       */
+      double worst_proj = 0.0, worst_today = 0.0;
+      for (unsigned i = 0; i < n; i++) {
+         double delta = (double)s[i].used_after - (double)s[i].used_at_drain;
+         double ratio = s[i].quads ? (double)s[i].total / (double)s[i].quads
+                                   : 1.0;
+         double proj = (double)s[i].used_at_drain + delta * ratio;
+         col[i] = delta / (1024.0 * 1024.0);
+         if (proj > worst_proj)
+            worst_proj = proj;
+         if ((double)s[i].used_after > worst_today)
+            worst_today = (double)s[i].used_after;
+      }
+      cp_episode_quantiles(col, n, &med, &p90, &max);
+      fprintf(stderr, "  episode device scratch: median %.2f MB p90 %.2f MB "
+              "max %.2f MB\n", med, p90, max);
+      fprintf(stderr, "  device arena: peak today %.1f MB, projected at the "
+              "bound %.1f MB (x%.2f), arena %.1f MB, cap %.1f MB\n",
+              worst_today / (1024.0 * 1024.0),
+              worst_proj / (1024.0 * 1024.0),
+              worst_today > 0.0 ? worst_proj / worst_today : 0.0,
+              (double)cp->dscratch.size / (1024.0 * 1024.0),
+              (double)CP_SCRATCH_MAX_BYTES / (1024.0 * 1024.0));
+      fprintf(stderr, "  VERDICT (size): the wider bound %s the arena "
+              "(%.1f MB projected against %.1f MB held, %u regrows observed)\n",
+              worst_proj <= (double)cp->dscratch.size ? "FITS inside"
+                                                      : "CROSSES",
+              worst_proj / (1024.0 * 1024.0),
+              (double)cp->dscratch.size / (1024.0 * 1024.0),
+              cp->dscratch.num_overflow);
+
+      /* The gate at cp_pass_finish_bounded_groups(): 4*bound <= capacity. */
+      unsigned refused = 0;
+      for (unsigned i = 0; i < n; i++)
+         refused += s[i].capacity && s[i].total > s[i].capacity / 4u;
+      fprintf(stderr, "  capacity/4 gate: %u of %u episodes (%.1f%%) have "
+              "total > capacity/4 and would be refused at the wider bound\n",
+              refused, n, 100.0 * (double)refused / (double)n);
+   }
+
+   if (cp_debug->episode_wait_split) {
+      unsigned m = 0;
+      double wait_ms = 0.0, scan_ms = 0.0, tail_ms = 0.0, recover_ms = 0.0;
+      for (unsigned i = 0; i < n; i++) {
+         if (!s[i].have_split)
+            continue;
+         double w = (double)s[i].wait_ns / 1e6;
+         double t = s[i].ms_tail;
+         wait_ms += w;
+         scan_ms += s[i].ms_scan;
+         tail_ms += t;
+         recover_ms += w < t ? w : t;
+         col[m++] = w * 1000.0;   /* us */
+      }
+      if (!m) {
+         fprintf(stderr, "cudavk: episode wait split: no episode recorded all "
+                 "three events\n");
+         free(col);
+         return;
+      }
+      cp_episode_quantiles(col, m, &med, &p90, &max);
+      fprintf(stderr, "cudavk: episode wait split: %u episodes\n"
+              "  measured drain wait: median %.0f us p90 %.0f us max %.0f us, "
+              "total %.3f ms\n", m, med, p90, max, wait_ms);
+      unsigned k = 0;
+      for (unsigned i = 0; i < n; i++)
+         if (s[i].have_split)
+            col[k++] = s[i].ms_scan * 1000.0;
+      cp_episode_quantiles(col, m, &med, &p90, &max);
+      fprintf(stderr, "  device counts->scan:  median %.0f us p90 %.0f us, "
+              "total %.3f ms\n", med, p90, scan_ms);
+      k = 0;
+      for (unsigned i = 0; i < n; i++)
+         if (s[i].have_split)
+            col[k++] = s[i].ms_tail * 1000.0;
+      cp_episode_quantiles(col, m, &med, &p90, &max);
+      fprintf(stderr, "  device scan->bucket:  median %.0f us p90 %.0f us, "
+              "total %.3f ms\n", med, p90, tail_ms);
+      /*
+       * A drain taken at the scan still waits for everything up to the scan,
+       * so what a move can recover is the part of the wait the fill, sort,
+       * quad build and bucketing account for — and never more than the wait
+       * itself. That minimum is the ceiling, before any question of whether
+       * the host has work to issue during it.
+       */
+      fprintf(stderr, "  VERDICT (wait): moving the drain to the scan can "
+              "remove at most %.3f ms of the %.3f ms measured here (%.1f%%); "
+              "the chain after the scan is %.1f%% of the episode's device "
+              "time\n", recover_ms, wait_ms,
+              wait_ms > 0.0 ? 100.0 * recover_ms / wait_ms : 0.0,
+              (scan_ms + tail_ms) > 0.0
+                 ? 100.0 * tail_ms / (scan_ms + tail_ms) : 0.0);
+   }
+   free(col);
+}
+
+/* One event record on the main stream, lazily creating the events. */
+static void
+cp_episode_probe_mark(struct cp_context *cp, unsigned stage)
+{
+   if (!cp_debug->episode_wait_split || cp->episode_probe.ev_failed)
+      return;
+   if (!cp->episode_probe.ev_join) {
+      if (cuEventCreate(&cp->episode_probe.ev_join, CU_EVENT_DEFAULT) !=
+             CUDA_SUCCESS ||
+          cuEventCreate(&cp->episode_probe.ev_scan, CU_EVENT_DEFAULT) !=
+             CUDA_SUCCESS ||
+          cuEventCreate(&cp->episode_probe.ev_end, CU_EVENT_DEFAULT) !=
+             CUDA_SUCCESS) {
+         fprintf(stderr, "cudavk: episode wait split: cuEventCreate failed; "
+                 "the split is not recorded\n");
+         cp->episode_probe.ev_failed = true;
+         return;
+      }
+   }
+   CUevent ev = stage == 0 ? cp->episode_probe.ev_join
+              : stage == 1 ? cp->episode_probe.ev_scan
+                           : cp->episode_probe.ev_end;
+   /* Out of order means an episode left early; the split is dropped rather
+    * than read from a previous episode's events. */
+   if (stage != cp->episode_probe.stage) {
+      cp->episode_probe.stage = 0;
+      if (stage != 0)
+         return;
+   }
+   if (cuEventRecord(ev, cp->stream) != CUDA_SUCCESS) {
+      cp->episode_probe.ev_failed = true;
+      return;
+   }
+   cp->episode_probe.stage = stage + 1;
+}
+
+/* Keep one episode's sample; called where every allocation it sizes is made. */
+static void
+cp_episode_probe_push(struct cp_context *cp)
+{
+   if (!cp->episode_probe.cur_valid)
+      return;
+   cp->episode_probe.cur_valid = false;
+   cp->episode_probe.cur.used_after = cp->dscratch.used;
+   cp->episode_probe.cur.dscratch_size = cp->dscratch.size;
+   cp->episode_probe.cur.dregrows = cp->dscratch.num_overflow;
+   if (cp->episode_probe.n == cp->episode_probe.cap) {
+      unsigned want = cp->episode_probe.cap ? cp->episode_probe.cap * 2 : 4096;
+      if (want > (1u << 20)) {          /* ~80 MB of samples is plenty */
+         cp->episode_probe.dropped++;
+         return;
+      }
+      void *p = realloc(cp->episode_probe.samples,
+                        (size_t)want * sizeof(*cp->episode_probe.samples));
+      if (!p) {
+         cp->episode_probe.dropped++;
+         return;
+      }
+      cp->episode_probe.samples = p;
+      cp->episode_probe.cap = want;
+   }
+   cp->episode_probe.samples[cp->episode_probe.n++] = cp->episode_probe.cur;
+}
+
 /*
  * What reconstructing batches and episodes from a stream of draws cost, when
  * the whole pass was in an array the entire time.
@@ -829,6 +1090,20 @@ cp_context_cleanup(struct cp_context *cp)
               (double)cp->fs_blocks / (double)cp->fs_launches, cp->sm_count,
               cp_debug->fs_grid_waves);
    cp_plan_report(cp);
+   /* Guarded by the same flags that fill it: with both off nothing here was
+    * ever allocated, so this whole block compiles out and the teardown path
+    * is the one it was. */
+   if (cp_debug->episode_size_stats || cp_debug->episode_wait_split) {
+      cp_episode_probe_report(cp);
+      free(cp->episode_probe.samples);
+      cp->episode_probe.samples = NULL;
+      if (cp->episode_probe.ev_join) {
+         cuEventDestroy(cp->episode_probe.ev_join);
+         cuEventDestroy(cp->episode_probe.ev_scan);
+         cuEventDestroy(cp->episode_probe.ev_end);
+         cp->episode_probe.ev_join = 0;
+      }
+   }
    if (cp_debug->upload_stats)
       fprintf(stderr, "cudavk: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
               " bytes=%" PRIu64 " empty=%" PRIu64 " coalesce=%d\n",
@@ -8354,10 +8629,23 @@ cp_pass_finish(struct cp_context *cp)
 
    CP_NVTX_SCOPEF("episode %u segs", nsegs);
 
+   if (cp_debug->episode_size_stats || cp_debug->episode_wait_split) {
+      /* An episode that left between the drain and the shade — a fallback, or
+       * a refused allocation — is counted, not sampled: its allocations are
+       * not the ones the sizing question is about. */
+      if (cp->episode_probe.cur_valid)
+         cp->episode_probe.dropped++;
+      cp->episode_probe.cur_valid = false;
+      cp->episode_probe.stage = 0;
+   }
+
    /* The segments' count phases ran on the side streams; the scan reads
     * across all of them. */
    if (!cp_pass_join(cp, nsegs))
       return;
+   /* The counts are joined here, so this is where a drain taken at the scan
+    * would already have everything before the scan behind it. */
+   cp_episode_probe_mark(cp, 0);
 
    /* --- scan the accumulated counts, clamp the runs to the array ---
     *
@@ -8367,6 +8655,8 @@ cp_pass_finish(struct cp_context *cp)
     * word per pixel. */
    CUstream pass_main = cp->stream;
    cp_abuf_scan(cp, screen, ab, (unsigned)n, ab->cursor);
+   /* Everything the proposed drain would wait for is now on the stream. */
+   cp_episode_probe_mark(cp, 1);
 
    /* --- fill --- */
    if (ab->recs && screen->kernels.abuf_fill_recs) {
@@ -8491,9 +8781,12 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
                      MIN2(((unsigned)ab->quad_capacity + 255) / 256, 1024u),
                      1, 1, 256, 1, 1, 0, cp->stream, p, NULL);
    }
+   /* The last thing the drain below waits for. */
+   cp_episode_probe_mark(cp, 2);
 
    /* --- the drain: the six counters and the per-segment quad counts --- */
    uint32_t ctr[CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS] = { 0 };
+   uint64_t probe_w0 = cp->plan.wait_episode_ns;
    if (!cp_sync_timed(cp, cp->stream, &cp->plan.wait_episode_ns,
                       &cp->plan.wait_episode_n))
       return;
@@ -8506,6 +8799,36 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
 
    uint32_t total = ctr[0], fill_over = ctr[1];
    uint32_t quads = ctr[3], quad_over = ctr[4], covered = ctr[5];
+
+   /*
+    * The probes' sample, opened here because this is the only place both the
+    * exact fragment total and the exact quad count are in hand, and closed
+    * where the allocations they would size have all been made. The events are
+    * read here too: the drain above has already synchronised the stream, so
+    * every one of them has completed and nothing waits.
+    */
+   if (cp_debug->episode_size_stats || cp_debug->episode_wait_split) {
+      struct cp_episode_sample *cur = &cp->episode_probe.cur;
+      memset(cur, 0, sizeof(*cur));
+      cur->total = total;
+      cur->quads = quads;
+      cur->capacity = ab->capacity;
+      cur->nsegs = nsegs;
+      cur->used_at_drain = cp->dscratch.used;
+      cur->wait_ns = cp->plan.wait_episode_ns - probe_w0;
+      if (cp->episode_probe.stage == 3) {
+         float ms_scan = 0.0f, ms_tail = 0.0f;
+         if (cuEventElapsedTime(&ms_scan, cp->episode_probe.ev_join,
+                                cp->episode_probe.ev_scan) == CUDA_SUCCESS &&
+             cuEventElapsedTime(&ms_tail, cp->episode_probe.ev_scan,
+                                cp->episode_probe.ev_end) == CUDA_SUCCESS) {
+            cur->ms_scan = ms_scan;
+            cur->ms_tail = ms_tail;
+            cur->have_split = 1;
+         }
+      }
+      cp->episode_probe.cur_valid = true;
+   }
 
    if (total > ab->peak)
       ab->peak = total;
@@ -8724,6 +9047,12 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
    }
    cp_stream_set(cp, pass_main);
    cp->fs_batch = saved_fs_batch;
+   /* Every allocation the drained quad count sized has now been made, so this
+    * is where the sample opened at the drain is closed. */
+   if (cp_debug->episode_size_stats || cp_debug->episode_wait_split) {
+      cp->episode_probe.cur.ngroups = ngroups;
+      cp_episode_probe_push(cp);
+   }
    /* A failed join leaves the shading streams unordered against the composite;
     * neither compositing nor re-rendering is safe after it. */
    if (!cp_pass_join(cp, nsegs))

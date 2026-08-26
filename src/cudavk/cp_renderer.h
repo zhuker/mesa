@@ -175,6 +175,27 @@ struct cp_draw_batch {
       struct cp_rect scissors[CP_MAX_BATCH_DRAWS];
 };
 
+/*
+ * One episode's sizing and wait split. Instrumentation only, written under
+ * CUDAVK_EPISODE_SIZE_STATS and CUDAVK_EPISODE_WAIT_SPLIT and read by nothing
+ * in the renderer. Buffered rather than printed where it is taken: an fprintf
+ * inside the episode would be measured instead of the episode.
+ */
+struct cp_episode_sample {
+   uint32_t total;          /* ctr[0], the scan's exact fragment total */
+   uint32_t quads;          /* ctr[3], the number the drain is taken for */
+   uint32_t capacity;       /* ab->capacity, for the capacity/4 gate */
+   uint32_t nsegs, ngroups;
+   uint64_t used_at_drain;  /* cp->dscratch.used before the shade arrays */
+   uint64_t used_after;     /* ... and after them */
+   uint64_t dscratch_size;
+   uint64_t wait_ns;        /* this episode's share of wait_episode_ns */
+   uint32_t dregrows;       /* cp->dscratch.num_overflow, cumulative */
+   uint32_t have_split;
+   float    ms_scan;        /* device: counts joined -> scan complete */
+   float    ms_tail;        /* device: scan -> abuf_seg_count complete */
+};
+
 struct cp_context {
 
    /* Per-renderer A-buffer storage: every CUDA pointer belongs to this
@@ -540,6 +561,24 @@ struct cp_context {
       uint64_t wait_seg_ns, wait_seg_n;            /* segment composite ctrs */
       uint64_t wait_upload_ns, wait_upload_n;      /* desc-arena HtoD */
    } plan;
+
+   /*
+    * Instrumentation only, off by default. See CUDAVK_EPISODE_SIZE_STATS and
+    * CUDAVK_EPISODE_WAIT_SPLIT in FLAGS.md. Nothing in the renderer reads any
+    * of it, and with both flags off nothing writes it either.
+    */
+   struct {
+      struct cp_episode_sample *samples;
+      unsigned n, cap, dropped;
+      /* Recorded on cp->stream around the episode chain, and read only after
+       * the drain that has already synchronised it — so the split costs three
+       * event records and no wait. */
+      CUevent ev_join, ev_scan, ev_end;
+      bool ev_failed;
+      unsigned stage;                 /* how many were recorded this episode */
+      struct cp_episode_sample cur;
+      bool cur_valid;
+   } episode_probe;
 
    /* GPU-resident pipeline state — managed memory, written by CPU on state
     * changes, read by GPU kernels during draws. */

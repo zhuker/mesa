@@ -391,6 +391,14 @@ static const struct cp_flag_def flags[] = {
      F(abuf_bound_any_tris),
      "drop the two-triangle condition from the per-draw A-buffer fast path; "
      "the fragment and quad product tests are what bound it" },
+   { "CUDAVK_EPISODE_SIZE_STATS", CP_FLAG_BOOL_VALUE, F(episode_size_stats),
+     "record what each episode's shade arrays would cost if they were sized "
+     "from the scan's fragment total instead of the drained quad count, and "
+     "report the distribution at teardown; instrumentation only" },
+   { "CUDAVK_EPISODE_WAIT_SPLIT", CP_FLAG_BOOL_VALUE, F(episode_wait_split),
+     "split the episode drain's wait into the device time before and after "
+     "the A-buffer scan, reported at teardown; adds three event records per "
+     "episode and no synchronisation" },
    { "CUDAVK_ABUF_COMPILE", CP_FLAG_OPT_BOOL, F(abuf_compile),
      "force the A-buffer branches in (1) or out (0) of the NVRTC build",
      .empty_is_unset = true },
