@@ -176,6 +176,28 @@ struct cp_draw_batch {
 };
 
 /*
+ * One peel loop's shape, for CUDAVK_PEEL_SETUP_CENSUS. Instrumentation only,
+ * read by nothing in the renderer.
+ *
+ * The question is how much of stage 1 a reusing pass throws away.
+ * cp_rast_small_or_defer() computes a full setup_triangle() for every
+ * triangle, then returns without appending when the primitive is above
+ * CP_SMALL_THRESHOLD and the mode is CP_QUEUE_REUSE — so on every pass after
+ * the first, one full setup per queued primitive is computed and discarded.
+ * The count of queued primitives is the nontrivial counter the build pass
+ * left on the device, and the peel loop's own convergence check already
+ * synchronises the stream, so reading it costs no wait.
+ */
+struct cp_peel_sample {
+   uint32_t rast_tris;       /* stage-1 threads, per pass */
+   uint32_t queued;          /* nontrivial entries the build pass left */
+   uint32_t passes_planned;
+   uint32_t passes_run;
+   uint32_t have_queued;
+   uint32_t cached;          /* cache_queues: a reusing pass was possible */
+};
+
+/*
  * One episode's sizing and wait split. Instrumentation only, written under
  * CUDAVK_EPISODE_SIZE_STATS and CUDAVK_EPISODE_WAIT_SPLIT and read by nothing
  * in the renderer. Buffered rather than printed where it is taken: an fprintf
@@ -579,6 +601,17 @@ struct cp_context {
       struct cp_episode_sample cur;
       bool cur_valid;
    } episode_probe;
+
+   /* The same shape for CUDAVK_PEEL_SETUP_CENSUS; see cp_peel_sample. The
+    * frame count is the driver's own convention — cp_depth_attachment_store
+    * fires exactly once per frame on both captures. */
+   struct {
+      struct cp_peel_sample *samples;
+      unsigned n, cap, dropped;
+      uint64_t frames;
+      struct cp_peel_sample cur;
+      bool cur_open;
+   } peel_probe;
 
    /* GPU-resident pipeline state — managed memory, written by CPU on state
     * changes, read by GPU kernels during draws. */

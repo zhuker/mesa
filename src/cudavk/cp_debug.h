@@ -269,6 +269,7 @@ struct cp_debug {
    bool     abuf_bound_any_tris;
    bool     episode_size_stats;
    bool     episode_wait_split;
+   bool     peel_setup_census;
    struct cp_opt_int abuf_compile;
 
    /* Draw batching. */

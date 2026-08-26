@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-122 switches.
+123 switches.
 
 ## Tracing
 
@@ -129,6 +129,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_ABUF_BOUND_ANY_TRIS` | bool (value) | `off` | — | drop the two-triangle condition from the per-draw A-buffer fast path; the fragment and quad product tests are what bound it |
 | `CUDAVK_EPISODE_SIZE_STATS` | bool (value) | `off` | — | record what each episode's shade arrays would cost if they were sized from the scan's fragment total instead of the drained quad count, and report the distribution at teardown; instrumentation only |
 | `CUDAVK_EPISODE_WAIT_SPLIT` | bool (value) | `off` | — | split the episode drain's wait into the device time before and after the A-buffer scan, reported at teardown; adds three event records per episode and no synchronisation |
+| `CUDAVK_PEEL_SETUP_CENSUS` | bool (value) | `off` | — | count the peel loop's passes and the triangle setups a reusing pass computes and discards, reported at teardown; reads one device word behind the convergence check that already synchronises |
 | `CUDAVK_ABUF_COMPILE` | bool (optional) | `unset` | — | force the A-buffer branches in (1) or out (0) of the NVRTC build |
 
 ## Draw batching

@@ -399,6 +399,10 @@ static const struct cp_flag_def flags[] = {
      "split the episode drain's wait into the device time before and after "
      "the A-buffer scan, reported at teardown; adds three event records per "
      "episode and no synchronisation" },
+   { "CUDAVK_PEEL_SETUP_CENSUS", CP_FLAG_BOOL_VALUE, F(peel_setup_census),
+     "count the peel loop's passes and the triangle setups a reusing pass "
+     "computes and discards, reported at teardown; reads one device word "
+     "behind the convergence check that already synchronises" },
    { "CUDAVK_ABUF_COMPILE", CP_FLAG_OPT_BOOL, F(abuf_compile),
      "force the A-buffer branches in (1) or out (0) of the NVRTC build",
      .empty_is_unset = true },

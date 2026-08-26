@@ -924,6 +924,120 @@ cp_episode_probe_push(struct cp_context *cp)
    cp->episode_probe.samples[cp->episode_probe.n++] = cp->episode_probe.cur;
 }
 
+
+/*
+ * CUDAVK_PEEL_SETUP_CENSUS — how much of stage 1 a reusing pass throws away.
+ *
+ * cp_rast_small_or_defer() opens with an unconditional setup_triangle() and
+ * then, for a primitive above CP_SMALL_THRESHOLD, returns without appending
+ * when the mode is CP_QUEUE_REUSE. Stage 2 already avoids the mirror of this
+ * one stage later — `if (entry & CP_NT_HUGE) continue;` sits *before* its own
+ * setup_triangle(), because "the alternative is to redo the setup on every
+ * pass purely to rediscover that the primitive is too large for this stage".
+ * Stage 1 has never had the same argument applied to it.
+ *
+ * What a removal would be worth is (queued primitives) x (passes after the
+ * first), and both are countable without a profiler: the build pass leaves the
+ * queued count in the nontrivial counter, and the peel loop's own convergence
+ * check already synchronises the stream, so the four-byte read behind it adds
+ * no wait. Everything else is host arithmetic.
+ *
+ * This counts. It does not time. A run under this flag is not a timed run.
+ */
+static void
+cp_peel_probe_report(struct cp_context *cp)
+{
+   unsigned n = cp->peel_probe.n;
+   double frames = (double)MAX2(cp->peel_probe.frames, (uint64_t)1);
+   if (!n) {
+      fprintf(stderr, "cudavk: peel setup census: no peel loop ran (%u "
+              "dropped)\n", cp->peel_probe.dropped);
+      return;
+   }
+   const struct cp_peel_sample *s = cp->peel_probe.samples;
+
+   uint64_t loops = n, multi = 0, reuse_passes = 0, all_passes = 0;
+   uint64_t inv_all = 0, inv_reuse = 0, discarded = 0, no_read = 0;
+   uint64_t max_passes = 0;
+   for (unsigned i = 0; i < n; i++) {
+      uint64_t p = s[i].passes_run;
+      uint64_t r = p > 1 && s[i].cached ? p - 1 : 0;
+      all_passes += p;
+      reuse_passes += r;
+      multi += p > 1;
+      max_passes = MAX2(max_passes, p);
+      inv_all += (uint64_t)s[i].rast_tris * p;
+      inv_reuse += (uint64_t)s[i].rast_tris * r;
+      if (r && !s[i].have_queued)
+         no_read++;
+      else
+         discarded += (uint64_t)s[i].queued * r;
+   }
+
+   fprintf(stderr,
+      "cudavk: peel setup census: %" PRIu64 " peel loops over %.0f frames "
+      "(%.2f/frame), %" PRIu64 " ran more than one pass (%.1f%%)\n",
+      loops, frames, (double)loops / frames, multi,
+      100.0 * (double)multi / (double)loops);
+   fprintf(stderr,
+      "  passes: %" PRIu64 " total (%.2f/frame), longest loop %" PRIu64 "; "
+      "reusing passes %" PRIu64 " (%.2f/frame) = plain cp_rasterize_stage1 "
+      "launches\n",
+      all_passes, (double)all_passes / frames, max_passes, reuse_passes,
+      (double)reuse_passes / frames);
+   fprintf(stderr,
+      "  stage-1 thread invocations, direct path: %" PRIu64 " total "
+      "(%.0f/frame), of which %" PRIu64 " (%.0f/frame) are on a reusing "
+      "pass\n",
+      inv_all, (double)inv_all / frames, inv_reuse,
+      (double)inv_reuse / frames);
+   fprintf(stderr,
+      "  full setups computed and discarded on a reusing pass: %" PRIu64
+      " (%.0f/frame)\n", discarded, (double)discarded / frames);
+   if (no_read)
+      fprintf(stderr, "  %" PRIu64 " reusing loops never reached a "
+              "convergence check, so their queued count is unknown and they "
+              "are excluded from the line above\n", no_read);
+
+   /*
+    * The number the decision turns on. Below about 5% a perfect removal is
+    * under the old capture's own session spread (0.119 ms against a 1.894
+    * ms/frame direct stage-1 class), so it cannot be measured even if it
+    * works.
+    */
+   double share = inv_all ? 100.0 * (double)discarded / (double)inv_all : 0.0;
+   fprintf(stderr,
+      "  VERDICT (C1): a per-triangle queued bit would skip %.0f setups a "
+      "frame, %.2f%% of all direct stage-1 thread invocations. %s\n",
+      (double)discarded / frames, share,
+      share >= 5.0 ? "AT OR ABOVE the 5% line: worth designing."
+                   : "BELOW the 5% line: removal is exhausted here.");
+}
+
+static void
+cp_peel_probe_push(struct cp_context *cp)
+{
+   if (!cp->peel_probe.cur_open)
+      return;
+   cp->peel_probe.cur_open = false;
+   if (cp->peel_probe.n == cp->peel_probe.cap) {
+      unsigned want = cp->peel_probe.cap ? cp->peel_probe.cap * 2 : 4096;
+      if (want > (1u << 21)) {
+         cp->peel_probe.dropped++;
+         return;
+      }
+      void *p = realloc(cp->peel_probe.samples,
+                        (size_t)want * sizeof(*cp->peel_probe.samples));
+      if (!p) {
+         cp->peel_probe.dropped++;
+         return;
+      }
+      cp->peel_probe.samples = p;
+      cp->peel_probe.cap = want;
+   }
+   cp->peel_probe.samples[cp->peel_probe.n++] = cp->peel_probe.cur;
+}
+
 /*
  * What reconstructing batches and episodes from a stream of draws cost, when
  * the whole pass was in an array the entire time.
@@ -1093,6 +1207,11 @@ cp_context_cleanup(struct cp_context *cp)
    /* Guarded by the same flags that fill it: with both off nothing here was
     * ever allocated, so this whole block compiles out and the teardown path
     * is the one it was. */
+   if (cp_debug->peel_setup_census) {
+      cp_peel_probe_report(cp);
+      free(cp->peel_probe.samples);
+      cp->peel_probe.samples = NULL;
+   }
    if (cp_debug->episode_size_stats || cp_debug->episode_wait_split) {
       cp_episode_probe_report(cp);
       free(cp->episode_probe.samples);
@@ -2734,6 +2853,11 @@ cp_depth_attachment_xfer(struct cp_context *cp,
       .stencil_clear = store ? depth->stencil_clear : 0,
       .stencil_value = depth->stencil_value,
    };
+   /* The project's own frame convention: this fires exactly once per frame on
+    * both captures, and is what the iteration-25 profile counted frames with.
+    * Instrumentation only. */
+   if (store && cp_debug->peel_setup_census)
+      cp->peel_probe.frames++;
    void *params[] = { &args };
    CUresult err = cp_launch(cp, fn,
       (args.width + 15) / 16, (args.height + 15) / 16, args.samples,
@@ -6825,6 +6949,18 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       passes = 0;
 
    unsigned passes_run = 0;
+   if (cp_debug->peel_setup_census && passes) {
+      /* A loop that left early — a failed sync, or an opaque append that
+       * returns from inside it — is counted, not sampled. */
+      if (cp->peel_probe.cur_open)
+         cp->peel_probe.dropped++;
+      cp->peel_probe.cur = (struct cp_peel_sample) {
+         .rast_tris = rast_num_triangles,
+         .passes_planned = passes,
+         .cached = cache_queues ? 1u : 0u,
+      };
+      cp->peel_probe.cur_open = true;
+   }
    for (unsigned pass = 0; pass < passes; pass++) {
       passes_run = pass + 1;
       CP_NVTX_SCOPEF("pass %u", pass);
@@ -7018,6 +7154,19 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             if (!cp_sync_timed(cp, cp->stream, &cp->plan.wait_peel_ns,
                                &cp->plan.wait_peel_n))
                return;
+            /* The build pass left the queued count here and a reusing pass
+             * never resets it. The stream is synchronised by the line above,
+             * so this four-byte read waits for nothing. */
+            if (cp_debug->peel_setup_census && cp->peel_probe.cur_open &&
+                !cp->peel_probe.cur.have_queued && cp->cur_qset.counts) {
+               uint32_t q = 0;
+               if (cuMemcpyDtoH(&q, cp->cur_qset.counts,
+                                sizeof(q)) == CUDA_SUCCESS) {
+                  cp->peel_probe.cur.queued =
+                     MIN2(q, (uint32_t)CP_MAX_NONTRIVIAL);
+                  cp->peel_probe.cur.have_queued = 1;
+               }
+            }
             if (!*(volatile uint32_t *)(uintptr_t)cp->peel_any)
                break;
             interval_start = pass + 1;
@@ -7025,6 +7174,11 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                                   (unsigned)CP_PEEL_CHECK_MAX);
          }
       }
+   }
+
+   if (cp_debug->peel_setup_census && cp->peel_probe.cur_open) {
+      cp->peel_probe.cur.passes_run = passes_run;
+      cp_peel_probe_push(cp);
    }
 
    /*
