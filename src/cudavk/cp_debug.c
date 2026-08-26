@@ -213,13 +213,15 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_OPAQUE_EPISODE", CP_FLAG_BOOL_VALUE,
      F(no_opaque_episode),
      "disable consecutive opaque-run visibility deferral" },
-   { "CUDAVK_OPAQUE_STREAMS", CP_FLAG_BOOL_VALUE, F(opaque_streams),
-     "fan an opaque episode's segments over the pass side streams, the way a "
-     "blended episode's already are, instead of issuing them back to back on "
-     "the main stream" },
+   { "CUDAVK_NO_OPAQUE_STREAMS", CP_FLAG_BOOL_VALUE, F(no_opaque_streams),
+     "issue an opaque episode's segments back to back on the main stream "
+     "instead of fanning them over the pass side streams" },
    { "CUDAVK_NO_SAMPLER_VARIANT", CP_FLAG_BOOL_VALUE,
      F(no_sampler_variant),
      "disable literal-state fragment sampler variants" },
+   { "CUDAVK_NO_GPU_SEM_WAIT", CP_FLAG_BOOL_VALUE, F(no_gpu_sem_wait),
+     "block the submitting thread on a queue-submit wait semaphore instead of "
+     "making the renderer stream wait on its completion event" },
    { "CUDAVK_NO_TEXTURE_CACHE", CP_FLAG_BOOL_VALUE, F(no_texture_cache),
      "disable direct CUDA hardware-texture fragment execution; fall back to "
      "software sampling" },
@@ -487,6 +489,13 @@ static const struct {
    const char *now;
 } retired[] = {
    /* Renamed into the registry: one prefix, one table. */
+   /* Default flipped on, so the switch that changes behaviour is now the
+    * one that turns it off. The old name is not silently ignored: a script
+    * still exporting CUDAVK_OPAQUE_STREAMS=1 would otherwise appear to select
+    * the arm it already gets, and =0 would appear to select the old one and
+    * would not. */
+   { "CUDAVK_OPAQUE_STREAMS",          "CUDAVK_NO_OPAQUE_STREAMS" },
+
    { "CPVK_DEBUG_ROWS",                "CUDAVK_DEBUG_ROWS" },
    { "CPVK_DEBUG_CLIP",                "CUDAVK_DEBUG_CLIP" },
    { "CPVK_DEBUG_PASS",                "CUDAVK_DEBUG_PASS" },

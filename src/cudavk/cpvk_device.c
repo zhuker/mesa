@@ -76,6 +76,21 @@ static const struct vk_device_extension_table cpvk_device_extensions = {
     */
    .KHR_create_renderpass2 = true,
    .KHR_depth_stencil_resolve = true,
+
+   /*
+    * Timeline semaphores, implemented as a 64-bit counter on the driver's one
+    * vk_sync type (cpvk_sync.c); the runtime's vk_semaphore.c supplies
+    * vkWaitSemaphores, vkSignalSemaphore and vkGetSemaphoreCounterValue on top
+    * of it, so there is no entrypoint of this here.
+    *
+    * The extension form, not core: apiVersion stays 1.1, which is what the
+    * driver implements, and promoting it to 1.2 would claim everything else in
+    * that version too. Note that this is the whole of what is possible here --
+    * an exportable timeline is not. CUDA 12.8 has no call that creates or
+    * exports a semaphore, so VK_KHR_external_semaphore_fd stays unadvertised;
+    * see docs/cudavk/CUDA_INTEROP.md.
+    */
+   .KHR_timeline_semaphore = true,
 };
 
 static void
@@ -112,6 +127,12 @@ cpvk_get_features(struct vk_features *features)
        * are both implemented; the old Vulkan-1.3 experiment overclaimed all
        * of these merely because that core version made them mandatory. */
       .dynamicRendering = true,
+
+      /* Vulkan 1.2 / KHR_timeline_semaphore. The counter, the monotonic
+       * signal and the host wait are the vk_sync type's; wait-before-signal
+       * is the runtime's ASSISTED timeline mode over this driver's
+       * VK_SYNC_WAIT_PENDING. See cpvk_sync.c. */
+      .timelineSemaphore = true,
    };
 }
 

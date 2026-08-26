@@ -203,8 +203,9 @@ struct cp_debug {
    bool no_counter_block;
    unsigned upload_flush_fail_at;
    bool no_opaque_episode;
-   bool opaque_streams;
+   bool no_opaque_streams;
    bool no_sampler_variant;
+   bool no_gpu_sem_wait;
    /* Derived in apply_couplings() from no_texture_cache: the hardware texture
     * path is the default, and the registry carries the revert. Every use site
     * still reads texture_cache, so nothing else had to be inverted. */

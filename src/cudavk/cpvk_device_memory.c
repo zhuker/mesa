@@ -22,11 +22,24 @@
 /* Last: intercepts the CUDA entry points for the iteration 26 census. */
 #include "cp_smallop_tele.h"
 
+/*
+ * One signal a completed submit owes, with the epoch the sync was armed at:
+ * the sync may have been reset while the submit was still running, and a
+ * signal whose epoch is stale has already been consumed. See cpvk_sync.c.
+ */
+struct cpvk_pending_signal {
+   struct vk_sync *sync;
+   uint64_t value;
+   uint64_t epoch;
+};
+
 struct cpvk_pending_submit {
    struct cpvk_pending_submit *next;
-   CUevent done;
+   /* The submit's completion event, shared with every sync this submit
+    * signals; this record holds one reference and drops it below. */
+   struct cpvk_cuevent *done;
    uint32_t signal_count;
-   struct vk_sync_signal signals[];
+   struct cpvk_pending_signal signals[];
 };
 
 static int
@@ -45,23 +58,20 @@ cpvk_submit_worker(void *data)
       struct cpvk_pending_submit *pending = dev->submit_head;
       mtx_unlock(&dev->submit_lock);
 
-      CUresult status = cuEventSynchronize(pending->done);
+      CUresult status = cuEventSynchronize(pending->done->event);
       if (status != CUDA_SUCCESS)
          atomic_store_explicit(&dev->device_lost, true, memory_order_release);
       /* Always unblock Vulkan waiters. They observe DEVICE_LOST on the next
        * queue/device call instead of hanging behind a failed CUDA event. */
       for (uint32_t i = 0; i < pending->signal_count; i++) {
-         VkResult result = vk_sync_signal(&dev->vk,
-                                          pending->signals[i].sync,
-                                          pending->signals[i].signal_value);
-         if (result != VK_SUCCESS) {
-            atomic_store_explicit(&dev->device_lost, true,
-                                  memory_order_release);
-            fprintf(stderr, "cudavk: async sync signal failed: %d\n",
-                    result);
-         }
+         cpvk_sync_signal_completion(&dev->vk, pending->signals[i].sync,
+                                     pending->signals[i].value,
+                                     pending->signals[i].epoch);
       }
-      cuEventDestroy(pending->done);
+      /* Not destroyed here: the syncs this submit signalled hold their own
+       * references, and a wait on one of them becomes a device wait on this
+       * event. The last holder destroys it. */
+      cpvk_cuevent_unref(dev, pending->done);
 
       mtx_lock(&dev->submit_lock);
       assert(dev->submit_head == pending);
@@ -150,13 +160,32 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
-   VkResult result = vk_sync_wait_many(&dev->vk, submit->wait_count,
-                                       submit->waits,
-                                       VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
-   if (result != VK_SUCCESS)
-      return result;
-
    CPVK_CTX_SCOPE(dev);
+
+   /*
+    * Wait semaphores, on the device where the sync carries a completion event
+    * and on the host where it does not.
+    *
+    * A real driver makes the GPU wait here; this used to block the application
+    * thread in vk_sync_wait_many before a single command was translated, which
+    * on a queue whose signals are already CUDA events is an unnecessary round
+    * trip. The fallback is not a formality: a sync with no event has had
+    * nothing recorded into it -- a fence or semaphore signalled from the host,
+    * or one whose signalling submit has not been issued yet -- and there is no
+    * device object to wait on.
+    */
+   for (uint32_t i = 0; i < submit->wait_count; i++) {
+      if (!cp_debug->no_gpu_sem_wait &&
+          cpvk_sync_gpu_wait(&dev->vk, submit->waits[i].sync,
+                             submit->waits[i].wait_value,
+                             dev->renderer.stream))
+         continue;
+      VkResult result = vk_sync_wait(&dev->vk, submit->waits[i].sync,
+                                     submit->waits[i].wait_value,
+                                     VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    mtx_lock(&dev->submit_lock);
    bool retired = dev->submit_head == NULL;
    mtx_unlock(&dev->submit_lock);
@@ -334,19 +363,39 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
    size_t pending_size = sizeof(struct cpvk_pending_submit) +
                          (size_t)submit->signal_count *
-                         sizeof(struct vk_sync_signal);
+                         sizeof(struct cpvk_pending_signal);
    struct cpvk_pending_submit *pending = calloc(1, pending_size);
    if (!pending)
       return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY));
    pending->signal_count = submit->signal_count;
-   memcpy(pending->signals, submit->signals,
-          (size_t)submit->signal_count * sizeof(struct vk_sync_signal));
-   if (cuEventCreate(&pending->done, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS ||
-       cuEventRecord(pending->done, dev->renderer.stream) != CUDA_SUCCESS) {
-      if (pending->done)
-         cuEventDestroy(pending->done);
+   CUevent done = NULL;
+   if (cuEventCreate(&done, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS ||
+       cuEventRecord(done, dev->renderer.stream) != CUDA_SUCCESS) {
+      if (done)
+         cuEventDestroy(done);
       free(pending);
       return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
+   }
+   pending->done = cpvk_cuevent_create(done);
+   if (!pending->done) {
+      cuEventDestroy(done);
+      free(pending);
+      return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY));
+   }
+
+   /*
+    * Arm the syncs this submit signals before the worker can publish anything.
+    * The sync is still unsignalled from here until the worker gets to it; what
+    * it has gained is the device-side half of that completion, which is what a
+    * later submit waits on, and the promise that it will get there, which is
+    * what VK_SYNC_WAIT_PENDING answers.
+    */
+   for (uint32_t i = 0; i < submit->signal_count; i++) {
+      pending->signals[i].sync = submit->signals[i].sync;
+      pending->signals[i].value = submit->signals[i].signal_value;
+      pending->signals[i].epoch =
+         cpvk_sync_arm(&dev->vk, submit->signals[i].sync,
+                       submit->signals[i].signal_value, pending->done);
    }
 
    mtx_lock(&dev->submit_lock);

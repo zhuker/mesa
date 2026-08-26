@@ -652,6 +652,42 @@ void cpvk_query_pool_unref(struct cpvk_query_pool *pool);
 void cpvk_event_ref(struct cpvk_event *event);
 void cpvk_event_unref(struct cpvk_event *event);
 
+/*
+ * A CUDA completion event, refcounted because one submit's event is shared by
+ * the pending-submit record that waits on it and by every vk_sync that submit
+ * signals. The name is cuevent, not event: cpvk_event is VkEvent and already
+ * owns the plain names above.
+ *
+ * The event outlives the submit worker's wait on it, which is the whole point:
+ * a sync that carries one can make the GPU wait (cuStreamWaitEvent) instead of
+ * blocking the application thread. See cpvk_sync.c.
+ */
+struct cpvk_cuevent {
+   CUevent event;
+   atomic_uint refcnt;
+};
+
+struct cpvk_cuevent *cpvk_cuevent_create(CUevent event);
+struct cpvk_cuevent *cpvk_cuevent_ref(struct cpvk_cuevent *ev);
+void cpvk_cuevent_unref(struct cpvk_device *dev, struct cpvk_cuevent *ev);
+
+/*
+ * Arm a sync for a submit that will signal it: promise `value`, take the
+ * submit's completion event, and return the epoch the promise was made at.
+ * The worker publishes the completion with that epoch, and a reset in between
+ * makes it stale, which is how a consumed signal stops being republished.
+ */
+uint64_t cpvk_sync_arm(struct vk_device *device, struct vk_sync *sync,
+                       uint64_t value, struct cpvk_cuevent *ev);
+void cpvk_sync_signal_completion(struct vk_device *device,
+                                 struct vk_sync *sync, uint64_t value,
+                                 uint64_t epoch);
+
+/* Wait for a sync on the stream. False when it carries no device work that
+ * reaches the value and the caller must fall back to a host wait. */
+bool cpvk_sync_gpu_wait(struct vk_device *device, struct vk_sync *sync,
+                        uint64_t wait_value, CUstream stream);
+
 void cpvk_execute_draw_cmd(struct cpvk_device *dev,
                            const struct cp_render_scope *scope,
                            const struct cpvk_draw_cmd *d);
