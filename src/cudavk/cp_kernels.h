@@ -8,11 +8,11 @@ struct cp_sampler_info;
 struct cp_tex_desc_ref;
 
 struct cp_kernels {
-   /* The rasterizer module was compiled with griddepcontrol.wait in the
-    * kernels that can be a PDL secondary. Set by cp_kernels_init() from
-    * cp_pdl_kernels(); read by cp_launch() before it may set the programmatic
-    * launch attribute. The two must never disagree. */
-   bool pdl;
+   /* The PDL level the modules were compiled at: which griddepcontrol.wait
+    * instructions are actually in the binaries. Set by cp_kernels_init() from
+    * cp_pdl_kernels(); read by cp_launch_after() before it may set the
+    * programmatic launch attribute. The two must never disagree. */
+   unsigned pdl;
 
    CUmodule module;
    CUmodule clear_module;
@@ -104,7 +104,33 @@ struct cp_kernels {
 /* Whether the kernels were compiled with the census and A-buffer verification
  * instrumentation. See cp_kernels.c. */
 bool cp_kernels_instrumented(void);
-bool cp_pdl_kernels(int sm_major, int sm_minor);
+/*
+ * PDL tiers. A launch site names the tier its link belongs to, and the
+ * attribute is only set when the loaded modules were built at that level or
+ * higher -- so a level-1 module can never be launched with a level-2 link's
+ * attribute and find no wait in the kernel.
+ */
+/*
+ * The levels are also a decomposition of the mechanism, which is why they are
+ * ordered this way rather than by how much work each link does.
+ *
+ *   1  the A-buffer scan chain. Two of its three secondaries have real work
+ *      in front of the wait, one of them a 3.7 MB clear that was hoisted
+ *      there on purpose.
+ *   2  the rasterizer stage links. Every one of these secondaries reads the
+ *      queue its predecessor filled as its first act, so there is nothing to
+ *      overlap and the ONLY thing the attribute can buy is the inter-grid
+ *      gap. Level 2 minus level 1 is therefore a measurement of the gap
+ *      alone.
+ *   3  the fragment writeback and the segment scatter, both of which have an
+ *      independent global load in front of the wait. Level 3 minus level 2
+ *      is preamble overlap again, on kernels that are not the scan chain.
+ */
+#define CP_PDL_TIER_SCAN   1u
+#define CP_PDL_TIER_RASTER 2u
+#define CP_PDL_TIER_FS     3u
+#define CP_PDL_TIER_MAX    3u
+unsigned cp_pdl_kernels(int sm_major, int sm_minor);
 
 /* The device's compute capability is all this needs of a screen, so it takes
  * that and not the screen: the kernels are the same kernels whichever Vulkan

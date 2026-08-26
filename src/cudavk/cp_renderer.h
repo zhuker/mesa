@@ -746,14 +746,17 @@ CUresult cp_launch_after(struct cp_context *cp, CUfunction f,
                          unsigned gx, unsigned gy, unsigned gz,
                          unsigned bx, unsigned by, unsigned bz,
                          unsigned shmem, CUstream stream,
-                         void **params, void **extra, CUfunction pdl_after);
+                         void **params, void **extra, CUfunction pdl_after,
+                         unsigned pdl_tier);
 CUresult cp_upload_flush(struct cp_context *cp);
 void cp_stream_set(struct cp_context *cp, CUstream stream);
 
 #define CP_LAUNCH(...) CP_CU_WARN(cp_launch(cp, __VA_ARGS__), "cuLaunchKernel")
-/* `prev` first for readability at the call site; it is passed last. */
-#define CP_LAUNCH_AFTER(prev, ...) \
-   CP_CU_WARN(cp_launch_after(cp, __VA_ARGS__, (prev)), "cuLaunchKernel")
+/* `prev` and its tier first for readability at the call site; they are passed
+ * last. The tier must be the one whose kernels carry the matching wait. */
+#define CP_LAUNCH_AFTER(prev, tier, ...) \
+   CP_CU_WARN(cp_launch_after(cp, __VA_ARGS__, (prev), (tier)), \
+              "cuLaunchKernel")
 
 /* Slots the quad stream's own shading pass may use, four per quad. Bounds the
  * fragment shader's input and output buffers, which at five varyings are about

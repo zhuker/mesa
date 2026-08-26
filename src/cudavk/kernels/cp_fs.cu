@@ -12,6 +12,25 @@
  */
 #include "cp_rast_types.h"
 
+/*
+ * Programmatic dependent launch, secondary side. cp_kernels.c defines CP_PDL
+ * to the level the driver is running at, and only when the device and driver
+ * support the feature; see the same block in cp_rasterize.cu. cp_fs_writeback
+ * is a tier-2 secondary behind the compiled fragment shader.
+ *
+ * NVRTC 12.8 does not declare cudaGridDependencySynchronize, so the PTX
+ * instruction is written directly. Launched without the attribute the wait
+ * finds no prerequisite grid in flight and falls through.
+ */
+#ifndef CP_PDL
+#define CP_PDL 0
+#endif
+#if CP_PDL >= 3
+#define CP_PDL_WAIT3() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define CP_PDL_WAIT3() do { } while (0)
+#endif
+
 #define VISBUF_EMPTY 0xFFFFFFFFFFFFFFFFULL
 
 /* One semantic implementation is compiled twice: NVRTC uses CUDA's explicit
@@ -1118,12 +1137,32 @@ cp_fs_writeback_one(const struct cp_fs_writeback_args &args, uint32_t i)
 extern "C" __global__ void
 cp_fs_writeback(struct cp_fs_writeback_args args)
 {
+   /*
+    * The slot count is the interpolation's output, not the shader's: the
+    * shader cannot allocate its own slot, which is the whole reason
+    * cp_fs_compact exists. The interpolation is two grids back and has
+    * completed, so this load, the grid-stride arithmetic and the loop's first
+    * bound test may all be done before the wait -- while the fragment shader,
+    * which is what this kernel is a PDL secondary of, is still draining.
+    * Everything cp_fs_writeback_one() touches of the shader's own output
+    * (fs_out, discard_mask) is behind the wait.
+    */
    uint32_t limit = args.pixel_counter
       ? *(const uint32_t *)(uintptr_t)args.pixel_counter
       : args.num_pixels;
+#if CP_PDL >= 3
+   uint32_t first = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t stride = gridDim.x * blockDim.x;
+
+   CP_PDL_WAIT3();
+
+   for (uint32_t i = first; i < limit; i += stride)
+      cp_fs_writeback_one(args, i);
+#else
    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < limit;
         i += gridDim.x * blockDim.x)
       cp_fs_writeback_one(args, i);
+#endif
 }
 
 /*

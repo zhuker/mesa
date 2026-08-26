@@ -528,7 +528,7 @@ cp_launch_after(struct cp_context *cp, CUfunction f,
                 unsigned gx, unsigned gy, unsigned gz,
                 unsigned bx, unsigned by, unsigned bz,
                 unsigned shmem, CUstream stream, void **params, void **extra,
-                CUfunction pdl_after)
+                CUfunction pdl_after, unsigned pdl_tier)
 {
    cp_ctx_check("cp_launch", cp->dev->cuda_ctx);
    CUresult err = cp_upload_flush(cp);
@@ -539,12 +539,18 @@ cp_launch_after(struct cp_context *cp, CUfunction f,
    uint64_t epoch = cp_pdl_watch ?
       __atomic_load_n(&cp_pdl_epoch, __ATOMIC_RELAXED) : 0;
    bool pdl = pdl_after && cp_pdl_watch && !cp->pdl_failed &&
-              cp->dev->kernels.pdl &&
+              cp->dev->kernels.pdl >= pdl_tier &&
               cp->pdl_prev_fn == pdl_after &&
               cp->pdl_prev_stream == stream &&
               cp->pdl_prev_epoch == epoch;
 
-   if (pdl_after) {
+   /*
+    * Only count a link the running level is meant to convert. A level-1 run
+    * would otherwise report every level-2 site as a decline and make the take
+    * rate -- which is how a PDL measurement is checked for having happened at
+    * all -- unreadable.
+    */
+   if (pdl_after && cp->dev->kernels.pdl >= pdl_tier) {
       if (pdl)
          cp->pdl_taken++;
       else
@@ -596,7 +602,7 @@ cp_launch(struct cp_context *cp, CUfunction f,
           unsigned shmem, CUstream stream, void **params, void **extra)
 {
    return cp_launch_after(cp, f, gx, gy, gz, bx, by, bz, shmem, stream,
-                          params, extra, NULL);
+                          params, extra, NULL, 0);
 }
 
 /*
@@ -1977,7 +1983,8 @@ cp_abuf_scan_finish_only(struct cp_context *cp, struct cp_device *screen,
    unsigned brk = cp_debug->abuf_fuse_break;
    void *p[] = { &in, &out, &sums, &nsums, &n, &ept, &total, &zero,
                  &clamp_counts, &clamp_capacity, &clamp_overflow, &brk };
-   CP_LAUNCH_AFTER(pdl_after, screen->kernels.abuf_scan_finish, nsums, 1, 1,
+   CP_LAUNCH_AFTER(pdl_after, CP_PDL_TIER_SCAN,
+                   screen->kernels.abuf_scan_finish, nsums, 1, 1,
                    CP_ABUF_SCAN_BLOCK, 1, 1, 0, cp->stream, p, NULL);
 }
 
@@ -2201,7 +2208,7 @@ cp_abuf_quad_build(struct cp_context *cp, struct cp_device *screen,
                     &ab->quad_prim, &ab->quad_mask, &ab->peel_mask,
                     &ab->quad_block, &ab->shade_slot, &ab->quad_capacity,
                     &ab->quad_overflow };
-      CP_LAUNCH_AFTER(screen->kernels.abuf_scan_finish,
+      CP_LAUNCH_AFTER(screen->kernels.abuf_scan_finish, CP_PDL_TIER_SCAN,
                       screen->kernels.abuf_quad_fill_all,
                       DIV_ROUND_UP(nblocks, 256u), 1, 1, 256, 1, 1,
                       0, cp->stream, p, NULL);
@@ -3416,8 +3423,14 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
                     CUdeviceptr front_face, CUdeviceptr coverage,
                     CUdeviceptr fused_interp, unsigned num_threads,
                     CUevent ev_before,
-                    CUdeviceptr batch_rows)
+                    CUdeviceptr batch_rows, CUfunction *launched)
 {
+   /* Which kernel actually ran, for a caller that wants to name it as the
+    * predecessor of its own launch. A shader has five possible executions and
+    * a pending tune can retarget the launch to an alternate binary, so the
+    * caller cannot work this out from the mode it asked for. */
+   if (launched)
+      *launched = NULL;
    struct cp_shader_exec *base_exec = &fs->exec[mode];
    if (!base_exec->kernel && mode == CP_SHADER_EXEC_CLASSIC &&
        fs->exec[CP_SHADER_EXEC_FUSED].kernel) {
@@ -3787,6 +3800,8 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
       CUresult fs_err = cp_launch(cp, launch_kernel, fs_blocks,
                                        1, 1, 256, 1, 1, 0, cp->stream,
                                        fs_params, NULL);
+      if (launched && fs_err == CUDA_SUCCESS)
+         *launched = launch_kernel;
       cp_texture_cache_unpin(cp);
       if (fs_err != CUDA_SUCCESS) {
          fprintf(stderr, "cudavk: fragment shader launch failed (%d)\n",
@@ -4068,10 +4083,11 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
 
    enum cp_shader_exec_mode fs_mode = inshader_interp_dev
       ? inshader_mode : CP_SHADER_EXEC_CLASSIC;
+   CUfunction fs_kernel = NULL;
    if (!cp_fs_launch_shader(cp, state, fs, fs_mode, counter, fs_in,
                             fs_in_stride, fs_out, frag_coord, discard_mask,
                             front_face, coverage, inshader_interp_dev, num_pixels,
-                            0, batch_rows))
+                            0, batch_rows, &fs_kernel))
       return;
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
@@ -4129,9 +4145,19 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       /* The kernel strides, so the grid is capped: num_pixels is the
        * framebuffer's worst case and the launch was spending more time
        * scheduling idle blocks than writing pixels on small draws. */
-      CUresult wb_err = cp_launch(cp, screen->kernels.fs_writeback,
+      /*
+       * Tier 2: the writeback behind the shader itself. The shader is a
+       * generated kernel and gets no trigger of its own, which it does not
+       * need -- the trigger is implicit once its blocks exit. The name is
+       * carried out of cp_fs_launch_shader() rather than guessed, so the
+       * optional A-buffer colour scatter above, or a tuning event record,
+       * makes this decline instead of claiming a predecessor it no longer
+       * has.
+       */
+      CUresult wb_err = cp_launch_after(cp, screen->kernels.fs_writeback,
                      MIN2((num_pixels + 255) / 256, 2048u), 1, 1, 256, 1, 1,
-                     0, cp->stream, wb_params, NULL);
+                     0, cp->stream, wb_params, NULL,
+                     fs_kernel, CP_PDL_TIER_FS);
       cp_nvtx_pop();   /* writeback */
       if (wb_err != CUDA_SUCCESS) {
          fprintf(stderr, "cudavk: FS writeback launch failed (%d)\n", wb_err);
@@ -4480,7 +4506,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
                             fs_in_stride, fs_out, frag_coord, discard_mask,
                             front_face, coverage,
                             use_fused_interp ? interp_dev : 0, num_slots,
-                            ab->timing ? ab->ev[13] : 0, batch_rows))
+                            ab->timing ? ab->ev[13] : 0, batch_rows, NULL))
       return false;
    cp_abuf_mark(ab, ab->ev[14], cp->stream);
 
@@ -6308,10 +6334,16 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
                         (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
                         0, cp->stream, ap, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
+      /* Whichever of the two actually filled the queue is the predecessor;
+       * naming the wrong one costs the overlap, not the ordering. Stage 1 is
+       * never a secondary here -- the queue-counter clear is in front of it. */
+      CP_LAUNCH_AFTER(fused_count ? screen->kernels.clip_rast_fused_abuf
+                                  : screen->kernels.rasterize_stage1_abuf,
+                     CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage2_abuf,
                      CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                      256, 1, 1, 0, cp->stream, ap, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
+      CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2_abuf,
+                     CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage3_abuf,
                      CLAMP(rast_num_triangles * 8, 512u, 2048u), 1, 1,
                      64, 1, 1, 0, cp->stream, ap, NULL);
       cp_abuf_mark(ab, ab->ev[1], cp->stream);
@@ -6464,10 +6496,14 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
                         (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
                         0, cp->stream, ap, NULL);
-         CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
+         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage1_abuf,
+                        CP_PDL_TIER_RASTER,
+                        screen->kernels.rasterize_stage2_abuf,
                         CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                         256, 1, 1, 0, cp->stream, ap, NULL);
-         CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
+         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2_abuf,
+                        CP_PDL_TIER_RASTER,
+                        screen->kernels.rasterize_stage3_abuf,
                         CLAMP(rast_num_triangles * 8, 512u, 2048u), 1, 1,
                         64, 1, 1, 0, cp->stream, ap, NULL);
       }
@@ -6739,13 +6775,16 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 
       /* Stage 2: warp-cooperative, grid-strided over the nontrivial queue */
       void *s2_params[] = { &rast_args, &rast_queues };
-      CP_LAUNCH(screen->kernels.rasterize_stage2,
+      CP_LAUNCH_AFTER(fused_rast ? screen->kernels.clip_rast_fused
+                                 : screen->kernels.rasterize_stage1,
+         CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage2,
          s2_blocks, 1, 1, 256, 1, 1,
          0, cp->stream, s2_params, NULL);
 
       /* Stage 3: block per tile, grid-strided over the huge-tile queue */
       void *s3_params[] = { &rast_args, &rast_queues };
-      CP_LAUNCH(screen->kernels.rasterize_stage3,
+      CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2,
+         CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage3,
          s3_blocks, 1, 1, 64, 1, 1,
          0, cp->stream, s3_params, NULL);
 
@@ -7559,10 +7598,12 @@ cp_opaque_tile_visibility(struct cp_context *cp, struct cp_pass_seg *segs,
       CP_LAUNCH(screen->kernels.rasterize_stage1,
                 DIV_ROUND_UP(segs[s].rast_num_triangles, 256), 1, 1,
                 256, 1, 1, 0, cp->stream, params, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage2,
+      CP_LAUNCH_AFTER(screen->kernels.rasterize_stage1, CP_PDL_TIER_RASTER,
+                screen->kernels.rasterize_stage2,
                 CLAMP(DIV_ROUND_UP(segs[s].rast_num_triangles, 8), 1u, 512u),
                 1, 1, 256, 1, 1, 0, cp->stream, params, NULL);
-      CP_LAUNCH(screen->kernels.rasterize_stage3, 2048, 1, 1,
+      CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2, CP_PDL_TIER_RASTER,
+                screen->kernels.rasterize_stage3, 2048, 1, 1,
                 64, 1, 1, 0, cp->stream, params, NULL);
    }
 
@@ -8238,11 +8279,22 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
             .nsegs = nsegs,
             .ngroups = ngroups,
          };
+         /*
+          * The cursor clear moves in front of the prefix rather than behind
+          * it, so that the prefix and the scatter are adjacent kernels on the
+          * stream and the scatter can be a PDL secondary of the prefix. The
+          * prefix reads and writes seg_counts, seg_group, seg_base,
+          * group_base and group_counts, and never seg_cursor, so this is the
+          * same zeros to the same words at a different point in an order that
+          * already had to hold. Without the move the clear sits between them
+          * and the epoch check refuses the link -- correctly.
+          */
+         cuMemsetD32Async(seg_cursor, 0, nsegs, cp->stream);
+
          void *prefix_params[] = { &prefix };
          CP_LAUNCH(cp->dev->kernels.abuf_seg_prefix,
                    1, 1, 1, 1, 1, 1, 0, cp->stream, prefix_params, NULL);
 
-         cuMemsetD32Async(seg_cursor, 0, nsegs, cp->stream);
          bucket.seg_cursor = seg_cursor;
          bucket.seg_base = seg_base_dev;
          bucket.grouped = grouped;
@@ -8250,7 +8302,11 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          bucket.seg_group = seg_group_dev;
          bucket.group_base = group_base_dev;
          void *scatter_params[] = { &bucket };
-         CP_LAUNCH(cp->dev->kernels.abuf_seg_scatter,
+         /* The prefix is one thread walking nsegs x ngroups; the scatter's
+          * two independent loads and its CTA setup are worth having in
+          * flight while it does. */
+         CP_LAUNCH_AFTER(cp->dev->kernels.abuf_seg_prefix, CP_PDL_TIER_FS,
+                   cp->dev->kernels.abuf_seg_scatter,
                    ((unsigned)quad_bound + 255) / 256,
                    1, 1, 256, 1, 1, 0, cp->stream, scatter_params, NULL);
       }
@@ -8486,10 +8542,16 @@ cp_pass_finish(struct cp_context *cp)
          CP_LAUNCH(screen->kernels.rasterize_stage1_abuf,
                         (sg->rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
                         0, cp->stream, ap, NULL);
-         CP_LAUNCH(screen->kernels.rasterize_stage2_abuf,
+         /* One segment's three stages are a chain on that segment's own
+          * stream; the fan-out overlaps segments, never these. */
+         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage1_abuf,
+                        CP_PDL_TIER_RASTER,
+                        screen->kernels.rasterize_stage2_abuf,
                         CLAMP((sg->rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
                         256, 1, 1, 0, cp->stream, ap, NULL);
-         CP_LAUNCH(screen->kernels.rasterize_stage3_abuf,
+         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2_abuf,
+                        CP_PDL_TIER_RASTER,
+                        screen->kernels.rasterize_stage3_abuf,
                         CLAMP(sg->rast_num_triangles * 8, 512u, 2048u), 1, 1,
                         64, 1, 1, 0, cp->stream, ap, NULL);
       }

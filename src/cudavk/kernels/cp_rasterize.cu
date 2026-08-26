@@ -35,10 +35,27 @@
  * wait finds nothing in flight and falls through. That is why a declined
  * launch is still correct.
  */
-#if CP_PDL
-#define CP_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#ifndef CP_PDL
+#define CP_PDL 0
+#endif
+#define CP_PDL_WAIT_INSN() asm volatile("griddepcontrol.wait;" ::: "memory")
+#if CP_PDL >= 1
+#define CP_PDL_WAIT() CP_PDL_WAIT_INSN()
 #else
 #define CP_PDL_WAIT() do { } while (0)
+#endif
+/* Tier 2, the rasterizer stage links, and tier 3, the segment scatter. A
+ * tier's wait is compiled in only at its own level or above, so a level-1
+ * binary is bit for bit the one level 1 was measured with. */
+#if CP_PDL >= 2
+#define CP_PDL_WAIT2() CP_PDL_WAIT_INSN()
+#else
+#define CP_PDL_WAIT2() do { } while (0)
+#endif
+#if CP_PDL >= 3
+#define CP_PDL_WAIT3() CP_PDL_WAIT_INSN()
+#else
+#define CP_PDL_WAIT3() do { } while (0)
 #endif
 
 #define PACK_VISBUF(depth_uint, tri_id) \
@@ -911,6 +928,21 @@ cp_rasterize_stage2_body(struct cp_rasterize_args args, struct cp_rast_queues qu
    uint32_t num_warps = (gridDim.x * blockDim.x) / 32;
 
    uint32_t *nt_counter = (uint32_t *)(uintptr_t)queues.nontrivial_count;
+
+   /*
+    * Tier 2, and an honest one: everything below this point comes out of the
+    * queue stage 1 filled, so there is nothing here to hoist above the wait.
+    * The lane and warp indices above are register arithmetic, and the
+    * arguments arrive in constant memory rather than through a load. What the
+    * attribute can buy this launch is the inter-grid gap -- stage 1's teardown
+    * and this grid's CTA setup -- and not one instruction of overlap.
+    *
+    * The non-A-buffer wrappers do have one thing in front of it: their
+    * path_flag test, which reads a word the tiled opaque raster wrote two
+    * grids back and which therefore may be read before the wait.
+    */
+   CP_PDL_WAIT2();
+
    uint32_t num_nontrivial = cp_queue_used(*nt_counter, CP_MAX_NONTRIVIAL);
    uint32_t *nt_queue = (uint32_t *)(uintptr_t)queues.nontrivial;
 
@@ -1117,6 +1149,12 @@ static __device__ __forceinline__ void
 cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues queues)
 {
    uint32_t *huge_counter = (uint32_t *)(uintptr_t)queues.huge_count;
+
+   /* Tier 2. Same shape as stage 2, and the same admission: the tile count and
+    * every tile in the queue are stage 2's output, so the wait is at the top
+    * with nothing but the path_flag test in front of it. */
+   CP_PDL_WAIT2();
+
    uint32_t num_tiles = cp_queue_used(*huge_counter, CP_MAX_HUGE_TILES);
 
    struct cp_tile_pair *huge_queue =
@@ -1562,7 +1600,7 @@ cp_abuf_scan_finish(const uint32_t *in, uint32_t *out, const uint32_t *sums,
     * Only under CP_PDL: without the attribute there is nothing to overlap and
     * the second pass over the index range would be pure loop overhead.
     */
-#if CP_PDL
+#if CP_PDL >= 1
    if (zero) {
       uint32_t zbase = blockIdx.x * (CP_ABUF_SCAN_BLOCK * ept);
       for (uint32_t j = 0; j < ept; j++) {
@@ -2209,7 +2247,7 @@ cp_abuf_quad_fill_all(const uint32_t *frags, const uint32_t *offsets,
     * still draining. `blk_offsets` is the scan's own output and must not be
     * touched until the wait.
     */
-#if CP_PDL
+#if CP_PDL >= 1
    bool live = b < nblocks && blk_counts[b];
    CP_PDL_WAIT();
    if (!live)
@@ -2603,6 +2641,17 @@ cp_abuf_seg_scatter(struct cp_abuf_seg_args args)
    if (q >= args.num_quads || q >= exact)
       return;
    uint32_t seg = ((const unsigned char *)(uintptr_t)args.quad_seg)[q];
+
+   /*
+    * Tier 2, and this one has real preamble. `num_quads_dev` is the scan's
+    * grand total and `quad_seg` is the segment count pass's output; both were
+    * written two or more grids back, and only the immediately preceding grid
+    * -- the one-thread prefix -- has its dependency relaxed. So the two loads
+    * above resolve while that serial loop is still running, and everything
+    * after the wait (seg_base, group_base) is the prefix's own output.
+    */
+   CP_PDL_WAIT3();
+
    if (!args.warp_aggregate) {
       uint32_t pos = atomicAdd(
          (unsigned int *)(uintptr_t)args.seg_cursor + seg, 1u);

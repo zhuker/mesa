@@ -87,8 +87,8 @@ cp_kernels_instrumented(void)
 }
 
 /*
- * Whether the rasterizer module is compiled with the programmatic dependent
- * launch waits in it.
+ * Which programmatic-dependent-launch waits the kernel modules are compiled
+ * with -- a level, 0 for none.
  *
  * Asked here rather than at the launch site because the two have to agree:
  * CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION lets the secondary
@@ -101,22 +101,22 @@ cp_kernels_instrumented(void)
  * driver. Neither is negotiable, so an older device or driver simply leaves
  * the flag inert and every launch stays a normal one.
  */
-bool
+unsigned
 cp_pdl_kernels(int sm_major, int sm_minor)
 {
    int driver = 0;
 
    if (!cp_debug->pdl)
-      return false;
+      return 0;
    if (sm_major < 9)
-      return false;
+      return 0;
 #if CUDA_VERSION < 11080
-   return false;
+   return 0;
 #else
    (void)sm_minor;
    if (cuDriverGetVersion(&driver) != CUDA_SUCCESS || driver < 11080)
-      return false;
-   return true;
+      return 0;
+   return MIN2(cp_debug->pdl, (unsigned)CP_PDL_TIER_MAX);
 #endif
 }
 
@@ -167,11 +167,17 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
       opts[num_opts++] = "--relocatable-device-code=true";
    if (cp_kernels_instrumented())
       opts[num_opts++] = "-DCP_ABUF_INSTRUMENT=1";
-   /* Only the rasterizer module holds a PDL secondary. Defining this for the
-    * other five would evict their NVRTC cache entries every time the flag is
-    * flipped, and an A/B that recompiles one side is an A/B about NVRTC. */
-   if (!strcmp(name, "cp_rasterize.cu") && cp_pdl_kernels(sm_major, sm_minor))
-      opts[num_opts++] = "-DCP_PDL=1";
+   /* Only the rasterizer and the fragment module hold PDL secondaries.
+    * Defining this for the other four would evict their NVRTC cache entries
+    * every time the level is changed, and an A/B that recompiles one side is
+    * an A/B about NVRTC. The level is in the define, so each level has its
+    * own cache entry and level 1 keeps the binary it was measured with. */
+   char pdl_opt[24];
+   unsigned pdl = cp_pdl_kernels(sm_major, sm_minor);
+   if (pdl && (!strcmp(name, "cp_rasterize.cu") || !strcmp(name, "cp_fs.cu"))) {
+      snprintf(pdl_opt, sizeof(pdl_opt), "-DCP_PDL=%u", pdl);
+      opts[num_opts++] = pdl_opt;
+   }
 
    if (cp_debug->small_threshold.set) {
       snprintf(small_opt, sizeof(small_opt), "-DCP_SMALL_THRESHOLD=%d",

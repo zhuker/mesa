@@ -204,7 +204,9 @@ struct cp_debug {
    unsigned upload_flush_fail_at;
    bool no_opaque_episode;
    bool no_opaque_streams;
-   bool pdl;
+   /* A level: 0 off, 1 the scan chain, 2 the raster and FS tier. See the
+    * registry entry and CP_PDL_TIER_* in cp_kernels.h. */
+   unsigned pdl;
    bool no_sampler_variant;
    bool no_gpu_sem_wait;
    /* Derived in apply_couplings() from no_texture_cache: the hardware texture
