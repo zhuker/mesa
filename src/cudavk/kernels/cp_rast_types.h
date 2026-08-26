@@ -684,6 +684,16 @@ struct cp_fs_interp_args {
    uint64_t out_prim_list;    /* uint32 per slot quad: global primitive id */
    uint32_t fused_direct;
    uint32_t pad_fused;
+   /*
+    * The same device-side launch predicate cp_rasterize_args carries, and for
+    * the same reason: a predicated peel pass has to compact nothing, so that
+    * the slot counter the generated shader reads its extent from stays at the
+    * zero the memset before this launch put there. Zero leaves the ordinary
+    * path unchanged, which is every caller but the peel loop.
+    */
+   uint64_t path_flag;
+   uint32_t path_value;
+   uint32_t pad_path;
 };
 
 struct cp_fs_writeback_args {
@@ -1155,6 +1165,38 @@ struct cp_sampler_info {
  * many further passes rather than up to as many as it has already run.
  */
 #define CP_PEEL_CHECK_MAX    16
+
+/*
+ * The two caps of the predicated peel schedule (CUDAVK_PEEL_PREDICATE).
+ *
+ * With the flag on, a peel pass whose predecessor composited nothing is not
+ * skipped by the host — it is launched with every stage predicated off a
+ * device flag, so it costs its launches and nothing else. That is what makes
+ * it affordable to stop asking the device whether to stop, and the price of
+ * asking is the most expensive single wait in the driver.
+ *
+ * A predicated pass is not free: about eleven launches, two grids of blocks
+ * that load a counter and return, and one 1.8 MB clear, which is roughly
+ * 10 us against the 1.62 ms a convergence check costs. So the schedule may
+ * waste passes, but the waste has to be *bounded*, or a draw with 256 layers
+ * and a wrong prediction spends 226 wasted passes and loses outright. These
+ * two constants are that bound; neither is a tuning knob.
+ *
+ * CP_PEEL_FREE_MAX — a draw whose whole loop is at most this many passes runs
+ * with no check at all. peel_passes is MIN2(CP_BLEND_LAYERS, num_triangles),
+ * so the loop's own bound is already tight here and the worst case is
+ * CP_PEEL_FREE_MAX - 1 wasted passes, about 30 us against one removed 1.62 ms
+ * check.
+ *
+ * CP_PEEL_PREDICT_MAX — the most passes the host will launch without a check
+ * when it is relying on the previous frame's converged trip count. A wholly
+ * wrong prediction therefore wastes at most this many passes, about 160 us,
+ * a tenth of the single check it is buying. At the cap the loop falls back to
+ * today's doubling schedule, so the worst case degenerates to today's
+ * behaviour plus this bounded overshoot.
+ */
+#define CP_PEEL_FREE_MAX      4
+#define CP_PEEL_PREDICT_MAX   16
 
 /* Multisampling. 1x, 4x and 8x are advertised, and the visibility, depth and
  * colour buffers all hold the samples plane after plane: sample s of pixel p

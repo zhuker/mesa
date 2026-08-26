@@ -35,6 +35,14 @@
 #define CP_MAX_SAMPLERS       4096
 
 /*
+ * Slots in the peel trip-count predictor. Direct-mapped, one per distinct
+ * (vertex shader, fragment shader, primitive count) a frame peels; a capture
+ * peels a handful of draws a frame, so this is ample and a collision costs a
+ * prediction rather than a pixel.
+ */
+#define CP_PEEL_PREDICT_SLOTS 64
+
+/*
  * Draw batching.
  *
  * Consecutive draws that would produce the same pixels in any order are held
@@ -371,6 +379,26 @@ struct cp_context {
    unsigned visbuf_samples; /* what the visibility and depth buffers were sized for */
    CUdeviceptr peel_next;   /* per-pixel: first primitive not yet blended */
    CUdeviceptr peel_any;    /* one uint32, managed: a pass found work to do */
+   /* One uint32: what peel_any held at the end of the previous pass, latched
+    * by cp_peel_pass_flag. The predicate a predicated peel pass reads; see
+    * CP_PEEL_FREE_MAX. */
+   CUdeviceptr peel_prev;
+   /*
+    * The trip-count predictor (S2c): how many passes this draw needed the
+    * last time it was seen, keyed on the pair of shaders and the primitive
+    * count. Captures repeat their draws frame to frame, which is the property
+    * the censuses of iterations 19-23 relied on.
+    *
+    * Direct-mapped and fixed size: a miss or a collision is not an error, it
+    * is the cold case, and the loop falls back to today's doubling schedule.
+    * It predicts a *cost*, never an output: the loop bound and every pass
+    * inside it are what they were.
+    */
+   struct cp_peel_predict {
+      const void *vs, *fs;
+      unsigned    num_triangles;
+      unsigned    passes;      /* 0 when the slot has never been filled */
+   } peel_predict[CP_PEEL_PREDICT_SLOTS];
    unsigned visbuf_w, visbuf_h;
    /*
     * What the five framebuffer-sized buffers were actually allocated for, as
@@ -953,7 +981,8 @@ void cp_shade_fragments(struct cp_context *cp,
                         void *color_data, float vp_scale_x, float vp_scale_y,
                         float vp_trans_x, float vp_trans_y, CUdeviceptr reject,
                         CUdeviceptr resolved, unsigned reject_pass,
-                        CUdeviceptr seg_ranges, unsigned num_seg_ranges);
+                        CUdeviceptr seg_ranges, unsigned num_seg_ranges,
+                        CUdeviceptr peel_flag);
 
 
 bool cp_batch_order_free(const struct cp_draw_state *state);

@@ -329,6 +329,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_TILE_CENSUS_EVERY", CP_FLAG_UINT, F(tile_census_every),
      "report the tile census this often, in episodes", .dflt = 2000,
      .has_range = true, .lo = 1, .hi = 1000000 },
+   { "CUDAVK_PEEL_PREDICATE", CP_FLAG_BOOL_VALUE, F(peel_predicate),
+     "run peel passes predicated on the device flag the rasterizer already "
+     "honours and predict the trip count, instead of draining the device to "
+     "ask whether the draw has converged; scheduling only, same pixels" },
    { "CUDAVK_TILED_OPAQUE", CP_FLAG_BOOL_VALUE, F(tiled_opaque),
      "use the experimental opaque episode sort-middle tile rasterizer" },
    { "CUDAVK_TILED_OPAQUE_CENSUS", CP_FLAG_BOOL_VALUE,

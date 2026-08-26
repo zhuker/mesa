@@ -35,6 +35,10 @@ struct cp_kernels {
    CUfunction clip_triangles;
    CUfunction clear_visbuf;
    CUfunction peel_advance;
+   /* The predicated peel schedule (CUDAVK_PEEL_PREDICATE): the per-pass flag
+    * handover, and the visibility clear it predicates. */
+   CUfunction peel_pass_flag;
+   CUfunction peel_clear_visbuf;
    CUfunction resolve_samples;
    CUfunction blit_linear;
    CUfunction resolve_visbuf;

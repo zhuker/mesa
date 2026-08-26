@@ -400,6 +400,11 @@ cp_abuf_scatter_colors(uint64_t fs_out, uint32_t fs_out_stride,
 extern "C" __global__ void
 cp_fs_interpolate(struct cp_fs_interp_args args)
 {
+   if (args.path_flag &&
+       (!!*(const volatile uint32_t *)(uintptr_t)args.path_flag) !=
+          !!args.path_value)
+      return;
+
    uint32_t quad = blockIdx.x * blockDim.x + threadIdx.x;
    uint32_t quad_h = (args.height + 1) / 2;
    if (quad >= args.quad_width * quad_h)
@@ -583,6 +588,11 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
 extern "C" __global__ void
 cp_fs_compact(struct cp_fs_interp_args args)
 {
+   if (args.path_flag &&
+       (!!*(const volatile uint32_t *)(uintptr_t)args.path_flag) !=
+          !!args.path_value)
+      return;
+
    uint32_t quad = blockIdx.x * blockDim.x + threadIdx.x;
    uint32_t quad_h = (args.height + 1) / 2;
    if (quad >= args.quad_width * quad_h)

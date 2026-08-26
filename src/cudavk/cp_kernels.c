@@ -340,6 +340,9 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
    k->rasterize_triangles = k->rasterize_stage1;
    cuModuleGetFunction(&k->clear_visbuf, k->module, "cp_clear_visbuf");
    cuModuleGetFunction(&k->peel_advance, k->module, "cp_peel_advance");
+   cuModuleGetFunction(&k->peel_pass_flag, k->module, "cp_peel_pass_flag");
+   cuModuleGetFunction(&k->peel_clear_visbuf, k->module,
+                       "cp_peel_clear_visbuf");
    cuModuleGetFunction(&k->resolve_visbuf, k->module, "cp_resolve_visbuf");
 
    /*

@@ -3699,7 +3699,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
                    float vp_trans_x, float vp_trans_y,
                    CUdeviceptr reject, CUdeviceptr resolved,
                    unsigned reject_pass, CUdeviceptr seg_ranges,
-                   unsigned num_seg_ranges)
+                   unsigned num_seg_ranges, CUdeviceptr peel_flag)
 {
    struct cp_device *screen = cp->dev;
    struct cp_shader_binary *fs = state->fs;
@@ -3796,6 +3796,18 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       .dbg_counters = cp->abuf_dbg.counters,
       .seg_ranges = seg_ranges,
       .num_seg_ranges = num_seg_ranges,
+      /*
+       * The predicated peel schedule's flag (CUDAVK_PEEL_PREDICATE), zero for
+       * every other caller. Only the compaction reads it: the slot counter is
+       * memset to zero above whatever happens, so a compaction that returns
+       * leaves the fragment shader and the writeback an extent of zero slots,
+       * and both already read that extent from the device. The generated
+       * shader is not touched and shades nothing — which is the guarantee a
+       * side-effect shader needs, since "shades zero slots" has to be exact
+       * for a pass whose only output is its stores.
+       */
+      .path_flag = peel_flag,
+      .path_value = 1,
    };
 
    cp_fs_interp_setup(cp, state, scope, info, fs, num_fs_inputs, num_vs_outputs, &interp);
@@ -4596,6 +4608,63 @@ cp_restore_preclip(const struct cp_pending_clip *clip,
    *vs_output_buf = clip->positions;
    *rast_num_triangles = clip->rast_num_triangles;
    *fs_prim_shift = clip->fs_prim_shift;
+}
+
+/*
+ * The peel trip-count predictor (S2c).
+ *
+ * A draw's converged pass count is a property of its geometry, and a capture
+ * submits the same geometry every frame. So the count the loop arrived at last
+ * time is a good guess at where to put this frame's single confirming check —
+ * and a guess is all it has to be. Predicting too high wastes predicated
+ * passes, capped at CP_PEEL_PREDICT_MAX; predicting too low costs one check,
+ * which is what today's schedule pays anyway. Neither can change a pixel: the
+ * loop bound is peel_passes either way.
+ *
+ * Direct-mapped, so an eviction is a miss and a miss is today's schedule.
+ */
+static unsigned
+cp_peel_predict_slot(const struct cp_draw_state *state, unsigned num_triangles)
+{
+   uintptr_t h = (uintptr_t)state->vs * 0x9E3779B97F4A7C15ull;
+   h ^= (uintptr_t)state->fs * 0xC2B2AE3D27D4EB4Full;
+   h ^= (uintptr_t)num_triangles * 0x165667B19E3779F9ull;
+   return (unsigned)((h >> 32) % CP_PEEL_PREDICT_SLOTS);
+}
+
+/* The previous trip count for this draw, or zero when there is none. */
+static unsigned
+cp_peel_predict_get(struct cp_context *cp, const struct cp_draw_state *state,
+                    unsigned num_triangles)
+{
+   const struct cp_peel_predict *p =
+      &cp->peel_predict[cp_peel_predict_slot(state, num_triangles)];
+   if (p->vs != state->vs || p->fs != state->fs ||
+       p->num_triangles != num_triangles)
+      return 0;
+   return p->passes;
+}
+
+/*
+ * What this draw actually cost, recorded for the next frame.
+ *
+ * The value stored is the number of passes the loop ran, not the pass the
+ * draw truly converged on — a delayed check cannot tell them apart. That
+ * makes the prediction a fixed point rather than something that drifts
+ * upward: predicting the same number again produces the same number again,
+ * and the gap between it and true convergence is bounded by the check
+ * interval that produced it, which CP_PEEL_CHECK_MAX already bounds.
+ */
+static void
+cp_peel_predict_put(struct cp_context *cp, const struct cp_draw_state *state,
+                    unsigned num_triangles, unsigned passes_run)
+{
+   struct cp_peel_predict *p =
+      &cp->peel_predict[cp_peel_predict_slot(state, num_triangles)];
+   p->vs = state->vs;
+   p->fs = state->fs;
+   p->num_triangles = num_triangles;
+   p->passes = passes_run;
 }
 
 /*
@@ -6495,20 +6564,99 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    if (abuf_prod)
       passes = 0;
 
+   /*
+    * The predicated peel schedule (CUDAVK_PEEL_PREDICATE), off by default.
+    *
+    * What the check above buys is the avoidance of wasted passes, and it buys
+    * it at 1.62 ms a time — the most expensive single wait in the driver. This
+    * makes a wasted pass cost its launches instead of its work, and then stops
+    * asking as often. Three parts, all of which have to hold together:
+    *
+    *   - every stage of a pass is predicated on the device flag the rasterizer
+    *     already honours, through the path_flag/path_value pair stages 1, 2
+    *     and 3 have carried since the tiled opaque episodes;
+    *   - the flag's per-pass reset moves to a one-thread kernel on the stream,
+    *     because a host store to it would now race kernels still in flight;
+    *   - the trip count is predicted from the previous frame instead of asked
+    *     for, and the two caps in cp_rast_types.h bound what a wrong
+    *     prediction costs.
+    *
+    * Declined for an appending pass (which never wires peel_any into the
+    * rasterizer at all, so its flag would read zero and predicate the draw
+    * away), and for the census and A-buffer instrumentation, whose records are
+    * per pass and would gain entries for passes that ran as no-ops.
+    */
+   bool peel_predicate = peel && cp_debug->peel_predicate &&
+                         !cp->pass.appending && !census && !abuf_log &&
+                         !cp_kernels_instrumented() &&
+                         cp->peel_any && cp->peel_prev &&
+                         screen->kernels.peel_pass_flag &&
+                         screen->kernels.peel_clear_visbuf;
+   CUdeviceptr shade_flag = 0;
+   if (peel_predicate) {
+      if (passes <= CP_PEEL_FREE_MAX) {
+         /*
+          * The no-check arm. peel_passes is MIN2(CP_BLEND_LAYERS,
+          * num_triangles), so a blended full-screen quad is two passes and
+          * cannot need a check: the loop's own bound is tighter than anything
+          * the device could tell us. Setting the interval past the loop means
+          * the test below never fires.
+          */
+         check_interval = passes + 1;
+      } else {
+         unsigned predicted = cp_peel_predict_get(cp, state, num_triangles);
+         if (predicted)
+            check_interval = MIN2(MAX2(predicted, 1u),
+                                  (unsigned)CP_PEEL_PREDICT_MAX);
+         /* No prediction: today's schedule, which the doubling below resumes
+          * from either way. */
+      }
+   }
+
    unsigned passes_run = 0;
    for (unsigned pass = 0; pass < passes; pass++) {
       passes_run = pass + 1;
       CP_NVTX_SCOPEF("pass %u", pass);
       cp->scratch.used = shade_mark;
       cp->dscratch.used = shade_dmark;
+      if (peel_predicate) {
+         /*
+          * Latch what the previous pass did and zero the flag for this one,
+          * on the stream, ahead of everything this pass launches. Pass 0 has
+          * no predecessor and always runs.
+          */
+         unsigned init = pass == 0;
+         void *pf_params[] = { &cp->peel_any, &cp->peel_prev, &init };
+         CP_LAUNCH(screen->kernels.peel_pass_flag, 1, 1, 1, 1, 1, 1,
+                        0, cp->stream, pf_params, NULL);
+         rast_args.path_flag = pass ? cp->peel_prev : 0;
+         rast_args.path_value = 1;
+         shade_flag = pass ? cp->peel_prev : 0;
+      }
       if (pass) {
          /* Each pass resolves visibility afresh, minus what has been rejected. */
-         cuMemsetD32Async(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples, cp->stream);
+         if (peel_predicate) {
+            /* The one bulk operation of a wasted pass that would not be
+             * predicated away by itself: 7.4 MB at 1280x720. A pass that is
+             * predicated off writes no visibility entry, so leaving the buffer
+             * as the last pass that ran left it is exactly the state today's
+             * early break leaves it in. */
+            unsigned vis_entries = w * h * fb_samples;
+            void *cv_params[] = { &visbuf, &cp->peel_prev, &vis_entries };
+            CP_LAUNCH(screen->kernels.peel_clear_visbuf,
+                           MIN2((vis_entries + 255) / 256, 2048u), 1, 1,
+                           256, 1, 1, 0, cp->stream, cv_params, NULL);
+         } else {
+            cuMemsetD32Async(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples, cp->stream);
+         }
          rast_args.reject_passes = pass;
       }
       /* Cleared at the start of each interval, not each pass: the question
-       * asked below is whether any pass since the last check composited. */
-      if (peel && pass == interval_start)
+       * asked below is whether any pass since the last check composited. The
+       * predicated schedule clears it on the device instead, once per pass,
+       * and asks the tighter question "did the last pass composite" — the same
+       * question, by the monotonicity the comment above rests on. */
+      if (peel && !peel_predicate && pass == interval_start)
          *(volatile uint32_t *)(uintptr_t)cp->peel_any = 0;
       rast_queues.mode = !cache_queues ? CP_QUEUE_FILL
                        : pass ? CP_QUEUE_REUSE : CP_QUEUE_BUILD;
@@ -6674,13 +6822,14 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                             vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
                             retry ? cp->reject : 0,
                             retry ? cp->resolved : 0,
-                            pass, 0, 0);
+                            pass, 0, 0, shade_flag);
 
       if (peel) {
          /* Step past what this pass blended, and stop once the interval finds
           * nothing left to composite — which is the common case at pass 2,
           * since most blended draws do not overlap themselves. */
-         void *pa_params[] = { &visbuf, &cp->peel_next, &w, &h };
+         CUdeviceptr pa_flag = peel_predicate && pass ? cp->peel_prev : 0;
+         void *pa_params[] = { &visbuf, &cp->peel_next, &w, &h, &pa_flag };
          CP_LAUNCH(screen->kernels.peel_advance,
                         (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1,
                         0, cp->stream, pa_params, NULL);
@@ -6689,14 +6838,25 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             if (!cp_sync_timed(cp, cp->stream, &cp->plan.wait_peel_ns,
                                &cp->plan.wait_peel_n))
                return;
-            if (!*(volatile uint32_t *)(uintptr_t)cp->peel_any)
+            if (!*(volatile uint32_t *)(uintptr_t)cp->peel_any) {
+               /* What this draw cost, for the next frame to place its one
+                * check with. Recorded from a check rather than from
+                * convergence, which is what makes it a fixed point. */
+               if (peel_predicate)
+                  cp_peel_predict_put(cp, state, num_triangles, pass + 1);
                break;
+            }
             interval_start = pass + 1;
             check_interval = MIN2(check_interval * 2,
                                   (unsigned)CP_PEEL_CHECK_MAX);
          }
       }
    }
+
+   /* A draw that ran its whole loop without a check saying stop — the no-check
+    * arm, or one that never converges — predicts its own bound next time. */
+   if (peel_predicate && passes && passes_run == passes)
+      cp_peel_predict_put(cp, state, num_triangles, passes);
 
    /*
     * TEMPORARY: report what the four steps cost, and check the lists against
@@ -7608,7 +7768,7 @@ cp_opaque_finish(struct cp_context *cp)
                          seg->rast.vp_trans_y, 0, 0, 0,
                          ranges_dev + (size_t)group_range_base[g] *
                             sizeof(ranges[0]),
-                         group_range_count[g]);
+                         group_range_count[g], 0);
    }
    cp->fs_batch = saved_fs_batch;
 }
@@ -9205,6 +9365,11 @@ cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
        * whether another one is worth launching. */
       if (!cp->peel_any)
          cp_mem_alloc_managed_retry(cp, &cp->peel_any, sizeof(uint32_t));
+      /* Its latch, written and read only by the device — but managed as well,
+       * so the two words behave identically under a debugger and neither
+       * needs a copy to inspect. Absent, the predicated schedule declines. */
+      if (!cp->peel_prev)
+         cp_mem_alloc_managed_retry(cp, &cp->peel_prev, sizeof(uint32_t));
       if (e1 != CUDA_SUCCESS || e2 != CUDA_SUCCESS)
          fprintf(stderr, "cudavk: visbuf/depthbuf alloc %zu px x %u samples "
                  "failed (%d, %d)\n", cp->fb_cap_px, samples, e1, e2);

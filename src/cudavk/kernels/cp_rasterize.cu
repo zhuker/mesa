@@ -1375,8 +1375,14 @@ cp_clip_rast_fused_abuf(struct cp_clip_args cargs,
  */
 extern "C" __global__ void
 cp_peel_advance(uint64_t *visbuf, uint32_t *peel_next,
-                uint32_t width, uint32_t height)
+                uint32_t width, uint32_t height,
+                const uint32_t *path_flag)
 {
+   /* The predicated peel schedule's flag, null for every other caller. A pass
+    * whose predecessor composited nothing selected nothing either, so this
+    * would walk the whole visibility buffer to advance no pixel. */
+   if (path_flag && !*(const volatile uint32_t *)path_flag)
+      return;
    uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
    uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
    if (x >= width || y >= height)
@@ -1384,6 +1390,63 @@ cp_peel_advance(uint64_t *visbuf, uint32_t *peel_next,
    uint64_t entry = visbuf[y * width + x];
    if (entry != VISBUF_EMPTY)
       peel_next[y * width + x] = VISBUF_TRIID(entry) + 1u;
+}
+
+/*
+ * One pass of the predicated peel schedule's flag handover (S2b).
+ *
+ * `any` is the flag emit_fragment sets when a pixel still had a layer to
+ * composite. The host used to zero it with a store between passes, which is
+ * only sound while the host also drains between passes. Once it stops
+ * draining, that store races the kernels of a pass still in flight, so the
+ * reset moves here and is ordered with them by the stream.
+ *
+ * Two words rather than one because a pass cannot both read the flag as its
+ * predicate and write it as its result: `prev` latches what the previous pass
+ * did and is what the pass about to be enqueued is predicated on, and `any`
+ * starts that pass at zero. `init` is the first pass of the draw, which has no
+ * predecessor and always runs.
+ *
+ * Monotone by construction: once `prev` is zero the pass writes nothing, so
+ * `any` stays zero and every later pass of the draw is predicated off too —
+ * which is the same "once a pass composites nothing every later pass does too"
+ * the host's check has always relied on.
+ */
+extern "C" __global__ void
+cp_peel_pass_flag(uint32_t *any, uint32_t *prev, uint32_t init)
+{
+   if (threadIdx.x || blockIdx.x)
+      return;
+   volatile uint32_t *a = (volatile uint32_t *)any;
+   volatile uint32_t *p = (volatile uint32_t *)prev;
+   *p = init ? 1u : *a;
+   *a = 0u;
+}
+
+/*
+ * The per-pass visibility clear, predicated (S2a).
+ *
+ * cuMemsetD32Async cannot be predicated, and at 1280x720 it is 7.4 MB a pass —
+ * comparable on its own to the whole launch budget a wasted pass is allowed.
+ * A pass that is predicated off writes nothing to the visibility buffer, so
+ * leaving it exactly as the last pass that ran left it is the state the host's
+ * early break leaves it in today.
+ *
+ * Grid-strided, so the grid is a statement about how much of the machine to
+ * use rather than a bound: `count` is the number of uint64 entries, samples
+ * included, since the buffer holds sample s of pixel p at s * width * height
+ * + p.
+ */
+extern "C" __global__ void
+cp_peel_clear_visbuf(uint64_t *visbuf, const uint32_t *path_flag,
+                     uint32_t count)
+{
+   if (path_flag && !*(const volatile uint32_t *)path_flag)
+      return;
+   uint32_t stride = gridDim.x * blockDim.x;
+   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+        i += stride)
+      visbuf[i] = VISBUF_EMPTY;
 }
 
 /*
