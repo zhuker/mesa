@@ -305,6 +305,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_SEG_MERGE", CP_FLAG_BOOL_VALUE, F(no_seg_merge),
      "disable merged shading groups: every episode segment shades in its "
      "own launch group, as before" },
+   { "CUDAVK_NO_DRAIN_HOIST", CP_FLAG_BOOL_VALUE, F(no_drain_hoist),
+     "compute the episode's shading groups and their range and constant-buffer "
+     "tables inside the shade loop, after the drain, instead of above it; the "
+     "revert for a reorder that changes no launch and no byte" },
    { "CUDAVK_NO_ABUF_APPEND", CP_FLAG_BOOL_VALUE, F(no_abuf_append),
      "disable the single-pass A-buffer build: the count pass stops appending "
      "(pixel, prim) records and the fill rasterizes a second time" },

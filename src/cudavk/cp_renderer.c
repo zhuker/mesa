@@ -8482,6 +8482,158 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
    return err == CUDA_SUCCESS;
 }
 
+/*
+ * --- merge segments into shading groups ---
+ *
+ * The capture's big passes alternate two vertex shaders draw by draw, so an
+ * episode carries several times more segments than distinct shading
+ * identities. Segments whose shade would be launched with the same shaders,
+ * constant-buffer count and primitive mode shade as one group over one
+ * contiguous slice of the grouped quad list — the interpolator resolves each
+ * quad's own vertex stream and slice table through a range table — and the
+ * composite still resolves per *segment*, through descs synthesized as offsets
+ * into the group's arrays. Everything before this point, the fallback, and the
+ * bucketing kernels are unchanged: grouping is purely how the dense bases are
+ * laid out and how many shade launch groups run.
+ *
+ * Factored out of cp_pass_finish() unchanged, because it reads only `segs` and
+ * therefore belongs above the episode drain rather than after it.
+ */
+static void
+cp_pass_group_map(struct cp_context *cp, const struct cp_pass_seg *segs,
+                  unsigned nsegs, uint8_t *seg_group, unsigned *group_first,
+                  unsigned *group_members, unsigned *ngroups_out)
+{
+   unsigned ngroups = 0;
+   for (unsigned s = 0; s < nsegs; s++) {
+      unsigned g = ngroups;
+      if (!cp_debug->no_seg_merge) {
+         for (unsigned i = 0; i < ngroups; i++) {
+            const struct cp_pass_seg *f = &segs[group_first[i]];
+            if (f->batch.state.vs == segs[s].batch.state.vs &&
+                f->batch.state.fs == segs[s].batch.state.fs &&
+                f->batch.state.num_fs_ubos == segs[s].batch.state.num_fs_ubos &&
+                f->batch.info.mode == segs[s].batch.info.mode) {
+               g = i;
+               break;
+            }
+         }
+      }
+      if (g == ngroups) {
+         group_first[ngroups] = s;
+         group_members[ngroups] = 0;
+         ngroups++;
+      }
+      seg_group[s] = (uint8_t)g;
+      group_members[g]++;
+   }
+   *ngroups_out = ngroups;
+}
+
+/*
+ * One multi-member group's range table, and its members' fragment
+ * constant-buffer rows concatenated into cp->pass_group_ubos at `row_base`.
+ *
+ * The only producer of either, so that the hoisted path above the drain and
+ * the CUDAVK_NO_DRAIN_HOIST path inside the shade loop cannot disagree about a
+ * byte: they call this with different `row_base` and nothing else.
+ *
+ * `row_base` is where the group's rows land in the shared table; `row_base`
+ * *inside* a range stays group-local, because it indexes the table the launch
+ * is handed and the launch is handed this group's slice.
+ *
+ * Returns false only when the row table cannot be allocated.
+ */
+static bool
+cp_pass_group_table_one(struct cp_context *cp, const struct cp_pass_seg *segs,
+                        unsigned nsegs, const uint8_t *seg_group, unsigned g,
+                        uint32_t row_base, struct cp_seg_range *ranges,
+                        unsigned *nr_out, uint32_t *rows_out)
+{
+   const struct cp_pass_seg *first = NULL;
+   for (unsigned s = 0; s < nsegs && !first; s++)
+      if (seg_group[s] == g)
+         first = &segs[s];
+   bool need_rows = first && first->batch.state.fs->reads_const_bufs;
+
+   if (need_rows && !cp->pass_group_ubos) {
+      cp->pass_group_ubos =
+         malloc((size_t)CP_PASS_MAX_SEGS * CP_MAX_BATCH_DRAWS *
+                CP_ARG_UBO_STRIDE * sizeof(uint64_t));
+      if (!cp->pass_group_ubos)
+         return false;
+   }
+
+   unsigned nr = 0;
+   uint32_t rows = 0;
+   for (unsigned s = 0; s < nsegs; s++) {
+      if (seg_group[s] != g)
+         continue;
+      const struct cp_pass_seg *m = &segs[s];
+      ranges[nr++] = (struct cp_seg_range) {
+         .positions = m->rast.positions,
+         .prim_refs = m->rast.prim_refs,
+         .draw_slices = m->slices_dev,
+         .num_draw_slices = m->batch.ndraws,
+         .prim_base = m->prim_base,
+         .prim_end = m->prim_base + m->prim_slots,
+         .row_base = rows,
+         .prim_shift = m->prim_shift,
+      };
+      if (need_rows)
+         memcpy(cp->pass_group_ubos +
+                (size_t)(row_base + rows) * CP_ARG_UBO_STRIDE,
+                m->batch.fs_ubos,
+                (size_t)m->batch.ndraws * CP_ARG_UBO_STRIDE *
+                sizeof(uint64_t));
+      rows += m->batch.ndraws;
+   }
+   *nr_out = nr;
+   *rows_out = rows;
+   return true;
+}
+
+/*
+ * Every multi-member group's tables, built above the drain, laid out
+ * group-major: one flat ranges array sliced by group_range_base[], and one row
+ * table sliced by group_row_base[].
+ *
+ * The row table is sized for CP_PASS_MAX_SEGS * CP_MAX_BATCH_DRAWS rows and the
+ * group-major total is the sum of every segment's ndraws over at most
+ * CP_PASS_MAX_SEGS segments, so it fits exactly and the concatenation cannot
+ * run past it.
+ *
+ * Returns false on the one condition the in-loop path also fails on, so this
+ * cannot change an outcome -- only when the work happens.
+ */
+static bool
+cp_pass_group_tables(struct cp_context *cp, const struct cp_pass_seg *segs,
+                     unsigned nsegs, const uint8_t *seg_group,
+                     const unsigned *group_members, unsigned ngroups,
+                     struct cp_seg_range *ranges_all,
+                     unsigned *group_range_base, uint32_t *group_rows,
+                     uint32_t *group_row_base)
+{
+   unsigned nr_all = 0;
+   uint32_t row_base = 0;
+   for (unsigned g = 0; g < ngroups; g++) {
+      group_range_base[g] = nr_all;
+      group_row_base[g] = row_base;
+      group_rows[g] = 0;
+      if (group_members[g] <= 1)
+         continue;
+      unsigned nr = 0;
+      uint32_t rows = 0;
+      if (!cp_pass_group_table_one(cp, segs, nsegs, seg_group, g, row_base,
+                                   &ranges_all[nr_all], &nr, &rows))
+         return false;
+      nr_all += nr;
+      group_rows[g] = rows;
+      row_base += rows;
+   }
+   return true;
+}
+
 void
 cp_pass_finish(struct cp_context *cp)
 {
@@ -8674,6 +8826,47 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
                      1, 1, 256, 1, 1, 0, cp->stream, p, NULL);
    }
 
+   /*
+    * --- everything after the drain that the drain's answer is not needed
+    * for, hoisted above it ---
+    *
+    * The tail's host work splits cleanly in two. Which segments shade
+    * together, how many members each group has, each group's range table and
+    * the concatenation of its members' fragment constant-buffer rows are
+    * functions of `segs` alone. Only the dense bases, the descs and the
+    * launches need `ctr`.
+    *
+    * The drain is the driver's largest host block -- 9.88 a frame, 6.017
+    * ms/frame, and host time immediately after it lands on the frame at a
+    * measured slope of 1.02 (PERFORMANCE.md 5.2b) -- so host work sitting
+    * behind it for no reason is paid for at par. Moving it above the sync
+    * changes no launch, no launch argument and no uploaded byte: the range
+    * tables are built group-major into one flat array instead of per group
+    * into a stack one, and the row concatenation gets a per-group base
+    * instead of restarting at zero, which is the same bytes at a different
+    * offset of the same buffer.
+    *
+    * CUDAVK_NO_DRAIN_HOIST is the revert, and it is also the fallback path:
+    * a precompute that cannot allocate leaves `hoisted` false and the loop
+    * below does exactly what it did before, including failing the same way.
+    */
+   uint8_t seg_group[CP_PASS_MAX_SEGS];
+   unsigned group_first[CP_PASS_MAX_SEGS];
+   unsigned group_members[CP_PASS_MAX_SEGS];
+   unsigned ngroups = 0;
+   struct cp_seg_range ranges_all[CP_PASS_MAX_SEGS];
+   unsigned group_range_base[CP_PASS_MAX_SEGS];
+   uint32_t group_rows[CP_PASS_MAX_SEGS], group_row_base[CP_PASS_MAX_SEGS];
+   bool hoisted = !cp_debug->no_drain_hoist;
+
+   cp_pass_group_map(cp, segs, nsegs, seg_group, group_first, group_members,
+                     &ngroups);
+   if (hoisted)
+      hoisted = cp_pass_group_tables(cp, segs, nsegs, seg_group,
+                                     group_members, ngroups, ranges_all,
+                                     group_range_base, group_rows,
+                                     group_row_base);
+
    /* --- the drain: the six counters and the per-segment quad counts --- */
    uint32_t ctr[CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS] = { 0 };
    if (!cp_sync_timed(cp, cp->stream, &cp->plan.wait_episode_ns,
@@ -8706,43 +8899,6 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
    }
    if (!quads)
       return;   /* nothing covered anything; there is nothing to composite */
-
-   /*
-    * --- merge segments into shading groups ---
-    *
-    * The capture's big passes alternate two vertex shaders draw by draw, so
-    * an episode carries several times more segments than distinct shading
-    * identities. Segments whose shade would be launched with the same
-    * shaders, constant-buffer count and primitive mode shade as one group
-    * over one contiguous slice of the grouped quad list — the interpolator
-    * resolves each quad's own vertex stream and slice table through a range
-    * table — and the composite still resolves per *segment*, through descs
-    * synthesized as offsets into the group's arrays. Everything before this
-    * point, the fallback, and the bucketing kernels are unchanged: grouping
-    * is purely how the dense bases are laid out and how many shade launch
-    * groups run.
-    */
-   uint8_t seg_group[CP_PASS_MAX_SEGS];
-   unsigned group_first[CP_PASS_MAX_SEGS];
-   unsigned ngroups = 0;
-   for (unsigned s = 0; s < nsegs; s++) {
-      unsigned g = ngroups;
-      if (!cp_debug->no_seg_merge) {
-         for (unsigned i = 0; i < ngroups; i++) {
-            struct cp_pass_seg *f = &segs[group_first[i]];
-            if (f->batch.state.vs == segs[s].batch.state.vs &&
-                f->batch.state.fs == segs[s].batch.state.fs &&
-                f->batch.state.num_fs_ubos == segs[s].batch.state.num_fs_ubos &&
-                f->batch.info.mode == segs[s].batch.info.mode) {
-               g = i;
-               break;
-            }
-         }
-      }
-      if (g == ngroups)
-         group_first[ngroups++] = s;
-      seg_group[s] = (uint8_t)g;
-   }
 
    /* --- dense bases, group-major so each group's quads are one slice --- */
    uint32_t seg_base_host[CP_PASS_MAX_SEGS];
@@ -8795,9 +8951,7 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
       if (!gq)
          continue;
       struct cp_pass_seg *sg = &segs[group_first[g]];
-      unsigned members = 0;
-      for (unsigned s = 0; s < nsegs; s++)
-         members += seg_group[s] == g;
+      unsigned members = group_members[g];
       if (cp->seg_streams[0])
          cp_stream_set(cp, cp_pass_seg_stream(cp, g));
       struct cp_abuf_seg_shade ss = {
@@ -8818,39 +8972,24 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
           * group-global rows, so the shader indexes the concatenated table
           * exactly as it indexes a single batch's.
           */
-         struct cp_seg_range ranges[CP_PASS_MAX_SEGS];
+         struct cp_seg_range ranges_local[CP_PASS_MAX_SEGS];
+         const struct cp_seg_range *ranges = ranges_local;
          unsigned nr = 0;
          uint32_t rows = 0;
+         uint64_t *group_ubos = cp->pass_group_ubos;
          bool need_rows = sg->batch.state.fs->reads_const_bufs;
-         if (need_rows && !cp->pass_group_ubos) {
-            cp->pass_group_ubos =
-               malloc((size_t)CP_PASS_MAX_SEGS * CP_MAX_BATCH_DRAWS *
-                      CP_ARG_UBO_STRIDE * sizeof(uint64_t));
-            if (!cp->pass_group_ubos) {
-               failed = true;
-               break;
-            }
-         }
-         for (unsigned s = 0; s < nsegs; s++) {
-            if (seg_group[s] != g)
-               continue;
-            struct cp_pass_seg *m = &segs[s];
-            ranges[nr++] = (struct cp_seg_range) {
-               .positions = m->rast.positions,
-               .prim_refs = m->rast.prim_refs,
-               .draw_slices = m->slices_dev,
-               .num_draw_slices = m->batch.ndraws,
-               .prim_base = m->prim_base,
-               .prim_end = m->prim_base + m->prim_slots,
-               .row_base = rows,
-               .prim_shift = m->prim_shift,
-            };
-            if (need_rows)
-               memcpy(cp->pass_group_ubos + (size_t)rows * CP_ARG_UBO_STRIDE,
-                      m->batch.fs_ubos,
-                      (size_t)m->batch.ndraws * CP_ARG_UBO_STRIDE *
-                      sizeof(uint64_t));
-            rows += m->batch.ndraws;
+         if (hoisted) {
+            /* Built above the drain by the same function, at a group-major
+             * offset into the same two tables. */
+            ranges = &ranges_all[group_range_base[g]];
+            nr = members;
+            rows = group_rows[g];
+            group_ubos = cp->pass_group_ubos +
+                         (size_t)group_row_base[g] * CP_ARG_UBO_STRIDE;
+         } else if (!cp_pass_group_table_one(cp, segs, nsegs, seg_group, g, 0,
+                                             ranges_local, &nr, &rows)) {
+            failed = true;
+            break;
          }
          CUdeviceptr ranges_dev =
             cp_upload(cp, ranges, (size_t)nr * sizeof(ranges[0]));
@@ -8863,7 +9002,7 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
          /* The launch-wide table and slices are placeholders the ranges
           * override per quad; ndraws is the concatenated row count, which
           * is what enables the batch-rows path and sizes the upload. */
-         cp->fs_batch.ubos = need_rows ? cp->pass_group_ubos : sg->batch.fs_ubos;
+         cp->fs_batch.ubos = need_rows ? group_ubos : sg->batch.fs_ubos;
          cp->fs_batch.ndraws = rows;
          cp->fs_batch.slices = sg->slices_dev;
          cp->fs_batch.prim_shift = sg->prim_shift;

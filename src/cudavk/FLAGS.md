@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-120 switches.
+121 switches.
 
 ## Tracing
 
@@ -92,6 +92,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_ABUF_FUSE_BREAK` | uint | `0` | 0&ndash;2 | negative control for the fusion check: 1 drops the block base in the fused scan, 2 stops the fused quad count writing an uncovered zero |
 | `CUDAVK_FLUSH_DRAIN` | bool (value) | `off` | — | restore the draining flush: cp_flush waits for the whole device and rewinds the arenas in place instead of ping-ponging generations |
 | `CUDAVK_NO_SEG_MERGE` | bool (value) | `off` | — | disable merged shading groups: every episode segment shades in its own launch group, as before |
+| `CUDAVK_NO_DRAIN_HOIST` | bool (value) | `off` | — | compute the episode's shading groups and their range and constant-buffer tables inside the shade loop, after the drain, instead of above it; the revert for a reorder that changes no launch and no byte |
 | `CUDAVK_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |
 | `CUDAVK_NO_FUSED_ABUF_INTERP` | bool (value) | `off` | — | launch A-buffer interpolation separately instead of calling it from the generated fragment shader; performance experiment only |
 | `CUDAVK_NO_FUSED_INTERP` | bool (value) | `off` | — | restore the direct shade path's separate cp_fs_interpolate launch instead of the slim compaction plus in-shader interpolation |
