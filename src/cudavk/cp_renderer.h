@@ -1045,6 +1045,10 @@ uint32_t cp_vertex_fill_w(enum pipe_format format, enum cp_vf_conv conv);
 bool cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
                    unsigned width, unsigned height, unsigned stride,
                    unsigned pixel_size, const uint32_t value[4], bool depth);
+bool cp_clear_rect_masked(struct cp_context *cp, void *data, uint64_t offset,
+                          unsigned width, unsigned height, unsigned stride,
+                          unsigned pixel_size, const uint32_t value[4],
+                          const uint32_t mask[4]);
 
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 void cp_context_cleanup(struct cp_context *cp);

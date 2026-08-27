@@ -230,6 +230,7 @@ if dep_vulkan_loader.found()
     'cpvk_cubelodf16',
     'cpvk_cubesph',
     'cpvk_cubesph_nearest',
+    'cpvk_clear',
     'cpvk_depth_attachment',
     'cpvk_desc_array',
     'cpvk_descriptor_pool',

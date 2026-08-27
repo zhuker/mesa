@@ -49,6 +49,14 @@ struct cp_clear_args {
    uint32_t stride;         /* Row stride in bytes */
    uint32_t clear_value[4]; /* Clear color as 4x u32 */
    uint32_t pixel_size;     /* Bytes per pixel */
+   /*
+    * Which bits of each word the masked kernel writes; the other bits are
+    * read back and preserved. Only cp_clear_masked_kernel reads this, and it
+    * exists for one case: vkCmdClearDepthStencilImage naming a single aspect
+    * of a packed D24S8 or D32S8 image, where the aspect that was not named
+    * has to survive a clear that shares its word.
+    */
+   uint32_t clear_mask[4];
 };
 
 struct cp_depth_attachment_args {

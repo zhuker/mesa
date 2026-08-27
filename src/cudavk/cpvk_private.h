@@ -448,6 +448,21 @@ struct cpvk_clear {
     */
    unsigned samples;
    uint64_t sample_stride;
+   /*
+    * A read-modify-write clear: only these bits are written. It exists for
+    * vkCmdClearDepthStencilImage naming one aspect of a packed format, where
+    * the aspect that was not named shares the word and has to survive. Every
+    * other clear leaves `masked` false and keeps the whole-word kernel.
+    */
+   bool masked;
+   uint32_t mask[4];
+   /*
+    * Recorded inside a render pass by vkCmdClearAttachments rather than at its
+    * start by LOAD_OP_CLEAR. A depth clear like this may not simply declare
+    * the depth buffer defined, because it may cover only part of it; see
+    * cpvk_execute_clear().
+    */
+   bool mid_pass;
 };
 
 /*
@@ -589,6 +604,20 @@ struct cpvk_cmd_buffer {
    uint64_t vb_base[16];
    unsigned num_vb;
    unsigned fb_samples;
+   /*
+    * What vkCmdClearAttachments needs in order to build the same clear
+    * vkCmdBeginRendering would have built for LOAD_OP_CLEAR: the colour
+    * attachment's image and its resolved subresource geometry, plus the render
+    * area a clear rectangle is clipped to. `cmd->fb` carries the rest.
+    *
+    * Held rather than recomputed because the attachment is named by index at
+    * clear time, not by view, and resolving a view is where BeginRendering
+    * already decided which mip level and array layer this pass writes.
+    */
+   struct cpvk_image *clear_color_image;
+   unsigned clear_color_stride;
+   unsigned clear_color_format;      /* enum pipe_format */
+   VkRect2D clear_area;
    const void *index_ptr;
    unsigned index_size;
    /* Push constants are per stage: an application may write overlapping

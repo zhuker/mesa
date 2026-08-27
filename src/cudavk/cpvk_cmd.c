@@ -1657,6 +1657,13 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    cmd->fb = fb;
    cmd->has_fb = true;
 
+   /* What a vkCmdClearAttachments in this pass will clear, resolved once
+    * here: the same subresource LOAD_OP_CLEAR below writes. */
+   cmd->clear_color_image = cimg;
+   cmd->clear_color_stride = cimg ? cimg->row_stride[color_level] : 0;
+   cmd->clear_color_format = color_format;
+   cmd->clear_area = pRenderingInfo->renderArea;
+
    cmd->resolve_valid = false;
    if (cat && cview && cat->resolveImageView != VK_NULL_HANDLE &&
        cat->resolveMode != VK_RESOLVE_MODE_NONE) {
@@ -1992,6 +1999,17 @@ cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c)
    cp_batch_flush(cp);
 
    if (c->depth) {
+      /*
+       * A mid-pass clear covers a rectangle inside a buffer whose rest may
+       * never have been written: this pass may have loaded nothing and cleared
+       * nothing, in which case the first draw would run the lazy full clear
+       * and wipe what was cleared here. Run that clear first instead. The
+       * contents it invents are the ones the lazy path would have invented,
+       * because a depth buffer nothing loaded or cleared is undefined.
+       */
+      if (c->mid_pass && !cp->depthbuf_cleared)
+         cp_clear_depthbuf(cp, 1.0f);
+
       uint32_t value[4] = { cp_depth_to_sortable(c->depth_value) };
       bool ok = true;
       for (unsigned s = 0; s < MAX2(c->samples, 1u); s++)
@@ -2000,16 +2018,23 @@ cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c)
                                            s * c->sample_stride),
                        c->offset, c->width, c->height, c->stride,
                        c->pixel_size, value, true);
-      cp->depthbuf_cleared = ok;
+      /* A mid-pass clear says nothing about the pixels outside its rectangle,
+       * so it may only confirm the flag, never set it. */
+      if (!c->mid_pass)
+         cp->depthbuf_cleared = ok;
       return ok;
    }
 
    /* Once per sample plane. */
    bool ok = true;
-   for (unsigned s = 0; s < MAX2(c->samples, 1u); s++)
-      ok &= cp_clear_rect(cp, (char *)c->data + s * c->sample_stride, c->offset,
-                    c->width, c->height, c->stride, c->pixel_size, c->value,
-                    false);
+   for (unsigned s = 0; s < MAX2(c->samples, 1u); s++) {
+      char *plane = (char *)c->data + s * c->sample_stride;
+      ok &= c->masked
+         ? cp_clear_rect_masked(cp, plane, c->offset, c->width, c->height,
+                                c->stride, c->pixel_size, c->value, c->mask)
+         : cp_clear_rect(cp, plane, c->offset, c->width, c->height, c->stride,
+                         c->pixel_size, c->value, false);
+   }
    return ok;
 }
 
@@ -2766,6 +2791,392 @@ static uint64_t
 cpvk_image_end(const struct cpvk_image *img)
 {
    return (img && img->mem) ? img->mem->dev_ptr + img->offset + img->size : 0;
+}
+
+/* ---------------------------------------------------------------- clears */
+
+/*
+ * vkCmdClearColorImage, vkCmdClearDepthStencilImage and vkCmdClearAttachments.
+ *
+ * Implemented here for the same reason vkCmdFillBuffer is: nothing else
+ * implements them. There is no vk_common_CmdClearAttachments,
+ * vk_common_CmdClearColorImage or vk_common_CmdClearDepthStencilImage anywhere
+ * in src/vulkan, so the three dispatch slots were NULL, vkGetDeviceProcAddr
+ * returned NULL for all three, and an application that called one jumped to
+ * address zero -- three segfaults with no driver output at all, which is how
+ * an audit of this driver found them. They are core Vulkan 1.0 with no feature
+ * or extension gate, so "not implemented" was never a legal answer.
+ *
+ * All three record a CPVK_OP_CLEAR and let the submit loop replay it in
+ * sequence, which is the whole point: a clear recorded after a draw must not
+ * run before it. An immediate blit here would be that bug. It also gets the
+ * texture-cache invalidation right, because the submit loop already does that
+ * for any CPVK_OP_CLEAR that names an image.
+ */
+
+static uint32_t
+cpvk_f32_bits(float f)
+{
+   uint32_t u;
+   memcpy(&u, &f, sizeof(u));
+   return u;
+}
+
+/*
+ * One clear per mip level of a subresource range.
+ *
+ * A level's rows are contiguous and so are the array layers behind them
+ * (cpvk_image_layout: level_size = row_stride * h * d, layers stride by
+ * level_size), so one rectangle of `h * d * layers` rows covers every layer of
+ * a level at once. Samples are planes and the executor walks them.
+ */
+static bool
+cpvk_record_image_clear(struct cpvk_cmd_buffer *cmd, struct cpvk_image *img,
+                        const VkImageSubresourceRange *range,
+                        unsigned pixel_size, const uint32_t value[4],
+                        const uint32_t mask[4])
+{
+   const uint32_t levels = vk_image_subresource_level_count(&img->vk, range);
+   const uint32_t layers = vk_image_subresource_layer_count(&img->vk, range);
+   enum pipe_format pfmt = vk_format_to_pipe_format(img->vk.format);
+
+   for (uint32_t l = 0; l < levels; l++) {
+      unsigned level = range->baseMipLevel + l;
+      if (level >= CPVK_MAX_MIP_LEVELS || level >= img->vk.mip_levels)
+         return false;
+
+      unsigned w = util_format_get_nblocksx(
+         pfmt, u_minify(img->vk.extent.width, level));
+      unsigned h = util_format_get_nblocksy(
+         pfmt, u_minify(img->vk.extent.height, level));
+      unsigned d = u_minify(img->vk.extent.depth, level);
+      uint64_t rows = (uint64_t)h * d * layers;
+      if (!w || !rows)
+         continue;
+
+      struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_CLEAR);
+      if (!op)
+         return false;
+      op->clear = (struct cpvk_clear) {
+         .image = img,
+         .data = (void *)(uintptr_t)(img->mem->dev_ptr + img->offset +
+                                     img->level_offset[level] +
+                                     (uint64_t)range->baseArrayLayer *
+                                        img->level_size[level]),
+         .width = w,
+         .height = (unsigned)rows,
+         .stride = img->row_stride[level],
+         .pixel_size = pixel_size,
+         .samples = MAX2(img->vk.samples, 1u),
+         .sample_stride = img->sample_stride,
+         .masked = mask != NULL,
+      };
+      memcpy(op->clear.value, value, sizeof(op->clear.value));
+      if (mask)
+         memcpy(op->clear.mask, mask, sizeof(op->clear.mask));
+   }
+   return true;
+}
+
+static void
+cpvk_clear_refuse(struct cpvk_cmd_buffer *cmd, const char *what)
+{
+   fprintf(stderr, "cudavk: %s\n", what);
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image,
+                        VkImageLayout imageLayout,
+                        const VkClearColorValue *pColor,
+                        uint32_t rangeCount,
+                        const VkImageSubresourceRange *pRanges)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_image, img, image);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+
+   if (!img || !img->mem) {
+      cpvk_clear_refuse(cmd, "vkCmdClearColorImage on an image with no memory");
+      return;
+   }
+
+   enum pipe_format pfmt = vk_format_to_pipe_format(img->vk.format);
+   unsigned bpp = util_format_get_blocksize(pfmt);
+   /* The clear kernel indexes on the element size and has no default arm, so a
+    * size it does not name would write nothing at all -- refuse instead. That
+    * excludes the three-component formats R8G8B8, R16G16B16 and R32G32B32. */
+   if (util_format_is_compressed(pfmt) ||
+       util_format_is_depth_or_stencil(pfmt) ||
+       (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8 && bpp != 16)) {
+      cpvk_clear_refuse(cmd, "vkCmdClearColorImage: unsupported format");
+      return;
+   }
+
+   /*
+    * The float/int/uint union is decided by the format, not by the caller:
+    * util_format_pack_rgba reinterprets the same bytes as uint32, int32 or
+    * float according to whether the format is pure-integer. This is the same
+    * call LOAD_OP_CLEAR makes, so the two agree by construction.
+    */
+   uint32_t value[4] = { 0 };
+   util_format_pack_rgba(pfmt, value, pColor->float32, 1);
+
+   for (uint32_t i = 0; i < rangeCount; i++) {
+      if (pRanges[i].aspectMask != VK_IMAGE_ASPECT_COLOR_BIT) {
+         cpvk_clear_refuse(cmd, "vkCmdClearColorImage: non-colour aspect");
+         return;
+      }
+      if (!cpvk_record_image_clear(cmd, img, &pRanges[i], bpp, value, NULL)) {
+         cpvk_clear_refuse(cmd, "vkCmdClearColorImage: subresource out of range");
+         return;
+      }
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage image,
+                               VkImageLayout imageLayout,
+                               const VkClearDepthStencilValue *pDepthStencil,
+                               uint32_t rangeCount,
+                               const VkImageSubresourceRange *pRanges)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_image, img, image);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+
+   if (!img || !img->mem) {
+      cpvk_clear_refuse(cmd,
+         "vkCmdClearDepthStencilImage on an image with no memory");
+      return;
+   }
+
+   /*
+    * The three formats vkCmdBeginRendering accepts as a depth attachment, and
+    * for the same reason: these are the packings the depth load and store
+    * kernels know. Anything else would be cleared into a layout nothing else
+    * in this driver reads.
+    */
+   VkFormat fmt = img->vk.format;
+   if (fmt != VK_FORMAT_D32_SFLOAT && fmt != VK_FORMAT_D24_UNORM_S8_UINT &&
+       fmt != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+      cpvk_clear_refuse(cmd,
+         "vkCmdClearDepthStencilImage: unsupported depth/stencil format");
+      return;
+   }
+   unsigned bpp = util_format_get_blocksize(vk_format_to_pipe_format(fmt));
+
+   float depth = CLAMP(pDepthStencil->depth, 0.0f, 1.0f);
+   uint32_t stencil = pDepthStencil->stencil & 0xffu;
+
+   for (uint32_t i = 0; i < rangeCount; i++) {
+      VkImageAspectFlags aspects = pRanges[i].aspectMask;
+      bool want_depth = aspects & VK_IMAGE_ASPECT_DEPTH_BIT;
+      bool want_stencil = aspects & VK_IMAGE_ASPECT_STENCIL_BIT;
+
+      if (aspects & ~(VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT |
+                                          VK_IMAGE_ASPECT_STENCIL_BIT) ||
+          !aspects ||
+          (want_stencil && fmt == VK_FORMAT_D32_SFLOAT)) {
+         cpvk_clear_refuse(cmd,
+            "vkCmdClearDepthStencilImage: aspect the format does not have");
+         return;
+      }
+
+      /*
+       * The stencil byte is written here, in the image, which is where the
+       * depth store writes it too (cp_clear.cu). Nothing else in this driver
+       * reads or writes stencil -- there is no stencil test -- so a cleared
+       * stencil aspect survives exactly as far as a stored one does.
+       *
+       * The mask is what keeps the aspect that was not named: in D24S8 both
+       * live in one word, and in D32S8 the stencil byte shares the element
+       * with the depth float.
+       */
+      uint32_t value[4] = { 0 };
+      uint32_t mask[4] = { 0 };
+      if (fmt == VK_FORMAT_D24_UNORM_S8_UINT) {
+         uint32_t d24 = (uint32_t)lrintf(depth * 16777215.0f);
+         value[0] = (stencil << 24) | (d24 & 0x00ffffffu);
+         mask[0] = (want_depth ? 0x00ffffffu : 0u) |
+                   (want_stencil ? 0xff000000u : 0u);
+      } else if (fmt == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+         value[0] = cpvk_f32_bits(depth);
+         value[1] = stencil;
+         mask[0] = want_depth ? 0xffffffffu : 0u;
+         mask[1] = want_stencil ? 0x000000ffu : 0u;
+      } else {
+         value[0] = cpvk_f32_bits(depth);
+         mask[0] = 0xffffffffu;
+      }
+
+      if (!cpvk_record_image_clear(cmd, img, &pRanges[i], bpp, value, mask)) {
+         cpvk_clear_refuse(cmd,
+            "vkCmdClearDepthStencilImage: subresource out of range");
+         return;
+      }
+   }
+}
+
+/*
+ * vkCmdClearAttachments: inside the pass, on whatever is bound, in sequence.
+ *
+ * Three things make this different from the two image clears above.
+ *
+ * It is ordered against the draws already recorded in this pass, so it is an
+ * op like any other rather than something done to the image now.
+ *
+ * It clears the attachment's *view* -- the mip level and array layer
+ * vkCmdBeginRendering resolved -- and it is clipped to the render area, which
+ * is why the geometry comes from what BeginRendering worked out and not from
+ * the image.
+ *
+ * And the depth aspect is not the depth image: this driver's depth test reads
+ * a renderer-side buffer that the pass loads at the start and stores at the
+ * end, exactly as LOAD_OP_CLEAR does, so an in-pass depth clear clears that
+ * buffer.
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdClearAttachments(VkCommandBuffer commandBuffer,
+                         uint32_t attachmentCount,
+                         const VkClearAttachment *pAttachments,
+                         uint32_t rectCount, const VkClearRect *pRects)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+
+   /*
+    * A secondary command buffer recorded with RENDER_PASS_CONTINUE inherits
+    * its render pass and never sees vkCmdBeginRendering, so nothing here knows
+    * which subresource is bound or how wide its rows are. Refusing is the only
+    * honest answer; guessing would clear the wrong memory.
+    */
+   if (!cmd->has_fb || cmd->active_scope >= cmd->num_scopes) {
+      cpvk_clear_refuse(cmd, "vkCmdClearAttachments outside a render pass this "
+                        "command buffer began (an inherited pass in a "
+                        "secondary cannot resolve its attachments)");
+      return;
+   }
+   struct cp_render_scope *scope = &cmd->scopes[cmd->active_scope];
+
+   for (uint32_t a = 0; a < attachmentCount; a++) {
+      const VkClearAttachment *at = &pAttachments[a];
+
+      for (uint32_t r = 0; r < rectCount; r++) {
+         const VkClearRect *cr = &pRects[r];
+
+         /* One layer, because one layer is what a scope binds: the view's
+          * baseArrayLayer is already folded into the base address. */
+         if (cr->baseArrayLayer != 0 || cr->layerCount > 1) {
+            cpvk_clear_refuse(cmd, "vkCmdClearAttachments: layered clear "
+                              "(this driver binds one layer per pass)");
+            return;
+         }
+
+         /* Clipped to the render area, which the spec requires the rectangle
+          * to be inside anyway. */
+         int64_t x0 = MAX2((int64_t)cr->rect.offset.x,
+                           (int64_t)cmd->clear_area.offset.x);
+         int64_t y0 = MAX2((int64_t)cr->rect.offset.y,
+                           (int64_t)cmd->clear_area.offset.y);
+         int64_t x1 = MIN2((int64_t)cr->rect.offset.x + cr->rect.extent.width,
+                           (int64_t)cmd->clear_area.offset.x +
+                              cmd->clear_area.extent.width);
+         int64_t y1 = MIN2((int64_t)cr->rect.offset.y + cr->rect.extent.height,
+                           (int64_t)cmd->clear_area.offset.y +
+                              cmd->clear_area.extent.height);
+         if (x1 <= x0 || y1 <= y0)
+            continue;
+         unsigned w = (unsigned)(x1 - x0), h = (unsigned)(y1 - y0);
+
+         if (at->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+            if (at->colorAttachment != 0 || !cmd->fb.color ||
+                !cmd->clear_color_image) {
+               cpvk_clear_refuse(cmd, "vkCmdClearAttachments: no such colour "
+                                 "attachment (this driver binds one)");
+               return;
+            }
+            unsigned bpp =
+               util_format_get_blocksize(cmd->clear_color_format);
+            if (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8 && bpp != 16) {
+               cpvk_clear_refuse(cmd,
+                  "vkCmdClearAttachments: unsupported colour element size");
+               return;
+            }
+
+            struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_CLEAR);
+            if (!op)
+               return;
+            op->clear = (struct cpvk_clear) {
+               .image = cmd->clear_color_image,
+               .data = cmd->fb.color,
+               .offset = (uint64_t)y0 * cmd->clear_color_stride +
+                         (uint64_t)x0 * bpp,
+               .width = w,
+               .height = h,
+               .stride = cmd->clear_color_stride,
+               .pixel_size = bpp,
+               .samples = cmd->fb_samples,
+               .sample_stride = cmd->fb.color_sample_stride,
+               .mid_pass = true,
+            };
+            util_format_pack_rgba(cmd->clear_color_format, op->clear.value,
+                                  at->clearValue.color.float32, 1);
+         }
+
+         if (at->aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT |
+                               VK_IMAGE_ASPECT_STENCIL_BIT)) {
+            if (!cmd->fb.has_zs) {
+               cpvk_clear_refuse(cmd, "vkCmdClearAttachments: no depth/stencil "
+                                 "attachment is bound");
+               return;
+            }
+
+            /*
+             * Stencil is written by the pass's depth store and nowhere else,
+             * which is the behaviour LOAD_OP_CLEAR already has: the store
+             * writes one value over the attachment. It can therefore honour a
+             * clear of the whole render area and nothing narrower, so a
+             * sub-rectangle is refused rather than quietly widened.
+             */
+            if (at->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) {
+               if (x0 != cmd->clear_area.offset.x ||
+                   y0 != cmd->clear_area.offset.y ||
+                   w != cmd->clear_area.extent.width ||
+                   h != cmd->clear_area.extent.height) {
+                  cpvk_clear_refuse(cmd,
+                     "vkCmdClearAttachments: a stencil clear of part of the "
+                     "render area (this driver writes stencil only at the "
+                     "pass's depth store, which covers the attachment)");
+                  return;
+               }
+               scope->depth.stencil_clear = 1;
+               scope->depth.stencil_value =
+                  at->clearValue.depthStencil.stencil & 0xffu;
+            }
+
+            if (at->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) {
+               struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_CLEAR);
+               if (!op)
+                  return;
+               op->clear = (struct cpvk_clear) {
+                  .depth = true,
+                  .depth_value = at->clearValue.depthStencil.depth,
+                  .offset = ((uint64_t)y0 * cmd->fb.width + x0) *
+                            sizeof(uint32_t),
+                  .width = w,
+                  .height = h,
+                  .stride = cmd->fb.width * sizeof(uint32_t),
+                  .pixel_size = sizeof(uint32_t),
+                  .samples = cmd->fb_samples,
+                  .sample_stride = (uint64_t)cmd->fb.width * cmd->fb.height *
+                                   sizeof(uint32_t),
+                  .mid_pass = true,
+               };
+            }
+         }
+      }
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
