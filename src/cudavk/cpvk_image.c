@@ -375,8 +375,14 @@ cpvk_DestroyImage(VkDevice _device, VkImage _image,
       cpvk_memory_note_unbind(dev, image->mem, image);
       cpvk_drain_census_call(dev, CPVK_DRAIN_DESTROY_IMAGE);
       if (cp_debug->texture_cache) {
-         cpvk_device_drain(_device, CPVK_DRAIN_DESTROY_IMAGE);
-         cpvk_texture_cache_image_destroy(image);
+         /* Deferred: the cache's CUDA objects outlive the image by as long as
+          * the submit that could still be reading them. Everything the host
+          * can reach is unlinked inside the retire call, as it was here. */
+         if (!cp_debug->destroy_defer ||
+             !cpvk_texture_cache_image_retire(image)) {
+            cpvk_device_drain(_device, CPVK_DRAIN_DESTROY_IMAGE);
+            cpvk_texture_cache_image_destroy(image);
+         }
       }
       vk_image_destroy(&dev->vk, pAllocator, &image->vk);
    }
@@ -581,8 +587,13 @@ cpvk_DestroyImageView(VkDevice _device, VkImageView _view,
    if (view) {
       cpvk_drain_census_call(dev, CPVK_DRAIN_DESTROY_VIEW);
       if (cp_debug->texture_cache) {
-         cpvk_device_drain(_device, CPVK_DRAIN_DESTROY_VIEW);
-         cpvk_texture_cache_view_destroy(view);
+         /* The retire call also takes view->tex_info, so the cuMemFree below
+          * finds nothing left to free. */
+         if (!cp_debug->destroy_defer ||
+             !cpvk_texture_cache_view_retire(view)) {
+            cpvk_device_drain(_device, CPVK_DRAIN_DESTROY_VIEW);
+            cpvk_texture_cache_view_destroy(view);
+         }
       }
       if (view->image) {
          simple_mtx_lock(&dev->view_lock);

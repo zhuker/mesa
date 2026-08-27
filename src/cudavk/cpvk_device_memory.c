@@ -69,11 +69,6 @@ cpvk_submit_worker(void *data)
                                      pending->signals[i].value,
                                      pending->signals[i].epoch);
       }
-      /* Not destroyed here: the syncs this submit signalled hold their own
-       * references, and a wait on one of them becomes a device wait on this
-       * event. The last holder destroys it. */
-      cpvk_cuevent_unref(dev, pending->done);
-
       mtx_lock(&dev->submit_lock);
       assert(dev->submit_head == pending);
       dev->submit_head = pending->next;
@@ -81,6 +76,16 @@ cpvk_submit_worker(void *data)
          dev->submit_tail = NULL;
       cnd_broadcast(&dev->submit_changed);
       mtx_unlock(&dev->submit_lock);
+      /* Not destroyed here: the syncs this submit signalled hold their own
+       * references, and a wait on one of them becomes a device wait on this
+       * event. The last holder destroys it.
+       *
+       * Dropped after the record leaves the list, not before: cpvk_submit_
+       * barrier() reads submit_tail->done under this lock, and a reference
+       * taken from a record whose event had already been unreferenced would
+       * be a reference to freed memory. Nothing observes when the event is
+       * destroyed, so the move costs nothing. */
+      cpvk_cuevent_unref(dev, pending->done);
       free(pending);
    }
 }
@@ -131,6 +136,23 @@ cpvk_submit_wait_pending(struct cpvk_device *dev)
 }
 
 
+/*
+ * The newest submit that has not completed, referenced, or NULL when the list
+ * is empty -- which means every submit's event has already been waited on by
+ * the worker, so the device holds nothing this driver put there.
+ */
+struct cpvk_cuevent *
+cpvk_submit_barrier(struct cpvk_device *dev)
+{
+   if (!dev->submit_worker_initialized)
+      return NULL;
+   mtx_lock(&dev->submit_lock);
+   struct cpvk_cuevent *ev =
+      dev->submit_tail ? cpvk_cuevent_ref(dev->submit_tail->done) : NULL;
+   mtx_unlock(&dev->submit_lock);
+   return ev;
+}
+
 static VkResult
 cpvk_submit_abort(struct cpvk_device *dev, VkResult result)
 {
@@ -164,6 +186,13 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
    CPVK_CTX_SCOPE(dev);
+
+   /* After the scope, never before it: retirement destroys CUDA objects that
+    * belong to this device's context. This is the one place the host is
+    * already at a submit boundary, so it is where a completed barrier is
+    * cheapest to notice. */
+   if (cp_debug->destroy_defer)
+      cpvk_retire_poll(dev);
 
    /*
     * Wait semaphores, on the device where the sync carries a completion event
@@ -527,6 +556,7 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    simple_mtx_init(&dev->view_lock, mtx_plain);
    simple_mtx_init(&dev->texture_cache_lock, mtx_plain);
    simple_mtx_init(&dev->texture_cache_use_lock, mtx_plain);
+   simple_mtx_init(&dev->retire_lock, mtx_plain);
    dev->texture_cache_images = NULL;
    dev->texture_cache_views = NULL;
    dev->texture_cache_view_count = dev->texture_cache_view_cap = 0;
@@ -577,6 +607,7 @@ fail_stream:
       simple_mtx_destroy(&dev->view_lock);
       simple_mtx_destroy(&dev->texture_cache_lock);
       simple_mtx_destroy(&dev->texture_cache_use_lock);
+      simple_mtx_destroy(&dev->retire_lock);
    }
    if (kernels_initialized)
       cp_kernels_destroy(&dev->cp_dev.kernels);
@@ -607,6 +638,7 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    cuCtxPushCurrent(dev->cu_ctx);
    cuCtxSynchronize();
    cpvk_submit_wait_pending(dev);
+   cpvk_retire_all(dev);
    cpvk_submit_worker_finish(dev);
    vk_queue_finish(&dev->queue);
 
@@ -614,6 +646,7 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    cp_context_cleanup(&dev->renderer);
    cpvk_texture_cache_report(dev);
    cpvk_drain_census_report(dev);
+   cpvk_retire_report(dev);
    for (unsigned i = 0; i < dev->num_shaders; i++)
       cp_shader_binary_destroy(dev->shader_cache[i].bin);
    free(dev->shader_cache);
@@ -630,6 +663,7 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    simple_mtx_destroy(&dev->view_lock);
    simple_mtx_destroy(&dev->texture_cache_lock);
    simple_mtx_destroy(&dev->texture_cache_use_lock);
+   simple_mtx_destroy(&dev->retire_lock);
 
    /* Restore the caller's context before the push target stops existing. */
    cuCtxPopCurrent(NULL);
@@ -691,6 +725,7 @@ cpvk_drain_census_report(struct cpvk_device *dev)
       [CPVK_DRAIN_CACHE_IMAGE]   = "cache_image_sync",
       [CPVK_DRAIN_CACHE_VIEW]    = "cache_view_sync",
       [CPVK_DRAIN_CACHE_PURGE]   = "cache_purge_sync",
+      [CPVK_DRAIN_RETIRE_OVERFLOW] = "retire_overflow",
    };
    /* Two submits per frame is the convention every number here uses. */
    double frames = dev->drain_census.submits / 2.0;
@@ -733,6 +768,10 @@ cpvk_device_drain(VkDevice _device, enum cpvk_drain_site site)
       atomic_store_explicit(&dev->device_lost, true, memory_order_release);
    cpvk_submit_wait_pending(dev);
    cpvk_drain_census_note(dev, site, started);
+   /* The device is idle here by construction, so nothing has to be queried:
+    * a drain retires the whole queue, whoever asked for the drain. */
+   if (cp_debug->destroy_defer && site != CPVK_DRAIN_RETIRE_OVERFLOW)
+      cpvk_retire_all(dev);
    return atomic_load_explicit(&dev->device_lost, memory_order_acquire)
       ? vk_error(dev, VK_ERROR_DEVICE_LOST) : VK_SUCCESS;
 }

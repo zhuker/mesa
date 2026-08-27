@@ -322,6 +322,7 @@ struct cp_debug {
     * be shown inert at machine level rather than argued to be.
     */
    bool destroy_census;   /* CUDAVK_DESTROY_CENSUS; see cpvk_private.h */
+   bool destroy_defer;    /* CUDAVK_DESTROY_DEFER; see cpvk_private.h */
 };
 
 /*

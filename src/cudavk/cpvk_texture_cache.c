@@ -1,5 +1,6 @@
 #include "cpvk_private.h"
 #include "cp_debug.h"
+#include "util/u_atomic.h"
 #include "util/u_math.h"
 
 #include <inttypes.h>
@@ -955,6 +956,285 @@ cpvk_texture_cache_image_destroy(struct cpvk_image *image)
       cpvk_cache_device_loss(dev);
    simple_mtx_unlock(&dev->texture_cache_lock);
    simple_mtx_unlock(&dev->texture_cache_use_lock);
+}
+
+/*
+ * The retirement queue: CUDAVK_DESTROY_DEFER.
+ *
+ * What the drain at vkDestroyImage / vkDestroyImageView protects is the CUDA
+ * side of the cache -- the mipmapped array, the texture and surface objects,
+ * the writer event and the view's cp_texture_info allocation -- against a
+ * kernel that is still reading them. Vulkan already forbids the application
+ * to destroy an object whose submitted commands have not completed, so the
+ * drain is defensive; but the cache's objects are the driver's own, so the
+ * driver has to say for itself when nothing can be reading them.
+ *
+ * It can, exactly and cheaply. The driver issues device work only from inside
+ * vkQueueSubmit, and every submit ends with a CUevent recorded on the stream
+ * the side streams have been joined into (cp_pass_join, then cp_batch_flush,
+ * then the cuEventRecord in cpvk_queue_submit). So "every submit that could
+ * have referenced this object has completed" and "the device is idle" are the
+ * same statement here, and a record retired at the newest pending submit's
+ * event is retired no earlier than the drain would have returned -- including
+ * for an application that breaks the rule and gets away with it today.
+ *
+ * The host side is unchanged and stays where it is: the cookie slot, the
+ * cache list, the per-image object list and the byte budget are all updated
+ * under the same two locks, at the same point, before this returns. Those
+ * were never protected by the synchronisation; they were protected by the
+ * locks. What is deferred is the CUDA teardown of objects that, by then, no
+ * live structure can reach.
+ */
+
+/* The queue is bounded so that deferring a free can never become holding one:
+ * past this many records, or this many cached bytes, the caller drains and
+ * retires everything, which is what it did on every destroy before. */
+#define CPVK_RETIRE_MAX_RECORDS 256
+#define CPVK_RETIRE_MAX_BYTES (64ull * 1024 * 1024)
+
+struct cpvk_retire {
+   struct cpvk_retire *next;
+   struct cpvk_cuevent *barrier;
+   struct cpvk_texture_cache *cache;    /* a whole detached cache, or NULL */
+   struct cpvk_texture_object *objects; /* one view's objects, or NULL */
+   CUevent writer_event;
+   CUdeviceptr tex_info;
+   size_t bytes;
+};
+
+/* Destroy what the record owns. The context is the caller's: every caller is
+ * an entry point holding CPVK_CTX_SCOPE, or the teardown path. */
+static void
+cpvk_retire_release(struct cpvk_device *dev, struct cpvk_retire *rec)
+{
+   bool ok = true;
+   while (rec->objects) {
+      struct cpvk_texture_object *next = rec->objects->next;
+      if (cuTexObjectDestroy(rec->objects->object) != CUDA_SUCCESS)
+         ok = false;
+      free(rec->objects);
+      rec->objects = next;
+   }
+   if (rec->cache) {
+      struct cpvk_texture_cache *cache = rec->cache;
+      while (cache->objects) {
+         struct cpvk_texture_object *next = cache->objects->next;
+         if (cuTexObjectDestroy(cache->objects->object) != CUDA_SUCCESS)
+            ok = false;
+         free(cache->objects);
+         cache->objects = next;
+      }
+      for (unsigned l = 0; l < CPVK_MAX_MIP_LEVELS; l++)
+         if (cache->surfaces[l] &&
+             cuSurfObjectDestroy(cache->surfaces[l]) != CUDA_SUCCESS)
+            ok = false;
+      if (cache->ready && cuEventDestroy(cache->ready) != CUDA_SUCCESS)
+         ok = false;
+      if (cache->array && cuMipmappedArrayDestroy(cache->array) != CUDA_SUCCESS)
+         ok = false;
+      free(cache);
+   }
+   if (rec->writer_event && cuEventDestroy(rec->writer_event) != CUDA_SUCCESS)
+      ok = false;
+   if (rec->tex_info)
+      cuMemFree(rec->tex_info);
+   if (!ok)
+      cpvk_cache_device_loss(dev);
+   cpvk_cuevent_unref(dev, rec->barrier);
+   free(rec);
+   dev->retire_freed++;
+}
+
+void
+cpvk_retire_poll(struct cpvk_device *dev)
+{
+   if (!p_atomic_read(&dev->retire_head))
+      return;
+   simple_mtx_lock(&dev->retire_lock);
+   while (dev->retire_head) {
+      struct cpvk_retire *rec = dev->retire_head;
+      /* Appended in submit order, so the first record that is not complete
+       * ends the walk: nothing behind it can be older. */
+      if (cuEventQuery(rec->barrier->event) != CUDA_SUCCESS)
+         break;
+      dev->retire_head = rec->next;
+      if (!dev->retire_head)
+         dev->retire_tail = NULL;
+      dev->retire_pending--;
+      dev->retire_bytes -= rec->bytes;
+      cpvk_retire_release(dev, rec);
+   }
+   simple_mtx_unlock(&dev->retire_lock);
+}
+
+/* Everything, without asking: for a caller that has just drained, and for
+ * teardown. */
+void
+cpvk_retire_all(struct cpvk_device *dev)
+{
+   if (!p_atomic_read(&dev->retire_head))
+      return;
+   simple_mtx_lock(&dev->retire_lock);
+   while (dev->retire_head) {
+      struct cpvk_retire *rec = dev->retire_head;
+      dev->retire_head = rec->next;
+      dev->retire_pending--;
+      dev->retire_bytes -= rec->bytes;
+      cpvk_retire_release(dev, rec);
+   }
+   dev->retire_tail = NULL;
+   simple_mtx_unlock(&dev->retire_lock);
+}
+
+/*
+ * Take the barrier and queue the record. With no submit in flight the device
+ * holds nothing of ours, so the record is released here and the destroy costs
+ * nothing at all -- which is also what the drain would have found.
+ */
+static bool
+cpvk_retire_enqueue(struct cpvk_device *dev, struct cpvk_retire *rec)
+{
+   if (!rec->cache && !rec->objects && !rec->writer_event && !rec->tex_info) {
+      free(rec);
+      dev->retire_immediate++;
+      return true;
+   }
+   rec->barrier = cpvk_submit_barrier(dev);
+   if (!rec->barrier) {
+      cpvk_retire_release(dev, rec);
+      dev->retire_immediate++;
+      return true;
+   }
+
+   simple_mtx_lock(&dev->retire_lock);
+   rec->next = NULL;
+   if (dev->retire_tail)
+      dev->retire_tail->next = rec;
+   else
+      dev->retire_head = rec;
+   dev->retire_tail = rec;
+   dev->retire_pending++;
+   dev->retire_deferred++;
+   dev->retire_bytes += rec->bytes;
+   if (dev->retire_pending > dev->retire_peak)
+      dev->retire_peak = dev->retire_pending;
+   if (dev->retire_bytes > dev->retire_peak_bytes)
+      dev->retire_peak_bytes = dev->retire_bytes;
+   uint64_t pending = dev->retire_pending;
+   simple_mtx_unlock(&dev->retire_lock);
+
+   /* Cheap first: most records retire on a query, and only a queue that keeps
+    * growing has to pay for it. */
+   if (pending > CPVK_RETIRE_MAX_RECORDS / 2 ||
+       dev->retire_bytes > CPVK_RETIRE_MAX_BYTES / 2)
+      cpvk_retire_poll(dev);
+   if (dev->retire_pending > CPVK_RETIRE_MAX_RECORDS ||
+       dev->retire_bytes > CPVK_RETIRE_MAX_BYTES) {
+      dev->retire_overflow_drains++;
+      cpvk_device_drain(cpvk_device_to_handle(dev), CPVK_DRAIN_RETIRE_OVERFLOW);
+      cpvk_retire_all(dev);
+   }
+   return true;
+}
+
+bool
+cpvk_texture_cache_image_retire(struct cpvk_image *image)
+{
+   if (!image)
+      return true;
+   struct cpvk_device *dev = image->dev;
+   struct cpvk_retire *rec = calloc(1, sizeof(*rec));
+   if (!rec) {
+      dev->retire_declined++;
+      return false;
+   }
+
+   simple_mtx_lock(&dev->texture_cache_use_lock);
+   simple_mtx_lock(&dev->texture_cache_lock);
+   struct cpvk_texture_cache *cache = image->texture_cache;
+   if (cache) {
+      /* The unlink half of cpvk_cache_drop_locked(), with the CUDA half left
+       * to the record. The budget is credited here, not at retirement, so a
+       * deferred free is never a deferred accounting. */
+      if (image->texture_cache_prev) {
+         *image->texture_cache_prev = image->texture_cache_next;
+         if (image->texture_cache_next)
+            image->texture_cache_next->texture_cache_prev =
+               image->texture_cache_prev;
+      }
+      image->texture_cache_next = NULL;
+      image->texture_cache_prev = NULL;
+      dev->texture_cache_bytes -= cache->bytes;
+      rec->bytes = cache->bytes;
+      image->texture_cache = NULL;
+   }
+   rec->cache = cache;
+   rec->writer_event = image->writer_event;
+   image->writer_event = NULL;
+   image->writer_event_valid = false;
+   simple_mtx_unlock(&dev->texture_cache_lock);
+   simple_mtx_unlock(&dev->texture_cache_use_lock);
+
+   return cpvk_retire_enqueue(dev, rec);
+}
+
+bool
+cpvk_texture_cache_view_retire(struct cpvk_image_view *view)
+{
+   if (!view)
+      return true;
+   struct cpvk_device *dev = view->dev;
+   struct cpvk_retire *rec = calloc(1, sizeof(*rec));
+   if (!rec) {
+      dev->retire_declined++;
+      return false;
+   }
+
+   simple_mtx_lock(&dev->texture_cache_use_lock);
+   simple_mtx_lock(&dev->texture_cache_lock);
+   if (view->cache_cookie &&
+       view->cache_cookie <= dev->texture_cache_view_count &&
+       dev->texture_cache_views[view->cache_cookie - 1] == view)
+      dev->texture_cache_views[view->cache_cookie - 1] = NULL;
+   view->cache_cookie = 0;
+   if (view->image && view->image->texture_cache) {
+      struct cpvk_texture_object **link = &view->image->texture_cache->objects;
+      while (*link) {
+         if ((*link)->view == view) {
+            struct cpvk_texture_object *dead = *link;
+            *link = dead->next;
+            /* Unreachable from the cache from here, and destroyed later. */
+            dead->next = rec->objects;
+            rec->objects = dead;
+            continue;
+         }
+         link = &(*link)->next;
+      }
+   }
+   /* The view's own device allocation goes with them: a descriptor row a
+    * running kernel holds names this pointer. */
+   rec->tex_info = view->tex_info;
+   view->tex_info = 0;
+   view->tex_info_host = NULL;
+   simple_mtx_unlock(&dev->texture_cache_lock);
+   simple_mtx_unlock(&dev->texture_cache_use_lock);
+
+   return cpvk_retire_enqueue(dev, rec);
+}
+
+void
+cpvk_retire_report(struct cpvk_device *dev)
+{
+   if (!cp_debug->destroy_census && !cp_debug->destroy_defer)
+      return;
+   fprintf(stderr, "cudavk: retirement queue: deferred=%" PRIu64
+           " immediate=%" PRIu64 " freed=%" PRIu64 " peak_pending=%" PRIu64
+           " overflow_drains=%" PRIu64 " declined=%" PRIu64
+           " still_pending=%" PRIu64 " peak_bytes=%" PRIu64 "\n",
+           dev->retire_deferred, dev->retire_immediate, dev->retire_freed,
+           dev->retire_peak, dev->retire_overflow_drains,
+           dev->retire_declined, dev->retire_pending,
+           dev->retire_peak_bytes);
 }
 
 void

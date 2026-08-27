@@ -184,6 +184,10 @@ static const struct cp_flag_def flags[] = {
      "split by the call site that asked for it, so the application's own "
      "vkDeviceWaitIdle can be told apart from the driver's; reports at "
      "teardown" },
+   { "CUDAVK_DESTROY_DEFER", CP_FLAG_BOOL_VALUE, F(destroy_defer),
+     "retire an image's or a view's cached texture objects when the submit "
+     "that could still be reading them completes, instead of draining the "
+     "whole device at vkDestroyImage and vkDestroyImageView" },
    { "CUDAVK_NO_META_FOLD", CP_FLAG_BOOL_VALUE, F(no_meta_fold),
      "upload the vertex stage's vcount and stride as their own block again "
      "instead of carrying them in the argument block's scalar area" },

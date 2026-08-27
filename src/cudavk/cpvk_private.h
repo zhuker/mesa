@@ -67,6 +67,7 @@ struct cpvk_physical_device {
 };
 
 struct cpvk_pending_submit;
+struct cpvk_retire;
 
 /*
  * The whole-device drains, by who asked for one.
@@ -89,6 +90,7 @@ enum cpvk_drain_site {
    CPVK_DRAIN_CACHE_IMAGE,     /* the cache's own sync, image destroy */
    CPVK_DRAIN_CACHE_VIEW,      /* the cache's own sync, view destroy */
    CPVK_DRAIN_CACHE_PURGE,     /* the cache's own sync, budget purge */
+   CPVK_DRAIN_RETIRE_OVERFLOW, /* CUDAVK_DESTROY_DEFER, queue over budget */
    CPVK_DRAIN_SITES,
 };
 
@@ -197,6 +199,20 @@ struct cpvk_device {
       uint64_t ns[CPVK_DRAIN_SITES];
       uint64_t submits;
    } drain_census;
+
+   /*
+    * CUDAVK_DESTROY_DEFER: the retirement queue. Entries are appended in
+    * submit order, so their barriers are monotonic and the walk stops at the
+    * first one that has not completed. The lock guards the list only: an
+    * entry's contents are already unreachable from any live object, which is
+    * what makes retiring them outside the cache locks safe.
+    */
+   simple_mtx_t retire_lock;
+   struct cpvk_retire *retire_head, *retire_tail;
+   uint64_t retire_pending, retire_peak;
+   uint64_t retire_bytes, retire_peak_bytes;
+   uint64_t retire_deferred, retire_immediate, retire_freed;
+   uint64_t retire_overflow_drains, retire_declined;
 };
 
 /*
@@ -899,6 +915,24 @@ bool cpvk_texture_cache_image_written(struct cpvk_image *image,
                                       CUstream stream);
 void cpvk_texture_cache_image_destroy(struct cpvk_image *image);
 void cpvk_texture_cache_view_destroy(struct cpvk_image_view *view);
+
+/*
+ * CUDAVK_DESTROY_DEFER. The two _retire entry points do everything the two
+ * _destroy ones do except the CUDA teardown, which they hand to the
+ * retirement queue keyed on the submit that could still be reading the
+ * objects. They return false when they could not defer, and the caller then
+ * drains as before. See the design note above cpvk_retire_enqueue().
+ */
+bool cpvk_texture_cache_image_retire(struct cpvk_image *image);
+bool cpvk_texture_cache_view_retire(struct cpvk_image_view *view);
+void cpvk_retire_poll(struct cpvk_device *dev);
+void cpvk_retire_all(struct cpvk_device *dev);
+void cpvk_retire_report(struct cpvk_device *dev);
+
+/* A reference to the newest submit that has not completed, or NULL when none
+ * has: with no pending submit the device holds nothing of ours, because the
+ * driver issues device work only from inside vkQueueSubmit. */
+struct cpvk_cuevent *cpvk_submit_barrier(struct cpvk_device *dev);
 void cpvk_texture_cache_sampler_destroy(struct cpvk_sampler *sampler);
 void cpvk_texture_cache_report(struct cpvk_device *dev);
 enum cp_texture_cache_purge_result
