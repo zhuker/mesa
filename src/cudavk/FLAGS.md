@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-120 switches.
+121 switches.
 
 ## Tracing
 
@@ -55,6 +55,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_NO_ABUF_BATCH` | bool (presence) | `off` | — | disable batching of A-buffer draws |
 | `CUDAVK_NO_PASS_EPISODE` | bool (value) | `off` | — | disable pass episodes: consecutive blended batches stop sharing one A-buffer build and drain |
 | `CUDAVK_UPLOAD_STATS` | bool (value) | `off` | — | count small host-to-device copies, clears, context syncs and upload ring wraps per call site, and report them at teardown |
+| `CUDAVK_DESTROY_CENSUS` | bool (value) | `off` | — | count and time every whole-device drain taken at object destruction, split by the call site that asked for it, so the application's own vkDeviceWaitIdle can be told apart from the driver's; reports at teardown |
 | `CUDAVK_NO_META_FOLD` | bool (value) | `off` | — | upload the vertex stage's vcount and stride as their own block again instead of carrying them in the argument block's scalar area |
 | `CUDAVK_NO_COUNTER_BLOCK` | bool (value) | `off` | — | clear the A-buffer's scalar counters one at a time again instead of clearing the whole counter block once per draw or episode |
 | `CUDAVK_NO_UPLOAD_COALESCE` | bool (value) | `off` | — | send one host-to-device copy per upload block again instead of one per launch boundary |

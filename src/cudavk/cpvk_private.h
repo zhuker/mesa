@@ -68,6 +68,30 @@ struct cpvk_physical_device {
 
 struct cpvk_pending_submit;
 
+/*
+ * The whole-device drains, by who asked for one.
+ *
+ * With the hardware texture cache on, destroying an image or a view, or
+ * freeing memory that still has bindings, drains the device -- and then the
+ * cache drains it again on its own account. Both the application's own
+ * vkDeviceWaitIdle and the driver's three internal ones land in the same
+ * function, so the wait census could not tell them apart, and the small
+ * operation census cannot see the cache's syncs at all (cpvk_texture_cache.c
+ * does not include cp_smallop_tele.h). This enum is what separates them.
+ *
+ * Counted only under CUDAVK_DESTROY_CENSUS. See docs/cudavk/FLAGS.md.
+ */
+enum cpvk_drain_site {
+   CPVK_DRAIN_APP,             /* the application's own vkDeviceWaitIdle */
+   CPVK_DRAIN_DESTROY_IMAGE,   /* cpvk_DestroyImage */
+   CPVK_DRAIN_DESTROY_VIEW,    /* cpvk_DestroyImageView */
+   CPVK_DRAIN_FREE_MEMORY,     /* cpvk_FreeMemory, when bindings remain */
+   CPVK_DRAIN_CACHE_IMAGE,     /* the cache's own sync, image destroy */
+   CPVK_DRAIN_CACHE_VIEW,      /* the cache's own sync, view destroy */
+   CPVK_DRAIN_CACHE_PURGE,     /* the cache's own sync, budget purge */
+   CPVK_DRAIN_SITES,
+};
+
 struct cpvk_device {
    struct vk_device vk;
    struct cpvk_physical_device *pdev;
@@ -160,6 +184,19 @@ struct cpvk_device {
    unsigned num_shaders, max_shaders;
    simple_mtx_t shader_cache_lock;
 
+   /*
+    * CUDAVK_DESTROY_CENSUS. `calls` counts arrivals at the site, `waits` the
+    * ones that really drained -- a destroy with the cache off, or a
+    * vkFreeMemory with no bindings, arrives without draining -- and `ns` is
+    * the host time blocked in that drain. `submits` divides the totals; these
+    * captures submit twice per frame (WORKFLOW.md 4.1).
+    */
+   struct {
+      uint64_t calls[CPVK_DRAIN_SITES];
+      uint64_t waits[CPVK_DRAIN_SITES];
+      uint64_t ns[CPVK_DRAIN_SITES];
+      uint64_t submits;
+   } drain_census;
 };
 
 /*
@@ -829,6 +866,20 @@ void cpvk_memory_note_unbind(struct cpvk_device *dev,
                              void *resource);
 
 VKAPI_ATTR VkResult VKAPI_CALL cpvk_DeviceWaitIdle(VkDevice device);
+
+/*
+ * The same drain the entry point takes, told which site asked. The entry
+ * point is CPVK_DRAIN_APP; the driver's own three name themselves, so that
+ * one counter can size the split the wait census could not.
+ */
+VkResult cpvk_device_drain(VkDevice device, enum cpvk_drain_site site);
+
+/* 0 when the census is off, which is what makes the note below a no-op. */
+uint64_t cpvk_drain_census_start(void);
+void cpvk_drain_census_note(struct cpvk_device *dev, enum cpvk_drain_site site,
+                            uint64_t started);
+void cpvk_drain_census_call(struct cpvk_device *dev, enum cpvk_drain_site site);
+void cpvk_drain_census_report(struct cpvk_device *dev);
 
 enum cp_texture_cache_result
 cpvk_texture_cache_resolve(void *private_data, uint64_t image_cookie,

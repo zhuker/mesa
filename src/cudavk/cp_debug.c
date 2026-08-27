@@ -179,6 +179,11 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_UPLOAD_STATS", CP_FLAG_BOOL_VALUE, F(upload_stats),
      "count small host-to-device copies, clears, context syncs and upload "
      "ring wraps per call site, and report them at teardown" },
+   { "CUDAVK_DESTROY_CENSUS", CP_FLAG_BOOL_VALUE, F(destroy_census),
+     "count and time every whole-device drain taken at object destruction, "
+     "split by the call site that asked for it, so the application's own "
+     "vkDeviceWaitIdle can be told apart from the driver's; reports at "
+     "teardown" },
    { "CUDAVK_NO_META_FOLD", CP_FLAG_BOOL_VALUE, F(no_meta_fold),
      "upload the vertex stage's vcount and stride as their own block again "
      "instead of carrying them in the argument block's scalar area" },

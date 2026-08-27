@@ -373,8 +373,9 @@ cpvk_DestroyImage(VkDevice _device, VkImage _image,
 
    if (image) {
       cpvk_memory_note_unbind(dev, image->mem, image);
+      cpvk_drain_census_call(dev, CPVK_DRAIN_DESTROY_IMAGE);
       if (cp_debug->texture_cache) {
-         cpvk_DeviceWaitIdle(_device);
+         cpvk_device_drain(_device, CPVK_DRAIN_DESTROY_IMAGE);
          cpvk_texture_cache_image_destroy(image);
       }
       vk_image_destroy(&dev->vk, pAllocator, &image->vk);
@@ -578,8 +579,9 @@ cpvk_DestroyImageView(VkDevice _device, VkImageView _view,
    CPVK_CTX_SCOPE(dev);
 
    if (view) {
+      cpvk_drain_census_call(dev, CPVK_DRAIN_DESTROY_VIEW);
       if (cp_debug->texture_cache) {
-         cpvk_DeviceWaitIdle(_device);
+         cpvk_device_drain(_device, CPVK_DRAIN_DESTROY_VIEW);
          cpvk_texture_cache_view_destroy(view);
       }
       if (view->image) {

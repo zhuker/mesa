@@ -313,6 +313,15 @@ struct cp_debug {
    struct cp_opt_int medium_threshold;
    struct cp_opt_int point_threshold;
    struct cp_opt_int tile_bound;
+
+   /*
+    * Instrumentation added after the rest, and deliberately last: a field
+    * inserted into one of the groups above moves every later offset, and the
+    * whole struct is read by cp_renderer.c and cpvk_cmd.c. Appending keeps
+    * those two objects byte-identical to the base, which is what lets a flag
+    * be shown inert at machine level rather than argued to be.
+    */
+   bool destroy_census;   /* CUDAVK_DESTROY_CENSUS; see cpvk_private.h */
 };
 
 /*

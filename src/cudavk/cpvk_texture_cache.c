@@ -795,8 +795,11 @@ cpvk_texture_cache_view_destroy(struct cpvk_image_view *view)
     * current; this used to set it and fold the result into `ok`. */
    bool ok = true;
    simple_mtx_lock(&dev->texture_cache_use_lock);
+   uint64_t started = cpvk_drain_census_start();
+   cpvk_drain_census_call(dev, CPVK_DRAIN_CACHE_VIEW);
    if (ok)
       ok = cuCtxSynchronize() == CUDA_SUCCESS;
+   cpvk_drain_census_note(dev, CPVK_DRAIN_CACHE_VIEW, started);
    simple_mtx_lock(&dev->texture_cache_lock);
    if (view->cache_cookie &&
        view->cache_cookie <= dev->texture_cache_view_count &&
@@ -895,7 +898,11 @@ cpvk_texture_cache_purge(void *private_data)
       return CP_TEXTURE_CACHE_PURGE_NONE;
    simple_mtx_lock(&dev->texture_cache_use_lock);
    simple_mtx_lock(&dev->texture_cache_lock);
-   if (cuCtxSynchronize() != CUDA_SUCCESS) {
+   uint64_t started = cpvk_drain_census_start();
+   cpvk_drain_census_call(dev, CPVK_DRAIN_CACHE_PURGE);
+   CUresult purge_sync = cuCtxSynchronize();
+   cpvk_drain_census_note(dev, CPVK_DRAIN_CACHE_PURGE, started);
+   if (purge_sync != CUDA_SUCCESS) {
       cpvk_cache_device_loss(dev);
       simple_mtx_unlock(&dev->texture_cache_lock);
       simple_mtx_unlock(&dev->texture_cache_use_lock);
@@ -931,8 +938,11 @@ cpvk_texture_cache_image_destroy(struct cpvk_image *image)
    struct cpvk_device *dev = image->dev;
    bool ok = true;
    simple_mtx_lock(&dev->texture_cache_use_lock);
+   uint64_t started = cpvk_drain_census_start();
+   cpvk_drain_census_call(dev, CPVK_DRAIN_CACHE_IMAGE);
    if (ok)
       ok = cuCtxSynchronize() == CUDA_SUCCESS;
+   cpvk_drain_census_note(dev, CPVK_DRAIN_CACHE_IMAGE, started);
    simple_mtx_lock(&dev->texture_cache_lock);
    ok &= cpvk_cache_drop_locked(image, NULL, NULL);
    if (image->writer_event) {

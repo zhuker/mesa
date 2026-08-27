@@ -18,6 +18,7 @@
 #include "vk_sync.h"
 #include "vk_util.h"
 #include "util/os_time.h"
+#include "util/u_atomic.h"
 
 /* Last: intercepts the CUDA entry points for the iteration 26 census. */
 #include "cp_smallop_tele.h"
@@ -156,6 +157,8 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    /* The census divides by this: these captures submit twice per frame, which
     * is the same paired-submit convention every timing number here uses. */
    cp_smallop_hit(__FILE__, __LINE__, CP_SMALLOP_SUBMIT, 0);
+   if (cp_debug->destroy_census)
+      p_atomic_inc(&dev->drain_census.submits);
 
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
@@ -610,6 +613,7 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    cpvk_batch_break_report();
    cp_context_cleanup(&dev->renderer);
    cpvk_texture_cache_report(dev);
+   cpvk_drain_census_report(dev);
    for (unsigned i = 0; i < dev->num_shaders; i++)
       cp_shader_binary_destroy(dev->shader_cache[i].bin);
    free(dev->shader_cache);
@@ -636,17 +640,110 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    vk_free(alloc, dev);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL
-cpvk_DeviceWaitIdle(VkDevice _device)
+/*
+ * CUDAVK_DESTROY_CENSUS: who asks for a whole-device drain, and what it costs.
+ *
+ * Instrumentation only. The wait census (docs/cudavk/PERFORMANCE.md) prices
+ * this site at 2.24 waits and 0.514 ms/frame blocked and calls it the only
+ * wait-bound site in the driver, but it cannot say whether those waits are the
+ * application's own vkDeviceWaitIdle or the three the driver takes when an
+ * image, a view or a bound allocation is destroyed. Nothing can be designed at
+ * the site until that split is known, and the split costs one counter.
+ *
+ * The clock is read only when the flag is on, so a run without it pays one
+ * predictable branch per destroy.
+ */
+uint64_t
+cpvk_drain_census_start(void)
+{
+   /* os_time_get_nano is CLOCK_MONOTONIC since boot, so 0 is free as "off". */
+   return cp_debug->destroy_census ? (uint64_t)os_time_get_nano() : 0;
+}
+
+void
+cpvk_drain_census_note(struct cpvk_device *dev, enum cpvk_drain_site site,
+                       uint64_t started)
+{
+   if (!started)
+      return;
+   uint64_t ns = (uint64_t)os_time_get_nano() - started;
+   p_atomic_inc(&dev->drain_census.waits[site]);
+   p_atomic_add(&dev->drain_census.ns[site], ns);
+}
+
+void
+cpvk_drain_census_call(struct cpvk_device *dev, enum cpvk_drain_site site)
+{
+   if (cp_debug->destroy_census)
+      p_atomic_inc(&dev->drain_census.calls[site]);
+}
+
+void
+cpvk_drain_census_report(struct cpvk_device *dev)
+{
+   if (!cp_debug->destroy_census)
+      return;
+   static const char *const names[CPVK_DRAIN_SITES] = {
+      [CPVK_DRAIN_APP]           = "app_wait_idle",
+      [CPVK_DRAIN_DESTROY_IMAGE] = "destroy_image",
+      [CPVK_DRAIN_DESTROY_VIEW]  = "destroy_view",
+      [CPVK_DRAIN_FREE_MEMORY]   = "free_memory",
+      [CPVK_DRAIN_CACHE_IMAGE]   = "cache_image_sync",
+      [CPVK_DRAIN_CACHE_VIEW]    = "cache_view_sync",
+      [CPVK_DRAIN_CACHE_PURGE]   = "cache_purge_sync",
+   };
+   /* Two submits per frame is the convention every number here uses. */
+   double frames = dev->drain_census.submits / 2.0;
+   if (frames <= 0.0)
+      frames = 1.0;
+   uint64_t total_waits = 0, total_ns = 0;
+   fprintf(stderr, "cudavk: drain census over %.1f frames (%" PRIu64
+           " submits)\n", frames, dev->drain_census.submits);
+   for (unsigned s = 0; s < CPVK_DRAIN_SITES; s++) {
+      uint64_t calls = dev->drain_census.calls[s];
+      uint64_t waits = dev->drain_census.waits[s];
+      uint64_t ns = dev->drain_census.ns[s];
+      total_waits += waits;
+      total_ns += ns;
+      fprintf(stderr, "cudavk:   %-17s calls=%" PRIu64 " drains=%" PRIu64
+              " blocked_ms=%.3f per_frame=%.3f blocked_ms_frame=%.4f\n",
+              names[s], calls, waits, ns / 1.0e6, waits / frames,
+              ns / 1.0e6 / frames);
+   }
+   fprintf(stderr, "cudavk:   %-17s calls=- drains=%" PRIu64
+           " blocked_ms=%.3f per_frame=%.3f blocked_ms_frame=%.4f\n",
+           "TOTAL", total_waits, total_ns / 1.0e6, total_waits / frames,
+           total_ns / 1.0e6 / frames);
+}
+
+/*
+ * Exactly what the entry point did, including its own context scope: the
+ * three internal callers already hold one, so this push is redundant and was
+ * redundant before, and it is kept so that the census arm differs from the
+ * base only by counters.
+ */
+VkResult
+cpvk_device_drain(VkDevice _device, enum cpvk_drain_site site)
 {
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    CPVK_CTX_SCOPE(dev);
 
+   uint64_t started = cpvk_drain_census_start();
    if (cuCtxSynchronize() != CUDA_SUCCESS)
       atomic_store_explicit(&dev->device_lost, true, memory_order_release);
    cpvk_submit_wait_pending(dev);
+   cpvk_drain_census_note(dev, site, started);
    return atomic_load_explicit(&dev->device_lost, memory_order_acquire)
       ? vk_error(dev, VK_ERROR_DEVICE_LOST) : VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+cpvk_DeviceWaitIdle(VkDevice _device)
+{
+   VK_FROM_HANDLE(cpvk_device, dev, _device);
+
+   cpvk_drain_census_call(dev, CPVK_DRAIN_APP);
+   return cpvk_device_drain(_device, CPVK_DRAIN_APP);
 }
 
 /*
@@ -924,8 +1021,9 @@ cpvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
    if (!mem)
       return;
 
+   cpvk_drain_census_call(dev, CPVK_DRAIN_FREE_MEMORY);
    if (cp_debug->texture_cache && mem->bindings)
-      cpvk_DeviceWaitIdle(_device);
+      cpvk_device_drain(_device, CPVK_DRAIN_FREE_MEMORY);
    while (mem->bindings) {
       struct cpvk_memory_binding *binding = mem->bindings;
       struct cpvk_memory_binding *next = binding->next;
