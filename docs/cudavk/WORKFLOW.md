@@ -123,14 +123,22 @@ application, both replayed with no display server:
 
 | name | file | shipping default, paired-submit median |
 |---|---|---:|
-| old capture | `~/headless_streamer_20260814T155742.gfxr` | **15.7514 ms** |
-| Crossroads | `~/headless_streamer_1818_20260817T173522.gfxr` | **5.8982 ms** |
+| old capture | `~/headless_streamer_20260814T155742.gfxr` | **12.7826 ms** |
+| Crossroads | `~/headless_streamer_1818_20260817T173522.gfxr` | **5.6936 ms** |
 
-Both figures are the median of run medians of the shipping default measured
-alone in one session — six runs on old, four on Crossroads — in
-`docs/cudavk/history/PERF16_ITERATIONS.md`, "The standing default, stated as a
-distribution". A complete old-capture replay is **3,022 submits**
+Both figures are the median of run medians of the shipping default, measured
+alone in one session with strictly alternating arms — six runs on old, four on
+Crossroads — on the tip that landed PDL
+(`docs/cudavk/history/perf-2026-08-27/pdl_landing.md`;
+`docs/cudavk/PERFORMANCE.md` §1 states the distribution). A complete old-capture
+replay is **3,022 submits** and a Crossroads replay is **2,994**
 (`iterations.json`, status note).
+
+**This table has been wrong twice by being left alone**, so check it against
+`PERFORMANCE.md` §1 before quoting it. It carried **15.7514 / 5.8982** until
+2026-08-26, which is this driver with the opaque episode fan-out reverted, and
+**13.1626 / 5.8230** is the same driver again before PDL landed. Two scheduling
+commits, 3.06 ms, no work removed by either.
 
 `docs/cudavk/GFXRECONSTRUCT.md` is how a capture is taken, read and turned
 into frames. To replay one:
@@ -237,7 +245,8 @@ surprisingly good.
 ### 4.5 Other standing rules
 
 * **Nothing else on the GPU.** Two passes sharing the card measure each other.
-  `nvidia-smi --query-compute-apps=pid` is the check; `cp_iterate.sh` warns.
+  `nvidia-smi --query-compute-apps=pid` is *not* a sufficient check on its own —
+  see §4.11, which is the strong form of this rule.
 * **Record the arms.** `arms.txt` naming candidate, control and base
   environment is written before the runs, so a later reader can tell what was
   actually set.
@@ -255,6 +264,133 @@ surprisingly good.
   the loads it had just made dead and reported a 17% win that did not exist.
   Keep the work observable, and read the generated code when a probe looks too
   good (`TESTING.md`, "Traps").
+
+### 4.6 Attribute a site by caller before you rank it
+
+**A site's ceiling is not the ceiling of any one caller of that site.** The
+2026-08-27 destruction-drain item was ranked first at 0.22 ms/frame on the
+strength of the `vkDeviceWaitIdle` site's censused 0.514 ms/frame, and a
+per-caller census then found the driver owned **3.0% of it by blocked time**
+while owning **55.5% of it by call count** — the two disagree by 18×, in the
+direction that kills the lead, because the driver's own drains arrive at a
+device that is already empty (`DEAD_ENDS.md` §17).
+
+A census that counts calls can agree with the API trace to the unit and still
+mislead by two orders of magnitude on cost. Split by caller *first*; it is one
+counter per call site.
+
+### 4.7 A conversion is a property of the site, and adding is not removing
+
+Two separate rules, and both were paid for.
+
+**A conversion cannot be carried between sites.** Injecting host time at a site
+and reading the slope of frame time against it gives the site's own conversion.
+The four measured in this driver are **episode drain +1.02, segment counters
++1.03, `vkDeviceWaitIdle` +0.44, peel checks −0.03** (`PERFORMANCE.md` §5.2b).
+That range spans everything from "one for one" to "free", inside one driver, so
+a factor taken from one site says nothing about another. The 11% figure this
+project briefly carried was a property of one rejected *patch*, not of a site,
+and is retired.
+
+**The add direction and the remove direction are different measurements.**
+Injection measures *adding* host time, because a wait cannot be shortened
+without a mechanism. To measure the remove direction, move the injected spin to
+the **other side** of the wait, so the probe becomes the exact inverse of the
+mechanism, at the same site, in the same units — and keep the original
+placement as the **positive control**, which must reproduce the published
+add-direction slope. At the episode drain that is +1.02 after the sync (control)
+against 0.065 before it at D = 125 µs (result)
+(`history/perf-2026-08-27/item2_p0_results.md`).
+
+### 4.8 A census divided by a frame count is a MEAN; the frame convention is a MEDIAN
+
+Any instrument that sums over a whole replay and divides by the frame count
+includes start-up and shader compilation. §4.1's frame is a hot-tail median. On
+the old capture the same replay is **20.305 ms mean against 13.163 ms median —
+they differ by 54%** (both of that census's own pre-PDL replay; compare a mean
+and a median from the *same* run, never across runs).
+
+So a census's `ms/frame` and this document's `ms/frame` are not the same unit.
+State which one a number is, and never form a percentage from one over the
+other: 2.066 ms/frame of drain ceiling is 10.2% of the mean frame, not 15.7% of
+the median one. **Ratios inside one census are safe**, being two sums over the
+same interval.
+
+### 4.9 Check a profiled window against `PERFORMANCE.md` §5.1 before reading it
+
+A capture is not homogeneous, and `nsys --duration` samples a **phase**, not the
+capture. Two windows of one replay disagreed **50×** on the launch count of the
+class under study — an 8-second window from process start reported
+`cp_rasterize_stage3_abuf` at 2.0 launches/frame, and a window at `--delay=12`
+reported 100.6 against §5.1's 134.6. The first was a peel-heavy phase and was
+discarded rather than reported.
+
+The same trap fires on kernel *mix*: a 900-launch window had a stage3:`_abuf`
+ratio of 5.62:1 against §5.1's 0.55:1, a **10.1×** disagreement, because those
+launches were the first four or five frames. Multiplying a start-up fraction by
+a steady-state count produces a number with two incompatible parents.
+
+**So: print the window's per-frame launch counts, compare them against §5.1, and
+say so, before any number comes out of that window.** Both artefacts above were
+caught this way, one of them by the agent auditing its own result.
+
+### 4.10 Register several falsifiers, not one
+
+A single falsifier is either falsely reassuring or falsely alarming depending
+which one you happen to pick, and **you cannot tell which until they disagree**.
+The worked example is ours: of three registered falsifiers one fired, the
+conclusion held anyway, and the disagreement is what revealed that the fired one
+was measuring *population* where the question was *work*. With only that
+falsifier a dead lead would have been designed; with only the surviving one the
+right answer would have rested on a reason that could not be defended.
+
+Register them before the run, in writing, with the bar each one has to cross.
+This is the most transferable rule in this file and it has nothing to do with
+this driver.
+
+### 4.11 The GPU must be exclusively ours, and a point check cannot prove it
+
+**A point-in-time `nvidia-smi` cannot see a tenant that runs as a rapid series
+of short processes.** One did exactly that during the 2026-08-27 session — a
+foreign `vpxenc` batch in **four bursts** over a 2,156-sample log — and an
+earlier single point check landed in a gap and missed it.
+
+The procedure, and every part of it earns its place:
+
+1. **Sample at 1 Hz for the whole measurement window**, not before it. The
+   reusable sampler is `history/perf-2026-08-27/tools/gpu_watch.sh`.
+2. **Gate the start**: do not begin a run while the log shows a foreign process.
+3. **Audit every entry afterwards**, not just the first and last.
+4. **Report exclusivity positively** — *"N samples over the window, nothing but
+   our own processes"* — never *"the card looked idle"*. A negative claim about
+   a sampler you did not run is not evidence.
+
+A run that overlaps a foreign burst is discarded and repeated, not annotated.
+
+One result of that session is robust by construction and is worth knowing as a
+pattern: a time-slicing tenant **cannot** produce a sustained
+`sm__cycles_active.max` equal to 99.7% of elapsed on our own kernel, so that
+particular finding did not depend on the sampler at all. Where such an argument
+exists, state it; where it does not, the sampler log is the evidence.
+
+### 4.12 Never read a predictor's accuracy from a run in which the predictor drives the schedule
+
+The peel ring's key stability reads **96.6% stable with `CUDAVK_PEEL_PREDICATE=1`
+and 82.0% with it off** (`history/perf-2026-08-27/peel_closed.md`). The flag-on
+figure is an artefact: the ring records the prediction it was handed, so
+"predicted exactly" is self-fulfilling and "predicted high" is invisible, because
+the loop simply runs to the prediction.
+
+**Had the accuracy question been read from the flag-on runs, the conclusion would
+have been "the ring is excellent and the design is sound" — the opposite of the
+truth**, and it would have reopened a lead that three other measurements had
+closed. This is the rule that *saved* a conclusion rather than one that explains
+a failure, which is why it is worth its own line.
+
+The general form: **if a mechanism's output feeds back into what the mechanism
+is measured against, the measurement is circular.** Read the predictor's accuracy
+from a run where something else decides the schedule, and treat a
+suspiciously good self-reported accuracy as a symptom rather than a result.
 
 ---
 
@@ -625,3 +761,15 @@ which is not durable:
 
 Anything from there that a later decision will depend on should be copied into
 `docs/cudavk/` before it is needed.
+
+The 2026-08-26/27 session did that: its 52 reports are **in the tree** at
+`docs/cudavk/history/perf-2026-08-27/`, with `SESSION_HANDOFF.md` as the
+consolidated form and `SESSION_INDEX.md` as the file map. Its reusable
+instruments are under `history/perf-2026-08-27/tools/`:
+
+| tool | what it is for |
+|---|---|
+| `gpu_watch.sh` | the 1 Hz exclusivity sampler §4.11 requires |
+| `decisive_ab_ts.sh` | strictly alternating arms with timestamps, for §4.2 |
+| `drain_probe_full.diff` | the 569-line drain/episode instrumentation, reverted from the tree |
+| `pdl_launch_cost.cpp`, `wide_bench.cu` | the launch-price microbenchmarks behind `PERFORMANCE.md` §4 |

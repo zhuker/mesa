@@ -5,7 +5,10 @@ work, and what is left. Read this before choosing what to optimise next.
 
 Every number here comes from a measurement that is named beside it. The long
 form of each one is in `history/PERF16_ITERATIONS.md` (the iteration record) and
-in the raw evidence under `/tmp/perf16/`. Approaches that are closed are in
+in the raw evidence under `/tmp/perf16/`. The 2026-08-26/27 measurement session
+is archived **in the tree**, 52 reports plus its reusable instruments, at
+`history/perf-2026-08-27/`; entries below cite it by filename, and
+`history/perf-2026-08-27/SESSION_HANDOFF.md` is its consolidated form. Approaches that are closed are in
 `DEAD_ENDS.md`; open questions are in `TODO.md`; how to run a measurement is in
 `WORKFLOW.md` and `TESTING.md`.
 
@@ -20,9 +23,24 @@ Two GFXR captures carry the work:
 
 ## 1. Where the driver is today
 
-The shipping default, measured alone — no arms, no flags beyond the base
+**Today's shipping default is old 12.7826 ms and Crossroads 5.6936 ms**, with
+programmatic dependent launch landed and on by default at level 3
+(`6e6e00968ca`; level 4 is offered as a diagnostic in `b9766f720a4`). Those are
+the candidate arm of the decisive PDL run on the final tip `b9766f720a4` — 6
+runs per arm on old and 4 on Crossroads, all 20 full length at 3,022 / 2,994
+submits, one stdout hash per capture across both arms, arms non-overlapping, IQR
+[12.7632, 12.8075] and [5.6868, 5.7007]
+(`history/perf-2026-08-27/pdl_landing.md`).
+
+**The two measurements below are the pre-PDL baseline** at `e2fea470d04`, and
+they are kept because §3, §5, §5.2b and every census in this document are
+anchored to them. They are directly comparable to the figure above: the PDL
+run's own control arm reads **13.1641** against the 13.1626 measured here in a
+different session hours earlier — **1.5 µs apart.**
+
+The pre-PDL driver, measured alone — no arms, no flags beyond the base
 environment, one session, three replays of each capture at `e2fea470d04`
-(`/tmp/perf-audit/reprofile_baseline.md`):
+(`history/perf-2026-08-27/reprofile_baseline.md`):
 
 | capture | run medians (ms/frame) | median | IQR | full range |
 |---|---|---:|---|---|
@@ -145,7 +163,8 @@ with.
   hot-tail MEDIAN.** An instrument that sums over a whole replay and divides by
   a frame count includes start-up, shader compilation and teardown. On the old
   capture the two differ by 54%: the mean paired-submit interval is **20.305
-  ms** and the skip-50 median is **13.163 ms**, because the largest single
+  ms** and the skip-50 median is **13.163 ms** — both of the census's own
+  pre-PDL replay, which is the pair to compare — because the largest single
   interval in the replay is 1,781 ms of shader compilation. Checked, not
   assumed: §5.2b's `blocked + issued = 20.33 ms/frame` lands on the 20.305 ms
   wall span to 0.1%, which is one thread accounting for all of its own time —
@@ -189,10 +208,14 @@ Old-capture paired-submit median, one row per iteration that moved it.
 | iteration 27 — vertex fetch fused into the vertex shader | 16.0194 | **+0.49 ms**: −194.3 launches, −194.3 clears (−84.9 MB), −192.0 copies per frame |
 | iteration 28 — A-buffer support chain in two static fusions | 15.7514 | **+0.22 ms**: −91.1 launches and −27.4 clears per frame, −49.9 MB of clear traffic |
 | `20611f5b131` — opaque episode segment fan-out made the default | **13.1626** | **+2.73 ms**: no operation removed at all — the episode drain's mean wait falls 0.874 → 0.606 ms because an episode's 12.42 segments now overlap on the side streams. Crossroads gains 0.08 ms, because its episodes average 1.71 segments |
+| `6e6e00968ca` — programmatic dependent launch on by default at level 3 | **12.7826** | **+0.38 ms**: again no operation removed — a dependent kernel may start before its predecessor has drained. Crossroads gains 0.15 ms. Decisive instrument, p = 0.0011 / 0.0143 |
 
-That last row is the only one in this table that bought its milliseconds by
-**overlapping** work rather than by removing it, and it is the largest single
-row since the texture cache.
+**The last two rows are the only ones in this table that bought their
+milliseconds by overlapping work rather than by removing it**, and together they
+are 3.11 ms — the second largest block in the table after the texture cache.
+They are also why the earlier rows must never be quoted as today's frame:
+anything above 12.7826 is a driver at least one mechanism out of date, and the
+15.7514 that stood in this document until 2026-08-26 was two.
 
 Iteration 24 was kept opt-in and became the default later; iteration 14's
 same-LLVM fragment architecture is still opt-in (`CUDAVK_INLINE_FS`). Eighteen
@@ -215,6 +238,9 @@ has never survived contact with a measurement.
 | copies merged at an unchanged boundary | **0.59 µs** | iteration 26 S3: +0.2979 ms over 502.5 copies on old |
 | small clear | **0.66–1.01 µs** | iteration 26 S2 (0.66 old, 0.75 Crossroads) and S4 (0.16 old, 1.01 Crossroads) |
 | bare same-stream launch | **under 1 µs** (take 0.6–1.0) | iteration 27: 0.512–0.529 ms measured, of which 0.241 ms is priced clears and merged copies and 0.065 ms is 84.9 MB never written, leaving 0.13–0.21 ms for 194.3 launches |
+| **a real chain launch removed** | **0.78–0.81 µs** | 2026-08-27, three instruments (`history/perf-2026-08-27/wide_bench.md` §7): spread injection, frame slope over its linear region, **0.782 µs, 95% CI [0.633, 0.949]**; union idle in front of a real chain kernel, nsys over 955,301 kernels, **0.809 µs**; and the row above at 0.6–1.0 |
+| **an exposed launch added** | **1.974 µs** | same session, same probe run bunched instead of spread: least squares over 15 points, 1.9745 µs/launch, against a back-to-back empty-kernel floor of 2.047 µs. Not one of 1.21 million injected launches had a kernel in front of it |
+| **a launch removed from a population that was running concurrently** | **the credit is divided by the overlap factor, and can invert** | 2026-08-27: the wide raster merge removed 298.8 launches/frame and cost **0.410 ms/frame**, an implied −1.372 µs per launch removed. See the overlap factor below and `DEAD_ENDS.md` §22 |
 | device operation that also carries bandwidth or a whole pass | **about 1.86 µs** | iteration 28 item 4: 0.2208 ms over 91.1 launches and 27.4 clears, whose clears carried 49.9 MB/frame and whose compaction pass over 230,400 blocks stopped running |
 | idle 256-thread block | **under 0.2 ns** | iteration 27 grid sweep: 306,686 fewer blocks scheduled per frame cost less than 0.06 ms |
 | kernel-to-kernel dependency **overlapped**, secondary with no preamble | **0.44 µs** (old), **0.84 µs** (Crossroads) | PDL level 2 against level 1: +0.1859 ms over 421.50 converted links on old, +0.0686 ms over 81.95 on Crossroads. Every secondary here reads the queue its predecessor filled as its first instruction, so this is the inter-grid gap alone |
@@ -276,14 +302,67 @@ a fixed per-episode cost is nearly three times the share of its frame. Fixed-cos
 removals keep favouring Crossroads; launch-count and fragment-side work keep
 favouring old.
 
+### The launch has two prices, and they are the same cost measured either side of the hiding
+
+A sixth rule, and it decides how every launch-count lead in this document is
+quoted. **0.78–0.81 µs is the price of REMOVING a real launch; 1.974 µs is the
+price of ADDING an exposed one.** The front end costs about 2 µs per launch and
+it is hidden when the kernel in front of it runs long: **74.9% of real chain
+kernels start with zero union idle**, while the bunched injection put 1.21
+million launches on an empty queue where nothing could hide them.
+
+**Quote a launch-removal lead as the range 0.78–0.81 µs, never as the 1.974
+floor and never as the 0.6 bottom edge of the older row.** The difference is not
+academic — at 1.974 µs the launch axis would have led the 2026-08-27 ranking; at
+0.782 it ranks behind the episode drain (554 legally mergeable launches × 0.782
+= 0.433 ms/frame). An earlier reading of that run quoted 1.974 as *the* marginal
+price; that reading is withdrawn by its own author in the same document.
+
+### The overlap factor: the quantity that decides whether a merge pays at all
+
+A count of launches is not a forecast until it is divided by how concurrent
+those launches already are. **Overlap factor = summed kernel time ÷ union of
+kernel intervals** over the population under study — 1.00 means strictly serial,
+and the launch price applies in full; anything above 1 means the launches are
+already running together and the credit is scaled by the serial fraction
+`1/overlap`.
+
+Measured on the shipping default (PDL 3, fan-out on), two nsys windows agreeing
+to 2.5%, gated first against §5.1's 1,314.2 launches/frame
+(`history/perf-2026-08-27/item4_countphase_overlap.md`):
+
+| population | overlap factor |
+|---|---:|
+| `cp_rasterize_stage3_abuf` alone — 53% of the count-phase triple's time | **1.89×** |
+| `cp_clip_rast_fused_abuf` alone | 1.44× |
+| `cp_rasterize_stage2_abuf` alone | 1.22× |
+| the three A-buffer count-phase stages, time-weighted | **1.59×** |
+| the abuf count-phase triple taken as a group | 2.50× |
+| the opaque/direct triple taken as a group | **2.68×** |
+| all kernels | 1.80× |
+
+Two readings that are easy to get wrong:
+
+1. **Use the per-stage SELF-overlap, not the group's.** A merge of "the same
+   stage across the segments of one episode" concatenates that stage's own
+   population; it does not remove the pipelining between *different* stages, so
+   the group figure flatters it. Here that is 1.59× time-weighted rather than
+   2.50×.
+2. **The scaled credit is the ceiling, not the answer.** Scaling the count-phase
+   merge's 0.433 ms/frame by 1/1.59 gives about 0.16 ms — *before* subtracting
+   the device cost of the merged form, which was measured to be larger than
+   that. See `DEAD_ENDS.md` §22 for the rule this produced.
+
 ---
 
 ## 5. Where the frame goes today
 
 §5.1 comes from `/tmp/perf16/iter28-profile/report.md`, taken at `ba8891878df`
 — that is before iteration 28 item 4 and before the fan-out default, so the
-frame is 15.99 ms there and 13.16 ms now. §5.2 has been re-derived at
-`e2fea470d04` and states both arms.
+frame is 15.99 ms there, 13.16 ms at `e2fea470d04` and **12.78 ms with PDL
+landed**. §5.2 has been re-derived at `e2fea470d04` and states both arms. Every
+share and every census in §5 is anchored to the 13.16 ms pre-PDL frame, so a
+share taken from here and applied to today's 12.78 ms frame is out by 3%.
 
 **The launch counts in §5.1 are stale by a known amount and no more.** The
 driver's own counter reads **1,314.2 launches/frame on old and 346.0 on
@@ -341,6 +420,30 @@ Read the column as a share, not as a budget.
 Crossroads has the same shape at a smaller scale: 439 kernels/frame, 3.157 ms of
 kernel time, raster chain 1.63 ms of that (51.6%), 815 device operations.
 
+**A class's share of this table is NOT its share of the frame, and the gap is
+large.** Only **16.7%** of `cp_rasterize_stage3_abuf`'s time is *exclusive* —
+83.3% of it already has another kernel running. Shrinking every launch of it and
+recomputing the union of all kernel intervals over a window checked against this
+table (`history/perf-2026-08-27/tiling_ncu.md`):
+
+| change | device busy removed |
+|---|---:|
+| `stage3_abuf` 2× faster | **0.187 ms/frame** |
+| `stage3_abuf` 4× faster | 0.288 ms/frame |
+| `stage3_abuf` **infinitely** fast | **0.404 ms/frame** |
+| whole raster chain 2× faster | 0.763 ms/frame |
+| whole raster chain **deleted** | **2.106 ms/frame** |
+
+The raster chain is 54.7% of kernel time in the table above, and **deleting all
+of it returns 2.1 ms of device busy time** — and device time is not frame time,
+because §5.2 has the host blocked 73.7% of the frame and the site's own slope
+decides what a device saving is worth.
+
+**So size a kernel-side lead as `class time × exclusive fraction`, then apply
+the site's measured slope. Never from the share in this table.** This is the
+generalisable result of the 2026-08-27 tiling audit, and it is why entry 24 of
+`DEAD_ENDS.md` refuses a mechanism whose whole best case is 2.1–2.6 ms.
+
 ### 5.2 The finding that matters most: it is a ping-pong, not a pipeline
 
 | old capture, per frame | ms | share | reverted arm | earlier profile |
@@ -386,8 +489,8 @@ Plus `vkDeviceWaitIdle` → `cuCtxSynchronize` 2.24 times a frame and one blocki
 ms/frame over 8.26 waits** — unchanged by the fan-out (2.591 reverted) and equal
 to the earlier figure of 2.580 — of which the episode drain is 2.129 ms over
 5.57 waits and the segment counters 0.428 ms over 1.69. **Crossroads runs no
-peel checks at all**: that counter is zero on every run, so §6 item 1 has to be
-justified on the old capture alone.
+peel checks at all**: that counter is zero on every run, so §6 item 1 was an
+old-capture-only lead before it was closed.
 
 **Every one of these waits is a read-back-and-decide**: the drain copies six
 counters plus the per-segment quad counts to the host and branches on overflow
@@ -456,7 +559,8 @@ the quad counters:
 **Every per-frame figure in these two tables is MEAN-based** — the census sums
 over the whole replay and divides by the frame count, so it includes start-up
 and shader compilation, while this document's frame time is a hot-tail median.
-On the old capture that is 20.305 ms mean against 13.163 ms median. So
+On the old capture that is 20.305 ms mean against 13.163 ms median — both from
+the census's own pre-PDL replay, which is the right pair to compare. So
 **2.066 ms/frame is 10.2% of the mean frame**, not 15.7% of the median one, and
 it must be quoted with that attached. The **ratio** columns — ceiling as a share
 of blocked, gap-bound versus wait-bound — are unaffected, being ratios of two
@@ -509,6 +613,17 @@ has since retired. At their measured slopes they are worth about **0.26 and
 0.22 ms/frame** — each comparable to a whole accepted iteration — so they are
 **sized, and open**, not closed. Only the peel site is closed on its conversion.
 
+**Correction, 2026-08-27: `vkDeviceWaitIdle`'s 0.22 ms/frame is almost all the
+application's own call, not the driver's.** A per-caller census
+(`CUDAVK_DESTROY_CENSUS`, both captures, agreeing with this census to 0.00% —
+1,510 + 814 + 1,067 = 3,391 exactly) splits the site: the application's own
+`vkDeviceWaitIdle` blocks 0.4847 ms/frame at 485.0 µs per drain, `destroy_view`
+0.0149 at 21.1 µs, and `destroy_image` 0.0001 at **0.28 µs**. The driver's share
+is **3.00% on old and 0.24% on Crossroads**, which at this site's +0.44 slope is
+**0.0066 ms/frame**. What is left of the 0.22 is a call the application makes and
+the driver cannot defer. See `DEAD_ENDS.md` §17 and `WORKFLOW.md` §4.6:
+**attribute a site by caller before ranking it.**
+
 **The three are unlikely to be additive.** The segment-counter sweep saturates:
 its point slopes run 1.16, 1.03, 0.80 as injection rises from 0.25 to 1.00
 ms/frame, which is the host running out of slack elsewhere. Recovering time at
@@ -545,7 +660,74 @@ Ranked by value. "Supported" means a measurement in this project points at the
 number; "estimate" means it is a forecast from the price table and has not been
 measured.
 
-### 1. Peel checks — 0.20–0.50 ms, risk medium, estimate
+### 0. What bounds everything below: the device is not full, and never has been
+
+Read this first, because it sizes the whole section. `nsys --gpu-metrics` with
+no CUDA tracing, 60,163 samples over a window checked against §5.1
+(`history/perf-2026-08-27/tiling_ncu.md`):
+
+| counter | over the whole window | over busy samples |
+|---|---:|---:|
+| GR Active | **81%** | 87% |
+| SMs Active | **20%** | 31% |
+| SM Issue | **3%** | 4% |
+| compute warps in flight | 5 per cycle | |
+| DRAM read / write | **1% / 1%** | |
+
+The engine is occupied four fifths of the time, a fifth of the SMs have work,
+and those SMs issue on 3% of their cycles. **And this has not moved since
+iteration 1.** The baseline at `5ebc37aa36e` recorded 85–96% GR-active, SM issue
+3–7%, ~25% SMs active and 5 warps in flight, on the same capture with the same
+instrument (`nsys --gpu-metrics`, what `cp_profile.sh METRICS=1` runs), so the
+quantities are comparable. The frame went 24.53 → 13.16 ms (−46%, and −47.9% at
+today's post-PDL 12.78; this audit ran at the pre-PDL `e2fea470d04`) across every
+accepted change in §3 — the register-cap trials, the three fusions, the texture
+cache, the small-operation work, the A-buffer fusions, the fan-out, PDL — and
+**the machine's utilisation profile is where iteration 1 found it.**
+
+**Every millisecond this driver has won was won by issuing less, or by
+overlapping what it issues. None of it was won by filling the GPU.** A lead
+whose argument is "the GPU is empty, give it more work" has to explain why
+forty-six percent of the frame came out without any of these counters moving.
+Size kernel-side leads with §5.1's exclusive-fraction rule and host-side leads
+with the site's own slope.
+
+**And width is not the missing lever.** The driver already launches 12.05
+waves/SM in FS main (grids of 1,025–4,096) and issues on **3.64%** of cycles,
+against 1.25–1.80% for the 0.15–0.60 wave raster launches, while a synthetic
+kernel at 2.45 waves reached **59%**. **The warps are resident and stalled, not
+absent.** Width moves occupancy from 6–14% to 26–78% and buys back the launch;
+it does not move issue. Nor are bigger blocks the lever: at 1,000 items all four
+block sizes land on the same time, and 64-thread blocks are fastest at maximum
+width (`history/perf-2026-08-27/wide_bench.md`).
+
+### The ranking after the 2026-08-27 session
+
+| # | lead | status |
+|---|---|---|
+| 1 | let the host run past the episode drain (item 4 below) | **LIVE.** Site ceiling 2.066 ms/frame; the built run-ahead mechanism's own censused ceiling is **0.387 ms/frame**, 0.092 of it converted today at ≈1.0, and the gap is scheduling, not capacity |
+| 2 | segment counters ≈0.26 ms/frame, `vkDeviceWaitIdle` ≈0.22 | sized and open, unlikely to be additive with 1 — **but see the correction under item 4**: the driver's own share of the `vkDeviceWaitIdle` site is 3.0%, worth 0.0066 ms/frame |
+| 3 | fuse `cp_fs_writeback` into the fragment shader (item 3 below) | **PARKED** at about 0.04 ms on a correctness failure |
+| — | peel checks (item 1 below) | **CLOSED**, 0.00 ms |
+| — | widen the `bounded` fast path (item 2 below) | **CLOSED**, 0.00 ms |
+| — | launch-count merges, kernel stalls, object-destruction drains, tiling v2 | **CLOSED**, see `DEAD_ENDS.md` §17–§24 |
+
+### 1. Peel checks — **CLOSED, 0.00 ms, measured**
+
+**The 0.20–0.50 ms estimate this document carried is retracted.** It is left
+here in full because the design below is still the best written record of the
+site, and because the retraction is itself evidence: the estimate was never
+supported by anything but the size of the wait.
+
+Three independent measurements closed it (§7 has them in full): a perfect
+predictor still pays 1.093 checks/frame of today's 1.706; the census puts the
+deferral ceiling at 0.301 ms/frame with the device already busy at **every one
+of 2,577 checks**; and `CUDAVK_WAIT_SPIN_US` injects up to 2.05 ms/frame of host
+time at that exact site for a frame slope of **−0.03**. Adding host time there
+is free, which is the same statement as removing it being worthless.
+
+What follows is the design as it stood, and the wait figures it was written
+from.
 
 2.751 ms/frame of blocked host over only 1.70 waits, at **1.614 ms each** — the
 most expensive single wait in the driver, and the best ratio of value to blast
@@ -638,7 +820,8 @@ disproves six million times.**
 still open, and the largest single item in the driver.** §5.2b censused every
 host block and measured each live site's conversion; four sites close, and the
 other two open ones — segment counters ≈0.26 ms/frame and `vkDeviceWaitIdle`
-≈0.22 — are an order of magnitude smaller than this one. The drain's
+≈0.22, of which only **0.0066 is the driver's own** (§5.2b, correction of
+2026-08-27) — are an order of magnitude smaller than this one. The drain's
 ceiling is **2.066 ms/frame on old** (34.3% of its blocked time) and **0.757 on
 Crossroads** (35.6%), and it is **gap-bound on 10,819 of 14,932 waits**, so on
 72% of drains the host has issue work in hand and the wait is the shorter term.
@@ -677,11 +860,128 @@ response is the skip-50 median frame, so a slope of 1.02 measures the transfer
 between the two conventions at this site and finds it at par. §5.2b's 2.066
 ms/frame therefore does **not** need discounting for the median convention.
 
-**What is still unproven** is symmetry: the probe measures the *add* direction.
-At peel both directions agree (~0 added, ~0.30 ceiling, device never idle), but
-at the drain only the add direction is measured. A deferral mechanism still has
-to be built and measured. What has changed is that its ceiling is no longer
-discounted by a factor that turns out not to exist.
+**The symmetry caveat is retired at this site, 2026-08-27.** Every wait-site
+number above is an *add*-direction measurement, and the add and remove
+directions are different measurements. P0 measured the remove direction directly
+by moving the existing injected spin to the **other side** of the drain's sync,
+so the probe becomes the exact inverse of the mechanism, at the same site, in
+the same units (`history/perf-2026-08-27/item2_p0_results.md`; 28 replays, arms
+strictly alternating on one binary, 931 sampler observations with none foreign,
+3,022 submits and one stdout sha on all 28 runs, injection line read on every
+run — 14,932 injections, µs wanted against µs spun agreeing to 0.1%):
+
+| D, µs injected per drain | 62 | 125 | 250 | 500 | 1000 |
+|---|---:|---:|---:|---:|---:|
+| slope, spin **after** the sync (positive control) | 0.992 | 1.045 | 1.050 | 1.025 | 1.026 |
+| slope, spin **before** the sync (the mechanism's direction) | **0.034** | **0.065** | 0.257 | 0.413 | 0.589 |
+
+The after-arm is the positive control and it reproduces the published +1.02, so
+the port is right. The registered bar was "slope at D=125 below 0.25"; measured
+**0.065**, four times inside it. **Host work moved to just before this drain is
+absorbed by the wait rather than added to the frame** — about 1.24 ms/frame of
+relocatable work for under 0.08 ms/frame of cost.
+
+A second, independent instrument agrees: the driver's own episode-drain counter
+is unchanged at every D in the after arm, and in the before arm it *falls* by
+what was injected — 98.9% absorbed at D=62, 6,419 of 14,932 ms at D=1000. And
+the decoy control did not fire: 238,912 and 955,648 clears issued on a side
+stream with 0 injections did not lengthen the mean wait (it fell 2% and 6.7%),
+so side-stream work does not lengthen the drain.
+
+**The drain's wait CDF, which nothing in this project had.**
+`slope_before/slope_after` is `E[max(0, D−W)]/D`; differencing `D·G(D)` gives
+
+| D, µs | 62 | 125 | 250 | 500 | 1000 |
+|---|---:|---:|---:|---:|---:|
+| **P(wait < D)** | 0.034 | 0.091 | 0.427 | 0.561 | 0.745 |
+
+Mean wait 0.579 ms, almost no mass below 125 µs, and **a knee between 125 and
+250 µs — that knee is the relocation budget in one number.**
+
+#### The mechanism was built, and what it found is a scheduling gap
+
+A run-ahead that holds a drain's successor batches and issues their vertex phase
+in front of the drain was built, measured and swept
+(`history/perf-2026-08-27/item2_tier2.md`, `item2_min_verts_sweep.md`,
+`item2_capacity_read.md`, `item2_resolve_why.md`). All correctness gates pass at
+every setting: 0 stray launches and 0 drops including at `MIN_VERTS=0`, resolves
+equal drains exactly (14,932/14,932), and one stdout hash across all 24 sweep
+runs plus the earlier 30.
+
+**Its ceiling is 0.387 ms/frame on old** — P1's census of the vertex work that
+sits inside the drain's shadow, 585.4 of 585.7 ms issued, i.e. essentially *all*
+the vertex work; 0.072 ms/frame on Crossroads. That figure is **mean-based**
+(census total ÷ frame count) like everything in §5.2b.
+
+| `MIN_VERTS` | relocated | share of the 0.387 ceiling | batches held | dominant decline |
+|---:|---:|---:|---:|---|
+| 32 (default) | 0.028 ms/f | 7% | 9,467 | `small` only |
+| 8 | 0.045 | 12% | 16,822 | `small`, then `full` |
+| 2 | 0.092 | 24% | 36,129 | **`full` only** |
+| 0 | 0.092 | 24% | 36,129 | `full` only |
+
+The frame followed monotonically — medians control-minus-candidate −0.011,
++0.009, +0.028, **+0.069** — and every point is inside the 0.119 ms session
+spread, with at least one pair of opposite sign at every value. So neither
+registered refutation fires: the moved work *is* on the critical path, and
+holding does not cost more than it saves. **0.092 ms/frame simply cannot be
+resolved at a 0.119 ms spread.**
+
+**The conversion is 1.01, not the 0.75 the sweep first implied.** The held-call
+timer brackets the mechanism's own 56.6 KB record copy at 3.84 µs per hold
+against P1's 2.87 µs of censused vertex phase, so 0.98 µs is self-overhead: of
+0.092 ms relocated, **0.068 is work removed from the burst** and 0.024 is new
+work added in front of the drain, where P0 says it is free. 0.069 of frame for
+0.068 of true relocation is **1.01 — the site's own +1.02 recovered end to end.**
+That makes the forecast *worse*, not better: at 1.01 the frame gain can never
+exceed the vertex work actually moved.
+
+**Do not raise the hold capacity.** The binding decline is `full`, the hold
+capacity of 8, which is `CP_PASS_STREAMS` — held segments keep their own queue
+set so segments 0..7 map one-to-one onto `seg_qsets[0..7]`, which is what
+preserves `fetch_fold`. At conversion 1.0 and the measured reach factor 0.62 the
+ladder is:
+
+| cap | true work moved | verdict |
+|---:|---:|---|
+| 8 (today) | 0.068 ms/f | measured 0.069, agrees |
+| 16 | 0.104 | **still inside the 0.119 spread** |
+| 32 | 0.163 | |
+| 64 | 0.238 | needs 56 more queue sets at 19.2 MB each = **1.07 GB** |
+
+The honest question was never "is 8 structural" but "is +153 MB worth +0.10 ms",
+and the ladder answers no. Nor can it be had by sharing queue sets: `fetch_fold`
+requires seed(A) → count(A) → seed(B) → count(B), and the mechanism issues every
+seed before the drain and every count after it, so two batches on one set have
+count(B) accumulating on count(A)'s residue. **No event fixes an ordering the
+mechanism deliberately breaks.**
+
+**The real limit is reach, and the reason is scheduling.** 56.4% of deferrals
+hold nothing and never reach an admission decision at all. The resolve-reason
+probe (counters only, self-check exact on all three runs, no median quoted)
+found that **99.99% of zero-hold deferrals had a LATE SUCCESSOR** — 8,311 of
+8,312 on old, 5,520 of 5,521 on Crossroads. By the pre-registered definition
+that is the good branch: not "there was no successor" (which would have closed
+the item at 0.068 ms/frame) but "the successor existed and a required resolve
+came first".
+
+| site | zero-hold | share | late |
+|---|---:|---:|---:|
+| `draw_execute` | 3,823 | **46.0%** | 100% |
+| `scope_end` | 3,728 | 44.9% | 99.97% |
+| `unknown` | 761 | 9.2% | 100% |
+| `flush`, `admit`, `opaque_append` | 0 | — | — |
+
+The `MAX_SEGS=1` cross-check is decisive about capacity: `draw_execute` zero
+stays at exactly 3,823 and total zero at exactly 8,312 while the histogram
+collapses and `admit` rises 4,096 → 4,414. **Capacity moves work between `admit`
+and the held set without changing how many drains find nothing to hold.**
+
+**Status: alive, small, and the next lever is cheaper than the last one.** The
+ceiling is unchanged at 0.387 ms/frame, 0.092 of it is converted today at ≈1.0,
+and the gap is a scheduling problem — a required resolve pre-empting an
+available successor — recoverable with **no capacity change**. It is not "a
+0.387 ms opportunity"; nothing has yet resolved above the run spread.
 
 The obvious route into it is still **refuted by measurement**.
 `CUDAVK_UNSAFE_NO_OVERFLOW=1`, which removes the wait by sizing for the worst
@@ -940,3 +1240,33 @@ both do.
   frame is host-bound before reaching for a profiler, and remember that CUPTI
   adds host-side cost to every launch in a driver that issues over a thousand
   a frame.
+
+### Closed in the second half of the same session (2026-08-27), with the number
+
+The evidence is in `DEAD_ENDS.md` §17–§24 and the raw reports are archived under
+`history/perf-2026-08-27/`. Each of these was a ranked lead when the session
+started.
+
+- **Object-destruction drains — 0.0066 ms/frame.** The driver owns 55.5% of the
+  `vkDeviceWaitIdle` site *by count* and 3.0% of it *by blocked time*, because
+  the driver's drains arrive at a device that is already empty. `DEAD_ENDS.md`
+  §17.
+- **Kernel stalls / "wider requests" — nothing to widen.** `cp_rasterize_stage3`
+  reading 1.00 sectors/request was an artefact of the profiled window (its
+  working launches read 3.087); `_abuf`'s 1.00 is the **optimum**, because 67%
+  of its requests are one uniform 4-byte broadcast per block. `DEAD_ENDS.md`
+  §18.
+- **Removing degenerate stage-3 launches — capped at 0.164 ms/frame** without
+  needing the launch mix, and the host cannot know the tile count without a
+  readback that costs a hundred times the launch. `DEAD_ENDS.md` §19.
+- **The wide raster merge — removing 298.8 launches/frame COST 0.410 ms/frame.**
+  `DEAD_ENDS.md` §20.
+- **The count-phase merge — refuted by the same rule before it was built.**
+  `DEAD_ENDS.md` §21, and the rule itself in §22.
+- **Tier 1, hoisting the shading-group tables above the drain — measured zero**
+  with the hash gate passing on ten runs. `DEAD_ENDS.md` §23.
+- **The opaque sort-middle tiling prototype, and any v2 of it — refused.** Best
+  case 2.1–2.6 ms/frame of kernel time against the +2.73 ms/frame fan-out it
+  has to surrender, and the note's recorded explanation is dead in both halves
+  (compute throughput 2.53%, branch efficiency 94.32%, triangles 1.7 px across).
+  `DEAD_ENDS.md` §24.

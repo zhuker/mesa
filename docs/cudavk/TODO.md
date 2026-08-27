@@ -5,10 +5,14 @@ in one place so a fresh look does not have to reconstruct it from commit
 messages. Read `DEAD_ENDS.md` first if you are about to optimise something --
 this file is what is still open, that file is what has already been closed.
 
-Numbers are as at HEAD (`e2fea470d04`), old capture **13.16 ms/frame**,
-Crossroads **5.82 ms/frame** (`/tmp/perf-audit/reprofile_baseline.md`). The old
-capture's 15.74 stood until `20611f5b131` made the opaque-episode fan-out the
-default; `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89.
+Numbers are as at the tip that landed PDL, old capture **12.78 ms/frame**,
+Crossroads **5.69 ms/frame**
+(`history/perf-2026-08-27/pdl_landing.md`). Two older figures appear in leads
+written before those commits and neither is today's driver: **13.16 / 5.82** is
+the pre-PDL baseline at `e2fea470d04` (`reprofile_baseline.md`), and the old
+capture's **15.74** stood until `20611f5b131` made the opaque-episode fan-out the
+default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
+`CUDAVK_NO_PDL=1` still measures 13.16.
 
 ## Correctness, ordered by how much they matter
 
@@ -122,7 +126,7 @@ Two framings this list depends on:
   a socket. That removes the context clobber, the allocator competition and the
   blast radius of correctness item 3 in one move, and it is measured working
   (`CUDA_INTEROP.md` §1.1). It also keeps external semaphores off the critical
-  path, because the host handshake is cheap next to a 15.74 ms frame.
+  path, because the host handshake is cheap next to a 12.78 ms frame.
 
 ### Tier 0 — cheap, and everything rests on them
 
@@ -327,7 +331,7 @@ produce against the proprietary driver.*
 **Do not start 11 for interop reasons at all** — it is closed. And do not
 reach for external synchronisation before measuring that the host handshake
 costs something: the fence wait is needed regardless and a socket round trip is
-tens of microseconds against a 15.74 ms frame.
+tens of microseconds against a 12.78 ms frame.
 
 There is a cheaper cudavk-only shortcut if the handshake ever does measure: the
 submit event at `cpvk_device_memory.c:329` is already created with
@@ -521,30 +525,120 @@ measurements these come from.
    Also open: where the 2.453 ms median inter-submit stall actually lives, since
    `vkDeviceWaitIdle` blocks only 0.514 ms/frame and so is not mostly that.
 
+   **STATUS AFTER 2026-08-27 — the mechanism was built, and the lead is alive,
+   small, and cheaper to attack than it was.** Full account in
+   `PERFORMANCE.md` §6 item 4; raw reports in
+   `history/perf-2026-08-27/item2_tier2.md`, `item2_min_verts_sweep.md`,
+   `item2_capacity_read.md`, `item2_resolve_why.md`, `item2_p0_results.md`.
+
+   - **The symmetry caveat is retired at this site.** P0 measured the *remove*
+     direction directly, by moving the injected spin to the other side of the
+     drain's sync: slope **0.065** at D = 125 µs against a registered bar of
+     0.25, with the after-arm positive control reproducing the published +1.02.
+     About 1.24 ms/frame of host work is relocatable into this wait for under
+     0.08 ms/frame of cost. The drain's wait CDF has a **knee between 125 and
+     250 µs**, and that knee is the relocation budget in one number.
+   - **The run-ahead's own ceiling is 0.387 ms/frame on old** (P1's census of
+     vertex work inside the drain's shadow — 585.4 of 585.7 ms issued;
+     **mean-based**), 0.072 on Crossroads. **0.092 ms/frame is converted
+     today**, at a measured conversion of **≈1.0**, and it cannot be resolved
+     against the 0.119 ms session spread — the frame moved +0.069 with the right
+     sign and monotonically, but inside the noise.
+   - **Do not raise the hold capacity.** The ladder at conversion 1.0 and the
+     measured 0.62 reach factor: cap 16 → 0.104 ms/frame (**still inside the
+     0.119 spread**), 32 → 0.163, 64 → 0.238 for 56 more queue sets at 19.2 MB
+     each = **1.07 GB**. Sharing queue sets is refused by `fetch_fold`'s
+     required seed→count ordering, which the mechanism deliberately breaks.
+   - **The gap is SCHEDULING, not capacity.** 56.4% of deferrals hold nothing,
+     and **99.99% of those had a late successor** (8,311 of 8,312 on old, 5,520
+     of 5,521 on Crossroads): the successor existed and a required resolve came
+     first. By site: `draw_execute` **46.0%**, `scope_end` 44.9%, `unknown`
+     9.2%; `flush`, `admit` and `opaque_append` are zero. The `MAX_SEGS=1`
+     cross-check is decisive — `draw_execute` zero stays at exactly 3,823 and
+     total zero at exactly 8,312 while the histogram collapses and `admit` rises
+     4,096 → 4,414.
+   - **So the next lever is the resolve, not the buffer**, and it needs **no
+     capacity change**. Two registered predictions failed on the way here and
+     are worth knowing: the render-scope explanation does not carry it
+     (`scope_begin` never appears, `opaque_append` is 0, `scope_end` alone is
+     below half), and `draw_execute` was predicted to be zero and is the single
+     largest contributor.
+   - **Honest framing:** this is not "a 0.387 ms opportunity". Nothing here has
+     resolved above the run spread yet.
+
 2. **Fuse the fragment writeback into the fragment shader.** Parked with a
    working mechanism and a wrong result; about 0.04 ms and a known next step.
    See `DEAD_ENDS.md`.
-3. **Five CUDA-side items from a research note**, none of which need a toolkit
-   upgrade: `CU_JIT_SPLIT_COMPILE` (cold JIT 536 ms to 186 ms, measured),
-   raising `CUDA_CACHE_MAXSIZE`, the `enable_smem_spilling` pragma, reopening
-   CUDA graphs on 12.8 specifically, and `griddepcontrol`, which is used zero
-   times today. `notes/CUDA13_UPGRADE.md`.
-4. **The opaque sort-middle tiling prototype** in `notes/OPAQUE_TILING_PROTOTYPE.md`
-   exists behind flags and was never taken to an accepted result.
+3. **`CUDA_CACHE_MAXSIZE` is unset, and the cubin cache is at its cap and
+   evicting.** Free, one line, and it is no longer speculative: measured
+   2026-08-27, `~/.nv/ComputeCache` holds **1,074,252,980 bytes = 1024.49 MiB**
+   against the **1 GiB** default cap, in **9,957 files** — down from the 12,286
+   files an earlier note recorded, which is eviction in progress. The documented
+   maximum is 4 GiB (CUDA 12.8.1 Programming Guide §18, "CUDA Environment
+   Variables"). Every evicted entry re-pays a cold JIT — 0.3–0.5 s of `ptxas`
+   for the raster module alone. `CUDA_CACHE_MAXSIZE` appears **nowhere in
+   `src/`** and is set nowhere in the environment.
+   **This cannot help steady-state frame time**; it removes a growing, invisible
+   cold-start tax, and it should be done before anything that invalidates cache
+   entries. The measurement to watch is the cold-vs-warm replay factor in
+   `tests/cp_gpu_busy.sh`, not frame time. Careful with the implementation: this
+   codebase reads the environment **once**, in the debug-flag initialiser, so an
+   `setenv`-if-unset in device init has to respect that rule; a line in
+   `tests/*.sh` and the developer shell is the cheaper form.
+   (`history/perf-2026-08-27/cuda_leads.md` §2.)
+4. **Four further CUDA-side items from the same research note**, none of which
+   need a toolkit upgrade: `CU_JIT_SPLIT_COMPILE` (cold JIT 536 ms to 186 ms,
+   measured), the `enable_smem_spilling` pragma, reopening CUDA graphs on 12.8
+   specifically, and `griddepcontrol` — which is no longer "used zero times
+   today", since PDL landed and uses it; what is left there is link D, the
+   A-buffer scan chain. `notes/CUDA13_UPGRADE.md`,
+   `history/perf-2026-08-27/cuda_leads.md`.
 5. **`pbribl` regresses by about 0.03 ms** with vertex-fetch fusion enabled and
    nobody knows why. Bounded and deliberately accepted; the cost is in fused
    execution on that workload, not in the machinery around it.
 6. **Where the 2.453 ms median inter-submit stall lives.** `PERFORMANCE.md`
    §5.2 attributes the frame-boundary gap to it, and the census now shows
    `vkDeviceWaitIdle` blocks only 0.514 ms/frame, so most of that stall is
-   somewhere the driver does not currently instrument. Open.
-7. **`CUDAVK_PDL` is measured and unlanded.** +0.4342 ms (+3.29%) on old and
-   +0.1297 (+2.23%) on Crossroads at level 3 against level 0, decisive
-   instrument, arms non-overlapping, p = 0.0011 and 0.0143; −1.5% on the
-   eighteen-sample sweep with no sample regressed and the standing exceptions
-   unchanged. It works by overlapping a kernel's preamble with its
-   predecessor's tail — the same family as the fan-out. Levels are additive to
-   within 0.042 ms.
+   somewhere the driver does not currently instrument. Open — but note the
+   2026-08-27 reading of it: the driver issues device work **only from inside
+   `vkQueueSubmit`**, and recording touches CUDA not at all, so while the
+   replayer decodes the next frame the driver has nothing queued *by
+   construction*. Width cannot touch that; only letting the host run past the
+   drain can (`history/perf-2026-08-27/wide_bench.md`).
+
+7. **Port the blended path's fs-UBO row concatenation to the opaque path — the
+   only never-measured lead left in the programme.** `FS main (direct)` runs
+   **74.5 launches/frame against 74.5 direct raster triples — exactly 1:1, no
+   merging at all**, because the opaque group key demands a byte-identical
+   `memcmp` of the fs-UBO rows. The blended path already solved that problem
+   with row concatenation plus `row_base`. It is **the same file, the same
+   mechanism, no new kernel and no ABI or scheduling change**, and there is no
+   device half to add: the grid is already 4,096 blocks.
+   Size: about **60 launches/frame removed**, worth **0.04–0.06 ms/frame** at
+   the 0.6–1.0 µs in-situ launch price (`history/perf-2026-08-27/wide_ceiling.md`
+   §7.4).
+   **Two warnings before anyone builds it, and they are the ones this programme
+   has already paid for:**
+   - Size it at the **0.78–0.81 µs removal price**, never at the 2.047 µs
+     per-launch floor. 60 × 2.047 = 0.12 ms is exactly the error
+     `PERFORMANCE.md` §4 exists to prevent.
+   - **Measure the overlap factor of those 74.5 launches first.**
+     `DEAD_ENDS.md` §22 applies directly: if they are already concurrent, this
+     merge inverts like the other two did, and the wide merge cost 0.410 ms for
+     removing five times as many launches.
+   It is on this list *because* it has never been run. Every other lead here has
+   a number against it; the cheap thing to do with this one is to measure it.
+
+**Removed from this list since it was last revised, so that nobody re-opens
+them:**
+
+- **The opaque sort-middle tiling prototype** — refused with a number on
+  2026-08-27: best case 2.1–2.6 ms/frame against the +2.73 ms/frame fan-out it
+  must surrender. `DEAD_ENDS.md` §24.
+- **`CUDAVK_PDL`** — it is **landed** and on by default at level 3
+  (`6e6e00968ca`, with level 4 offered as a diagnostic in `b9766f720a4`). Its
+  revert row in `PERFORMANCE.md` §1 is re-measured on the binary that landed:
+  12.7826 → 13.1641 on old and 5.6936 → 5.8458 on Crossroads.
 
 ## Housekeeping
 

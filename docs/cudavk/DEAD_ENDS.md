@@ -28,9 +28,19 @@ iteration record:
   `/tmp/perf16/iter27-vsfusion/handoff.md`).
 - Both arms of a comparison belong in **one session**. Control drift between
   sessions once faked sub-additivity (iteration 26).
-- The shipping default today is **15.7514 ms** on old and **5.8982 ms** on
-  Crossroads (iteration 28, distribution in
-  `docs/cudavk/history/PERF16_ITERATIONS.md`).
+- The shipping default today is **12.7826 ms** on old and **5.6936 ms** on
+  Crossroads, with PDL landed and on at level 3 (`6e6e00968ca`;
+  `docs/cudavk/PERFORMANCE.md` §1, raw run in
+  `docs/cudavk/history/perf-2026-08-27/pdl_landing.md`). Two older figures
+  appear in entries below and **neither is today's driver**:
+  **13.1626 / 5.8230** is the pre-PDL baseline at `e2fea470d04`, and
+  **15.7514 / 5.8982** is that same driver again with the opaque episode fan-out
+  reverted (`20611f5b131`). Each step is one commit and a scheduling change, not
+  a re-measurement, so an entry's *ratio* to its own baseline survives while its
+  share of the frame does not.
+- Entries 17 to 23 come from the 2026-08-27 session, whose 52 raw reports are
+  archived under `docs/cudavk/history/perf-2026-08-27/`. Each entry names the
+  file its numbers came from.
 - Evidence files and history documents were written when the driver was called
   `cudapipe`, so they name flags `CUDAPIPE_*`. The current names are `CUDAVK_*`
   (`src/cudavk/FLAGS.md`). This document uses the current names.
@@ -62,6 +72,14 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 14 | Vertex fetch fused as a device link | 4 | REFUTED, then **superseded** | 48.05 ms; iteration 27's bitcode inline paid +0.49 ms |
 | 15 | Fragment writeback fused into the shader | 28 item 3 | **PARKED** | wrong frames; the central invariant is measured FALSE |
 | 16 | Blocking-sync context to coexist with an ML pipeline | interop | REFUTED | +97.8% frame under load, and it saves no CPU there either |
+| 17 | Deferring the driver's object-destruction drains | 2026-08-27 item 1 | REFUTED | the driver owns 55.5% of the site by count and **3.0% by blocked time** — 0.0066 ms/frame |
+| 18 | Wider memory requests in the rasterizer stages | 2026-08-27 item 3 | REFUTED | one 1.00 sectors/request was an artefact, the other is the **optimum**; SoA would make it worse |
+| 19 | Not issuing the degenerate stage-3 launches | 2026-08-27 item 3 | REFUTED | capped at **0.164 ms/frame** without the mix; the host cannot know the count without a readback worth 100× the launch |
+| 20 | Merging the per-segment raster launches (the wide merge) | 2026-08-27 item 4 | REFUTED | removing **298.8 launches/frame cost 0.410 ms/frame** — the credit inverted |
+| 21 | Merging the A-buffer count-phase launches | 2026-08-27 item 4 | REFUTED | refuted before it was built: its dominant stage is already **1.89× self-overlapped** |
+| 22 | **The merge rule** | 2026-08-27 | **RULE** | a launch-removal credit is only collectable where the launches were **serial** |
+| 23 | Hoisting the shading-group tables above the drain (Tier 1) | 2026-08-27 item 2 | REFUTED | measured zero on both captures; one hash across both arms on ten runs |
+| 24 | The opaque sort-middle tiling prototype, and a v2 of it | 2026-08-27 audit | REFUTED | best case **2.1–2.6 ms/frame** against the **+2.73 ms** fan-out it has to surrender |
 
 ---
 
@@ -878,6 +896,407 @@ wake-up latency stops being multiplied by seventeen. The second is the real
 condition, and it is the same one that makes most of `PERFORMANCE.md`
 interesting.
 
+## 17. Deferring the driver's object-destruction drains — REFUTED
+
+2026-08-27, item 1. Evidence:
+`history/perf-2026-08-27/item1_census_results.md` and `item1_destroy_defer.md`.
+
+**Tried.** With the texture cache on, destroying an image or a view drains the
+whole device (`cpvk_DeviceWaitIdle` plus the cache's own `cuCtxSynchronize`;
+`cpvk_image.c:376-379`, `:580-584`, `cpvk_texture_cache.c:933-935`, `:797-799`).
+The plan was a retirement queue keyed on the pending submit's event, so a free
+waits for that event instead of for the whole device.
+
+**Promising because.** The wait census measured the `vkDeviceWaitIdle` site at
+0.514 ms/frame blocked with a 0.500 ms ceiling and a measured +0.44 slope, the
+driver reaches that site from three of its own call paths, and it was the only
+**wait-bound** site in the driver (3,339 of 3,390), so it would be additive with
+everything else. It was ranked first at 0.22 ms/frame.
+
+**Measured.** `CUDAVK_DESTROY_CENSUS`, both captures, GPU exclusivity positive,
+and the instrument agreeing with the wait census to 0.00% (1,510 + 814 + 1,067 =
+3,391 exactly):
+
+| caller | ms/frame blocked, old | µs per drain |
+|---|---:|---:|
+| the application's own `vkDeviceWaitIdle` | 0.4847 | 485.0 |
+| `destroy_view` | 0.0149 | 21.1 |
+| `destroy_image` | 0.0001 | **0.28** |
+| **driver share** | **3.00%** | |
+
+Crossroads' driver share is **0.24%**. At the site's measured +0.44 slope the
+entire driver share is worth **0.0066 ms/frame**.
+
+**Mechanism.** **Count and cost point opposite ways.** By count the driver owns
+**55.5%** of the site (1,881 of 3,391) and the capture-file arithmetic that
+predicted that was exactly right. By blocked time it owns **3.0%**, because the
+driver's drains arrive at a device that is already empty. `destroy_image` is
+*already* a null drain at 0.28 µs. **Deferring frees cannot recover time that is
+not being spent.**
+
+A second registered prediction was confirmed on the way past: the texture
+cache's second sync is a null sync — 0.19 µs per drain, constant on both
+captures, 1.63% and 12.49% of the destroy sites' blocked time, under the 20%
+bar. "Destroying drains twice" was a call count, never a cost.
+
+**Retry if.** The workload changes so that destruction happens while the device
+is busy — a capture that destroys images inside a frame rather than at pass
+boundaries. The mechanism exists and is inert with its flag off
+(`CUDAVK_DESTROY_DEFER`, branch `destroy-defer`); it was never measured and
+never landed.
+
+**Cost.** One census and one built-but-unmeasured mechanism. The rule it paid
+for is in the rules list below and in `WORKFLOW.md` §4.6.
+
+---
+
+## 18. Wider memory requests in the rasterizer stages — REFUTED
+
+2026-08-27, item 3. Evidence: `history/perf-2026-08-27/item3_stall_attrib.md`.
+
+**Tried.** Nothing was built. The lead said `cp_rasterize_stage3` and
+`cp_rasterize_stage3_abuf` both read **1.00 sectors/request** — the far side of
+coalesced — and inferred that the fix is wider requests: vector loads, or
+structure-of-arrays on the producer. It was sized at up to ~2.0 ms/frame through
+exclusivity and costed at a quarter of an iteration.
+
+**Measured.** Source-level attribution over 900 consecutive launches (skip 200)
+refutes half of it and recategorises the other half.
+
+- **stage3's 1.00 was an artefact of the profiled window.** 65.3% of its
+  launches are **degenerate** — 16 instructions per warp: read the tile counter,
+  find `num_tiles == 0`, exit. Those are 65% of launches but 7.3% of the time
+  and 4.8% of the load requests. Its **working** launches issue **3.087
+  sectors/request**. There is nothing to widen. (A 6-launch sample reproduced
+  the 1.00 artefact exactly — the same hazard as `WORKFLOW.md` §4.9, caught by
+  the agent on itself.)
+- **`_abuf`'s 1.00 is real and is the OPTIMUM.** All 24 global loads sit at
+  exactly 1.00, in three groups, none of them a per-lane strided walk:
+
+| share of requests | what |
+|---:|---|
+| **67.2%** | `LDG.E` of `*huge_counter` — **one uniform 4-byte read per block**, followed by `R2UR` |
+| 27.6% | the 84-byte `cp_setup_cache_entry`, read field by field by `threadIdx.x == 0` only |
+| 5.2% | `huge_queue[tile_idx]`, an 8-byte pair split into its fields |
+
+**A load issued by one active lane gives one sector per request by
+construction, and that is its optimum.** The per-lane traffic in the same kernel
+is the *output* side and is already wide — `STG.E.64` at 2.56 sectors/request,
+atomics at 2.08.
+
+**Mechanism.** By consumer instruction, `R2UR` waiting on the tile counter is
+**51.6%** of long-scoreboard samples, the store address chain 37.3%, the third
+6.5% — top three 95.5%. More than half the stall is every warp in the block
+waiting on a single uniform 4-byte load at the top of the kernel. That is a
+**latency dependency, not bandwidth and not coalescing.** Widening is legal in
+exactly one place — padding the setup entry 84 → 96 bytes to permit `LDG.128`,
+collapsing 22 instructions to about 6 — and it touches **0% of the measured
+stall**. **SoA on the producer would make it worse**: one lane reading one
+record would go from 1 request to 21, on different lines.
+
+**Retry if.** The uniform counter read at the top of `_abuf` can be removed or
+hoisted rather than widened — that is the 51.6%, and it is a dependency
+question, not a layout one. Nothing about sectors per request reopens this.
+
+**Cost.** One profiling run. It also produced the only lead of that item, which
+is entry 19.
+
+---
+
+## 19. Not issuing the degenerate stage-3 launches — REFUTED
+
+2026-08-27, item 3, follow-up. Evidence:
+`history/perf-2026-08-27/SESSION_HANDOFF.md` §16.1 with
+`item3_stall_attrib.md`.
+
+**Tried.** Nothing was built. Entry 18 found that **65.3% of
+`cp_rasterize_stage3` launches do no work** — they start 512–2,048 blocks, read
+a zero tile counter and exit. That is a launch-count question in the same
+currency as PDL and the merges, priced at 0.78–0.81 µs per launch removed.
+
+**Measured — as a cap, deliberately without the mix.** The follow-up window's
+stage3:`_abuf` launch mix is 5.62:1 against `PERFORMANCE.md` §5.1's 0.55:1, a
+**10.1× disagreement**, because launches 201–1,100 are the first four or five
+frames and not steady state. Multiplying a start-up fraction by a steady-state
+count would have produced a number with two incompatible parents, so the item
+was **capped instead**: the degenerate fraction cannot exceed 1, so even if
+*every* stage-3 launch on both variants were degenerate and removable, the item
+is 209.1 launches/frame × 0.782 µs = **0.164 ms/frame, CI [0.132, 0.198]** —
+1.3% of the frame at the absolute maximum, 0.5% at the conditional estimate of
+0.062.
+
+**Mechanism, and the trap in the framing.** **A device-side early exit is
+already the current behaviour** — the 16-instructions-per-warp launches *are*
+that exit. The only saving left is not *issuing* the launch, which is a host
+decision that requires a device number. The host cannot know the tile count
+without a readback, and a readback at that point **is** the wait the census
+prices at 0.514–6.018 ms/frame: trading a 0.782 µs launch for a sync of that
+order loses by a factor of hundreds.
+
+**Retry if.** Stage 3 is fused into stage 2 for another reason and this comes
+along free, or a device-side conditional launch becomes available that does not
+cost a round trip. Neither is worth building for 0.164 ms.
+
+---
+
+## 20. Merging the per-segment raster launches — the wide merge — REFUTED
+
+2026-08-27, item 4. Evidence: `history/perf-2026-08-27/item4_merge_results.md`,
+`item4_f4_device_fork.md`, `item4_merge.md`.
+
+**Tried.** Replace the per-segment loop that launches stage 1, 2 and 3 for each
+blended segment with one merged grid per chunk that does the same items.
+
+**Promising because.** It removes launches, and a launch was priced at 0.78 µs.
+
+**Measured.** **Removing 298.8 launches/frame COST 0.410 ms/frame** — an implied
+**−1.372 µs per launch removed** against a settled credit of **+0.782 µs**. It
+is the first measurement in this project where removing launches made the frame
+slower. All supporting gates passed (one stdout hash across 8 runs, PDL links
+down 199 as predicted), so the result is interpretable rather than suspect.
+
+**Mechanism — structural, not implementation.** F4 measured the merged form per
+*item*, against the loop it replaces, on two independent pairs agreeing to 1%:
+
+| kernel | control ns/item | merged ns/item | ratio |
+|---|---:|---:|---:|
+| stage1 | 8,113 | 3,428 | 0.42 |
+| stage2 | 5,563 | 2,410 | 0.43 |
+| stage3 | 17,065 | 5,747 | **0.34** |
+
+The bar was ≤1.25×. **The merged form is three times cheaper per item.**
+Register pressure is real (48→64, 56→109, 46→94, occupancy roughly halved) and
+does not dominate, because it is amortised over about 5 items. **Union busy
+FELL** on both measures while the frame got slower — all kernels −0.9%, the
+changed chain −3.2%. The device is not paying for the merge; it is being paid.
+
+**The overlap factor names it: control 2.19×, candidate 1.37×.** The control's
+per-segment launches run concurrently across the eight side streams that blended
+segments have always used; a merged chunk is one grid on one stream. A merged
+launch takes about 2.0× as long as *one* control launch while replacing about
+**five that were running concurrently**. Critical path per chunk grows 29.8 µs.
+
+**A self-correction that tightened it.** F4's critical-path bound first used an
+assumed batches/frame instead of the counter arm's own launches/frame: frames
+per window 137.6 → 415.3, merged chunks per frame 82.3 → 27.26, **bound 2.45 →
+0.81 ms/frame**, and the observed 0.410 moves from 17% to **51% of the bound**.
+Everything else in F4 is a ratio or a per-unit-work quantity and is unchanged.
+The corrected bound is a tighter fit, so the causal account is strengthened.
+
+**Retry if.** A merged form issues its chunks across several streams and so
+keeps the concurrency the loop already had — which is most of what the loop was
+doing. **Halving the register count cannot help**; per-item efficiency is
+already 3× better. What this closes for good is any launch-count forecast for a
+merge whose launches are currently concurrent (entry 22).
+
+---
+
+## 21. Merging the A-buffer count-phase launches — REFUTED
+
+2026-08-27, item 4. Evidence:
+`history/perf-2026-08-27/item4_countphase_overlap.md`.
+
+**Tried.** Nothing was built, and that is the point. This was the next merge on
+the list, forecast at 554 mergeable launches × 0.782 µs = **0.433 ms/frame**.
+
+**Measured, on the shipping default** (PDL 3, fan-out on), two windows agreeing
+to 2.5% and gated first — the counter arm reproduces 1,314.2 launches/frame,
+which is `PERFORMANCE.md` §5.1's own figure to the decimal:
+
+| population | overlap factor |
+|---|---:|
+| `cp_rasterize_stage3_abuf` alone, 53% of the triple's time | **1.89×** |
+| `cp_clip_rast_fused_abuf` alone | 1.44× |
+| `cp_rasterize_stage2_abuf` alone | 1.22× |
+| the three stages, time-weighted | **1.59×** |
+| the abuf count-phase triple as a group | 2.50× |
+| the opaque/direct triple as a group | **2.68×** |
+| all kernels | 1.80× |
+
+The faithful figure is the per-stage **self**-overlap, not the group's, because
+a merge of "the same stage across the segments of one episode" concatenates that
+population and does not remove the pipelining between different stages. The
+dominant stage is at 1.89×, past the 1.8× bar registered in advance.
+
+**Mechanism.** Scaling the credit by the serial fraction 1/1.59 makes the
+0.433 ms/frame arithmetic worth about **0.16 ms** — before subtracting the
+device-side cost of the merged form, which entry 20 measured *at this width* to
+be larger than the credit. The direct/opaque path is worse for a merge, not
+better, at 2.68×.
+
+**Retry if.** Nothing here reopens on implementation quality. **This driver's
+mergeable launches are the ones the fan-out already made concurrent**, and the
+fan-out is worth +2.73 ms/frame. A merge would have to buy back that concurrency
+by other means first.
+
+**Cost.** One profiling window, against a build that entry 20 shows would have
+cost an iteration and lost.
+
+---
+
+## 22. THE MERGE RULE — the credit is only there where the launches were serial
+
+This is a rule, not a lead, and it is here because it closed two leads in one
+session (entries 20 and 21) and would have closed a third before it was built.
+
+> **A merge only collects the launch-removal credit where the launches it merges
+> were SERIAL. Where they were concurrent, merging converts parallel work into a
+> longer critical path and the credit inverts.**
+
+How to apply it, in order:
+
+1. **Measure the overlap factor of the population you intend to merge, at its
+   own position in the shipping driver** — summed kernel time ÷ union of kernel
+   intervals. Not of a related population, and not of the group it sits in: use
+   the per-stage self-overlap, because a merge concatenates one stage's own
+   launches and leaves the pipelining between stages alone.
+2. **Scale the launch-count credit by `1/overlap`.** At 1.59× the credit is 63%
+   of the arithmetic; at 2.68× it is 37%.
+3. **Then subtract the merged form's own device cost**, which is a separate
+   measurement and can exceed what is left. In entry 20 the merged kernels were
+   **three times cheaper per item** and the frame still got **0.410 ms slower**,
+   because per-item efficiency is not the currency — critical path is.
+4. **Watch the sign of union busy.** In entry 20 union busy *fell* while the
+   frame *rose*. That combination is the signature of lost concurrency and of
+   nothing else; if it appears, stop looking for an implementation defect.
+
+The general form: a launch count is a currency only where the launches are on
+one critical path. Everywhere else it is a proxy, and the proxy is wrong by the
+overlap factor.
+
+---
+
+## 23. Hoisting the shading-group tables above the drain (Tier 1) — REFUTED
+
+2026-08-27, item 2 Tier 1. Evidence:
+`history/perf-2026-08-27/item2_tier1_remeasure.md`, with the first measurement
+in `tier1_tier2_results.md`.
+
+**Tried.** Reorder the work around the episode drain so that the shading-group
+tables are built before the drain rather than after it — pure host-side
+reordering, no work removed, no device behaviour changed.
+
+**Promising because.** P0 had just shown that host work moved to just before
+this drain is absorbed by the wait (slope 0.065 at D = 125 µs), so a reorder
+should have been free real estate.
+
+**Measured, re-run on the default path after its revert arm was fixed.** All
+four gates pass, including the one that decides it:
+
+| gate | result |
+|---|---|
+| both arms complete | 10 of 10 runs rc=0 |
+| submit counts | 3,022 old / 2,994 Crossroads, control included |
+| candidate hash | session standard, unchanged from before the fix |
+| **control hash == candidate hash** | **one hash per capture across both arms** |
+
+So the reorder really is a reorder — no byte of output moves when the hoist is
+reverted, which was Tier 1's only correctness argument and now has ten runs
+behind it.
+
+**The median is consistent with zero on both captures.** Old: the candidate is
+nominally slower by 0.045 ms, but the three pairwise differences disagree in
+sign, span 0.168 ms, and the control arm's own spread across repeats is 0.185 ms
+— larger than the session spread and four times the claimed effect. Crossroads:
+−0.003 ms, a tenth of that capture's spread. The claim was "0.00 to +0.05"; the
+measurement cannot distinguish +0.05 from 0.00 from −0.05.
+
+**Mechanism.** There is no mechanism to find: the tables are not what the host
+is waiting for. Recorded as what it was declared to be — **a tidiness change
+worth about zero, with an unchanged bitstream.** The forced-fallback pair
+(+0.0184 ms at 28.85 ms/frame) stays on the record as a different-regime
+datapoint, not as the result.
+
+**It cost a bug and paid for its own fix.** The refactor made
+`cp_pass_group_table_one()` both the single producer of the group rows and the
+allocator of `pass_group_ubos`; the revert path did not re-read that pointer
+after the producer ran, so the first multi-member group whose FS reads const
+bufs launched a shade with a null table, `rows` collapsed to 1 while `ndraws`
+still carried the real row count, and the shader walked off the argument block.
+Deterministic device loss at the same capture index on both captures, and
+**invisible under `FORCE_PASS_FALLBACK`**, because that path never reaches the
+grouped shade loop.
+
+**Retry if.** Never on performance grounds at this size. If it is landed, land
+it as tidiness with the hash gate quoted.
+
+---
+
+## 24. The opaque sort-middle tiling prototype — REFUTED, and its recorded reason was wrong
+
+2026-08-27 audit. Evidence: `history/perf-2026-08-27/tiling_ncu.md` and
+`stage3_imbalance.md`. The prototype itself is
+`notes/OPAQUE_TILING_PROTOTYPE.md`, behind `CUDAVK_TILED_OPAQUE`.
+
+**Tried.** A sort-middle tiled path for the opaque stream: bin references into
+screen tiles, then raster each tile once. The note named Nsight Compute on
+`cp_opaque_tile_raster` as the required next step; **that step had never been
+run.** It was run here, on `multithreading`, the sample the note says amplifies
+the failure.
+
+**The note's own explanation is dead in both halves.** It blames a
+`references × tile area` coverage loop and register/divergence pressure.
+Measured: compute throughput **2.53%**, DRAM **0.23%**, branch efficiency
+**94.32%**. What is actually happening is a one-block signature — per-SM
+counters, single pass, three consecutive launches agreeing to 0.2%:
+`gpc__cycles_elapsed.max` 110.8 M against `sm__cycles_active.max` **110.5 M =
+99.75% of elapsed**, average SM 22%, **minimum 0.10%**. One block sets the
+kernel's duration, and 73.3% of stall cycles are at the CTA barrier waiting for
+thread 0's per-reference `setup_triangle()` and its copy of `cp_rasterize_args`
+into shared memory.
+
+**The census kills the successor directions.** Total references barely move with
+tile size — 1,190,127 at 16 px, 1,074,095 at 32, 1,027,161 at 64 — which solves
+to a mean triangle edge of about **1.7 px** and 1.07 references per triangle.
+The hot tile at pixel (704, 352) holds **26,297 distinct triangles** and resolves
+563 visible pixels. So there is no large-triangle population to split off, and
+the tile lists are depth complexity rather than coverage.
+
+**The model, built on one workload and tested on another.** Duration = longest
+tile list × ~3,409 cycles per reference. Cross-check A: 1.07 M refs × 4,213
+profiled cycles over 170 SMs = 26.6 M against a measured `sm__cycles_active.avg`
+of 24.5 M, 9% out. Cross-check B: applied to the old capture's 10,033 measured
+per-episode longest lists it predicts **+12.8 ms/frame** against the recorded
+2026-08-18 regression of **+10.38 ms/frame** — a workload it was not fitted to.
+
+**The refusal, with the number.** A v2 that fixed both required directions would
+cost 0.15–0.6 ms/frame of tile raster plus about 0.13 ms of binning and could
+displace about 2.87 ms/frame of the direct raster chain: **a ceiling of 2.1–2.6
+ms/frame of kernel time.** But the tiled arm must give up the opaque stream
+fan-out, which `PERFORMANCE.md` §1 banks at **+2.73 ms/frame on old**. **The
+lead's whole best case is smaller than the mechanism it has to surrender.**
+
+**Retry if.** The fan-out stops being worth +2.73 ms — a workload with few
+segments per episode, where Crossroads-like behaviour dominates — *and* a
+per-tile occlusion mechanism exists to shorten a list that is depth complexity.
+Keep `CUDAVK_TILED_OPAQUE` off; do not design a v2 without both.
+
+**A process finding of equal value.** `CUDAVK_TILE_CENSUS` has never reported
+anything: `cp_tile_census_end_pass()` (`cp_renderer.c:7998`) is **called
+nowhere**, and the only other call to `cp_tile_census_reduce_pass()` fires only
+when the framebuffer changes size inside one bind — which no sample and neither
+capture does. The prototype's own "Implementation, 1. Census" step therefore
+never ran, and the reference distribution that kills its stated explanation was
+one line of code away from the people who abandoned it. **Before trusting a
+census flag, check that its reducer is reachable on the workload you are
+running.** The one-line fix used to take these numbers lives only in a throw-away
+copy and is not proposed for the tree.
+
+**Related, and it does not reopen anything.** In the shipping driver
+`cp_rasterize_stage3_abuf` shows the same `sm__cycles_active.max` signature
+(median 93.9% of elapsed against a median average SM of 16.4%) for the opposite
+reason. A probe on every 29th launch across a full old-capture replay (6,669
+launches) read back the device-built tile queue: median 12 entries, p90 404,
+max 4,434; **17.6% of launches have an empty queue**; and the grid is
+`CLAMP(rast_num_triangles * 8, 512, 2048)`, sized from the triangle count rather
+than from the queue stage 2 builds on the device, so **98.3% of launches have
+queue ≤ grid** and the median launch leaves 500 of 512 blocks idle. The longest
+block holds *one* item. Compaction and rebalancing buy nothing here; only more
+warps per item or more items per launch can — and by the exclusive-fraction rule
+the whole question is worth under 0.4 ms/frame of device time. See entry 10.
+
+---
+
 ## The rules these produced
 
 Each is tied to the evidence that produced it. They are ordered by how often they
@@ -941,3 +1360,18 @@ would have saved an iteration.
     one session; any probe whose stdout hash changes is invalid until the submit
     and frame counts are checked, because a run that dies early produces a fast
     and meaningless median.
+13. **A merge only collects the launch-removal credit where the launches it
+    merges were serial.** Entry 22, and entries 20 and 21 are what it cost to
+    learn. Removing 298.8 launches a frame made the frame 0.410 ms slower while
+    the merged kernels were three times cheaper per item.
+14. **Attribute a wait site by caller before ranking it.** Entry 17: the driver
+    owns 55.5% of the destruction-drain site by call count and 3.0% of it by
+    blocked time — an 18× disagreement in the direction that matters, because
+    the driver's own drains arrive at an already-empty device. A census that
+    counts calls can agree with the API trace to the unit and still mislead by
+    two orders of magnitude on cost.
+15. **A launch has two prices.** 0.78–0.81 µs to remove a real one, 1.974 µs to
+    add an exposed one, because the front end is hidden behind the previous
+    kernel on 74.9% of real chain launches (`PERFORMANCE.md` §4). Quote a
+    removal lead as a range. The wrong one of these two numbers would have put
+    the launch axis at the top of the 2026-08-27 ranking.

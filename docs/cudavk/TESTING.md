@@ -748,6 +748,80 @@ Both the check and the break flag belong in the registry
 `FLAGS.md` describe them. Run `cp_debug_doc.py --check` after touching it, and
 `cp_no_getenv.py` if you were tempted to read the variable directly instead.
 
+### The other negative control: proving a patch is INERT
+
+A revert flag is only a control if the flag-off build really is the old driver
+*and* the flag-on build really contains the feature. The second half is the one
+that gets skipped, and skipping it produced a **vacuous proof** on 2026-08-27:
+
+> A stray `git checkout` deleted a probe's implementation. The commit carried
+> **the flags and no code.** The inertness check did not catch it — it
+> *confirmed* it, reporting `0 instruction lines differ, 520 of 520 sections
+> byte-identical`. A perfect result, produced by the bug it was meant to detect.
+
+**A folded-off build and a build with the feature MISSING are
+indistinguishable unless something distinguishes them.** This is `WORKFLOW.md`
+§4.4 ("a different hash is usually a run that died") applied to a *build* rather
+than to a run.
+
+**Four different claims, routinely confused.** Say which one you are making:
+
+| claim | what it compares | what it proves |
+|---|---|---|
+| **collateral damage** | files you never edited, base against shipped | no struct offset moved, nothing unrelated shifted |
+| **containment** | only the intended functions changed | the edit is where you say it is |
+| **folding** | base against flags-off | the off arm costs nothing |
+| **positive control** | base against the feature **live** | **the feature exists** |
+
+The first three are worthless without the fourth. Report all four as one line:
+*"0 collateral, +4,361 present, +1,076 removable by folding."*
+
+**Match the control arm to the KIND of gate.** The general form is: *fold the
+gate to the value that should DELETE the code, and require the delete to show
+up.*
+
+- **A compile-time macro** — the **live** arm must differ. Worked example: PTX
+  656,339 → 756,883, cubin `.text` 357,888 → 412,544, 40 → 43 kernels, and
+  folded-off is **0 bytes** from base.
+- **A runtime bool** — the informative arm is the opposite one, with the gates
+  **hardcoded false**. If the implementation had been deleted, flags-off would
+  *equal* folded. Worked example: base 28,472 / off 32,833 / on 32,507 / folded
+  31,757.
+- **A flag registry row** — **`.text` is the wrong section.** A new row is a
+  *table* entry, so the `.text` delta of `cp_debug.c.o` is 0 by construction,
+  which has exactly the shape of the vacuous result. Its evidence is
+  `.data.rel.ro.local.flags` (+88) and `.bss.present_in_env` (+1). **Control the
+  flag in `.data` and the implementation in `.text`.**
+
+**The strongest control is not a size — it is a relocation.** For a
+runtime-gated patch, disassemble the flags-off entry point and read its
+relocations and offsets. The shipped `cpvk_DestroyImage` can reach
+`cpvk_device_drain`, `cpvk_drain_census_call` and
+`cpvk_texture_cache_image_retire`; the base object has **zero** matching
+symbols. In `cp_pass_finish`, `cmpb $0x0,0x11c` is the flag test and
+`0x238/0x240/0x248` are the merged kernel handles being launched; the base has
+zero references to `0x11c`. **A deleted implementation cannot produce a
+relocation.**
+
+**Two implementation rules, each measured twice in one session:**
+
+1. **A field added for measurement goes at the END of its struct.** Mid-struct
+   placement cost **1,601** changed displacement lines in one object and **915**
+   in another — two agents, two structs, the same lesson. **Trap:** `struct
+   cp_kernels` is *embedded* in `struct cp_device`, so appending to the
+   innermost struct still shifts everything after it in the outer one.
+   End-of-struct is necessary, not sufficient: what it buys is that the residue
+   becomes **classifiable** — 93 displacements at exactly +0x18, 8 `__LINE__`
+   immediates, 1 label renumber, 0 unexplained — rather than zero.
+2. **Gate even the parts too cheap to gate.** One unguarded counter increment
+   costs nothing to run and **363 bytes to prove**, because it survives folding
+   and then has to be explained.
+
+**Rebuilding in place invalidates runs.** Producing these control arms needed
+three in-place rebuilds of a build directory that a measurer was using. **Any
+run started inside such a window is discarded and repeated.** Build variants in
+a separate directory, or announce the window before you start.
+
 ---
 
 ## 8. A real regression against the noise
@@ -762,11 +836,17 @@ Every gate has a floor. Anything under it is a question, not a finding.
 | `gltfscenerendering` cost, three runs of one build | 13.87, 14.83, 13.88 ms — a **6.9%** spread, wider than the ±5% the gate flags at |
 | the 600-frame sweep, two runs of one build | 0.6-1.2% during the phase 1a pass |
 | capture replay wall time, paired runs | four consecutive pairs agreed to 0.07%, then a later pair disagreed by 3.9% |
-| shipping default, old capture | median of run medians **15.7514 ms**, IQR [15.7305, 15.7596], range [15.7200, 15.7911] |
-| shipping default, Crossroads | median of run medians **5.8982 ms**, IQR [5.8877, 5.8990] |
+| the driver at iteration 28, old capture | median of run medians **15.7514 ms**, IQR [15.7305, 15.7596], range [15.7200, 15.7911] |
+| the driver at iteration 28, Crossroads | median of run medians **5.8982 ms**, IQR [5.8877, 5.8990] |
+| **today's shipping default**, old / Crossroads | **12.7826** IQR [12.7632, 12.8075] / **5.6936** IQR [5.6868, 5.7007] |
 
-The last two are from `docs/cudavk/history/PERF16_ITERATIONS.md`, "The standing
-default, stated as a distribution", six runs on old and four on Crossroads.
+The first two are from `docs/cudavk/history/PERF16_ITERATIONS.md`, "The standing
+default, stated as a distribution", six runs on old and four on Crossroads; the
+third is from `history/perf-2026-08-27/pdl_landing.md` on the tip that landed
+PDL, same run counts. **The level is not what this table is for — the SPREAD
+is**, and the spread is what survives a re-baselining: an IQR of about 0.03 ms
+on old at both 15.75 and 12.78, roughly 0.2% of the frame, which is why a 1%
+move needs paired arms and not two means.
 
 So:
 
@@ -846,7 +926,10 @@ Before keeping a correctness-sensitive change:
 * **Native suite 65/65** in the default state and with every new revert flag
   set, run serially.
 * The candidate with each new opt-in flag **unset** matches the immediate
-  baseline. This is a diagnostic, not the external verdict.
+  baseline. This is a diagnostic, not the external verdict — and it is worthless
+  on its own: pair it with a **positive control** showing the feature is present
+  in the shipped build, or a deleted implementation will pass it (§7, "The other
+  negative control").
 * Sample sweep: both `_timing.csv` files hold all 18 rows at exit 0; reference
   and candidate hold the same 60 frame indices; the verdict table actually ran
   (`correctness.gate_ran`); only the two standing exceptions appear; no
