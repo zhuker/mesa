@@ -49,7 +49,7 @@ static const struct cpvk_format_info cpvk_formats[] = {
     */
    { VK_FORMAT_R16G16_SFLOAT,       CP_TEXEL_R16G16_SFLOAT,      CP_COLOR_R16G16_SFLOAT,       false },
    { VK_FORMAT_R16_SFLOAT,          CP_TEXEL_R16_SFLOAT,         CP_COLOR_R16_SFLOAT,          false },
-   { VK_FORMAT_R16G16_UNORM,        CP_TEXEL_R16G16_UNORM,       -1,                           false },
+   { VK_FORMAT_R16G16_UNORM,        CP_TEXEL_R16G16_UNORM,       CP_COLOR_R16G16_UNORM,        false },
    { VK_FORMAT_R32_SINT,            CP_TEXEL_R32_SINT,           -1,                           false },
    { VK_FORMAT_R16_SINT,            CP_TEXEL_R16_SINT,           -1,                           false },
    { VK_FORMAT_B10G11R11_UFLOAT_PACK32, CP_TEXEL_R11G11B10_FLOAT, CP_COLOR_R11G11B10_FLOAT,    false },

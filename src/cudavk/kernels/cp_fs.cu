@@ -774,6 +774,28 @@ cp_float_to_unorm8(float v)
 }
 
 static __device__ __forceinline__ float
+cp_unorm16_to_float(uint32_t v)
+{
+   return (float)v * (1.0f / 65535.0f);
+}
+
+/*
+ * The 16-bit twin of cp_float_to_unorm8, deliberately the same three steps in
+ * the same order: clamp to [0,1], scale by the largest representable value,
+ * add a half and truncate. binary32 carries 24 bits of mantissa, so the
+ * product is within about 0.004 of the exact one and the sum below 2^23 is
+ * exact: the truncation is round-to-nearest for every value that is not
+ * within that 0.004 of a tie, which is as close to correct rounding as this
+ * arithmetic gets and is what the 8-bit path already does.
+ */
+static __device__ __forceinline__ uint32_t
+cp_float_to_unorm16(float v)
+{
+   v = fminf(fmaxf(v, 0.0f), 1.0f);
+   return (uint32_t)(v * 65535.0f + 0.5f);
+}
+
+static __device__ __forceinline__ float
 cp_half_to_float_wb(unsigned short h)
 {
    unsigned sign = (unsigned)(h >> 15) << 31;
@@ -836,6 +858,7 @@ cp_bytes_per_pixel(uint32_t encoding)
    case CP_COLOR_R32G32B32A32_FLOAT: return 16;
    case CP_COLOR_R16G16B16A16_FLOAT: return 8;
    case CP_COLOR_R16G16_SFLOAT:      return 4;
+   case CP_COLOR_R16G16_UNORM:       return 4;
    case CP_COLOR_R16_SFLOAT:         return 2;
    case CP_COLOR_R8G8_UNORM:         return 2;
    case CP_COLOR_R8_UNORM:           return 1;
@@ -895,6 +918,13 @@ cp_load_dst(const void *ptr, uint32_t encoding, float *out)
       const uint8_t *v = (const uint8_t *)ptr;
       out[0] = cp_unorm8_to_float(v[0]);
       out[1] = cp_unorm8_to_float(v[1]);
+      out[2] = 0.0f; out[3] = 1.0f;
+      break;
+   }
+   case CP_COLOR_R16G16_UNORM: {
+      const unsigned short *v = (const unsigned short *)ptr;
+      out[0] = cp_unorm16_to_float(v[0]);
+      out[1] = cp_unorm16_to_float(v[1]);
       out[2] = 0.0f; out[3] = 1.0f;
       break;
    }
@@ -1002,6 +1032,12 @@ cp_store_dst(void *ptr, uint32_t encoding, const float *c)
       uint8_t *v = (uint8_t *)ptr;
       v[0] = (uint8_t)cp_float_to_unorm8(c[0]);
       v[1] = (uint8_t)cp_float_to_unorm8(c[1]);
+      break;
+   }
+   case CP_COLOR_R16G16_UNORM: {
+      unsigned short *v = (unsigned short *)ptr;
+      v[0] = (unsigned short)cp_float_to_unorm16(c[0]);
+      v[1] = (unsigned short)cp_float_to_unorm16(c[1]);
       break;
    }
    /*
