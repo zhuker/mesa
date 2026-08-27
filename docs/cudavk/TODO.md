@@ -5,7 +5,10 @@ in one place so a fresh look does not have to reconstruct it from commit
 messages. Read `DEAD_ENDS.md` first if you are about to optimise something --
 this file is what is still open, that file is what has already been closed.
 
-Numbers are as at HEAD, old capture 15.74 ms/frame, Crossroads 5.87 ms/frame.
+Numbers are as at HEAD (`e2fea470d04`), old capture **13.16 ms/frame**,
+Crossroads **5.82 ms/frame** (`/tmp/perf-audit/reprofile_baseline.md`). The old
+capture's 15.74 stood until `20611f5b131` made the opaque-episode fan-out the
+default; `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89.
 
 ## Correctness, ordered by how much they matter
 
@@ -428,15 +431,96 @@ driver.
 Ranked by the evidence behind them, not by size. `PERFORMANCE.md` has the
 measurements these come from.
 
-1. **The host waits about 17 times a frame and is blocked about 12.44 ms doing
-   it.** Device idle is 4.16 ms, almost exactly host issue time, so the driver
-   is a ping-pong rather than a pipeline. This is the largest remaining item by
-   a wide margin and the hardest. Two of its three sites survived contact with
-   evidence; the third is closed. The design and the addendum that cut it down
-   are in `/tmp/perf16/iter29-sync/`, and the two cheap probes that should be
-   run before anything is built are described there: the ratio of the A-buffer
-   bound to its actual count, and how much host work exists to overlap with a
-   wait. Neither has been run.
+1. **The host waits 16.76 times a frame and is blocked 9.73 ms doing it.**
+   Device idle is 3.70 ms, almost exactly host issue time (3.48 ms), so the
+   driver is still a ping-pong rather than a pipeline. This is the largest
+   remaining item by a wide margin and the hardest. The fan-out
+   (`20611f5b131`) took 2.65 ms out of the episode drain at an **unchanged**
+   9.88 waits/frame — it shortened each wait, it did not remove one — leaving
+   the drain at 5.989 ms/frame, peel checks at 2.751 over 1.70 waits and
+   segment counters at 0.982 over 4.17. Crossroads blocks 2.563 ms over 8.26
+   waits and runs **no peel checks at all**. Two of the site's three routes
+   survived contact with evidence; the third is closed
+   (`/tmp/perf16/iter29-sync/`).
+
+   **Both gating probes have now been run** — both captures, one session, at
+   `e2fea470d04`, instrumentation only behind `CUDAVK_DRAIN_PROBE`, output
+   hashes and submit counts unchanged
+   (`/tmp/perf-audit/probes_p1_p2.md`, diff at
+   `/tmp/perf-audit/drain_probe.diff`):
+
+   - **P1 — bound-based sizing is not dead.** Median `total/quads` is **3.753**
+     on old and **3.725** on Crossroads, max **3.99** over 20,704 episodes. The
+     ratio is capped at 4 by geometry (a quad is 2×2 pixels), and the driver
+     allocates `4 × quads` (`want_slots = num_quads * 4`,
+     `cp_renderer.c:4182`) over arrays that are dense over **quads**
+     (`slot = 4·q + lane`). A host substitute that knows only `total` must
+     bound quads by it and allocate `4 × total`, i.e. **3.75× today's
+     allocation** — the 94% figure is how full today's arrays are, not an
+     allocation. S1d survives P1, but it is **gated on memory, not on ratio**,
+     against the same 8.59 GB scratch cap `UNSAFE_NO_OVERFLOW` hit; the
+     deciding measurement is the `dscratch` high-water at the drain. Related
+     and free: the tail drain's `quad_over` test is redundant when
+     `fill_over == 0`, since `quad_capacity == capacity` and `quads <= total`.
+     **Caveat: P1 is _not_ the `bound/actual` ratio of the `bounded` fast
+     path** — that is `ab->nblocks × rast_num_triangles` over actual quads, a
+     different quantity — so the clip-rectangle lead must not be sized from
+     3.75 and still needs its own probe at `cp_renderer.c:6402–6413`.
+   - **P2 — there is host work to overlap.** Median inter-drain issue burst
+     **306 µs** on old and **139 µs** on Crossroads, against a mean drain wait
+     of 606 µs, so the "tens of microseconds → dead" branch does not fire.
+     **Caveat: the naive `min(burst, wait) × 9.88 = 3.02 ms/frame` double-counts.**
+     The host's total issue time is 3.48 ms/frame and the device is 72% busy,
+     so the frame cannot fall below ≈9.5 ms; the real headroom is the 3.70 ms
+     of device idle, and 2.5–3.5 ms/frame is the honest ceiling on old.
+     P2 says nothing about S1b's 250 MB–1.6 GB memory cost, which is why S1b
+     stays demoted.
+
+   A third finding fell out of P1: **6.9% of old-capture drains and 18.3% of
+   Crossroads drains return `quads == 0`** — the host blocks to be told the
+   episode covered nothing. That is 0.053 ms/frame on old (0.9% of the site's
+   blocked time) and **0.322 ms/frame on Crossroads (15.1%)**, where an empty
+   drain costs almost as much as a productive one (0.315 against 0.397 ms
+   mean). **It is not a lead**: the drain is taken for `fill_over`/`quad_over`,
+   `quads` rides along in the same copy, and `cp_pass_can_retry` forbids the
+   fragment shader before the overflow answer, so an oracle for `quads == 0`
+   would save no wait. Only S1d — draining at the scan — would attack it.
+
+   **P3, the probe P1 said was still needed, has also been run, and it closes
+   the clip-rectangle lead** (`/tmp/perf-audit/bound_probe_p3.md`). At the drain
+   the `bounded` predicate falls back to, the clip rectangle is **never tighter
+   than the framebuffer** (0 of 8,836 samples), `nblocks × tris / actual quads`
+   has a median of **3.46e7** on old and **2.95e7** on Crossroads, and **no
+   variant admits a single draw** — today's, clip-rect, or with `tris <= 2`
+   dropped. `PERFORMANCE.md` §6 item 2 is closed at 0.00 ms, and the `bounded`
+   fast path is effectively dead code on both captures.
+   **STATUS AFTER 2026-08-26**: six of the eight blocking sites are closed by
+   the census (`PERFORMANCE.md` §5.2b), and the **episode drain is the one that
+   is open — and it is now the largest single lead in the driver, worth up to
+   about 2.07 ms/frame.** Its ceiling is 2.066 ms/frame at 34.3% of its blocked
+   time, gap-bound on 72% of its waits, and its conversion factor is **measured
+   at +1.02** by injecting host time at the site (`CUDAVK_WAIT_SPIN_US`, slope
+   over a 0–1.98 ms/frame sweep, residuals under 0.031 ms). Host time added
+   there lands one for one on the frame.
+   The peel site is closed by the same probe returning **−0.03**, which also
+   **retires the 11% "conversion"** taken from the rejected predication patch:
+   injecting 2.05 ms/frame at the peel site costs nothing, so that patch's
+   0.110 ms was its mechanism, not its blocking. Do not size anything with 11%.
+   `ready = 0` at all 28,852 waits, so no wait in this driver is pure overhead.
+   **What is unproven at the drain is symmetry** — the probe measures the *add*
+   direction, and a deferral mechanism still has to be built and measured.
+   **Three sites are live, not one.** The same probe at the other two gives
+   **segment counters +1.03** near the origin (ceiling 0.253 → **≈0.26
+   ms/frame**) and **`vkDeviceWaitIdle` +0.44**, linear to 1.01 ms/frame
+   injected (ceiling 0.500 → **≈0.22 ms/frame**). Each is comparable to a whole
+   accepted iteration. Both had been closed "by size" at the retired 11%, which
+   was wrong: they are **sized and open**. The segment sweep saturates above
+   ~0.5 ms/frame injected (point slopes 1.16, 1.03, 0.80), so the three are
+   unlikely to be additive — recovering at one site spends slack another would
+   have used.
+   Also open: where the 2.453 ms median inter-submit stall actually lives, since
+   `vkDeviceWaitIdle` blocks only 0.514 ms/frame and so is not mostly that.
+
 2. **Fuse the fragment writeback into the fragment shader.** Parked with a
    working mechanism and a wrong result; about 0.04 ms and a known next step.
    See `DEAD_ENDS.md`.
@@ -450,6 +534,17 @@ measurements these come from.
 5. **`pbribl` regresses by about 0.03 ms** with vertex-fetch fusion enabled and
    nobody knows why. Bounded and deliberately accepted; the cost is in fused
    execution on that workload, not in the machinery around it.
+6. **Where the 2.453 ms median inter-submit stall lives.** `PERFORMANCE.md`
+   §5.2 attributes the frame-boundary gap to it, and the census now shows
+   `vkDeviceWaitIdle` blocks only 0.514 ms/frame, so most of that stall is
+   somewhere the driver does not currently instrument. Open.
+7. **`CUDAVK_PDL` is measured and unlanded.** +0.4342 ms (+3.29%) on old and
+   +0.1297 (+2.23%) on Crossroads at level 3 against level 0, decisive
+   instrument, arms non-overlapping, p = 0.0011 and 0.0143; −1.5% on the
+   eighteen-sample sweep with no sample regressed and the standing exceptions
+   unchanged. It works by overlapping a kernel's preamble with its
+   predecessor's tail — the same family as the fan-out. Levels are additive to
+   within 0.042 ms.
 
 ## Housekeeping
 
