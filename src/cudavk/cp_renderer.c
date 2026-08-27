@@ -3855,6 +3855,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
                    unsigned w, unsigned h, void *color_data,
                    float vp_scale_x, float vp_scale_y,
                    float vp_trans_x, float vp_trans_y,
+                   float depth_scale, float depth_translate,
                    CUdeviceptr reject, CUdeviceptr resolved,
                    unsigned reject_pass, CUdeviceptr seg_ranges,
                    unsigned num_seg_ranges)
@@ -3946,6 +3947,9 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       .quad_width = (w + 1) / 2,
       .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
       .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
+      /* gl_FragCoord.z is the depth the rasterizer tested with, so the
+       * interpolator takes the same viewport depth transform. */
+      .depth_scale = depth_scale, .depth_translate = depth_translate,
       /* TEMPORARY: see cp->abuf_dbg above. */
       .dbg_blk_offsets = cp->abuf_dbg.blk_offsets,
       .dbg_blk_counts = cp->abuf_dbg.blk_counts,
@@ -4320,6 +4324,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
               unsigned w, unsigned h,
               float vp_scale_x, float vp_scale_y,
               float vp_trans_x, float vp_trans_y,
+              float depth_scale, float depth_translate,
               uint32_t num_quads, uint32_t num_covered, bool record_colors,
               void *color_data, bool composite, float *t_interp,
               float *t_shade, float *t_composite,
@@ -4416,6 +4421,9 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
       .quad_width = (w + 1) / 2,
       .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
       .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
+      /* gl_FragCoord.z is the depth the rasterizer tested with, so the
+       * interpolator takes the same viewport depth transform. */
+      .depth_scale = depth_scale, .depth_translate = depth_translate,
       .abuf_quad_prim = ab->quad_prim,
       .abuf_quad_mask = ab->quad_mask,
       .abuf_quad_block = ab->quad_block,
@@ -4995,7 +5003,10 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       .vp_w = vp_w, .vp_h = vp_h,
       .clip_x0 = clip_x0, .clip_y0 = clip_y0,
       .clip_x1 = clip_x1, .clip_y1 = clip_y1,
-      .vp_near = 0.0f, .vp_far = 1.0f,
+      /* The viewport's depth transform, which until now was computed here
+       * (cpvk_cmd.c:1905) and read nowhere. */
+      .depth_scale = state->viewport.scale[2],
+      .depth_translate = state->viewport.translate[2],
       .vp_scale_x = vp_scale_x, .vp_scale_y = vp_scale_y,
       .vp_trans_x = vp_trans_x, .vp_trans_y = vp_trans_y,
       /*
@@ -6867,6 +6878,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                             rast_args.prim_refs, num_triangles, w, h,
                             color_data,
                             vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
+                            rast_args.depth_scale, rast_args.depth_translate,
                             retry ? cp->reject : 0,
                             retry ? cp->resolved : 0,
                             pass, 0, 0);
@@ -6941,7 +6953,9 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                                 rast_args.positions, vs_output_buf,
                                 rast_args.prim_refs, w, h,
                                 vp_scale_x, vp_scale_y,
-                                vp_trans_x, vp_trans_y, qcounters[0],
+                                vp_trans_x, vp_trans_y,
+                                rast_args.depth_scale,
+                                rast_args.depth_translate, qcounters[0],
                                 abuf_covered,
                                 ab->colors_ready && cp->abuf_dbg.colors,
                                 color_data, abuf_prod,
@@ -7805,7 +7819,8 @@ cp_opaque_finish(struct cp_context *cp)
                          seg->num_triangles, w, h,
                          color_data, seg->rast.vp_scale_x,
                          seg->rast.vp_scale_y, seg->rast.vp_trans_x,
-                         seg->rast.vp_trans_y, 0, 0, 0,
+                         seg->rast.vp_trans_y, seg->rast.depth_scale,
+                         seg->rast.depth_translate, 0, 0, 0,
                          ranges_dev + (size_t)group_range_base[g] *
                             sizeof(ranges[0]),
                          group_range_count[g]);
@@ -8410,6 +8425,7 @@ cp_pass_finish_bounded_groups(struct cp_context *cp,
          first->rast.prim_refs, w, h, first->rast.vp_scale_x,
          first->rast.vp_scale_y,
          first->rast.vp_trans_x, first->rast.vp_trans_y,
+         first->rast.depth_scale, first->rast.depth_translate,
          (uint32_t)quad_bound, 0, false, NULL, false, &ti, &ts, &tc, &shade);
       if (!shaded)
          break;
@@ -8874,6 +8890,7 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
                          sg->rast.positions, sg->rast.prim_refs, w, h,
                          sg->rast.vp_scale_x, sg->rast.vp_scale_y,
                          sg->rast.vp_trans_x, sg->rast.vp_trans_y,
+                         sg->rast.depth_scale, sg->rast.depth_translate,
                          gq, 0, false, NULL, false, &ti, &ts, &tc, &ss)) {
          failed = true;
          break;

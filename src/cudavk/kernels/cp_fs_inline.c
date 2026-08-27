@@ -13,7 +13,7 @@
 /* This bitcode is embedded and linked later, so an ABI drift cannot be left
  * for runtime pointer decoding to discover. Keep sentinel offsets across the
  * early inputs, point state, A-buffer state, segment table and fused tail. */
-_Static_assert(sizeof(struct cp_fs_interp_args) == 408,
+_Static_assert(sizeof(struct cp_fs_interp_args) == 416,
                "cp_fs_interp_args ABI size");
 _Static_assert(_Alignof(struct cp_fs_interp_args) == 8,
                "cp_fs_interp_args ABI alignment");
@@ -33,6 +33,8 @@ _Static_assert(offsetof(struct cp_fs_interp_args, out_prim_list) == 392,
                "cp_fs_interp_args.out_prim_list ABI");
 _Static_assert(offsetof(struct cp_fs_interp_args, fused_direct) == 400,
                "cp_fs_interp_args.fused_direct ABI");
+_Static_assert(offsetof(struct cp_fs_interp_args, depth_scale) == 404,
+               "cp_fs_interp_args.depth_scale ABI");
 
 _Static_assert(sizeof(struct cp_seg_range) == 48, "cp_seg_range ABI size");
 _Static_assert(_Alignof(struct cp_seg_range) == 8,

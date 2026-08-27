@@ -655,7 +655,8 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
    uint32_t plane = (uint32_t)sample * args->width * args->height;
    uint32_t at = plane + (uint32_t)py * args->width + (uint32_t)px;
 
-   uint32_t depth_uint = float_to_sortable_uint(ndc_z * 0.5f + 0.5f);
+   uint32_t depth_uint = float_to_sortable_uint(
+      CP_WINDOW_DEPTH(ndc_z, args->depth_scale, args->depth_translate));
 
    if (args->depth_test && args->depthbuf) {
       uint32_t prev = ((const uint32_t *)(uintptr_t)args->depthbuf)[at];
@@ -2884,7 +2885,8 @@ cp_opaque_tile_raster(struct cp_opaque_tile_raster_args args)
             ndc_z = w0 * setup.ndc_z0 + w1 * setup.ndc_z1 +
                     (1.0f - w0 - w1) * setup.ndc_z2;
          }
-         uint32_t depth = float_to_sortable_uint(ndc_z * 0.5f + 0.5f);
+         uint32_t depth = float_to_sortable_uint(
+            CP_WINDOW_DEPTH(ndc_z, rast.depth_scale, rast.depth_translate));
          uint32_t pixel = py * args.width + px;
          if (!cp_opaque_depth_pass(&rast, pixel, depth))
             continue;
