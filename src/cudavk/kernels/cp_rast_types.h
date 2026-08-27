@@ -1284,6 +1284,51 @@ static_assert(sizeof(struct cp_rast_queues) == 56, "raster queue launch ABI");
 _Static_assert(sizeof(struct cp_rast_queues) == 56, "raster queue launch ABI");
 #endif
 
+/*
+ * THE RASTER MERGE: one raster stage over several segments in one launch.
+ *
+ * The two structs above are the launch-wide arguments of one segment's
+ * rasterization, and they are exactly what a launch spanning several segments
+ * can no longer pass by value -- the same sentence cp_seg_range says about the
+ * interpolator's arguments, one layer down. So they become a per-item record
+ * and the launch carries a table of them.
+ *
+ * The block -> item map is a prefix over the per-item block counts, and the
+ * prefix rather than a uniform stride is the whole point: item i owns blocks
+ * [block_base[i], block_base[i+1]), so the block it runs as is
+ * blockIdx.x - block_base[i] out of block_base[i+1] - block_base[i], which is
+ * bit for bit the (blockIdx.x, gridDim.x) pair that block would have seen in
+ * the segment's own launch. Nothing about the work assignment changes; only
+ * how many launches carry it. That is what makes the merge an experiment about
+ * launch count and about nothing else.
+ *
+ * The prefix travels by value in the launch's own arguments -- it is 40 bytes
+ * -- so the map costs constant-bank reads and no global traffic at all. Only
+ * the 400 byte record itself is uploaded.
+ *
+ * CP_RAST_MERGE_MAX is CP_PASS_STREAMS and that is not a coincidence: segment
+ * s rasterizes into queue set s % CP_PASS_STREAMS, so segments s and s + 8
+ * share one nontrivial queue, one huge queue and one setup cache. Today they
+ * are serialised by sharing a stream. A merged launch would run them at the
+ * same time into the same queue, which is a data race and not a merge, so the
+ * merge is chunked at the width of the queue-set pool and consecutive chunks
+ * stay ordered by the stream they are issued on.
+ */
+#define CP_RAST_MERGE_MAX 8u
+
+/* One merged item: everything a single-segment launch passed by value. */
+struct cp_rast_item {
+   struct cp_rasterize_args args;
+   struct cp_rast_queues queues;
+};
+
+/* The merged launch's own arguments: the block -> item prefix and the table. */
+struct cp_rast_merge_args {
+   uint64_t items;                            /* const struct cp_rast_item * */
+   uint32_t nitems;
+   uint32_t block_base[CP_RAST_MERGE_MAX + 1];
+};
+
 #define CP_MAX_VERTEX_ELEMENTS_VF 16
 #define CP_MAX_VERTEX_BUFFERS_VF 16
 

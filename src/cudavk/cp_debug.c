@@ -308,6 +308,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_ABUF_APPEND", CP_FLAG_BOOL_VALUE, F(no_abuf_append),
      "disable the single-pass A-buffer build: the count pass stops appending "
      "(pixel, prim) records and the fill rasterizes a second time" },
+   { "CUDAVK_MERGE_FILL_RAST", CP_FLAG_BOOL_VALUE, F(merge_fill_rast),
+     "rasterize the episode's fill relaunches in merged launches, up to eight "
+     "segments in one grid per stage, instead of one triple per segment; "
+     "needs NO_ABUF_APPEND to reach the relaunch loop at all" },
    { "CUDAVK_NO_FUSED_ABUF_INTERP", CP_FLAG_BOOL_VALUE,
      F(no_fused_abuf_interp),
      "launch A-buffer interpolation separately instead of calling it from "

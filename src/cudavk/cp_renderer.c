@@ -8553,6 +8553,107 @@ cp_pass_finish(struct cp_context *cp)
                      &ab->capacity };
       CP_LAUNCH(screen->kernels.abuf_fill_recs, 2048, 1, 1, 256, 1, 1,
                      0, cp->stream, fp, NULL);
+   } else if (cp_debug->merge_fill_rast &&
+              screen->kernels.rasterize_stage1_abuf_merged) {
+      /*
+       * THE RASTER MERGE, in the fill-relaunch position.
+       *
+       * The loop below this one is nsegs triples issued back to back at ONE
+       * host point, behind one join, with no host work between them. That is
+       * what makes it the honest place to ask the launch-count question: a
+       * merge here changes when nothing is issued and only how much each
+       * launch carries. Every other candidate in the driver -- the count
+       * phase above all -- would also have to defer work to the end of the
+       * episode, and deferral lands on the episode drain, the one wait site
+       * with a measured conversion of 1.02, where any delay is paid at par.
+       * A win or a loss measured here is a statement about launch width and
+       * about nothing else.
+       *
+       * The chunk width is CP_RAST_MERGE_MAX, and it is a correctness bound,
+       * not a tuning knob: segment s rasterizes into queue set
+       * s % CP_PASS_STREAMS, so s and s + 8 share a nontrivial queue, a huge
+       * queue and a setup cache. The per-segment loop keeps them apart by
+       * putting them on the same stream; the merge keeps them apart by
+       * putting them in different launches on one stream, which is the same
+       * ordering by the same mechanism. Chunks start at multiples of the
+       * width, so the queue sets within a chunk are always distinct.
+       *
+       * The whole chunk runs on the main stream. The fan-out it replaces
+       * bought concurrency ACROSS segments; one grid holding every segment's
+       * blocks is at least as concurrent within a stage, and pays for it with
+       * a barrier between stages that eight streams did not have -- item 7's
+       * stage 2 now waits for item 0's stage 1. That trade is the experiment.
+       */
+      for (unsigned s0 = 0; s0 < nsegs; s0 += CP_RAST_MERGE_MAX) {
+         unsigned n_items = MIN2(nsegs - s0, (unsigned)CP_RAST_MERGE_MAX);
+         struct cp_rast_item items[CP_RAST_MERGE_MAX];
+         struct cp_rast_merge_args m1 = {0}, m2 = {0}, m3 = {0};
+
+         m1.nitems = m2.nitems = m3.nitems = n_items;
+         for (unsigned i = 0; i < n_items; i++) {
+            struct cp_pass_seg *sg = &segs[s0 + i];
+            /* The item record is the per-segment loop's two by-value
+             * arguments, patched exactly as it patches them. */
+            items[i].args = sg->rast;
+            items[i].args.abuf_frags = ab->frags;
+            items[i].args.abuf_capacity = ab->capacity;
+            items[i].args.abuf_mode = CP_ABUF_FILL;
+            items[i].queues = sg->queues;
+            items[i].queues.mode = CP_QUEUE_FILL;
+            /* The segment's own queue set, saved with its arguments; the
+             * clears are the loop's, in the loop's order, on one stream. */
+            cuMemsetD32Async(items[i].queues.nontrivial_count, 0, 3,
+                             cp->stream);
+            /* Each stage's prefix is that stage's own per-segment grid,
+             * unchanged, so a block's (index, width) pair inside the merged
+             * grid is the pair its segment's launch would have handed it. */
+            unsigned t = sg->rast_num_triangles;
+            m1.block_base[i + 1] = m1.block_base[i] + (t + 255) / 256;
+            m2.block_base[i + 1] =
+               m2.block_base[i] + CLAMP((t + 7) / 8, 1u, 512u);
+            m3.block_base[i + 1] =
+               m3.block_base[i] + CLAMP(t * 8, 512u, 2048u);
+         }
+
+         CUdeviceptr items_dev =
+            cp_upload(cp, items, (size_t)n_items * sizeof(items[0]));
+         if (!items_dev)
+            return;
+         m1.items = m2.items = m3.items = items_dev;
+
+         /*
+          * Stage 1 is a plain launch, deliberately. CP_PDL_ANY promises the
+          * secondary executes nothing before its wait, and a merged kernel
+          * resolves its item and reads its record first -- legal data, since
+          * the table is host upload and not a predecessor's output, but not
+          * the promise that macro makes. It would decline in any case: the
+          * table's upload flushes immediately in front of this launch and the
+          * epoch check refuses a link across a flush.
+          */
+         void *p1[] = { &m1 };
+         if (m1.block_base[n_items])
+            CP_LAUNCH(screen->kernels.rasterize_stage1_abuf_merged,
+                      m1.block_base[n_items], 1, 1, 256, 1, 1,
+                      0, cp->stream, p1, NULL);
+         /*
+          * Stages 2 and 3 keep their links, and the merge gives them the
+          * preamble they never had: their comments say there is nothing to
+          * hoist above the wait because the arguments arrive in constant
+          * memory, and now the item resolve and the record load sit there.
+          */
+         void *p2[] = { &m2 };
+         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage1_abuf_merged,
+                         CP_PDL_TIER_RASTER,
+                         screen->kernels.rasterize_stage2_abuf_merged,
+                         m2.block_base[n_items], 1, 1, 256, 1, 1,
+                         0, cp->stream, p2, NULL);
+         void *p3[] = { &m3 };
+         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2_abuf_merged,
+                         CP_PDL_TIER_RASTER,
+                         screen->kernels.rasterize_stage3_abuf_merged,
+                         m3.block_base[n_items], 1, 1, 64, 1, 1,
+                         0, cp->stream, p3, NULL);
+      }
    } else {
       /* One relaunch per segment from its saved arguments, fanned back out
        * over the side streams behind the scan. */

@@ -99,6 +99,23 @@ struct cp_kernels {
    char *fs_helper_ptx;
 
    bool initialized;
+
+   /*
+    * THE RASTER MERGE: the same three A-buffer stages, over up to
+    * CP_RAST_MERGE_MAX segments per launch. Null unless
+    * CUDAVK_MERGE_FILL_RAST compiled them into the module; the host tests the
+    * stage-1 handle before taking the merged path, so a module without them
+    * simply keeps the per-segment loop.
+    *
+    * At the end of the struct for the reason the flag is at the end of
+    * struct cp_debug: three handles inserted beside the stages they merge
+    * would shift every later member and rewrite the displacement in every
+    * function that reads one, which buries an experiment's real footprint in
+    * noise no reviewer can check.
+    */
+   CUfunction rasterize_stage1_abuf_merged;
+   CUfunction rasterize_stage2_abuf_merged;
+   CUfunction rasterize_stage3_abuf_merged;
 };
 
 /* Whether the kernels were compiled with the census and A-buffer verification
