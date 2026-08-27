@@ -14,20 +14,37 @@
 #include "util/u_debug.h"
 
 /*
- * Nothing yet. KHR_get_physical_device_properties2 was advertised first and
- * taken straight back out: an application that enables it calls the KHR
- * aliases, and at apiVersion 1.0 those alias entrypoints are not wired to the
- * runtime's core implementations, so the loader jumps to a null pointer. That
- * is the "advertised and then clamped is worse than refused" rule in its
- * sharpest form — the failure was a segfault inside vulkaninfo with no driver
- * frame in the backtrace. It comes back with apiVersion 1.1, or with the
- * aliases implemented explicitly.
+ * KHR_get_physical_device_properties2 was advertised once, removed after
+ * vulkaninfo segfaulted, and is back. The segfault was real; the reason
+ * recorded for it was wrong, and it cost this extension a long exile.
+ *
+ * The old comment blamed unwired KHR aliases at apiVersion 1.0. They were
+ * never unwired. vk_dispatch_table.h stores each core entrypoint and its KHR
+ * alias in a union, and physical_device_compaction_table[] maps both
+ * entrypoint indices onto that one shared dispatch slot, so filling the core
+ * slot resolves both names. The extension check in
+ * vk_physical_device_entrypoint_is_enabled is only a gate: passing it hands
+ * back the core implementation.
+ *
+ * The actual crash was a missing *core* entrypoint,
+ * cpvk_GetPhysicalDeviceMemoryProperties2 -- see the comment on it below. It
+ * segfaulted at apiVersion 1.1 with no extension requested at all; enabling
+ * the extension merely widened the blast radius to more callers. Implementing
+ * it fixed both.
+ *
+ * Do NOT add KHR alias forwarders here to "help". Because core and alias share
+ * one dispatch slot, a driver that defines both trips
+ * assert(disp[disp_index] == NULL) in
+ * vk_physical_device_dispatch_table_from_entrypoints, which is a hard abort in
+ * this build. Fourteen Mesa drivers advertise this extension and not one of
+ * them defines an alias forwarder; lavapipe is the model.
  */
 static const struct vk_instance_extension_table cpvk_instance_extensions = {
    /* Mesa WSI common supplies a real headless surface implementation. No X11,
     * Wayland or display platform extension is exposed by this build. */
    .KHR_surface = true,
    .EXT_headless_surface = true,
+   .KHR_get_physical_device_properties2 = true,
 };
 
 static const struct vk_device_extension_table cpvk_device_extensions = {
@@ -598,6 +615,26 @@ cpvk_GetPhysicalDeviceMemoryProperties(
                              VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
                           .heapIndex = 0 },
    };
+}
+
+/*
+ * Mesa's convention runs the other way from the rest of the 1.0 entrypoints in
+ * this file: the driver implements the *2 form and vk_common builds the 1.0
+ * call on top of it (vk_physical_device.c:171-186). There is no
+ * vk_common_GetPhysicalDeviceMemoryProperties2, so defining only the 1.0 form
+ * left the shared dispatch slot NULL and the core 1.1 call jumped through it.
+ * That was a live segfault at apiVersion 1.1 with no extension requested.
+ *
+ * The pNext chain is ignored on purpose: VK_EXT_memory_budget is not
+ * advertised, so no chained struct is legal here yet.
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_GetPhysicalDeviceMemoryProperties2(
+   VkPhysicalDevice physicalDevice,
+   VkPhysicalDeviceMemoryProperties2 *pMemoryProperties)
+{
+   cpvk_GetPhysicalDeviceMemoryProperties(physicalDevice,
+                                          &pMemoryProperties->memoryProperties);
 }
 
 VKAPI_ATTR void VKAPI_CALL
