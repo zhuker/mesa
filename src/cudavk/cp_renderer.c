@@ -38,9 +38,41 @@
  * The state and every line of the mechanism live beside cp_pass_finish(),
  * which is where the drain it defers is.
  */
+/*
+ * CUDAVK_AHEAD_WHY: which of the driver's exits from the append loop resolved a
+ * deferral, and whether it held anything when it did.
+ *
+ * 56.4% of deferrals hold nothing AND are not counted as a decline -- they
+ * never reached an admission decision, so no capacity change can touch them.
+ * P1's two anchors localise them: 4,223 gaps have nine or more appendable
+ * batches against 4,096 deferrals measured at the cap of 8 (the mechanism
+ * reaches the big gaps essentially perfectly), while 7,321 gaps have one or
+ * two against 8,422 deferrals that held nothing. The missing reach is the
+ * entire small-gap population. This names which exit takes them.
+ */
+enum cp_ahead_site {
+   CP_AHEAD_SITE_UNKNOWN,
+   CP_AHEAD_SITE_SCOPE_BEGIN,     /* cp_render_scope_begin: framebuffer bind */
+   CP_AHEAD_SITE_SCOPE_END,       /* cp_render_scope_end */
+   CP_AHEAD_SITE_FLUSH,           /* cp_batch_flush_why: readback, clear,
+                                   * order point, "the next draw cannot join" */
+   CP_AHEAD_SITE_NOT_APPENDABLE,  /* cp_batch_flush_defer_why fall-through */
+   CP_AHEAD_SITE_APPEND_OPAQUE,   /* cp_pass_append: the episode was opaque */
+   CP_AHEAD_SITE_APPEND_SMALL,    /* cp_pass_append: under abuf_min_tris */
+   CP_AHEAD_SITE_APPEND_SETUP,    /* cp_pass_append: episode begin refused */
+   CP_AHEAD_SITE_OPAQUE_APPEND,   /* cp_opaque_append: an OPAQUE successor */
+   CP_AHEAD_SITE_DRAW_EXECUTE,    /* the net at cp_draw_execute_batch */
+   CP_AHEAD_SITE_ADMIT,           /* admission refused this batch */
+   CP_AHEAD_SITE_SEAM,            /* admitted, then backed out before the seam */
+   CP_AHEAD_SITE_COUNT,
+};
+
 static bool cp_ahead_deferred(const struct cp_context *cp);
 static bool cp_ahead_holding(const struct cp_context *cp);
-static void cp_ahead_resolve(struct cp_context *cp);
+static void cp_ahead_resolve(struct cp_context *cp, enum cp_ahead_site site);
+static void cp_ahead_site(struct cp_context *cp, enum cp_ahead_site site);
+static void cp_ahead_site_clear(struct cp_context *cp);
+static void cp_ahead_note_late_append(struct cp_context *cp);
 static void cp_ahead_note_launch(struct cp_context *cp);
 static void cp_ahead_note_fallback(struct cp_context *cp);
 static void cp_ahead_destroy(struct cp_context *cp);
@@ -5322,7 +5354,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * makes it slow instead of wrong.
     */
    if (cp_ahead_deferred(cp) && !cp_ahead_holding(cp))
-      cp_ahead_resolve(cp);
+      cp_ahead_resolve(cp, CP_AHEAD_SITE_DRAW_EXECUTE);
    unsigned batch_draws = batch->ndraws;
    const struct cp_draw_call *info = &batch->info;
    unsigned drawid_offset = batch->drawid_offset;
@@ -9285,6 +9317,32 @@ struct cp_ahead_run {
    uint64_t declines[CP_AHEAD_DECL_COUNT];
    uint64_t held_hist[CP_AHEAD_MAX_SEGS + 1];
    uint64_t hold_ns_sum, hold_bytes_peak;
+
+   /*
+    * CUDAVK_AHEAD_WHY, and it is LAST for the reason every measurement field
+    * in this driver is last: it is a probe, it has to be provably inert, and a
+    * field in the middle costs displacement lines that have nothing to do with
+    * it.
+    *
+    * `site` is a hint the caller about to close the episode leaves behind. The
+    * outermost caller wins: cp_render_scope_begin() sets it before calling
+    * cp_batch_flush_why(), which only fills it if it is still unknown -- the
+    * resolve that matters happens inside that flush, so attributing it to the
+    * flush would hide exactly the boundary this probe exists to find.
+    *
+    * `watch` is what separates "there was no successor" from "the successor
+    * arrived after a resolve we had to take anyway": after a deferral that
+    * held nothing, the next blended segment recorded before the next deferral
+    * scores a `late` for the site that resolved it.
+    */
+   enum cp_ahead_site site;
+   /* site + 1 while watching for a late successor, 0 when not -- so that the
+    * calloc that creates this struct is the whole initialisation and the
+    * flag-off build carries no initialiser to explain. */
+   unsigned watch;
+   uint64_t resolve_site[CP_AHEAD_SITE_COUNT];
+   uint64_t zero_site[CP_AHEAD_SITE_COUNT];
+   uint64_t late_site[CP_AHEAD_SITE_COUNT];
 };
 
 static void cp_ahead_replay(struct cp_context *cp);
@@ -9301,6 +9359,45 @@ static bool
 cp_ahead_deferred(const struct cp_context *cp)
 {
    return cp->runahead && cp->runahead->deferred;
+}
+
+/*
+ * Leave a hint about which exit is closing the episode. Weak on purpose: the
+ * OUTERMOST caller wins, because cp_render_scope_begin() and
+ * cp_render_scope_end() reach cp_pass_finish() through cp_batch_flush_why()
+ * and it is that inner call which resolves. Cleared when a resolve consumes
+ * it, and by the two scope functions on the way out so it cannot leak into a
+ * later resolve.
+ */
+static void
+cp_ahead_site(struct cp_context *cp, enum cp_ahead_site site)
+{
+   struct cp_ahead_run *a = cp->runahead;
+   if (a && cp_debug->ahead_why && a->site == CP_AHEAD_SITE_UNKNOWN)
+      a->site = site;
+}
+
+static void
+cp_ahead_site_clear(struct cp_context *cp)
+{
+   struct cp_ahead_run *a = cp->runahead;
+   if (a && cp_debug->ahead_why)
+      a->site = CP_AHEAD_SITE_UNKNOWN;
+}
+
+/*
+ * A blended segment appended after a deferral that held nothing: the successor
+ * existed, and the resolve simply came first. Called from
+ * cp_pass_record_segment(), which is the one place a segment is recorded.
+ */
+static void
+cp_ahead_note_late_append(struct cp_context *cp)
+{
+   struct cp_ahead_run *a = cp->runahead;
+   if (a && cp_debug->ahead_why && a->watch) {
+      a->late_site[a->watch - 1]++;
+      a->watch = 0;
+   }
 }
 
 /*
@@ -9595,7 +9692,7 @@ cp_ahead_defer(struct cp_context *cp, const struct cp_pass_tail *t)
  * two functions no path in this driver reaches CUDA without passing.
  */
 static void
-cp_ahead_resolve(struct cp_context *cp)
+cp_ahead_resolve(struct cp_context *cp, enum cp_ahead_site site)
 {
    struct cp_ahead_run *a = cp->runahead;
    if (!a || !a->deferred)
@@ -9603,6 +9700,16 @@ cp_ahead_resolve(struct cp_context *cp)
 
    a->deferred = false;
    a->resolves++;
+   if (cp_debug->ahead_why) {
+      /* An explicit site beats the hint; the hint is what cp_pass_finish()'s
+       * caller left, and it is consumed here whether it was used or not. */
+      enum cp_ahead_site s = site != CP_AHEAD_SITE_UNKNOWN ? site : a->site;
+      a->site = CP_AHEAD_SITE_UNKNOWN;
+      a->resolve_site[s]++;
+      a->watch = a->nheld ? 0 : (unsigned)s + 1;
+      if (!a->nheld)
+         a->zero_site[s]++;
+   }
    uint64_t fallbacks_before = a->fallbacks;
    cp_pass_tail_run(cp, &a->tail);
 
@@ -9771,6 +9878,53 @@ cp_ahead_report(struct cp_context *cp)
       if (a->declines[i])
          fprintf(stderr, " %s:%" PRIu64, why[i], a->declines[i]);
    fprintf(stderr, "\n");
+
+   if (!cp_debug->ahead_why)
+      return;
+
+   /*
+    * CUDAVK_AHEAD_WHY. Read the ZERO column first: those are the deferrals
+    * that held nothing and were not counted as a decline, because they never
+    * reached an admission decision. `late` says whether a blended successor
+    * turned up anyway after the resolve -- which separates "the pass ended"
+    * from "the successor arrived behind a resolve we had to take".
+    */
+   static const char *const site[CP_AHEAD_SITE_COUNT] = {
+      "unknown", "scope_begin", "scope_end", "flush", "not_appendable",
+      "append_opaque", "append_small", "append_setup", "opaque_append",
+      "draw_execute", "admit", "seam",
+   };
+   fprintf(stderr, "cudavk: run-ahead why: resolves by site "
+           "(resolve/zero-hold/late successor):");
+   for (unsigned i = 0; i < CP_AHEAD_SITE_COUNT; i++)
+      if (a->resolve_site[i])
+         fprintf(stderr, " %s:%" PRIu64 "/%" PRIu64 "/%" PRIu64, site[i],
+                 a->resolve_site[i], a->zero_site[i], a->late_site[i]);
+   fprintf(stderr, "\n");
+
+   /* The four-way split the question was asked in, so the answer can be read
+    * without adding the columns up by hand. cp_pass_finish() is every site
+    * that arrives through a hint. */
+   uint64_t pf = 0, pfz = 0;
+   for (unsigned i = CP_AHEAD_SITE_UNKNOWN; i <= CP_AHEAD_SITE_APPEND_SETUP;
+        i++) {
+      pf += a->resolve_site[i];
+      pfz += a->zero_site[i];
+   }
+   fprintf(stderr,
+           "cudavk: run-ahead why: pass_finish %" PRIu64 " (%" PRIu64
+           " zero), opaque_append %" PRIu64 " (%" PRIu64
+           " zero), draw_execute %" PRIu64 " (%" PRIu64
+           " zero), admission %" PRIu64 " (%" PRIu64 " zero)\n",
+           pf, pfz,
+           a->resolve_site[CP_AHEAD_SITE_OPAQUE_APPEND],
+           a->zero_site[CP_AHEAD_SITE_OPAQUE_APPEND],
+           a->resolve_site[CP_AHEAD_SITE_DRAW_EXECUTE],
+           a->zero_site[CP_AHEAD_SITE_DRAW_EXECUTE],
+           a->resolve_site[CP_AHEAD_SITE_ADMIT] +
+              a->resolve_site[CP_AHEAD_SITE_SEAM],
+           a->zero_site[CP_AHEAD_SITE_ADMIT] +
+              a->zero_site[CP_AHEAD_SITE_SEAM]);
 }
 
 
@@ -10073,7 +10227,7 @@ cp_pass_finish(struct cp_context *cp)
     * deferred episode.
     */
    if (cp_ahead_deferred(cp))
-      cp_ahead_resolve(cp);
+      cp_ahead_resolve(cp, CP_AHEAD_SITE_UNKNOWN);
 
    struct cp_device *screen = cp->dev;
    struct cp_abuf *ab = cp->abuf;
@@ -10361,6 +10515,10 @@ cp_pass_record_segment(struct cp_context *cp,
     */
    if (cp_debug->ahead_census && !cp->pass.opaque)
       cp->ahead.gap_appends++;
+   /* CUDAVK_AHEAD_WHY: a blended segment appended after a deferral that held
+    * nothing. The successor existed; the resolve came first. */
+   if (!cp->pass.opaque)
+      cp_ahead_note_late_append(cp);
 }
 
 
@@ -10401,8 +10559,10 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
 {
    const struct cp_fb_desc *fb = &cp->batch.scope.fb;
 
-   if (cp->pass.nsegs && cp->pass.opaque)
+   if (cp->pass.nsegs && cp->pass.opaque) {
+      cp_ahead_site(cp, CP_AHEAD_SITE_APPEND_OPAQUE);
       cp_pass_finish(cp);
+   }
 
    /*
     * A batch too small for the A-buffer, decided before the vertex work.
@@ -10417,6 +10577,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
        cp_batch_total_triangles(&cp->batch.info, cp->batch.draws, ndraws,
                                 cp->batch.instance_counts)
           < cp_debug->abuf_min_tris) {
+      cp_ahead_site(cp, CP_AHEAD_SITE_APPEND_SMALL);
       cp_pass_finish(cp);
       cp_draw_execute_batch(cp, &cp->batch);
       return;
@@ -10495,7 +10656,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
           * reason.
           */
          a->declines[CP_AHEAD_DECL_SEAM]++;
-         cp_ahead_resolve(cp);
+         cp_ahead_resolve(cp, CP_AHEAD_SITE_SEAM);
          if (cp->device_fatal)
             return;
          if (!cp_pass_join(cp, CP_PASS_STREAMS))
@@ -10506,7 +10667,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
          cp_draw_execute_batch(cp, &cp->batch);
          return;
       }
-      cp_ahead_resolve(cp);
+      cp_ahead_resolve(cp, CP_AHEAD_SITE_ADMIT);
       if (cp->device_fatal)
          return;
    }
@@ -10517,6 +10678,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
          /* A refusal falls back; a latched device loss must not. */
          if (begun < 0 || cp->device_fatal)
             return;
+         cp_ahead_site(cp, CP_AHEAD_SITE_APPEND_SETUP);
          cp_pass_finish(cp);
          cp_draw_execute_batch(cp, &cp->batch);
          return;
@@ -10578,7 +10740,7 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
     * below cannot catch it, because while a tail is deferred nsegs is zero.
     */
    if (cp_ahead_deferred(cp))
-      cp_ahead_resolve(cp);
+      cp_ahead_resolve(cp, CP_AHEAD_SITE_OPAQUE_APPEND);
 
    if (cp->pass.nsegs && !cp->pass.opaque)
       cp_pass_finish(cp);
@@ -10750,6 +10912,7 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
    }
 
    /* Whatever the episode holds was submitted before these draws. */
+   cp_ahead_site(cp, CP_AHEAD_SITE_NOT_APPENDABLE);
    cp_pass_finish(cp);
    cp->tile_census_solo += ndraws;
    cp_draw_execute_batch(cp, &cp->batch);
@@ -10758,6 +10921,9 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
 void
 cp_batch_flush_why(struct cp_context *cp, const char *why)
 {
+   /* Weak: a scope change has already claimed the hint, and the resolve that
+    * matters for it happens inside the call below. */
+   cp_ahead_site(cp, CP_AHEAD_SITE_FLUSH);
    cp_batch_flush_defer_why(cp, why);
    if (cp_debug->debug_episode && cp->pass.nsegs)
       fprintf(stderr, "episode-cut: flush_why=%s nsegs=%u\n", why,
@@ -10779,10 +10945,13 @@ void
 cp_render_scope_begin(struct cp_context *cp, const struct cp_render_scope *scope)
 {
    cp->plan.scopes++;
+   cp_ahead_site_clear(cp);
+   cp_ahead_site(cp, CP_AHEAD_SITE_SCOPE_BEGIN);
    cp_batch_flush_why(cp, "framebuffer");
    if (cp_debug->debug_episode)
       fprintf(stderr, "episode-cut: begin_render\n");
    cp_pass_finish(cp);
+   cp_ahead_site_clear(cp);
    cp->pass.scope = *scope;
    cp->pass.scope_open = true;
    cp_context_set_framebuffer(cp, &scope->fb, scope->attachment_samples);
@@ -10796,12 +10965,15 @@ cp_render_scope_begin(struct cp_context *cp, const struct cp_render_scope *scope
 void
 cp_render_scope_end(struct cp_context *cp)
 {
+   cp_ahead_site_clear(cp);
+   cp_ahead_site(cp, CP_AHEAD_SITE_SCOPE_END);
    cp_batch_flush_why(cp, "render scope end");
    if (cp_debug->debug_episode)
       fprintf(stderr, "episode-cut: end_render\n");
    cp_pass_finish(cp);
    if (cp->pass.scope.depth.store)
       cp_depth_attachment_xfer(cp, &cp->pass.scope, true);
+   cp_ahead_site_clear(cp);
    cp->pass.scope_open = false;
 }
 

@@ -370,6 +370,12 @@ static const struct cp_flag_def flags[] = {
      "measured, times eight for the clip outputs the census excludes, plus "
      "margin. There is no grow path -- the run-ahead declines and the batch "
      "runs normally", .dflt = 24, .has_range = true, .lo = 1, .hi = 4096 },
+   { "CUDAVK_AHEAD_WHY", CP_FLAG_BOOL_VALUE, F(ahead_why),
+     "attribute every run-ahead resolve to the exit that took it, and count "
+     "the deferrals that held nothing by the same key. Those are not "
+     "declines -- they never reached an admission decision -- so no capacity "
+     "or threshold change can touch them, and this is what names which exit "
+     "they belong to. Counters only, and a probe run is not a timed run" },
    { "CUDAVK_WAIT_SPIN_DECOY", CP_FLAG_UINT, F(wait_spin_decoy),
      "issue this many four-byte clears on a stream of their own immediately "
      "before the named wait's sync; the control for whether work issued on "

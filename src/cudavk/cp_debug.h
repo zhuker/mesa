@@ -346,6 +346,7 @@ struct cp_debug {
    unsigned ahead_budget_us;
    unsigned ahead_min_verts;
    unsigned ahead_hold_mb;
+   bool     ahead_why;
 };
 
 /*

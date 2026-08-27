@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-131 switches.
+132 switches.
 
 ## Tracing
 
@@ -102,6 +102,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_AHEAD_BUDGET_US` | uint | `125` | 0&ndash;100000 | stop admitting batches once this much host time has been relocated in front of one drain. The default is the knee of the drain's measured wait CDF -- P(W<125us)=0.09 against P(W<250us)=0.43 -- so work moved under it is absorbed at a measured slope of 0.065 instead of 1.02. 0 removes the budget |
 | `CUDAVK_AHEAD_MIN_VERTS` | uint | `32` | 0&ndash;1000000 | refuse to hold a batch with fewer assembled vertices than this: below it the vertex phase relocates less host time than the stream switch and the ordering edge that holding it costs. 0 removes the floor |
 | `CUDAVK_AHEAD_HOLD_MB` | uint | `24` | 1&ndash;4096 | how much device scratch the held batches of one drain may take before the run-ahead declines. Sized from the census: 2.14 MB peak per episode measured, times eight for the clip outputs the census excludes, plus margin. There is no grow path -- the run-ahead declines and the batch runs normally |
+| `CUDAVK_AHEAD_WHY` | bool (value) | `off` | — | attribute every run-ahead resolve to the exit that took it, and count the deferrals that held nothing by the same key. Those are not declines -- they never reached an admission decision -- so no capacity or threshold change can touch them, and this is what names which exit they belong to. Counters only, and a probe run is not a timed run |
 | `CUDAVK_WAIT_SPIN_DECOY` | uint | `0` | 0&ndash;4096 | issue this many four-byte clears on a stream of their own immediately before the named wait's sync; the control for whether work issued on another stream during a wait makes the wait longer |
 | `CUDAVK_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |
 | `CUDAVK_NO_FUSED_ABUF_INTERP` | bool (value) | `off` | — | launch A-buffer interpolation separately instead of calling it from the generated fragment shader; performance experiment only |
