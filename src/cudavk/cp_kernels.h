@@ -21,6 +21,9 @@ struct cp_kernels {
    /* Clear kernels */
    CUfunction clear_kernel;
    CUfunction clear_depth_kernel;
+   /* The read-modify-write clear, for one aspect of a packed depth-stencil
+    * image; see cp_clear_masked_kernel. */
+   CUfunction clear_masked_kernel;
    CUfunction depth_attachment_load;
    CUfunction depth_attachment_store;
    CUfunction cache_convert;
