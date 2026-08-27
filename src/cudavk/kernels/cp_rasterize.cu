@@ -165,13 +165,20 @@ float_to_sortable_uint(float f)
  * Clipping against the planes that make the perspective divide meaningful,
  * one thread per input triangle.
  *
- * Gallium presents clip coordinates with the OpenGL depth convention,
- * -w <= x,y,z <= w. The six view-volume planes plus a small positive-W
- * guard matter here:
+ * Vulkan's clip volume is 0 <= z <= w and -w <= x,y <= w — the depth range is
+ * half of OpenGL's, and this used to clip against OpenGL's z >= -w. The six
+ * view-volume planes plus a small positive-W guard matter here:
  *
- *   z >= -w     one of the depth planes. Under the conventional projection it
+ *   z >= 0      one of the depth planes. Under the conventional projection it
  *               is the near plane, and a ground plane running to the horizon
- *               crosses it.
+ *               crosses it. **This is z >= 0, not z >= -w.** With the OpenGL
+ *               plane, geometry between the two — nearer than Vulkan's near
+ *               plane but not yet behind the eye — survived clipping and was
+ *               rasterised with a negative window depth, which is outside
+ *               [minDepth, maxDepth] and unreadable by anything that samples
+ *               the stored depth buffer. Measured on a triangle crossing the
+ *               near plane: 1352 lit pixels against lavapipe's 338, and depth
+ *               values reaching -0.498.
  *   z <= w      the other one. Under a reversed-Z projection — depth cleared
  *               to 0 and tested GREATER_OR_EQUAL, which is what the real
  *               application uses — this is the near plane instead, and the two
@@ -200,7 +207,7 @@ float_to_sortable_uint(float f)
 static __device__ __forceinline__ float
 clip_dist(const float4 *v, int plane)
 {
-   return plane == 0 ? v[0].z + v[0].w
+   return plane == 0 ? v[0].z
         : plane == 1 ? v[0].w - 1e-6f
         : plane == 2 ? v[0].w - v[0].z
         : plane == 3 ? v[0].x + v[0].w
