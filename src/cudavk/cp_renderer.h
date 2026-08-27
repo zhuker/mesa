@@ -134,6 +134,59 @@ struct cp_abuf_dbg_state {
 };
 
 
+/*
+ * CUDAVK_AHEAD_CENSUS: what a run-ahead of the drain could actually move.
+ *
+ * The wait census bounded the drain at 2.066 ms/frame on the old capture, as
+ * sum over drains of min(host issue burst after the wait, the wait). That is the
+ * ceiling for EVERY mechanism that relocates host work into the drain. A
+ * concrete mechanism moves a strict subset of that burst, so the ceiling is a
+ * bound and not a forecast, and the subset needs its own measurement.
+ *
+ * This is that measurement, for the one surviving mechanism: issue the next
+ * episode's vertex stage across the drain. It accumulates two quantities over
+ * the same inter-drain gaps -- all host issue time, and the host issue time
+ * spent in the vertex phase of appending segments -- and reports both against
+ * the drain's own wait. The first must reproduce the wait census, which is what
+ * makes the second believable; if it does not, nothing may be concluded from
+ * the second in either direction.
+ *
+ * It also reports what the mechanism would have to allocate (the design's
+ * per-segment formula, evaluated on the real distribution rather than on a
+ * placeholder) and how many appendable blended batches actually follow a drain,
+ * which is the difference between "there is nothing to move" and "there is
+ * something to move and nowhere to move it from".
+ *
+ * Counters only. No behaviour changes, and a probe run is not a timed run.
+ */
+#define CP_AHEAD_HIST  17    /* appendable batches after a drain, 16+ in the last */
+#define CP_AHEAD_VHIST 24    /* log2 buckets of a segment's assembled vertices */
+
+struct cp_ahead_census {
+   /* The gap opened by the last episode drain, if one is open. */
+   bool     open;
+   uint64_t gap_start_ns, gap_start_blocked_ns, gap_start_vertex_ns;
+   uint64_t pending_wait_ns;
+   uint64_t gap_bytes, gap_bytes_host;
+   unsigned gap_appends;
+
+   uint64_t drains, wait_ns;
+   uint64_t gaps;
+   uint64_t issue_all_ns, issue_vtx_ns;
+   uint64_t ceil_all_ns, ceil_vtx_ns;
+   uint64_t appends_hist[CP_AHEAD_HIST];
+
+   /* Per appended segment, at the seam the mechanism would hold at. */
+   uint64_t segs, seg_verts, seg_tris, seg_refs, seg_fused, seg_stable;
+   uint64_t seg_bytes, seg_bytes_host;
+   uint64_t seg_bytes_max;
+   uint64_t ep_bytes_peak, ep_bytes_host_peak;
+   uint64_t verts_hist[CP_AHEAD_VHIST];
+
+   /* The arenas at the drain, which is what sizes any run-ahead allocation. */
+   uint64_t dscratch_peak, scratch_peak, dscratch_sum, scratch_sum;
+};
+
 struct cp_draw_batch {
    struct cp_draw_state state;
    struct cp_render_scope scope;
@@ -614,6 +667,7 @@ struct cp_context {
    CUevent flush_retire[CP_FLUSH_GENS];
    bool flush_retire_recorded[CP_FLUSH_GENS];
 
+
    struct {
       CUdeviceptr base[CP_FLUSH_GENS];
       size_t size[CP_FLUSH_GENS];
@@ -661,6 +715,40 @@ struct cp_context {
     * Set when a draw joins a batch, cleared when cp_draw_execute_batch() returns.
     */
    bool batch_uploads_live;
+
+   /*
+    * The conversion probe's state, and it is LAST ON PURPOSE.
+    *
+    * CUDAVK_WAIT_SPIN_DECOY's stream and the four bytes it writes, created on
+    * first use so a run without the flag has neither; nothing reads spin_word,
+    * which is the point -- the decoy has to be a real device operation with no
+    * dependency on anything. spin_n and spin_ns are what the injection
+    * actually cost, reported so that a sweep point which injected nothing is
+    * distinguishable from the control.
+    *
+    * Appended rather than placed with the other wait state so that no existing
+    * field's offset moves: this is a probe, and it has to be provably inert at
+    * machine level with its flags off. Adding it in the middle shifted every
+    * later field by 48 bytes and produced 900 displacement changes in
+    * cp_renderer.c.o that had nothing to do with the probe.
+    */
+   CUstream spin_stream;
+   CUdeviceptr spin_word;
+   bool spin_failed;
+   uint64_t spin_decoys;
+   uint64_t spin_n, spin_ns;
+
+   /*
+    * Every nanosecond this thread has spent blocked in cp_sync_timed(), and
+    * every nanosecond it has spent in the vertex phase of an appending
+    * segment. Both are running totals; CUDAVK_AHEAD_CENSUS reads differences
+    * of them across an inter-drain gap, which is how "issue time" is separated
+    * from "gap" -- the same subtraction PERFORMANCE.md 5.2b's census made, so
+    * the two are comparable.
+    */
+   uint64_t blocked_all_ns;
+   uint64_t vertex_issue_ns;
+   struct cp_ahead_census ahead;
 };
 
 

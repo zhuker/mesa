@@ -70,6 +70,17 @@ struct cp_flag_def {
    const struct cp_flag_value *values;   /* CP_FLAG_ENUM */
 };
 
+/* Sites for CUDAVK_WAIT_SPIN_SITE, in the order cp_wait_is_spin_site() tests.
+ * Only the four stream waits cp_sync_timed() takes; the eight-site census that
+ * names the other four lives on branch peel-predicate and is not ported here. */
+static const struct cp_flag_value wait_sites[] = {
+   { "episode", 0 },
+   { "quads",   1 },
+   { "peel",    2 },
+   { "seg",     3 },
+   { NULL, 0 },
+};
+
 static const struct cp_flag_value ctx_scheds[] = {
    { "auto",     CP_CTX_SCHED_AUTO },
    { "spin",     CP_CTX_SCHED_SPIN },
@@ -309,6 +320,30 @@ static const struct cp_flag_def flags[] = {
      "compute the episode's shading groups and their range and constant-buffer "
      "tables inside the shade loop, after the drain, instead of above it; the "
      "revert for a reorder that changes no launch and no byte" },
+   { "CUDAVK_WAIT_SPIN_US", CP_FLAG_UINT, F(wait_spin_us),
+     "busy-wait this many microseconds on the host at the wait named by "
+     "CUDAVK_WAIT_SPIN_SITE, outside that wait's own timing; the slope of "
+     "frame time against it is the site's conversion from host time to frame "
+     "time. 0 is off and changes nothing", .dflt = 0,
+     .has_range = true, .lo = 0, .hi = 100000 },
+   { "CUDAVK_WAIT_SPIN_SITE", CP_FLAG_ENUM, F(wait_spin_site),
+     "which wait CUDAVK_WAIT_SPIN_US injects at: episode | quads | peel | seg",
+     .dflt = 0, .values = wait_sites },
+   { "CUDAVK_WAIT_SPIN_BEFORE", CP_FLAG_BOOL_VALUE, F(wait_spin_before),
+     "spin BEFORE the sync instead of after it, which is the inverse of what a "
+     "deferral does at that site: the response is flat while the injection "
+     "fits inside the wait, and its slope at D is the wait CDF at D" },
+   { "CUDAVK_AHEAD_CENSUS", CP_FLAG_BOOL_VALUE, F(ahead_census),
+     "census what a run-ahead of the episode drain could move: the host issue "
+     "time in each inter-drain gap, the part of it that is the vertex phase of "
+     "an appending segment, how many appendable batches follow a drain, and "
+     "what the run-ahead arena would have to hold; counters only, changes no "
+     "rendering" },
+   { "CUDAVK_WAIT_SPIN_DECOY", CP_FLAG_UINT, F(wait_spin_decoy),
+     "issue this many four-byte clears on a stream of their own immediately "
+     "before the named wait's sync; the control for whether work issued on "
+     "another stream during a wait makes the wait longer", .dflt = 0,
+     .has_range = true, .lo = 0, .hi = 4096 },
    { "CUDAVK_NO_ABUF_APPEND", CP_FLAG_BOOL_VALUE, F(no_abuf_append),
      "disable the single-pass A-buffer build: the count pass stops appending "
      "(pixel, prim) records and the fill rasterizes a second time" },

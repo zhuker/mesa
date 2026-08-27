@@ -314,6 +314,26 @@ struct cp_debug {
    struct cp_opt_int medium_threshold;
    struct cp_opt_int point_threshold;
    struct cp_opt_int tile_bound;
+
+   /*
+    * The conversion probe, and it is LAST ON PURPOSE.
+    *
+    * The registry addresses every field through offsetof, so where a flag sits
+    * in this struct is free -- but it is not free in the generated code, and
+    * for a probe that has to be provably inert with its flags off it is the
+    * whole proof. Adding these four in the middle moved every later field by
+    * 16 bytes and put 76 displacement changes into cp_renderer.c.o that had
+    * nothing to do with the probe. Appended, the object file is byte-identical
+    * to the one without it once the flags are folded off.
+    *
+    * Anything added here for measurement rather than for rendering should go
+    * at the end for the same reason.
+    */
+   unsigned wait_spin_us;
+   int      wait_spin_site;
+   bool     wait_spin_before;
+   unsigned wait_spin_decoy;
+   bool     ahead_census;
 };
 
 /*

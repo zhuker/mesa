@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-121 switches.
+126 switches.
 
 ## Tracing
 
@@ -93,6 +93,11 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_FLUSH_DRAIN` | bool (value) | `off` | — | restore the draining flush: cp_flush waits for the whole device and rewinds the arenas in place instead of ping-ponging generations |
 | `CUDAVK_NO_SEG_MERGE` | bool (value) | `off` | — | disable merged shading groups: every episode segment shades in its own launch group, as before |
 | `CUDAVK_NO_DRAIN_HOIST` | bool (value) | `off` | — | compute the episode's shading groups and their range and constant-buffer tables inside the shade loop, after the drain, instead of above it; the revert for a reorder that changes no launch and no byte |
+| `CUDAVK_WAIT_SPIN_US` | uint | `0` | 0&ndash;100000 | busy-wait this many microseconds on the host at the wait named by CUDAVK_WAIT_SPIN_SITE, outside that wait's own timing; the slope of frame time against it is the site's conversion from host time to frame time. 0 is off and changes nothing |
+| `CUDAVK_WAIT_SPIN_SITE` | enum | `episode` | — | which wait CUDAVK_WAIT_SPIN_US injects at: episode \| quads \| peel \| seg |
+| `CUDAVK_WAIT_SPIN_BEFORE` | bool (value) | `off` | — | spin BEFORE the sync instead of after it, which is the inverse of what a deferral does at that site: the response is flat while the injection fits inside the wait, and its slope at D is the wait CDF at D |
+| `CUDAVK_AHEAD_CENSUS` | bool (value) | `off` | — | census what a run-ahead of the episode drain could move: the host issue time in each inter-drain gap, the part of it that is the vertex phase of an appending segment, how many appendable batches follow a drain, and what the run-ahead arena would have to hold; counters only, changes no rendering |
+| `CUDAVK_WAIT_SPIN_DECOY` | uint | `0` | 0&ndash;4096 | issue this many four-byte clears on a stream of their own immediately before the named wait's sync; the control for whether work issued on another stream during a wait makes the wait longer |
 | `CUDAVK_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |
 | `CUDAVK_NO_FUSED_ABUF_INTERP` | bool (value) | `off` | — | launch A-buffer interpolation separately instead of calling it from the generated fragment shader; performance experiment only |
 | `CUDAVK_NO_FUSED_INTERP` | bool (value) | `off` | — | restore the direct shade path's separate cp_fs_interpolate launch instead of the slim compaction plus in-shader interpolation |

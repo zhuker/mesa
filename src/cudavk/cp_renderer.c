@@ -688,6 +688,215 @@ cp_scratch_begin(struct cp_context *cp)
 /* Reset scratch after all GPU work is done. Frees overflow arenas (old
  * arenas that were replaced during growth) and resets the bump pointer.
  * The current arena is kept at its grown size. */
+/*
+ * The conversion probe (CUDAVK_WAIT_SPIN_US), and its direction.
+ *
+ * A wait cannot be shortened without a mechanism, but the host's time at that
+ * point can be moved for nothing, and the slope of frame time against the
+ * moved time is the derivative a deferral lead needs. The probe was written on
+ * branch peel-predicate as an ADD-direction instrument -- spin D microseconds
+ * immediately after the wait returns -- and measured +1.0207 at the episode
+ * drain and -0.0262 at the peel check.
+ *
+ * CUDAVK_WAIT_SPIN_BEFORE moves the spin to the other side of the sync, and
+ * that is what makes it a probe of a mechanism rather than of a site.
+ * Deferring the drain past the next episode's vertex stage does not RECOVER
+ * wait time: the wait keeps its length, the device work behind it is
+ * untouched, and the drain is taken at the same point in the stream order.
+ * What moves is host work, from after the sync to before it. So
+ *
+ *   after  (today):   [ wait W ][ spin D ][ issue B ]  -> frame + s*D
+ *   before (this):    [ spin D ][ wait W ][ issue B ]  -> frame + s*max(0, D-W)
+ *
+ * and the before-arm is the exact inverse of the mechanism's perturbation, at
+ * the same site, in the same units. Three things fall out of one sweep:
+ *
+ *  - the before-arm is FLAT while D is inside the wait distribution, which is
+ *    the mechanism's premise, measured rather than assumed;
+ *  - its slope at D is s * P(W < D), so the sweep reconstructs the drain's
+ *    WAIT CDF, which no instrument in this driver has produced;
+ *  - the value of relocating V milliseconds of host work per wait is read
+ *    straight off the curve as s*V*waits_per_frame - dFrame(D = V).
+ *
+ * The spin is a busy wait on the monotonic clock, not a sleep: a sleep yields
+ * the core and changes scheduling, which would measure something else.
+ * os_time_get_nano() is a real call into the vDSO, so nothing here can be
+ * optimised away. In both directions it sits OUTSIDE the wait's own timing, so
+ * the blocked column stays honest and CUDAVK_PLAN_STATS stays comparable with
+ * every earlier run.
+ *
+ * CUDAVK_WAIT_SPIN_DECOY answers the other half, which no amount of spinning
+ * can: does issuing device work on ANOTHER stream just before the sync make
+ * the sync longer? The mechanism issues the next episode's vertex work on
+ * dedicated streams while the drain's chain is still running, so if the answer
+ * is yes the design is paying for itself and no frame result would be
+ * attributable to the deferral. The decoy issues N four-byte cuMemsetD32Async
+ * on a stream created for the purpose, onto a word nothing reads -- host cost
+ * and a real device operation, with no dependency on anything.
+ *
+ * Both are 0 by default and neither is reached then.
+ */
+static void
+cp_wait_spin(struct cp_context *cp, unsigned us)
+{
+   uint64_t t0 = (uint64_t)os_time_get_nano();
+   uint64_t end = t0 + (uint64_t)us * 1000u;
+   uint64_t now;
+   while ((now = (uint64_t)os_time_get_nano()) < end)
+      ;
+   cp->spin_n++;
+   cp->spin_ns += now - t0;
+}
+
+/*
+ * The decoy's stream and its scratch word, built on first use so that a run
+ * without the flag creates neither. Failure disarms the decoy and says so
+ * rather than failing the frame: this is a probe.
+ */
+static void
+cp_wait_decoy(struct cp_context *cp, unsigned n)
+{
+   if (!cp->spin_stream) {
+      if (cp->spin_failed)
+         return;
+      if (cuStreamCreate(&cp->spin_stream, CU_STREAM_NON_BLOCKING) !=
+             CUDA_SUCCESS ||
+          cuMemAlloc(&cp->spin_word, 4) != CUDA_SUCCESS) {
+         fprintf(stderr, "cudavk: CUDAVK_WAIT_SPIN_DECOY could not create its "
+                 "stream; the decoy arm is off for this process\n");
+         cp->spin_failed = true;
+         cp->spin_stream = NULL;
+         return;
+      }
+   }
+   for (unsigned i = 0; i < n; i++)
+      cuMemsetD32Async(cp->spin_word, i, 1, cp->spin_stream);
+   cp->spin_decoys += n;
+}
+
+/*
+ * Which of the four stream waits this is, recovered from the counter the
+ * caller passed rather than from a new argument, so that cp_sync_timed() stays
+ * the one place a stream wait is taken and its four call sites are unchanged.
+ */
+static bool
+cp_wait_is_spin_site(const struct cp_context *cp, const uint64_t *ns)
+{
+   switch (cp_debug->wait_spin_site) {
+   case 0: return ns == &cp->plan.wait_episode_ns;
+   case 1: return ns == &cp->plan.wait_quads_ns;
+   case 2: return ns == &cp->plan.wait_peel_ns;
+   case 3: return ns == &cp->plan.wait_seg_ns;
+   default: return false;
+   }
+}
+
+/*
+ * CUDAVK_AHEAD_CENSUS, the gap half.
+ *
+ * Called at the start and the end of every episode drain. The gap a drain
+ * opens is closed by the next one, and inside it two running totals are
+ * differenced: everything the host did, and the part of it that was the vertex
+ * phase of an appending segment. Subtracting cp->blocked_all_ns turns "gap"
+ * into "issue", which is the wait census's own convention, so the all-work
+ * column is directly comparable to its 2.066 ms/frame and is the self-check on
+ * everything else this prints.
+ */
+static void
+cp_ahead_gap_close(struct cp_context *cp, uint64_t now)
+{
+   struct cp_ahead_census *a = &cp->ahead;
+   if (!a->open)
+      return;
+   a->open = false;
+   uint64_t gap = now - a->gap_start_ns;
+   uint64_t blocked = cp->blocked_all_ns - a->gap_start_blocked_ns;
+   uint64_t issue_all = gap > blocked ? gap - blocked : 0;
+   uint64_t issue_vtx = cp->vertex_issue_ns - a->gap_start_vertex_ns;
+   /* The vertex phase is inside the gap's issue time by construction; clamp
+    * rather than trust it, so a clock anomaly cannot make the subset larger
+    * than the set it is a subset of and quietly break the bound. */
+   issue_vtx = MIN2(issue_vtx, issue_all);
+
+   a->gaps++;
+   a->issue_all_ns += issue_all;
+   a->issue_vtx_ns += issue_vtx;
+   a->ceil_all_ns += MIN2(issue_all, a->pending_wait_ns);
+   a->ceil_vtx_ns += MIN2(issue_vtx, a->pending_wait_ns);
+   a->appends_hist[MIN2(a->gap_appends, (unsigned)CP_AHEAD_HIST - 1)]++;
+   a->ep_bytes_peak = MAX2(a->ep_bytes_peak, a->gap_bytes);
+   a->ep_bytes_host_peak = MAX2(a->ep_bytes_host_peak, a->gap_bytes_host);
+}
+
+/*
+ * CUDAVK_AHEAD_CENSUS, the per-segment half.
+ *
+ * Called from the vertex phase of an appending segment, at the point where
+ * everything the run-ahead arena would have to hold is known. The byte figures
+ * are the design's own formula evaluated on the real distribution, which is
+ * what sets the arena caps and the admission threshold -- the design used a
+ * placeholder of 5,000 triangles and four vertex outputs and said so.
+ *
+ * The clip's outputs are NOT counted. Holding the clip launch does not hold the
+ * clip's output allocations, and `clipped` alone is max_clipped * 3 * out_stride
+ * = 384*T*V bytes against the vertex output's 48*T*V -- eight times larger. The
+ * design moves those to replay time for exactly that reason, so counting them
+ * here would size an arena the mechanism does not need. What is counted is what
+ * the vertex stage produces and the held count consumes.
+ */
+static void
+cp_ahead_note_vertex(struct cp_context *cp, unsigned num_triangles,
+                     unsigned total_verts, unsigned num_vs_outputs,
+                     unsigned vs_in_stride, bool have_refs, bool fused,
+                     bool stable)
+{
+   struct cp_ahead_census *a = &cp->ahead;
+   uint64_t dev = (uint64_t)total_verts * num_vs_outputs * 16;   /* vs_output */
+   if (vs_in_stride && !fused)
+      dev += (uint64_t)total_verts * vs_in_stride;               /* vs_input */
+   if (stable)
+      dev += (uint64_t)num_triangles * CP_CLIP_MAX_OUT * 4;      /* active_ids */
+   dev += 4;                                                     /* clip_count */
+   uint64_t host = have_refs ? (uint64_t)total_verts * 8 : 0;    /* vid + iid */
+
+   a->segs++;
+   a->seg_tris += num_triangles;
+   a->seg_verts += total_verts;
+   a->seg_refs += have_refs;
+   a->seg_fused += fused;
+   a->seg_stable += stable;
+   a->seg_bytes += dev;
+   a->seg_bytes_host += host;
+   a->seg_bytes_max = MAX2(a->seg_bytes_max, dev);
+   a->gap_bytes += dev;
+   a->gap_bytes_host += host;
+
+   unsigned b = 0;
+   for (unsigned v = total_verts; v > 1 && b < CP_AHEAD_VHIST - 1; v >>= 1)
+      b++;
+   a->verts_hist[b]++;
+}
+
+static void
+cp_ahead_gap_open(struct cp_context *cp, uint64_t now, uint64_t wait_ns)
+{
+   struct cp_ahead_census *a = &cp->ahead;
+   a->open = true;
+   a->gap_start_ns = now;
+   a->gap_start_blocked_ns = cp->blocked_all_ns;
+   a->gap_start_vertex_ns = cp->vertex_issue_ns;
+   a->pending_wait_ns = wait_ns;
+   a->gap_appends = 0;
+   a->gap_bytes = 0;
+   a->gap_bytes_host = 0;
+   a->drains++;
+   a->wait_ns += wait_ns;
+   a->dscratch_peak = MAX2(a->dscratch_peak, (uint64_t)cp->dscratch.used);
+   a->scratch_peak = MAX2(a->scratch_peak, (uint64_t)cp->scratch.used);
+   a->dscratch_sum += cp->dscratch.used;
+   a->scratch_sum += cp->scratch.used;
+}
+
 /* One timed synchronize: the wall time the calling thread spent blocked. */
 static bool
 cp_sync_timed(struct cp_context *cp, CUstream stream,
@@ -696,10 +905,40 @@ cp_sync_timed(struct cp_context *cp, CUstream stream,
    /* Whatever is owed was owed to work this is about to wait for. */
    if (cp_upload_flush(cp) != CUDA_SUCCESS)
       return false;
+
+   const bool episode = ns == &cp->plan.wait_episode_ns;
+
+   /* After the owed flush, so the injection is host time and not a copy. */
+   const bool site = (cp_debug->wait_spin_us || cp_debug->wait_spin_decoy) &&
+                     cp_wait_is_spin_site(cp, ns);
+   if (site) {
+      if (cp_debug->wait_spin_decoy)
+         cp_wait_decoy(cp, cp_debug->wait_spin_decoy);
+      if (cp_debug->wait_spin_us && cp_debug->wait_spin_before)
+         cp_wait_spin(cp, cp_debug->wait_spin_us);
+   }
+
    int64_t t0 = os_time_get_nano();
+   if (cp_debug->ahead_census && episode)
+      cp_ahead_gap_close(cp, (uint64_t)t0);
    CUresult err = cuStreamSynchronize(stream);
-   *ns += (uint64_t)(os_time_get_nano() - t0);
+   int64_t t1 = os_time_get_nano();
+   uint64_t blocked = (uint64_t)(t1 - t0);
+   *ns += blocked;
    (*n)++;
+   /* Guarded, not unconditional: an ungated accumulate here costs nothing to
+    * run and everything to prove, because it survives folding the flags off
+    * and the object file then stops being identical to the one without the
+    * probe. 363 bytes of it, measured. */
+   if (cp_debug->ahead_census) {
+      cp->blocked_all_ns += blocked;
+      if (episode)
+         cp_ahead_gap_open(cp, (uint64_t)t1, blocked);
+   }
+
+   if (site && cp_debug->wait_spin_us && !cp_debug->wait_spin_before)
+      cp_wait_spin(cp, cp_debug->wait_spin_us);
+
    if (err != CUDA_SUCCESS) {
       cp_renderer_texture_fatal(cp);
       return false;
@@ -772,6 +1011,86 @@ cp_scratch_destroy(struct cp_context *cp)
  * other causes.
  */
 /*
+ * CUDAVK_AHEAD_CENSUS at teardown.
+ *
+ * Read the first two data lines together and in that order. `all` is the wait
+ * census's own quantity -- sum over drains of min(host issue after the wait,
+ * the wait) -- and it must reproduce that census's 2.066 ms/frame on the old
+ * capture and 0.757 on Crossroads. If it does not, this instrument is not
+ * measuring what that one measured and NOTHING may be concluded from the
+ * `vertex` line in either direction. If it does, `vertex` is the run-ahead
+ * mechanism's own ceiling: a strict subset of the same burst, at the same
+ * site, over the same gaps.
+ *
+ * Per-frame figures are deliberately not printed. The frame count is the
+ * harness's, this instrument's totals span the whole process including
+ * start-up and shader compilation, and dividing here would invite the mean
+ * being compared against a hot-tail median. Divide outside, by the same submit
+ * count every other figure in this project uses.
+ */
+static void
+cp_ahead_census_report(struct cp_context *cp)
+{
+   const struct cp_ahead_census *a = &cp->ahead;
+   if (!cp_debug->ahead_census || !a->drains)
+      return;
+
+   fprintf(stderr,
+           "cudavk: ahead census: %" PRIu64 " drains, %" PRIu64
+           " closed gaps, %.1f ms blocked at the drain (mean %.3f ms)\n",
+           a->drains, a->gaps, a->wait_ns / 1e6,
+           a->wait_ns / 1e6 / (double)a->drains);
+   fprintf(stderr,
+           "cudavk: ahead census: ceiling all %.1f ms of %.1f ms issued "
+           "(%.1f%% of blocked) -- CROSS-CHECK against the wait census\n",
+           a->ceil_all_ns / 1e6, a->issue_all_ns / 1e6,
+           100.0 * a->ceil_all_ns / (double)MAX2(a->wait_ns, 1u));
+   fprintf(stderr,
+           "cudavk: ahead census: ceiling VERTEX %.1f ms of %.1f ms issued "
+           "(%.1f%% of blocked, %.1f%% of the all-work ceiling)\n",
+           a->ceil_vtx_ns / 1e6, a->issue_vtx_ns / 1e6,
+           100.0 * a->ceil_vtx_ns / (double)MAX2(a->wait_ns, 1u),
+           100.0 * a->ceil_vtx_ns / (double)MAX2(a->ceil_all_ns, 1u));
+
+   fprintf(stderr, "cudavk: ahead census: appendable batches after a drain:");
+   for (unsigned i = 0; i < CP_AHEAD_HIST; i++)
+      if (a->appends_hist[i])
+         fprintf(stderr, " %u:%" PRIu64, i, a->appends_hist[i]);
+   fprintf(stderr, "\n");
+
+   if (a->segs)
+      fprintf(stderr,
+              "cudavk: ahead census: %" PRIu64 " appended segments, %.0f "
+              "triangles and %.0f vertices each, %.1f%% built refs, %.1f%% "
+              "fused the fetch, %.1f%% stable clip\n",
+              a->segs, (double)a->seg_tris / (double)a->segs,
+              (double)a->seg_verts / (double)a->segs,
+              100.0 * (double)a->seg_refs / (double)a->segs,
+              100.0 * (double)a->seg_fused / (double)a->segs,
+              100.0 * (double)a->seg_stable / (double)a->segs);
+   fprintf(stderr,
+           "cudavk: ahead census: run-ahead arena would want %.2f MB per "
+           "segment mean, %.2f MB worst segment, %.2f MB peak per episode "
+           "(device); %.2f MB peak per episode (managed)\n",
+           a->segs ? (double)a->seg_bytes / (double)a->segs / 1048576.0 : 0.0,
+           (double)a->seg_bytes_max / 1048576.0,
+           (double)a->ep_bytes_peak / 1048576.0,
+           (double)a->ep_bytes_host_peak / 1048576.0);
+   fprintf(stderr, "cudavk: ahead census: segment vertices by power of two:");
+   for (unsigned i = 0; i < CP_AHEAD_VHIST; i++)
+      if (a->verts_hist[i])
+         fprintf(stderr, " 2^%u:%" PRIu64, i, a->verts_hist[i]);
+   fprintf(stderr, "\n");
+   fprintf(stderr,
+           "cudavk: ahead census: at the drain, dscratch %.1f MB peak / "
+           "%.1f MB mean, scratch %.1f MB peak / %.1f MB mean\n",
+           a->dscratch_peak / 1048576.0,
+           (double)a->dscratch_sum / (double)a->drains / 1048576.0,
+           a->scratch_peak / 1048576.0,
+           (double)a->scratch_sum / (double)a->drains / 1048576.0);
+}
+
+/*
  * What reconstructing batches and episodes from a stream of draws cost, when
  * the whole pass was in an array the entire time.
  */
@@ -810,6 +1129,25 @@ cp_plan_report(struct cp_context *cp)
               cp->plan.wait_peel_ns / 1e6, cp->plan.wait_peel_n,
               cp->plan.wait_seg_ns / 1e6, cp->plan.wait_seg_n,
               cp->plan.wait_upload_ns / 1e6, cp->plan.wait_upload_n);
+   /*
+    * What the conversion probe actually injected. Printed whenever it fired,
+    * because a sweep point that injected nothing looks exactly like the
+    * control -- the same trap PDL's converted-link count exists to catch.
+    * `wanted` is what the flag asked for and `spun` is what the busy wait
+    * really cost; a large gap means the clock call dominates and the sweep's x
+    * axis is wrong.
+    */
+   if (cp->spin_n || cp->spin_decoys)
+      fprintf(stderr, "cudavk: wait injection: site %d, %s, %" PRIu64
+              " injections, %.1f ms wanted, %.1f ms spun, %" PRIu64
+              " decoy clears\n",
+              cp_debug->wait_spin_site,
+              cp_debug->wait_spin_before ? "BEFORE the sync"
+                                         : "after the sync",
+              cp->spin_n,
+              (double)cp->spin_n * cp_debug->wait_spin_us / 1e3,
+              cp->spin_ns / 1e6, cp->spin_decoys);
+   cp_ahead_census_report(cp);
    if (cp->plan.opaque_episodes)
       fprintf(stderr, "cudavk: opaque episodes: %" PRIu64 " closed, %" PRIu64
               " segments (%.2f per episode, longest %" PRIu64 "), %" PRIu64
@@ -959,6 +1297,15 @@ cp_context_cleanup(struct cp_context *cp)
    if (cp->fuse_check) {
       cuMemFree(cp->fuse_check);
       cp->fuse_check = 0;
+   }
+   /* The decoy's stream and word, which only a probe run ever created. */
+   if (cp->spin_stream) {
+      cuStreamDestroy(cp->spin_stream);
+      cp->spin_stream = NULL;
+   }
+   if (cp->spin_word) {
+      cuMemFree(cp->spin_word);
+      cp->spin_word = 0;
    }
    cp_abuf_cleanup(cp->abuf);
    free(cp->abuf);
@@ -5036,6 +5383,21 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * attributed to nothing. */
    cp_stage_end(cp, -1);
 
+   /*
+    * CUDAVK_AHEAD_CENSUS: the vertex phase's host cost for an appending
+    * segment, from here to the seam the run-ahead design would hold at.
+    * cp->blocked_all_ns is differenced across the same interval, so a scratch
+    * reclaim landing inside it is not counted as issue time -- the same
+    * subtraction the gap accounting makes, for the same reason.
+    */
+   uint64_t vtx_t0 = 0, vtx_blocked0 = 0;
+   const bool vtx_census = cp_debug->ahead_census && cp->pass.appending &&
+                           !cp->pass.opaque;
+   if (vtx_census) {
+      vtx_t0 = (uint64_t)os_time_get_nano();
+      vtx_blocked0 = cp->blocked_all_ns;
+   }
+
    /* Reclaim last draw's scratch and size the arena for this one. A pass
     * episode owns the epoch instead: every segment's clipped stream has to
     * survive until the episode's shading has read it, so only the first
@@ -5736,6 +6098,14 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                p_atomic_inc(&state->vs->vs_census->launches_fused);
          }
 
+         /* The run-ahead census, here because this is the last point at
+          * which everything the run-ahead arena would hold is in scope. */
+         if (cp_debug->ahead_census && cp->pass.appending && !cp->pass.opaque)
+            cp_ahead_note_vertex(cp, num_triangles, total_verts,
+                                 num_vs_outputs, vs_in_stride,
+                                 refs != NULL, fused_vfetch,
+                                 stable_clip_early);
+
          /* Compiled shaders grid-stride; see the fragment launch. */
          CUresult vs_err = cp_launch(cp, vs_exec->kernel,
             MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
@@ -6249,6 +6619,13 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    }
 
    if (abuf) {
+      /* The seam. Everything above is the vertex phase a run-ahead would move
+       * across the drain; everything below is the count phase it would hold. */
+      if (vtx_census) {
+         uint64_t el = (uint64_t)os_time_get_nano() - vtx_t0;
+         uint64_t bl = cp->blocked_all_ns - vtx_blocked0;
+         cp->vertex_issue_ns += el > bl ? el - bl : 0;
+      }
       size_t n = (size_t)w * h;
       struct cp_rasterize_args aa = rast_args;
       aa.abuf_counts = ab->counts;
@@ -9124,6 +9501,20 @@ cp_pass_record_segment(struct cp_context *cp,
    }
    cp->pass.nsegs++;
    cp->pass.next_prim += rast_num_triangles;
+   /*
+    * How many appendable BLENDED batches follow a drain, which is the hold
+    * count a run-ahead could reach -- and the difference between "there is
+    * nothing to move" and "there is something to move and nowhere to move it
+    * from".
+    *
+    * Opaque segments come through here too, on the ordinary opaque path and
+    * under CUDAVK_TILED_OPAQUE, and they are NOT candidates: the mechanism
+    * holds the A-buffer count of a blended segment and an opaque episode has
+    * none. Counting them would inflate the one number this census exists to
+    * report.
+    */
+   if (cp_debug->ahead_census && !cp->pass.opaque)
+      cp->ahead.gap_appends++;
 }
 
 
