@@ -232,6 +232,7 @@ if dep_vulkan_loader.found()
     'cpvk_cubesph_nearest',
     'cpvk_clear',
     'cpvk_depth_attachment',
+    'cpvk_depth_convention',
     'cpvk_desc_array',
     'cpvk_descriptor_pool',
     'cpvk_descriptor_semantics',

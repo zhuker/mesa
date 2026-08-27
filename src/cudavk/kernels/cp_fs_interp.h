@@ -150,8 +150,9 @@ cp_interp_pixel_prepared(struct cp_fs_interp_args *args, uint32_t tri_id,
    float4 fc;
    fc.x = cx;
    fc.y = cy;
-   fc.z = (b0 * tri->ndc_z0 + b1 * tri->ndc_z1 + b2 * tri->ndc_z2) *
-          0.5f + 0.5f;
+   fc.z = CP_WINDOW_DEPTH(b0 * tri->ndc_z0 + b1 * tri->ndc_z1 +
+                          b2 * tri->ndc_z2,
+                          args->depth_scale, args->depth_translate);
    fc.w = persp0 + persp1 + persp2;
    if (args->frag_coord)
       ((float4 *)(uintptr_t)args->frag_coord)[slot] = fc;

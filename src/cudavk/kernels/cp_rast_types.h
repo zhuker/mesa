@@ -85,6 +85,30 @@ struct cp_vertex_args {
    uint32_t num_varyings;   /* Number of output floats per vertex (beyond position) */
 };
 
+/*
+ * Window-space depth, the one place the convention lives.
+ *
+ * Vulkan's clip volume is 0 <= z <= w, so the NDC z the perspective divide
+ * produces is already in [0, 1] and the viewport transform is
+ *
+ *     z_window = minDepth + z_ndc * (maxDepth - minDepth)
+ *
+ * (Vulkan 1.3, "Controlling the Viewport": z_f = p_z * z_d + o_z), which for
+ * the default depth range is z_ndc unchanged. This driver used to store
+ * OpenGL's 0.5 * z_ndc + 0.5 at every one of these sites and to ignore
+ * minDepth/maxDepth entirely. Depth *testing* did not notice, because that
+ * map is monotone and so orders fragments identically -- but the values
+ * themselves are what gl_FragCoord.z reports and what a stored depth image
+ * holds, and both were wrong by half a unit against lavapipe.
+ *
+ * Every producer of a depth value goes through here: the two rasterizer sites
+ * that key the visibility buffer and the depth buffer, and the interpolator
+ * that fills gl_FragCoord. They must agree, or a shader would read a depth
+ * the depth test never used.
+ */
+#define CP_WINDOW_DEPTH(ndc_z, scale, translate) \
+   ((translate) + (ndc_z) * (scale))
+
 struct cp_rasterize_args {
    /* Optional device-side launch predicate. Zero leaves the ordinary path
     * unchanged; otherwise every raster stage returns unless *path_flag equals
@@ -106,7 +130,14 @@ struct cp_rasterize_args {
    uint32_t num_varyings;
    /* Viewport (raw scale/translate for proper Vulkan Y handling) */
    float vp_x, vp_y, vp_w, vp_h;
-   float vp_near, vp_far;
+   /*
+    * The viewport's depth transform, CP_WINDOW_DEPTH's two coefficients:
+    * depth_scale is maxDepth - minDepth and depth_translate is minDepth.
+    * These stand where vp_near/vp_far stood, which no kernel ever read --
+    * every depth site hardcoded OpenGL's 0.5 * z + 0.5 instead, so the
+    * viewport's depth range did nothing and gl_FragCoord.z was wrong.
+    */
+   float depth_scale, depth_translate;
    float vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y;
    /*
     * The rectangle of pixels a fragment may land in, inclusive on both ends:
@@ -709,6 +740,11 @@ struct cp_fs_interp_args {
     */
    uint64_t out_prim_list;    /* uint32 per slot quad: global primitive id */
    uint32_t fused_direct;
+   /* The viewport depth transform, exactly as cp_rasterize_args carries it:
+    * gl_FragCoord.z has to be the depth the rasterizer tested with, so both
+    * read the same two coefficients through CP_WINDOW_DEPTH. */
+   float depth_scale;
+   float depth_translate;
    uint32_t pad_fused;
 };
 
