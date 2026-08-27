@@ -9353,7 +9353,7 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
          const struct cp_seg_range *ranges = ranges_local;
          unsigned nr = 0;
          uint32_t rows = 0;
-         uint64_t *group_ubos = cp->pass_group_ubos;
+         uint32_t row_base = 0;
          bool need_rows = sg->batch.state.fs->reads_const_bufs;
          if (hoisted) {
             /* Built above the drain by the same function, at a group-major
@@ -9361,10 +9361,32 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
             ranges = &ranges_all[group_range_base[g]];
             nr = members;
             rows = group_rows[g];
-            group_ubos = cp->pass_group_ubos +
-                         (size_t)group_row_base[g] * CP_ARG_UBO_STRIDE;
+            row_base = group_row_base[g];
          } else if (!cp_pass_group_table_one(cp, segs, nsegs, seg_group, g, 0,
                                              ranges_local, &nr, &rows)) {
+            failed = true;
+            break;
+         }
+         /*
+          * The row table is read AFTER its producer, never before it.
+          * cp_pass_group_table_one() allocates cp->pass_group_ubos on first
+          * use, so a copy of the pointer taken above the call is NULL for the
+          * first group that ever needs rows. The old code took it there, and
+          * only the hoisted path re-read it afterwards; the revert path
+          * therefore launched the shade with a NULL row table, which makes
+          * cp_abuf_shade() upload ONE row while fs_batch.ndraws still says
+          * `rows`, and the batch-rows index then runs off the end of the
+          * argument block. That is the VK_ERROR_DEVICE_LOST the Tier 1
+          * control arm took on both captures.
+          */
+         uint64_t *group_ubos = need_rows && cp->pass_group_ubos
+            ? cp->pass_group_ubos + (size_t)row_base * CP_ARG_UBO_STRIDE
+            : NULL;
+         /* Fail closed rather than launch a shade with no row table: both
+          * producers allocate it or return false, so this cannot be reached,
+          * and if it ever is the episode re-renders segment by segment
+          * instead of faulting the device. */
+         if (need_rows && !group_ubos) {
             failed = true;
             break;
          }
