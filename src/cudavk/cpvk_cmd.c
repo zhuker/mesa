@@ -690,6 +690,17 @@ cpvk_cmd_retain_event(struct cpvk_cmd_buffer *cmd, struct cpvk_event *event)
    return true;
 }
 
+/* The staging blocks vkCmdUpdateBuffer allocated. Released when the recording
+ * they belong to goes away, which Vulkan forbids while a submission of it is
+ * still running. */
+static void
+cpvk_cmd_free_inline_blocks(struct cpvk_cmd_buffer *cmd)
+{
+   for (unsigned i = 0; i < cmd->num_inline_blocks; i++)
+      cuMemFree(cmd->inline_blocks[i]);
+   cmd->num_inline_blocks = 0;
+}
+
 static void
 cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
                       VkCommandBufferResetFlags flags)
@@ -723,6 +734,7 @@ cpvk_cmd_buffer_reset(struct vk_command_buffer *vk_cmd,
    cmd->num_desc_retired = 0;
    cmd->desc_arena_used = 0;
    cmd->desc_arena_dirty = false;
+   cpvk_cmd_free_inline_blocks(cmd);
 }
 
 static void
@@ -733,6 +745,8 @@ cpvk_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd)
 
    cpvk_cmd_release_objects(cmd);
    vk_command_buffer_finish(&cmd->vk);
+   cpvk_cmd_free_inline_blocks(cmd);
+   free(cmd->inline_blocks);
    for (unsigned i = 0; i < cmd->num_desc_retired; i++) {
       cuMemFree(cmd->desc_retired[i].dev);
       free(cmd->desc_retired[i].host);
@@ -786,6 +800,7 @@ cpvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
+   cpvk_cmd_free_inline_blocks(cmd);
    cmd->num_dispatches = 0;
    cmd->num_ops = 0;
    cmd->num_scopes = 0;
@@ -1106,12 +1121,64 @@ cpvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
    d->push_size = cmd->compute_push_size;
 }
 
+/*
+ * vkCmdDispatchIndirect. vk_common_CmdDispatchIndirect forwards to
+ * CmdDispatchIndirect2KHR, which this driver does not implement, so the common
+ * path is a valid pointer onto a null one. The grid is three words in device
+ * memory and is read at submit; see cpvk_execute_dispatch().
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                         VkDeviceSize offset)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_buffer, buf, buffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+
+   if (!cmd->compute_pipeline || !buf || !buf->mem)
+      return;
+
+   struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_DISPATCH);
+   if (!op)
+      return;
+   struct cpvk_dispatch *d = &op->dispatch;
+   d->pipeline = cmd->compute_pipeline;
+   d->grid[0] = d->grid[1] = d->grid[2] = 0;
+   d->indirect = buf->mem->dev_ptr + buf->offset + offset;
+   memcpy(d->addrs, cmd->compute_addrs, sizeof(d->addrs));
+   memcpy(d->push, cmd->compute_push, sizeof(d->push));
+   d->push_size = cmd->compute_push_size;
+}
+
 /* ------------------------------------------------------------- execution */
 
 VkResult
 cpvk_execute_dispatch(struct cpvk_device *dev,
                        const struct cpvk_dispatch *d)
 {
+   /*
+    * An indirect dispatch reads its grid from device memory, which whatever
+    * ran before it in this submission may have written, so the stream has to
+    * have reached this point before the three words mean anything. A host
+    * wait per vkCmdDispatchIndirect, and the same trade the indirect draws
+    * make.
+    */
+   struct cpvk_dispatch resolved;
+   if (d->indirect) {
+      cp_batch_flush_why(&dev->renderer, "Vulkan order point");
+      cp_pass_finish(&dev->renderer);
+      if (cuStreamSynchronize(dev->renderer.stream) != CUDA_SUCCESS)
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+      resolved = *d;
+      resolved.indirect = 0;
+      if (cuMemcpyDtoH(resolved.grid, d->indirect, sizeof(resolved.grid)) !=
+          CUDA_SUCCESS)
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+      if (!resolved.grid[0] || !resolved.grid[1] || !resolved.grid[2])
+         return VK_SUCCESS;
+      d = &resolved;
+   }
+
    struct cp_shader_binary *bin = d->pipeline->bin;
    struct cp_shader_exec *exec = bin
       ? &bin->exec[CP_SHADER_EXEC_CLASSIC] : NULL;
@@ -1989,6 +2056,64 @@ cpvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
                     vertexOffset, true);
 }
 
+/*
+ * vkCmdDrawIndirect and vkCmdDrawIndexedIndirect.
+ *
+ * Implemented here for the reason vkCmdFillBuffer is: vk_common_CmdDrawIndirect
+ * forwards to CmdDrawIndirect2KHR, which this driver does not implement, so the
+ * common path is a valid pointer that jumps through a null one -- worse than a
+ * NULL entry point, because vkGetDeviceProcAddr answers as if it worked.
+ * maxDrawIndirectCount was already advertised as UINT32_MAX.
+ *
+ * The parameters are read at submit rather than here, because device memory is
+ * where they are and a dispatch recorded earlier in the same command buffer is
+ * a normal way to produce them. What is recorded is an ordinary draw with the
+ * state this one would have had, plus where to find its counts.
+ */
+static void
+cpvk_record_draw_indirect(struct cpvk_cmd_buffer *cmd, struct cpvk_buffer *buf,
+                          VkDeviceSize offset, uint32_t drawCount,
+                          uint32_t stride, bool indexed)
+{
+   if (!buf || !buf->mem || !drawCount)
+      return;
+
+   cpvk_record_draw_cmd(cmd, 0, 0, 1, 0, 0, indexed);
+   if (!cmd->num_ops || cmd->ops[cmd->num_ops - 1].kind != CPVK_OP_DRAW)
+      return;   /* no pipeline bound, or the op array could not grow */
+
+   struct cpvk_draw_cmd *d = &cmd->ops[cmd->num_ops - 1].draw_cmd;
+   d->indirect = buf->mem->dev_ptr + buf->offset + offset;
+   d->indirect_draws = drawCount;
+   /* A stride of zero is legal when there is one draw, and the array is
+    * tightly packed by definition when the application leaves it out. */
+   d->indirect_stride = stride ? stride :
+      (indexed ? sizeof(VkDrawIndexedIndirectCommand)
+               : sizeof(VkDrawIndirectCommand));
+   d->indirect_indexed = indexed;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                     VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_buffer, buf, buffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   cpvk_record_draw_indirect(cmd, buf, offset, drawCount, stride, false);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                            VkDeviceSize offset, uint32_t drawCount,
+                            uint32_t stride)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_buffer, buf, buffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   cpvk_record_draw_indirect(cmd, buf, offset, drawCount, stride, true);
+}
+
 /* A recorded clear, at submit. */
 bool
 cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c)
@@ -2281,6 +2406,11 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
        !a->pipeline->blend.enable || !b->pipeline->blend.enable)
       CPVK_DIFF(memcmp(&a->scissor, &b->scissor, sizeof(a->scissor)),
                 "scissor");
+   /* An indirect draw's counts are not known here, so it can neither be
+    * merged into a batch nor have one merged into it: the batch key would be
+    * built from placeholders. It is resolved into ordinary draws at submit,
+    * and those merge normally with each other. */
+   CPVK_DIFF(a->indirect || b->indirect, "indirect draw");
    CPVK_DIFF(a->call.mode != b->call.mode, "topology");
    CPVK_DIFF(a->call.index_size != b->call.index_size, "index size");
    CPVK_DIFF(a->call.index_ptr != b->call.index_ptr, "index buffer");
@@ -2600,12 +2730,84 @@ cpvk_prepare_draw(struct cpvk_device *dev, const struct cp_render_scope *scope,
       fs_push_dev ? fs_push_dev : dev->null_desc;
 }
 
+static void cpvk_execute_order_point(struct cpvk_device *dev);
+
+/*
+ * An indirect draw, resolved.
+ *
+ * The counts are in device memory, and what wrote them may be a dispatch or a
+ * copy recorded earlier in this same command buffer, so everything issued so
+ * far has to have run before they can be read. That is a host wait per
+ * vkCmdDrawIndirect, on a driver that already waits about seventeen times a
+ * frame; it is the price of resolving the parameters on the host, and the
+ * alternative -- a device-side draw the whole pipeline could be launched from
+ * -- is a different driver.
+ *
+ * Each resolved draw is an ordinary recorded draw with its counts filled in,
+ * so batching, the vertex fetch and the index path treat it as one.
+ */
+static void
+cpvk_execute_draw_indirect(struct cpvk_device *dev,
+                           const struct cp_render_scope *scope,
+                           const struct cpvk_draw_cmd *d)
+{
+   cpvk_execute_order_point(dev);
+   if (cuStreamSynchronize(dev->renderer.stream) != CUDA_SUCCESS) {
+      fprintf(stderr, "cudavk: indirect draw could not drain the stream\n");
+      return;
+   }
+
+   if (!dev->indirect_draws) {
+      dev->indirect_draws = calloc(CPVK_INDIRECT_DRAW_SLOTS,
+                                   sizeof(*dev->indirect_draws));
+      if (!dev->indirect_draws)
+         return;
+   }
+
+   for (uint32_t i = 0; i < d->indirect_draws; i++) {
+      /* VkDrawIndirectCommand is four words and VkDrawIndexedIndirectCommand
+       * is five, with vertexOffset signed. */
+      uint32_t p[5] = { 0 };
+      size_t bytes = d->indirect_indexed ? sizeof(VkDrawIndexedIndirectCommand)
+                                         : sizeof(VkDrawIndirectCommand);
+      if (cuMemcpyDtoH(p, d->indirect + (uint64_t)i * d->indirect_stride,
+                       bytes) != CUDA_SUCCESS) {
+         fprintf(stderr, "cudavk: indirect draw parameters unreadable\n");
+         return;
+      }
+
+      struct cpvk_draw_cmd *r =
+         &dev->indirect_draws[dev->indirect_draw_next++ %
+                              CPVK_INDIRECT_DRAW_SLOTS];
+      *r = *d;
+      r->indirect = 0;
+      r->indirect_draws = 0;
+      /* The recorded plan was computed for the placeholder draw, and this
+       * copy is not the op the plan named. */
+      r->plan_prev = NULL;
+      r->plan_mergeable = false;
+      r->range.count = p[0];
+      r->call.instance_count = MAX2(p[1], 1u);
+      r->range.start = p[2];
+      r->range.index_bias = d->indirect_indexed ? (int32_t)p[3] : 0;
+      r->call.start_instance = d->indirect_indexed ? p[4] : p[3];
+      if (!r->range.count)
+         continue;
+      cpvk_execute_draw_cmd(dev, scope, r);
+   }
+}
+
 /* Run one recorded draw through the renderer. */
 void
 cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *scope,
                       const struct cpvk_draw_cmd *d)
 {
    struct cp_context *cp = &dev->renderer;
+
+   if (d->indirect) {
+      cpvk_execute_draw_indirect(dev, scope, d);
+      return;
+   }
 
    /*
     * Decide about the batch *before* staging this draw's state.
@@ -2742,6 +2944,68 @@ cpvk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
       .dst = dst->mem->dev_ptr + dst->offset + dstOffset,
       .words = size / 4,
       .value = data,
+   };
+}
+
+/*
+ * vkCmdUpdateBuffer: up to 65536 inline bytes, copied into the buffer where
+ * the command was recorded.
+ *
+ * vk_common_CmdUpdateBuffer forwards to CmdUpdateMemoryKHR, unimplemented
+ * here, so this is the third member of the vkCmdFillBuffer family of holes: a
+ * pointer that resolves and then jumps through zero.
+ *
+ * The bytes belong to the caller only for the duration of the call, so they
+ * are staged into device memory now and the recording keeps an ordinary copy
+ * op. One allocation per call is affordable for a command with a 64 KiB cap
+ * that no per-draw path uses, and it removes every question about which
+ * storage a re-submitted command buffer reads.
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
+                     VkDeviceSize dstOffset, VkDeviceSize dataSize,
+                     const void *pData)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_buffer, dst, dstBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+
+   if (!dst || !dst->mem || !dataSize)
+      return;
+
+   if (cmd->num_inline_blocks == cmd->max_inline_blocks) {
+      unsigned want = cmd->max_inline_blocks ? cmd->max_inline_blocks * 2 : 8;
+      void *p = realloc(cmd->inline_blocks, want * sizeof(*cmd->inline_blocks));
+      if (!p) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return;
+      }
+      cmd->inline_blocks = p;
+      cmd->max_inline_blocks = want;
+   }
+
+   CUdeviceptr staging = 0;
+   if (cuMemAlloc(&staging, dataSize) != CUDA_SUCCESS ||
+       cuMemcpyHtoD(staging, pData, dataSize) != CUDA_SUCCESS) {
+      if (staging)
+         cuMemFree(staging);
+      fprintf(stderr, "cudavk: vkCmdUpdateBuffer could not stage %llu bytes\n",
+              (unsigned long long)dataSize);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   cmd->inline_blocks[cmd->num_inline_blocks++] = staging;
+
+   struct cpvk_copy *c = cpvk_record_copy(cmd);
+   if (!c)
+      return;
+   *c = (struct cpvk_copy) {
+      .src = staging,
+      .dst = dst->mem->dev_ptr + dst->offset + dstOffset,
+      .width_bytes = dataSize,
+      .rows = 1,
+      .src_end = staging + dataSize,
+      .dst_end = dst->mem->dev_ptr + dst->offset + dst->vk.size,
    };
 }
 
@@ -4161,6 +4425,46 @@ cpvk_record_query(struct cpvk_cmd_buffer *cmd, struct cpvk_query_pool *pool,
    };
 }
 
+/*
+ * vkCmdCopyQueryPoolResults.
+ *
+ * vk_common_CmdCopyQueryPoolResults forwards to
+ * CmdCopyQueryPoolResultsToMemoryKHR, unimplemented here, so this was another
+ * valid pointer onto a null one.
+ *
+ * It writes exactly what vkGetQueryPoolResults writes -- including that this
+ * driver's queries are stubs and its timestamps carry no valid bits -- but in
+ * the queue's order rather than the host's, which is the whole difference
+ * between the two commands and the only thing this can honestly promise.
+ */
+VKAPI_ATTR void VKAPI_CALL
+cpvk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool _pool,
+                             uint32_t firstQuery, uint32_t queryCount,
+                             VkBuffer dstBuffer, VkDeviceSize dstOffset,
+                             VkDeviceSize stride, VkQueryResultFlags flags)
+{
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+   VK_FROM_HANDLE(cpvk_buffer, dst, dstBuffer);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+
+   if (!pool || !dst || !dst->mem || !queryCount)
+      return;
+   if (!cpvk_cmd_retain_query(cmd, pool)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+
+   struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_QUERY_COPY);
+   if (!op)
+      return;
+   op->query_copy = (struct cpvk_query_copy) {
+      .pool = pool, .first = firstQuery, .count = queryCount,
+      .dst = dst->mem->dev_ptr + dst->offset + dstOffset,
+      .stride = stride, .flags = flags,
+   };
+}
+
 VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool _pool,
                        uint32_t firstQuery, uint32_t queryCount)
@@ -4313,6 +4617,60 @@ cpvk_query_complete(void *data)
 
    cpvk_query_pool_unref(pool);
    free(cb);
+}
+
+/*
+ * The recorded result copy, at submit.
+ *
+ * The results are filled by a host callback launched on the renderer stream,
+ * so they are known once the stream has reached this point -- which is also
+ * exactly the set of queries "recorded before this command" names. Draining
+ * once here is what makes reading pool->results on the host legitimate, and
+ * VK_QUERY_RESULT_WAIT_BIT is then already satisfied for everything this
+ * submission could have completed.
+ */
+VkResult
+cpvk_execute_query_copy(struct cpvk_device *dev,
+                        const struct cpvk_query_copy *qc)
+{
+   struct cpvk_query_pool *pool = qc->pool;
+
+   cpvk_execute_order_point(dev);
+   if (cuStreamSynchronize(dev->renderer.stream) != CUDA_SUCCESS)
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
+
+   bool wide = qc->flags & VK_QUERY_RESULT_64_BIT;
+   bool with_avail = qc->flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
+   unsigned words = 1 + (with_avail ? 1 : 0);
+   size_t slot_size = words * (wide ? sizeof(uint64_t) : sizeof(uint32_t));
+   uint64_t stride = qc->stride ? qc->stride : slot_size;
+
+   for (uint32_t i = 0; i < qc->count; i++) {
+      uint32_t q = qc->first + i;
+      bool avail = q < pool->count &&
+         atomic_load_explicit(&pool->available[q], memory_order_acquire);
+      uint64_t value = avail ? pool->results[q] : 0;
+      /* A query neither available nor asked for partially is left alone, as
+       * vkGetQueryPoolResults leaves its slot alone. */
+      bool write_value = avail || (qc->flags & VK_QUERY_RESULT_PARTIAL_BIT);
+      if (!write_value && !with_avail)
+         continue;
+
+      uint64_t slot64[2] = { value, avail };
+      uint32_t slot32[2] = { (uint32_t)value, avail };
+      const void *src = wide ? (const void *)slot64 : (const void *)slot32;
+      size_t unit = wide ? sizeof(uint64_t) : sizeof(uint32_t);
+      CUdeviceptr at = qc->dst + (uint64_t)i * stride;
+
+      if (write_value &&
+          cuMemcpyHtoD(at, src, unit) != CUDA_SUCCESS)
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+      if (with_avail &&
+          cuMemcpyHtoD(at + unit, (const char *)src + unit, unit) !=
+             CUDA_SUCCESS)
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+   }
+   return VK_SUCCESS;
 }
 
 VkResult

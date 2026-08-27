@@ -145,6 +145,18 @@ struct cpvk_device {
    bool prev_draw_valid;
 
    /*
+    * Where an indirect draw's resolved parameters live while it runs.
+    *
+    * They cannot be on the stack: cpvk_execute_draw_cmd() keeps the draw it
+    * ran in prev_draw and the next draw dereferences it to decide whether it
+    * can merge, so the storage has to outlive the call. A ring rather than one
+    * slot, because a single vkCmdDrawIndirect issues many of these back to
+    * back and each one is still the previous draw of the next.
+    */
+   struct cpvk_draw_cmd *indirect_draws;   /* CPVK_INDIRECT_DRAW_SLOTS of them */
+   unsigned indirect_draw_next;
+
+   /*
     * Compiled shaders, by the hash of the stage that produced them.
     *
     * Two pipelines built from the same SPIR-V used to compile it twice and
@@ -386,12 +398,20 @@ struct cpvk_event {
 
 #define CPVK_MAX_DISPATCHES 64
 
+/* Slots in cpvk_device::indirect_draws. More than one because the draw a
+ * merge test compares against is the previous one, which may be the previous
+ * draw of the same indirect command. */
+#define CPVK_INDIRECT_DRAW_SLOTS 4
+
 /* Buffer slot 0 is the push constant block; descriptors start after it. */
 #define CPVK_MAX_PUSH_BYTES 256
 
 struct cpvk_dispatch {
    struct cpvk_pipeline *pipeline;
+   /* Read from `indirect` at submit when it is non-zero; see
+    * cpvk_execute_dispatch(). */
    uint32_t grid[3];
+   CUdeviceptr indirect;
    CUdeviceptr addrs[16];
    /* Slot 0 is the push constant block for a compute shader exactly as it is
     * for a graphics one. Leaving it empty is an address of zero, which is
@@ -420,6 +440,16 @@ struct cpvk_draw_cmd {
    struct cp_rect scissor;
    struct cp_draw_call call;
    struct cp_draw_range range;
+   /*
+    * vkCmdDrawIndirect and vkCmdDrawIndexedIndirect: the counts above are not
+    * known while recording, because they are in device memory that a dispatch
+    * or a copy earlier in the same submission may still be writing. `indirect`
+    * is where they are; zero for a direct draw, and everything else in this
+    * structure is the state the draw would have had either way.
+    */
+   CUdeviceptr indirect;
+   uint32_t indirect_draws, indirect_stride;
+   bool indirect_indexed;
    uint64_t vb_base[16];
    unsigned num_vb;
    CUdeviceptr addrs[16];
@@ -536,6 +566,7 @@ enum cpvk_op_kind {
    CPVK_OP_EVENT_SET,
    CPVK_OP_EVENT_RESET,
    CPVK_OP_EVENT_WAIT,
+   CPVK_OP_QUERY_COPY,
 };
 
 struct cpvk_event_op {
@@ -554,6 +585,21 @@ struct cpvk_fill {
    uint32_t value;
 };
 
+/*
+ * vkCmdCopyQueryPoolResults: the same bytes vkGetQueryPoolResults would
+ * produce, written into a buffer in the queue's order rather than the host's.
+ * The results themselves are filled by a host callback on the renderer stream,
+ * so this op reads them where that callback has already run -- see
+ * cpvk_execute_query_copy().
+ */
+struct cpvk_query_copy {
+   struct cpvk_query_pool *pool;
+   uint32_t first, count;
+   CUdeviceptr dst;
+   uint64_t stride;
+   VkQueryResultFlags flags;
+};
+
 struct cpvk_op {
    enum cpvk_op_kind kind;
    /* BEGIN_RENDER/DRAW only; remapped when secondary ops are imported. */
@@ -564,6 +610,7 @@ struct cpvk_op {
       struct cpvk_copy copy;
       struct cpvk_fill fill;
       struct cpvk_query_op query;
+      struct cpvk_query_copy query_copy;
       struct cpvk_dispatch dispatch;
       struct cpvk_event_op event;
    };
@@ -665,6 +712,16 @@ struct cpvk_cmd_buffer {
       size_t used;
    } *desc_retired;
    unsigned num_desc_retired, max_desc_retired;
+
+   /*
+    * vkCmdUpdateBuffer's inline bytes, staged in device memory at record time
+    * so that the update is an ordinary recorded copy. One allocation per call
+    * -- the command is capped at 65536 bytes and is not a per-draw path --
+    * released when the command buffer is reset or freed, which Vulkan already
+    * forbids while a submission of it is still running.
+    */
+   CUdeviceptr *inline_blocks;
+   unsigned num_inline_blocks, max_inline_blocks;
 };
 /* Recording entry points hold only a command buffer, but they still reach
  * CUDA -- cpvk_arena_append allocates -- so they need the scope too. */
@@ -721,6 +778,8 @@ void cpvk_execute_draw_cmd(struct cpvk_device *dev,
                            const struct cp_render_scope *scope,
                            const struct cpvk_draw_cmd *d);
 bool cpvk_execute_clear(struct cpvk_device *dev, const struct cpvk_clear *c);
+VkResult cpvk_execute_query_copy(struct cpvk_device *dev,
+                                 const struct cpvk_query_copy *qc);
 VkResult cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c);
 void cpvk_batch_break_report(void);
 VkResult cpvk_execute_query(struct cpvk_device *dev,

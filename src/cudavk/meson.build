@@ -238,6 +238,7 @@ if dep_vulkan_loader.found()
     'cpvk_draw',
     'cpvk_event_state',
     'cpvk_fixed_edge',
+    'cpvk_indirect',
     'cpvk_lod',
     'cpvk_lodblit',
     'cpvk_lodimp',
