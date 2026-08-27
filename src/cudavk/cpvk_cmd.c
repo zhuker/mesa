@@ -1521,6 +1521,29 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          const struct cpvk_format_info *vf = cpvk_format_info(view->vk.format);
          color_format = vk_format_to_pipe_format(view->vk.format);
          fb.color_encoding = vf ? vf->color : cimg->color;
+         /*
+          * A format the writeback kernel cannot encode is refused here, in
+          * the same shape as the unsupported depth format below, because
+          * the alternative is not "no picture" but a wrong one. Every draw
+          * path resolves the encoding as MAX2(fb.color_encoding, 0)
+          * (cp_renderer.c:4129, :4560, :8465, :8935) and 0 is
+          * CP_COLOR_R8G8B8A8_UNORM, so a -1 attachment was rendered as if
+          * it were RGBA8: measured on VK_FORMAT_R16G16_UNORM, a
+          * LOAD_OP_CLEAR packed the real format correctly and the draw then
+          * wrote the bytes ff 00 00 ff over it, which reads back as
+          * R16=255 G16=65280. No error was returned at any point.
+          *
+          * vkCreateImage stays permissive on purpose (see cpvk_image.c), and
+          * vkGetPhysicalDeviceImageFormatProperties2 already refuses this
+          * usage, so this is the first place a client that never asked can
+          * be told -- and it is the last place before the pixels are wrong.
+          */
+         if (fb.color_encoding < 0) {
+            fprintf(stderr, "cudavk: unsupported colour attachment format %u "
+                    "(no writeback encoding)\n", view->vk.format);
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
          /* How far apart the samples are, which the renderer needs in order
           * to write them and the resolve needs in order to find them. */
          fb.color_sample_stride = (unsigned)cimg->sample_stride;

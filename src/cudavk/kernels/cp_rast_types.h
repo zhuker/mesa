@@ -519,6 +519,24 @@ enum cp_color_encoding {
     * multiply would flush them to zero.
     */
    CP_COLOR_R8G8B8A8_UINT,
+   /*
+    * Sixteen bits per channel, normalised. Appended after the integer
+    * encoding rather than filed next to CP_COLOR_R8G8_UNORM so that no
+    * existing enumerator's value moves: the host passes this number to the
+    * kernels in cp_fs_writeback_args and cp_resolve_msaa_args, and a
+    * renumbering that reached only one side of that boundary would be
+    * silent.
+    *
+    * It exists because a depth-reprojection pass wants a two-channel target
+    * with more than eight bits of precision and does not want a float one.
+    * Until it did, cpvk_formats[] carried this format with colour encoding
+    * -1 and the draw path's MAX2(encoding, 0) turned that into
+    * CP_COLOR_R8G8B8A8_UNORM: four RGBA bytes written into two 16-bit
+    * texels, no error anywhere. cpvk_CmdBeginRendering now refuses a
+    * colour attachment with no encoding, so a future gap of this kind
+    * fails instead of drawing.
+    */
+   CP_COLOR_R16G16_UNORM,
 };
 
 /*
