@@ -55,6 +55,50 @@ cp_clear_depth_kernel(struct cp_clear_args args)
 
 
 
+/*
+ * The same fill, but only over the bits `clear_mask` names.
+ *
+ * vkCmdClearDepthStencilImage may name one aspect of a packed format, and in
+ * D24_UNORM_S8_UINT both aspects live in the same 32-bit word, so writing the
+ * word whole would destroy the aspect the caller did not ask for. Every other
+ * clear in this driver writes whole words and keeps using the plain kernel;
+ * this one reads first, which is why it is a separate entry point rather than
+ * a mask of all ones threaded through the common path.
+ *
+ * Each thread owns one pixel, so the read-modify-write races nothing.
+ */
+extern "C" __global__ void
+cp_clear_masked_kernel(struct cp_clear_args args)
+{
+   uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+
+   if (x >= args.width || y >= args.height)
+      return;
+
+   uint8_t *base = (uint8_t *)(uintptr_t)args.target;
+   uint8_t *pixel = base + y * args.stride + x * args.pixel_size;
+
+   if (args.pixel_size == 1) {
+      uint32_t m = args.clear_mask[0] & 0xffu;
+      *pixel = (uint8_t)((*pixel & ~m) | (args.clear_value[0] & m));
+   } else if (args.pixel_size == 2) {
+      uint16_t *p = (uint16_t *)pixel;
+      uint32_t m = args.clear_mask[0] & 0xffffu;
+      *p = (uint16_t)((*p & ~m) | (args.clear_value[0] & m));
+   } else {
+      unsigned words = args.pixel_size / 4;
+      uint32_t *p = (uint32_t *)pixel;
+      for (unsigned i = 0; i < words; i++) {
+         uint32_t m = args.clear_mask[i];
+         if (m == 0xffffffffu)
+            p[i] = args.clear_value[i];
+         else if (m)
+            p[i] = (p[i] & ~m) | (args.clear_value[i] & m);
+      }
+   }
+}
+
 extern "C" __global__ void
 cp_depth_attachment_load(struct cp_depth_attachment_args args)
 {

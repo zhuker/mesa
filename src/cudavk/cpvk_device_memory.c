@@ -292,6 +292,12 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
                return cpvk_submit_abort(dev, r);
             break;
          }
+         case CPVK_OP_QUERY_COPY: {
+            VkResult r = cpvk_execute_query_copy(dev, &cmd->ops[o].query_copy);
+            if (r != VK_SUCCESS)
+               return cpvk_submit_abort(dev, r);
+            break;
+         }
          case CPVK_OP_FILL: {
             /* A fill observes rendering the same way a copy does, so whatever
              * is held back has to run first. */
@@ -618,6 +624,8 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       cuMemFree(dev->null_desc);
    if (dev->null_data)
       cuMemFree(dev->null_data);
+   free(dev->indirect_draws);
+   dev->indirect_draws = NULL;
    free(dev->texture_cache_views);
    dev->texture_cache_views = NULL;
    free(dev->texture_batch_workspace);

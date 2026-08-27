@@ -9606,13 +9606,15 @@ cp_vertex_fill_w(enum pipe_format format, enum cp_vf_conv conv)
  * rather than something wrong -- which is the worse failure of the two,
  * because nothing looks like "the clear did not run".
  */
-bool
-cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
-              unsigned width, unsigned height, unsigned stride,
-              unsigned pixel_size, const uint32_t value[4], bool depth)
+static bool
+cp_clear_rect_impl(struct cp_context *cp, void *data, uint64_t offset,
+                   unsigned width, unsigned height, unsigned stride,
+                   unsigned pixel_size, const uint32_t value[4],
+                   const uint32_t mask[4], bool depth)
 {
    struct cp_device *screen = cp->dev;
-   CUfunction fn = depth ? screen->kernels.clear_depth_kernel
+   CUfunction fn = mask  ? screen->kernels.clear_masked_kernel
+                 : depth ? screen->kernels.clear_depth_kernel
                          : screen->kernels.clear_kernel;
 
    if (!fn || !data)
@@ -9620,7 +9622,7 @@ cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
 
    /* Depth is Z16/Z32F/Z24X8 only, colour excludes the three-component
     * formats R8G8B8, R16G16B16 and R32G32B32. */
-   if (depth) {
+   if (depth && !mask) {
       if (pixel_size != 2 && pixel_size != 4)
          return false;
    } else if (pixel_size != 1 && pixel_size != 2 && pixel_size != 4 &&
@@ -9638,10 +9640,39 @@ cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
       .pixel_size = pixel_size,
    };
    memcpy(args.clear_value, value, sizeof(args.clear_value));
+   if (mask)
+      memcpy(args.clear_mask, mask, sizeof(args.clear_mask));
 
    void *params[] = { &args };
    return cp_launch(cp, fn,
       (width + 15) / 16, (height + 15) / 16, 1,
       16, 16, 1,
       0, cp->stream, params, NULL) == CUDA_SUCCESS;
+}
+
+bool
+cp_clear_rect(struct cp_context *cp, void *data, uint64_t offset,
+              unsigned width, unsigned height, unsigned stride,
+              unsigned pixel_size, const uint32_t value[4], bool depth)
+{
+   return cp_clear_rect_impl(cp, data, offset, width, height, stride,
+                             pixel_size, value, NULL, depth);
+}
+
+/*
+ * The same rectangle, writing only the bits `mask` names.
+ *
+ * vkCmdClearDepthStencilImage can name one aspect of a format whose two
+ * aspects share a word -- D24_UNORM_S8_UINT does, and D32_SFLOAT_S8_UINT
+ * shares an eight-byte element -- and the aspect that was not named has to
+ * come out of the clear unchanged.
+ */
+bool
+cp_clear_rect_masked(struct cp_context *cp, void *data, uint64_t offset,
+                     unsigned width, unsigned height, unsigned stride,
+                     unsigned pixel_size, const uint32_t value[4],
+                     const uint32_t mask[4])
+{
+   return cp_clear_rect_impl(cp, data, offset, width, height, stride,
+                             pixel_size, value, mask, false);
 }
