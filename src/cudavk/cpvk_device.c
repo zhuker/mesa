@@ -79,6 +79,28 @@ static const struct vk_device_extension_table cpvk_device_extensions = {
     */
    .KHR_maintenance1 = true,
 
+   /*
+    * Promoted to Vulkan 1.1, which this driver advertises, so the entrypoints
+    * behind these two already exist and are already what the runtime
+    * dispatches: cpvk_BindBufferMemory2 and cpvk_GetBufferMemoryRequirements2
+    * in cpvk_device_memory.c, cpvk_BindImageMemory2 and
+    * cpvk_GetImageMemoryRequirements2 in cpvk_image.c. Only the extension
+    * names were missing, and a name is what vkCreateDevice checks.
+    *
+    * That mattered. The headless streamer capture this driver is measured
+    * against enables seven device extensions, and these were two of the six
+    * that went unadvertised, so vkCreateDevice returned
+    * VK_ERROR_EXTENSION_NOT_PRESENT and the replay ran at all only because
+    * gfxrecon's --remove-unsupported stripped them first. A client that
+    * enables them unconditionally could not create a device here.
+    *
+    * As with KHR_get_physical_device_properties2 above, do not add KHR alias
+    * forwarders: core and alias share one dispatch slot and defining both
+    * trips an assert in the runtime.
+    */
+   .KHR_bind_memory2 = true,
+   .KHR_get_memory_requirements2 = true,
+
    /* The capture uses the KHR aliases even though these commands are core in
     * 1.1. The implementation below is shared with the core entrypoints. */
    .KHR_descriptor_update_template = true,
