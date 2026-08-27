@@ -334,6 +334,18 @@ struct cp_debug {
    bool     wait_spin_before;
    unsigned wait_spin_decoy;
    bool     ahead_census;
+
+   /*
+    * The run-ahead itself, appended for the same reason: it defaults off, it
+    * has to be provably inert with the level at zero, and every field that
+    * moves an offset costs displacement lines in the object that have nothing
+    * to do with the mechanism.
+    */
+   unsigned ahead;
+   unsigned ahead_max_segs;
+   unsigned ahead_budget_us;
+   unsigned ahead_min_verts;
+   unsigned ahead_hold_mb;
 };
 
 /*

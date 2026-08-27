@@ -339,6 +339,37 @@ static const struct cp_flag_def flags[] = {
      "an appending segment, how many appendable batches follow a drain, and "
      "what the run-ahead arena would have to hold; counters only, changes no "
      "rendering" },
+   { "CUDAVK_AHEAD", CP_FLAG_UINT, F(ahead),
+     "run the next episode's vertex stage across the episode drain: the "
+     "drain's tail is deferred, the appendable batches that follow issue "
+     "their vertex phase on a stream of their own, and the tail and those "
+     "batches' A-buffer count phases run after it. 0 is off and changes "
+     "nothing, 1 holds at most two batches, 2 holds up to "
+     "CUDAVK_AHEAD_MAX_SEGS", .dflt = 0, .has_range = true, .lo = 0, .hi = 2 },
+   { "CUDAVK_AHEAD_MAX_SEGS", CP_FLAG_UINT, F(ahead_max_segs),
+     "how many batches the run-ahead may hold across one drain. Eight is a "
+     "structural cap, not a tuning choice: held batch k takes rasterizer "
+     "queue set k and there are eight of them, which is what lets the held "
+     "vertex stage keep seeding its own queue counters", .dflt = 8,
+     .has_range = true, .lo = 1, .hi = 8 },
+   { "CUDAVK_AHEAD_BUDGET_US", CP_FLAG_UINT, F(ahead_budget_us),
+     "stop admitting batches once this much host time has been relocated in "
+     "front of one drain. The default is the knee of the drain's measured "
+     "wait CDF -- P(W<125us)=0.09 against P(W<250us)=0.43 -- so work moved "
+     "under it is absorbed at a measured slope of 0.065 instead of 1.02. "
+     "0 removes the budget", .dflt = 125,
+     .has_range = true, .lo = 0, .hi = 100000 },
+   { "CUDAVK_AHEAD_MIN_VERTS", CP_FLAG_UINT, F(ahead_min_verts),
+     "refuse to hold a batch with fewer assembled vertices than this: below "
+     "it the vertex phase relocates less host time than the stream switch and "
+     "the ordering edge that holding it costs. 0 removes the floor",
+     .dflt = 32, .has_range = true, .lo = 0, .hi = 1000000 },
+   { "CUDAVK_AHEAD_HOLD_MB", CP_FLAG_UINT, F(ahead_hold_mb),
+     "how much device scratch the held batches of one drain may take before "
+     "the run-ahead declines. Sized from the census: 2.14 MB peak per episode "
+     "measured, times eight for the clip outputs the census excludes, plus "
+     "margin. There is no grow path -- the run-ahead declines and the batch "
+     "runs normally", .dflt = 24, .has_range = true, .lo = 1, .hi = 4096 },
    { "CUDAVK_WAIT_SPIN_DECOY", CP_FLAG_UINT, F(wait_spin_decoy),
      "issue this many four-byte clears on a stream of their own immediately "
      "before the named wait's sync; the control for whether work issued on "

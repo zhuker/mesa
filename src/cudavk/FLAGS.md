@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-126 switches.
+131 switches.
 
 ## Tracing
 
@@ -97,6 +97,11 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_WAIT_SPIN_SITE` | enum | `episode` | — | which wait CUDAVK_WAIT_SPIN_US injects at: episode \| quads \| peel \| seg |
 | `CUDAVK_WAIT_SPIN_BEFORE` | bool (value) | `off` | — | spin BEFORE the sync instead of after it, which is the inverse of what a deferral does at that site: the response is flat while the injection fits inside the wait, and its slope at D is the wait CDF at D |
 | `CUDAVK_AHEAD_CENSUS` | bool (value) | `off` | — | census what a run-ahead of the episode drain could move: the host issue time in each inter-drain gap, the part of it that is the vertex phase of an appending segment, how many appendable batches follow a drain, and what the run-ahead arena would have to hold; counters only, changes no rendering |
+| `CUDAVK_AHEAD` | uint | `0` | 0&ndash;2 | run the next episode's vertex stage across the episode drain: the drain's tail is deferred, the appendable batches that follow issue their vertex phase on a stream of their own, and the tail and those batches' A-buffer count phases run after it. 0 is off and changes nothing, 1 holds at most two batches, 2 holds up to CUDAVK_AHEAD_MAX_SEGS |
+| `CUDAVK_AHEAD_MAX_SEGS` | uint | `8` | 1&ndash;8 | how many batches the run-ahead may hold across one drain. Eight is a structural cap, not a tuning choice: held batch k takes rasterizer queue set k and there are eight of them, which is what lets the held vertex stage keep seeding its own queue counters |
+| `CUDAVK_AHEAD_BUDGET_US` | uint | `125` | 0&ndash;100000 | stop admitting batches once this much host time has been relocated in front of one drain. The default is the knee of the drain's measured wait CDF -- P(W<125us)=0.09 against P(W<250us)=0.43 -- so work moved under it is absorbed at a measured slope of 0.065 instead of 1.02. 0 removes the budget |
+| `CUDAVK_AHEAD_MIN_VERTS` | uint | `32` | 0&ndash;1000000 | refuse to hold a batch with fewer assembled vertices than this: below it the vertex phase relocates less host time than the stream switch and the ordering edge that holding it costs. 0 removes the floor |
+| `CUDAVK_AHEAD_HOLD_MB` | uint | `24` | 1&ndash;4096 | how much device scratch the held batches of one drain may take before the run-ahead declines. Sized from the census: 2.14 MB peak per episode measured, times eight for the clip outputs the census excludes, plus margin. There is no grow path -- the run-ahead declines and the batch runs normally |
 | `CUDAVK_WAIT_SPIN_DECOY` | uint | `0` | 0&ndash;4096 | issue this many four-byte clears on a stream of their own immediately before the named wait's sync; the control for whether work issued on another stream during a wait makes the wait longer |
 | `CUDAVK_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |
 | `CUDAVK_NO_FUSED_ABUF_INTERP` | bool (value) | `off` | — | launch A-buffer interpolation separately instead of calling it from the generated fragment shader; performance experiment only |

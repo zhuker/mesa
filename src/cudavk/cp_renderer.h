@@ -187,6 +187,9 @@ struct cp_ahead_census {
    uint64_t dscratch_peak, scratch_peak, dscratch_sum, scratch_sum;
 };
 
+/* CUDAVK_AHEAD's held state; defined in cp_renderer.c, where the seam is. */
+struct cp_ahead_run;
+
 struct cp_draw_batch {
    struct cp_draw_state state;
    struct cp_render_scope scope;
@@ -749,6 +752,19 @@ struct cp_context {
    uint64_t blocked_all_ns;
    uint64_t vertex_issue_ns;
    struct cp_ahead_census ahead;
+
+   /*
+    * CUDAVK_AHEAD's whole state, behind one pointer and LAST, for the reason
+    * the two blocks above are last.
+    *
+    * A deferred episode tail plus the batches held across it is about 500 KB
+    * of held state; putting it in the context by value would move nothing and
+    * cost every later field's displacement in an object that has to be shown
+    * inert with the flag off. NULL is the off state, allocated at the first
+    * deferral and freed at teardown, and every site that tests it is a null
+    * check on a pointer that is null in a shipping run.
+    */
+   struct cp_ahead_run *runahead;
 };
 
 

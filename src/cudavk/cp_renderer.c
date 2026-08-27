@@ -32,6 +32,21 @@
 #include "cp_smallop_tele.h"
 
 /*
+ * CUDAVK_AHEAD, forward-declared here because four of its hooks sit in
+ * functions this file defines long before the mechanism itself: the launch
+ * invariant, the fallback counter, teardown and the CUDAVK_PLAN_STATS report.
+ * The state and every line of the mechanism live beside cp_pass_finish(),
+ * which is where the drain it defers is.
+ */
+static bool cp_ahead_deferred(const struct cp_context *cp);
+static bool cp_ahead_holding(const struct cp_context *cp);
+static void cp_ahead_resolve(struct cp_context *cp);
+static void cp_ahead_note_launch(struct cp_context *cp);
+static void cp_ahead_note_fallback(struct cp_context *cp);
+static void cp_ahead_destroy(struct cp_context *cp);
+static void cp_ahead_report(struct cp_context *cp);
+
+/*
  * Bring a renderer up on a device.
  *
  * Everything here is CUDA and the driver's own bookkeeping -- a stream, the
@@ -535,6 +550,11 @@ cp_launch_after(struct cp_context *cp, CUfunction f,
    if (err != CUDA_SUCCESS)
       return err;
    cp->launches++;
+   /* The run-ahead's invariant, checked at the one place a kernel can be
+    * launched: nothing may be issued while an episode's tail is deferred
+    * except the held batch's own vertex phase. One null test when the flag is
+    * off; the count is printed and must be zero. */
+   cp_ahead_note_launch(cp);
 
    uint64_t epoch = cp_pdl_watch ?
       __atomic_load_n(&cp_pdl_epoch, __ATOMIC_RELAXED) : 0;
@@ -1097,6 +1117,7 @@ cp_ahead_census_report(struct cp_context *cp)
 static void
 cp_plan_report(struct cp_context *cp)
 {
+   cp_ahead_report(cp);
    if (!cp_debug->plan_stats || !cp->plan.merge_tests)
       return;
 
@@ -1364,6 +1385,7 @@ cp_context_cleanup(struct cp_context *cp)
    free(cp->hardware_texture.resolve_workspace);
    cp->hardware_texture.resolve_workspace = NULL;
    free(cp->pass_segs);
+   cp_ahead_destroy(cp);
    free(cp->pass_group_ubos);
 }
 
@@ -5115,6 +5137,169 @@ cp_restore_preclip(const struct cp_pending_clip *clip,
 }
 
 /*
+ * CUDAVK_AHEAD's two entry points into the draw path. The state itself lives
+ * next to cp_pass_finish(), which is where the drain it defers is; these two
+ * are all the vertex phase needs to know about it.
+ */
+static bool cp_ahead_holding(const struct cp_context *cp);
+static bool cp_ahead_hold(struct cp_context *cp,
+                          const struct cp_rasterize_args *rast_args,
+                          const struct cp_rast_queues *rast_queues,
+                          const struct cp_pending_clip *pending_clip,
+                          unsigned rast_num_triangles, unsigned num_triangles,
+                          const struct cp_draw_batch *batch, bool fetch_fold);
+
+/*
+ * The A-buffer count phase of one batch: the clears the episode does not
+ * already own, the fused clip, the three counting rasterizer stages, and --
+ * for an appending batch -- the segment record.
+ *
+ * Factored out of cp_draw_execute_batch() so that it has exactly ONE producer,
+ * for the same reason cp_pass_group_table_one() does: CUDAVK_AHEAD replays it
+ * later, from a held record, and a second copy of a hundred lines of launch
+ * arguments would be a second thing to keep in agreement. The in-place caller
+ * and the replay hand it the same six argument structs; nothing else crosses
+ * the seam, which is what makes the seam a seam.
+ *
+ * `rast_args`, `rast_queues`, `pending_clip`, `rast_num_triangles` and
+ * `vs_output_buf` are in/out because the fused clip commits to the clipped
+ * geometry optimistically and cp_restore_preclip() has to be able to undo that
+ * commitment in the caller's own locals -- see cp_rast_args_unclip().
+ */
+enum cp_count_result {
+   CP_COUNT_FATAL,      /* the device is lost; the caller must return */
+   CP_COUNT_RECORDED,   /* an appending batch: the segment is recorded */
+   CP_COUNT_DONE,       /* a classic draw: the caller carries on */
+};
+
+static enum cp_count_result
+cp_abuf_count_phase(struct cp_context *cp, struct cp_device *screen,
+                    struct cp_abuf *ab, struct cp_rasterize_args *rast_args,
+                    struct cp_rast_queues *rast_queues,
+                    struct cp_pending_clip *pending_clip,
+                    unsigned *rast_num_triangles, unsigned num_triangles,
+                    CUdeviceptr *vs_output_buf,
+                    const struct cp_draw_batch *batch, bool fetch_fold,
+                    size_t n, CUdeviceptr *abuf_recs_filled)
+{
+   struct cp_rasterize_args aa = *rast_args;
+   aa.abuf_counts = ab->counts;
+   aa.abuf_offsets = ab->offsets;
+   aa.abuf_cursor = ab->cursor;
+   aa.abuf_overflow = ab->overflow;
+
+   /* --- step 1: count ---
+    *
+    * An episode's per-pixel counts accumulate across its segments, so the
+    * clears run for the first segment only; every segment's fragments then
+    * carry its own primitive-slot base, which is what makes the episode's
+    * one sort come out in submission order. */
+   /* An episode's clears run once, on the main stream in cp_pass_append(),
+    * gated ahead of every segment stream. */
+   if (!cp->pass.appending) {
+      cuMemsetD32Async(ab->counts, 0, n, cp->stream);
+      if (!cp_debug->no_counter_block) {
+         /* One clear for every scalar counter this draw will fill: the
+          * worklist counts, the block counts and the debug counters are
+          * written only by kernels launched further down, so clearing them
+          * here is the same zero at a cheaper price. */
+         cuMemsetD32Async(ab->counters, 0, CP_ABUF_BLOCK_WORDS, cp->stream);
+      } else {
+         cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
+         if (ab->recs)
+            cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
+      }
+   }
+   if (cp->pass.appending)
+      aa.abuf_prim_base = cp->pass.next_prim;
+   /* Single-pass build: this counting launch also appends the records the
+    * fill will replay, so it needs the array bound the fill would have
+    * used. First-draw bootstrap runs count-only — the records array is
+    * sized from this draw's count, along with everything else. */
+   if (ab->recs) {
+      aa.abuf_recs = ab->recs;
+      aa.abuf_rec_cursor = ab->rec_cursor;
+      aa.abuf_capacity = ab->capacity;
+      *abuf_recs_filled = ab->recs;
+   }
+   /* The queue counters the count pass is about to fill, unless
+    * cp_vertex_fetch already seeded them for this batch. */
+   if (!fetch_fold &&
+       cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream) !=
+       CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return CP_COUNT_FATAL;
+   }
+   aa.abuf_mode = CP_ABUF_COUNT;
+   rast_queues->mode = CP_QUEUE_FILL;
+   cp_abuf_mark(ab, ab->ev[0], cp->stream);
+   /* The _abuf specialisations: same rasterizer, compiled with the count
+    * and fill branch live. Every other launch in this file uses the plain
+    * ones, which have no A-buffer code in them at all. */
+   bool fused_count = false;
+   if (pending_clip->pending) {
+      /* Clip and stage 1 in one launch: a thread per input triangle, so
+       * the grid is the clip kernel's, an eighth of the worst-case slot
+       * count the classic stage 1 is sized for — and the clip kernel's
+       * 64-thread blocks, which measured 0.3 ms/frame better than 256 on
+       * the old capture (more blocks spread the same small draw over
+       * more SMs). Stages 2 and 3 follow unchanged — see the fused
+       * kernel's comment for why they keep their own grids. */
+      void *fp[] = { &pending_clip->args, &aa, rast_queues };
+      CUresult fused_err = cp_launch(cp,
+         screen->kernels.clip_rast_fused_abuf,
+         (pending_clip->args.num_triangles + 63) / 64, 1, 1,
+         64, 1, 1, 0, cp->stream, fp, NULL);
+      fused_count = fused_err == CUDA_SUCCESS;
+      if (fused_count) {
+         pending_clip->pending = false;
+      } else {
+         cp_warn_fused_rast_refused(fused_err);
+      }
+      if (!fused_count &&
+          !cp_flush_pending_clip(cp, screen, pending_clip)) {
+         cp_restore_preclip(pending_clip, rast_args, vs_output_buf,
+                            rast_num_triangles, &cp->fs_batch.prim_shift);
+         cp_rast_args_unclip(&aa, pending_clip->positions,
+                             pending_clip->num_triangles,
+                             pending_clip->rect_prim_shift);
+      }
+   }
+   void *ap[] = { &aa, rast_queues };
+   /* Tier 4, count pass. The queue-counter clear above is skipped whenever
+    * the vertex stage seeded the counters (fetch_fold), and the episode's
+    * clears run for its first segment only, so this site is expected to
+    * take. The clip may or may not be the kernel in front of it. */
+   if (!fused_count)
+      CP_LAUNCH_AFTER(CP_PDL_ANY, CP_PDL_TIER_STAGE1,
+                     screen->kernels.rasterize_stage1_abuf,
+                     (*rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
+                     0, cp->stream, ap, NULL);
+   /* Whichever of the two actually filled the queue is the predecessor;
+    * naming the wrong one costs the overlap, not the ordering. Stage 1 is
+    * never a secondary here -- the queue-counter clear is in front of it. */
+   CP_LAUNCH_AFTER(fused_count ? screen->kernels.clip_rast_fused_abuf
+                               : screen->kernels.rasterize_stage1_abuf,
+                  CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage2_abuf,
+                  CLAMP((*rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
+                  256, 1, 1, 0, cp->stream, ap, NULL);
+   CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2_abuf,
+                  CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage3_abuf,
+                  CLAMP(*rast_num_triangles * 8, 512u, 2048u), 1, 1,
+                  64, 1, 1, 0, cp->stream, ap, NULL);
+   cp_abuf_mark(ab, ab->ev[1], cp->stream);
+
+   /* The segment is counted; everything from the scan on happens once,
+    * at cp_pass_finish(). */
+   if (cp->pass.appending) {
+      cp_pass_record_segment(cp, &aa, rast_queues, *rast_num_triangles,
+                             num_triangles, batch);
+      return CP_COUNT_RECORDED;
+   }
+   return CP_COUNT_DONE;
+}
+
+/*
  * Run one draw, or one batch of them, through the whole pipeline.
  *
  * `batch_draws` is how many merged draws this launch stands for and
@@ -5128,6 +5313,16 @@ void
 cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 {
    cp->plan.flushes++;
+   /*
+    * The second resolution point, and it is the net rather than the rule: a
+    * draw that is not a held one must not run while an episode's tail is
+    * still deferred, because it would rewind the arenas that episode is
+    * reading. Every path that gets here is supposed to have closed the
+    * episode through cp_pass_finish() already; if one ever does not, this
+    * makes it slow instead of wrong.
+    */
+   if (cp_ahead_deferred(cp) && !cp_ahead_holding(cp))
+      cp_ahead_resolve(cp);
    unsigned batch_draws = batch->ndraws;
    const struct cp_draw_call *info = &batch->info;
    unsigned drawid_offset = batch->drawid_offset;
@@ -5402,7 +5597,18 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * episode owns the epoch instead: every segment's clipped stream has to
     * survive until the episode's shading has read it, so only the first
     * segment reclaims and the rest allocate beyond. */
-   if (!cp->pass.appending || cp->pass.nsegs == 0)
+   /*
+    * ...and a held batch reclaims nothing at all. Its segment index is 0 --
+    * no segment of the next episode has been recorded yet -- so both tests
+    * below would fire, and both would take the memory the DEFERRED tail is
+    * still reading: cp_scratch_begin() may synchronise and rewind the upload
+    * arena the held batch's own slice table is in, and the rewind below hands
+    * this batch the addresses the previous episode's segments are shading
+    * from. The held batch allocates ABOVE the deferred episode's high-water
+    * instead, which is what every second and later segment of an episode
+    * already does; the drain that follows is what makes it safe to reuse.
+    */
+   if ((!cp->pass.appending || cp->pass.nsegs == 0) && !cp_ahead_holding(cp))
       cp_scratch_begin(cp);
    if (cp->device_fatal)
       return;
@@ -5456,8 +5662,9 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
     * CP_SCRATCH_RECLAIM_BYTES makes cp_scratch_alloc() drain the device and
     * free the overflow arenas — and it was passing it several times a frame.
     *
-    * Same episode exception as the managed arena above. */
-   if (!cp->pass.appending || cp->pass.nsegs == 0)
+    * Same episode exception as the managed arena above, and the same
+    * run-ahead exception: see cp_scratch_begin()'s call above. */
+   if ((!cp->pass.appending || cp->pass.nsegs == 0) && !cp_ahead_holding(cp))
       cp->dscratch.used = 0;
 
    /*
@@ -6626,120 +6833,33 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          uint64_t bl = cp->blocked_all_ns - vtx_blocked0;
          cp->vertex_issue_ns += el > bl ? el - bl : 0;
       }
-      size_t n = (size_t)w * h;
-      struct cp_rasterize_args aa = rast_args;
-      aa.abuf_counts = ab->counts;
-      aa.abuf_offsets = ab->offsets;
-      aa.abuf_cursor = ab->cursor;
-      aa.abuf_overflow = ab->overflow;
-
-      /* --- step 1: count ---
+      /*
+       * The seam, and the run-ahead's hold point.
        *
-       * An episode's per-pixel counts accumulate across its segments, so the
-       * clears run for the first segment only; every segment's fragments then
-       * carry its own primitive-slot base, which is what makes the episode's
-       * one sort come out in submission order. */
-      /* An episode's clears run once, on the main stream in cp_pass_append(),
-       * gated ahead of every segment stream. */
-      if (!cp->pass.appending) {
-         cuMemsetD32Async(ab->counts, 0, n, cp->stream);
-         if (!cp_debug->no_counter_block) {
-            /* One clear for every scalar counter this draw will fill: the
-             * worklist counts, the block counts and the debug counters are
-             * written only by kernels launched further down, so clearing them
-             * here is the same zero at a cheaper price. */
-            cuMemsetD32Async(ab->counters, 0, CP_ABUF_BLOCK_WORDS, cp->stream);
-         } else {
-            cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
-            if (ab->recs)
-               cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
-         }
-      }
-      if (cp->pass.appending)
-         aa.abuf_prim_base = cp->pass.next_prim;
-      /* Single-pass build: this counting launch also appends the records the
-       * fill will replay, so it needs the array bound the fill would have
-       * used. First-draw bootstrap runs count-only — the records array is
-       * sized from this draw's count, along with everything else. */
-      if (ab->recs) {
-         aa.abuf_recs = ab->recs;
-         aa.abuf_rec_cursor = ab->rec_cursor;
-         aa.abuf_capacity = ab->capacity;
-         abuf_recs_filled = ab->recs;
-      }
-      /* The queue counters the count pass is about to fill, unless
-       * cp_vertex_fetch already seeded them for this batch. */
-      if (!fetch_fold &&
-          cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream) !=
-          CUDA_SUCCESS) {
-         cp_renderer_texture_fatal(cp);
+       * While a drain's tail is deferred this batch's vertex phase has just
+       * been issued on a stream of its own and must NOT count: the count
+       * writes the episode's shared per-pixel lists, which the deferred tail
+       * is still reading. Everything the count needs is complete and is a
+       * value struct at this line, so holding it is a copy and a return.
+       */
+      if (cp_ahead_holding(cp)) {
+         if (!cp_ahead_hold(cp, &rast_args, &rast_queues, &pending_clip,
+                            rast_num_triangles, num_triangles, batch,
+                            fetch_fold))
+            cp->pass.append_failed = true;
          return;
       }
-      aa.abuf_mode = CP_ABUF_COUNT;
-      rast_queues.mode = CP_QUEUE_FILL;
-      cp_abuf_mark(ab, ab->ev[0], cp->stream);
-      /* The _abuf specialisations: same rasterizer, compiled with the count
-       * and fill branch live. Every other launch in this file uses the plain
-       * ones, which have no A-buffer code in them at all. */
-      bool fused_count = false;
-      if (pending_clip.pending) {
-         /* Clip and stage 1 in one launch: a thread per input triangle, so
-          * the grid is the clip kernel's, an eighth of the worst-case slot
-          * count the classic stage 1 is sized for — and the clip kernel's
-          * 64-thread blocks, which measured 0.3 ms/frame better than 256 on
-          * the old capture (more blocks spread the same small draw over
-          * more SMs). Stages 2 and 3 follow unchanged — see the fused
-          * kernel's comment for why they keep their own grids. */
-         void *fp[] = { &pending_clip.args, &aa, &rast_queues };
-         CUresult fused_err = cp_launch(cp,
-            screen->kernels.clip_rast_fused_abuf,
-            (pending_clip.args.num_triangles + 63) / 64, 1, 1,
-            64, 1, 1, 0, cp->stream, fp, NULL);
-         fused_count = fused_err == CUDA_SUCCESS;
-         if (fused_count) {
-            pending_clip.pending = false;
-         } else {
-            cp_warn_fused_rast_refused(fused_err);
-         }
-         if (!fused_count &&
-             !cp_flush_pending_clip(cp, screen, &pending_clip)) {
-            cp_restore_preclip(&pending_clip, &rast_args, &vs_output_buf,
-                               &rast_num_triangles, &cp->fs_batch.prim_shift);
-            cp_rast_args_unclip(&aa, pending_clip.positions,
-                                pending_clip.num_triangles,
-                                pending_clip.rect_prim_shift);
-         }
-      }
-      void *ap[] = { &aa, &rast_queues };
-      /* Tier 4, count pass. The queue-counter clear above is skipped whenever
-       * the vertex stage seeded the counters (fetch_fold), and the episode's
-       * clears run for its first segment only, so this site is expected to
-       * take. The clip may or may not be the kernel in front of it. */
-      if (!fused_count)
-         CP_LAUNCH_AFTER(CP_PDL_ANY, CP_PDL_TIER_STAGE1,
-                        screen->kernels.rasterize_stage1_abuf,
-                        (rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
-                        0, cp->stream, ap, NULL);
-      /* Whichever of the two actually filled the queue is the predecessor;
-       * naming the wrong one costs the overlap, not the ordering. Stage 1 is
-       * never a secondary here -- the queue-counter clear is in front of it. */
-      CP_LAUNCH_AFTER(fused_count ? screen->kernels.clip_rast_fused_abuf
-                                  : screen->kernels.rasterize_stage1_abuf,
-                     CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage2_abuf,
-                     CLAMP((rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
-                     256, 1, 1, 0, cp->stream, ap, NULL);
-      CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2_abuf,
-                     CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage3_abuf,
-                     CLAMP(rast_num_triangles * 8, 512u, 2048u), 1, 1,
-                     64, 1, 1, 0, cp->stream, ap, NULL);
-      cp_abuf_mark(ab, ab->ev[1], cp->stream);
 
-      /* The segment is counted; everything from the scan on happens once,
-       * at cp_pass_finish(). */
-      if (cp->pass.appending) {
-         cp_pass_record_segment(cp, &aa, &rast_queues, rast_num_triangles,
-                                num_triangles, batch);
+      size_t n = (size_t)w * h;
+      switch (cp_abuf_count_phase(cp, screen, ab, &rast_args, &rast_queues,
+                                  &pending_clip, &rast_num_triangles,
+                                  num_triangles, &vs_output_buf, batch,
+                                  fetch_fold, n, &abuf_recs_filled)) {
+      case CP_COUNT_FATAL:
+      case CP_COUNT_RECORDED:
          return;
+      case CP_COUNT_DONE:
+         break;
       }
 
       /* --- step 2: prefix sum ---
@@ -7863,6 +7983,11 @@ static void
 cp_pass_fallback(struct cp_context *cp, struct cp_pass_seg *segs,
                  unsigned nsegs)
 {
+   /* A fallback re-executes classically, and a classic execution rewinds the
+    * device scratch -- over anything a run-ahead is holding. Counted here,
+    * at the one place it can happen, so that cp_ahead_resolve() can tell
+    * whether the held vertex output survived its own tail. */
+   cp_ahead_note_fallback(cp);
    if (!cp_pass_can_retry(cp))
       return;
    /* The abandoned episode's kernels may still be in flight on the side
@@ -9011,238 +9136,677 @@ cp_pass_group_tables(struct cp_context *cp, const struct cp_pass_seg *segs,
    return true;
 }
 
-void
-cp_pass_finish(struct cp_context *cp)
-{
-   cp->plan.pass_finish_calls++;
-   struct cp_device *screen = cp->dev;
-   struct cp_abuf *ab = cp->abuf;
-   unsigned nsegs = cp->pass.nsegs;
-   if (nsegs)
-      cp->plan.pass_finishes++;
 
-   if (nsegs && cp_debug->debug_episode)
-      fprintf(stderr, "episode: nsegs=%u opaque=%d\n", nsegs,
-              (int)cp->pass.opaque);
+/* ===========================================================================
+ * CUDAVK_AHEAD -- issue the next episode's vertex stage across the episode
+ * drain.
+ *
+ * WHAT IT DOES, in one paragraph. cp_pass_finish() is cut in two at the sync.
+ * The front half issues the whole A-buffer build and then hands the tail --
+ * the drain, the counter read-back, the dense bases, the shades and the
+ * composite -- to cp_ahead_defer() instead of running it. The host carries on
+ * replaying the command stream; the appendable blended batches that follow run
+ * their VERTEX phase on a stream of their own and stop at the seam in
+ * cp_draw_execute_batch(), recording a held segment rather than counting.
+ * When anything at all needs the episode closed, cp_ahead_resolve() runs the
+ * tail -- the drain is taken at the same point in the stream order, for the
+ * same length -- and then replays the held batches' count phases. The host
+ * reaches the sync having already issued work that used to sit behind it.
+ *
+ * WHY IT IS WORTH DOING, measured rather than assumed:
+ *
+ *  - host work moved to just BEFORE this sync is ABSORBED. The conversion
+ *    probe run backwards (CUDAVK_WAIT_SPIN_BEFORE) measures slope 0.034 at
+ *    62 us/drain and 0.065 at 125, against +1.02 for the same injection after
+ *    the sync on the same binary. The symmetry this rests on is a
+ *    measurement now, not an assumption;
+ *  - the budget is the knee of the wait CDF that probe reconstructed:
+ *    P(W<125us) = 0.09, P(W<250us) = 0.43. Under ~125 us per drain is nearly
+ *    free; past 250 us it is paid for at a rising rate. CUDAVK_AHEAD_BUDGET_US
+ *    is that knee and it is the admission rule, in the CDF's own units;
+ *  - the prize is the vertex phase's share of the post-drain burst, censused
+ *    at 0.387 ms/frame on the old capture and 0.072 on Crossroads. Note WHY
+ *    the vertex phase specifically: its ceiling is ~100% of the vertex work
+ *    ISSUED (585.4 of 585.7 ms), where the all-work ceiling is 21% of all work
+ *    issued. Vertex work is almost entirely inside this drain's shadow.
+ *
+ * WHAT IT DOES NOT TOUCH, because that is the line the last mechanism at this
+ * site could not hold: the overflow branch, cp_pass_can_retry(), the
+ * `running != quads` check and the capacity/4 gate are all in the tail and are
+ * unchanged. Nothing fail-closed for the correctness of the drawn image
+ * becomes fail-open. What DOES become fail-open is the extent of the held
+ * state, so it is counted rather than asserted about: CUDAVK_PLAN_STATS prints
+ * the deferrals, the holds, the held-count histogram, the declines by reason,
+ * the drops and any launch issued while a tail was open outside the held path,
+ * which must be zero.
+ * ===========================================================================
+ */
 
-   if (!nsegs)
-      return;
-   if (cp->pass.opaque) {
-      cp_opaque_finish(cp);
-      return;
-   }
+/* Eight because held batch k takes rasterizer queue set k, of which there are
+ * CP_PASS_STREAMS = 8. That is what lets a held vertex stage keep seeding its
+ * own queue counters (fetch_fold) without two held batches seeding the same
+ * set; it is a correctness cap, not a tuning constant. */
+#define CP_AHEAD_MAX_SEGS 8
+/* Two streams for the held vertex phases, so two of them can overlap, and not
+ * eight: the machine is already under-filled at this point in the frame and
+ * every extra stream is another edge at the join. */
+#define CP_AHEAD_STREAMS  2
 
-   /* Cleared first: nothing below may see the episode as still open. */
-   cp->pass.nsegs = 0;
-   cp->pass.next_prim = 0;
+enum cp_ahead_decline {
+   CP_AHEAD_DECL_FULL,     /* the hold set is full */
+   CP_AHEAD_DECL_BUDGET,   /* the relocation budget for this drain is spent */
+   CP_AHEAD_DECL_BYTES,    /* the held batches have taken their scratch cap */
+   CP_AHEAD_DECL_SMALL,    /* under CUDAVK_AHEAD_MIN_VERTS */
+   CP_AHEAD_DECL_ABUF,     /* a growth is pending, or the arrays are not there */
+   CP_AHEAD_DECL_FB,       /* a different framebuffer: setup would resize */
+   CP_AHEAD_DECL_STATE,    /* no streams, or the device is already lost */
+   CP_AHEAD_DECL_SEAM,     /* admitted, but the batch did not reach the seam */
+   CP_AHEAD_DECL_COUNT,
+};
 
-   struct cp_pass_seg *segs = cp->pass_segs;
-   unsigned w = cp->pass.w, h = cp->pass.h;
-   size_t n = (size_t)w * h;
-   bool failed = false;
+/* One held batch, captured at the seam. Everything the count phase reads is
+ * in here by value; nothing else crosses the seam, which is what makes the
+ * seam a seam rather than a split through a hundred live locals. */
+struct cp_ahead_seg {
+   struct cp_rasterize_args rast;
+   struct cp_rast_queues    queues;
+   struct cp_pending_clip   clip;
+   struct cp_draw_batch     batch;
+   struct cp_fs_batch       fs_batch;
+   CUdeviceptr vs_output_buf;
+   unsigned rast_num_triangles;
+   unsigned num_triangles;
+   unsigned slot;              /* segment index, and so queue set, at replay */
+   bool fetch_fold;
+};
 
-   /*
-    * The fallback exists for overflow and allocation failure, which the
-    * sample set never reaches and the captures reach only on the standalone
-    * A-buffer path -- so the episode fallback is code the gate cannot
-    * exercise. This makes it reachable on purpose: every episode takes it,
-    * and the output must be identical, because re-executing the segments
-    * classically is defined to produce what the episode would have.
-    */
-   if (cp_debug->force_pass_fallback) {
-      cp_pass_fallback(cp, segs, nsegs);
-      return;
-   }
-
-   CP_NVTX_SCOPEF("episode %u segs", nsegs);
-
-   /* The segments' count phases ran on the side streams; the scan reads
-    * across all of them. */
-   if (!cp_pass_join(cp, nsegs))
-      return;
-
-   /* --- scan the accumulated counts, clamp the runs to the array ---
-    *
-    * The fill cursor's clear rides in the same pass: nothing between here and
-    * the fill can replace ab->cursor, and the clear was a 3.7 MB device
-    * operation of its own immediately behind a kernel that already writes one
-    * word per pixel. */
-   CUstream pass_main = cp->stream;
-   cp_abuf_scan(cp, screen, ab, (unsigned)n, ab->cursor);
-
-   /* --- fill --- */
-   if (ab->recs && screen->kernels.abuf_fill_recs) {
-      /* Single-pass build: every segment's count already appended its
-       * records (ab->recs cannot change mid-episode — a pending growth
-       * refuses the append), so the whole episode's fill is one linear
-       * replay on the main stream, and the fan-out/join the per-segment
-       * relaunches needed disappears with them. */
-      void *fp[] = { &ab->recs, &ab->rec_cursor, &ab->capacity, &ab->frags,
-                     &ab->offsets, &ab->counts, &ab->cursor, &ab->overflow,
-                     &ab->capacity };
-      CP_LAUNCH(screen->kernels.abuf_fill_recs, 2048, 1, 1, 256, 1, 1,
-                     0, cp->stream, fp, NULL);
-   } else {
-      /* One relaunch per segment from its saved arguments, fanned back out
-       * over the side streams behind the scan. */
-      if (!cp_pass_broadcast(cp, nsegs))
-         return;
-      for (unsigned s = 0; s < nsegs; s++) {
-         struct cp_pass_seg *sg = &segs[s];
-         if (cp->seg_streams[0])
-            cp_stream_set(cp, cp_pass_seg_stream(cp, s));
-         struct cp_rasterize_args aa = sg->rast;
-         aa.abuf_frags = ab->frags;
-         aa.abuf_capacity = ab->capacity;
-         aa.abuf_mode = CP_ABUF_FILL;
-         struct cp_rast_queues q = sg->queues;
-         q.mode = CP_QUEUE_FILL;
-         /* The segment's own queue set, saved with its arguments. */
-         cuMemsetD32Async(q.nontrivial_count, 0, 3, cp->stream);
-         void *ap[] = { &aa, &q };
-         /* Tier 4, pass segments. Expected to decline for the same reason as
-          * the tiled fallback: one clear per segment, inside the loop. */
-         CP_LAUNCH_AFTER(CP_PDL_ANY, CP_PDL_TIER_STAGE1,
-                        screen->kernels.rasterize_stage1_abuf,
-                        (sg->rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
-                        0, cp->stream, ap, NULL);
-         /* One segment's three stages are a chain on that segment's own
-          * stream; the fan-out overlaps segments, never these. */
-         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage1_abuf,
-                        CP_PDL_TIER_RASTER,
-                        screen->kernels.rasterize_stage2_abuf,
-                        CLAMP((sg->rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
-                        256, 1, 1, 0, cp->stream, ap, NULL);
-         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2_abuf,
-                        CP_PDL_TIER_RASTER,
-                        screen->kernels.rasterize_stage3_abuf,
-                        CLAMP(sg->rast_num_triangles * 8, 512u, 2048u), 1, 1,
-                        64, 1, 1, 0, cp->stream, ap, NULL);
-      }
-      cp_stream_set(cp, pass_main);
-      if (!cp_pass_join(cp, nsegs))
-         return;
-   }
-
-   /* --- sort, both worklists --- */
-   {
-      unsigned nn = (unsigned)n;
-      unsigned max_short = cp_debug->abuf_short_sort_max;
-      unsigned min_long = cp_debug->no_abuf_short_sort ? 2 : max_short + 1;
-      if (!cp_debug->no_abuf_short_sort) {
-         if (cp_debug->no_counter_block) {
-            cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
-            cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
-         }
-         void *ssp[] = { &ab->frags, &ab->offsets, &ab->counts, &nn,
-                         &max_short, &ab->clist, &ab->clist_count,
-                         &min_long, &ab->list, &ab->list_count };
-         CP_LAUNCH(screen->kernels.abuf_sort_short,
-                        MIN2((nn + 255) / 256, 4096u), 1, 1, 256, 1, 1,
-                        0, cp->stream, ssp, NULL);
-      } else {
-         if (cp_debug->no_counter_block)
-            cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
-         void *wp[] = { &ab->counts, &nn, &min_long, &ab->list,
-                        &ab->list_count };
-         CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
-                        256, 1, 1, 0, cp->stream, wp, NULL);
-      }
-      void *sp[] = { &ab->frags, &ab->offsets, &ab->counts, &ab->list,
-                     &ab->list_count, &ab->long_runs };
-      CP_LAUNCH(screen->kernels.abuf_sort, 4096, 1, 1, 256, 1, 1,
-                     0, cp->stream, sp, NULL);
-      if (cp_debug->no_abuf_short_sort) {
-         unsigned min1 = 1;
-         if (cp_debug->no_counter_block)
-            cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
-         void *cw[] = { &ab->counts, &nn, &min1, &ab->clist,
-                        &ab->clist_count };
-         CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
-                        256, 1, 1, 0, cp->stream, cw, NULL);
-      }
-   }
-
-   /* --- the quad stream --- */
-   cp_abuf_quad_build(cp, screen, ab, w, h);
-
-cp_tile_census_quads(cp, segs, nsegs, w, h);
-
-   if (cp_pass_finish_bounded_groups(cp, segs, nsegs, w, h))
-      return;
-   if (!cp_pass_can_retry(cp))
-      return;
-
-   /* --- bucket the quads by segment, before the drain so the counts ride
-    * it --- */
-   CUdeviceptr quad_seg = cp_scratch_alloc_device(cp, ab->quad_capacity);
-   uint32_t seg_prims[CP_PASS_MAX_SEGS];
-   for (unsigned s = 0; s < nsegs; s++)
-      seg_prims[s] = segs[s].prim_base;
-   CUdeviceptr seg_prims_dev = cp_upload(cp, seg_prims, (size_t)nsegs * 4);
-   if (!quad_seg || !seg_prims_dev) {
-      cp_pass_fallback(cp, segs, nsegs);
-      return;
-   }
-   if (cp_debug->no_counter_block)
-      cuMemsetD32Async(ab->seg_counts, 0, CP_PASS_MAX_SEGS, cp->stream);
-   struct cp_abuf_seg_args sa = {
-      .quad_prim = ab->quad_prim,
-      .seg_prim_base = seg_prims_dev,
-      .seg_counts = ab->seg_counts,
-      .quad_seg = quad_seg,
-      .num_quads_dev = ab->bsum3,
-      .nsegs = nsegs,
-      .num_quads = (uint32_t)ab->quad_capacity,
-      .warp_aggregate = !cp_debug->no_abuf_warp_bucket,
-   };
-   {
-      void *p[] = { &sa };
-      CP_LAUNCH(screen->kernels.abuf_seg_count,
-                     MIN2(((unsigned)ab->quad_capacity + 255) / 256, 1024u),
-                     1, 1, 256, 1, 1, 0, cp->stream, p, NULL);
-   }
-
-   /*
-    * --- everything after the drain that the drain's answer is not needed
-    * for, hoisted above it ---
-    *
-    * The tail's host work splits cleanly in two. Which segments shade
-    * together, how many members each group has, each group's range table and
-    * the concatenation of its members' fragment constant-buffer rows are
-    * functions of `segs` alone. Only the dense bases, the descs and the
-    * launches need `ctr`.
-    *
-    * The drain is the driver's largest host block -- 9.88 a frame, 6.017
-    * ms/frame, and host time immediately after it lands on the frame at a
-    * measured slope of 1.02 (PERFORMANCE.md 5.2b) -- so host work sitting
-    * behind it for no reason is paid for at par. Moving it above the sync
-    * changes no launch, no launch argument and no uploaded byte: the range
-    * tables are built group-major into one flat array instead of per group
-    * into a stack one, and the row concatenation gets a per-group base
-    * instead of restarting at zero, which is the same bytes at a different
-    * offset of the same buffer.
-    *
-    * CUDAVK_NO_DRAIN_HOIST is the revert, and it is also the fallback path:
-    * a precompute that cannot allocate leaves `hoisted` false and the loop
-    * below does exactly what it did before, including failing the same way.
-    */
-   uint8_t seg_group[CP_PASS_MAX_SEGS];
+/*
+ * The deferred half of cp_pass_finish(), by value.
+ *
+ * cp_pass_finish() builds this on its own stack whether or not the run-ahead
+ * is on, and hands a pointer to cp_pass_tail_run(); the flag-off path
+ * therefore copies nothing. Only a deferral copies it, into the held state.
+ */
+struct cp_pass_tail {
+   struct cp_pass_seg *segs;
+   unsigned nsegs;
+   unsigned w, h;
+   size_t n;
+   CUstream main;
+   CUdeviceptr quad_seg;
+   struct cp_abuf_seg_args sa;
+   /* The shading-group tables Tier 1 built above the drain. */
+   unsigned ngroups;
+   bool hoisted;
+   uint8_t  seg_group[CP_PASS_MAX_SEGS];
    unsigned group_first[CP_PASS_MAX_SEGS];
    unsigned group_members[CP_PASS_MAX_SEGS];
-   unsigned ngroups = 0;
    struct cp_seg_range ranges_all[CP_PASS_MAX_SEGS];
    unsigned group_range_base[CP_PASS_MAX_SEGS];
    uint32_t group_rows[CP_PASS_MAX_SEGS], group_row_base[CP_PASS_MAX_SEGS];
-   bool hoisted = !cp_debug->no_drain_hoist;
+};
 
-   cp_pass_group_map(cp, segs, nsegs, seg_group, group_first, group_members,
-                     &ngroups);
-   if (hoisted)
-      hoisted = cp_pass_group_tables(cp, segs, nsegs, seg_group,
-                                     group_members, ngroups, ranges_all,
-                                     group_range_base, group_rows,
-                                     group_row_base);
+struct cp_ahead_run {
+   struct cp_pass_tail tail;
+   struct cp_ahead_seg held[CP_AHEAD_MAX_SEGS];
+   CUstream streams[CP_AHEAD_STREAMS];
+   CUevent  ev[CP_AHEAD_STREAMS];
+   /*
+    * The edge in the OTHER direction, and it is the one this design nearly
+    * missed. A held batch keeps the rasterizer queue set of the segment it
+    * will become, so that its vertex fetch can still seed that set's counters
+    * (fetch_fold). Those counters are the ones the PREVIOUS episode's segment
+    * on the same queue set is still reading: its count stages are on a
+    * segment stream and the drain that would have ordered them has not been
+    * taken yet. So the ahead streams wait, once per drain, on an event
+    * recorded on the main stream -- which the front half's cp_pass_join() has
+    * already put behind every segment stream.
+    *
+    * One event record and at most two waits per drain, issued BEFORE the sync
+    * and so absorbed by it. The alternative was to turn fetch_fold off for
+    * held batches and pay two clears per held segment at REPLAY time, i.e.
+    * after the sync at the full 1.02 slope -- 0.08 to 0.19 ms/frame against
+    * this form's 0.005. That is the design's own failure mode 2 and it is why
+    * the ordered form is the mechanism rather than the fallback.
+    */
+   CUevent  gate;
+   unsigned gated;             /* ahead streams already behind this drain */
+   bool gate_recorded;
+   bool ready, stream_failed;
+   bool deferred;              /* a tail is waiting to be run */
+   bool holding;               /* inside a held batch's vertex phase */
+   unsigned nheld;
+   unsigned used_streams;      /* bitmask of ahead streams with held work */
+   uint64_t hold_ns;           /* host time relocated in front of this drain */
+   uint64_t hold_bytes;        /* device scratch the held batches took */
+
+   /* Everything below is what makes the held state checkable from outside. */
+   uint64_t defers, holds, replays, resolves, drops, strays, fallbacks;
+   uint64_t declines[CP_AHEAD_DECL_COUNT];
+   uint64_t held_hist[CP_AHEAD_MAX_SEGS + 1];
+   uint64_t hold_ns_sum, hold_bytes_peak;
+};
+
+static void cp_ahead_replay(struct cp_context *cp);
+static void cp_ahead_drop(struct cp_context *cp);
+static void cp_pass_tail_run(struct cp_context *cp, struct cp_pass_tail *t);
+
+static bool
+cp_ahead_holding(const struct cp_context *cp)
+{
+   return cp->runahead && cp->runahead->holding;
+}
+
+static bool
+cp_ahead_deferred(const struct cp_context *cp)
+{
+   return cp->runahead && cp->runahead->deferred;
+}
+
+/*
+ * A launch issued while a tail is deferred and no batch is being held would be
+ * work the episode's own ordering does not cover. It cannot happen -- the tail
+ * clears `deferred` before it runs, the replay runs after it, and every path
+ * out of the append loop resolves first -- so this counts rather than asserts,
+ * and the count is printed. A number other than zero is a missed resolution
+ * point, which is the one failure mode of this design that is silent.
+ */
+static void
+cp_ahead_note_launch(struct cp_context *cp)
+{
+   struct cp_ahead_run *a = cp->runahead;
+   if (a && a->deferred && !a->holding)
+      a->strays++;
+}
+
+static void
+cp_ahead_note_fallback(struct cp_context *cp)
+{
+   if (cp->runahead)
+      cp->runahead->fallbacks++;
+}
+
+static struct cp_ahead_run *
+cp_ahead_state(struct cp_context *cp)
+{
+   if (cp->runahead)
+      return cp->runahead;
+   if (!cp_debug->ahead)
+      return NULL;
+   cp->runahead = calloc(1, sizeof(*cp->runahead));
+   return cp->runahead;
+}
+
+/*
+ * The two streams and their events, once. Allocate-or-decline, with no retry
+ * loop and no grow path: a failure here leaves the run-ahead permanently off
+ * and the driver behaves exactly as it does with the flag unset.
+ *
+ * The ahead streams are not registered with the texture cache's per-stream
+ * serials on purpose. cp_texture_stream_serial() answers 0 for a stream it
+ * does not know, which is the conservative answer -- batch-local memoization
+ * only -- and the vertex phase does not take the hardware-texture path anyway.
+ */
+static bool
+cp_ahead_streams_ready(struct cp_context *cp, struct cp_ahead_run *a)
+{
+   if (a->ready)
+      return true;
+   if (a->stream_failed)
+      return false;
+   for (unsigned i = 0; i < CP_AHEAD_STREAMS; i++) {
+      if (cuStreamCreate(&a->streams[i], CU_STREAM_NON_BLOCKING) !=
+             CUDA_SUCCESS ||
+          cuEventCreate(&a->ev[i], CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
+         fprintf(stderr, "cudavk: run-ahead streams unavailable; "
+                 "CUDAVK_AHEAD is off for this process\n");
+         a->stream_failed = true;
+         return false;
+      }
+   }
+   if (cuEventCreate(&a->gate, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
+      a->stream_failed = true;
+      return false;
+   }
+   a->ready = true;
+   return true;
+}
+
+/*
+ * Put ahead stream `i` behind everything the main stream has issued for the
+ * deferred episode, once per drain. See the gate's comment in the state
+ * struct for why this exists at all.
+ */
+static bool
+cp_ahead_gate(struct cp_context *cp, struct cp_ahead_run *a, unsigned i)
+{
+   if (a->gated & (1u << i))
+      return true;
+   if (!a->gate_recorded) {
+      /* An event orders other streams against this one, so anything owed on
+       * this one has to be issued first -- cp_pass_join()'s rule. */
+      if (cp_upload_flush(cp) != CUDA_SUCCESS ||
+          cuEventRecord(a->gate, cp->stream) != CUDA_SUCCESS)
+         return false;
+      a->gate_recorded = true;
+   }
+   if (cuStreamWaitEvent(a->streams[i], a->gate, 0) != CUDA_SUCCESS)
+      return false;
+   a->gated |= 1u << i;
+   return true;
+}
+
+/*
+ * Whether this batch may be held, and if not, why not.
+ *
+ * THE ADMISSION RULE IS A TIME BUDGET, not a batch count, because the thing
+ * being spent is the drain's wait and the CDF is in microseconds. Holding is
+ * free while the relocated host time is inside the wait and costs at a rising
+ * rate past it; the measured knee is 125 us per drain, so that is the default
+ * cap and the batch that crosses it is the last one admitted.
+ *
+ * THE POPULATION IS BIMODAL and the rule has to serve both modes. 36% of
+ * drains are followed by exactly ONE appendable batch and 21% by the full 16,
+ * with a thin middle. A count-based rule tuned for the mean of 5.92 would
+ * over-serve the first mode -- where the whole win is one batch and the cost
+ * is the stream switch and one ordering edge -- and under-serve the second,
+ * where the budget is the only thing that should stop it. So:
+ *
+ *  - the single-batch mode is protected by CUDAVK_AHEAD_MIN_VERTS, which
+ *    refuses a batch whose vertex phase is smaller than the edge it costs.
+ *    Its default is 32 assembled vertices: the fixed part of a vertex phase (a
+ *    malloc, the ref loop, the slice-table upload, one or two launches) is a
+ *    few microseconds against about 1.3 us of added stream switch and wait
+ *    edge, and below a dozen triangles that margin is gone;
+ *  - the sixteen-batch mode is bounded by the budget and by
+ *    CUDAVK_AHEAD_MAX_SEGS, and it is where the win is: the censused vertex
+ *    ceiling is 39 us per drain on average, which is 31% of the free budget,
+ *    so the whole prize fits inside the region the probe measured as absorbed.
+ *
+ * The other four rules are correctness, not tuning: no pending growth (the
+ * arrays the replay counts into must not be freed between hold and replay),
+ * the same framebuffer (cp_abuf_setup() must be the no-op it is for an equal
+ * size, or it would resize arrays the deferred tail is still reading), the
+ * streams, and a device that is not already lost.
+ */
+static bool
+cp_ahead_admit(struct cp_context *cp, const struct cp_draw_batch *batch,
+               unsigned total_verts)
+{
+   struct cp_ahead_run *a = cp->runahead;
+   struct cp_abuf *ab = cp->abuf;
+   unsigned max = MIN2(cp_debug->ahead_max_segs, (unsigned)CP_AHEAD_MAX_SEGS);
+   if (cp_debug->ahead < 2)
+      max = MIN2(max, 2u);
+
+   if (a->nheld >= max) {
+      a->declines[CP_AHEAD_DECL_FULL]++;
+      return false;
+   }
+   if (cp_debug->ahead_budget_us &&
+       a->hold_ns >= (uint64_t)cp_debug->ahead_budget_us * 1000) {
+      a->declines[CP_AHEAD_DECL_BUDGET]++;
+      return false;
+   }
+   if (a->hold_bytes >= (uint64_t)cp_debug->ahead_hold_mb << 20) {
+      a->declines[CP_AHEAD_DECL_BYTES]++;
+      return false;
+   }
+   if (total_verts < cp_debug->ahead_min_verts) {
+      a->declines[CP_AHEAD_DECL_SMALL]++;
+      return false;
+   }
+   if (!ab->frags || ab->grow_to || !ab->composite || !ab->ready) {
+      a->declines[CP_AHEAD_DECL_ABUF]++;
+      return false;
+   }
+   if (ab->w != batch->scope.fb.width || ab->h != batch->scope.fb.height) {
+      a->declines[CP_AHEAD_DECL_FB]++;
+      return false;
+   }
+   if (cp->device_fatal || !cp->seg_streams[0] ||
+       !cp_ahead_streams_ready(cp, a) ||
+       !cp_ahead_gate(cp, a, a->nheld % CP_AHEAD_STREAMS)) {
+      a->declines[CP_AHEAD_DECL_STATE]++;
+      return false;
+   }
+   /*
+    * The one check cp_pass_appendable() makes that a held batch skips is
+    * `next_prim < CP_PRIM_ID_LIMIT`, because next_prim only advances when the
+    * segment is recorded, at replay. It is skipped safely rather than
+    * silently: the held batches are the FIRST segments of the next episode,
+    * so next_prim is zero, and eight of them can contribute at most
+    * 8 * CP_MAX_BATCH_TRIS * CP_CLIP_MAX_OUT = 16.8M primitive slots against
+    * a limit of 2^30. The bound is structural, not statistical.
+    */
+   return true;
+}
+
+/*
+ * The seam. Called from cp_draw_execute_batch() with the vertex phase issued
+ * and the count phase not, and it is a copy and nothing else.
+ */
+static bool
+cp_ahead_hold(struct cp_context *cp,
+              const struct cp_rasterize_args *rast_args,
+              const struct cp_rast_queues *rast_queues,
+              const struct cp_pending_clip *pending_clip,
+              unsigned rast_num_triangles, unsigned num_triangles,
+              const struct cp_draw_batch *batch, bool fetch_fold)
+{
+   struct cp_ahead_run *a = cp->runahead;
+   if (!a || !a->deferred || a->nheld >= CP_AHEAD_MAX_SEGS)
+      return false;
+
+   struct cp_ahead_seg *hs = &a->held[a->nheld];
+   hs->rast = *rast_args;
+   hs->queues = *rast_queues;
+   hs->clip = *pending_clip;
+   hs->batch = *batch;
+   /* The slice table and the primitive shift the segment record reads are
+    * cp->fs_batch's, and cp->fs_batch belongs to whichever batch ran last --
+    * by the time this one is replayed that is a different batch. Held with
+    * the rest of the seam. */
+   hs->fs_batch = cp->fs_batch;
+   hs->vs_output_buf = rast_args->positions;
+   hs->rast_num_triangles = rast_num_triangles;
+   hs->num_triangles = num_triangles;
+   hs->fetch_fold = fetch_fold;
+   hs->slot = a->nheld;
+   a->nheld++;
+   a->holds++;
+   return true;
+}
+
+/*
+ * The episode's shared clears and the gate every segment stream waits on.
+ *
+ * Factored out of cp_pass_append() because the run-ahead cannot run it at the
+ * first held batch: it zeroes ab->counts, which the DEFERRED tail's composite
+ * still reads. Issued at replay time instead, on the main stream, after the
+ * tail's composite and before the first replayed count -- which is the same
+ * order the unmodified driver has, since there the clears also follow the
+ * previous episode's composite on that stream.
+ *
+ * 1 ok, 0 the A-buffer refused this size, -1 the device is lost.
+ */
+static int
+cp_pass_episode_begin(struct cp_context *cp, const struct cp_fb_desc *fb)
+{
+   struct cp_abuf *ab = cp->abuf;
+   unsigned w = fb->width, h = fb->height;
+
+   if (!w || !h || !cp_abuf_setup(cp, ab, w, h))
+      return cp->device_fatal ? -1 : 0;
+
+   /* The episode's shared lists. Every segment below accumulates into
+    * them, so a clear that never ran would be read as real counts. */
+   CUresult err = cuMemsetD32Async(ab->counts, 0, (size_t)w * h, cp->stream);
+   if (err == CUDA_SUCCESS) {
+      if (!cp_debug->no_counter_block) {
+         /* Every scalar counter this episode fills, in one clear. */
+         err = cuMemsetD32Async(ab->counters, 0, CP_ABUF_BLOCK_WORDS,
+                                cp->stream);
+      } else {
+         err = cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
+         if (err == CUDA_SUCCESS && ab->recs)
+            err = cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
+      }
+   }
+   if (err == CUDA_SUCCESS && cp->seg_streams[0]) {
+      /* The gate every segment stream waits on. */
+      err = cp_upload_flush(cp);
+      if (err == CUDA_SUCCESS)
+         err = cuEventRecord(cp->pass_gate, cp->stream);
+   }
+   if (err != CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return -1;
+   }
+   return 1;
+}
+
+/*
+ * Take the tail, or run it. The only place `deferred` is set.
+ */
+static bool
+cp_ahead_defer(struct cp_context *cp, const struct cp_pass_tail *t)
+{
+   if (!cp_debug->ahead)
+      return false;
+   struct cp_ahead_run *a = cp_ahead_state(cp);
+   /* A second deferral while one is open cannot happen: every path that
+    * reaches cp_pass_finish() resolves first. Refusing rather than asserting
+    * keeps a missed path slow instead of wrong. */
+   if (!a || a->deferred || a->nheld || cp->device_fatal ||
+       !cp_ahead_streams_ready(cp, a))
+      return false;
+   a->tail = *t;
+   a->deferred = true;
+   a->defers++;
+   return true;
+}
+
+/*
+ * Run the deferred tail and then the held batches' count phases.
+ *
+ * Every path that needs the episode closed comes through here, and they all
+ * come through cp_pass_finish() or cp_draw_execute_batch() to get here -- the
+ * two functions no path in this driver reaches CUDA without passing.
+ */
+static void
+cp_ahead_resolve(struct cp_context *cp)
+{
+   struct cp_ahead_run *a = cp->runahead;
+   if (!a || !a->deferred)
+      return;
+
+   a->deferred = false;
+   a->resolves++;
+   uint64_t fallbacks_before = a->fallbacks;
+   cp_pass_tail_run(cp, &a->tail);
+
+   if (a->nheld) {
+      a->held_hist[a->nheld]++;
+      a->hold_ns_sum += a->hold_ns;
+      a->hold_bytes_peak = MAX2(a->hold_bytes_peak, a->hold_bytes);
+      /*
+       * A tail that fell back re-executed its segments classically, and a
+       * classic execution rewinds the device scratch -- over the held batches'
+       * vertex output. Their count phases would read the wrong triangles, so
+       * the holds are dropped and the batches run normally instead. Correct,
+       * rare (the captures never overflow), and counted, because a run where
+       * this happens looks exactly like a run where the mechanism did not
+       * fire.
+       */
+      if (a->fallbacks == fallbacks_before && !cp->device_fatal)
+         cp_ahead_replay(cp);
+      else
+         cp_ahead_drop(cp);
+   }
+   a->nheld = 0;
+   a->used_streams = 0;
+   a->gated = 0;
+   a->gate_recorded = false;
+   a->hold_ns = 0;
+   a->hold_bytes = 0;
+}
+
+static void
+cp_ahead_replay(struct cp_context *cp)
+{
+   struct cp_ahead_run *a = cp->runahead;
+   struct cp_device *screen = cp->dev;
+   struct cp_abuf *ab = cp->abuf;
+   const struct cp_fb_desc *fb = &a->held[0].batch.scope.fb;
+
+   if (cp_pass_episode_begin(cp, fb) != 1) {
+      cp_ahead_drop(cp);
+      return;
+   }
+
+   /*
+    * The one ordering edge the mechanism adds. The held vertex stages ran on
+    * the ahead streams; their count phases run on the segment streams, and
+    * stage 1 reads what the vertex shader wrote -- including, under
+    * fetch_fold, the queue counters the fetch seeded. One event per ahead
+    * stream that carries held work, waited on by each segment stream before
+    * its first replayed launch.
+    */
+   for (unsigned i = 0; i < CP_AHEAD_STREAMS; i++) {
+      if (!(a->used_streams & (1u << i)))
+         continue;
+      if (cuEventRecord(a->ev[i], a->streams[i]) != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return;
+      }
+   }
+
+   CUstream saved_stream = cp->stream;
+   struct cp_queue_set saved_qset = cp->cur_qset;
+   struct cp_fs_batch saved_fs_batch = cp->fs_batch;
+   size_t n = (size_t)fb->width * fb->height;
+
+   for (unsigned i = 0; i < a->nheld; i++) {
+      struct cp_ahead_seg *hs = &a->held[i];
+      unsigned k = hs->slot % CP_PASS_STREAMS;
+      CUstream target = cp->seg_streams[0] ? cp->seg_streams[k] : saved_stream;
+      CUevent ahead_ev = a->ev[hs->slot % CP_AHEAD_STREAMS];
+
+      if (cp->seg_streams[0] &&
+          cuStreamWaitEvent(target, cp->pass_gate, 0) != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         break;
+      }
+      if (cuStreamWaitEvent(target, ahead_ev, 0) != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         break;
+      }
+      cp_stream_set(cp, target);
+      cp->cur_qset = cp->seg_qsets[k];
+      cp->fs_batch = hs->fs_batch;
+
+      CUdeviceptr recs_filled = 0;
+      cp->pass.appending = true;
+      enum cp_count_result r =
+         cp_abuf_count_phase(cp, screen, ab, &hs->rast, &hs->queues, &hs->clip,
+                             &hs->rast_num_triangles, hs->num_triangles,
+                             &hs->vs_output_buf, &hs->batch, hs->fetch_fold,
+                             n, &recs_filled);
+      cp->pass.appending = false;
+      if (r != CP_COUNT_RECORDED)
+         break;
+      a->replays++;
+   }
+
+   cp_stream_set(cp, saved_stream);
+   cp->cur_qset = saved_qset;
+   cp->fs_batch = saved_fs_batch;
+}
+
+/*
+ * Give up on the held batches and render them the way the driver would have
+ * without the run-ahead. Their vertex work runs twice; that is the price of a
+ * back-out and it is why it is counted.
+ */
+static void
+cp_ahead_drop(struct cp_context *cp)
+{
+   struct cp_ahead_run *a = cp->runahead;
+   struct cp_fs_batch saved_fs_batch = cp->fs_batch;
+
+   a->drops += a->nheld;
+   for (unsigned i = 0; i < a->nheld && !cp->device_fatal; i++)
+      cp_draw_execute_batch(cp, &a->held[i].batch);
+   cp->fs_batch = saved_fs_batch;
+}
+
+static void
+cp_ahead_destroy(struct cp_context *cp)
+{
+   struct cp_ahead_run *a = cp->runahead;
+   if (!a)
+      return;
+   for (unsigned i = 0; i < CP_AHEAD_STREAMS; i++) {
+      if (a->ev[i])
+         cuEventDestroy(a->ev[i]);
+      if (a->streams[i])
+         cuStreamDestroy(a->streams[i]);
+   }
+   if (a->gate)
+      cuEventDestroy(a->gate);
+   free(a);
+   cp->runahead = NULL;
+}
+
+static void
+cp_ahead_report(struct cp_context *cp)
+{
+   const struct cp_ahead_run *a = cp->runahead;
+   if (!a || !a->defers)
+      return;
+
+   static const char *const why[CP_AHEAD_DECL_COUNT] = {
+      "full", "budget", "bytes", "small", "abuf", "fb", "state", "seam",
+   };
+   fprintf(stderr,
+           "cudavk: run-ahead: %" PRIu64 " drains deferred, %" PRIu64
+           " batches held, %" PRIu64 " counts replayed, %" PRIu64
+           " resolves, %" PRIu64 " dropped after a fallback, %" PRIu64
+           " stray launches\n",
+           a->defers, a->holds, a->replays, a->resolves, a->drops, a->strays);
+   fprintf(stderr,
+           "cudavk: run-ahead: %.1f us relocated per deferral (mean), "
+           "%.2f MB scratch worst drain, cap %u MB, budget %u us\n",
+           (double)a->hold_ns_sum / 1000.0 / (double)a->defers,
+           (double)a->hold_bytes_peak / 1048576.0, cp_debug->ahead_hold_mb,
+           cp_debug->ahead_budget_us);
+   fprintf(stderr, "cudavk: run-ahead: batches held per drain:");
+   for (unsigned i = 0; i <= CP_AHEAD_MAX_SEGS; i++)
+      if (a->held_hist[i])
+         fprintf(stderr, " %u:%" PRIu64, i, a->held_hist[i]);
+   fprintf(stderr, "\n");
+   fprintf(stderr, "cudavk: run-ahead: declines:");
+   for (unsigned i = 0; i < CP_AHEAD_DECL_COUNT; i++)
+      if (a->declines[i])
+         fprintf(stderr, " %s:%" PRIu64, why[i], a->declines[i]);
+   fprintf(stderr, "\n");
+}
+
+
+/*
+ * The tail of cp_pass_finish(): the drain, the counters it reads back, the
+ * dense bases, the shades and the composite.
+ *
+ * Split from the front half at the sync so that CUDAVK_AHEAD can defer it,
+ * and so that there is exactly one copy of it whether it runs in place or
+ * later. Every local it needs is in `t`, and the flag-off path builds `t` on
+ * cp_pass_finish()'s own stack and passes a pointer, so the split costs a call
+ * and no copy.
+ */
+static void
+cp_pass_tail_run(struct cp_context *cp, struct cp_pass_tail *t)
+{
+   struct cp_device *screen = cp->dev;
+   struct cp_abuf *ab = cp->abuf;
+   struct cp_pass_seg *segs = t->segs;
+   unsigned nsegs = t->nsegs;
+   unsigned w = t->w, h = t->h;
+   size_t n = t->n;
+   CUstream pass_main = t->main;
+   CUdeviceptr quad_seg = t->quad_seg;
+   struct cp_abuf_seg_args sa = t->sa;
+   bool failed = false;
+
+   const uint8_t *seg_group = t->seg_group;
+   const unsigned *group_first = t->group_first;
+   const unsigned *group_members = t->group_members;
+   const struct cp_seg_range *ranges_all = t->ranges_all;
+   const unsigned *group_range_base = t->group_range_base;
+   const uint32_t *group_rows = t->group_rows;
+   const uint32_t *group_row_base = t->group_row_base;
+   unsigned ngroups = t->ngroups;
+   bool hoisted = t->hoisted;
 
    /* --- the drain: the six counters and the per-segment quad counts --- */
    uint32_t ctr[CP_ABUF_COUNTERS + CP_PASS_MAX_SEGS] = { 0 };
@@ -9494,6 +10058,266 @@ cp_tile_census_quads(cp, segs, nsegs, w, h);
    }
 }
 
+void
+cp_pass_finish(struct cp_context *cp)
+{
+   cp->plan.pass_finish_calls++;
+   /*
+    * RESOLUTION POINT, and the one that matters: this is the function every
+    * path in the driver that needs the episode closed goes through, including
+    * the ones that do not know an episode exists (cp_batch_flush_why() calls
+    * it unconditionally, and every readback, clear, copy, dispatch, barrier
+    * and submit calls that). It must run BEFORE cp->pass.nsegs is read: while
+    * a tail is deferred nsegs is zero and the held batches are not segments
+    * yet, so the early return below would step straight over the whole
+    * deferred episode.
+    */
+   if (cp_ahead_deferred(cp))
+      cp_ahead_resolve(cp);
+
+   struct cp_device *screen = cp->dev;
+   struct cp_abuf *ab = cp->abuf;
+   unsigned nsegs = cp->pass.nsegs;
+   if (nsegs)
+      cp->plan.pass_finishes++;
+
+   if (nsegs && cp_debug->debug_episode)
+      fprintf(stderr, "episode: nsegs=%u opaque=%d\n", nsegs,
+              (int)cp->pass.opaque);
+
+   if (!nsegs)
+      return;
+   if (cp->pass.opaque) {
+      cp_opaque_finish(cp);
+      return;
+   }
+
+   /* Cleared first: nothing below may see the episode as still open. */
+   cp->pass.nsegs = 0;
+   cp->pass.next_prim = 0;
+
+   struct cp_pass_seg *segs = cp->pass_segs;
+   unsigned w = cp->pass.w, h = cp->pass.h;
+   size_t n = (size_t)w * h;
+
+   /*
+    * The fallback exists for overflow and allocation failure, which the
+    * sample set never reaches and the captures reach only on the standalone
+    * A-buffer path -- so the episode fallback is code the gate cannot
+    * exercise. This makes it reachable on purpose: every episode takes it,
+    * and the output must be identical, because re-executing the segments
+    * classically is defined to produce what the episode would have.
+    */
+   if (cp_debug->force_pass_fallback) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+
+   CP_NVTX_SCOPEF("episode %u segs", nsegs);
+
+   /* The segments' count phases ran on the side streams; the scan reads
+    * across all of them. */
+   if (!cp_pass_join(cp, nsegs))
+      return;
+
+   /* --- scan the accumulated counts, clamp the runs to the array ---
+    *
+    * The fill cursor's clear rides in the same pass: nothing between here and
+    * the fill can replace ab->cursor, and the clear was a 3.7 MB device
+    * operation of its own immediately behind a kernel that already writes one
+    * word per pixel. */
+   CUstream pass_main = cp->stream;
+   cp_abuf_scan(cp, screen, ab, (unsigned)n, ab->cursor);
+
+   /* --- fill --- */
+   if (ab->recs && screen->kernels.abuf_fill_recs) {
+      /* Single-pass build: every segment's count already appended its
+       * records (ab->recs cannot change mid-episode — a pending growth
+       * refuses the append), so the whole episode's fill is one linear
+       * replay on the main stream, and the fan-out/join the per-segment
+       * relaunches needed disappears with them. */
+      void *fp[] = { &ab->recs, &ab->rec_cursor, &ab->capacity, &ab->frags,
+                     &ab->offsets, &ab->counts, &ab->cursor, &ab->overflow,
+                     &ab->capacity };
+      CP_LAUNCH(screen->kernels.abuf_fill_recs, 2048, 1, 1, 256, 1, 1,
+                     0, cp->stream, fp, NULL);
+   } else {
+      /* One relaunch per segment from its saved arguments, fanned back out
+       * over the side streams behind the scan. */
+      if (!cp_pass_broadcast(cp, nsegs))
+         return;
+      for (unsigned s = 0; s < nsegs; s++) {
+         struct cp_pass_seg *sg = &segs[s];
+         if (cp->seg_streams[0])
+            cp_stream_set(cp, cp_pass_seg_stream(cp, s));
+         struct cp_rasterize_args aa = sg->rast;
+         aa.abuf_frags = ab->frags;
+         aa.abuf_capacity = ab->capacity;
+         aa.abuf_mode = CP_ABUF_FILL;
+         struct cp_rast_queues q = sg->queues;
+         q.mode = CP_QUEUE_FILL;
+         /* The segment's own queue set, saved with its arguments. */
+         cuMemsetD32Async(q.nontrivial_count, 0, 3, cp->stream);
+         void *ap[] = { &aa, &q };
+         /* Tier 4, pass segments. Expected to decline for the same reason as
+          * the tiled fallback: one clear per segment, inside the loop. */
+         CP_LAUNCH_AFTER(CP_PDL_ANY, CP_PDL_TIER_STAGE1,
+                        screen->kernels.rasterize_stage1_abuf,
+                        (sg->rast_num_triangles + 255) / 256, 1, 1, 256, 1, 1,
+                        0, cp->stream, ap, NULL);
+         /* One segment's three stages are a chain on that segment's own
+          * stream; the fan-out overlaps segments, never these. */
+         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage1_abuf,
+                        CP_PDL_TIER_RASTER,
+                        screen->kernels.rasterize_stage2_abuf,
+                        CLAMP((sg->rast_num_triangles + 7) / 8, 1u, 512u), 1, 1,
+                        256, 1, 1, 0, cp->stream, ap, NULL);
+         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2_abuf,
+                        CP_PDL_TIER_RASTER,
+                        screen->kernels.rasterize_stage3_abuf,
+                        CLAMP(sg->rast_num_triangles * 8, 512u, 2048u), 1, 1,
+                        64, 1, 1, 0, cp->stream, ap, NULL);
+      }
+      cp_stream_set(cp, pass_main);
+      if (!cp_pass_join(cp, nsegs))
+         return;
+   }
+
+   /* --- sort, both worklists --- */
+   {
+      unsigned nn = (unsigned)n;
+      unsigned max_short = cp_debug->abuf_short_sort_max;
+      unsigned min_long = cp_debug->no_abuf_short_sort ? 2 : max_short + 1;
+      if (!cp_debug->no_abuf_short_sort) {
+         if (cp_debug->no_counter_block) {
+            cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
+            cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
+         }
+         void *ssp[] = { &ab->frags, &ab->offsets, &ab->counts, &nn,
+                         &max_short, &ab->clist, &ab->clist_count,
+                         &min_long, &ab->list, &ab->list_count };
+         CP_LAUNCH(screen->kernels.abuf_sort_short,
+                        MIN2((nn + 255) / 256, 4096u), 1, 1, 256, 1, 1,
+                        0, cp->stream, ssp, NULL);
+      } else {
+         if (cp_debug->no_counter_block)
+            cuMemsetD32Async(ab->list_count, 0, 1, cp->stream);
+         void *wp[] = { &ab->counts, &nn, &min_long, &ab->list,
+                        &ab->list_count };
+         CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
+                        256, 1, 1, 0, cp->stream, wp, NULL);
+      }
+      void *sp[] = { &ab->frags, &ab->offsets, &ab->counts, &ab->list,
+                     &ab->list_count, &ab->long_runs };
+      CP_LAUNCH(screen->kernels.abuf_sort, 4096, 1, 1, 256, 1, 1,
+                     0, cp->stream, sp, NULL);
+      if (cp_debug->no_abuf_short_sort) {
+         unsigned min1 = 1;
+         if (cp_debug->no_counter_block)
+            cuMemsetD32Async(ab->clist_count, 0, 1, cp->stream);
+         void *cw[] = { &ab->counts, &nn, &min1, &ab->clist,
+                        &ab->clist_count };
+         CP_LAUNCH(screen->kernels.abuf_worklist, (nn + 255) / 256, 1, 1,
+                        256, 1, 1, 0, cp->stream, cw, NULL);
+      }
+   }
+
+   /* --- the quad stream --- */
+   cp_abuf_quad_build(cp, screen, ab, w, h);
+
+cp_tile_census_quads(cp, segs, nsegs, w, h);
+
+   if (cp_pass_finish_bounded_groups(cp, segs, nsegs, w, h))
+      return;
+   if (!cp_pass_can_retry(cp))
+      return;
+
+   /* --- bucket the quads by segment, before the drain so the counts ride
+    * it --- */
+   CUdeviceptr quad_seg = cp_scratch_alloc_device(cp, ab->quad_capacity);
+   uint32_t seg_prims[CP_PASS_MAX_SEGS];
+   for (unsigned s = 0; s < nsegs; s++)
+      seg_prims[s] = segs[s].prim_base;
+   CUdeviceptr seg_prims_dev = cp_upload(cp, seg_prims, (size_t)nsegs * 4);
+   if (!quad_seg || !seg_prims_dev) {
+      cp_pass_fallback(cp, segs, nsegs);
+      return;
+   }
+   if (cp_debug->no_counter_block)
+      cuMemsetD32Async(ab->seg_counts, 0, CP_PASS_MAX_SEGS, cp->stream);
+   struct cp_abuf_seg_args sa = {
+      .quad_prim = ab->quad_prim,
+      .seg_prim_base = seg_prims_dev,
+      .seg_counts = ab->seg_counts,
+      .quad_seg = quad_seg,
+      .num_quads_dev = ab->bsum3,
+      .nsegs = nsegs,
+      .num_quads = (uint32_t)ab->quad_capacity,
+      .warp_aggregate = !cp_debug->no_abuf_warp_bucket,
+   };
+   {
+      void *p[] = { &sa };
+      CP_LAUNCH(screen->kernels.abuf_seg_count,
+                     MIN2(((unsigned)ab->quad_capacity + 255) / 256, 1024u),
+                     1, 1, 256, 1, 1, 0, cp->stream, p, NULL);
+   }
+
+   /*
+    * --- everything after the drain that the drain's answer is not needed
+    * for, hoisted above it ---
+    *
+    * The tail's host work splits cleanly in two. Which segments shade
+    * together, how many members each group has, each group's range table and
+    * the concatenation of its members' fragment constant-buffer rows are
+    * functions of `segs` alone. Only the dense bases, the descs and the
+    * launches need `ctr`.
+    *
+    * The drain is the driver's largest host block -- 9.88 a frame, 6.017
+    * ms/frame, and host time immediately after it lands on the frame at a
+    * measured slope of 1.02 (PERFORMANCE.md 5.2b) -- so host work sitting
+    * behind it for no reason is paid for at par. Moving it above the sync
+    * changes no launch, no launch argument and no uploaded byte: the range
+    * tables are built group-major into one flat array instead of per group
+    * into a stack one, and the row concatenation gets a per-group base
+    * instead of restarting at zero, which is the same bytes at a different
+    * offset of the same buffer.
+    *
+    * CUDAVK_NO_DRAIN_HOIST is the revert, and it is also the fallback path:
+    * a precompute that cannot allocate leaves `hoisted` false and the loop
+    * below does exactly what it did before, including failing the same way.
+    */
+   struct cp_pass_tail t;
+   t.segs = segs;
+   t.nsegs = nsegs;
+   t.w = w;
+   t.h = h;
+   t.n = n;
+   t.main = pass_main;
+   t.quad_seg = quad_seg;
+   t.sa = sa;
+   t.ngroups = 0;
+   t.hoisted = !cp_debug->no_drain_hoist;
+
+   cp_pass_group_map(cp, segs, nsegs, t.seg_group, t.group_first,
+                     t.group_members, &t.ngroups);
+   if (t.hoisted)
+      t.hoisted = cp_pass_group_tables(cp, segs, nsegs, t.seg_group,
+                                       t.group_members, t.ngroups,
+                                       t.ranges_all, t.group_range_base,
+                                       t.group_rows, t.group_row_base);
+
+   /*
+    * ...and here the front half ends. Under CUDAVK_AHEAD the tail is handed
+    * over and this returns: the host goes back to replaying the command
+    * stream, and the next appendable batches issue their vertex phase before
+    * the sync below is taken. With the flag off, or when the run-ahead
+    * declines, the tail runs here, in place, in the order it always did.
+    */
+   if (cp_ahead_defer(cp, &t))
+      return;
+   cp_pass_tail_run(cp, &t);
+}
+
 /* Record the segment cp_draw_execute has just counted; called from inside
  * it, with the count launches already on the stream. */
 void
@@ -9575,7 +10399,6 @@ cp_batch_total_triangles(const struct cp_draw_call *info,
 static void
 cp_pass_append(struct cp_context *cp, unsigned ndraws)
 {
-   struct cp_abuf *ab = cp->abuf;
    const struct cp_fb_desc *fb = &cp->batch.scope.fb;
 
    if (cp->pass.nsegs && cp->pass.opaque)
@@ -9604,39 +10427,98 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
     * the shared lists once, on the main stream, with the gate event recorded
     * behind them — every segment stream waits on it before its first work.
     */
-   if (cp->pass.nsegs == 0) {
-      unsigned w = fb->width, h = fb->height;
-      if (!w || !h || !cp_abuf_setup(cp, ab, w, h)) {
-         /* A refusal falls back; a latched device loss must not. */
+   /*
+    * The run-ahead, and it sits here because this is the last point before
+    * anything of the next episode has been issued.
+    *
+    * A deferred tail means the previous episode's drain has not been taken
+    * yet. This batch is the candidate for running across it: if it is
+    * admitted its vertex phase goes on an ahead stream and stops at the seam,
+    * and if it is not, the tail is resolved first and this batch then takes
+    * the ordinary path below, exactly as it would with the flag off.
+    */
+   if (cp_ahead_deferred(cp)) {
+      unsigned verts = 3 * cp_batch_total_triangles(&cp->batch.info,
+                                                    cp->batch.draws, ndraws,
+                                                    cp->batch.instance_counts);
+      if (cp_ahead_admit(cp, &cp->batch, verts)) {
+         struct cp_ahead_run *a = cp->runahead;
+         unsigned slot = a->nheld;
+         unsigned held_before = a->nheld;
+         CUstream saved_stream = cp->stream;
+         struct cp_queue_set saved_qset = cp->cur_qset;
+
+         /* The held vertex phase runs on an ahead stream, never on the
+          * segment stream it will count on: the deferred tail's shades are
+          * queued on those eight, and putting a vertex shader in front of one
+          * would delay the composite -- which is the peel patch's failure
+          * mode exactly. It keeps the queue set of the segment it will
+          * become, so the fetch may still seed its own counters. */
+         cp_stream_set(cp, a->streams[slot % CP_AHEAD_STREAMS]);
+         cp->cur_qset = cp->seg_qsets[slot % CP_PASS_STREAMS];
+         a->used_streams |= 1u << (slot % CP_AHEAD_STREAMS);
+         a->holding = true;
+         cp->pass.appending = true;
+         cp->pass.append_failed = false;
+
+         uint64_t t0 = (uint64_t)os_time_get_nano();
+         uint64_t blocked0 = cp->blocked_all_ns;
+         size_t dmark = cp->dscratch.used;
+
+         cp_draw_execute_batch(cp, &cp->batch);
+
+         cp->pass.appending = false;
+         a->holding = false;
+         cp_stream_set(cp, saved_stream);
+         cp->cur_qset = saved_qset;
+
+         if (a->nheld > held_before) {
+            /* What the relocation actually cost, in the units the admission
+             * rule spends: host time in front of the drain, and the device
+             * scratch the held batch took above the deferred episode's
+             * high-water. Blocked time is subtracted for the same reason the
+             * census subtracts it -- a hold that blocked did not relocate. */
+            uint64_t el = (uint64_t)os_time_get_nano() - t0;
+            uint64_t bl = cp->blocked_all_ns - blocked0;
+            a->hold_ns += el > bl ? el - bl : 0;
+            a->hold_bytes += cp->dscratch.used > dmark
+               ? cp->dscratch.used - dmark : 0;
+            return;
+         }
+
+         /*
+          * Admitted and then refused by the draw path itself -- the batch
+          * backed out before the seam. Its vertex work is spent either way.
+          * Resolve, close the episode the replay just opened so that this
+          * batch still draws after every segment that preceded it, and render
+          * it classically: the ordinary append_failed path, for the ordinary
+          * reason.
+          */
+         a->declines[CP_AHEAD_DECL_SEAM]++;
+         cp_ahead_resolve(cp);
          if (cp->device_fatal)
             return;
+         if (!cp_pass_join(cp, CP_PASS_STREAMS))
+            return;
          cp_pass_finish(cp);
+         if (cp->device_fatal)
+            return;
          cp_draw_execute_batch(cp, &cp->batch);
          return;
       }
-      /* The episode's shared lists. Every segment below accumulates into
-       * them, so a clear that never ran would be read as real counts. */
-      CUresult err = cuMemsetD32Async(ab->counts, 0, (size_t)w * h,
-                                      cp->stream);
-      if (err == CUDA_SUCCESS) {
-         if (!cp_debug->no_counter_block) {
-            /* Every scalar counter this episode fills, in one clear. */
-            err = cuMemsetD32Async(ab->counters, 0, CP_ABUF_BLOCK_WORDS,
-                                   cp->stream);
-         } else {
-            err = cuMemsetD32Async(ab->sum3, 0, 3, cp->stream);
-            if (err == CUDA_SUCCESS && ab->recs)
-               err = cuMemsetD32Async(ab->rec_cursor, 0, 1, cp->stream);
-         }
-      }
-      if (err == CUDA_SUCCESS && cp->seg_streams[0]) {
-         /* The gate every segment stream waits on. */
-         err = cp_upload_flush(cp);
-         if (err == CUDA_SUCCESS)
-            err = cuEventRecord(cp->pass_gate, cp->stream);
-      }
-      if (err != CUDA_SUCCESS) {
-         cp_renderer_texture_fatal(cp);
+      cp_ahead_resolve(cp);
+      if (cp->device_fatal)
+         return;
+   }
+
+   if (cp->pass.nsegs == 0) {
+      int begun = cp_pass_episode_begin(cp, fb);
+      if (begun <= 0) {
+         /* A refusal falls back; a latched device loss must not. */
+         if (begun < 0 || cp->device_fatal)
+            return;
+         cp_pass_finish(cp);
+         cp_draw_execute_batch(cp, &cp->batch);
          return;
       }
    }
@@ -9687,6 +10569,16 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    if (cp_debug->debug_episode)
       fprintf(stderr, "append: nsegs=%u opaque=%d ndraws=%u\n",
               cp->pass.nsegs, (int)cp->pass.opaque, ndraws);
+
+   /*
+    * RESOLUTION POINT. An opaque run is not a candidate for the run-ahead --
+    * it has no A-buffer count to hold -- and it must not start while a
+    * blended tail is deferred: its segments record into cp->pass_segs, which
+    * is the array the deferred tail is going to shade from. The two tests
+    * below cannot catch it, because while a tail is deferred nsegs is zero.
+    */
+   if (cp_ahead_deferred(cp))
+      cp_ahead_resolve(cp);
 
    if (cp->pass.nsegs && !cp->pass.opaque)
       cp_pass_finish(cp);
