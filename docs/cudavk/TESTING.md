@@ -151,15 +151,14 @@ registry held 71 and the commit messages quoted 71/71, which is what a count
 carried forward by hand does; recount it from the registry every time it is
 touched.
 
-**Every one of them passes except `cpvk_step`, so the state right now is
-72/73.** Both of the tests that have been registered failing were registered
-that way on purpose: a gap nothing runs is a gap nobody fixes. `cpvk_gather`
-was written against `nir_texop_tg4` missing from the supported set in
-`cp_nir_to_llvm.c`, which made every `textureGather()` return `0 0 0 1`, and
-the sampler serves gathers now and it passes. `cpvk_step` is the open one:
-`step()` returns 1.0 where the spec requires 0.0, on every shader that uses
-it, while the `x < edge ? 1.0 : 0.0` control in the same shader is correct.
-**Any other failure is a regression.**
+**Every one of them passes, `cpvk_gather` and `cpvk_step` included.** Both
+were registered as ordinary failing tests rather than parked outside the suite,
+because a gap nothing runs is a gap nobody fixes. `cpvk_gather` was written
+against `nir_texop_tg4` missing from the supported set in `cp_nir_to_llvm.c`,
+which made every `textureGather()` return `0 0 0 1`. `cpvk_step` was written
+against `emit_alu()` building a boolean `inot` as a 32-bit bitwise NOT, which
+made every `step()` return 1.0. Both are served now and both pass, on the same
+pixels lavapipe and NVIDIA produce. **Any failure is a regression.**
 
 **Every test is registered `is_parallel : false`, and that is load-bearing.**
 Two CUDA contexts at once produce false OOM and false device-lost, because each

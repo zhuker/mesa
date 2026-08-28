@@ -1723,6 +1723,67 @@ build_scalar_only(struct ntl_context *ctx,
    return result;
 }
 
+/*
+ * A NIR value of bit_size 1 in the shapes this file produces it in.
+ *
+ * There is more than one. Every comparison below zero-extends LLVM's `i1` to
+ * `i32`, because everything that consumes a boolean here -- bcsel, b2f32,
+ * b2i32 -- asks only whether it is non-zero, and an `i32` is what the rest of
+ * the value flow is already carrying. nir_load_const emits a real `i1`. Both
+ * are correct for a consumer that tests against zero and neither is correct
+ * for a bitwise operator, which is what NIR's *logical* operators on booleans
+ * are: `inot` of a 1-bit value is `!`, not `~`, and a 32-bit NOT of the 1 a
+ * comparison produced is 0xfffffffe -- still non-zero, so still true.
+ *
+ * Reduce to `i1` first and the width stops mattering.
+ */
+static LLVMValueRef
+to_bool_i1(struct ntl_context *ctx, LLVMValueRef v)
+{
+   LLVMTypeRef t = LLVMTypeOf(v);
+   LLVMTypeRef elem = LLVMGetTypeKind(t) == LLVMVectorTypeKind
+      ? LLVMGetElementType(t) : t;
+
+   if (LLVMGetTypeKind(elem) == LLVMIntegerTypeKind &&
+       LLVMGetIntTypeWidth(elem) == 1)
+      return v;
+
+   return LLVMBuildICmp(ctx->builder, LLVMIntNE, v, LLVMConstNull(t), "");
+}
+
+/*
+ * inot, iand, ior and ixor on a bit_size-1 destination: !, &&, || and ^^.
+ *
+ * The result is widened back to the zero-extended `i32` every comparison in
+ * this file hands out, so one representation leaves emit_alu() no matter which
+ * of the two came in, and a later `iand` cannot be given an `i1` and an `i32`
+ * to combine.
+ */
+static LLVMValueRef
+build_bool_logic(struct ntl_context *ctx, nir_op op, LLVMValueRef *src,
+                 unsigned num_comp)
+{
+   LLVMValueRef a = to_bool_i1(ctx, src[0]);
+   LLVMValueRef r;
+
+   switch (op) {
+   case nir_op_inot:
+      r = LLVMBuildNot(ctx->builder, a, "");
+      break;
+   case nir_op_iand:
+      r = LLVMBuildAnd(ctx->builder, a, to_bool_i1(ctx, src[1]), "");
+      break;
+   case nir_op_ior:
+      r = LLVMBuildOr(ctx->builder, a, to_bool_i1(ctx, src[1]), "");
+      break;
+   default:
+      r = LLVMBuildXor(ctx->builder, a, to_bool_i1(ctx, src[1]), "");
+      break;
+   }
+
+   return LLVMBuildZExt(ctx->builder, r, get_llvm_type(ctx, 32, num_comp), "");
+}
+
 static void
 emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
 {
@@ -1979,14 +2040,29 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    case nir_op_fdiv:
       result = LLVMBuildFDiv(ctx->builder, src[0], src[1], "");
       break;
+   /*
+    * The four bitwise operators are also NIR's logical operators, and which
+    * one is meant is the destination width. At bit_size 1 they combine
+    * booleans and the operands may not be one bit wide here; at any other
+    * width they are the shader's own `&`, `|`, `^` and `~` and go straight
+    * through. Getting that wrong is invisible except through step(): it is
+    * the shortest route in the language to a boolean `inot`, and
+    * cpvk_step.c is what caught it.
+    */
    case nir_op_iand:
-      result = LLVMBuildAnd(ctx->builder, src[0], src[1], "");
+      result = instr->def.bit_size == 1
+         ? build_bool_logic(ctx, instr->op, src, num_comp)
+         : LLVMBuildAnd(ctx->builder, src[0], src[1], "");
       break;
    case nir_op_ior:
-      result = LLVMBuildOr(ctx->builder, src[0], src[1], "");
+      result = instr->def.bit_size == 1
+         ? build_bool_logic(ctx, instr->op, src, num_comp)
+         : LLVMBuildOr(ctx->builder, src[0], src[1], "");
       break;
    case nir_op_ixor:
-      result = LLVMBuildXor(ctx->builder, src[0], src[1], "");
+      result = instr->def.bit_size == 1
+         ? build_bool_logic(ctx, instr->op, src, num_comp)
+         : LLVMBuildXor(ctx->builder, src[0], src[1], "");
       break;
    case nir_op_ishl:
       result = LLVMBuildShl(ctx->builder, src[0], src[1], "");
@@ -2004,7 +2080,9 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       result = LLVMBuildFNeg(ctx->builder, src[0], "");
       break;
    case nir_op_inot:
-      result = LLVMBuildNot(ctx->builder, src[0], "");
+      result = instr->def.bit_size == 1
+         ? build_bool_logic(ctx, instr->op, src, num_comp)
+         : LLVMBuildNot(ctx->builder, src[0], "");
       break;
    case nir_op_u2f32:
       result = LLVMBuildUIToFP(ctx->builder, src[0], get_float_type(ctx, 32), "");
