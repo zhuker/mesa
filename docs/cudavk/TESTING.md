@@ -138,11 +138,11 @@ When the new path is already the default, the revert flag goes on the
 ## 4. Gate 1: the native test suite
 
 ```bash
-./venv/bin/meson test -C build-cudavk --suite cudavk                    # all 72
+./venv/bin/meson test -C build-cudavk --suite cudavk                    # all 73
 ./venv/bin/meson test -C build-cudavk --print-errorlogs cpvk_batchblend # one
 ```
 
-**72 tests**, and **72/72** is the state the branch is kept in: 54 C tests,
+**73 tests**, and **73/73** is the state the branch is kept in: 55 C tests,
 four `cpvk_vfetch` modes, thirteen Python gates and one fault-mode rerun of a C
 test, counted from the registry in `src/cudavk/meson.build`. Iteration 28
 recorded 65/65 in the default state and 65/65 with every revert flag set
@@ -151,13 +151,15 @@ registry held 71 and the commit messages quoted 71/71, which is what a count
 carried forward by hand does; recount it from the registry every time it is
 touched.
 
-**Every one of them passes, `cpvk_gather` included.** That test was written
-against an open gap — `nir_texop_tg4` was not in the supported set in
-`cp_nir_to_llvm.c`, so every `textureGather()` returned the constant
-`0 0 0 1` — and it was registered as an ordinary failing test rather than
-parked outside the suite, because a gap nothing runs is a gap nobody fixes.
-The sampler serves gathers now and it passes, on the same pixels lavapipe and
-NVIDIA produce. **Any failure is a regression.**
+**Every one of them passes except `cpvk_step`, so the state right now is
+72/73.** Both of the tests that have been registered failing were registered
+that way on purpose: a gap nothing runs is a gap nobody fixes. `cpvk_gather`
+was written against `nir_texop_tg4` missing from the supported set in
+`cp_nir_to_llvm.c`, which made every `textureGather()` return `0 0 0 1`, and
+the sampler serves gathers now and it passes. `cpvk_step` is the open one:
+`step()` returns 1.0 where the spec requires 0.0, on every shader that uses
+it, while the `x < edge ? 1.0 : 0.0` control in the same shader is correct.
+**Any other failure is a regression.**
 
 **Every test is registered `is_parallel : false`, and that is load-bearing.**
 Two CUDA contexts at once produce false OOM and false device-lost, because each

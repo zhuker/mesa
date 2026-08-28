@@ -260,6 +260,7 @@ if dep_vulkan_loader.found()
     'cpvk_smoke',
     'cpvk_ssbo_length',
     'cpvk_static_viewport',
+    'cpvk_step',
     'cpvk_sync_state',
     'cpvk_timeline_semaphore',
     'cpvk_tex',

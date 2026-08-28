@@ -112,6 +112,26 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
    `CUDA_INTEROP.md`, `history/perf-2026-08-27/leads.md` and this file's own
    Tier 4, and renumbering them would silently redirect those references.
 
+11. **`step()` returns 1.0 everywhere.** `src/cudavk/tests/cpvk_step.c` fails
+   on this driver and passes on lavapipe and on NVIDIA. What the backend is
+   handed for `step(edge, x)` after `nir_opt_algebraic` is
+   `b2f32(inot(flt(x, edge)))`, and `emit_alu()` in `cp_nir_to_llvm.c` builds
+   the comparison as a zero-extended `i1` -- 0 or 1 -- while building `inot`
+   as a 32-bit bitwise NOT. `~1` is `0xfffffffe` and `~0` is `0xffffffff`, and
+   `b2f32` reads any non-zero as true, so the answer is 1.0 whatever the
+   comparison said. Nothing warns: `slt` never reaches the backend, the ops
+   involved are all implemented, and the wrong value is a legal one.
+
+   The blast radius is every shader that calls `step()`, which is 352 of the
+   1066 shader modules in the HeadlessStreamer capture. It is what makes that
+   capture's frame lose its baked shadows: fragment module 348 asks
+   `step(half_extent, abs(pos - centre))` to decide whether it is inside the
+   baked lighting volume, gets "outside" for every pixel, and skips the
+   shadow and ambient-occlusion lookup
+   (`/home/alexzhukov/gather-validation/DRAW_BISECT.md`).
+
+   Appended for the same reason item 10 was.
+
 ## Vulkan surface not implemented
 
 The driver advertises Vulkan 1.1. The Gallium driver that was removed advertised
