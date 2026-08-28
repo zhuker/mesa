@@ -329,3 +329,85 @@ segment-counter ceilings (≈2.3 ms/frame on old, ≈0.9 on Crossroads) plus
 whatever share of the unexplained inter-submit stall E recovers. Every number
 above that is an estimate, and rule 1 applies: measure the unit before
 building the mechanism.
+
+
+---
+
+# Revision after the compiled "favorite" harness — 2026-08-28
+
+The tocpp-compiled replay of the favorite capture (`~/favorite-cpp`, README
+inside) changes the evidence base in three ways: the replayer floor is gone
+from measurements (native 2.73 → 1.21 ms/frame, cudavk 9.99 → ~8.9), the
+workload's structure is now known exactly, and the app side is *editable
+source*, which makes a class of sizing experiments nearly free.
+
+## New facts, measured
+
+1. **`CUDAVK_PLAN_STATS=1` under the compiled harness, favorite, one run**
+   (mean-based, 2,467 frames): segment counters **1.235 ms/frame over 1.40
+   waits (0.879 ms mean)** — the largest site; episode drain 1.117 over 4.77
+   (0.234 mean); peel 0.106; desc uploads ~0. Censused blocked ≈ 2.47 ms of
+   the 8.9 ms frame. **On this capture the old ranking inverts: the segment
+   counter site is #1**, with few but very long waits, and the drain's mean
+   is 2.6× shorter than on the old capture. 646 launches/frame, 7.1 episodes
+   closed/frame, PDL attribute taken on 99.9% of offers.
+2. **The app forbids cross-frame overlap.** Every frame is: render submit
+   (~200 draws) → readback-only submit (barrier, 3.6 MB
+   `vkCmdCopyImageToBuffer`, barrier) → **`vkDeviceWaitIdle`**. The device is
+   fully drained by the app once per frame. Idea E (submit thread) is
+   worthless here structurally, not just on replayer grounds, and any
+   run-ahead mechanism can only collect within one frame.
+3. **Per-frame allocator churn is real but small**: one 3.6 MB staging
+   `VkDeviceMemory` allocated, mapped, bound and freed per frame; cudavk's
+   whole-process ioctl bill is ~0.275 ms/frame (native's is ~1.5). The raw
+   `cuMemAllocManaged`-per-call allocator is a ~0.1 ms/frame lead at most.
+4. **Correctness gate, open**: cudavk matches native almost exactly for
+   frames 0–800, then diverges from ~frame 1000 (mean abs diff to ~24, up to
+   80% of pixels off by >2). Dumps in `~/favorite-cpp/dump-{native,cudavk}`.
+   Perf acceptance on favorite should be hash-gated once this is fixed.
+
+## What the editable app side buys: ablations that size leads before building
+
+Each is a small edit to generated source, run same-session against the
+unedited binary. These replace guesswork about ceilings:
+
+- **AB1 — delete the app's `vkDeviceWaitIdle`** (fences already order CPU
+  reuse): upper-bounds what *any* cross-frame pipelining in the driver could
+  ever give on a well-behaved app. If this moves nothing, cross-frame ideas
+  are dead on real grounds; if it moves a lot, it argues for the B/C family
+  hard.
+- **AB2 — delete the readback submit** (copy + barriers): isolates
+  render-only driver cost and prices the download+drain tail.
+- **AB3 — reuse one staging buffer/memory** instead of per-frame
+  alloc/map/free: end-to-end price of allocator churn, closing the pool
+  question with one number.
+- **AB4 — the divergence bisect**: correctness mode (`DUMP_DIR`) at frame
+  ~1000 under `CUDAVK_NO_*` reverts to attribute the rendering break.
+
+## Revised idea ranking for this workload
+
+1. **Attack the segment-counter wait on favorite first** (was #2-and-closed
+   on old). 0.879 ms mean × 1.40/frame with the device *known* to drain to
+   idle every frame anyway — re-run `CUDAVK_DRAIN_PROBE`/`WAIT_SPIN` style
+   conversion probes on favorite before assuming the old capture's closure
+   transfers. The old closure was workload-specific (clip rectangles never
+   tighter than framebuffer); favorite renders different content.
+2. **Idea C (temporal sizing) gets stronger**: 7.1 episodes/frame, a fixed
+   per-frame structure, and a strictly repeating app make last-frame
+   predictors ideal; the drain + counter sites it removes are 2.35 ms/frame
+   here.
+3. **Idea B (device-side branches) unchanged in shape**, now with a cleaner
+   measurement bed and an explicit per-frame sync point that bounds risk: a
+   wrong speculative episode can be repaired at the app's own frame drain.
+4. **Idea A (stable addresses) unchanged**, still the enabler for B/C.
+5. **Idea E parked with prejudice** for this app class (fact 2), pending AB1.
+6. **Idea D (paged A-buffer) still last**: favorite's blended share and
+   overflow rate should come from the C-probe run before any surgery.
+
+## Measurement conventions for the compiled harness
+
+4,934 submits exactly; frame = paired-submit median, skip 50; perf mode
+(`SUBMIT_TS_FILE`) and correctness mode (`DUMP_DIR`) are mutually exclusive
+runs; correctness-mode timing is invalid by construction. The harness has no
+stdout-hash guard — until AB4 lands a checksum, validate runs by submit
+count and, for acceptance decisions, by frame dumps.
