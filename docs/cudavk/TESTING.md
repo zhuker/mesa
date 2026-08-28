@@ -138,17 +138,28 @@ When the new path is already the default, the revert flag goes on the
 ## 4. Gate 1: the native test suite
 
 ```bash
-./venv/bin/meson test -C build-cudavk --suite cudavk                    # all 67
+./venv/bin/meson test -C build-cudavk --suite cudavk                    # all 72
 ./venv/bin/meson test -C build-cudavk --print-errorlogs cpvk_batchblend # one
 ```
 
-**67 tests**, and 67/67 is the state the branch is kept in: 49 C tests, four
-`cpvk_vfetch` modes, thirteen Python gates and one fault-mode rerun of a C
+**72 tests**, and **71/72** is the state the branch is kept in: 54 C tests,
+four `cpvk_vfetch` modes, thirteen Python gates and one fault-mode rerun of a C
 test, counted from the registry in `src/cudavk/meson.build`. Iteration 28
 recorded 65/65 in the default state and 65/65 with every revert flag set
-(`docs/cudavk/history/PERF16_ITERATIONS.md`); two tests have been added since,
-and the count here is recounted from the registry rather than carried
-forward.
+(`docs/cudavk/history/PERF16_ITERATIONS.md`). This paragraph said 67 while the
+registry held 71 and the commit messages quoted 71/71, which is what a count
+carried forward by hand does; recount it from the registry every time it is
+touched.
+
+**The one failure is `cpvk_gather`, and it is expected to fail.** It is a
+regression test written against a gap that is still open: `nir_texop_tg4` is
+not in the supported set in `cp_nir_to_llvm.c`, so every `textureGather()`
+returns the constant `0 0 0 1`. The test passes on lavapipe and on NVIDIA, so
+it is a statement about this driver and not about the test — see
+`TODO.md`, correctness item 10. It is registered as an ordinary test rather
+than parked outside the suite because a gap nothing runs is a gap nobody
+fixes; when the gather is implemented the expected state becomes 72/72 and
+this paragraph goes away. **Any other failure is a regression.**
 
 **Every test is registered `is_parallel : false`, and that is load-bearing.**
 Two CUDA contexts at once produce false OOM and false device-lost, because each

@@ -87,6 +87,25 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
 9. **`renderheadless` is missing from the sweep** because it drives its own
    frames, so it is never compared. It is compared by hand instead, which means
    in practice it is compared rarely.
+10. **Every `textureGather()` returns `0 0 0 1`.** `cp_nir_to_llvm.c:2511`
+   builds its `supported` predicate from five texture ops -- `tex`, `txl`,
+   `txb`, `txf`, `txf_ms` -- and `nir_texop_tg4` is not one of them, so the
+   unsupported branch below it returns the placeholder constant and the
+   comment says so: "Shadow compares, gathers and derivative-explicit samples
+   still have to produce a value even though the sampler cannot serve them
+   yet". Nothing warns, nothing counts it, and the hardware texture path
+   cannot rescue it either -- `cp_hardware_texture_shader_eligible()` admits
+   only the same four float4 ops, so a shader containing one gather falls off
+   that path as a whole. `src/cudavk/tests/cpvk_gather.c` is the failing test:
+   it passes on lavapipe and on NVIDIA and returns `0 0 0 255` here, while its
+   control `texture()` fetch through the same image, sampler and descriptor is
+   correct on all three. The same branch swallows shadow compares and
+   `textureGrad` the same way; only the gather has a test.
+
+   This is appended rather than inserted at its rank -- which is third, above
+   the bounds check -- because items 1-9 are cited by number from
+   `CUDA_INTEROP.md`, `history/perf-2026-08-27/leads.md` and this file's own
+   Tier 4, and renumbering them would silently redirect those references.
 
 ## Vulkan surface not implemented
 

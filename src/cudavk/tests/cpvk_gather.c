@@ -1,0 +1,1044 @@
+/*
+ * textureGather(): four texels, one component each, in the order the spec
+ * names -- and the one texture op in the language that returns something no
+ * single filtered sample can.
+ *
+ * An ordinary texture() fetch collapses a 2x2 footprint into one colour and
+ * the shader never sees the texels. textureGather() does the opposite: it
+ * takes the same four texels a linear filter would have blended, throws away
+ * three of the four channels, and hands back the chosen component of each,
+ * unfiltered and unweighted, as an RGBA vector. Shadow-map filtering, edge
+ * detection and every hand-rolled reconstruction filter are built on it, and
+ * it is the one texture op whose answer is a permutation rather than an
+ * average -- so a driver that gets the four texels right and the order wrong
+ * is wrong in a way no blend test can see.
+ *
+ *    layout(set = 0, binding = 0) uniform sampler2D tex;
+ *    out_colour = textureGather(tex, vec2(0.5, 0.5), comp);
+ *
+ * The image is 2x2 and every one of its sixteen bytes is different:
+ *
+ *    texel (0,0)  RGBA  16  32  48  64      texel (1,0)  RGBA  80  96 112 128
+ *    texel (0,1)  RGBA 144 160 176 192      texel (1,1)  RGBA 208 224 240 255
+ *
+ * so no permutation of texels, no wrong component and no wrong channel can
+ * land on the right answer by coincidence -- including the alpha channel,
+ * which is the usual place a mistake hides because everything else in a test
+ * image has alpha 255.
+ *
+ * The coordinate is the safest one available. At (0.5, 0.5) the unnormalised
+ * coordinate is exactly (1.0, 1.0), which is the corner where all four texels
+ * meet, so i0 = floor(1.0 - 0.5) = 0, i1 = 1, and likewise for j. The
+ * footprint is the whole image, half a texel from every centre: no rounding
+ * rule, no subtexel precision and no address mode can move it. Nothing is
+ * clamped, so the wrap mode cannot contribute either, and the filter cannot:
+ * a gather ignores magFilter entirely, which is why this test can use one
+ * NEAREST sampler for everything it does.
+ *
+ * The order is the assertion. Vulkan (and GLSL before it) fixes the result as
+ *
+ *    R = tau(i0, j1)   G = tau(i1, j1)   B = tau(i1, j0)   A = tau(i0, j0)
+ *
+ * -- counter-clockwise from the lower-left texel of the footprint, starting
+ * at the bottom, which is not the raster order anybody writes by hand. Two
+ * gathers run:
+ *
+ *    textureGather(tex, uv)      component 0 by default  ->  144 208  80  16
+ *    textureGather(tex, uv, 1)   component 1 explicitly  ->  160 224  96  32
+ *
+ * The first is the two-argument form, so it also covers the default component
+ * operand; the second is the form the HeadlessStreamer capture's own shader
+ * uses. A driver that emits raster order returns 16 80 144 208 for the first,
+ * and this test names that specifically rather than reporting four wrong
+ * numbers. A driver that ignores the component operand returns the same pixel
+ * for both, and that is named too.
+ *
+ * A third draw is the control, and it is what makes a failure mean something.
+ * It is an ordinary texture() at (0.75, 0.75), which NEAREST resolves to texel
+ * (1,1) exactly, through the same image, the same sampler, the same descriptor
+ * set and the same pipeline layout. If the control paints 208 224 240 255 then
+ * the image reached the device, the descriptor was bound, the sampler works
+ * and the triangle covered the viewport -- so anything wrong in the other two
+ * frames is the gather and only the gather.
+ *
+ * Every value here is a whole 8-bit level fetched, not filtered, so the
+ * expected pixel is exact; one LSB of slack is a courtesy, not a tolerance.
+ * One full-viewport triangle paints all 64x64 pixels per pass and every pixel
+ * is checked, not a probe.
+ *
+ * What the native driver does today, and why this test exists:
+ * `cp_nir_to_llvm.c` builds its `supported` predicate from five texture ops --
+ * tex, txl, txb, txf and txf_ms -- and `nir_texop_tg4` is not one of them. The
+ * unsupported branch below it returns a constant, with the comment "Shadow
+ * compares, gathers and derivative-explicit samples still have to produce a
+ * value even though the sampler cannot serve them yet". So every gather in
+ * every shader returns 0 0 0 1 -- silently, with no warning, no fallback and
+ * no counter -- and the hardware texture path cannot rescue it either, since
+ * its eligibility gate admits only the same four float4 ops. This test fails
+ * on the native driver on purpose and passes on lavapipe and on NVIDIA, which
+ * is the only evidence that it covers anything at all: a gather test that
+ * cannot fail would be reporting the constant.
+ *
+ * The target is an optimal-tiled device-local image copied back through a
+ * buffer, so this runs unchanged on NVIDIA, on lavapipe and on the native
+ * driver. The sampled image is linear-tiled and host-written, which all three
+ * report as VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT capable.
+ * SPIR-V is embedded; nothing is read from disk.
+ *
+ *   cc -std=c11 -Wall -Wextra -Werror src/cudavk/tests/cpvk_gather.c \
+ *      -o /tmp/cpvk-tests/cpvk_gather -lvulkan
+ *
+ * Generated with glslangValidator (Glslang 11:16.4.0) from:
+ *
+ *   -- g.vert --
+ *   #version 450
+ *   const vec2 base[3] = vec2[3](vec2(-1.0, -1.0),
+ *                                vec2( 3.0, -1.0),
+ *                                vec2(-1.0,  3.0));
+ *   void main()
+ *   {
+ *      gl_Position = vec4(base[gl_VertexIndex], 0.0, 1.0);
+ *   }
+ *
+ *   -- gn.frag --  the control
+ *   #version 450
+ *   layout(set = 0, binding = 0) uniform sampler2D tex;
+ *   layout(location = 0) out vec4 out_colour;
+ *   void main()
+ *   {
+ *      out_colour = texture(tex, vec2(0.75, 0.75));
+ *   }
+ *
+ *   -- g0.frag --  the default component
+ *   #version 450
+ *   layout(set = 0, binding = 0) uniform sampler2D tex;
+ *   layout(location = 0) out vec4 out_colour;
+ *   void main()
+ *   {
+ *      out_colour = textureGather(tex, vec2(0.5, 0.5));
+ *   }
+ *
+ *   -- g1.frag --  component 1, the one the capture's shader gathers
+ *   #version 450
+ *   layout(set = 0, binding = 0) uniform sampler2D tex;
+ *   layout(location = 0) out vec4 out_colour;
+ *   void main()
+ *   {
+ *      out_colour = textureGather(tex, vec2(0.5, 0.5), 1);
+ *   }
+ */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <vulkan/vulkan.h>
+
+#define W 64
+#define H 64
+
+/* The sampled image, and the two coordinates the shaders read it at. */
+#define TEX_W 2
+#define TEX_H 2
+#define GATHER_U 0.5f      /* the corner where all four texels meet */
+#define GATHER_V 0.5f
+#define NEAREST_U 0.75f    /* the centre of texel (1,1) */
+#define NEAREST_V 0.75f
+
+#define NPASS 3            /* control, gather component 0, gather component 1 */
+
+#define CHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
+   fprintf(stderr, "%s failed: %d\n", #x, _r); return 1; } } while (0)
+
+/* g.vert */
+static const uint32_t vert_spv[] = {
+   0x07230203u, 0x00010000u, 0x0008000bu, 0x00000028u, 0x00000000u, 0x00020011u,
+   0x00000001u, 0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu,
+   0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u, 0x0007000fu, 0x00000000u,
+   0x00000004u, 0x6e69616du, 0x00000000u, 0x0000000du, 0x0000001au, 0x00030003u,
+   0x00000002u, 0x000001c2u, 0x00040005u, 0x00000004u, 0x6e69616du, 0x00000000u,
+   0x00060005u, 0x0000000bu, 0x505f6c67u, 0x65567265u, 0x78657472u, 0x00000000u,
+   0x00060006u, 0x0000000bu, 0x00000000u, 0x505f6c67u, 0x7469736fu, 0x006e6f69u,
+   0x00070006u, 0x0000000bu, 0x00000001u, 0x505f6c67u, 0x746e696fu, 0x657a6953u,
+   0x00000000u, 0x00070006u, 0x0000000bu, 0x00000002u, 0x435f6c67u, 0x4470696cu,
+   0x61747369u, 0x0065636eu, 0x00070006u, 0x0000000bu, 0x00000003u, 0x435f6c67u,
+   0x446c6c75u, 0x61747369u, 0x0065636eu, 0x00030005u, 0x0000000du, 0x00000000u,
+   0x00060005u, 0x0000001au, 0x565f6c67u, 0x65747265u, 0x646e4978u, 0x00007865u,
+   0x00050005u, 0x0000001du, 0x65646e69u, 0x6c626178u, 0x00000065u, 0x00030047u,
+   0x0000000bu, 0x00000002u, 0x00050048u, 0x0000000bu, 0x00000000u, 0x0000000bu,
+   0x00000000u, 0x00050048u, 0x0000000bu, 0x00000001u, 0x0000000bu, 0x00000001u,
+   0x00050048u, 0x0000000bu, 0x00000002u, 0x0000000bu, 0x00000003u, 0x00050048u,
+   0x0000000bu, 0x00000003u, 0x0000000bu, 0x00000004u, 0x00040047u, 0x0000001au,
+   0x0000000bu, 0x0000002au, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u,
+   0x00000002u, 0x00030016u, 0x00000006u, 0x00000020u, 0x00040017u, 0x00000007u,
+   0x00000006u, 0x00000004u, 0x00040015u, 0x00000008u, 0x00000020u, 0x00000000u,
+   0x0004002bu, 0x00000008u, 0x00000009u, 0x00000001u, 0x0004001cu, 0x0000000au,
+   0x00000006u, 0x00000009u, 0x0006001eu, 0x0000000bu, 0x00000007u, 0x00000006u,
+   0x0000000au, 0x0000000au, 0x00040020u, 0x0000000cu, 0x00000003u, 0x0000000bu,
+   0x0004003bu, 0x0000000cu, 0x0000000du, 0x00000003u, 0x00040015u, 0x0000000eu,
+   0x00000020u, 0x00000001u, 0x0004002bu, 0x0000000eu, 0x0000000fu, 0x00000000u,
+   0x00040017u, 0x00000010u, 0x00000006u, 0x00000002u, 0x0004002bu, 0x00000008u,
+   0x00000011u, 0x00000003u, 0x0004001cu, 0x00000012u, 0x00000010u, 0x00000011u,
+   0x0004002bu, 0x00000006u, 0x00000013u, 0xbf800000u, 0x0005002cu, 0x00000010u,
+   0x00000014u, 0x00000013u, 0x00000013u, 0x0004002bu, 0x00000006u, 0x00000015u,
+   0x40400000u, 0x0005002cu, 0x00000010u, 0x00000016u, 0x00000015u, 0x00000013u,
+   0x0005002cu, 0x00000010u, 0x00000017u, 0x00000013u, 0x00000015u, 0x0006002cu,
+   0x00000012u, 0x00000018u, 0x00000014u, 0x00000016u, 0x00000017u, 0x00040020u,
+   0x00000019u, 0x00000001u, 0x0000000eu, 0x0004003bu, 0x00000019u, 0x0000001au,
+   0x00000001u, 0x00040020u, 0x0000001cu, 0x00000007u, 0x00000012u, 0x00040020u,
+   0x0000001eu, 0x00000007u, 0x00000010u, 0x0004002bu, 0x00000006u, 0x00000021u,
+   0x00000000u, 0x0004002bu, 0x00000006u, 0x00000022u, 0x3f800000u, 0x00040020u,
+   0x00000026u, 0x00000003u, 0x00000007u, 0x00050036u, 0x00000002u, 0x00000004u,
+   0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x0004003bu, 0x0000001cu,
+   0x0000001du, 0x00000007u, 0x0004003du, 0x0000000eu, 0x0000001bu, 0x0000001au,
+   0x0003003eu, 0x0000001du, 0x00000018u, 0x00050041u, 0x0000001eu, 0x0000001fu,
+   0x0000001du, 0x0000001bu, 0x0004003du, 0x00000010u, 0x00000020u, 0x0000001fu,
+   0x00050051u, 0x00000006u, 0x00000023u, 0x00000020u, 0x00000000u, 0x00050051u,
+   0x00000006u, 0x00000024u, 0x00000020u, 0x00000001u, 0x00070050u, 0x00000007u,
+   0x00000025u, 0x00000023u, 0x00000024u, 0x00000021u, 0x00000022u, 0x00050041u,
+   0x00000026u, 0x00000027u, 0x0000000du, 0x0000000fu, 0x0003003eu, 0x00000027u,
+   0x00000025u, 0x000100fdu, 0x00010038u
+};
+
+/* gn.frag -- the control: an ordinary NEAREST fetch of texel (1,1). */
+static const uint32_t frag_nearest_spv[] = {
+   0x07230203u, 0x00010000u, 0x0008000bu, 0x00000013u, 0x00000000u, 0x00020011u,
+   0x00000001u, 0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu,
+   0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u, 0x0006000fu, 0x00000004u,
+   0x00000004u, 0x6e69616du, 0x00000000u, 0x00000009u, 0x00030010u, 0x00000004u,
+   0x00000007u, 0x00030003u, 0x00000002u, 0x000001c2u, 0x00040005u, 0x00000004u,
+   0x6e69616du, 0x00000000u, 0x00050005u, 0x00000009u, 0x5f74756fu, 0x6f6c6f63u,
+   0x00007275u, 0x00030005u, 0x0000000du, 0x00786574u, 0x00040047u, 0x00000009u,
+   0x0000001eu, 0x00000000u, 0x00040047u, 0x0000000du, 0x00000021u, 0x00000000u,
+   0x00040047u, 0x0000000du, 0x00000022u, 0x00000000u, 0x00020013u, 0x00000002u,
+   0x00030021u, 0x00000003u, 0x00000002u, 0x00030016u, 0x00000006u, 0x00000020u,
+   0x00040017u, 0x00000007u, 0x00000006u, 0x00000004u, 0x00040020u, 0x00000008u,
+   0x00000003u, 0x00000007u, 0x0004003bu, 0x00000008u, 0x00000009u, 0x00000003u,
+   0x00090019u, 0x0000000au, 0x00000006u, 0x00000001u, 0x00000000u, 0x00000000u,
+   0x00000000u, 0x00000001u, 0x00000000u, 0x0003001bu, 0x0000000bu, 0x0000000au,
+   0x00040020u, 0x0000000cu, 0x00000000u, 0x0000000bu, 0x0004003bu, 0x0000000cu,
+   0x0000000du, 0x00000000u, 0x00040017u, 0x0000000fu, 0x00000006u, 0x00000002u,
+   0x0004002bu, 0x00000006u, 0x00000010u, 0x3f400000u, 0x0005002cu, 0x0000000fu,
+   0x00000011u, 0x00000010u, 0x00000010u, 0x00050036u, 0x00000002u, 0x00000004u,
+   0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x0004003du, 0x0000000bu,
+   0x0000000eu, 0x0000000du, 0x00050057u, 0x00000007u, 0x00000012u, 0x0000000eu,
+   0x00000011u, 0x0003003eu, 0x00000009u, 0x00000012u, 0x000100fdu, 0x00010038u
+};
+
+/* g0.frag -- textureGather with the default component. */
+static const uint32_t frag_gather0_spv[] = {
+   0x07230203u, 0x00010000u, 0x0008000bu, 0x00000015u, 0x00000000u, 0x00020011u,
+   0x00000001u, 0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu,
+   0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u, 0x0006000fu, 0x00000004u,
+   0x00000004u, 0x6e69616du, 0x00000000u, 0x00000009u, 0x00030010u, 0x00000004u,
+   0x00000007u, 0x00030003u, 0x00000002u, 0x000001c2u, 0x00040005u, 0x00000004u,
+   0x6e69616du, 0x00000000u, 0x00050005u, 0x00000009u, 0x5f74756fu, 0x6f6c6f63u,
+   0x00007275u, 0x00030005u, 0x0000000du, 0x00786574u, 0x00040047u, 0x00000009u,
+   0x0000001eu, 0x00000000u, 0x00040047u, 0x0000000du, 0x00000021u, 0x00000000u,
+   0x00040047u, 0x0000000du, 0x00000022u, 0x00000000u, 0x00020013u, 0x00000002u,
+   0x00030021u, 0x00000003u, 0x00000002u, 0x00030016u, 0x00000006u, 0x00000020u,
+   0x00040017u, 0x00000007u, 0x00000006u, 0x00000004u, 0x00040020u, 0x00000008u,
+   0x00000003u, 0x00000007u, 0x0004003bu, 0x00000008u, 0x00000009u, 0x00000003u,
+   0x00090019u, 0x0000000au, 0x00000006u, 0x00000001u, 0x00000000u, 0x00000000u,
+   0x00000000u, 0x00000001u, 0x00000000u, 0x0003001bu, 0x0000000bu, 0x0000000au,
+   0x00040020u, 0x0000000cu, 0x00000000u, 0x0000000bu, 0x0004003bu, 0x0000000cu,
+   0x0000000du, 0x00000000u, 0x00040017u, 0x0000000fu, 0x00000006u, 0x00000002u,
+   0x0004002bu, 0x00000006u, 0x00000010u, 0x3f000000u, 0x0005002cu, 0x0000000fu,
+   0x00000011u, 0x00000010u, 0x00000010u, 0x00040015u, 0x00000012u, 0x00000020u,
+   0x00000001u, 0x0004002bu, 0x00000012u, 0x00000013u, 0x00000000u, 0x00050036u,
+   0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u,
+   0x0004003du, 0x0000000bu, 0x0000000eu, 0x0000000du, 0x00060060u, 0x00000007u,
+   0x00000014u, 0x0000000eu, 0x00000011u, 0x00000013u, 0x0003003eu, 0x00000009u,
+   0x00000014u, 0x000100fdu, 0x00010038u
+};
+
+/* g1.frag -- textureGather of component 1. */
+static const uint32_t frag_gather1_spv[] = {
+   0x07230203u, 0x00010000u, 0x0008000bu, 0x00000015u, 0x00000000u, 0x00020011u,
+   0x00000001u, 0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu,
+   0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u, 0x0006000fu, 0x00000004u,
+   0x00000004u, 0x6e69616du, 0x00000000u, 0x00000009u, 0x00030010u, 0x00000004u,
+   0x00000007u, 0x00030003u, 0x00000002u, 0x000001c2u, 0x00040005u, 0x00000004u,
+   0x6e69616du, 0x00000000u, 0x00050005u, 0x00000009u, 0x5f74756fu, 0x6f6c6f63u,
+   0x00007275u, 0x00030005u, 0x0000000du, 0x00786574u, 0x00040047u, 0x00000009u,
+   0x0000001eu, 0x00000000u, 0x00040047u, 0x0000000du, 0x00000021u, 0x00000000u,
+   0x00040047u, 0x0000000du, 0x00000022u, 0x00000000u, 0x00020013u, 0x00000002u,
+   0x00030021u, 0x00000003u, 0x00000002u, 0x00030016u, 0x00000006u, 0x00000020u,
+   0x00040017u, 0x00000007u, 0x00000006u, 0x00000004u, 0x00040020u, 0x00000008u,
+   0x00000003u, 0x00000007u, 0x0004003bu, 0x00000008u, 0x00000009u, 0x00000003u,
+   0x00090019u, 0x0000000au, 0x00000006u, 0x00000001u, 0x00000000u, 0x00000000u,
+   0x00000000u, 0x00000001u, 0x00000000u, 0x0003001bu, 0x0000000bu, 0x0000000au,
+   0x00040020u, 0x0000000cu, 0x00000000u, 0x0000000bu, 0x0004003bu, 0x0000000cu,
+   0x0000000du, 0x00000000u, 0x00040017u, 0x0000000fu, 0x00000006u, 0x00000002u,
+   0x0004002bu, 0x00000006u, 0x00000010u, 0x3f000000u, 0x0005002cu, 0x0000000fu,
+   0x00000011u, 0x00000010u, 0x00000010u, 0x00040015u, 0x00000012u, 0x00000020u,
+   0x00000001u, 0x0004002bu, 0x00000012u, 0x00000013u, 0x00000001u, 0x00050036u,
+   0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u,
+   0x0004003du, 0x0000000bu, 0x0000000eu, 0x0000000du, 0x00060060u, 0x00000007u,
+   0x00000014u, 0x0000000eu, 0x00000011u, 0x00000013u, 0x0003003eu, 0x00000009u,
+   0x00000014u, 0x000100fdu, 0x00010038u
+};
+
+/*
+ * The image, indexed [j][i] -- row j, column i, exactly as the gather's own
+ * (i,j) naming does. Sixteen distinct bytes: no permutation of these texels
+ * and no wrong component can produce the right pixel.
+ */
+static const unsigned char texel[TEX_H][TEX_W][4] = {
+   { {  16,  32,  48,  64 }, {  80,  96, 112, 128 } },   /* j = 0 */
+   { { 144, 160, 176, 192 }, { 208, 224, 240, 255 } },   /* j = 1 */
+};
+
+/* The footprint at (0.5, 0.5) is the whole image: i0 = 0, i1 = 1, j0 = 0,
+ * j1 = 1. Nothing about it depends on rounding. */
+#define I0 0
+#define I1 1
+#define J0 0
+#define J1 1
+
+/*
+ * The spec's order, written once, as code rather than as four numbers:
+ * counter-clockwise from the lower-left texel, starting at the bottom.
+ *
+ *    R = tau(i0, j1)   G = tau(i1, j1)   B = tau(i1, j0)   A = tau(i0, j0)
+ */
+static void
+gather_expect(int comp, unsigned char *out)
+{
+   out[0] = texel[J1][I0][comp];
+   out[1] = texel[J1][I1][comp];
+   out[2] = texel[J0][I1][comp];
+   out[3] = texel[J0][I0][comp];
+}
+
+/* The mistake worth naming: raster order, top-left first, which is what a
+ * driver writes when it fills the vector in the order it walked the texels. */
+static void
+raster_order(int comp, unsigned char *out)
+{
+   out[0] = texel[J0][I0][comp];
+   out[1] = texel[J0][I1][comp];
+   out[2] = texel[J1][I0][comp];
+   out[3] = texel[J1][I1][comp];
+}
+
+/* What the native driver's unsupported-texture-op branch returns: (0,0,0,1). */
+static const unsigned char unsupported_rgba[4] = { 0, 0, 0, 255 };
+
+/* Nothing in the frame should ever be this; a missing draw shows up as it. */
+static const unsigned char clear_rgba[4] = { 26, 26, 38, 255 };
+
+struct scan {
+   unsigned matched;      /* pixels equal to the expected colour, within 1 */
+   unsigned clear;        /* pixels still the clear colour: nothing drew */
+   unsigned other;        /* pixels that are neither */
+   unsigned char worst[4];   /* the first pixel that was neither */
+   int worst_x, worst_y;
+};
+
+static uint32_t
+pick_memory(VkPhysicalDevice pdev, uint32_t bits, VkMemoryPropertyFlags want)
+{
+   VkPhysicalDeviceMemoryProperties mp;
+   vkGetPhysicalDeviceMemoryProperties(pdev, &mp);
+   for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+      if ((bits & (1u << i)) &&
+          (mp.memoryTypes[i].propertyFlags & want) == want)
+         return i;
+   return UINT32_MAX;
+}
+
+/* One LSB of slack, and no more: every expected colour is a whole 8-bit level
+ * that was fetched rather than filtered. */
+static int
+same(const unsigned char *px, const unsigned char *want)
+{
+   for (int i = 0; i < 4; i++) {
+      int d = (int)px[i] - (int)want[i];
+      if (d < -1 || d > 1)
+         return 0;
+   }
+   return 1;
+}
+
+static const unsigned char *
+pixel(const unsigned char *px, int x, int y)
+{
+   return px + ((size_t)y * W + x) * 4;
+}
+
+/* Every pixel of one frame, against the one colour the whole frame must be. */
+static void
+scan_image(const unsigned char *px, const unsigned char *want, struct scan *s)
+{
+   memset(s, 0, sizeof(*s));
+   s->worst_x = s->worst_y = -1;
+   for (int y = 0; y < H; y++) {
+      for (int x = 0; x < W; x++) {
+         const unsigned char *p = pixel(px, x, y);
+         if (same(p, want)) {
+            s->matched++;
+         } else if (same(p, clear_rgba)) {
+            s->clear++;
+         } else {
+            s->other++;
+            if (s->worst_x < 0) {
+               s->worst_x = x;
+               s->worst_y = y;
+               memcpy(s->worst, p, 4);
+            }
+         }
+      }
+   }
+}
+
+static void
+describe(const char *what, const unsigned char *px)
+{
+   printf("  %-34s = %3u %3u %3u %3u\n", what, px[0], px[1], px[2], px[3]);
+}
+
+static void
+write_ppm(const char *path, const unsigned char *px)
+{
+   FILE *f = fopen(path, "wb");
+   if (!f)
+      return;
+   fprintf(f, "P6\n%d %d\n255\n", W, H);
+   for (int i = 0; i < W * H; i++) {
+      fputc(px[i * 4 + 0], f);
+      fputc(px[i * 4 + 1], f);
+      fputc(px[i * 4 + 2], f);
+   }
+   fclose(f);
+   printf("  %s written\n", path);
+}
+
+int
+main(int argc, char **argv)
+{
+   const char *ppm = argc > 1 ? argv[1] : NULL;
+
+   VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                             .apiVersion = VK_API_VERSION_1_3 };
+   VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                                .pApplicationInfo = &app };
+   VkInstance inst;
+   CHECK(vkCreateInstance(&ici, NULL, &inst));
+
+   uint32_t n = 1;
+   VkPhysicalDevice pdev;
+   CHECK(vkEnumeratePhysicalDevices(inst, &n, &pdev));
+
+   VkPhysicalDeviceProperties pprops;
+   vkGetPhysicalDeviceProperties(pdev, &pprops);
+   printf("device: %s\n", pprops.deviceName);
+
+   uint32_t family_count = 0;
+   vkGetPhysicalDeviceQueueFamilyProperties(pdev, &family_count, NULL);
+   VkQueueFamilyProperties *families = calloc(family_count, sizeof(*families));
+   vkGetPhysicalDeviceQueueFamilyProperties(pdev, &family_count, families);
+   uint32_t family = UINT32_MAX;
+   for (uint32_t i = 0; i < family_count; i++)
+      if (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { family = i; break; }
+   free(families);
+   if (family == UINT32_MAX) { fprintf(stderr, "no graphics queue\n"); return 1; }
+
+   /*
+    * Dynamic rendering is core from 1.3, but the native driver reports less
+    * than that and means it, so ask for the extension when it is advertised --
+    * and name its dependency chain as well, because on a device below 1.3
+    * nothing else supplies it and the validation layer refuses the device
+    * otherwise: VUID-vkCreateDevice-ppEnabledExtensionNames-01387. Above 1.3
+    * the chain is core, so only the extension itself is asked for, which is
+    * what keeps vkGetDeviceProcAddr of the KHR entrypoints legal everywhere.
+    */
+   static const char *const wanted[] = {
+      VK_KHR_MULTIVIEW_EXTENSION_NAME,
+      VK_KHR_MAINTENANCE2_EXTENSION_NAME,
+      VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,
+      VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,
+      VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+   };
+   const uint32_t wanted_count = sizeof(wanted) / sizeof(wanted[0]);
+   const int core_dynrend = pprops.apiVersion >= VK_API_VERSION_1_3;
+
+   uint32_t ext_count = 0;
+   CHECK(vkEnumerateDeviceExtensionProperties(pdev, NULL, &ext_count, NULL));
+   VkExtensionProperties *exts = calloc(ext_count, sizeof(*exts));
+   CHECK(vkEnumerateDeviceExtensionProperties(pdev, NULL, &ext_count, exts));
+   const char *dev_exts[sizeof(wanted) / sizeof(wanted[0])];
+   uint32_t dev_ext_count = 0;
+   int have_dynrend = 0;
+   for (uint32_t w = 0; w < wanted_count; w++) {
+      const int is_dynrend = w == wanted_count - 1;
+      if (core_dynrend && !is_dynrend)
+         continue;
+      for (uint32_t i = 0; i < ext_count; i++) {
+         if (strcmp(exts[i].extensionName, wanted[w]))
+            continue;
+         dev_exts[dev_ext_count++] = wanted[w];
+         have_dynrend |= is_dynrend;
+         break;
+      }
+   }
+   free(exts);
+   if (!have_dynrend && !core_dynrend) {
+      fprintf(stderr, "no dynamic rendering\n");
+      return 1;
+   }
+
+   /*
+    * A gather has no feature or extension to ask for and no limit to consult.
+    * OpImageGather is core SPIR-V, textureGather is core GLSL 4.00, and every
+    * Vulkan implementation must serve it; the only reportable property nearby
+    * is the offset range, which this test does not use. So there is nothing to
+    * query here and nothing a device can decline -- which is exactly why a
+    * driver that cannot do it has nowhere to say so.
+    */
+   float prio = 1.0f;
+   VkDeviceQueueCreateInfo qi = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &prio };
+   VkPhysicalDeviceDynamicRenderingFeatures dyn = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+      .dynamicRendering = VK_TRUE };
+   VkDeviceCreateInfo dci = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &dyn,
+      .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
+      .enabledExtensionCount = dev_ext_count,
+      .ppEnabledExtensionNames = dev_exts };
+   VkDevice dev;
+   CHECK(vkCreateDevice(pdev, &dci, NULL, &dev));
+
+   VkQueue queue;
+   vkGetDeviceQueue(dev, family, 0, &queue);
+
+   /* The KHR entrypoints exist when the extension was enabled above; a 1.3
+    * device that does not advertise it at all still has the core ones. */
+   PFN_vkCmdBeginRenderingKHR begin_rendering =
+      (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(dev, have_dynrend ?
+         "vkCmdBeginRenderingKHR" : "vkCmdBeginRendering");
+   PFN_vkCmdEndRenderingKHR end_rendering =
+      (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(dev, have_dynrend ?
+         "vkCmdEndRenderingKHR" : "vkCmdEndRendering");
+   if (!begin_rendering || !end_rendering) {
+      fprintf(stderr, "dynamic rendering entrypoints missing\n");
+      return 1;
+   }
+
+   /* Optimal tiling and a copy back through a buffer, so that a device which
+    * cannot render into linear host memory still runs this. */
+   const VkFormat cfmt = VK_FORMAT_R8G8B8A8_UNORM;
+   VkImageCreateInfo imgi = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D, .format = cfmt,
+      .extent = { W, H, 1 }, .mipLevels = 1, .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+               VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+   VkImage img;
+   CHECK(vkCreateImage(dev, &imgi, NULL, &img));
+   VkMemoryRequirements ireq;
+   vkGetImageMemoryRequirements(dev, img, &ireq);
+   uint32_t itype = pick_memory(pdev, ireq.memoryTypeBits,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+   if (itype == UINT32_MAX)
+      itype = pick_memory(pdev, ireq.memoryTypeBits, 0);
+   if (itype == UINT32_MAX) { fprintf(stderr, "no image memory type\n"); return 1; }
+   VkMemoryAllocateInfo imai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = ireq.size,
+                                 .memoryTypeIndex = itype };
+   VkDeviceMemory imem;
+   CHECK(vkAllocateMemory(dev, &imai, NULL, &imem));
+   CHECK(vkBindImageMemory(dev, img, imem, 0));
+
+   VkImageViewCreateInfo vci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = cfmt,
+      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+   VkImageView view;
+   CHECK(vkCreateImageView(dev, &vci, NULL, &view));
+
+   /* One buffer, three frames: the control, then the two gathers. */
+   const VkDeviceSize frame_bytes = (VkDeviceSize)W * H * 4;
+   VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                              .size = NPASS * frame_bytes,
+                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+   VkBuffer readback;
+   CHECK(vkCreateBuffer(dev, &bci, NULL, &readback));
+   VkMemoryRequirements breq;
+   vkGetBufferMemoryRequirements(dev, readback, &breq);
+   uint32_t btype = pick_memory(pdev, breq.memoryTypeBits,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+   if (btype == UINT32_MAX) { fprintf(stderr, "no host-visible type\n"); return 1; }
+   VkMemoryAllocateInfo bmai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = breq.size,
+                                 .memoryTypeIndex = btype };
+   VkDeviceMemory bmem;
+   CHECK(vkAllocateMemory(dev, &bmai, NULL, &bmem));
+   CHECK(vkBindBufferMemory(dev, readback, bmem, 0));
+
+   /*
+    * The sampled image: 2x2, linear-tiled and written by the host. Sixteen
+    * distinct bytes, laid out row by row so that texel[j][i] on the host is
+    * texel (i,j) to the gather.
+    */
+   VkImageCreateInfo timgi = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .extent = { TEX_W, TEX_H, 1 }, .mipLevels = 1, .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
+      .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED };
+   VkImage timg;
+   CHECK(vkCreateImage(dev, &timgi, NULL, &timg));
+   VkMemoryRequirements treq;
+   vkGetImageMemoryRequirements(dev, timg, &treq);
+   uint32_t ttype = pick_memory(pdev, treq.memoryTypeBits,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+   if (ttype == UINT32_MAX)
+      ttype = pick_memory(pdev, treq.memoryTypeBits,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+   if (ttype == UINT32_MAX) { fprintf(stderr, "no texture memory type\n"); return 1; }
+   VkMemoryAllocateInfo tmai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = treq.size,
+                                 .memoryTypeIndex = ttype };
+   VkDeviceMemory tmem;
+   CHECK(vkAllocateMemory(dev, &tmai, NULL, &tmem));
+   CHECK(vkBindImageMemory(dev, timg, tmem, 0));
+   {
+      /* The row pitch is the driver's, not two texels: a linear image may pad
+       * its rows, and assuming it does not puts rows where no sampler looks. */
+      VkImageSubresource sub = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
+      VkSubresourceLayout lay;
+      vkGetImageSubresourceLayout(dev, timg, &sub, &lay);
+
+      void *p;
+      CHECK(vkMapMemory(dev, tmem, 0, VK_WHOLE_SIZE, 0, &p));
+      unsigned char *t = (unsigned char *)p + lay.offset;
+      for (int j = 0; j < TEX_H; j++)
+         for (int i = 0; i < TEX_W; i++)
+            memcpy(t + (size_t)j * lay.rowPitch + (size_t)i * 4,
+                   texel[j][i], 4);
+      VkMappedMemoryRange flush = {
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+         .memory = tmem, .size = VK_WHOLE_SIZE };
+      CHECK(vkFlushMappedMemoryRanges(dev, 1, &flush));
+      vkUnmapMemory(dev, tmem);
+   }
+   VkImageViewCreateInfo tvci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = timg, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = timgi.format,
+      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+   VkImageView tview;
+   CHECK(vkCreateImageView(dev, &tvci, NULL, &tview));
+
+   /*
+    * One NEAREST sampler for all three passes. A gather ignores magFilter, so
+    * this sampler cannot influence the two frames the test is about -- and it
+    * makes the control's fetch a whole texel rather than a blend, so the
+    * control's expected pixel is a row of the table above.
+    */
+   VkSamplerCreateInfo sci = {
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
+      .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+      .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+      .maxLod = 0.0f };
+   VkSampler sampler;
+   CHECK(vkCreateSampler(dev, &sci, NULL, &sampler));
+
+   VkDescriptorSetLayoutBinding dslb = {
+      .binding = 0,
+      .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT };
+   VkDescriptorSetLayoutCreateInfo dsli = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount = 1, .pBindings = &dslb };
+   VkDescriptorSetLayout dsl;
+   CHECK(vkCreateDescriptorSetLayout(dev, &dsli, NULL, &dsl));
+
+   VkDescriptorPoolSize dps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
+   VkDescriptorPoolCreateInfo dpi = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &dps };
+   VkDescriptorPool dpool;
+   CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &dpool));
+   VkDescriptorSetAllocateInfo dsai = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
+   VkDescriptorSet dset;
+   CHECK(vkAllocateDescriptorSets(dev, &dsai, &dset));
+
+   VkDescriptorImageInfo dii = {
+      .sampler = sampler, .imageView = tview,
+      .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+   VkWriteDescriptorSet write = {
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset,
+      .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .pImageInfo = &dii };
+   vkUpdateDescriptorSets(dev, 1, &write, 0, NULL);
+
+   VkShaderModuleCreateInfo vsmi = {
+      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      .codeSize = sizeof(vert_spv), .pCode = vert_spv };
+   VkShaderModule vs;
+   CHECK(vkCreateShaderModule(dev, &vsmi, NULL, &vs));
+
+   /*
+    * Three fragment shaders, not one with a branch: the component of a
+    * textureGather is a constant expression in GLSL and a constant operand in
+    * SPIR-V, so it cannot be pushed. Three pipelines over one layout, one
+    * descriptor set and one image is the closest this can get to changing
+    * nothing but the texture op.
+    */
+   const uint32_t *frag_code[NPASS] = {
+      frag_nearest_spv, frag_gather0_spv, frag_gather1_spv };
+   const size_t frag_size[NPASS] = {
+      sizeof(frag_nearest_spv), sizeof(frag_gather0_spv),
+      sizeof(frag_gather1_spv) };
+   static const char *const pass_name[NPASS] = {
+      "texture()          control",
+      "textureGather() comp 0",
+      "textureGather() comp 1",
+   };
+   VkShaderModule fs[NPASS];
+   for (int p = 0; p < NPASS; p++) {
+      VkShaderModuleCreateInfo fsmi = {
+         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+         .codeSize = frag_size[p], .pCode = frag_code[p] };
+      CHECK(vkCreateShaderModule(dev, &fsmi, NULL, &fs[p]));
+   }
+
+   VkPipelineLayoutCreateInfo pli = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = 1, .pSetLayouts = &dsl };
+   VkPipelineLayout layout;
+   CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &layout));
+
+   VkPipelineVertexInputStateCreateInfo vi = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+   VkPipelineInputAssemblyStateCreateInfo ia = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+   VkViewport vp = { 0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f };
+   VkRect2D scissor = { { 0, 0 }, { W, H } };
+   VkPipelineViewportStateCreateInfo vps = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+      .viewportCount = 1, .pViewports = &vp,
+      .scissorCount = 1, .pScissors = &scissor };
+   VkPipelineRasterizationStateCreateInfo rs = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+      .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+      .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+   VkPipelineMultisampleStateCreateInfo ms = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+   VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = 0xF };
+   VkPipelineColorBlendStateCreateInfo cb = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+      .attachmentCount = 1, .pAttachments = &cba };
+   VkPipelineDepthStencilStateCreateInfo ds = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+   VkPipelineRenderingCreateInfo pri = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+      .colorAttachmentCount = 1, .pColorAttachmentFormats = &cfmt };
+
+   VkPipeline pipe[NPASS];
+   for (int p = 0; p < NPASS; p++) {
+      VkPipelineShaderStageCreateInfo stages[2] = {
+         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+           .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs,
+           .pName = "main" },
+         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+           .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs[p],
+           .pName = "main" },
+      };
+      VkGraphicsPipelineCreateInfo gpi = {
+         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+         .pNext = &pri, .stageCount = 2, .pStages = stages,
+         .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+         .pViewportState = &vps, .pRasterizationState = &rs,
+         .pMultisampleState = &ms, .pDepthStencilState = &ds,
+         .pColorBlendState = &cb, .layout = layout };
+      CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL,
+                                      &pipe[p]));
+   }
+
+   VkCommandPoolCreateInfo cpi = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .queueFamilyIndex = family };
+   VkCommandPool pool;
+   CHECK(vkCreateCommandPool(dev, &cpi, NULL, &pool));
+   VkCommandBufferAllocateInfo cbai = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1 };
+   VkCommandBuffer cmd;
+   CHECK(vkAllocateCommandBuffers(dev, &cbai, &cmd));
+
+   VkCommandBufferBeginInfo bi = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+   CHECK(vkBeginCommandBuffer(cmd, &bi));
+
+   /* The host wrote the texels; hand the image to the fragment stage. */
+   VkImageMemoryBarrier tex_to_read = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+      .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = timg,
+      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                        0, NULL, 0, NULL, 1, &tex_to_read);
+
+   VkImageMemoryBarrier to_colour = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = img,
+      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+   VkImageMemoryBarrier to_src = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = img,
+      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+   VkImageMemoryBarrier back_to_colour = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+      .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = img,
+      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+
+   VkRenderingAttachmentInfo at = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .imageView = view,
+      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      .clearValue.color.float32 = { 26.0f / 255.0f, 26.0f / 255.0f,
+                                    38.0f / 255.0f, 1.0f } };
+   VkRenderingInfo ri = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = { { 0, 0 }, { W, H } }, .layerCount = 1,
+      .colorAttachmentCount = 1, .pColorAttachments = &at };
+
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                        0, NULL, 0, NULL, 1, &to_colour);
+
+   for (int pass = 0; pass < NPASS; pass++) {
+      if (pass)
+         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                              0, NULL, 0, NULL, 1, &back_to_colour);
+
+      begin_rendering(cmd, &ri);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[pass]);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+                              0, 1, &dset, 0, NULL);
+      vkCmdDraw(cmd, 3, 1, 0, 0);
+      end_rendering(cmd);
+
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                           0, NULL, 0, NULL, 1, &to_src);
+
+      VkBufferImageCopy copy = {
+         .bufferOffset = (VkDeviceSize)pass * frame_bytes,
+         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+         .imageExtent = { W, H, 1 } };
+      vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             readback, 1, &copy);
+   }
+
+   VkBufferMemoryBarrier to_host = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .buffer = readback, .size = VK_WHOLE_SIZE };
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_HOST_BIT, 0,
+                        0, NULL, 1, &to_host, 0, NULL);
+   CHECK(vkEndCommandBuffer(cmd));
+
+   VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                       .commandBufferCount = 1, .pCommandBuffers = &cmd };
+   CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+   CHECK(vkQueueWaitIdle(queue));
+
+   unsigned char *mapped = NULL;
+   CHECK(vkMapMemory(dev, bmem, 0, VK_WHOLE_SIZE, 0, (void **)&mapped));
+   VkMappedMemoryRange invalidate = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = bmem, .size = VK_WHOLE_SIZE };
+   CHECK(vkInvalidateMappedMemoryRanges(dev, 1, &invalidate));
+
+   unsigned char expect[NPASS][4];
+   memcpy(expect[0], texel[J1][I1], 4);     /* NEAREST at (0.75, 0.75) */
+   gather_expect(0, expect[1]);
+   gather_expect(1, expect[2]);
+
+   unsigned char wrong_order[2][4];
+   raster_order(0, wrong_order[0]);
+   raster_order(1, wrong_order[1]);
+
+   const unsigned char *frame[NPASS];
+   const unsigned char *got[NPASS];
+   struct scan s[NPASS];
+   for (int p = 0; p < NPASS; p++) {
+      frame[p] = mapped + (size_t)p * frame_bytes;
+      got[p] = pixel(frame[p], W / 2, H / 2);
+      scan_image(frame[p], expect[p], &s[p]);
+   }
+
+   printf("  texture %dx%d, gathered at (%.3f, %.3f), i0=%d i1=%d j0=%d j1=%d\n",
+          TEX_W, TEX_H, (double)GATHER_U, (double)GATHER_V, I0, I1, J0, J1);
+   describe("texel (0,0)", texel[0][0]);
+   describe("texel (1,0)", texel[0][1]);
+   describe("texel (0,1)", texel[1][0]);
+   describe("texel (1,1)", texel[1][1]);
+   for (int p = 0; p < NPASS; p++) {
+      char what[64];
+      snprintf(what, sizeof(what), "%s expected", pass_name[p]);
+      describe(what, expect[p]);
+      snprintf(what, sizeof(what), "%s got", pass_name[p]);
+      describe(what, got[p]);
+      printf("    %u of %d pixels on it, %u still the clear colour, "
+             "%u neither\n", s[p].matched, W * H, s[p].clear, s[p].other);
+      if (s[p].other)
+         printf("    first stray at (%d,%d) = %3u %3u %3u %3u\n",
+                s[p].worst_x, s[p].worst_y, s[p].worst[0], s[p].worst[1],
+                s[p].worst[2], s[p].worst[3]);
+   }
+
+   int fail = 0;
+
+   for (int p = 0; p < NPASS; p++) {
+      if (s[p].clear == (unsigned)(W * H)) {
+         printf("FAIL %s: the frame is entirely the clear colour, so the draw "
+                "did not cover the viewport\n", pass_name[p]);
+         fail = 1;
+      }
+   }
+
+   /*
+    * The control first, because it decides what a gather failure can mean. If
+    * this one is wrong then the image, the descriptor or the draw is wrong and
+    * the gather verdicts below say nothing about gathering.
+    */
+   if (s[0].matched != (unsigned)(W * H)) {
+      printf("FAIL the control texture() fetch did not return texel (1,1) "
+             "%u %u %u %u, so nothing below is about the gather: the image, "
+             "the sampler or the descriptor is wrong first\n",
+             expect[0][0], expect[0][1], expect[0][2], expect[0][3]);
+      fail = 1;
+   }
+
+   for (int p = 1; p < NPASS; p++) {
+      const int comp = p - 1;
+      if (s[p].matched == (unsigned)(W * H))
+         continue;
+      fail = 1;
+
+      if (same(got[p], unsupported_rgba)) {
+         printf("FAIL %s returned %u %u %u %u, which is the constant the "
+                "unsupported-texture-op branch of cp_nir_to_llvm.c returns: "
+                "nir_texop_tg4 is not in its supported set, so the gather was "
+                "never emitted\n", pass_name[p], got[p][0], got[p][1],
+                got[p][2], got[p][3]);
+         continue;
+      }
+      if (same(got[p], wrong_order[comp])) {
+         printf("FAIL %s returned the four right texels in raster order "
+                "%u %u %u %u; the spec's order is counter-clockwise from the "
+                "lower-left texel, (i0,j1) (i1,j1) (i1,j0) (i0,j0) = "
+                "%u %u %u %u\n", pass_name[p],
+                got[p][0], got[p][1], got[p][2], got[p][3],
+                expect[p][0], expect[p][1], expect[p][2], expect[p][3]);
+         continue;
+      }
+      printf("FAIL %s painted %u of %d pixels %u %u %u %u; it should be "
+             "%u %u %u %u\n", pass_name[p], s[p].matched, W * H,
+             got[p][0], got[p][1], got[p][2], got[p][3],
+             expect[p][0], expect[p][1], expect[p][2], expect[p][3]);
+   }
+
+   /*
+    * And the failure that survives getting one frame right: a driver that
+    * drops the component operand gathers component 0 twice. The two expected
+    * pixels share no byte, so equality here is never a coincidence.
+    */
+   if (same(got[1], got[2])) {
+      printf("FAIL both gathers produced the same pixel %u %u %u %u, so the "
+             "component operand was ignored: component 0 and component 1 of "
+             "this image share no value\n",
+             got[1][0], got[1][1], got[1][2], got[1][3]);
+      fail = 1;
+   }
+
+   if (!fail)
+      printf("PASS textureGather returned components 0 and 1 of the four "
+             "footprint texels, counter-clockwise from (i0,j1), and the "
+             "control fetch agreed\n");
+
+   if (ppm) {
+      static const char *const suffix[NPASS] = { "", ".gather0", ".gather1" };
+      for (int p = 0; p < NPASS; p++) {
+         char path[1024];
+         snprintf(path, sizeof(path), "%.*s%s", (int)(sizeof(path) - 32), ppm,
+                  suffix[p]);
+         write_ppm(p ? path : ppm, frame[p]);
+      }
+   }
+
+   vkUnmapMemory(dev, bmem);
+   vkDestroyCommandPool(dev, pool, NULL);
+   for (int p = 0; p < NPASS; p++) {
+      vkDestroyPipeline(dev, pipe[p], NULL);
+      vkDestroyShaderModule(dev, fs[p], NULL);
+   }
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyShaderModule(dev, vs, NULL);
+   vkDestroyDescriptorPool(dev, dpool, NULL);
+   vkDestroyDescriptorSetLayout(dev, dsl, NULL);
+   vkDestroySampler(dev, sampler, NULL);
+   vkDestroyImageView(dev, tview, NULL);
+   vkDestroyImage(dev, timg, NULL);
+   vkFreeMemory(dev, tmem, NULL);
+   vkDestroyBuffer(dev, readback, NULL);
+   vkFreeMemory(dev, bmem, NULL);
+   vkDestroyImageView(dev, view, NULL);
+   vkDestroyImage(dev, img, NULL);
+   vkFreeMemory(dev, imem, NULL);
+   vkDestroyDevice(dev, NULL);
+   vkDestroyInstance(inst, NULL);
+   return fail;
+}
