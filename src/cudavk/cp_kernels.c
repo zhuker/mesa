@@ -262,37 +262,50 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
    return ptx;
 }
 
+/* The defines that turn on the sampler's optional entry points, written in a
+ * fixed order so that one set of options is one string and one cache key. */
+static void
+sampler_opt_defines(unsigned opts, char *buf, size_t size)
+{
+   snprintf(buf, size, "%s%s",
+            (opts & CP_SAMPLER_3D) ? "#define CP_ENABLE_3D_SAMPLER 1\n" : "",
+            (opts & CP_SAMPLER_GATHER) ? "#define CP_ENABLE_GATHER 1\n" : "");
+}
+
 static char *
 compile_sampler_source(const char *name, int sm_major, int sm_minor,
-                       bool enable_3d)
+                       unsigned opts)
 {
-   if (!enable_3d)
+   if (!opts)
       return compile_cuda_source(cp_sampler_src, name, sm_major, sm_minor,
                                  true);
 
-   static const char define[] = "#define CP_ENABLE_3D_SAMPLER 1\n";
+   char defines[128];
+   sampler_opt_defines(opts, defines, sizeof(defines));
+   size_t define_len = strlen(defines);
    size_t source_len = strlen(cp_sampler_src);
-   char *source = malloc(sizeof(define) - 1 + source_len + 1);
+   char *source = malloc(define_len + source_len + 1);
    if (!source)
       return NULL;
-   memcpy(source, define, sizeof(define) - 1);
-   memcpy(source + sizeof(define) - 1, cp_sampler_src, source_len + 1);
+   memcpy(source, defines, define_len);
+   memcpy(source + define_len, cp_sampler_src, source_len + 1);
    char *ptx = compile_cuda_source(source, name, sm_major, sm_minor, true);
    free(source);
    return ptx;
 }
 
 char *
-cp_compile_sampler_3d(int sm_major, int sm_minor)
+cp_compile_sampler_opts(int sm_major, int sm_minor, unsigned opts)
 {
-   return compile_sampler_source("cp_sampler_3d.cu", sm_major, sm_minor,
-                                 true);
+   char name[32];
+   snprintf(name, sizeof(name), "cp_sampler_opt%u.cu", opts);
+   return compile_sampler_source(name, sm_major, sm_minor, opts);
 }
 
 char *
 cp_compile_sampler_variant(int sm_major, int sm_minor,
                            const struct cp_sampler_info *info,
-                           bool enable_3d)
+                           unsigned opts)
 {
    static_assert(sizeof(float) == sizeof(uint32_t), "32-bit float required");
    uint32_t bits[8];
@@ -302,6 +315,9 @@ cp_compile_sampler_variant(int sm_major, int sm_minor,
    memcpy(&bits[3], &info->max_anisotropy, 4);
    for (unsigned i = 0; i < 4; i++)
       memcpy(&bits[4 + i], &info->border_color[i], 4);
+
+   char opt_defines[128];
+   sampler_opt_defines(opts, opt_defines, sizeof(opt_defines));
 
    char defines[2048];
    int len = snprintf(defines, sizeof(defines),
@@ -318,7 +334,7 @@ cp_compile_sampler_variant(int sm_major, int sm_minor,
       "#define CP_SPEC_BORDER_G (__int_as_float((int)0x%08xU))\n"
       "#define CP_SPEC_BORDER_B (__int_as_float((int)0x%08xU))\n"
       "#define CP_SPEC_BORDER_A (__int_as_float((int)0x%08xU))\n",
-      enable_3d ? "#define CP_ENABLE_3D_SAMPLER 1\n" : "",
+      opt_defines,
       info->wrap_s, info->wrap_t, info->wrap_r, info->min_img_filter,
       info->mag_img_filter, info->min_mip_filter, info->unnormalized_coords,
       bits[0], bits[1], bits[2], bits[3], bits[4], bits[5], bits[6], bits[7]);
@@ -480,7 +496,7 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
    /* Kept as relocatable PTX rather than a module: it is linked into each
     * shader that samples textures, not launched on its own. */
    k->sampler_ptx = compile_sampler_source("cp_sampler.cu", sm_major,
-                                           sm_minor, false);
+                                           sm_minor, 0);
    if (cp_debug->texture_cache)
       k->math_ptx = compile_cuda_source(cp_math_src, "cp_math.cu", sm_major,
                                         sm_minor, true);
@@ -520,7 +536,8 @@ cp_kernels_destroy(struct cp_kernels *k)
       cuModuleUnload(k->vfetch_module);
    free(k->sampler_ptx);
    free(k->math_ptx);
-   free(k->sampler_3d_ptx);
+   for (unsigned i = 0; i < CP_SAMPLER_OPT_COUNT; i++)
+      free(k->sampler_opt_ptx[i]);
    free(k->fs_helper_ptx);
    memset(k, 0, sizeof(*k));
 }

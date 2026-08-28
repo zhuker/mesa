@@ -237,6 +237,9 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_SAMPLER_VARIANT", CP_FLAG_BOOL_VALUE,
      F(no_sampler_variant),
      "disable literal-state fragment sampler variants" },
+   { "CUDAVK_NO_TEXTURE_GATHER", CP_FLAG_BOOL_VALUE, F(no_texture_gather),
+     "refuse every textureGather() again, so that it returns the constant "
+     "0 0 0 1 the driver returned before the sampler could serve one" },
    { "CUDAVK_NO_GPU_SEM_WAIT", CP_FLAG_BOOL_VALUE, F(no_gpu_sem_wait),
      "block the submitting thread on a queue-submit wait semaphore instead of "
      "making the renderer stream wait on its completion event" },

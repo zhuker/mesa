@@ -219,6 +219,10 @@ struct cp_debug {
    unsigned pdl;
    bool no_pdl;
    bool no_sampler_variant;
+   /* Revert switch for the software textureGather. Set, every tg4 goes back to
+    * the unsupported branch's (0, 0, 0, 1) -- which is a wrong image, and is
+    * only there so that a shader can be built both ways in one session. */
+   bool no_texture_gather;
    bool no_gpu_sem_wait;
    /* Derived in apply_couplings() from no_texture_cache: the hardware texture
     * path is the default, and the registry carries the revert. Every use site

@@ -570,12 +570,33 @@ cp_cube_derivs(float x, float y, float z, float dx, float dy, float dz,
    *out_dv = 0.5f * (dvc - vc * dma * ima) * ima;
 }
 
-/* Bilinear filtering within one 2D slice. Keeping this as a force-inlined
- * fast path avoids imposing a z-tap loop on every ordinary 2D/cube sample. */
+/*
+ * The four texels of a bilinear footprint, in one loop, for both of the two
+ * things that want them.
+ *
+ * Each tap is the texel at (x0 + i, y0 + j) with the wrap mode applied to it
+ * on its own account, replaced by the border colour when it falls outside a
+ * clamp-to-border texture, and continued onto the adjacent face when the
+ * target is a cube map.
+ *
+ * A textureGather() is exactly this footprint with the weights taken off, so
+ * the loop is written once and instantiated twice rather than copied: with
+ * `gather` it stores component `comp` of each tap in `gathered[j * 2 + i]`,
+ * and without it, it blends them, which is the bilinear filter. Both
+ * instantiations are force-inlined into their caller. Sharing this out of
+ * line instead is the shape DEAD_ENDS entry 4 measured at 143-182 registers
+ * and +0.70..+1.45 ms on every arm, and rule 10 is that the sampler pays for
+ * instructions and code footprint, not for occupancy.
+ *
+ * `off_x`/`off_y` are textureGatherOffset()'s constant offset in texels; a
+ * filtered sample passes zero and the addition folds away.
+ */
+template <bool gather>
 static __device__ __forceinline__ struct cp_rgba
-cp_sample_linear_slice(const struct cp_texture_info *tex,
-                       const struct cp_sampler_info *samp, unsigned level,
-                       float su, float sv, int layer, int w, int h, bool cube)
+cp_footprint4(const struct cp_texture_info *tex,
+              const struct cp_sampler_info *samp, unsigned level,
+              float su, float sv, int layer, int w, int h, bool cube,
+              int off_x, int off_y, unsigned comp, float *gathered)
 {
    float fu = su - 0.5f;
    float fv = sv - 0.5f;
@@ -585,6 +606,9 @@ cp_sample_linear_slice(const struct cp_texture_info *tex,
    float av = fv - (float)y0;
    float acc_r = 0.0f, acc_g = 0.0f, acc_b = 0.0f, acc_a = 0.0f;
    float acc_w = 0.0f;
+
+   x0 += off_x;
+   y0 += off_y;
 
    for (int j = 0; j < 2; j++) {
       for (int i = 0; i < 2; i++) {
@@ -605,6 +629,11 @@ cp_sample_linear_slice(const struct cp_texture_info *tex,
             t.r = samp->border_color[0]; t.g = samp->border_color[1];
             t.b = samp->border_color[2]; t.a = samp->border_color[3];
          }
+         if (gather) {
+            gathered[j * 2 + i] =
+               comp == 0 ? t.r : comp == 1 ? t.g : comp == 2 ? t.b : t.a;
+            continue;
+         }
          acc_r += t.r * weight; acc_g += t.g * weight;
          acc_b += t.b * weight; acc_a += t.a * weight;
          acc_w += weight;
@@ -616,6 +645,17 @@ cp_sample_linear_slice(const struct cp_texture_info *tex,
       acc_r * inv_w, acc_g * inv_w, acc_b * inv_w, acc_a * inv_w,
    };
    return c;
+}
+
+/* Bilinear filtering within one 2D slice. Keeping this as a force-inlined
+ * fast path avoids imposing a z-tap loop on every ordinary 2D/cube sample. */
+static __device__ __forceinline__ struct cp_rgba
+cp_sample_linear_slice(const struct cp_texture_info *tex,
+                       const struct cp_sampler_info *samp, unsigned level,
+                       float su, float sv, int layer, int w, int h, bool cube)
+{
+   return cp_footprint4<false>(tex, samp, level, su, sv, layer, w, h, cube,
+                               0, 0, 0, nullptr);
 }
 
 /* Keep the additional z footprint out of the common 2D sampler's register
@@ -1117,12 +1157,10 @@ cp_tex_sample_impl(unsigned long long tex_handle,
    return make_float4(acc.r * inv, acc.g * inv, acc.b * inv, acc.a * inv);
 }
 
-template <bool filter_3d>
-static __device__ __forceinline__ float4
-cp_tex_sample_entry(unsigned long long tex_handle,
-                    unsigned long long samp_handle,
-                    float c0, float c1, float c2, float explicit_lod,
-                    int coord_slot, int flags)
+/* The sampler state an entry point works from: the state the specialiser
+ * baked into this module, or the one the descriptor names. */
+static __device__ __forceinline__ struct cp_sampler_info
+cp_entry_sampler(unsigned long long samp_handle)
 {
    struct cp_sampler_info samp;
 #ifdef CP_SPECIALIZED_SAMPLER
@@ -1144,7 +1182,18 @@ cp_tex_sample_entry(unsigned long long tex_handle,
 #else
    samp = cp_load_sampler(samp_handle);
 #endif
-   return cp_tex_sample_impl<filter_3d>(tex_handle, samp,
+   return samp;
+}
+
+template <bool filter_3d>
+static __device__ __forceinline__ float4
+cp_tex_sample_entry(unsigned long long tex_handle,
+                    unsigned long long samp_handle,
+                    float c0, float c1, float c2, float explicit_lod,
+                    int coord_slot, int flags)
+{
+   return cp_tex_sample_impl<filter_3d>(tex_handle,
+                                        cp_entry_sampler(samp_handle),
                                         c0, c1, c2, explicit_lod,
                                         coord_slot, flags);
 }
@@ -1168,6 +1217,111 @@ cp_tex_sample_3d(unsigned long long tex_handle, unsigned long long samp_handle,
    return cp_tex_sample_entry<true>(tex_handle, samp_handle,
                                     c0, c1, c2, explicit_lod,
                                     coord_slot, flags);
+}
+#endif
+
+#ifdef CP_ENABLE_GATHER
+/*
+ * textureGather(): the four texels a linear filter would have blended, one
+ * component of each, in the order the spec fixes -- counter-clockwise from
+ * the lower-left texel of the footprint:
+ *
+ *    R = tau(i0, j1)   G = tau(i1, j1)   B = tau(i1, j0)   A = tau(i0, j0)
+ *
+ * which is not the order the loop walks them in, and is the whole assertion
+ * of cpvk_gather: no blend test can see a permutation of four texels.
+ *
+ * None of cp_tex_sample_impl()'s level-of-detail work applies. A gather is
+ * the base level by definition, so there is no derivative, no mip blend, no
+ * anisotropy and no min/mag filter to consult -- the sampler contributes its
+ * wrap modes and its border colour and nothing else. What is shared is the
+ * part that is the same: the footprint, the wrap and border decision per tap,
+ * the texel decode for every format and the seamless cube edge, all of it
+ * through cp_footprint4<true>().
+ *
+ * Compiled only into a module some shader in the pipeline actually gathers
+ * with, exactly like cp_tex_sample_3d() above, so that a shader without one
+ * links the same bytes it linked before this existed.
+ */
+static __device__ __forceinline__ float4
+cp_tex_gather_impl(unsigned long long tex_handle, struct cp_sampler_info samp,
+                   float c0, float c1, float c2, int flags)
+{
+   float4 result = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+   if (!tex_handle)
+      return result;
+
+   const struct cp_texture_info *tex =
+      *(const struct cp_texture_info *const *)(tex_handle +
+                                               CP_DESC_IMAGE_FUNCTIONS_OFFSET);
+   if (!tex || !tex->base || !tex->width || !tex->height)
+      return result;
+
+   unsigned target = (unsigned)flags & CP_TEX_TARGET_MASK;
+   unsigned level = tex->first_level;
+   bool cube = target == CP_TEX_CUBE || target == CP_TEX_CUBE_ARRAY;
+
+   /* The coordinate resolves the way a sample's does. The targets that are
+    * missing here -- 1D, 1D array, 3D, multisampled -- have no gather in the
+    * language, and the compiler keeps them on the unsupported branch. */
+   float u = c0, v = c1;
+   int layer = 0;
+   if (cube) {
+      float fu, fv;
+      layer = (int)cp_cube_face(c0, c1, c2, &fu, &fv);
+      u = fu;
+      v = fv;
+   } else if (target == CP_TEX_2D_ARRAY) {
+      layer = (int)(c2 + 0.5f);
+   }
+
+   int w = (int)(tex->width >> level);
+   int h = (int)(tex->height >> level);
+   w = w < 1 ? 1 : w;
+   h = h < 1 ? 1 : h;
+
+   int depth = (int)tex->depth;
+   if (depth < 1)
+      depth = 1;
+   layer = layer < 0 ? 0 : (layer >= depth ? depth - 1 : layer);
+
+   float su = samp.unnormalized_coords ? u : u * (float)w;
+   float sv = samp.unnormalized_coords ? v : v * (float)h;
+
+   /* textureGatherOffset()'s two signed 4-bit fields. */
+   int off_x = (int)(((unsigned)flags >> CP_TEX_GATHER_OFF_X_SHIFT) &
+                     CP_TEX_GATHER_OFF_MASK);
+   int off_y = (int)(((unsigned)flags >> CP_TEX_GATHER_OFF_Y_SHIFT) &
+                     CP_TEX_GATHER_OFF_MASK);
+   off_x = (off_x ^ 8) - 8;
+   off_y = (off_y ^ 8) - 8;
+
+   unsigned comp = ((unsigned)flags >> CP_TEX_GATHER_COMP_SHIFT) &
+                   CP_TEX_GATHER_COMP_MASK;
+
+   /* gathered[j * 2 + i], raster order. A cube corner has only three texels
+    * and the fourth tap never fires, which leaves it at zero -- a value the
+    * specification leaves to the implementation. */
+   float gathered[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+   cp_footprint4<true>(tex, &samp, level, su, sv, layer, w, h, cube,
+                       off_x, off_y, comp, gathered);
+
+   return make_float4(gathered[2], gathered[3], gathered[1], gathered[0]);
+}
+
+extern "C" __device__ float4
+cp_tex_gather(unsigned long long tex_handle, unsigned long long samp_handle,
+              float c0, float c1, float c2, float explicit_lod,
+              int coord_slot, int flags)
+{
+   /* The eight arguments of cp_tex_sample(), so that the compiler's call site
+    * is the same call site with another name on it. A gather has no level of
+    * detail and needs no derivatives, so two of them go unread. */
+   (void)explicit_lod;
+   (void)coord_slot;
+   return cp_tex_gather_impl(tex_handle, cp_entry_sampler(samp_handle),
+                             c0, c1, c2, flags);
 }
 #endif
 

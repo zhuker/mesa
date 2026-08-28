@@ -1723,6 +1723,67 @@ build_scalar_only(struct ntl_context *ctx,
    return result;
 }
 
+/*
+ * A NIR value of bit_size 1 in the shapes this file produces it in.
+ *
+ * There is more than one. Every comparison below zero-extends LLVM's `i1` to
+ * `i32`, because everything that consumes a boolean here -- bcsel, b2f32,
+ * b2i32 -- asks only whether it is non-zero, and an `i32` is what the rest of
+ * the value flow is already carrying. nir_load_const emits a real `i1`. Both
+ * are correct for a consumer that tests against zero and neither is correct
+ * for a bitwise operator, which is what NIR's *logical* operators on booleans
+ * are: `inot` of a 1-bit value is `!`, not `~`, and a 32-bit NOT of the 1 a
+ * comparison produced is 0xfffffffe -- still non-zero, so still true.
+ *
+ * Reduce to `i1` first and the width stops mattering.
+ */
+static LLVMValueRef
+to_bool_i1(struct ntl_context *ctx, LLVMValueRef v)
+{
+   LLVMTypeRef t = LLVMTypeOf(v);
+   LLVMTypeRef elem = LLVMGetTypeKind(t) == LLVMVectorTypeKind
+      ? LLVMGetElementType(t) : t;
+
+   if (LLVMGetTypeKind(elem) == LLVMIntegerTypeKind &&
+       LLVMGetIntTypeWidth(elem) == 1)
+      return v;
+
+   return LLVMBuildICmp(ctx->builder, LLVMIntNE, v, LLVMConstNull(t), "");
+}
+
+/*
+ * inot, iand, ior and ixor on a bit_size-1 destination: !, &&, || and ^^.
+ *
+ * The result is widened back to the zero-extended `i32` every comparison in
+ * this file hands out, so one representation leaves emit_alu() no matter which
+ * of the two came in, and a later `iand` cannot be given an `i1` and an `i32`
+ * to combine.
+ */
+static LLVMValueRef
+build_bool_logic(struct ntl_context *ctx, nir_op op, LLVMValueRef *src,
+                 unsigned num_comp)
+{
+   LLVMValueRef a = to_bool_i1(ctx, src[0]);
+   LLVMValueRef r;
+
+   switch (op) {
+   case nir_op_inot:
+      r = LLVMBuildNot(ctx->builder, a, "");
+      break;
+   case nir_op_iand:
+      r = LLVMBuildAnd(ctx->builder, a, to_bool_i1(ctx, src[1]), "");
+      break;
+   case nir_op_ior:
+      r = LLVMBuildOr(ctx->builder, a, to_bool_i1(ctx, src[1]), "");
+      break;
+   default:
+      r = LLVMBuildXor(ctx->builder, a, to_bool_i1(ctx, src[1]), "");
+      break;
+   }
+
+   return LLVMBuildZExt(ctx->builder, r, get_llvm_type(ctx, 32, num_comp), "");
+}
+
 static void
 emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
 {
@@ -1979,14 +2040,29 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
    case nir_op_fdiv:
       result = LLVMBuildFDiv(ctx->builder, src[0], src[1], "");
       break;
+   /*
+    * The four bitwise operators are also NIR's logical operators, and which
+    * one is meant is the destination width. At bit_size 1 they combine
+    * booleans and the operands may not be one bit wide here; at any other
+    * width they are the shader's own `&`, `|`, `^` and `~` and go straight
+    * through. Getting that wrong is invisible except through step(): it is
+    * the shortest route in the language to a boolean `inot`, and
+    * cpvk_step.c is what caught it.
+    */
    case nir_op_iand:
-      result = LLVMBuildAnd(ctx->builder, src[0], src[1], "");
+      result = instr->def.bit_size == 1
+         ? build_bool_logic(ctx, instr->op, src, num_comp)
+         : LLVMBuildAnd(ctx->builder, src[0], src[1], "");
       break;
    case nir_op_ior:
-      result = LLVMBuildOr(ctx->builder, src[0], src[1], "");
+      result = instr->def.bit_size == 1
+         ? build_bool_logic(ctx, instr->op, src, num_comp)
+         : LLVMBuildOr(ctx->builder, src[0], src[1], "");
       break;
    case nir_op_ixor:
-      result = LLVMBuildXor(ctx->builder, src[0], src[1], "");
+      result = instr->def.bit_size == 1
+         ? build_bool_logic(ctx, instr->op, src, num_comp)
+         : LLVMBuildXor(ctx->builder, src[0], src[1], "");
       break;
    case nir_op_ishl:
       result = LLVMBuildShl(ctx->builder, src[0], src[1], "");
@@ -2004,7 +2080,9 @@ emit_alu(struct ntl_context *ctx, nir_alu_instr *instr)
       result = LLVMBuildFNeg(ctx->builder, src[0], "");
       break;
    case nir_op_inot:
-      result = LLVMBuildNot(ctx->builder, src[0], "");
+      result = instr->def.bit_size == 1
+         ? build_bool_logic(ctx, instr->op, src, num_comp)
+         : LLVMBuildNot(ctx->builder, src[0], "");
       break;
    case nir_op_u2f32:
       result = LLVMBuildUIToFP(ctx->builder, src[0], get_float_type(ctx, 32), "");
@@ -2259,6 +2337,64 @@ emit_load_const(struct ntl_context *ctx, nir_load_const_instr *instr)
    }
 }
 
+/*
+ * Whether the software sampler can serve this gather.
+ *
+ * This is the predicate, and it is exported because two places have to agree
+ * on it exactly: emit_tex() below, which decides whether to call
+ * cp_tex_gather(), and cpvk_nir_sampler_opts(), which decides whether the
+ * sampler module linked into the shader was compiled with that entry point in
+ * it. If they disagree in either direction the shader either renders black or
+ * fails to link, so there is one answer and both ask it.
+ *
+ * What is refused is refused because the alternative is four wrong texels: a
+ * shadow gather compares rather than returns, a sparse one owes a residency
+ * code, an implicit-LOD one is not the base level, and the four-offset form
+ * is four gathers rather than one. They keep the (0, 0, 0, 1) the driver
+ * already returned for them.
+ */
+bool
+cp_tex_gather_supported(struct nir_tex_instr *tex)
+{
+   if (tex->op != nir_texop_tg4)
+      return false;
+   if (cp_debug->no_texture_gather)
+      return false;
+   if (tex->is_shadow || tex->is_sparse || tex->is_gather_implicit_lod)
+      return false;
+   if (nir_tex_instr_has_explicit_tg4_offsets(tex))
+      return false;
+
+   /* The targets the language has a gather for. 1D, 3D and multisampled have
+    * none, and the sampler's gather entry point does not decode them. */
+   switch (tex->sampler_dim) {
+   case GLSL_SAMPLER_DIM_2D:
+   case GLSL_SAMPLER_DIM_RECT:
+   case GLSL_SAMPLER_DIM_EXTERNAL:
+   case GLSL_SAMPLER_DIM_CUBE:
+      break;
+   default:
+      return false;
+   }
+
+   /* The offset travels in the flags word as two signed 4-bit fields, which
+    * is the -8..+7 the specification permits and no more. A dynamic one has
+    * nowhere to travel at all. */
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type != nir_tex_src_offset)
+         continue;
+      if (!nir_src_is_const(tex->src[i].src))
+         return false;
+      for (unsigned c = 0; c < nir_src_num_components(tex->src[i].src); c++) {
+         int64_t off = nir_src_comp_as_int(tex->src[i].src, c);
+         if (off < -8 || off > 7)
+            return false;
+      }
+   }
+
+   return true;
+}
+
 static int32_t
 cp_tex_flags(const nir_tex_instr *tex)
 {
@@ -2290,6 +2426,26 @@ cp_tex_flags(const nir_tex_instr *tex)
       flags |= CP_TEX_LOD;
    else if (tex->op == nir_texop_txb)
       flags |= CP_TEX_BIAS;
+   else if (tex->op == nir_texop_tg4) {
+      /* Which component of the four texels, and where the footprint sits.
+       * The component is an operand of the instruction rather than a source,
+       * and dropping it is the failure that survives getting one gather
+       * right: every component then returns component 0. */
+      flags |= CP_TEX_GATHER |
+               ((int32_t)tex->component << CP_TEX_GATHER_COMP_SHIFT);
+      for (unsigned i = 0; i < tex->num_srcs; i++) {
+         if (tex->src[i].src_type != nir_tex_src_offset ||
+             !nir_src_is_const(tex->src[i].src))
+            continue;
+         unsigned comps = nir_src_num_components(tex->src[i].src);
+         if (comps > 0)
+            flags |= ((int32_t)nir_src_comp_as_int(tex->src[i].src, 0) &
+                      CP_TEX_GATHER_OFF_MASK) << CP_TEX_GATHER_OFF_X_SHIFT;
+         if (comps > 1)
+            flags |= ((int32_t)nir_src_comp_as_int(tex->src[i].src, 1) &
+                      CP_TEX_GATHER_OFF_MASK) << CP_TEX_GATHER_OFF_Y_SHIFT;
+      }
+   }
 
    return flags;
 }
@@ -2511,7 +2667,7 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
    bool supported = flags >= 0 && tex_handle && coord &&
       (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
        tex->op == nir_texop_txb || tex->op == nir_texop_txf ||
-       tex->op == nir_texop_txf_ms);
+       tex->op == nir_texop_txf_ms || cp_tex_gather_supported(tex));
 
    if (ctx->hardware_texture) {
       /* Shader admission makes both values mandatory. Never link a software
@@ -2562,8 +2718,10 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
       return;
    }
 
-   /* Shadow compares, gathers and derivative-explicit samples still have to
-    * produce a value even though the sampler cannot serve them yet. */
+   /* Shadow compares, derivative-explicit samples and the gathers
+    * cp_tex_gather_supported() refuses still have to produce a value even
+    * though the sampler cannot serve them yet. It is the wrong value, and
+    * silently so: see TODO.md, correctness item 10. */
    if (!supported) {
       LLVMTypeRef ft = get_float_type(ctx, bs);
       LLVMValueRef zero = LLVMConstReal(ft, 0.0);
@@ -2655,9 +2813,12 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
    LLVMTypeRef param_types[] = { i64, i64, f32, f32, f32, f32, i32, i32 };
    LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, 8, false);
 
-   const char *sample_name =
-      (flags & CP_TEX_TARGET_MASK) == CP_TEX_3D &&
-      !(flags & CP_TEX_FETCH) ? "cp_tex_sample_3d" : "cp_tex_sample";
+   const char *sample_name = "cp_tex_sample";
+   if (flags & CP_TEX_GATHER)
+      sample_name = "cp_tex_gather";
+   else if ((flags & CP_TEX_TARGET_MASK) == CP_TEX_3D &&
+            !(flags & CP_TEX_FETCH))
+      sample_name = "cp_tex_sample_3d";
    LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, sample_name);
    if (!fn)
       fn = LLVMAddFunction(ctx->module, sample_name, fn_type);

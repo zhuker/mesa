@@ -87,6 +87,53 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
 9. **`renderheadless` is missing from the sweep** because it drives its own
    frames, so it is never compared. It is compared by hand instead, which means
    in practice it is compared rarely.
+10. **What the unsupported-texture-op branch still swallows.** The plain
+   `textureGather()` is served now: `cp_tex_gather_supported()` admits
+   `nir_texop_tg4` on 2D, 2D array, rect and cube, with the component operand,
+   the wrap modes, the border colour and a constant `textureGatherOffset()`,
+   and `cp_tex_gather()` in the sampler returns the four texels in the spec's
+   order. `src/cudavk/tests/cpvk_gather.c` covers it and passes on this
+   driver, on lavapipe and on NVIDIA. What still falls to the placeholder
+   constant `0 0 0 1` at `cp_nir_to_llvm.c` is the rest of that predicate:
+   shadow compares, `textureGrad`, sparse residency, a gather with an implicit
+   LOD, the four-offset `textureGatherOffsets()` form, and a gather with a
+   dynamic offset. Nothing warns and nothing counts any of them, which is the
+   part of this item that has not changed -- a refused gather renders the same
+   black image it rendered before, silently. None has a test.
+
+   The hardware texture path does not serve gathers either, deliberately:
+   `cp_hardware_texture_shader_eligible()` is all-or-nothing per shader and
+   guards a measured 5.8382 ms (`DEAD_ENDS.md` entry 13), so `tld4` is its own
+   iteration and not a rider on this one. LLVM 18 has the unified `tld4`
+   intrinsic for 2D only, with no offset and no array or cube form.
+
+   This is appended rather than inserted at its rank -- which is third, above
+   the bounds check -- because items 1-9 are cited by number from
+   `CUDA_INTEROP.md`, `history/perf-2026-08-27/leads.md` and this file's own
+   Tier 4, and renumbering them would silently redirect those references.
+
+11. ~~**`step()` returns 1.0 everywhere.**~~ -- **done.** What the backend is
+   handed for `step(edge, x)` after `nir_opt_algebraic` is
+   `b2f32(inot(flt(x, edge)))`, and `emit_alu()` in `cp_nir_to_llvm.c` built
+   the comparison as a zero-extended `i1` -- 0 or 1 -- while building `inot`
+   as a 32-bit bitwise NOT. `~1` is `0xfffffffe` and `~0` is `0xffffffff`, and
+   `b2f32` reads any non-zero as true, so the answer was 1.0 whatever the
+   comparison said. Nothing warned: `slt` never reaches the backend, the ops
+   involved are all implemented, and the wrong value is a legal one. `inot`,
+   `iand`, `ior` and `ixor` now reduce their operands to `i1` when the
+   destination is one bit and widen the answer back, so the two boolean
+   representations this file produces stop mattering.
+   `src/cudavk/tests/cpvk_step.c` is the test, and it passes on this driver,
+   on lavapipe and on NVIDIA.
+
+   It was worth 352 of the 1066 shader modules in the HeadlessStreamer
+   capture. It is what made that capture's frame lose its baked shadows:
+   fragment module 348 asks `step(half_extent, abs(pos - centre))` whether it
+   is inside the baked lighting volume, got "outside" for every pixel, and
+   skipped the shadow and ambient-occlusion lookup
+   (`/home/alexzhukov/gather-validation/DRAW_BISECT.md`).
+
+   Appended for the same reason item 10 was.
 
 ## Vulkan surface not implemented
 
