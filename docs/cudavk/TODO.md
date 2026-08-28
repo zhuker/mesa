@@ -87,20 +87,25 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
 9. **`renderheadless` is missing from the sweep** because it drives its own
    frames, so it is never compared. It is compared by hand instead, which means
    in practice it is compared rarely.
-10. **Every `textureGather()` returns `0 0 0 1`.** `cp_nir_to_llvm.c:2511`
-   builds its `supported` predicate from five texture ops -- `tex`, `txl`,
-   `txb`, `txf`, `txf_ms` -- and `nir_texop_tg4` is not one of them, so the
-   unsupported branch below it returns the placeholder constant and the
-   comment says so: "Shadow compares, gathers and derivative-explicit samples
-   still have to produce a value even though the sampler cannot serve them
-   yet". Nothing warns, nothing counts it, and the hardware texture path
-   cannot rescue it either -- `cp_hardware_texture_shader_eligible()` admits
-   only the same four float4 ops, so a shader containing one gather falls off
-   that path as a whole. `src/cudavk/tests/cpvk_gather.c` is the failing test:
-   it passes on lavapipe and on NVIDIA and returns `0 0 0 255` here, while its
-   control `texture()` fetch through the same image, sampler and descriptor is
-   correct on all three. The same branch swallows shadow compares and
-   `textureGrad` the same way; only the gather has a test.
+10. **What the unsupported-texture-op branch still swallows.** The plain
+   `textureGather()` is served now: `cp_tex_gather_supported()` admits
+   `nir_texop_tg4` on 2D, 2D array, rect and cube, with the component operand,
+   the wrap modes, the border colour and a constant `textureGatherOffset()`,
+   and `cp_tex_gather()` in the sampler returns the four texels in the spec's
+   order. `src/cudavk/tests/cpvk_gather.c` covers it and passes on this
+   driver, on lavapipe and on NVIDIA. What still falls to the placeholder
+   constant `0 0 0 1` at `cp_nir_to_llvm.c` is the rest of that predicate:
+   shadow compares, `textureGrad`, sparse residency, a gather with an implicit
+   LOD, the four-offset `textureGatherOffsets()` form, and a gather with a
+   dynamic offset. Nothing warns and nothing counts any of them, which is the
+   part of this item that has not changed -- a refused gather renders the same
+   black image it rendered before, silently. None has a test.
+
+   The hardware texture path does not serve gathers either, deliberately:
+   `cp_hardware_texture_shader_eligible()` is all-or-nothing per shader and
+   guards a measured 5.8382 ms (`DEAD_ENDS.md` entry 13), so `tld4` is its own
+   iteration and not a rider on this one. LLVM 18 has the unified `tld4`
+   intrinsic for 2D only, with no offset and no array or cube form.
 
    This is appended rather than inserted at its rank -- which is third, above
    the bounds check -- because items 1-9 are cited by number from

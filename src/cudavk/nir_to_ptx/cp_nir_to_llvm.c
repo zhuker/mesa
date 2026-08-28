@@ -2259,6 +2259,64 @@ emit_load_const(struct ntl_context *ctx, nir_load_const_instr *instr)
    }
 }
 
+/*
+ * Whether the software sampler can serve this gather.
+ *
+ * This is the predicate, and it is exported because two places have to agree
+ * on it exactly: emit_tex() below, which decides whether to call
+ * cp_tex_gather(), and cpvk_nir_sampler_opts(), which decides whether the
+ * sampler module linked into the shader was compiled with that entry point in
+ * it. If they disagree in either direction the shader either renders black or
+ * fails to link, so there is one answer and both ask it.
+ *
+ * What is refused is refused because the alternative is four wrong texels: a
+ * shadow gather compares rather than returns, a sparse one owes a residency
+ * code, an implicit-LOD one is not the base level, and the four-offset form
+ * is four gathers rather than one. They keep the (0, 0, 0, 1) the driver
+ * already returned for them.
+ */
+bool
+cp_tex_gather_supported(struct nir_tex_instr *tex)
+{
+   if (tex->op != nir_texop_tg4)
+      return false;
+   if (cp_debug->no_texture_gather)
+      return false;
+   if (tex->is_shadow || tex->is_sparse || tex->is_gather_implicit_lod)
+      return false;
+   if (nir_tex_instr_has_explicit_tg4_offsets(tex))
+      return false;
+
+   /* The targets the language has a gather for. 1D, 3D and multisampled have
+    * none, and the sampler's gather entry point does not decode them. */
+   switch (tex->sampler_dim) {
+   case GLSL_SAMPLER_DIM_2D:
+   case GLSL_SAMPLER_DIM_RECT:
+   case GLSL_SAMPLER_DIM_EXTERNAL:
+   case GLSL_SAMPLER_DIM_CUBE:
+      break;
+   default:
+      return false;
+   }
+
+   /* The offset travels in the flags word as two signed 4-bit fields, which
+    * is the -8..+7 the specification permits and no more. A dynamic one has
+    * nowhere to travel at all. */
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type != nir_tex_src_offset)
+         continue;
+      if (!nir_src_is_const(tex->src[i].src))
+         return false;
+      for (unsigned c = 0; c < nir_src_num_components(tex->src[i].src); c++) {
+         int64_t off = nir_src_comp_as_int(tex->src[i].src, c);
+         if (off < -8 || off > 7)
+            return false;
+      }
+   }
+
+   return true;
+}
+
 static int32_t
 cp_tex_flags(const nir_tex_instr *tex)
 {
@@ -2290,6 +2348,26 @@ cp_tex_flags(const nir_tex_instr *tex)
       flags |= CP_TEX_LOD;
    else if (tex->op == nir_texop_txb)
       flags |= CP_TEX_BIAS;
+   else if (tex->op == nir_texop_tg4) {
+      /* Which component of the four texels, and where the footprint sits.
+       * The component is an operand of the instruction rather than a source,
+       * and dropping it is the failure that survives getting one gather
+       * right: every component then returns component 0. */
+      flags |= CP_TEX_GATHER |
+               ((int32_t)tex->component << CP_TEX_GATHER_COMP_SHIFT);
+      for (unsigned i = 0; i < tex->num_srcs; i++) {
+         if (tex->src[i].src_type != nir_tex_src_offset ||
+             !nir_src_is_const(tex->src[i].src))
+            continue;
+         unsigned comps = nir_src_num_components(tex->src[i].src);
+         if (comps > 0)
+            flags |= ((int32_t)nir_src_comp_as_int(tex->src[i].src, 0) &
+                      CP_TEX_GATHER_OFF_MASK) << CP_TEX_GATHER_OFF_X_SHIFT;
+         if (comps > 1)
+            flags |= ((int32_t)nir_src_comp_as_int(tex->src[i].src, 1) &
+                      CP_TEX_GATHER_OFF_MASK) << CP_TEX_GATHER_OFF_Y_SHIFT;
+      }
+   }
 
    return flags;
 }
@@ -2511,7 +2589,7 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
    bool supported = flags >= 0 && tex_handle && coord &&
       (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
        tex->op == nir_texop_txb || tex->op == nir_texop_txf ||
-       tex->op == nir_texop_txf_ms);
+       tex->op == nir_texop_txf_ms || cp_tex_gather_supported(tex));
 
    if (ctx->hardware_texture) {
       /* Shader admission makes both values mandatory. Never link a software
@@ -2562,8 +2640,10 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
       return;
    }
 
-   /* Shadow compares, gathers and derivative-explicit samples still have to
-    * produce a value even though the sampler cannot serve them yet. */
+   /* Shadow compares, derivative-explicit samples and the gathers
+    * cp_tex_gather_supported() refuses still have to produce a value even
+    * though the sampler cannot serve them yet. It is the wrong value, and
+    * silently so: see TODO.md, correctness item 10. */
    if (!supported) {
       LLVMTypeRef ft = get_float_type(ctx, bs);
       LLVMValueRef zero = LLVMConstReal(ft, 0.0);
@@ -2655,9 +2735,12 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
    LLVMTypeRef param_types[] = { i64, i64, f32, f32, f32, f32, i32, i32 };
    LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, 8, false);
 
-   const char *sample_name =
-      (flags & CP_TEX_TARGET_MASK) == CP_TEX_3D &&
-      !(flags & CP_TEX_FETCH) ? "cp_tex_sample_3d" : "cp_tex_sample";
+   const char *sample_name = "cp_tex_sample";
+   if (flags & CP_TEX_GATHER)
+      sample_name = "cp_tex_gather";
+   else if ((flags & CP_TEX_TARGET_MASK) == CP_TEX_3D &&
+            !(flags & CP_TEX_FETCH))
+      sample_name = "cp_tex_sample_3d";
    LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, sample_name);
    if (!fn)
       fn = LLVMAddFunction(ctx->module, sample_name, fn_type);

@@ -1089,6 +1089,24 @@ enum cp_tex_target {
 #define CP_TEX_LOD         0x20
 /* texture(..., bias): explicit_lod is added to the computed level. */
 #define CP_TEX_BIAS        0x40
+/*
+ * textureGather(): return one component of each of the four texels a linear
+ * filter would have blended, at the base level, unfiltered and unweighted.
+ * The rest of the word says which component and where the footprint sits.
+ */
+#define CP_TEX_GATHER      0x80
+/* Which component of each texel a gather returns, 0-3, in bits 8-9. */
+#define CP_TEX_GATHER_COMP_SHIFT  8
+#define CP_TEX_GATHER_COMP_MASK   0x3
+/*
+ * textureGatherOffset()'s constant offset, applied to the footprint in texel
+ * space: two signed 4-bit fields, which is exactly the -8..+7 the spec allows
+ * and what the flags word has room for. Zero is no offset, so nothing has to
+ * say whether an offset is present.
+ */
+#define CP_TEX_GATHER_OFF_X_SHIFT 10
+#define CP_TEX_GATHER_OFF_Y_SHIFT 14
+#define CP_TEX_GATHER_OFF_MASK    0xF
 
 /* Mirrors the subset of pipe_sampler_state the sampler actually uses. */
 struct cp_sampler_info {

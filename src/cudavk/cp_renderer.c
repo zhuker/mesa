@@ -3539,10 +3539,10 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
        (sampler_variant ||
         fs->num_sampler_variants < CP_MAX_SAMPLER_VARIANTS) &&
        (!base_exec->tune_cap || base_exec->tune_done)) {
-      char *sampler_ptx = cp_compile_sampler_variant(cp->dev->sm_major,
-                                                     cp->dev->sm_minor,
-                                                     resolved_samplers,
-                                                     fs->uses_tex_3d);
+      char *sampler_ptx = cp_compile_sampler_variant(
+         cp->dev->sm_major, cp->dev->sm_minor, resolved_samplers,
+         (fs->uses_tex_3d ? CP_SAMPLER_3D : 0) |
+         (fs->uses_tex_gather ? CP_SAMPLER_GATHER : 0));
       if (sampler_ptx) {
          cp_shader_build_sampler_variant(fs, sampler_ptx, resolved_samplers,
                                          fs->num_tex_descs, exec_mode);

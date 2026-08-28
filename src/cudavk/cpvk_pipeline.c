@@ -776,9 +776,19 @@ cpvk_nir_uses_tex(const nir_shader *nir)
    return false;
 }
 
-static bool
-cpvk_nir_uses_tex_3d(const nir_shader *nir)
+/*
+ * Which of the sampler's optional entry points this shader needs compiled in.
+ *
+ * The gather answer is not decided here: it is cp_tex_gather_supported(),
+ * which is also what the backend asks before it emits the call, because a
+ * shader that calls cp_tex_gather() into a module built without it does not
+ * link at all.
+ */
+static unsigned
+cpvk_nir_sampler_opts(const nir_shader *nir)
 {
+   unsigned opts = 0;
+
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -788,26 +798,30 @@ cpvk_nir_uses_tex_3d(const nir_shader *nir)
             if (tex->sampler_dim == GLSL_SAMPLER_DIM_3D &&
                 (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
                  tex->op == nir_texop_txb))
-               return true;
+               opts |= CP_SAMPLER_3D;
+            if (cp_tex_gather_supported(tex))
+               opts |= CP_SAMPLER_GATHER;
          }
       }
    }
-   return false;
+   return opts;
 }
 
 static const char *
-cpvk_sampler_ptx(struct cpvk_device *dev, bool enable_3d)
+cpvk_sampler_ptx(struct cpvk_device *dev, unsigned opts)
 {
    struct cp_kernels *kernels = &dev->cp_dev.kernels;
-   if (!enable_3d)
+   if (!opts)
       return kernels->sampler_ptx;
 
-   /* The z-filtering entry point nearly doubles the sampler module and costs
-    * about two seconds of NVRTC/JIT work. Compile it only for a pipeline that
-    * actually contains a 3D texture instruction, rather than charging every
-    * Vulkan process at device creation. */
+   assert(opts < CP_SAMPLER_OPT_COUNT);
+
+   /* The z-filtering entry point nearly doubles the sampler module, and each
+    * combination costs about two seconds of NVRTC/JIT work. Compile one only
+    * for a pipeline that actually contains the instruction that needs it,
+    * rather than charging every Vulkan process at device creation. */
    simple_mtx_lock(&dev->shader_cache_lock);
-   const char *ptx = kernels->sampler_3d_ptx;
+   const char *ptx = kernels->sampler_opt_ptx[opts];
    simple_mtx_unlock(&dev->shader_cache_lock);
    if (ptx)
       return ptx;
@@ -815,14 +829,14 @@ cpvk_sampler_ptx(struct cpvk_device *dev, bool enable_3d)
    /* NVRTC is slow; do not serialize unrelated pipeline-cache operations
     * behind it. Two racing first users may compile the same source, but only
     * one result is retained. */
-   char *compiled = cp_compile_sampler_3d(dev->pdev->sm_major,
-                                          dev->pdev->sm_minor);
+   char *compiled = cp_compile_sampler_opts(dev->pdev->sm_major,
+                                            dev->pdev->sm_minor, opts);
    simple_mtx_lock(&dev->shader_cache_lock);
-   if (!kernels->sampler_3d_ptx)
-      kernels->sampler_3d_ptx = compiled;
+   if (!kernels->sampler_opt_ptx[opts])
+      kernels->sampler_opt_ptx[opts] = compiled;
    else
       free(compiled);
-   ptx = kernels->sampler_3d_ptx;
+   ptx = kernels->sampler_opt_ptx[opts];
    simple_mtx_unlock(&dev->shader_cache_lock);
    return ptx;
 }
@@ -875,14 +889,17 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       pipeline->local_size[2] = nir->info.workgroup_size[2];
 
       bool uses_tex = cpvk_nir_uses_tex(nir);
-      bool uses_tex_3d = cpvk_nir_uses_tex_3d(nir);
-      const char *sampler_ptx = cpvk_sampler_ptx(dev, uses_tex_3d);
+      unsigned sampler_opts = cpvk_nir_sampler_opts(nir);
+      const char *sampler_ptx = cpvk_sampler_ptx(dev, sampler_opts);
       pipeline->bin = cp_compile_nir_to_ptx(
          nir, dev->pdev->sm_major, dev->pdev->sm_minor,
          uses_tex ? sampler_ptx : NULL, NULL, NULL,
          false, false, false, false);
-      if (pipeline->bin)
-         pipeline->bin->uses_tex_3d = uses_tex_3d;
+      if (pipeline->bin) {
+         pipeline->bin->uses_tex_3d = (sampler_opts & CP_SAMPLER_3D) != 0;
+         pipeline->bin->uses_tex_gather =
+            (sampler_opts & CP_SAMPLER_GATHER) != 0;
+      }
       ralloc_free(mem_ctx);
 
       if (!pipeline->bin ||
@@ -1164,8 +1181,8 @@ cpvk_compile_stage(struct cpvk_device *dev,
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
-   bool uses_tex_3d = cpvk_nir_uses_tex_3d(nir);
-   const char *sampler_ptx = cpvk_sampler_ptx(dev, uses_tex_3d);
+   unsigned sampler_opts = cpvk_nir_sampler_opts(nir);
+   const char *sampler_ptx = cpvk_sampler_ptx(dev, sampler_opts);
    bool frag = stage->stage == VK_SHADER_STAGE_FRAGMENT_BIT;
    struct cp_shader_binary *bin =
       cp_compile_nir_to_ptx(nir, dev->pdev->sm_major, dev->pdev->sm_minor,
@@ -1174,8 +1191,10 @@ cpvk_compile_stage(struct cpvk_device *dev,
                              cp_debug->no_inline_fs, cp_debug->inline_fs,
                              cp_debug->force_fused_fs,
                              cp_debug->texture_cache);
-   if (bin)
-      bin->uses_tex_3d = uses_tex_3d;
+   if (bin) {
+      bin->uses_tex_3d = (sampler_opts & CP_SAMPLER_3D) != 0;
+      bin->uses_tex_gather = (sampler_opts & CP_SAMPLER_GATHER) != 0;
+   }
    ralloc_free(mem_ctx);
 
    /* A small shader which calls the dynamic sampler helper cannot amortise a

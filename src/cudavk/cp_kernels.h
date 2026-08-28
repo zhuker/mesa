@@ -7,6 +7,18 @@
 struct cp_sampler_info;
 struct cp_tex_desc_ref;
 
+/*
+ * The sampler's optional entry points. Neither is in the module by default:
+ * the 3D one nearly doubles it, and both cost NVRTC time every shader that
+ * links them would otherwise not pay. A pipeline that contains no 3D sample
+ * and no gather therefore links exactly the bytes it linked before either
+ * existed, which is what keeps a new entry point out of the register
+ * allocation of the 64 capture shaders that do not use it.
+ */
+#define CP_SAMPLER_3D        (1u << 0)
+#define CP_SAMPLER_GATHER    (1u << 1)
+#define CP_SAMPLER_OPT_COUNT 4
+
 struct cp_kernels {
    /* The PDL level the modules were compiled at: which griddepcontrol.wait
     * instructions are actually in the binaries. Set by cp_kernels_init() from
@@ -98,7 +110,14 @@ struct cp_kernels {
     * samples textures. Owned here; see cp_compile_nir_to_ptx(). */
    char *sampler_ptx;
    char *math_ptx;
-   char *sampler_3d_ptx;
+   /*
+    * The same sampler with one or both of its optional entry points compiled
+    * in, indexed by the CP_SAMPLER_* bits. Each one costs module size and
+    * about two seconds of NVRTC work, so they are compiled when a pipeline
+    * first needs one and not at device creation. Slot 0 is `sampler_ptx` and
+    * stays empty.
+    */
+   char *sampler_opt_ptx[CP_SAMPLER_OPT_COUNT];
    char *fs_helper_ptx;
 
    bool initialized;
@@ -152,9 +171,9 @@ bool cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
                      struct disk_cache *disk_cache);
 void cp_kernels_destroy(struct cp_kernels *k);
 
-char *cp_compile_sampler_3d(int sm_major, int sm_minor);
+char *cp_compile_sampler_opts(int sm_major, int sm_minor, unsigned opts);
 char *cp_compile_sampler_variant(int sm_major, int sm_minor,
                                  const struct cp_sampler_info *info,
-                                 bool enable_3d);
+                                 unsigned opts);
 
 #endif

@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 struct nir_shader;
+struct nir_tex_instr;
 struct cp_sampler_info;
 
 #define CP_MAX_IO_SLOTS 32
@@ -194,6 +195,10 @@ struct cp_shader_binary {
    bool hw_inline_fallback_reported;
 
    bool uses_tex_3d;
+   /* Whether any textureGather() in the shader is one the sampler serves, and
+    * therefore whether the sampler module linked in has cp_tex_gather() in
+    * it. Both answers come from cp_tex_gather_supported(). */
+   bool uses_tex_gather;
 
    /* Whether the shader reads gl.VertexIndex. Only then does a non-indexed
     * draw have to materialise the vertex id array the shader reads from. */
@@ -296,6 +301,11 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
 
 void
 cp_shader_binary_destroy(struct cp_shader_binary *bin);
+
+/* Whether the software sampler serves this textureGather. The compiler and
+ * the pipeline both ask, and a disagreement is a shader that fails to link
+ * against cp_tex_gather() or one that silently renders black. */
+bool cp_tex_gather_supported(struct nir_tex_instr *tex);
 
 bool cp_shader_build_sampler_variant(struct cp_shader_binary *bin,
                                      const char *sampler_ptx,

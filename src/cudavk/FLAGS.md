@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-120 switches.
+121 switches.
 
 ## Tracing
 
@@ -70,6 +70,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_NO_PDL` | bool (value) | `off` | — | issue every kernel with an ordinary launch again, so that no dependent kernel starts before its predecessor in the same stream has drained; the revert for the programmatic dependent launch default |
 | `CUDAVK_PDL` | uint | `3` | — | how much of the driver runs its dependent kernels with the programmatic stream serialization attribute, so that a kernel may start before its predecessor on the same stream has drained: 0 none, 1 the A-buffer scan chain, 2 also the rasterizer stage links, 3 also the fragment writeback and the segment scatter, 4 also offers stage 1, which is a diagnostic rather than a default: most of those links are expected to refuse themselves and the counters are the measurement. The default is 3; lower it to bisect a regression, raise it to 4 to measure stage 1, and see CUDAVK_NO_PDL for the plain revert. Needs compute capability 9.0 and CUDA 11.8, and any link whose predecessor turns out not to be the named kernel falls back to an ordinary launch |
 | `CUDAVK_NO_SAMPLER_VARIANT` | bool (value) | `off` | — | disable literal-state fragment sampler variants |
+| `CUDAVK_NO_TEXTURE_GATHER` | bool (value) | `off` | — | refuse every textureGather() again, so that it returns the constant 0 0 0 1 the driver returned before the sampler could serve one |
 | `CUDAVK_NO_GPU_SEM_WAIT` | bool (value) | `off` | — | block the submitting thread on a queue-submit wait semaphore instead of making the renderer stream wait on its completion event |
 | `CUDAVK_NO_TEXTURE_CACHE` | bool (value) | `off` | — | disable direct CUDA hardware-texture fragment execution; fall back to software sampling |
 | `CUDAVK_TEXTURE_CACHE_FAIL_TABLE_UPLOAD_AT` | uint | `0` | — | fault injection: fail the Nth hardware texture table upload enqueue |
