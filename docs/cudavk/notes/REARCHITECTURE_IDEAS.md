@@ -234,6 +234,35 @@ time (present path, completion waits). If the stall is the replayer's own
 frame pacing, this idea is worth ~0 on these captures and must be argued on an
 interop/real-app workload instead.
 
+**PROBE ANSWERED, 2026-08-28 — the stall is the replayer, and E is worth ~0
+on these captures.** The old capture replayed on the native NVIDIA driver
+(`/tmp/rearch-probe/native-old-cpu/`, fps plugin, full 3,022 submits): frame
+median **2.879 ms** with the two half-intervals nearly symmetric (1.535 /
+1.340), wall 5.08 s against **4.88 s of replayer CPU (96% of one core, sys
+2.57 s of it — the 2.4 GB capture read and mapped-memory rewrites)**, GPU
+utilisation sampled at **0–1%** throughout. The native driver renders these
+frames in ~no GPU time; ~2.9 ms/frame is the replayer decoding the next frame
+on the same thread that calls `vkQueueSubmit`. That work exists identically
+under cudavk, and since the replayer is single-threaded it can only run
+between submits — which is where cudavk's 2.453 ms "unexplained" inter-submit
+stall sits. The stall is a harness floor, not driver time. Three consequences:
+
+- **cudavk's device-idle budget shrinks.** Of the 3.70 ms device idle, ~2.45
+  is replayer time no driver change can touch; the honest scheduling headroom
+  is ~1.25 ms/frame plus whatever device work can be made to *ride* the
+  replayer window (today the host has drained everything before submit
+  returns, so the window is wasted overlap space — one more argument for B/C:
+  decisions removed means device work spills into that window for free).
+- **A dedicated submit thread cannot win on these captures** — the app thread
+  *is* the bottleneck during the stall. E must be argued on a real-app or
+  interop workload, exactly as the caveat above predicted.
+- **Cross-arm comparisons stay valid but percentages are understated.** The
+  ~2.9 ms floor is additive and driver-independent (same replayer, same
+  capture), so A/B deltas are unaffected; but "frame time" overstates the
+  driver's own cost by ~2.5–2.9 ms on every capture number in this project,
+  and a driver improvement's percentage should be judged against the
+  replayer-floor-subtracted frame.
+
 ---
 
 ## Idea F — Device-side chaining of serial episode tails (CDP2 fire-and-forget)
@@ -286,8 +315,9 @@ way three iterations have ever been spent here":
 2. **A's probe** (address-masked recipe recurrence + slot high-water) — one
    census.
 3. **B's probe #1** (retry rate at the drain) — rides in the same run as 1.
-4. **E's probe** (attribute the inter-submit stall) — independent, closes an
-   open question in `PERFORMANCE.md` §5.2b either way.
+4. **E's probe** (attribute the inter-submit stall) — **DONE 2026-08-28**:
+   the stall is the GFXR replayer's own CPU time (see Idea E), which closes
+   §5.2b's open question and parks E on these captures.
 5. Only then decide between B-via-A (graphs+conditional nodes) and B-fallback
    (predicated chains + F), with C in either case; D stays parked unless B/C
    both die.
