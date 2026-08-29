@@ -268,6 +268,7 @@ if dep_vulkan_loader.found()
     'cpvk_timeline_semaphore',
     'cpvk_tex',
     'cpvk_tex3d',
+    'cpvk_texgrad',
     'cpvk_tri',
     'cpvk_ubo',
     'cpvk_uint_attachment',
@@ -293,6 +294,9 @@ if dep_vulkan_loader.found()
     endif
     if test_name == 'cpvk_fixed_edge'
       cpvk_seed_canary_exe = test_exe
+    endif
+    if test_name == 'cpvk_texgrad'
+      cpvk_texgrad_exe = test_exe
     endif
   endforeach
 
@@ -331,6 +335,13 @@ if dep_vulkan_loader.found()
   test('cpvk_vfetch_seed_gate', prog_python,
        args : [files('tests/cpvk_vfetch_seed_gate.py'), cpvk_seed_canary_exe],
        suite : 'cudavk', env : cpvk_test_env, timeout : 300,
+       is_parallel : false,
+       depends : [libvulkan_cudavk, cpvk_devenv_icd])
+  # textureGrad on the software sampler as well as on the hardware texture
+  # path: the plain test qualifies for the latter and would pass at HEAD.
+  test('cpvk_texgrad_gate', prog_python,
+       args : [files('tests/cpvk_texgrad_gate.py'), cpvk_texgrad_exe],
+       suite : 'cudavk', env : cpvk_test_env, timeout : 120,
        is_parallel : false,
        depends : [libvulkan_cudavk, cpvk_devenv_icd])
   test('cpvk_texture_cache_formats_gate', prog_python,

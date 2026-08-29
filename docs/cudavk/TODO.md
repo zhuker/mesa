@@ -93,13 +93,40 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
    the wrap modes, the border colour and a constant `textureGatherOffset()`,
    and `cp_tex_gather()` in the sampler returns the four texels in the spec's
    order. `src/cudavk/tests/cpvk_gather.c` covers it and passes on this
-   driver, on lavapipe and on NVIDIA. What still falls to the placeholder
-   constant `0 0 0 1` at `cp_nir_to_llvm.c` is the rest of that predicate:
-   shadow compares, `textureGrad`, sparse residency, a gather with an implicit
-   LOD, the four-offset `textureGatherOffsets()` form, and a gather with a
-   dynamic offset. Nothing warns and nothing counts any of them, which is the
-   part of this item that has not changed -- a refused gather renders the same
-   black image it rendered before, silently. None has a test.
+   driver, on lavapipe and on NVIDIA.
+
+   `textureGrad()` is served now too. `nir_texop_txd` is in emit_tex()'s
+   supported set, and `cp_grad_lod()` collapses the explicit gradients to
+   `log2(max(|dPdx * size|, |dPdy * size|))` -- the same arithmetic, down to
+   the lg2 approximation, that the quad-shuffle path at `cp_sampler.cu:942`
+   runs for an implicit sample -- so what reaches the sampler is an ordinary
+   `CP_TEX_LOD` sample and no sampler ABI changed. `cpvk_texgrad.c` and
+   `cpvk_texgrad_gate.py` cover it on both fragment paths and it passes on
+   this driver, on lavapipe and on NVIDIA. **What that approximation loses is
+   the footprint's shape**: the anisotropic filter cannot see the two gradient
+   vectors, so a `textureGrad()` at a grazing angle is filtered isotropically
+   at the long axis' level -- blurrier than the hardware, never aliased. A
+   `CP_TEX_GRAD` flag carrying four more floats through the
+   `cp_tex_sample_2d` ABI is what would fix that, and it is the size of the
+   gather commit; nothing has measured it as worth doing.
+
+   **`textureGrad()` is still only as good as the gradients it is handed, and
+   on this driver a shader's own gradients are zero** -- `nir_intrinsic_ddx`
+   and `ddy` return a constant zero at `cp_nir_to_llvm.c`, so a shader that
+   computes its footprint with `dFdx`/`dFdy` and passes it to `textureGrad()`
+   samples the base level. That is what the favorite2 capture does, and it is
+   correct-but-blurry rather than black. See item 12.
+
+   What still falls to the placeholder constant `0 0 0 1` at
+   `cp_nir_to_llvm.c` is the rest of that predicate: shadow compares, sparse
+   residency, a gather with an implicit LOD, the four-offset
+   `textureGatherOffsets()` form, and a gather with a dynamic offset. **They
+   are no longer silent**: `warn_placeholder_once()` names the operation on
+   stderr the first time each one is emitted, unconditionally and not behind a
+   debug flag, for the reason `warn_undef_once()` gives -- a full replay of
+   favorite2 compiled without a single warning while every `textureGrad()` in
+   it returned the constant and painted whole surfaces black. Nothing counts
+   them, and none of the remaining ones has a test.
 
    The hardware texture path does not serve gathers either, deliberately:
    `cp_hardware_texture_shader_eligible()` is all-or-nothing per shader and
@@ -134,6 +161,38 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
    (`/home/alexzhukov/gather-validation/DRAW_BISECT.md`).
 
    Appended for the same reason item 10 was.
+
+12. **`dFdx` and `dFdy` return zero.** `emit_intrinsic()` in
+   `cp_nir_to_llvm.c` answers all six derivative intrinsics with a constant
+   null, and its comment says why: "The fragment stage runs one thread per
+   pixel with no quad neighbours, so a general derivative isn't available."
+   **That comment is stale and the rest of the driver contradicts it.** The
+   fragment stage shades 2x2 quads -- `cp_fs.cu` walks a quad stream, a quad's
+   four slots are lanes `4q..4q+3`, and a slot the coverage mask does not name
+   is interpolated exactly like a covered one so the quad is whole. The
+   renderer publishes that fact to the sampler as the module global
+   `cp_quad_derivs` (`cp_renderer.c`, set to 1 for every graphics launch and
+   to 0 for compute), the sampler's implicit-LOD path shuffles across the quad
+   on the strength of it (`cp_sampler.cu:942`), and `cp_nir_to_llvm.c` already
+   has `cp_quad_derivative()`, which builds exactly this shuffle and is used
+   by the hardware texture path for implicit LOD.
+
+   So the missing piece is wiring, not architecture: the six intrinsics could
+   call `cp_quad_derivative()` on their operand. What has to be decided first
+   is what to do in compute, where there is no quad and `cp_quad_derivs` is 0,
+   and whether a quad's uncovered slots carry a coordinate good enough to
+   difference -- the sampler already accepts that for mip selection, and a
+   derivative is held to a higher standard.
+
+   It matters because it bounds what item 10's `textureGrad()` can do. The
+   favorite2 surface shader computes its footprint with `dFdx`/`dFdy` and
+   hands it to four `textureGrad()` calls, so it is handed zero, and a zero
+   footprint samples the base level: correct texels, no mip filtering, so
+   minified normal maps alias instead of turning black. Measured:
+   `abs(dFdx(gl_FragCoord.x))` is 0.0 on cudavk and 1.0 on NVIDIA
+   (`.audit/favorite2_shading.md`, probe V2).
+
+   Appended for the same reason items 10 and 11 were.
 
 ## Vulkan surface not implemented
 

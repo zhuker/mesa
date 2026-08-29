@@ -644,21 +644,50 @@ cp_image_format_size(enum pipe_format format, unsigned fallback_bits)
  * dedup gives up and repeats, which is the right way to degrade: something is
  * very wrong by then and the first lines have already been printed.
  */
-static void
-warn_undef_once(const char *what, const char *name)
+static bool
+first_mention(const char *name)
 {
    static const char *said[32];
    static unsigned num_said;
 
    for (unsigned i = 0; i < num_said; i++)
       if (said[i] == name)
-         return;
+         return false;
 
    if (num_said < ARRAY_SIZE(said))
       said[num_said++] = name;
 
+   return true;
+}
+
+static void
+warn_undef_once(const char *what, const char *name)
+{
+   if (!first_mention(name))
+      return;
+
    fprintf(stderr, "cudavk: %s '%s' is not implemented — the shader using "
            "it computes on undef and will render wrong.\n", what, name);
+}
+
+/*
+ * The same contract for the branches that emit a plausible *constant* instead
+ * of undef, which is the worse of the two: undef can fold a shader to
+ * something visibly broken, whereas (0, 0, 0, 1) survives every downstream
+ * operation and renders a picture. A full replay of the favorite2 capture
+ * compiled without a single warning while every textureGrad() in it returned
+ * that constant, and the black surfaces it produced took a per-draw bisect
+ * and a shader-replacement probe to trace back here.
+ */
+static void
+warn_placeholder_once(const char *what, const char *name)
+{
+   if (!first_mention(name))
+      return;
+
+   fprintf(stderr, "cudavk: %s '%s' is not implemented — the shader using it "
+           "reads the constant (0, 0, 0, 1) and will render wrong.\n",
+           what, name);
 }
 
 static void
@@ -2353,6 +2382,30 @@ emit_load_const(struct ntl_context *ctx, nir_load_const_instr *instr)
  * is four gathers rather than one. They keep the (0, 0, 0, 1) the driver
  * already returned for them.
  */
+/* A stable name per texture op for warn_placeholder_once(), which dedups on
+ * the pointer. NIR has no name table for these the way nir_op_infos is one for
+ * ALU ops, so this is it; a literal has one address per call site. */
+static const char *
+cp_texop_name(const nir_tex_instr *tex)
+{
+   switch (tex->op) {
+   case nir_texop_tex:              return tex->is_shadow ? "texture (shadow compare)"
+                                                          : "texture";
+   case nir_texop_txb:              return "textureLodBias";
+   case nir_texop_txl:              return "textureLod";
+   case nir_texop_txd:              return "textureGrad";
+   case nir_texop_txf:              return "texelFetch";
+   case nir_texop_txf_ms:           return "texelFetch (multisampled)";
+   case nir_texop_tg4:              return tex->is_shadow ? "textureGather (shadow compare)"
+                                                          : "textureGather";
+   case nir_texop_lod:              return "textureQueryLod";
+   case nir_texop_query_levels:     return "textureQueryLevels";
+   case nir_texop_texture_samples:  return "textureSamples";
+   case nir_texop_samples_identical: return "textureSamplesIdentical";
+   default:                         return "this texture op";
+   }
+}
+
 bool
 cp_tex_gather_supported(struct nir_tex_instr *tex)
 {
@@ -2423,6 +2476,12 @@ cp_tex_flags(const nir_tex_instr *tex)
    if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
       flags |= CP_TEX_FETCH;
    else if (tex->op == nir_texop_txl)
+      flags |= CP_TEX_LOD;
+   else if (tex->op == nir_texop_txd)
+      /* textureGrad() names a footprint rather than a level. emit_tex()
+       * collapses that footprint to a level with cp_grad_lod(), so what
+       * reaches the sampler is an ordinary explicit-LOD sample and the
+       * sampler needs no explicit-gradient path of its own. */
       flags |= CP_TEX_LOD;
    else if (tex->op == nir_texop_txb)
       flags |= CP_TEX_BIAS;
@@ -2529,6 +2588,129 @@ cp_quad_derivative(struct ntl_context *ctx, LLVMValueRef value, bool y)
                           y ? "ddy" : "ddx");
 }
 
+/* One axis of the texture's base level, as a float, from the sampler's own
+ * cp_tex_size(). Level 0 here is the view's base level, which is what the
+ * shader's coordinates are normalised against. */
+static LLVMValueRef
+cp_tex_dim(struct ntl_context *ctx, LLVMValueRef tex_handle, unsigned comp)
+{
+   LLVMTypeRef f32 = LLVMFloatTypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx->llvm_ctx);
+   LLVMTypeRef params[] = { i64, i32, i32 };
+   LLVMTypeRef fn_type = LLVMFunctionType(i32, params, 3, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, "cp_tex_size");
+   if (!fn)
+      fn = LLVMAddFunction(ctx->module, "cp_tex_size", fn_type);
+   LLVMValueRef args[] = { tex_handle, LLVMConstInt(i32, 0, false),
+                           LLVMConstInt(i32, comp, false) };
+   LLVMValueRef sz = LLVMBuildCall2(ctx->builder, fn_type, fn, args, 3,
+                                    "texdim");
+   return LLVMBuildSIToFP(ctx->builder, sz, f32, "");
+}
+
+/*
+ * The level of detail an explicit-gradient sample asks for.
+ *
+ * textureGrad() hands over the derivatives of the texture coordinate instead
+ * of a level. The software sampler has no explicit-gradient path -- its LOD
+ * has exactly three sources, a fetch's level, textureLod()'s level and the
+ * quad shuffle at cp_sampler.cu:942 -- so the footprint is collapsed to a
+ * level here and an ordinary explicit-LOD sample is emitted. Before this,
+ * nir_texop_txd was not in emit_tex()'s supported set at all and every
+ * textureGrad() returned the placeholder constant (0, 0, 0, 1).
+ *
+ * The rule is the specification's isotropic one,
+ *
+ *     lambda = log2(max(|dPdx * size|, |dPdy * size|))
+ *
+ * computed as 0.5 * log2(max of the squared lengths) so that no square root
+ * is needed. It is deliberately the same arithmetic the quad-shuffle path
+ * runs, down to using the lg2 approximation rather than a precise log2: a
+ * shader that samples one texture implicitly and another with textureGrad()
+ * must not see two different mip chains for the same footprint.
+ *
+ * What this approximation loses against a true gradient sample is the
+ * *shape* of the footprint. cp_sampler.cu's anisotropic filter builds its tap
+ * direction from the two gradient vectors, and only the collapsed scalar
+ * reaches it, so a textureGrad() on a grazing surface is filtered
+ * isotropically at the long axis' level: blurrier than the hardware, never
+ * aliased. On a cube the direction derivative is scaled onto the face by the
+ * face transform's 0.5/|major| and the derivative of |major| itself is
+ * dropped, so a footprint straddling a face edge gets a level that is close
+ * rather than exact.
+ */
+static LLVMValueRef
+cp_grad_lod(struct ntl_context *ctx, LLVMValueRef tex_handle,
+            LLVMValueRef ddx, LLVMValueRef ddy, unsigned ncomp, bool cube,
+            LLVMValueRef *coord)
+{
+   LLVMTypeRef f32 = LLVMFloatTypeInContext(ctx->llvm_ctx);
+
+   if (ncomp > 3)
+      ncomp = 3;
+
+   /* Texels per unit of coordinate, per axis. */
+   LLVMValueRef scale[3];
+   if (cube) {
+      /* A cube coordinate is a direction, and the face coordinate it becomes
+       * is (s, t) / |major| * 0.5 + 0.5, so a direction derivative is a face
+       * derivative scaled by 0.5 / |major|. Faces are square, so one axis
+       * serves for both. */
+      LLVMValueRef ma = NULL;
+      for (unsigned i = 0; i < 3; i++) {
+         LLVMValueRef a = build_intrinsic(ctx, "llvm.fabs", &coord[i], 1);
+         if (!ma) {
+            ma = a;
+         } else {
+            LLVMValueRef two[] = { ma, a };
+            ma = build_intrinsic(ctx, "llvm.maxnum", two, 2);
+         }
+      }
+      /* A zero direction selects no face; keep the divide finite rather than
+       * handing the sampler a NaN level. */
+      LLVMValueRef floor_args[] = { ma, LLVMConstReal(f32, 1e-8) };
+      ma = build_intrinsic(ctx, "llvm.maxnum", floor_args, 2);
+      LLVMValueRef half_face =
+         LLVMBuildFMul(ctx->builder, cp_tex_dim(ctx, tex_handle, 0),
+                       LLVMConstReal(f32, 0.5), "");
+      LLVMValueRef k = LLVMBuildFDiv(ctx->builder, half_face, ma, "");
+      scale[0] = scale[1] = scale[2] = k;
+   } else {
+      for (unsigned i = 0; i < ncomp; i++)
+         scale[i] = cp_tex_dim(ctx, tex_handle, i);
+   }
+
+   LLVMValueRef len2[2] = { NULL, NULL };
+   LLVMValueRef grad[2] = { ddx, ddy };
+   for (unsigned g = 0; g < 2; g++) {
+      for (unsigned i = 0; i < ncomp; i++) {
+         LLVMValueRef v = LLVMBuildFMul(ctx->builder,
+            cp_float_component(ctx, grad[g], i), scale[i], "");
+         LLVMValueRef sq = LLVMBuildFMul(ctx->builder, v, v, "");
+         len2[g] = len2[g] ? LLVMBuildFAdd(ctx->builder, len2[g], sq, "")
+                           : sq;
+      }
+   }
+
+   LLVMValueRef rho2 = build_intrinsic(ctx, "llvm.maxnum", len2, 2);
+   LLVMValueRef lod = build_nvvm_intrinsic(ctx, "llvm.nvvm.lg2.approx.f",
+                                           &rho2, 1);
+   lod = LLVMBuildFMul(ctx->builder, lod, LLVMConstReal(f32, 0.5), "grad_lod");
+
+   /*
+    * A zero gradient is log2(0) = -inf, and -inf survives the sampler's
+    * min_lod/max_lod clamps as a NaN once it meets an fmax against a NaN-free
+    * bound. It also happens on every fragment of this driver today, because
+    * dFdx and dFdy return zero (see emit_intrinsic), so it is the common case
+    * rather than an edge one: an unsized footprint samples the base level.
+    */
+   LLVMValueRef positive = LLVMBuildFCmp(ctx->builder, LLVMRealOGT, rho2,
+                                         LLVMConstReal(f32, 0.0), "");
+   return LLVMBuildSelect(ctx->builder, positive, lod,
+                          LLVMConstReal(f32, 0.0), "grad_lod_safe");
+}
+
 /* Emit one static float4 bindless texture-object instruction. The site number
  * is the immutable column in the row-major handle table uploaded before this
  * launch. Implicit LOD is expressed as explicit quad gradients: compute-stage
@@ -2629,6 +2811,7 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
 
    LLVMValueRef tex_handle = NULL, samp_handle = NULL, coord = NULL;
    LLVMValueRef explicit_lod = NULL;
+   LLVMValueRef ddx = NULL, ddy = NULL;
    LLVMValueRef sampler_offset = NULL, texture_offset = NULL;
    for (unsigned i = 0; i < tex->num_srcs; i++) {
       switch (tex->src[i].src_type) {
@@ -2657,6 +2840,12 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
       case nir_tex_src_lod:
          explicit_lod = get_src(ctx, &tex->src[i].src);
          break;
+      case nir_tex_src_ddx:
+         ddx = get_src(ctx, &tex->src[i].src);
+         break;
+      case nir_tex_src_ddy:
+         ddy = get_src(ctx, &tex->src[i].src);
+         break;
       default:
          break;
       }
@@ -2664,10 +2853,15 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
 
    int32_t flags = cp_tex_flags(tex);
 
+   /* textureGrad() is served by deriving its level from the gradients; both
+    * of them have to be there, because half a footprint is not one. */
+   bool grad_supported = tex->op == nir_texop_txd && ddx && ddy;
+
    bool supported = flags >= 0 && tex_handle && coord &&
       (tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
        tex->op == nir_texop_txb || tex->op == nir_texop_txf ||
-       tex->op == nir_texop_txf_ms || cp_tex_gather_supported(tex));
+       tex->op == nir_texop_txf_ms || grad_supported ||
+       cp_tex_gather_supported(tex));
 
    if (ctx->hardware_texture) {
       /* Shader admission makes both values mandatory. Never link a software
@@ -2718,11 +2912,17 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
       return;
    }
 
-   /* Shadow compares, derivative-explicit samples and the gathers
+   /* Shadow compares, sparse samples and the gathers
     * cp_tex_gather_supported() refuses still have to produce a value even
-    * though the sampler cannot serve them yet. It is the wrong value, and
-    * silently so: see TODO.md, correctness item 10. */
+    * though the sampler cannot serve them yet. It is the wrong value, so say
+    * so -- once per operation, unconditionally, for the reason
+    * warn_undef_once() gives above: a shader that renders a plausible wrong
+    * picture is the expensive failure, and this branch was silent by design
+    * until a whole replay of a real capture compiled without a single
+    * warning while every textureGrad() in it returned (0, 0, 0, 1).
+    * See TODO.md, correctness item 10. */
    if (!supported) {
+      warn_placeholder_once("the texture operation", cp_texop_name(tex));
       LLVMTypeRef ft = get_float_type(ctx, bs);
       LLVMValueRef zero = LLVMConstReal(ft, 0.0);
       if (nc == 1) {
@@ -2789,6 +2989,14 @@ emit_tex(struct ntl_context *ctx, nir_tex_instr *tex)
             ? LLVMBuildSIToFP(ctx->builder, lod_arg, f32, "")
             : LLVMBuildBitCast(ctx->builder, lod_arg, f32, "");
       }
+   } else if (grad_supported) {
+      /* The gradient carries one component per spatial axis; an array layer
+       * has no derivative, and a cube's three are a direction. */
+      unsigned grad_comps =
+         (unsigned)tex->coord_components - (tex->is_array ? 1u : 0u);
+      bool cube = (flags & CP_TEX_TARGET_MASK) == CP_TEX_CUBE ||
+                  (flags & CP_TEX_TARGET_MASK) == CP_TEX_CUBE_ARRAY;
+      lod_arg = cp_grad_lod(ctx, tex_handle, ddx, ddy, grad_comps, cube, c);
    }
 
    /* If the coordinate is a varying straight from the rasterizer, tell the
