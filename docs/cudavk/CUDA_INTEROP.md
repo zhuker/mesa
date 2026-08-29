@@ -219,7 +219,8 @@ the renderer-private `cp->depthbuf` as `uint32` per sample, indexed
 `[(sample*height+y)*width+x]` (`cp_renderer.c:9010-9011`, `cp_clear.cu:78-80`),
 in sign-flipped sortable-uint form, not float (`cp_renderer.c:2437-2444`). The
 image is loaded at scope begin (`cp_renderer.c:8922-8926`) and stored back at
-scope end (`:8929-8938`), re-encoded to `D32_SFLOAT` or `stencil|d24`. **The
+scope end (`:8929-8938`), re-encoded to `D32_SFLOAT`, `stencil|d24` or
+`unorm16`. **The
 depth `VkImage` is only valid after `vkCmdEndRendering` with `storeOp = STORE`.**
 
 The hardware texture cache is a *derived, read-only* `CUmipmappedArray`

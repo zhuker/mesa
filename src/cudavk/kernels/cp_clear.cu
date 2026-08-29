@@ -112,13 +112,22 @@ cp_depth_attachment_load(struct cp_depth_attachment_args args)
                         (uint64_t)y * args.row_stride +
                         (uint64_t)x * args.pixel_stride;
    uint32_t *dst = (uint32_t *)(uintptr_t)args.depthbuf;
-   uint32_t packed = *(const uint32_t *)src;
    uint32_t bits;
-   if (args.format == 2) {
+   /*
+    * The read is as wide as the texel and no wider. The 32-bit load below
+    * used to be unconditional, which for a two-byte D16 texel is both
+    * misaligned and an over-read of the next texel -- and of the row after
+    * the image, on the last one.
+    */
+   if (args.format == 3) {
+      float depth = (float)*(const uint16_t *)src * (1.0f / 65535.0f);
+      bits = __float_as_uint(depth);
+   } else if (args.format == 2) {
+      uint32_t packed = *(const uint32_t *)src;
       float depth = (float)(packed & 0x00ffffffu) * (1.0f / 16777215.0f);
       bits = __float_as_uint(depth);
    } else {
-      bits = packed;
+      bits = *(const uint32_t *)src;
    }
    dst[((uint64_t)sample * args.height + y) * args.width + x] =
       bits ^ 0x80000000u;
@@ -139,7 +148,14 @@ cp_depth_attachment_store(struct cp_depth_attachment_args args)
                   (uint64_t)x * args.pixel_stride;
    uint32_t bits =
       src[((uint64_t)sample * args.height + y) * args.width + x] ^ 0x80000000u;
-   if (args.format == 2) {
+   if (args.format == 3) {
+      /* D16_UNORM: quantise to the attachment's width, and write two bytes.
+       * A 32-bit store would put the neighbouring texel's half of the word
+       * back to whatever this depth happened to be. */
+      float depth = __uint_as_float(bits);
+      depth = depth < 0.0f ? 0.0f : (depth > 1.0f ? 1.0f : depth);
+      *(uint16_t *)dst = (uint16_t)__float2uint_rn(depth * 65535.0f);
+   } else if (args.format == 2) {
       float depth = __uint_as_float(bits);
       depth = depth < 0.0f ? 0.0f : (depth > 1.0f ? 1.0f : depth);
       uint32_t old = *(uint32_t *)dst;

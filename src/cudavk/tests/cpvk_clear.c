@@ -39,6 +39,11 @@
  *   G  an in-pass stencil clear of the whole render area, which the pass's
  *      depth store is the only thing that can honour -- the same route
  *      LOAD_OP_CLEAR's stencil value takes.
+ *   I  vkCmdClearDepthStencilImage on D16_UNORM, whose texel is two bytes
+ *      wide -- half of every other depth format here. A clear that wrote a
+ *      32-bit word would take the neighbouring texel with it, and the last
+ *      one would be written past the end of the row. The stencil aspect must
+ *      be refused for it, the way it already is for D32_SFLOAT.
  *   H  the refusals, which must be refusals and not crashes or silent
  *      no-ops: a layered clear rectangle, a stencil clear of part of the
  *      render area, and a vkCmdClearAttachments outside a render pass. Each
@@ -804,6 +809,62 @@ main(void)
       vkDestroyImage(dev, image, NULL);
       vkFreeMemory(dev, memory, NULL);
       puts("H: the cases this driver cannot serve are refused, not crashed");
+   }
+
+   /* ---------------------------------------------------------------- I */
+   {
+      const uint32_t W = 8, H = 8;
+      VkImage image;
+      VkDeviceMemory memory;
+      uint8_t *map;
+      CHECK(make_image(VK_FORMAT_D16_UNORM, W, H, 1, 1,
+                       VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                       &image, &memory, (void **)&map));
+      VkImageSubresource sub = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0 };
+      VkSubresourceLayout sl;
+      vkGetImageSubresourceLayout(dev, image, &sub, &sl);
+
+      /* Two clears, so that the second has to overwrite the first: a
+       * two-byte write that was really four bytes wide would leave half of
+       * the previous value in every other texel. */
+      const struct { float depth; uint32_t want; } steps[] = {
+         { 0.25f, 16384u },   /* round(0.25 * 65535) */
+         { 1.0f,  65535u },
+      };
+      for (unsigned s = 0; s < 2; s++) {
+         VkClearDepthStencilValue v = { steps[s].depth, 0 };
+         VkImageSubresourceRange range = { VK_IMAGE_ASPECT_DEPTH_BIT,
+                                           0, 1, 0, 1 };
+         CHECK(begin_cmd());
+         vkCmdClearDepthStencilImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, &v,
+                                     1, &range);
+         CHECK(end_and_run());
+         for (uint32_t y = 0; y < H; y++) {
+            for (uint32_t x = 0; x < W; x++) {
+               uint16_t got;
+               memcpy(&got, map + sl.offset + y * sl.rowPitch + x * 2, 2);
+               if (got != steps[s].want)
+                  FAIL("I: D16 depth %.2f at (%u,%u): %u, want %u\n",
+                       steps[s].depth, x, y, got, steps[s].want);
+            }
+         }
+      }
+
+      /* D16 has no stencil aspect, and naming one is the same mistake as
+       * naming it on D32_SFLOAT. */
+      VkClearDepthStencilValue v = { 0.5f, 0x7f };
+      VkImageSubresourceRange stencil_range = { VK_IMAGE_ASPECT_STENCIL_BIT,
+                                                0, 1, 0, 1 };
+      CHECK(begin_cmd());
+      vkCmdClearDepthStencilImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, &v, 1,
+                                  &stencil_range);
+      if (vkEndCommandBuffer(cmd) == VK_SUCCESS)
+         FAIL("I: a stencil clear of a D16 image was accepted\n");
+
+      vkDestroyImage(dev, image, NULL);
+      vkFreeMemory(dev, memory, NULL);
+      puts("I: vkCmdClearDepthStencilImage writes D16 two bytes at a time");
    }
 
    vkDestroyCommandPool(dev, pool, NULL);

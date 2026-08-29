@@ -138,11 +138,11 @@ When the new path is already the default, the revert flag goes on the
 ## 4. Gate 1: the native test suite
 
 ```bash
-./venv/bin/meson test -C build-cudavk --suite cudavk                    # all 73
+./venv/bin/meson test -C build-cudavk --suite cudavk                    # all 74
 ./venv/bin/meson test -C build-cudavk --print-errorlogs cpvk_batchblend # one
 ```
 
-**73 tests**, and **73/73** is the state the branch is kept in: 55 C tests,
+**74 tests**, and **74/74** is the state the branch is kept in: 56 C tests,
 four `cpvk_vfetch` modes, thirteen Python gates and one fault-mode rerun of a C
 test, counted from the registry in `src/cudavk/meson.build`. Iteration 28
 recorded 65/65 in the default state and 65/65 with every revert flag set
