@@ -194,6 +194,29 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
 
    Appended for the same reason items 10 and 11 were.
 
+13. **A peel pass commits one depth per pixel, not one per sample.** The
+   ordered-blending peel loop keys the visibility buffer on the primitive
+   index rather than on depth, so `cp_fs_writeback` cannot read the depth the
+   rasterizer tested with out of it and takes the interpolator's
+   `gl_FragCoord.z` instead. That is the same window depth *at the pixel
+   centre*: for a single-sampled attachment it is exactly the tested value,
+   and for a multisampled one it is one value for every sample the fragment
+   won, where the rasterizer tested each sample at its own position. Nothing
+   is known to depend on it — the peel path and multisampling have never been
+   measured together — but it is an approximation and it is not written down
+   anywhere else. Committing the exact per-sample depth needs a second
+   per-pixel array written under the same atomic that picks the layer, which
+   is a bigger change than the defect it would close.
+
+   This replaced a much worse bug, which is the reason the arrangement exists:
+   the writeback used to commit the visibility buffer's high word unread, so a
+   blended draw with `depthWriteEnable` stored a *primitive index* into the
+   depth buffer, which is a negative denormal or a NaN. Every later depth test
+   at those pixels failed. `src/cudavk/tests/cpvk_blend_depth_write.c` is the
+   test and `.audit/favorite2_group2.md` is the diagnosis.
+
+   Appended for the same reason items 10, 11 and 12 were.
+
 ## Vulkan surface not implemented
 
 The driver advertises Vulkan 1.1. The Gallium driver that was removed advertised

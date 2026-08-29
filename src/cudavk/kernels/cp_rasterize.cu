@@ -153,12 +153,12 @@ cp_sample_pos(uint32_t num_samples, int s, float *ox, float *oy)
    *ox = xs[s & 7]; *oy = ys[s & 7];
 }
 
+/* The one definition is cp_rast_types.h's, so that the fragment writeback
+ * builds the same key this rasterizer tested with. */
 static __device__ __forceinline__ uint32_t
 float_to_sortable_uint(float f)
 {
-   uint32_t u = __float_as_uint(f);
-   uint32_t mask = -((int32_t)u >> 31) | 0x80000000;
-   return u ^ mask;
+   return cp_float_to_sortable_uint(f);
 }
 
 /*

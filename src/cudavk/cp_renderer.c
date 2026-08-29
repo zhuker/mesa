@@ -3858,7 +3858,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
                    float depth_scale, float depth_translate,
                    CUdeviceptr reject, CUdeviceptr resolved,
                    unsigned reject_pass, CUdeviceptr seg_ranges,
-                   unsigned num_seg_ranges)
+                   unsigned num_seg_ranges, bool prim_keyed_visbuf)
 {
    struct cp_device *screen = cp->dev;
    struct cp_shader_binary *fs = state->fs;
@@ -4115,6 +4115,13 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       .fs_out = fs_out,
       .color_out = (uint64_t)(uintptr_t)color_data,
       .visbuf = visbuf,
+      /*
+       * A peel pass keys the visibility buffer on the primitive index, not on
+       * depth, so the depth to commit is the interpolator's — see the comment
+       * over the commit in cp_fs_writeback().
+       */
+      .frag_coord = frag_coord,
+      .depth_from_frag_coord = prim_keyed_visbuf ? 1u : 0u,
       .depthbuf = cp->depthbuf,
       .pixel_counter = counter,
       .discard_mask = discard_mask,
@@ -6906,7 +6913,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                             rast_args.depth_scale, rast_args.depth_translate,
                             retry ? cp->reject : 0,
                             retry ? cp->resolved : 0,
-                            pass, 0, 0);
+                            pass, 0, 0,
+                            rast_args.blend_peel != 0);
 
       if (peel) {
          /* Step past what this pass blended, and stop once the interval finds
@@ -7848,7 +7856,10 @@ cp_opaque_finish(struct cp_context *cp)
                          seg->rast.depth_translate, 0, 0, 0,
                          ranges_dev + (size_t)group_range_base[g] *
                             sizeof(ranges[0]),
-                         group_range_count[g]);
+                         group_range_count[g],
+                         /* A segment never runs the peel loop, so its
+                          * visibility buffer is keyed on depth. */
+                         false);
    }
    cp->fs_batch = saved_fs_batch;
 }
