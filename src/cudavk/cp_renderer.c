@@ -4138,16 +4138,22 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
    };
 
    /*
-    * An attachmentless pass has no colour to write back. It reaches this
-    * function at all because its fragment shader has side effects — storage
-    * image and SSBO writes, which the shader launch above has already made —
-    * and cp_fs_writeback does nothing else that such a pass asks for: `reject`
-    * and `resolved` belong to the discard retry, which needs a colour target
-    * to be enabled at all, and depth writeback never ran for a colourless
-    * draw because the whole fragment stage used to be skipped for one. So the
-    * launch is skipped rather than given a null `color_out` to dereference.
+    * A pass with no colour attachment still needs this launch when it writes
+    * depth, because `cp_fs_writeback` is the only thing that ever writes
+    * `cp->depthbuf`: the rasterizer reads it to test against and never
+    * advances it. A depth-only pass — a shadow map — that skipped the launch
+    * left its attachment at the clear value, which is what made favorite2's
+    * shadow map uniformly far and the surfaces sampling it black.
+    *
+    * `reject` and `resolved` belong to the discard retry, which needs a
+    * colour target to be enabled at all, so a colourless draw still asks for
+    * nothing else here; the kernel returns after the depth commit when
+    * `color_out` is null rather than dereferencing it. A truly attachmentless
+    * pass — a fragment shader run purely for its storage-image and SSBO
+    * writes, which the shader launch above has already made — writes neither,
+    * and is still skipped.
     */
-   if (color_data) {
+   if (color_data || (wb.depth_write && scope->fb.has_zs)) {
       void *wb_params[] = { &wb };
       cp_nvtx_push("writeback");
       /* The kernel strides, so the grid is capped: num_pixels is the
@@ -5958,6 +5964,23 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    bool fs_side_effects = state->fs && state->fs->writes_memory;
 
    /*
+    * A depth-only pass: a depth attachment, no colour, and a fragment shader
+    * that exists only to be allowed to discard. A shadow map is the whole
+    * reason such a pass exists, and this driver committed no depth for one --
+    * cp_fs_writeback is the only writer of cp->depthbuf, and it was launched
+    * only when there was a colour to blend, so the fragment stage was skipped
+    * altogether and every draw in the pass tested against, and left behind,
+    * the clear value. favorite2's 2080x2080 D16 shadow map came out uniformly
+    * 65535 and the surfaces that sample it went black.
+    *
+    * The depth *write mask*, not the depth test, is what decides: a draw with
+    * the test off and the mask on still writes depth, which is the same
+    * condition cp_fs_writeback itself uses.
+    */
+   bool depth_commit = !color_data && fb->has_zs &&
+                       state->depth.depth_writemask;
+
+   /*
     * Blended geometry needs every layer, not the nearest one. The visibility
     * buffer resolves a single fragment per pixel, which is what makes opaque
     * overdraw cost one shade — and exactly wrong for transparency, where
@@ -6871,8 +6894,10 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       /* Shade every covered pixel by running the fragment shader on the GPU:
        * interpolate its inputs, launch it, then blend its output into the
        * attachment — or, for a shader that exists for its stores rather than
-       * for a colour, just the first two. */
-      if (color_data || fs_side_effects)
+       * for a colour, just the first two. A depth-only pass runs it for a
+       * third reason: the writeback at the end of it is what commits depth,
+       * and the shader has to run first because it may discard. */
+      if (color_data || fs_side_effects || depth_commit)
          cp_shade_fragments(cp, state, &batch->scope, info, visbuf,
                             rast_args.positions, vs_output_buf,
                             rast_args.prim_refs, num_triangles, w, h,
