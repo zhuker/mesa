@@ -222,6 +222,7 @@ if dep_vulkan_loader.found()
     'cpvk_batchpush',
     'cpvk_batchtex',
     'cpvk_bccopy',
+    'cpvk_blend_depth_write',
     'cpvk_compute_pipeline_lifetime',
     'cpvk_cubebig',
     'cpvk_cubebig_pbrsamp',

@@ -1114,14 +1114,42 @@ cp_fs_writeback_one(const struct cp_fs_writeback_args &args, uint32_t i)
    if (resolved)
       resolved[pixel] = 1;
 
-   /* This fragment survived the depth test during rasterization, so commit its
-    * depth before the next draw tests against it. */
-   if (args.depth_write && args.depthbuf && args.visbuf) {
+   /*
+    * This fragment survived the depth test during rasterization, so commit its
+    * depth before the next draw tests against it.
+    *
+    * Ordinarily the depth is already in the visibility buffer's high word,
+    * exactly as the rasterizer tested with it, inverted for a GREATER family
+    * depth function so that the same atomicMin selects the farther fragment.
+    *
+    * Not so under the ordered-blending peel loop. There emit_fragment() keys
+    * the visibility buffer on the *primitive index* instead
+    * (kernels/cp_rasterize.cu, `blend_peel`), because a peel pass selects the
+    * lowest not-yet-composited layer rather than the nearest one. Reading the
+    * high word there committed a primitive index as a depth: a small integer
+    * is a negative denormal as a sortable uint, and ~small is 0xFFFFxxxx,
+    * which is the nearest possible value and NaN when the attachment is
+    * stored. Every later depth test at those pixels then failed, which is
+    * what hid the blended glass in favorite2 -- see
+    * src/cudavk/tests/cpvk_blend_depth_write.c. The interpolator's
+    * gl_FragCoord.z is the same window depth, so take it from there.
+    */
+   if (args.depth_write && args.depthbuf &&
+       (args.visbuf || args.depth_from_frag_coord)) {
+      uint32_t fc_key = 0;
+      if (args.depth_from_frag_coord && args.frag_coord)
+         fc_key = cp_float_to_sortable_uint(
+            ((const float4 *)(uintptr_t)args.frag_coord)[i].z);
       /* Depth is per sample: only the samples this fragment won advance. */
       for (uint32_t sm = 0; sm < samples; sm++) {
          if (!(cov & (1u << sm)))
             continue;
          size_t at = (size_t)sm * plane + pixel;
+         if (args.depth_from_frag_coord) {
+            if (args.frag_coord)
+               ((uint32_t *)(uintptr_t)args.depthbuf)[at] = fc_key;
+            continue;
+         }
          uint32_t key = (uint32_t)(((const uint64_t *)(uintptr_t)args.visbuf)[at] >> 32);
          ((uint32_t *)(uintptr_t)args.depthbuf)[at] =
             args.depth_key_invert ? ~key : key;

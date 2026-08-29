@@ -753,6 +753,17 @@ struct cp_fs_writeback_args {
    uint64_t fs_out;         /* Fragment shader colour output, per covered pixel */
    uint64_t color_out;
    uint64_t visbuf;         /* Source of the depth to commit */
+   /*
+    * The interpolator's gl_FragCoord, one float4 per shaded slot. Its .z is
+    * the same window depth the rasterizer tested with, and it is the depth to
+    * commit whenever the visibility buffer's high word is *not* a depth key
+    * — which is every pass of the ordered-blending peel loop, where
+    * emit_fragment() keys the buffer on the primitive index instead so that
+    * an atomicMin picks the lowest not-yet-composited layer.
+    */
+   uint64_t frag_coord;
+   uint32_t depth_from_frag_coord;
+   uint32_t pad_frag_coord;
    uint64_t depthbuf;
    uint64_t pixel_counter;  /* Device pointer to actual pixel count (0 = use num_pixels) */
    uint64_t discard_mask;   /* One byte per shaded pixel, set by `discard` (0 = none) */
@@ -820,6 +831,25 @@ struct cp_abuf_composite_args {
 };
 
 #ifdef __CUDACC__
+/*
+ * The depth buffer and the visibility buffer's high word hold depth as a
+ * *sortable* uint32: the float's bits with the sign folded in, so that an
+ * unsigned compare orders two depths the way a float compare would. Both the
+ * rasterizer, which writes the key, and the fragment writeback, which commits
+ * it, have to build it the same way, so it lives here rather than in either.
+ */
+static __device__ __forceinline__ uint32_t
+cp_float_to_sortable_uint(float f)
+{
+   /* The bit cast is written as a union rather than as __float_as_uint()
+    * because this header is also compiled freestanding by clang for the
+    * inline stages, which have no CUDA intrinsics. */
+   union { float f; uint32_t u; } bits;
+   bits.f = f;
+   uint32_t mask = -((int32_t)bits.u >> 31) | 0x80000000;
+   return bits.u ^ mask;
+}
+
 /* Resolve one primitive once, then index its three vertices and slots from the
  * returned base. `refs` and every entry are device addresses; the host never
  * dereferences them. Null refs are retired stable slots and are rejected by

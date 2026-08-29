@@ -1011,7 +1011,8 @@ void cp_shade_fragments(struct cp_context *cp,
                         float depth_scale, float depth_translate,
                         CUdeviceptr reject,
                         CUdeviceptr resolved, unsigned reject_pass,
-                        CUdeviceptr seg_ranges, unsigned num_seg_ranges);
+                        CUdeviceptr seg_ranges, unsigned num_seg_ranges,
+                        bool prim_keyed_visbuf);
 
 
 bool cp_batch_order_free(const struct cp_draw_state *state);
