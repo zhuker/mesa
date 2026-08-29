@@ -1061,6 +1061,10 @@ enum cp_texel_encoding {
    CP_TEXEL_R16_SFLOAT,
    CP_TEXEL_R16G16_SFLOAT,
    CP_TEXEL_R16G16_UNORM,
+   /* One 16-bit UNORM channel. This is what VK_FORMAT_D16_UNORM's depth
+    * aspect is: the depth store kernel writes round(depth * 65535) into two
+    * bytes, and this reads the same number back. */
+   CP_TEXEL_R16_UNORM,
    CP_TEXEL_A2B10G10R10_UNORM,
    CP_TEXEL_R32_SINT,
    CP_TEXEL_R16_SINT,

@@ -72,17 +72,28 @@ static const struct cpvk_format_info cpvk_formats[] = {
    { VK_FORMAT_BC3_UNORM_BLOCK,      CP_TEXEL_DXT5_RGBA,          -1,                           false },
    { VK_FORMAT_BC3_SRGB_BLOCK,       CP_TEXEL_DXT5_RGBA,          -1,                           false },
    { VK_FORMAT_D32_SFLOAT,          CP_TEXEL_R32_FLOAT,           -1,                           true  },
-   { VK_FORMAT_D32_SFLOAT_S8_UINT,  0,                            -1,                           true  },
-   { VK_FORMAT_D24_UNORM_S8_UINT,   0,                            -1,                           true  },
    /*
-    * D16 is a depth attachment and nothing else. It has no texel decode on
-    * purpose: the depth load and store kernels know its 16-bit UNORM packing,
-    * but the sampler does not, and a captured application already creates a
-    * *sampled* D16 image (see cpvk_CreateImage below). Leaving `texel` at
-    * zero is what keeps SAMPLED_IMAGE refused for it, here and in
-    * vkGetPhysicalDeviceImageFormatProperties2.
+    * The two combined depth/stencil formats have no texel decode: their depth
+    * aspect is not a whole texel -- D24S8 packs 24 bits of depth beside a
+    * stencil byte, D32S8 pads to eight -- and the sampler addresses texels,
+    * not aspects. Spelled CP_TEXEL_UNSUPPORTED rather than 0 so that the set
+    * of undecodable rows can be found by grep; a sampled view over one of
+    * them is reported by cpvk_view_report_undecodable().
     */
-   { VK_FORMAT_D16_UNORM,           0,                            -1,                           true  },
+   { VK_FORMAT_D32_SFLOAT_S8_UINT,  CP_TEXEL_UNSUPPORTED,         -1,                           true  },
+   { VK_FORMAT_D24_UNORM_S8_UINT,   CP_TEXEL_UNSUPPORTED,         -1,                           true  },
+   /*
+    * D16 is a depth attachment *and* a texture. The row carried `texel = 0`
+    * when the attachment half landed, on the grounds that the sampler did not
+    * know the packing -- and a captured application samples one anyway. It
+    * got opaque black for every lookup, 753 descriptor writes a replay, and
+    * whole faces of the shadow-receiving geometry rendered near-black with
+    * hard polygon edges (.audit/d16_gate3.md). The decode is two bytes over
+    * 65535, exactly what cp_depth_attachment_store wrote, so
+    * CP_TEXEL_R16_UNORM is the same number read back rather than a
+    * reinterpretation.
+    */
+   { VK_FORMAT_D16_UNORM,           CP_TEXEL_R16_UNORM,           -1,                           true  },
 };
 
 const struct cpvk_format_info *
@@ -330,12 +341,13 @@ cpvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
     * breaks the two stored GFXReconstruct captures, which create a sampled
     * D16 image and a 4x multisample sampled depth image without ever asking:
     * vkCreateImage then fails, and the replayer dereferences the null image
-    * it recorded rather than reporting the error. D16 being a depth
-    * attachment now does not change that case -- it has no texel decode, so
-    * a *sampled* D16 image is still a usage this driver refuses. What the
-    * driver cannot do with such an image is still refused where the work
-    * happens -- attachment binding, blit and resolve, and the
-    * sampled/storage descriptor paths.
+    * it recorded rather than reporting the error. A sampled D16 image is now
+    * a usage this driver serves; a 4x multisample sampled depth image is
+    * still not. What the driver cannot do with such an image is still
+    * refused where the work happens -- attachment binding, blit and resolve,
+    * and the sampled/storage descriptor paths -- and a sampled view over a
+    * format the sampler cannot decode is reported by
+    * cpvk_view_report_undecodable() below rather than returned as black.
     */
    if (pCreateInfo->mipLevels > CPVK_MAX_MIP_LEVELS)
       return vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);
@@ -506,6 +518,60 @@ cpvk_image_view_refresh(struct cpvk_image_view *view)
    }
 }
 
+/*
+ * The one thing worse than refusing a format is serving it wrongly, and this
+ * is where that used to happen. An image whose format has no CP_TEXEL_*
+ * decode reaches cp_fetch_texel with encoding CP_TEXEL_UNSUPPORTED, and that
+ * function's `default:` arm returns opaque black -- deterministically, on a
+ * device path where no diagnostic is possible. VK_FORMAT_D16_UNORM spent one
+ * release like that: the driver allowed the image, allowed the view, allowed
+ * 753 combined-image-sampler writes a replay, and returned 0.0 for every
+ * shadow lookup, which rendered whole faces of the receiving geometry black
+ * (.audit/d16_gate3.md). Nothing anywhere said so.
+ *
+ * So say so, once per format, on the host, where stderr exists. This is a
+ * report rather than a refusal on purpose: an image created with SAMPLED
+ * usage may still only ever be bound as an attachment, and both stored
+ * GFXReconstruct captures create images this driver cannot fully serve
+ * without ever asking whether it can -- refusing at vkCreateImage for
+ * exactly that reason is what broke them once already, and the replayer
+ * dereferences the null handle rather than reporting the error. The line is
+ * unconditional: a flag would make it invisible to the next person, who by
+ * construction does not know to set it.
+ */
+static void
+cpvk_view_report_undecodable(const struct cpvk_image_view *view)
+{
+   const struct cpvk_image *img = view->image;
+   if (!img || img->texel != CP_TEXEL_UNSUPPORTED ||
+       !(img->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT))
+      return;
+
+   /* Once per format per process. The set is small by construction -- it is
+    * the rows of cpvk_formats[] with no decode, plus whatever is not in the
+    * table at all -- and a bound of eight has never been approached. */
+   static simple_mtx_t reported_lock = SIMPLE_MTX_INITIALIZER;
+   static VkFormat reported[8];
+   static unsigned num_reported;
+
+   simple_mtx_lock(&reported_lock);
+   bool seen = false;
+   for (unsigned i = 0; i < num_reported; i++)
+      seen |= reported[i] == img->vk_format;
+   if (!seen && num_reported < ARRAY_SIZE(reported))
+      reported[num_reported++] = img->vk_format;
+   simple_mtx_unlock(&reported_lock);
+   if (seen)
+      return;
+
+   fprintf(stderr,
+           "cudavk: sampled image view over format %u, which this driver "
+           "cannot decode as a texture: every texture read of it returns "
+           "opaque black (0,0,0,1). Add a CP_TEXEL_* decode in "
+           "kernels/cp_sampler.cu and the row in cpvk_image.c to fix it.\n",
+           (unsigned)img->vk_format);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_CreateImageView(VkDevice _device,
                      const VkImageViewCreateInfo *pCreateInfo,
@@ -533,6 +599,7 @@ cpvk_CreateImageView(VkDevice _device,
    }
    view->tex_info_host = (struct cp_texture_info *)(uintptr_t)view->tex_info;
    cpvk_image_view_refresh(view);
+   cpvk_view_report_undecodable(view);
 
    if (view->image) {
       simple_mtx_lock(&dev->view_lock);

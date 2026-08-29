@@ -368,6 +368,17 @@ cp_fetch_texel(const struct cp_texture_info *tex, unsigned level,
          out.b = 0.0f; out.a = 1.0f;
          break;
       }
+      case CP_TEXEL_R16_UNORM: {
+         /* D16_UNORM's depth aspect, and the one-channel form of the pair
+          * above. Vulkan's conversion to RGBA gives a one-component format
+          * (r, 0, 0, 1), which is what D32_SFLOAT already gets here through
+          * CP_TEXEL_R32_FLOAT; lavapipe and NVIDIA both return exactly
+          * (d, 0, 0, 1) for a non-compare depth sample. */
+         const unsigned short *s = (const unsigned short *)t;
+         out.r = (float)s[0] * (1.0f / 65535.0f);
+         out.g = 0.0f; out.b = 0.0f; out.a = 1.0f;
+         break;
+      }
       case CP_TEXEL_A2B10G10R10_UNORM: {
          unsigned p = *(const unsigned *)t;
          out.r = (float)(p & 0x3FF) * (1.0f / 1023.0f);
