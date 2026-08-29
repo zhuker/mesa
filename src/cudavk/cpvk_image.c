@@ -74,6 +74,15 @@ static const struct cpvk_format_info cpvk_formats[] = {
    { VK_FORMAT_D32_SFLOAT,          CP_TEXEL_R32_FLOAT,           -1,                           true  },
    { VK_FORMAT_D32_SFLOAT_S8_UINT,  0,                            -1,                           true  },
    { VK_FORMAT_D24_UNORM_S8_UINT,   0,                            -1,                           true  },
+   /*
+    * D16 is a depth attachment and nothing else. It has no texel decode on
+    * purpose: the depth load and store kernels know its 16-bit UNORM packing,
+    * but the sampler does not, and a captured application already creates a
+    * *sampled* D16 image (see cpvk_CreateImage below). Leaving `texel` at
+    * zero is what keeps SAMPLED_IMAGE refused for it, here and in
+    * vkGetPhysicalDeviceImageFormatProperties2.
+    */
+   { VK_FORMAT_D16_UNORM,           0,                            -1,                           true  },
 };
 
 const struct cpvk_format_info *
@@ -321,9 +330,12 @@ cpvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
     * breaks the two stored GFXReconstruct captures, which create a sampled
     * D16 image and a 4x multisample sampled depth image without ever asking:
     * vkCreateImage then fails, and the replayer dereferences the null image
-    * it recorded rather than reporting the error. What the driver cannot do
-    * with such an image is still refused where the work happens -- attachment
-    * binding, blit and resolve, and the sampled/storage descriptor paths.
+    * it recorded rather than reporting the error. D16 being a depth
+    * attachment now does not change that case -- it has no texel decode, so
+    * a *sampled* D16 image is still a usage this driver refuses. What the
+    * driver cannot do with such an image is still refused where the work
+    * happens -- attachment binding, blit and resolve, and the
+    * sampled/storage descriptor paths.
     */
    if (pCreateInfo->mipLevels > CPVK_MAX_MIP_LEVELS)
       return vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);

@@ -1643,7 +1643,8 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       if (!view || !view->image || !view->image->mem ||
           (view->vk.format != VK_FORMAT_D32_SFLOAT &&
            view->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT &&
-           view->vk.format != VK_FORMAT_D24_UNORM_S8_UINT)) {
+           view->vk.format != VK_FORMAT_D24_UNORM_S8_UINT &&
+           view->vk.format != VK_FORMAT_D16_UNORM)) {
          fprintf(stderr, "cudavk: unsupported depth attachment format %u\n",
                  view ? view->vk.format : 0);
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -1671,8 +1672,12 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          .sample_stride = dimg->sample_stride,
          .pixel_stride = util_format_get_blocksize(
             vk_format_to_pipe_format(view->vk.format)),
+         /* The packing the load and store kernels switch on, not the
+          * VkFormat: 0 = D32_SFLOAT, 1 = D32_SFLOAT_S8_UINT,
+          * 2 = D24_UNORM_S8_UINT, 3 = D16_UNORM. */
          .format = view->vk.format == VK_FORMAT_D24_UNORM_S8_UINT ? 2 :
-                   view->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT ? 1 : 0,
+                   view->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT ? 1 :
+                   view->vk.format == VK_FORMAT_D16_UNORM ? 3 : 0,
          .load = dat->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
                  (store && !full_area),
          /* A resolve reads the attachment image, so its contents must be
@@ -3246,7 +3251,7 @@ cpvk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage image,
     */
    VkFormat fmt = img->vk.format;
    if (fmt != VK_FORMAT_D32_SFLOAT && fmt != VK_FORMAT_D24_UNORM_S8_UINT &&
-       fmt != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+       fmt != VK_FORMAT_D32_SFLOAT_S8_UINT && fmt != VK_FORMAT_D16_UNORM) {
       cpvk_clear_refuse(cmd,
          "vkCmdClearDepthStencilImage: unsupported depth/stencil format");
       return;
@@ -3264,7 +3269,8 @@ cpvk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage image,
       if (aspects & ~(VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT |
                                           VK_IMAGE_ASPECT_STENCIL_BIT) ||
           !aspects ||
-          (want_stencil && fmt == VK_FORMAT_D32_SFLOAT)) {
+          (want_stencil && (fmt == VK_FORMAT_D32_SFLOAT ||
+                            fmt == VK_FORMAT_D16_UNORM))) {
          cpvk_clear_refuse(cmd,
             "vkCmdClearDepthStencilImage: aspect the format does not have");
          return;
@@ -3292,6 +3298,13 @@ cpvk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage image,
          value[1] = stencil;
          mask[0] = want_depth ? 0xffffffffu : 0u;
          mask[1] = want_stencil ? 0x000000ffu : 0u;
+      } else if (fmt == VK_FORMAT_D16_UNORM) {
+         /* Two bytes per texel and no stencil to preserve. The masked kernel's
+          * 16-bit arm takes the low half of value[0] and mask[0], and the
+          * quantisation is the one cp_depth_attachment_store uses, so a
+          * cleared texel and a stored texel of the same depth agree. */
+         value[0] = (uint32_t)lrintf(depth * 65535.0f);
+         mask[0] = 0x0000ffffu;
       } else {
          value[0] = cpvk_f32_bits(depth);
          mask[0] = 0xffffffffu;
