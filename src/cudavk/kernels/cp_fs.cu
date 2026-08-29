@@ -1128,6 +1128,14 @@ cp_fs_writeback_one(const struct cp_fs_writeback_args &args, uint32_t i)
       }
    }
 
+   /*
+    * A depth-only pass reaches this kernel for the depth commit above and has
+    * nowhere to put a colour. Everything below dereferences `color_out`, so
+    * leave before any of it does.
+    */
+   if (!args.color_out)
+      return;
+
    const float4 *fs_out =
       (const float4 *)((const char *)(uintptr_t)args.fs_out +
                        (size_t)i * args.fs_out_stride);

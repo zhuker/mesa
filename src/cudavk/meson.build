@@ -235,6 +235,7 @@ if dep_vulkan_loader.found()
     'cpvk_d16_sampled',
     'cpvk_depth_attachment',
     'cpvk_depth_convention',
+    'cpvk_depth_only_pass',
     'cpvk_desc_array',
     'cpvk_descriptor_pool',
     'cpvk_descriptor_semantics',
