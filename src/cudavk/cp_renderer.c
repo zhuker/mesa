@@ -787,6 +787,45 @@ cp_scratch_destroy(struct cp_context *cp)
    if (cp->dscratch.base)
       cuMemFree(cp->dscratch.base);
    memset(&cp->dscratch, 0, sizeof(cp->dscratch));
+
+   if (cp->shade_ctr.base)
+      cuMemFree(cp->shade_ctr.base);
+   memset(&cp->shade_ctr, 0, sizeof(cp->shade_ctr));
+}
+
+/*
+ * A pre-zeroed 4-byte slot counter for the direct shade chain, or 0 when the
+ * pool cannot serve this call — the caller then allocates from scratch and
+ * clears it the classic way. See the struct comment for the reuse argument;
+ * the stream check is what makes it hold.
+ */
+#define CP_SHADE_CTR_N 4096u
+static CUdeviceptr
+cp_shade_counter_get(struct cp_context *cp)
+{
+   if (cp_debug->no_counter_pool || cp->stream != cp->main_stream)
+      return 0;
+   if (!cp->shade_ctr.base) {
+      CUdeviceptr base;
+      if (cp_mem_alloc_retry(cp, &base, CP_SHADE_CTR_N * 4) != CUDA_SUCCESS)
+         return 0;
+      if (cuMemsetD32Async(base, 0, CP_SHADE_CTR_N, cp->stream) !=
+          CUDA_SUCCESS) {
+         cuMemFree(base);
+         return 0;
+      }
+      cp->shade_ctr.base = base;
+      cp->shade_ctr.next = 0;
+   }
+   if (cp->shade_ctr.next == CP_SHADE_CTR_N) {
+      /* Every previous user ran on this stream, so this clear is ordered
+       * behind the last reader of every counter it recycles. */
+      if (cuMemsetD32Async(cp->shade_ctr.base, 0, CP_SHADE_CTR_N,
+                           cp->stream) != CUDA_SUCCESS)
+         return 0;
+      cp->shade_ctr.next = 0;
+   }
+   return cp->shade_ctr.base + 4 * cp->shade_ctr.next++;
 }
 
 /*
@@ -3469,7 +3508,9 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
                     unsigned fs_in_stride, CUdeviceptr fs_out,
                     CUdeviceptr frag_coord, CUdeviceptr discard_mask,
                     CUdeviceptr front_face, CUdeviceptr coverage,
-                    CUdeviceptr fused_interp, unsigned num_threads,
+                    CUdeviceptr fused_interp,
+                    const struct cp_fs_interp_args *interp_inline,
+                    unsigned num_threads,
                     CUevent ev_before,
                     CUdeviceptr batch_rows, CUfunction *launched)
 {
@@ -3648,6 +3689,14 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
    const size_t fs_tbl_off = fs_args_bytes + 16;
    size_t fs_blk_bytes = fs_tbl_off +
       (size_t)rows * CP_ARG_UBO_STRIDE * sizeof(uint64_t);
+   /* The fused-interpolation block rides in this upload rather than in one of
+    * its own; see the comment where cp_shade_fragments() chooses to pass it. */
+   size_t fs_interp_off = 0;
+   if (interp_inline) {
+      fs_blk_bytes = ALIGN_POT(fs_blk_bytes, 16);
+      fs_interp_off = fs_blk_bytes;
+      fs_blk_bytes += sizeof(*interp_inline);
+   }
 
    void *fs_blk = NULL;
    CUresult begin_err;
@@ -3686,8 +3735,12 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
     * given it — see CP_ARG_SLOT_COVERAGE. */
    fs_args_host[CP_ARG_SLOT_COVERAGE] =
       fs->writes_memory ? (void *)(uintptr_t)coverage : NULL;
-   fs_args_host[CP_ARG_SLOT_FUSED_INTERP] =
-      (void *)(uintptr_t)fused_interp;
+   fs_args_host[CP_ARG_SLOT_FUSED_INTERP] = interp_inline
+      ? (void *)(uintptr_t)(fs_args_dev + fs_interp_off)
+      : (void *)(uintptr_t)fused_interp;
+   if (interp_inline)
+      memcpy((char *)fs_blk + fs_interp_off, interp_inline,
+             sizeof(*interp_inline));
    fs_args_host[CP_ARG_SLOT_HW_TEX_TABLE] =
       (void *)(uintptr_t)(cp_shader_exec_is_hardware(exec_mode)
                           ? cp->hardware_texture.table_dev : 0);
@@ -3937,7 +3990,13 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
 
    /* Written by one kernel and read by the next; the host never sees them. */
    CUdeviceptr pixel_list = cp_scratch_alloc_device(cp, max_pixels * 4);
-   CUdeviceptr counter = cp_scratch_alloc_device(cp, 4);
+   /* A pool counter arrives already zeroed, so the memset below is owed only
+    * when the pool declines — keeping a small stream operation out of the
+    * serial link between the last rasterizer stage and the compaction. */
+   CUdeviceptr counter = cp_shade_counter_get(cp);
+   bool counter_pooled = counter != 0;
+   if (!counter)
+      counter = cp_scratch_alloc_device(cp, 4);
    CUdeviceptr fs_in = cp_scratch_alloc_device(cp, (size_t)max_pixels * fs_in_stride);
    CUdeviceptr fs_out = cp_scratch_alloc_device(cp, (size_t)max_pixels * fs_out_stride);
    CUdeviceptr coverage = cp_scratch_alloc_device(cp, max_pixels);
@@ -3967,7 +4026,8 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
     * turned into double-blended frames the moment the passes started reusing
     * one, which they must, or a 256 layer draw asks for tens of gigabytes.
     */
-   cuMemsetD32Async(counter, 0, 1, cp->stream);
+   if (!counter_pooled)
+      cuMemsetD32Async(counter, 0, 1, cp->stream);
    if (discard_mask)
       cuMemsetD8Async(discard_mask, 0, max_pixels, cp->stream);
 
@@ -4091,21 +4151,35 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
               "using classic standalone interpolation\n");
       fs->fused_fallback_reported = true;
    }
+   bool interp_inline = false;
    if (inshader_mode != CP_SHADER_EXEC_CLASSIC) {
       CUdeviceptr prim_list = cp_scratch_alloc_device(cp, max_pixels);
       if (prim_list) {
          interp.out_prim_list = prim_list;
          interp.fused_direct = 1;
-         inshader_interp_dev = cp_upload(cp, &interp, sizeof(interp));
-         if (!inshader_interp_dev) {
-            interp.out_prim_list = 0;
-            interp.fused_direct = 0;
-            inshader_mode = CP_SHADER_EXEC_CLASSIC;
+         /*
+          * The compaction takes this block by value, so only the fragment
+          * shader reads it from memory — and the shader has an upload of its
+          * own, the argument block. Carrying the interpolation block inside
+          * that upload leaves nothing owed on the stream between the last
+          * rasterizer stage and the compaction, which is what lets the
+          * compaction launch offer the dependent-launch attribute below.
+          */
+         if (cp_debug->interp_inline) {
+            interp_inline = true;
+         } else {
+            inshader_interp_dev = cp_upload(cp, &interp, sizeof(interp));
+            if (!inshader_interp_dev) {
+               interp.out_prim_list = 0;
+               interp.fused_direct = 0;
+               inshader_mode = CP_SHADER_EXEC_CLASSIC;
+            }
          }
       } else {
          inshader_mode = CP_SHADER_EXEC_CLASSIC;
       }
    }
+   bool inshader_ready = interp_inline || inshader_interp_dev;
 
    void *interp_params[] = { &interp };
    {
@@ -4115,11 +4189,29 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       /* One thread per 2x2 quad, and the shader then runs four threads per
        * quad so it can difference across one. */
       unsigned num_quads = ((w + 1) / 2) * ((h + 1) / 2);
-      CUfunction interp_kernel = inshader_interp_dev
+      CUfunction interp_kernel = inshader_ready
          ? screen->kernels.fs_compact : screen->kernels.fs_interpolate;
-      CUresult interp_err = cp_launch(cp, interp_kernel,
-                                           (num_quads + 255) / 256, 1, 1, 256, 1, 1,
-                                           0, cp->stream, interp_params, NULL);
+      /*
+       * The compaction's wait is its first instruction, so it may claim any
+       * kernel as its predecessor (CP_PDL_ANY): the last rasterizer stage on
+       * the plain path, the previous group's writeback in an episode. Where
+       * a clear or a copy sits in the link — the interpolation-block upload
+       * unless CUDAVK_INTERP_INLINE moved it, the discard-mask clear, a
+       * range-table upload — the epoch check declines the attribute and the
+       * launch stays ordinary. Both flags default off: the measured story is
+       * in their registry entries. The classic interpolator carries no wait
+       * and must not claim one.
+       */
+      CUresult interp_err;
+      if (inshader_ready && cp_debug->compact_pdl)
+         interp_err = cp_launch_after(cp, interp_kernel,
+                                      (num_quads + 255) / 256, 1, 1, 256, 1, 1,
+                                      0, cp->stream, interp_params, NULL,
+                                      CP_PDL_ANY, CP_PDL_TIER_FS);
+      else
+         interp_err = cp_launch(cp, interp_kernel,
+                                (num_quads + 255) / 256, 1, 1, 256, 1, 1,
+                                0, cp->stream, interp_params, NULL);
       if (interp_err != CUDA_SUCCESS) {
          fprintf(stderr, "cudavk: fs_interpolate launch failed (%d)\n", interp_err);
          cp_texture_cache_unpin(cp);
@@ -4133,12 +4225,13 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
     * early for threads beyond it. This avoids a sync just to read the count. */
    unsigned num_pixels = max_pixels;
 
-   enum cp_shader_exec_mode fs_mode = inshader_interp_dev
+   enum cp_shader_exec_mode fs_mode = inshader_ready
       ? inshader_mode : CP_SHADER_EXEC_CLASSIC;
    CUfunction fs_kernel = NULL;
    if (!cp_fs_launch_shader(cp, state, fs, fs_mode, counter, fs_in,
                             fs_in_stride, fs_out, frag_coord, discard_mask,
-                            front_face, coverage, inshader_interp_dev, num_pixels,
+                            front_face, coverage, inshader_interp_dev,
+                            interp_inline ? &interp : NULL, num_pixels,
                             0, batch_rows, &fs_kernel))
       return;
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
@@ -4574,7 +4667,7 @@ cp_abuf_shade(struct cp_context *cp, const struct cp_draw_state *state,
    if (!cp_fs_launch_shader(cp, state, fs, fs_mode, counter, fs_in,
                             fs_in_stride, fs_out, frag_coord, discard_mask,
                             front_face, coverage,
-                            use_fused_interp ? interp_dev : 0, num_slots,
+                            use_fused_interp ? interp_dev : 0, NULL, num_slots,
                             ab->timing ? ab->ev[13] : 0, batch_rows, NULL))
       return false;
    cp_abuf_mark(ab, ab->ev[14], cp->stream);

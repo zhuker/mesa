@@ -653,6 +653,22 @@ struct cp_context {
    } dscratch;
 
    /*
+    * Pre-zeroed slot counters for the direct shade chain. cp_shade_fragments
+    * used to zero its 4-byte counter with a cuMemsetD32Async between the last
+    * rasterizer stage and the compaction launch — a ~2 µs stream operation
+    * per shade whose only job was clearing four bytes, and the one thing
+    * standing between cp_fs_compact and a programmatic dependent launch.
+    * Counters are handed out of this ring instead; when it wraps, one memset
+    * re-zeroes the whole ring. Reuse is safe because every consumer of a
+    * counter runs on the stream the wrap memset is issued on — the handout
+    * refuses any other stream and falls back to the classic memset.
+    */
+   struct {
+      CUdeviceptr base;         /* CP_SHADE_CTR_N pre-zeroed uint32s */
+      unsigned next;            /* next counter to hand out */
+   } shade_ctr;
+
+   /*
     * A batch's per-draw uploads are live until its launches are issued.
     *
     * Each staged draw puts its push block in the upload arena and records the
@@ -770,7 +786,8 @@ void cp_stream_set(struct cp_context *cp, CUstream stream);
  * moved, and the upload flush must still have issued nothing.
  *
  * It must never be used by a site whose secondary executes anything before its
- * wait. cp_rasterize_stage1 is the only user, and its wait is at offset zero.
+ * wait. cp_rasterize_stage1 and cp_fs_compact are the only users, and both
+ * have the wait as their first instruction.
  */
 #define CP_PDL_ANY ((CUfunction)~(uintptr_t)0)
 

@@ -324,6 +324,25 @@ static const struct cp_flag_def flags[] = {
      F(no_fused_interp),
      "restore the direct shade path's separate cp_fs_interpolate launch "
      "instead of the slim compaction plus in-shader interpolation" },
+   { "CUDAVK_NO_COUNTER_POOL", CP_FLAG_BOOL_VALUE, F(no_counter_pool),
+     "restore the per-shade cuMemsetD32Async that zeroes the direct path's "
+     "slot counter instead of handing counters out of a pre-zeroed device "
+     "pool; the revert for the shade-chain counter pool" },
+   { "CUDAVK_INTERP_INLINE", CP_FLAG_BOOL_VALUE, F(interp_inline),
+     "carry the fused-interpolation argument block inside the fragment "
+     "argument block's upload instead of uploading it on its own before the "
+     "compaction launch. Off by default: it leaves no stream operation "
+     "between the last rasterizer stage and the compaction, but measured "
+     "+0.13 ms/frame on favorite3 (4+4 alternating, all four pairs agreeing) "
+     "for a reason not yet attributed; it exists because CUDAVK_COMPACT_PDL "
+     "is inert without it" },
+   { "CUDAVK_COMPACT_PDL", CP_FLAG_BOOL_VALUE, F(compact_pdl),
+     "offer the programmatic dependent launch attribute on the cp_fs_compact "
+     "launch against whatever kernel precedes it on the stream. Off by "
+     "default: without CUDAVK_INTERP_INLINE the interpolation-block upload "
+     "sits in the link and the epoch check declines nearly every offer; with "
+     "it, the pair measured 0.10 ms/frame better than INTERP_INLINE alone "
+     "and still 0.05 worse than neither" },
    { "CUDAVK_NO_INLINE_FS", CP_FLAG_BOOL_VALUE, F(no_inline_fs),
      "restore separate interpolation plus the resource-isolated classic "
      "fragment binary instead of same-LLVM inline interpolation" },
