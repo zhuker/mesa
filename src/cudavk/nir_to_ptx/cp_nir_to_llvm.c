@@ -2724,13 +2724,24 @@ emit_hardware_tex(struct ntl_context *ctx, nir_tex_instr *tex,
    LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx->llvm_ctx);
    LLVMValueRef object = cp_hardware_texture_handle(ctx);
    LLVMValueRef args[10] = { object };
+   bool layered = tex->is_array && tex->sampler_dim == GLSL_SAMPLER_DIM_2D;
    unsigned coord_count = tex->sampler_dim == GLSL_SAMPLER_DIM_2D ? 2 : 3;
    unsigned nargs = 1;
+   /* tex.a2d wants the layer as an integer ahead of the spatial coordinates;
+    * the hardware clamps it to the array, so only the rounding is ours
+    * (Vulkan rounds to nearest even). */
+   if (layered) {
+      LLVMValueRef layer_f = cp_float_component(ctx, coord, 2);
+      LLVMValueRef layer = build_nvvm_intrinsic(ctx, "llvm.nvvm.f2i.rn",
+                                                &layer_f, 1);
+      args[nargs++] = layer;
+   }
    for (unsigned i = 0; i < coord_count; i++)
       args[nargs++] = cp_float_component(ctx, coord, i);
 
-   const char *dim = tex->sampler_dim == GLSL_SAMPLER_DIM_2D ? "2d" :
-                     (tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? "3d" : "cube");
+   const char *dim = layered ? "2d.array" :
+                     (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ? "2d" :
+                     (tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? "3d" : "cube"));
    const char *mode = "";
    if (tex->op == nir_texop_txl) {
       LLVMValueRef lod = cp_tex_src_value(ctx, tex, nir_tex_src_lod);
@@ -2748,16 +2759,17 @@ emit_hardware_tex(struct ntl_context *ctx, nir_tex_instr *tex,
          scale = build_nvvm_intrinsic(ctx, "llvm.nvvm.ex2.approx.f",
                                       &bias, 1);
       }
+      unsigned coord_base = layered ? 2 : 1;   /* past handle and layer */
       for (unsigned i = 0; i < coord_count; i++) {
          LLVMValueRef v = dx ? cp_float_component(ctx, dx, i)
-                             : cp_quad_derivative(ctx, args[1 + i], false);
+                             : cp_quad_derivative(ctx, args[coord_base + i], false);
          if (scale)
             v = LLVMBuildFMul(ctx->builder, v, scale, "");
          args[nargs++] = v;
       }
       for (unsigned i = 0; i < coord_count; i++) {
          LLVMValueRef v = dy ? cp_float_component(ctx, dy, i)
-                             : cp_quad_derivative(ctx, args[1 + i], true);
+                             : cp_quad_derivative(ctx, args[coord_base + i], true);
          if (scale)
             v = LLVMBuildFMul(ctx->builder, v, scale, "");
          args[nargs++] = v;
@@ -2769,6 +2781,8 @@ emit_hardware_tex(struct ntl_context *ctx, nir_tex_instr *tex,
    params[0] = i64;
    for (unsigned i = 1; i < nargs; i++)
       params[i] = f32;
+   if (layered)
+      params[1] = i32;   /* the layer index */
    LLVMTypeRef ret = LLVMStructTypeInContext(ctx->llvm_ctx,
       (LLVMTypeRef[]){ f32, f32, f32, f32 }, 4, false);
    LLVMTypeRef fn_type = LLVMFunctionType(ret, params, nargs, false);
@@ -3311,12 +3325,23 @@ cp_hardware_texture_shader_eligible(struct nir_shader *nir)
             bool dim_ok = tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
                           tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ||
                           tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
-            if (!dim_ok || tex->is_array || tex->is_shadow || tex->is_sparse ||
+            /* A layered 2D tap samples with tex.a2d; other layered dims
+             * stay on the software sampler. */
+            bool array_ok = tex->sampler_dim == GLSL_SAMPLER_DIM_2D;
+            if (!dim_ok || (tex->is_array && !array_ok) || tex->is_shadow || tex->is_sparse ||
                 tex->def.bit_size != 32 || tex->def.num_components != 4 ||
                 nir_alu_type_get_base_type(tex->dest_type) != nir_type_float ||
                 (tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
-                 tex->op != nir_texop_txb && tex->op != nir_texop_txd))
+                 tex->op != nir_texop_txb && tex->op != nir_texop_txd)) {
+               if (cp_debug->shader_stats)
+                  fprintf(stderr, "cudavk: hw-tex ineligible tap: op=%u dim=%u "
+                          "array=%u shadow=%u comps=%u bits=%u type=%u\n",
+                          tex->op, tex->sampler_dim, tex->is_array,
+                          tex->is_shadow, tex->def.num_components,
+                          tex->def.bit_size,
+                          nir_alu_type_get_base_type(tex->dest_type));
                return false;
+            }
 
             unsigned ncoord = 0, nlod = 0, nbias = 0, nddx = 0, nddy = 0;
             for (unsigned i = 0; i < tex->num_srcs; i++) {
@@ -3339,7 +3364,7 @@ cp_hardware_texture_shader_eligible(struct nir_shader *nir)
                   return false;
             }
             unsigned expected_coord = tex->sampler_dim == GLSL_SAMPLER_DIM_2D
-               ? 2 : 3;
+               ? (tex->is_array ? 3 : 2) : 3;
             if (tex->coord_components != expected_coord || ncoord != 1 ||
                 (tex->op == nir_texop_tex && (nlod || nbias || nddx || nddy)) ||
                 (tex->op == nir_texop_txl &&
@@ -3351,8 +3376,14 @@ cp_hardware_texture_shader_eligible(struct nir_shader *nir)
                return false;
 
             struct cp_hw_tex_site ref = {0};
-            if (!capture_hw_tex_site(tex, &ref) || sampled >= CP_MAX_HW_TEX_SITES)
+            cp_spec_reject_reason = NULL;
+            if (!capture_hw_tex_site(tex, &ref) || sampled >= CP_MAX_HW_TEX_SITES) {
+               if (cp_debug->shader_stats)
+                  fprintf(stderr, "cudavk: hw-tex uncapturable tap: %s\n",
+                          cp_spec_reject_reason ? cp_spec_reject_reason
+                          : "site limit");
                return false;
+            }
             sampled++;
          }
       }
@@ -4995,7 +5026,8 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
       unsigned dim_count = 0;
       const char *dims[] = { "tex.grad.2d", "tex.level.2d",
                              "tex.grad.3d", "tex.level.3d",
-                             "tex.grad.cube", "tex.level.cube" };
+                             "tex.grad.cube", "tex.level.cube",
+                             "tex.grad.a2d", "tex.level.a2d" };
       for (unsigned i = 0; i < ARRAY_SIZE(dims); i++)
          dim_count += cp_count_substring(ptx, dims[i]);
       bad_hardware_ptx = strstr(ptx, "cp_tex_sample") ||

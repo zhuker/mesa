@@ -489,6 +489,16 @@ cpvk_cache_view_eligible(const struct cpvk_image_view *view, bool r_only,
       return image->vk.image_type == VK_IMAGE_TYPE_2D &&
              image->vk.array_layers == 1 && view->vk.base_array_layer == 0 &&
              view->vk.layer_count == 1;
+   /* A whole-image layered view. The allocator already builds these arrays
+    * CUDA_ARRAY3D_LAYERED and the conversion kernel already writes them
+    * (target 1); the compiler samples them with tex.a2d. Cube-compatible
+    * images keep the cube path above. */
+   if (view->vk.view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY)
+      return image->vk.image_type == VK_IMAGE_TYPE_2D &&
+             image->vk.array_layers > 1 &&
+             !(image->vk.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+             view->vk.base_array_layer == 0 &&
+             view->vk.layer_count == image->vk.array_layers;
    return false;
 }
 
