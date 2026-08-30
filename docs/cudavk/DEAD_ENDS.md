@@ -1331,7 +1331,10 @@ axis (≤0.037 ms) cannot fund stable-address surgery.
 **Retry if.** The serial-tail population grows by an order of magnitude (a
 workload with tens of blended episodes per frame), or a CUDA release brings
 device-side launch latency to parity with host issue — re-run
-`cdp2-microbench.cu` before believing either.
+`cdp2-microbench.cu` before believing either. **And re-run it on the target
+hardware regardless**: these prices are sm_120 (RTX 5090 dev box) facts, and
+the driver's primary target is B200 (sm_100) — no number in this entry has
+been measured there.
 
 **Cost.** Zero production code. One census, one microbenchmark, three
 locked replays.
