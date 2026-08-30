@@ -689,6 +689,22 @@ cp_scratch_begin(struct cp_context *cp)
  * arenas that were replaced during growth) and resets the bump pointer.
  * The current arena is kept at its grown size. */
 /* One timed synchronize: the wall time the calling thread spent blocked. */
+
+/* The conversion probe, iteration-29 pattern. Host time injected *before*
+ * the episode drain's sync is absorbed by whatever slack the wait has; time
+ * injected *after* it lands on the frame at the site's conversion factor.
+ * The slope of frame time against injected time, in each direction, sizes a
+ * deferral mechanism before it is built. Probe only; both default 0. */
+static void
+cp_wait_spin(unsigned us)
+{
+   if (!us)
+      return;
+   int64_t until = os_time_get_nano() + (int64_t)us * 1000;
+   while (os_time_get_nano() < until)
+      ;
+}
+
 static bool
 cp_sync_timed(struct cp_context *cp, CUstream stream,
               uint64_t *ns, uint64_t *n)
@@ -696,10 +712,15 @@ cp_sync_timed(struct cp_context *cp, CUstream stream,
    /* Whatever is owed was owed to work this is about to wait for. */
    if (cp_upload_flush(cp) != CUDA_SUCCESS)
       return false;
+   bool drain_site = ns == &cp->plan.wait_episode_ns;
+   if (drain_site)
+      cp_wait_spin(cp_debug->wait_spin_before_us);
    int64_t t0 = os_time_get_nano();
    CUresult err = cuStreamSynchronize(stream);
    *ns += (uint64_t)(os_time_get_nano() - t0);
    (*n)++;
+   if (drain_site)
+      cp_wait_spin(cp_debug->wait_spin_us);
    if (err != CUDA_SUCCESS) {
       cp_renderer_texture_fatal(cp);
       return false;

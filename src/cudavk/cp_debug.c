@@ -382,6 +382,14 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_KEEP_PUSHKEY", CP_FLAG_BOOL_PRESENCE, F(keep_pushkey),
      "put the push-constant block back in the merge key, so draws that push "
      "different constants stop merging" },
+   { "CUDAVK_WAIT_SPIN_US", CP_FLAG_OPT_INT, F(wait_spin_us),
+     "conversion probe: busy-wait this many microseconds after each episode "
+     "drain returns; the slope of frame time against injected time is the "
+     "site's conversion factor" },
+   { "CUDAVK_WAIT_SPIN_BEFORE_US", CP_FLAG_OPT_INT, F(wait_spin_before_us),
+     "conversion probe: busy-wait this many microseconds before each episode "
+     "drain's sync; time absorbed by the wait rather than added to the frame "
+     "is what a deferral mechanism could relocate for free" },
    { "CUDAVK_KEEP_IBKEY", CP_FLAG_BOOL_PRESENCE, F(keep_ibkey),
      "put the index buffer back in the merge key, which the slice table's "
      "per-draw base makes unnecessary; 23,276 separations on the occlusion "

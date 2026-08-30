@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-123 switches.
+125 switches.
 
 ## Tracing
 
@@ -115,6 +115,8 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_KEEP_VOFF` | bool (presence) | `off` | — | put the vertex offset back in the merge key; it is the largest merge blocker there is, 13,281 separations of 38,155 on Crossroads |
 | `CUDAVK_KEEP_INSTKEY` | bool (presence) | `off` | — | put the instance count back in the merge key, which the renderer's per-draw instance_counts[] row makes unnecessary |
 | `CUDAVK_KEEP_PUSHKEY` | bool (presence) | `off` | — | put the push-constant block back in the merge key, so draws that push different constants stop merging |
+| `CUDAVK_WAIT_SPIN_US` | int (optional) | `unset` | — | conversion probe: busy-wait this many microseconds after each episode drain returns; the slope of frame time against injected time is the site's conversion factor |
+| `CUDAVK_WAIT_SPIN_BEFORE_US` | int (optional) | `unset` | — | conversion probe: busy-wait this many microseconds before each episode drain's sync; time absorbed by the wait rather than added to the frame is what a deferral mechanism could relocate for free |
 | `CUDAVK_KEEP_IBKEY` | bool (presence) | `off` | — | put the index buffer back in the merge key, which the slice table's per-draw base makes unnecessary; 23,276 separations on the occlusion capture |
 | `CUDAVK_KEEP_VBKEY` | bool (presence) | `off` | — | put the vertex-buffer bindings back in the merge key; the per-draw elem_bases rows carry them, and this was the largest merge blocker on the occlusion capture, 144,008 separations of 332,027 |
 | `CUDAVK_NO_BINCACHE` | bool (presence) | `off` | — | disable the compiled-kernel binary cache |

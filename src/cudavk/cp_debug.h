@@ -272,6 +272,8 @@ struct cp_debug {
    bool keep_instkey;
    bool keep_vbkey;
    bool keep_ibkey;
+   unsigned wait_spin_us;
+   unsigned wait_spin_before_us;
    bool keep_pushkey;
    bool no_bincache;
    bool no_regcap;
