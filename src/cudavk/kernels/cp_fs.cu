@@ -602,6 +602,13 @@ cp_fs_interpolate(struct cp_fs_interp_args args)
 extern "C" __global__ void
 cp_fs_compact(struct cp_fs_interp_args args)
 {
+   /*
+    * First instruction, so the launch may claim CP_PDL_ANY: nothing is read
+    * before the predecessor — the rasterizer stage or the previous group's
+    * writeback — has drained. Inert on an ordinary launch.
+    */
+   CP_PDL_WAIT3();
+
    uint32_t quad = blockIdx.x * blockDim.x + threadIdx.x;
    uint32_t quad_h = (args.height + 1) / 2;
    if (quad >= args.quad_width * quad_h)

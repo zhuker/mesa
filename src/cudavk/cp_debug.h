@@ -253,6 +253,9 @@ struct cp_debug {
    bool no_abuf_append;
    bool no_fused_abuf_interp;
    bool no_fused_interp;
+   bool no_counter_pool;
+   bool interp_inline;
+   bool compact_pdl;
    bool no_inline_fs;
    bool inline_fs;
    bool force_fused_fs;
