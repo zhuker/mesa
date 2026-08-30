@@ -161,6 +161,10 @@ cp_vf_lane_ids(const struct cp_vertex_fetch_args *ap, uint32_t v,
          row = lo;
          local = v - sl[row].vert_begin;
          first_vertex = sl[row].first_vertex;
+         uint64_t slice_ib = ((uint64_t)sl[row].ib_base_hi << 32) |
+                             sl[row].ib_base_lo;
+         if (slice_ib)
+            ib = (const char *)(uintptr_t)slice_ib;
          ib += sl[row].index_bytes;
          /* A batch carries the per-draw instance shape here; the launch-wide
           * scalar cannot describe more than one draw and is passed zero. */

@@ -382,6 +382,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_KEEP_PUSHKEY", CP_FLAG_BOOL_PRESENCE, F(keep_pushkey),
      "put the push-constant block back in the merge key, so draws that push "
      "different constants stop merging" },
+   { "CUDAVK_KEEP_IBKEY", CP_FLAG_BOOL_PRESENCE, F(keep_ibkey),
+     "put the index buffer back in the merge key, which the slice table's "
+     "per-draw base makes unnecessary; 23,276 separations on the occlusion "
+     "capture" },
    { "CUDAVK_KEEP_VBKEY", CP_FLAG_BOOL_PRESENCE, F(keep_vbkey),
      "put the vertex-buffer bindings back in the merge key; the per-draw "
      "elem_bases rows carry them, and this was the largest merge blocker on "

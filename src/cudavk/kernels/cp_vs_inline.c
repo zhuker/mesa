@@ -41,7 +41,7 @@ _Static_assert(offsetof(struct cp_vertex_fetch_args, elem_bases) == 872,
 _Static_assert(offsetof(struct cp_vertex_fetch_args, seed_counts) == 880,
                "cp_vertex_fetch_args.seed_counts ABI");
 
-_Static_assert(sizeof(struct cp_draw_slice) == 16, "cp_draw_slice ABI size");
+_Static_assert(sizeof(struct cp_draw_slice) == 24, "cp_draw_slice ABI size");
 _Static_assert(_Alignof(struct cp_draw_slice) == 4,
                "cp_draw_slice ABI alignment");
 

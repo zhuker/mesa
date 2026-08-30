@@ -487,6 +487,12 @@ struct cp_draw_slice {
     * ignores in favour of this. vert_begin spans count that includes every
     * instance, so the fetch's slice search needs no other change. */
    uint32_t verts_per_instance;
+   /* This draw's own index-buffer base when it differs from the launch-wide
+    * one, split into halves to keep the struct's 4-byte ABI alignment; zero
+    * means inherit the launch-wide pointer. index_bytes applies either way.
+    * This is what lets draws bound to different index buffers merge. */
+   uint32_t ib_base_lo;
+   uint32_t ib_base_hi;
 };
 /* Entries per draw in the table at CP_ARG_SLOT_UBO_TABLE; matches
  * CP_MAX_CONST_BUFFERS and the 18.. layout it stands in for. */

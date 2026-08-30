@@ -2441,7 +2441,17 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
    CPVK_DIFF(a->indirect || b->indirect, "indirect draw");
    CPVK_DIFF(a->call.mode != b->call.mode, "topology");
    CPVK_DIFF(a->call.index_size != b->call.index_size, "index size");
-   CPVK_DIFF(a->call.index_ptr != b->call.index_ptr, "index buffer");
+   /*
+    * The index buffer is *not* a merge condition. The slice table carries a
+    * per-draw index-buffer base (cp_draw_slice.ib_base_*), and the fetch
+    * rebases before applying index_bytes, so draws bound to different index
+    * buffers merge. Refs never read a batch's index buffer on the host:
+    * batching requires MESA_PRIM_TRIANGLES with a classic-exec VS, which is
+    * the skip_refs condition. 23,276 separations on the occlusion capture.
+    * CUDAVK_KEEP_IBKEY restores it.
+    */
+   if (cp_debug->keep_ibkey)
+      CPVK_DIFF(a->call.index_ptr != b->call.index_ptr, "index buffer");
    CPVK_DIFF(a->call.start_instance != b->call.start_instance, "start instance");
    /*
     * The vertex offset, until the batched path stops taking it from the first

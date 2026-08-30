@@ -4813,6 +4813,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    const uint32_t *instance_counts = batch->compact_rows ?
                                      batch->instance_counts : NULL;
    const uint64_t *vb_table = batch->compact_rows ? batch->vb_bases : NULL;
+   const uint64_t *ib_ptrs = batch->compact_rows ? batch->index_ptrs : NULL;
    const struct cp_rect *scissors = batch->compact_rows ?
                                     batch->scissors : NULL;
 
@@ -5346,6 +5347,15 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                   indexed ? (uint32_t)draws[d].start * info->index_size : 0;
                slices[d].first_vertex =
                   indexed ? (uint32_t)draws[d].index_bias : draws[d].start;
+               /* This draw's own index buffer, when it is not the batch's.
+                * The fold of draws[0].start into vf_args.index_buffer does
+                * not happen on the slice path, so the base goes in whole. */
+               uint64_t slice_ib = 0;
+               if (indexed && ib_ptrs && ib_ptrs[d] &&
+                   ib_ptrs[d] != (uint64_t)(uintptr_t)info->index_ptr)
+                  slice_ib = ib_ptrs[d];
+               slices[d].ib_base_lo = (uint32_t)slice_ib;
+               slices[d].ib_base_hi = (uint32_t)(slice_ib >> 32);
                /* Zero for a plain draw, so the fetch skips the division; the
                 * span covers every instance either way. */
                slices[d].verts_per_instance = inst > 1 ? dverts : 0;
@@ -7221,6 +7231,7 @@ cp_batch_record_packet(struct cp_context *cp,
    }
 
    cp->batch.draws[n] = packet->range;
+   cp->batch.index_ptrs[n] = (uint64_t)(uintptr_t)packet->call.index_ptr;
    cp->batch.instance_counts[n] = packet->call.instance_count;
    cp->batch.draw_ids[n] = packet->drawid_offset;
    cp->batch.scissors[n] = packet->scissor;

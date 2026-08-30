@@ -170,6 +170,10 @@ struct cp_draw_batch {
        * draws bound to different vertex buffers merge — see
        * cp_vertex_fetch_args.elem_bases. */
       uint64_t vb_bases[CP_MAX_BATCH_DRAWS * CP_VB_TABLE_STRIDE];
+      /* Each merged draw's index-buffer device address, for the slice
+       * table's per-draw base; draws bound to different index buffers
+       * merge on the strength of this row. */
+      uint64_t index_ptrs[CP_MAX_BATCH_DRAWS];
       /* The scissor each draw was recorded under, for the per-draw clip
        * rectangles — see cp_rasterize_args.clip_rects. */
       struct cp_rect scissors[CP_MAX_BATCH_DRAWS];
