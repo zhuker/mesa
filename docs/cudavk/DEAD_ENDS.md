@@ -80,6 +80,8 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 22 | **The merge rule** | 2026-08-27 | **RULE** | a launch-removal credit is only collectable where the launches were **serial** |
 | 23 | Hoisting the shading-group tables above the drain (Tier 1) | 2026-08-27 item 2 | REFUTED | measured zero on both captures; one hash across both arms on ten runs |
 | 24 | The opaque sort-middle tiling prototype, and a v2 of it | 2026-08-27 audit | REFUTED | best case **2.1–2.6 ms/frame** against the **+2.73 ms** fan-out it has to surrender |
+| 25 | Device-side episode chaining: CDP2 tails, predicated pre-issue, conditional graphs | 2026-08-30, HeadlessStreamer | REFUTED | a device tail launch costs **7.3–8.7 µs against 1.5 host** on sm_120; the admissible unit is 0.037 ms/frame |
+| 26 | Emptying the stage3→fs_compact link: interp-in-argblock and compact PDL | 2026-08-30, HeadlessStreamer | REFUTED | INTERP_INLINE **+0.13 ms slower**; COMPACT_PDL inert without it; both in-tree, default off |
 
 ---
 
@@ -1288,7 +1290,95 @@ copy and is not proposed for the tree.
 reason. A probe on every 29th launch across a full old-capture replay (6,669
 launches) read back the device-built tile queue: median 12 entries, p90 404,
 max 4,434; **17.6% of launches have an empty queue**; and the grid is
-`CLAMP(rast_num_triangles * 8, 512, 2048)`, sized from the triangle count rather
+`CLAMP(rast_num_triangle## 25. Device-side episode chaining — CDP2 tails, predicated pre-issue, conditional graphs — REFUTED
+
+2026-08-30, on the HeadlessStreamer occlusion capture's compiled harness
+(`~/favorite3-cpp`), tree at 0f6e7436db7. Full record with the census and the
+microbenchmark source: `docs/cudavk/notes/DEVICE_EPISODE_CHAINS.md` on the
+`cudavk/device-episode-chains` branch (nothing was built, so nothing merged).
+
+**Tried.** Measure-first evaluation of moving the per-episode launch chain off
+the host: CDP2 fire-and-forget/tail-launch chaining of the serial blended
+tail, pre-issued predicated chains, and conditional graph nodes.
+
+**Promising because.** The frame is ~900 launches of 10–30 µs latency shells;
+the host issues every one. `REARCHITECTURE_IDEAS.md` ideas B/F.
+
+**Measured.**
+
+- The unit (nsys census, real-frame window): the merge rule admits only the
+  serial blended tail — **50.36 launches/frame in 4.95 chains**; 65.6% of the
+  links are already PDL-hidden at a 1.7 µs median gap. Chaining removes 45.4
+  host launches/frame = **0.035–0.037 ms/frame** at the settled 0.78–0.81 µs
+  price.
+- The mechanism (standalone `cdp2-microbench.cu`, sm_120, CUDA 12.8, two runs
+  agreeing to 1.5%): host-issued back-to-back links **1.48–1.51 µs**; CDP2
+  tail launch **7.32–7.44 µs**; fire-and-forget **8.65–8.73 µs**. A
+  device-side launch costs **~5× the host price on this machine**, so
+  converting the 45.4 links would *add* ≈0.26 ms/frame of device critical
+  path to save ≤0.037 of host issue.
+
+**Mechanism.** The launch-latency floor is the device front end, not the
+host's API call: `cuLaunchKernel` costs 1.43 µs of CPU while the device link
+is 1.5 µs end to end — the host is not the bottleneck it looks like from an
+API trace. Pre-issued predicated chains fail the same arithmetic from the
+other side: they issue the same launches earlier plus a repair arm (a
+launch-count *increase*), and the wait they would hide is measured flat
+(spin-probe slopes +0.02 before / +0.05–0.21 after across two campaigns).
+Conditional graphs stay closed under entry 1's retry-if: the prize on this
+axis (≤0.037 ms) cannot fund stable-address surgery.
+
+**Retry if.** The serial-tail population grows by an order of magnitude (a
+workload with tens of blended episodes per frame), or a CUDA release brings
+device-side launch latency to parity with host issue — re-run
+`cdp2-microbench.cu` before believing either.
+
+**Cost.** Zero production code. One census, one microbenchmark, three
+locked replays.
+
+---
+
+## 26. Emptying the stage3→fs_compact link — interp-in-argblock and compact PDL — REFUTED
+
+2026-08-30, same capture and method, on the `cudavk/raster-chain-merge`
+branch (merged at 0bd790b550c). Both mechanisms are **in-tree, default off**,
+with their losses recorded in `FLAGS.md`: `CUDAVK_INTERP_INLINE` and
+`CUDAVK_COMPACT_PDL`.
+
+**Tried.** The direct shade chain's one remaining exposed stretch was
+stage3 → (counter memset) → (interp upload) → fs_compact, all serial on the
+main stream. The counter memset became the counter pool and **paid +0.08–0.10
+ms** (the accepted half of this work). The other two ops: fold the fused-interp
+block into the FS argument-block upload so no stream op is left between
+stage3 and compact, and give `cp_fs_compact` a `griddepcontrol.wait` PDL
+prologue.
+
+**Promising because.** The measured gap before fs_compact was 5.70 µs median
+and every piece of it is device front-end latency (the host is 0.8–3 ms
+ahead); pricing put ~0.2–0.35 ms/frame on the pair.
+
+**Measured.** INTERP_INLINE: **+0.13 ms/frame slower**, all four palindromic
+pairs agreeing, microcause unattributed. COMPACT_PDL: buys back 0.10 of
+INTERP_INLINE's 0.13 but is inert without it; the pair nets **−0.05**. The
+counter pool alone took the gap to 0.83 µs — there was less left than the
+5.70 µs suggested.
+
+**Mechanism.** Not fully attributed, and recorded as such. The interp block
+riding in the argument upload grows the per-shade upload and moves it onto
+the timing-sensitive edge the counter pool had just cleaned; whatever the
+microcause, the direction is measured in four independent pairs.
+
+**Retry if.** Someone attributes INTERP_INLINE's +0.13 to a removable cause
+(the flag makes the experiment one environment variable), or the shade-chain
+shape changes so the compact link is exposed again — check with the entry's
+own numbers: gap-before-compact median was 0.83 µs *with* the counter pool.
+
+**Cost.** Two flag-gated mechanisms kept as controls, one palindromic
+session each.
+
+---
+
+s * 8, 512, 2048)`, sized from the triangle count rather
 than from the queue stage 2 builds on the device, so **98.3% of launches have
 queue ≤ grid** and the median launch leaves 500 of 512 blocks idle. The longest
 block holds *one* item. Compaction and rebalancing buy nothing here; only more
