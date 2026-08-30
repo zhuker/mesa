@@ -8,7 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CPVK_TEXTURE_CACHE_BUDGET (384ull * 1024ull * 1024ull)
+/* The refusal this budget produces is silent by design -- an allocation
+ * past it simply stays on the software sampler -- which is how 384 MiB sat
+ * 1.3 KB from its ceiling on the occlusion capture while 15,596 launches a
+ * replay fell back and nothing said so. The occlusion capture's content
+ * wants ~581 MiB; the default leaves headroom and the flag exists for
+ * co-located workloads that need the memory back. */
+#define CPVK_TEXTURE_CACHE_BUDGET \
+   ((uint64_t)cp_debug->texture_cache_budget_mb * 1024ull * 1024ull)
 
 struct cpvk_cache_format {
    CUarray_format format;
@@ -33,6 +40,13 @@ cpvk_cache_format(VkFormat format, struct cpvk_cache_format *out)
       return true;
    case VK_FORMAT_R16G16_UNORM:
       *out = (struct cpvk_cache_format){ CU_AD_FORMAT_UNSIGNED_INT16, 2, 4, 0, 1 };
+      return true;
+   /* A sampled D16 shadow map. The attachment half lives in the renderer;
+    * here it is a one-channel unorm16 texture like any other, and admitting
+    * it is what moves the descriptor-fallback population of the occlusion
+    * capture (15,193 launches) onto the hardware path. */
+   case VK_FORMAT_D16_UNORM:
+      *out = (struct cpvk_cache_format){ CU_AD_FORMAT_UNSIGNED_INT16, 1, 2, 0, 1 };
       return true;
    case VK_FORMAT_R16G16_SFLOAT:
       *out = (struct cpvk_cache_format){ CU_AD_FORMAT_HALF, 2, 4, 0, 1 };
@@ -442,11 +456,20 @@ cpvk_cache_sampler_desc(struct cpvk_device *dev, unsigned sampler_index,
 }
 
 static bool
-cpvk_cache_view_eligible(const struct cpvk_image_view *view, bool *cube)
+cpvk_cache_view_eligible(const struct cpvk_image_view *view, bool r_only,
+                         bool *cube)
 {
    const struct cpvk_image *image = view->image;
+   /* A sampled depth view is admissible only when every reading site
+    * consumes .r alone (CP_TEXTURE_COOKIE_R_ONLY): the hardware fills the
+    * missing channels of a one-channel array with zeros where Vulkan's
+    * depth expansion writes (0, 0, 1), and a site that reads only .r
+    * cannot see the difference. Formats the table does not carry still
+    * miss at cpvk_cache_image_eligible. */
+   bool aspect_ok = view->vk.aspects == VK_IMAGE_ASPECT_COLOR_BIT ||
+      (r_only && view->vk.aspects == VK_IMAGE_ASPECT_DEPTH_BIT);
    if (!view->cache_swizzle_identity || view->vk.view_format != image->vk_format ||
-       view->vk.aspects != VK_IMAGE_ASPECT_COLOR_BIT ||
+       !aspect_ok ||
        !view->vk.level_count || !view->vk.layer_count ||
        view->vk.base_mip_level != 0 ||
        view->vk.level_count != image->vk.mip_levels ||
@@ -520,11 +543,14 @@ cpvk_texture_cache_resolve_locked(struct cpvk_device *dev,
                                   struct cpvk_batch_wait *waits,
                                   size_t *num_waits, size_t max_waits)
 {
+   bool r_only = (image_cookie & CP_TEXTURE_COOKIE_R_ONLY) != 0;
+   image_cookie &= ~CP_TEXTURE_COOKIE_R_ONLY;
    struct cpvk_image_view *view = image_cookie &&
       image_cookie <= dev->texture_cache_view_count
       ? dev->texture_cache_views[image_cookie - 1] : NULL;
    *out = 0;
    if (!view || !view->image || !sampler_cookie) {
+      dev->texture_cache_stats.miss_lookup++;
       dev->texture_cache_stats.fallbacks++;
       return CP_TEXTURE_CACHE_SOFT_FALLBACK;
    }
@@ -532,11 +558,17 @@ cpvk_texture_cache_resolve_locked(struct cpvk_device *dev,
    struct cpvk_image *image = view->image;
    bool cube = false;
    CUDA_TEXTURE_DESC texture_desc = {0};
-   if (!cpvk_cache_view_eligible(view, &cube) ||
-       !cpvk_cache_sampler_desc(dev, sampler_index, cube, &texture_desc))
+   if (!cpvk_cache_view_eligible(view, r_only, &cube)) {
+      dev->texture_cache_stats.miss_view++;
       goto miss;
+   }
+   if (!cpvk_cache_sampler_desc(dev, sampler_index, cube, &texture_desc)) {
+      dev->texture_cache_stats.miss_sampler++;
+      goto miss;
+   }
    struct cpvk_cache_format format;
    if (!cpvk_cache_image_eligible(image, &format)) {
+      dev->texture_cache_stats.miss_image++;
       if (cp_debug->debug_tex)
          fprintf(stderr, "cudavk: texture cache image miss create=%u alias=%u "
                  "mem=%p kind=%d ledger=%u tiling=%u samples=%u format=%u\n",
@@ -548,8 +580,10 @@ cpvk_texture_cache_resolve_locked(struct cpvk_device *dev,
    }
    unsigned target = view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ? 2
       : (view->vk.view_type == VK_IMAGE_VIEW_TYPE_3D ? 4 : 1);
-   if (!(format.targets & target))
+   if (!(format.targets & target)) {
+      dev->texture_cache_stats.miss_target++;
       goto miss;
+   }
    if (!image->texture_cache && !cpvk_cache_allocate(image, &format)) {
       if (cp_debug->debug_tex)
          fprintf(stderr, "cudavk: texture cache array allocation miss\n");
@@ -558,6 +592,7 @@ cpvk_texture_cache_resolve_locked(struct cpvk_device *dev,
    struct cpvk_texture_object *object =
       cpvk_cache_object(view, sampler_index, &texture_desc);
    if (!object) {
+      dev->texture_cache_stats.miss_object++;
       if (cp_debug->debug_tex)
          fprintf(stderr, "cudavk: texture cache object miss view=%u levels=%u "
                  "layers=%u sampler=%u\n", view->vk.view_type,
@@ -569,12 +604,16 @@ cpvk_texture_cache_resolve_locked(struct cpvk_device *dev,
    bool rebuilt_here = false;
    if (!image->texture_cache->ready_valid ||
        image->texture_cache->scheduled_epoch != epoch) {
-      if (!cpvk_cache_rebuild(image, stream, &format, epoch))
+      if (!cpvk_cache_rebuild(image, stream, &format, epoch)) {
+         dev->texture_cache_stats.miss_rebuild++;
          goto miss;
+      }
       rebuilt_here = true;
    }
-   if (atomic_load_explicit(&image->content_epoch, memory_order_acquire) != epoch)
+   if (atomic_load_explicit(&image->content_epoch, memory_order_acquire) != epoch) {
+      dev->texture_cache_stats.miss_epoch++;
       goto miss;
+   }
    struct cpvk_texture_cache *cache = image->texture_cache;
    bool memo_hit = rebuilt_here;
    if (stream_serial) {
@@ -978,4 +1017,18 @@ cpvk_texture_cache_report(struct cpvk_device *dev)
            dev->texture_cache_stats.purge_reclaimed_bytes,
            dev->texture_cache_stats.purge_reclaimed_arrays,
            dev->texture_cache_stats.purge_reclaimed_objects);
+   fprintf(stderr, "cudavk: texture cache resolve misses:"
+           " view=%" PRIu64 " sampler=%" PRIu64 " image=%" PRIu64
+           " target=%" PRIu64 "\n",
+           dev->texture_cache_stats.miss_view,
+           dev->texture_cache_stats.miss_sampler,
+           dev->texture_cache_stats.miss_image,
+           dev->texture_cache_stats.miss_target);
+   fprintf(stderr, "cudavk: texture cache resolve misses 2:"
+           " object=%" PRIu64 " rebuild=%" PRIu64 " epoch=%" PRIu64 "\n",
+           dev->texture_cache_stats.miss_object,
+           dev->texture_cache_stats.miss_rebuild,
+           dev->texture_cache_stats.miss_epoch);
+   fprintf(stderr, "cudavk: texture cache resolve misses 3: lookup=%" PRIu64 "\n",
+           dev->texture_cache_stats.miss_lookup);
 }

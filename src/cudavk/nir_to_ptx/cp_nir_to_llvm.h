@@ -36,7 +36,11 @@ struct cp_hw_tex_site {
    uint8_t op;
    uint8_t dim;
    uint8_t coord_components;
-   uint8_t reserved;
+   /* Which components of the tex result the shader reads (bit0 = .r). A
+    * site that reads only .r can be served by a one-channel texture whose
+    * hardware fill of .gba differs from Vulkan's depth expansion; the
+    * preflight forwards this as CP_TEXTURE_COOKIE_R_ONLY. */
+   uint8_t read_mask;
 };
 
 /* Launches timed per phase of a shader's register-cap trial, and how many are

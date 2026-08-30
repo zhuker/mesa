@@ -217,6 +217,7 @@ struct cp_debug {
     * apply_couplings().
     */
    unsigned pdl;
+   unsigned texture_cache_budget_mb;
    bool no_pdl;
    bool no_sampler_variant;
    /* Revert switch for the software textureGather. Set, every tg4 goes back to

@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-125 switches.
+126 switches.
 
 ## Tracing
 
@@ -26,6 +26,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_DEBUG_TEX` | bool (presence) | `off` | — | trace sampler and texture-handle setup |
 | `CUDAVK_PLAN_STATS` | bool (value) | `off` | — | report at teardown what deciding one draw at a time costs: batch keys built, pairwise merge tests, flushes, pass episodes closed and every reactive reallocation, with per-scope averages |
 | `CUDAVK_SPEC_STATS` | bool (value) | `off` | — | report at teardown how many fragment launches used a sampler-specialised kernel, and which shaders sample textures the specialiser could not match; a silent drop to zero is a performance regression with no error |
+| `CUDAVK_TEXTURE_CACHE_BUDGET_MB` | uint | `2048` | — | hardware texture cache byte budget in MiB; an allocation past it falls back to software sampling silently, which cost 1.76 ms/frame on the occlusion capture at the old default of 384 |
 | `CUDAVK_TEXTURE_CACHE_STATS` | bool (value) | `off` | — | report hardware-texture fragment execution hits and software fallbacks |
 | `CUDAVK_DEBUG_VFETCH` | bool (presence) | `off` | — | dump what the GPU vertex fetch gathered; syncs, so debug-only |
 | `CUDAVK_DEBUG_WORK` | bool (presence) | `off` | — | report how much of the shading launch did work; syncs |

@@ -31,6 +31,10 @@
  * census. Nothing below this line calls them unwrapped. */
 #include "cp_smallop_tele.h"
 
+/* Which caller site produced a descriptor fallback; printed with the
+ * hardware-texture stats. Attribution before ranking, rule 14. */
+static uint64_t cp_hwtex_desc_fallback_site[10];
+
 /*
  * Bring a renderer up on a device.
  *
@@ -912,6 +916,11 @@ cp_hardware_texture_report(struct cp_context *cp)
       "none/other", "ineligible", "inline-footprint", "surviving-helper",
       "local-memory", "bad-texture-ptx", "jit", "other"
    };
+   fprintf(stderr, "cudavk: hardware texture descriptor fallback sites:");
+   for (unsigned i = 0; i < 10; i++)
+      if (cp_hwtex_desc_fallback_site[i])
+         fprintf(stderr, " s%u=%" PRIu64, i, cp_hwtex_desc_fallback_site[i]);
+   fputc('\n', stderr);
    fprintf(stderr, "cudavk: hardware texture shader fallback reasons:");
    for (unsigned i = 0; i < ARRAY_SIZE(reasons); i++)
       if (cp->hardware_texture.fallback_shader_reason[i])
@@ -3198,6 +3207,7 @@ cp_texture_stream_serial(const struct cp_context *cp)
    return 0; /* Unknown streams get only batch-local wait memoization. */
 }
 
+
 static bool
 cp_texture_cache_available(struct cp_context *cp,
                            const struct cp_draw_state *state,
@@ -3258,6 +3268,7 @@ cp_texture_cache_available(struct cp_context *cp,
          if (cp->device_fatal)
             return false;
          cp->hardware_texture.fallback_descriptor++;
+         cp_hwtex_desc_fallback_site[0]++;
          return false;
       }
       /* Keep the real grown authoritative arena, but do not consume dummy
@@ -3278,22 +3289,26 @@ cp_texture_cache_available(struct cp_context *cp,
    if (!fs->num_hw_tex_sites ||
        rows > SIZE_MAX / fs->num_hw_tex_sites) {
       cp->hardware_texture.fallback_descriptor++;
+      cp_hwtex_desc_fallback_site[1]++;
       return false;
    }
    size_t count = (size_t)rows * fs->num_hw_tex_sites;
    if (count > SIZE_MAX / sizeof(uint64_t)) {
       cp->hardware_texture.fallback_descriptor++;
+      cp_hwtex_desc_fallback_site[2]++;
       return false;
    }
    if (count > cp->hardware_texture.resolve_workspace_cells) {
       if (count > SIZE_MAX / (3 * sizeof(uint64_t))) {
          cp->hardware_texture.fallback_descriptor++;
+         cp_hwtex_desc_fallback_site[3]++;
          return false;
       }
       uint64_t *grown = realloc(cp->hardware_texture.resolve_workspace,
                                 count * 3 * sizeof(uint64_t));
       if (!grown) {
          cp->hardware_texture.fallback_descriptor++;
+         cp_hwtex_desc_fallback_site[4]++;
          return false;
       }
       cp->hardware_texture.resolve_workspace = grown;
@@ -3316,6 +3331,7 @@ cp_texture_cache_available(struct cp_context *cp,
          const struct cp_hw_tex_site *ref = &fs->hw_tex_sites[site];
          if (ref->image.ubo_slot >= CP_ARG_UBO_STRIDE ||
              ref->sampler.ubo_slot >= CP_ARG_UBO_STRIDE) {
+            cp_hwtex_desc_fallback_site[8]++;   /* ubo slot out of range */
             use = false;
             break;
          }
@@ -3337,9 +3353,14 @@ cp_texture_cache_available(struct cp_context *cp,
          if (sampler_field)
             memcpy(&sampler_cookie, sampler_field, sizeof(sampler_cookie));
          size_t index = (size_t)row_index * fs->num_hw_tex_sites + site;
+         /* A site that reads only .r may be served by a one-channel
+          * texture; the resolver is told through the cookie's top bit. */
+         if (image_cookie && (ref->read_mask & 0xe) == 0)
+            image_cookie |= CP_TEXTURE_COOKIE_R_ONLY;
          image_cookies[index] = image_cookie;
          sampler_cookies[index] = sampler_cookie;
          if (!image_cookie || !sampler_cookie) {
+            cp_hwtex_desc_fallback_site[7]++;   /* zero cookie, not resolve */
             use = false;
             break;
          }
@@ -3380,6 +3401,7 @@ cp_texture_cache_available(struct cp_context *cp,
    if (!use) {
       cp_texture_cache_unpin(cp);
       cp->hardware_texture.fallback_descriptor++;
+      cp_hwtex_desc_fallback_site[5]++;
       return false;
    }
 
@@ -3395,6 +3417,7 @@ cp_texture_cache_available(struct cp_context *cp,
          return false;
       }
       cp->hardware_texture.fallback_descriptor++;
+      cp_hwtex_desc_fallback_site[6]++;
       return false;
    }
    memcpy(upload, objects, bytes);

@@ -3265,6 +3265,7 @@ capture_hw_tex_site(nir_tex_instr *tex, struct cp_hw_tex_site *ref)
    ref->op = (uint8_t)tex->op;
    ref->dim = (uint8_t)tex->sampler_dim;
    ref->coord_components = tex->coord_components;
+   ref->read_mask = (uint8_t)(nir_def_components_read(&tex->def) & 0xf);
    return true;
 }
 

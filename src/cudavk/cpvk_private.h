@@ -133,6 +133,11 @@ struct cpvk_device {
       uint64_t purge_reclaimed_arrays, purge_reclaimed_objects;
       uint64_t array_alloc_attempts, object_create_attempts;
       uint64_t conversion_enqueue_attempts;
+      /* Which gate a resolve miss died at, so a fallback population can be
+       * attributed instead of guessed at -- two guesses missed before these
+       * were added. */
+      uint64_t miss_view, miss_sampler, miss_image, miss_target;
+      uint64_t miss_object, miss_rebuild, miss_epoch, miss_lookup;
    } texture_cache_stats;
 
    /* The last command draw staged into a pending renderer batch. Merge must be

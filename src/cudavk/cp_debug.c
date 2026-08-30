@@ -121,6 +121,11 @@ static const struct cp_flag_def flags[] = {
      "report at teardown how many fragment launches used a sampler-specialised "
      "kernel, and which shaders sample textures the specialiser could not "
      "match; a silent drop to zero is a performance regression with no error" },
+   { "CUDAVK_TEXTURE_CACHE_BUDGET_MB", CP_FLAG_UINT,
+     F(texture_cache_budget_mb),
+     "hardware texture cache byte budget in MiB; an allocation past it "
+     "falls back to software sampling silently, which cost 1.76 ms/frame "
+     "on the occlusion capture at the old default of 384", .dflt = 2048 },
    { "CUDAVK_TEXTURE_CACHE_STATS", CP_FLAG_BOOL_VALUE, F(texture_cache_stats),
      "report hardware-texture fragment execution hits and software fallbacks" },
    { "CUDAVK_DEBUG_VFETCH", CP_FLAG_BOOL_PRESENCE, F(debug_vfetch),

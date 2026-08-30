@@ -39,6 +39,12 @@ struct cp_device {
     * stream; CUDA-array ownership stays in the native Vulkan driver. */
    void *texture_cache_private;
    atomic_uint_fast64_t next_texture_stream_serial;
+   /* View cookies are small indices, so their top bit carries a per-site
+    * fact the resolver needs: the sampling shader reads only .r, which is
+    * what makes a one-channel (depth) texture safe to serve from the
+    * hardware path -- its .gba fill differs from Vulkan's expansion, and a
+    * site that never reads those lanes cannot tell. */
+#define CP_TEXTURE_COOKIE_R_ONLY (1ull << 63)
    enum cp_texture_cache_result
       (*texture_cache_resolve)(void *private_data,
                                uint64_t view_cookie,
