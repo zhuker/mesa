@@ -747,6 +747,7 @@ cpvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
       .max_anisotropy = pCreateInfo->anisotropyEnable ?
                         pCreateInfo->maxAnisotropy : 0.0f,
       .compare_enable = pCreateInfo->compareEnable,
+      /* PROBE (debug_tex): scope Phase B's shadow-tap emission. */
 #ifdef VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT
       .non_seamless_cube =
          !!(pCreateInfo->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT),
@@ -764,6 +765,14 @@ cpvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
               pCreateInfo->borderColor == VK_BORDER_COLOR_INT_OPAQUE_BLACK) {
       info.border_color[3] = 1.0f;
    }
+   if (cp_debug->debug_tex && pCreateInfo->compareEnable)
+      fprintf(stderr, "cudavk: compare sampler: op=%u min=%u mag=%u mip=%u "
+              "wrap=%u/%u border=%u aniso=%.1f\n",
+              pCreateInfo->compareOp, pCreateInfo->minFilter,
+              pCreateInfo->magFilter, pCreateInfo->mipmapMode,
+              pCreateInfo->addressModeU, pCreateInfo->addressModeV,
+              pCreateInfo->borderColor, info.max_anisotropy);
+
 
    /* Deduplicated, like the Gallium adapter's table: descriptors refer to
     * entries by index and identical states must land on one entry, because

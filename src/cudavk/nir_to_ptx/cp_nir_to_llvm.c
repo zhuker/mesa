@@ -3360,8 +3360,12 @@ cp_hardware_texture_shader_eligible(struct nir_shader *nir)
                   (src == nir_tex_src_bias && tex->op == nir_texop_txb) ||
                   ((src == nir_tex_src_ddx || src == nir_tex_src_ddy) &&
                    tex->op == nir_texop_txd);
-               if (!allowed)
+               if (!allowed) {
+                  if (cp_debug->shader_stats)
+                     fprintf(stderr, "cudavk: hw-tex disallowed src: op=%u "
+                             "src_type=%u\n", tex->op, src);
                   return false;
+               }
             }
             unsigned expected_coord = tex->sampler_dim == GLSL_SAMPLER_DIM_2D
                ? (tex->is_array ? 3 : 2) : 3;
@@ -3372,8 +3376,14 @@ cp_hardware_texture_shader_eligible(struct nir_shader *nir)
                 (tex->op == nir_texop_txb &&
                  (nbias != 1 || nlod || nddx || nddy)) ||
                 (tex->op == nir_texop_txd &&
-                 (nddx != 1 || nddy != 1 || nlod || nbias)))
+                 (nddx != 1 || nddy != 1 || nlod || nbias))) {
+               if (cp_debug->shader_stats)
+                  fprintf(stderr, "cudavk: hw-tex src-count mismatch: op=%u "
+                          "coords=%u/%u lod=%u bias=%u dd=%u/%u\n", tex->op,
+                          tex->coord_components, expected_coord, nlod, nbias,
+                          nddx, nddy);
                return false;
+            }
 
             struct cp_hw_tex_site ref = {0};
             cp_spec_reject_reason = NULL;
