@@ -1201,11 +1201,21 @@ struct cp_sampler_info {
  * and since a warp cannot retire until its slowest lane does, one large
  * triangle also holds up the 31 small ones sharing its warp.
  */
+/*
+ * Lowered 128 -> 16 and 1536 -> 256 on 2026-08-30. NCU showed stage 1 running
+ * 40-75 us launches at 3-6% occupancy: single lanes serially walking up to
+ * 128-pixel boxes while the machine idled, and stage 2 one tier up the same.
+ * Swept on all three HeadlessStreamer captures, arms alternating: 16/256 is
+ * the plateau on each -- favorite3 6.78 -> 6.27, favorite2 6.35 -> 5.91,
+ * favorite1 5.44 -> 5.10 ms -- and output stayed byte-identical on the small
+ * sweep's dump. Below 16/256 the queue round-trips win; the old values lose
+ * up to 0.5 ms/frame to lane-serial rasterization.
+ */
 #ifndef CP_SMALL_THRESHOLD
-#define CP_SMALL_THRESHOLD   128
+#define CP_SMALL_THRESHOLD   16
 #endif
 #ifndef CP_MEDIUM_THRESHOLD
-#define CP_MEDIUM_THRESHOLD  1536
+#define CP_MEDIUM_THRESHOLD  256
 #endif
 
 /*
