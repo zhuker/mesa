@@ -270,6 +270,7 @@ struct cp_debug {
    bool no_merge_scissor;
    bool keep_voff;
    bool keep_instkey;
+   bool keep_vbkey;
    bool keep_pushkey;
    bool no_bincache;
    bool no_regcap;

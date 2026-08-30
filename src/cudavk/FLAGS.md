@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-121 switches.
+122 switches.
 
 ## Tracing
 
@@ -115,6 +115,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_KEEP_VOFF` | bool (presence) | `off` | — | put the vertex offset back in the merge key; it is the largest merge blocker there is, 13,281 separations of 38,155 on Crossroads |
 | `CUDAVK_KEEP_INSTKEY` | bool (presence) | `off` | — | put the instance count back in the merge key, which the renderer's per-draw instance_counts[] row makes unnecessary |
 | `CUDAVK_KEEP_PUSHKEY` | bool (presence) | `off` | — | put the push-constant block back in the merge key, so draws that push different constants stop merging |
+| `CUDAVK_KEEP_VBKEY` | bool (presence) | `off` | — | put the vertex-buffer bindings back in the merge key; the per-draw elem_bases rows carry them, and this was the largest merge blocker on the occlusion capture, 144,008 separations of 332,027 |
 | `CUDAVK_NO_BINCACHE` | bool (presence) | `off` | — | disable the compiled-kernel binary cache |
 
 ## A-buffer

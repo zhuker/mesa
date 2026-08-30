@@ -2479,7 +2479,22 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
     * per-draw UBO rows point at the immutable snapshots owned by this command
     * buffer; requiring equal sets only split otherwise identical work. */
    CPVK_DIFF(a->num_vb != b->num_vb, "vertex buffer count");
-   CPVK_DIFF(memcmp(a->vb_base, b->vb_base, sizeof(a->vb_base)), "vertex buffers");
+   /*
+    * The vertex-buffer bindings are *not* a merge condition. The batch
+    * snapshots one row of per-element base addresses per merged draw
+    * (cp_batch_record_packet), the upload at cp_renderer.c's elem_bases_dev
+    * hands them to the fetch, and cp_vf_lane.h reads its element base
+    * per row -- "so draws bound to different vertex buffers merge", in that
+    * file's own words. Every batched draw has a classic-exec vertex shader
+    * (cpvk_batch_structural), so the no-VS passthrough path that still reads
+    * the batch-wide state->vb_base cannot see a merged batch.
+    *
+    * It was the largest merge blocker on the occlusion capture: 144,008
+    * separations of 332,027, ahead of the vertex shader's 95,448.
+    * CUDAVK_KEEP_VBKEY restores it.
+    */
+   if (cp_debug->keep_vbkey)
+      CPVK_DIFF(memcmp(a->vb_base, b->vb_base, sizeof(a->vb_base)), "vertex buffers");
    CPVK_DIFF(a->vs_push_size != b->vs_push_size ||
              a->fs_push_size != b->fs_push_size, "push constant size");
    /*

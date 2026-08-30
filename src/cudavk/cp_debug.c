@@ -382,6 +382,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_KEEP_PUSHKEY", CP_FLAG_BOOL_PRESENCE, F(keep_pushkey),
      "put the push-constant block back in the merge key, so draws that push "
      "different constants stop merging" },
+   { "CUDAVK_KEEP_VBKEY", CP_FLAG_BOOL_PRESENCE, F(keep_vbkey),
+     "put the vertex-buffer bindings back in the merge key; the per-draw "
+     "elem_bases rows carry them, and this was the largest merge blocker on "
+     "the occlusion capture, 144,008 separations of 332,027" },
    { "CUDAVK_NO_BINCACHE", CP_FLAG_BOOL_PRESENCE, F(no_bincache),
      "disable the compiled-kernel binary cache" },
 
