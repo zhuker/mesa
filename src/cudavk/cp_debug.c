@@ -173,6 +173,15 @@ static const struct cp_flag_def flags[] = {
      "when a cube descriptor is written, read back the first texel of each of "
      "its six faces from where the sampler will look; syncs" },
 
+   { "CUDAVK_GEOMETRY_CENSUS", CP_FLAG_UINT, F(geometry_census),
+     "diagnostic B0 post-stage2 visibility-buffer SHA-256 census; 1 and 2 "
+     "select independent fixed domain salts; invalid for timing", .dflt = 0,
+     .has_range = true, .lo = 0, .hi = 2 },
+   { "CUDAVK_GEOMETRY_CENSUS_SUBMIT_START", CP_FLAG_UINT,
+     F(geometry_census_submit_start),
+     "with GEOMETRY_CENSUS, skip hashing through this absolute internal "
+     "command-bearing submit ordinal", .dflt = 0 },
+
    /* ---- subsystem switches ---- */
    { "CUDAVK_NO_ABUFFER", CP_FLAG_BOOL_PRESENCE, F(no_abuffer),
      "disable the A-buffer; blended draws go back to the direct path" },

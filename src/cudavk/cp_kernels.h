@@ -29,6 +29,13 @@ struct cp_kernels {
    CUmodule module;
    CUmodule clear_module;
    CUmodule fs_module;
+   /* Separate diagnostic modules.  Null, and never compiled or loaded, when
+    * CUDAVK_GEOMETRY_CENSUS=0. */
+   CUmodule geometry_sha_module;
+   CUmodule geometry_final_module;
+   CUfunction geometry_sha_leaf;
+   CUfunction geometry_sha_node;
+   CUfunction geometry_final;
 
    /* Clear kernels */
    CUfunction clear_kernel;

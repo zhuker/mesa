@@ -21,6 +21,8 @@
 #include <stdio.h>
 
 #include "kernels/cp_rast_types.h"
+#include "kernels/cp_sha256_merkle.h"
+#include "kernels/cp_geometry_b0.h"
 
 #include "cp_shader_abi.h"
 
@@ -389,6 +391,41 @@ struct cp_context {
       int      *stages;   /* which stage the interval ending here belongs to */
       unsigned  num, cap;
    } timer;
+
+   /* CUDAVK_GEOMETRY_CENSUS B0.  This is diagnostic-only host state plus
+    * the two allocations named here.  Both stay absent in the disabled path. */
+#define CP_GEOM_B0_EX_APPENDING       0
+#define CP_GEOM_B0_EX_INDIRECT        1
+#define CP_GEOM_B0_EX_VS_MEMORY       2
+#define CP_GEOM_B0_EX_FS_MEMORY       3
+#define CP_GEOM_B0_EX_QUERY           4
+#define CP_GEOM_B0_EX_ABUFFER         5
+#define CP_GEOM_B0_EX_PEEL            6
+#define CP_GEOM_B0_EX_RETRY           7
+#define CP_GEOM_B0_EX_FUSED_CLIP      8
+#define CP_GEOM_B0_EX_UNSUPPORTED     9
+#define CP_GEOM_B0_EX_STAGE2_LAUNCH  10
+#define CP_GEOM_B0_EX_CAPACITY       11
+#define CP_GEOM_B0_EX_SCRATCH        12
+#define CP_GEOM_B0_EX_HASH_LAUNCH    13
+#define CP_GEOM_B0_EX_QUEUE          14
+#define CP_GEOM_B0_EX_OTHER          15
+#define CP_GEOM_B0_EX_COUNT          16
+   struct {
+      CUdeviceptr records;            /* managed, exactly 16 MiB */
+      CUdeviceptr scratch;            /* device, two Merkle digest planes */
+      size_t scratch_bytes;
+      uint64_t submit_ordinal;        /* absolute command-bearing submits */
+      uint32_t submit_occurrence;     /* low 32 bits of submit ordinal */
+      uint32_t unit_ordinal;          /* within the current occurrence */
+      uint64_t candidates;
+      uint64_t reserved;
+      uint64_t final_launches;
+      uint64_t exclusions[CP_GEOM_B0_EX_COUNT];
+      bool submit_has_query;
+      bool submit_has_indirect;
+      bool valid;
+   } geometry_b0;
 
    /* Visibility buffer, rebuilt per draw: it resolves which triangle of the
     * current draw wins each pixel. */
@@ -1078,6 +1115,8 @@ bool cp_clear_rect_masked(struct cp_context *cp, void *data, uint64_t offset,
 
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 void cp_context_cleanup(struct cp_context *cp);
+void cp_geometry_b0_submit(struct cp_context *cp, bool has_query,
+                           bool has_indirect);
 
 /*
  * A backstop, not a budget. The arena accumulates across the draws of a frame

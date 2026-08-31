@@ -160,6 +160,27 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
+   if (cp_debug->geometry_census && submit->command_buffer_count) {
+      bool has_query = false, has_indirect = false;
+      for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+         struct cpvk_cmd_buffer *cmd = container_of(submit->command_buffers[i],
+                                                    struct cpvk_cmd_buffer, vk);
+         for (unsigned o = 0; o < cmd->num_ops; o++) {
+            if (cmd->ops[o].kind == CPVK_OP_QUERY &&
+                cmd->ops[o].query.pool &&
+                cmd->ops[o].query.pool->type != VK_QUERY_TYPE_TIMESTAMP)
+               has_query = true;
+            if (cmd->ops[o].kind == CPVK_OP_QUERY_COPY &&
+                cmd->ops[o].query_copy.pool &&
+                cmd->ops[o].query_copy.pool->type != VK_QUERY_TYPE_TIMESTAMP)
+               has_query = true;
+            has_indirect |= cmd->ops[o].kind == CPVK_OP_DRAW &&
+                            cmd->ops[o].draw_cmd.indirect != 0;
+         }
+      }
+      cp_geometry_b0_submit(&dev->renderer, has_query, has_indirect);
+   }
+
    CPVK_CTX_SCOPE(dev);
 
    /*
@@ -214,6 +235,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
       struct cpvk_cmd_buffer *cmd =
          container_of(submit->command_buffers[i], struct cpvk_cmd_buffer, vk);
+
 
       /* Publish the host mirrors for sampler specialization. Shader UBO rows
        * contain device addresses; this is the bounded translation used by the

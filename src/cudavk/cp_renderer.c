@@ -102,6 +102,22 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
    cp->main_stream = cp->stream;
    cp->main_stream_serial = cp_texture_stream_serial_alloc(dev);
 
+   if (cp_debug->geometry_census) {
+      cp->geometry_b0.valid = dev->kernels.geometry_sha_leaf &&
+                              dev->kernels.geometry_sha_node &&
+                              dev->kernels.geometry_final;
+      const size_t record_bytes = (size_t)CP_GEOM_B0_CAPACITY *
+                                  CP_GEOM_B0_RECORD_BYTES;
+      if (cuMemAllocManaged(&cp->geometry_b0.records, record_bytes,
+                            CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
+         cp->geometry_b0.records = 0;
+         cp->geometry_b0.valid = false;
+      } else if (cuMemsetD8Async(cp->geometry_b0.records, 0, record_bytes,
+                                 cp->stream) != CUDA_SUCCESS) {
+         cp->geometry_b0.valid = false;
+      }
+   }
+
    /* The flush's generation ring; see cp_flush. A failed event creation
     * falls back to the draining flush by leaving flush_retire[0] null. */
    cp->flush_gens = cp_debug->flush_drain ? 1 : CP_FLUSH_GENS;
@@ -982,6 +998,348 @@ cp_hardware_texture_report(struct cp_context *cp)
               cp->hardware_texture.authoritative_oom_retries);
 }
 
+
+static const uint64_t cp_geom_b0_salts[3] = {
+   0, 0x47454f4d42305331ull, 0x47454f4d42305332ull,
+};
+static const uint64_t cp_geom_b0_regions[3] = {
+   0, 0x5649534230524731ull, 0x5649534230524732ull,
+};
+
+void
+cp_geometry_b0_submit(struct cp_context *cp, bool has_query, bool has_indirect)
+{
+   if (!cp_debug->geometry_census)
+      return;
+   cp->geometry_b0.submit_ordinal++;
+   cp->geometry_b0.submit_occurrence =
+      (uint32_t)cp->geometry_b0.submit_ordinal;
+   cp->geometry_b0.unit_ordinal = 0;
+   cp->geometry_b0.submit_has_query = has_query;
+   cp->geometry_b0.submit_has_indirect = has_indirect;
+}
+
+static uint64_t
+cp_geom_b0_sig_add(uint64_t h, const void *data, size_t size)
+{
+   const uint8_t *p = data;
+   while (size--) {
+      h ^= *p++;
+      h *= 1099511628211ull;
+   }
+   return h;
+}
+
+static bool
+cp_geometry_b0_launch_hash(struct cp_context *cp, CUdeviceptr source,
+                           uint64_t bytes, uint64_t region_id,
+                           struct cp_geom_b0_record *record,
+                           const struct cp_rast_queues *queues)
+{
+   struct cp_sha256_merkle_plan plan;
+   if (!cp->geometry_b0.valid || !cp->geometry_b0.records ||
+       !cp->geometry_b0.scratch ||
+       cp_sha256_merkle_make_plan(bytes, &plan) != 0 ||
+       plan.scratch_bytes > cp->geometry_b0.scratch_bytes) {
+      cp->geometry_b0.exclusions[CP_GEOM_B0_EX_SCRATCH]++;
+      cp->geometry_b0.valid = false;
+      return false;
+   }
+   if (cp->geometry_b0.reserved >= CP_GEOM_B0_CAPACITY) {
+      cp->geometry_b0.exclusions[CP_GEOM_B0_EX_CAPACITY]++;
+      cp->geometry_b0.valid = false;
+      return false;
+   }
+
+   uint64_t slot = cp->geometry_b0.reserved++;
+   const uint64_t per_launch =
+      (uint64_t)CP_SHA256_MERKLE_DEFAULT_THREADS *
+      CP_SHA256_MERKLE_MAX_GRID_X;
+   uint64_t first = 0;
+   while (first < plan.leaf_count) {
+      uint64_t work = MIN2(plan.leaf_count - first, per_launch);
+      uint32_t blocks = 0;
+      if (cp_sha256_merkle_launch_blocks(work,
+            CP_SHA256_MERKLE_DEFAULT_THREADS, &blocks) != 0)
+         goto launch_fail;
+      struct cp_sha256_merkle_leaf_args args = {
+         source, cp->geometry_b0.scratch, bytes, region_id, first, work,
+      };
+      void *params[] = { &args };
+      if (cp_launch(cp, cp->dev->kernels.geometry_sha_leaf,
+                    blocks, 1, 1, CP_SHA256_MERKLE_DEFAULT_THREADS, 1, 1,
+                    0, cp->stream, params, NULL) != CUDA_SUCCESS)
+         goto launch_fail;
+      first += work;
+   }
+
+   uint64_t count = plan.leaf_count;
+   uint64_t input_offset = 0, output_offset = plan.plane_bytes;
+   uint32_t level = 1;
+   while (count > 1) {
+      uint64_t parents = cp_sha256_merkle_parent_count(count);
+      first = 0;
+      while (first < parents) {
+         uint64_t work = MIN2(parents - first, per_launch);
+         uint32_t blocks = 0;
+         if (cp_sha256_merkle_launch_blocks(work,
+               CP_SHA256_MERKLE_DEFAULT_THREADS, &blocks) != 0)
+            goto launch_fail;
+         struct cp_sha256_merkle_node_args args = {
+            cp->geometry_b0.scratch + input_offset,
+            cp->geometry_b0.scratch + output_offset,
+            region_id, count, first, work, level, 0,
+         };
+         void *params[] = { &args };
+         if (cp_launch(cp, cp->dev->kernels.geometry_sha_node,
+                       blocks, 1, 1, CP_SHA256_MERKLE_DEFAULT_THREADS, 1, 1,
+                       0, cp->stream, params, NULL) != CUDA_SUCCESS)
+            goto launch_fail;
+         first += work;
+      }
+      uint64_t swap = input_offset;
+      input_offset = output_offset;
+      output_offset = swap;
+      count = parents;
+      level++;
+   }
+
+   struct cp_geom_b0_final_args final_args;
+   memset(&final_args, 0, sizeof(final_args));
+   final_args.root = cp->geometry_b0.scratch + plan.root_offset;
+   final_args.nontrivial_count = queues->nontrivial_count;
+   final_args.huge_count = queues->huge_count;
+   final_args.setup_count = queues->setup_count;
+   final_args.output = cp->geometry_b0.records +
+                       slot * CP_GEOM_B0_RECORD_BYTES;
+   final_args.record = *record;
+   void *final_params[] = { &final_args };
+   if (cp_launch(cp, cp->dev->kernels.geometry_final,
+                 1, 1, 1, 1, 1, 1, 0, cp->stream,
+                 final_params, NULL) != CUDA_SUCCESS)
+      goto launch_fail;
+   cp->geometry_b0.final_launches++;
+   return true;
+
+launch_fail:
+   cp->geometry_b0.exclusions[CP_GEOM_B0_EX_HASH_LAUNCH]++;
+   cp->geometry_b0.valid = false;
+   return false;
+}
+
+static void
+cp_geometry_b0_after_stage2(struct cp_context *cp,
+                            const struct cp_draw_state *state,
+                            const struct cp_draw_call *info,
+                            const struct cp_rasterize_args *rast,
+                            const struct cp_rast_queues *queues,
+                            CUresult stage2_result, CUresult predecessor_result,
+                            bool fused_rast, bool clip_fallback,
+                            bool retry, bool peel, bool abuf,
+                            bool clear_ok, bool queue_clear_ok,
+                            unsigned pass, unsigned stage2_blocks,
+                            unsigned triangles)
+{
+   if (!cp_debug->geometry_census ||
+       cp->geometry_b0.submit_ordinal <=
+          cp_debug->geometry_census_submit_start)
+      return;
+
+   cp->geometry_b0.candidates++;
+   uint32_t unit = ++cp->geometry_b0.unit_ordinal;
+#define CP_GEOM_REJECT(reason) do { \
+      cp->geometry_b0.exclusions[(reason)]++; return; \
+   } while (0)
+   if (stage2_result != CUDA_SUCCESS) {
+      cp->geometry_b0.valid = false;
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_STAGE2_LAUNCH);
+   }
+   if (predecessor_result != CUDA_SUCCESS) {
+      cp->geometry_b0.valid = false;
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_OTHER);
+   }
+   if (!clear_ok || !queue_clear_ok) {
+      cp->geometry_b0.valid = false;
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_OTHER);
+   }
+   if (cp->pass.appending)
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_APPENDING);
+   if (cp->geometry_b0.submit_has_indirect || info->indirect)
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_INDIRECT);
+   if (state->vs && state->vs->writes_memory)
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_VS_MEMORY);
+   if (state->fs && state->fs->writes_memory)
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_FS_MEMORY);
+   if (cp->geometry_b0.submit_has_query)
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_QUERY);
+   if (abuf)
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_ABUFFER);
+   (void)peel; /* ordinary peel passes are complete same-stream visbuf units */
+   if (retry)
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_RETRY);
+   if (clip_fallback)
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_FUSED_CLIP);
+   if (rast->path_flag || !rast->width || !rast->height ||
+       !rast->num_samples || rast->num_samples > CP_MAX_SAMPLES ||
+       pass > UINT16_MAX ||
+       (uint64_t)rast->width * rast->height > UINT64_MAX /
+                                                rast->num_samples / 8u)
+      CP_GEOM_REJECT(CP_GEOM_B0_EX_UNSUPPORTED);
+
+   uint64_t bytes = (uint64_t)rast->width * rast->height *
+                    rast->num_samples * 8u;
+   struct cp_geom_b0_record record;
+   memset(&record, 0, sizeof(record));
+   record.magic = CP_GEOM_B0_MAGIC;
+   record.version = CP_GEOM_B0_VERSION;
+   record.salt = cp_geom_b0_salts[cp_debug->geometry_census];
+   record.submit_ordinal = cp->geometry_b0.submit_ordinal;
+   record.submit_occurrence = cp->geometry_b0.submit_occurrence;
+   record.unit_ordinal = unit;
+   record.byte_length = bytes;
+   record.width = rast->width;
+   record.height = rast->height;
+   record.samples = rast->num_samples;
+   record.pass = pass;
+   record.path = fused_rast ? 1 : 0; /* fused clip+stage1, or ordinary */
+   record.predecessor = fused_rast ? 2 : 1;
+   record.stage2_blocks = stage2_blocks;
+   record.triangles = triangles;
+
+   uint64_t sig = 1469598103934665603ull;
+#define CP_GEOM_SIG(v) sig = cp_geom_b0_sig_add(sig, &(v), sizeof(v))
+   CP_GEOM_SIG(record.width); CP_GEOM_SIG(record.height);
+   CP_GEOM_SIG(record.samples); CP_GEOM_SIG(record.pass);
+   CP_GEOM_SIG(record.stage2_blocks); CP_GEOM_SIG(record.triangles);
+   CP_GEOM_SIG(info->mode); CP_GEOM_SIG(info->index_size);
+   CP_GEOM_SIG(state->blend.enable);
+   CP_GEOM_SIG(state->depth.depth_enabled);
+   CP_GEOM_SIG(state->depth.depth_writemask);
+   CP_GEOM_SIG(state->depth.depth_func);
+   CP_GEOM_SIG(rast->clip_x0); CP_GEOM_SIG(rast->clip_y0);
+   CP_GEOM_SIG(rast->clip_x1); CP_GEOM_SIG(rast->clip_y1);
+#undef CP_GEOM_SIG
+   record.structural_signature = sig;
+   cp_geometry_b0_launch_hash(cp, rast->framebuffer, bytes,
+      cp_geom_b0_regions[cp_debug->geometry_census], &record, queues);
+#undef CP_GEOM_REJECT
+}
+
+static void
+cp_geometry_b0_report(struct cp_context *cp, bool context_sync_ok)
+{
+   if (!cp_debug->geometry_census)
+      return;
+   const size_t records_bytes = (size_t)CP_GEOM_B0_CAPACITY *
+                                CP_GEOM_B0_RECORD_BYTES;
+   bool readable = context_sync_ok && cp->geometry_b0.records;
+   if (readable) {
+      if (cuMemPrefetchAsync(cp->geometry_b0.records, records_bytes,
+                            CU_DEVICE_CPU, cp->stream) != CUDA_SUCCESS ||
+          cuStreamSynchronize(cp->stream) != CUDA_SUCCESS) {
+         cp->geometry_b0.valid = false;
+         readable = false;
+      }
+   }
+
+   uint64_t complete = 0, admitted = 0, queue_reject = 0;
+   if (readable) {
+      const struct cp_geom_b0_record *records =
+         (const struct cp_geom_b0_record *)(uintptr_t)cp->geometry_b0.records;
+      for (uint64_t i = 0; i < cp->geometry_b0.reserved; i++) {
+         const struct cp_geom_b0_record *r = &records[i];
+         if (r->magic != CP_GEOM_B0_MAGIC ||
+             r->version != CP_GEOM_B0_VERSION ||
+             (r->status != CP_GEOM_B0_STATUS_COMPLETE &&
+              r->status != CP_GEOM_B0_STATUS_QUEUE_REJECT))
+            continue;
+         complete++;
+         if (r->status == CP_GEOM_B0_STATUS_COMPLETE)
+            admitted++;
+         else
+            queue_reject++;
+         char digest[65];
+         for (unsigned b = 0; b < 32; b++)
+            snprintf(digest + 2 * b, 3, "%02x", r->sha256[b]);
+         fprintf(stderr,
+            "CUDAVK_GEOM_B0_RECORD index=%" PRIu64 " status=%u salt=%016" PRIx64
+            " submit=%" PRIu64 " occurrence=%u unit=%u pass=%u path=%u"
+            " predecessor=%u w=%u h=%u samples=%u bytes=%" PRIu64
+            " signature=%016" PRIx64 " stage2_blocks=%u triangles=%u"
+            " nontrivial=%u huge=%u setup=%u queue_status=%u sha256=%s\n",
+            i, r->status, (uint64_t)r->salt,
+            (uint64_t)r->submit_ordinal, r->submit_occurrence,
+            r->unit_ordinal, r->pass, r->path, r->predecessor,
+            r->width, r->height, r->samples, (uint64_t)r->byte_length,
+            (uint64_t)r->structural_signature, r->stage2_blocks, r->triangles,
+            r->nontrivial_count, r->huge_count, r->setup_count,
+            r->queue_status, digest);
+      }
+   }
+   cp->geometry_b0.exclusions[CP_GEOM_B0_EX_QUEUE] += queue_reject;
+   uint64_t reasons = 0;
+   bool classification_ok = admitted <= cp->geometry_b0.candidates;
+   for (unsigned i = 0; i < CP_GEOM_B0_EX_COUNT; i++) {
+      uint64_t n = cp->geometry_b0.exclusions[i];
+      if (n > UINT64_MAX - reasons)
+         classification_ok = false;
+      else
+         reasons += n;
+   }
+   classification_ok &= admitted <= cp->geometry_b0.candidates &&
+      reasons == cp->geometry_b0.candidates - admitted;
+   uint64_t classified_raw = admitted > UINT64_MAX - reasons ?
+      UINT64_MAX : admitted + reasons;
+   CUresult scratch_free = cp->geometry_b0.scratch ?
+      cuMemFree(cp->geometry_b0.scratch) : CUDA_SUCCESS;
+   CUresult records_free = cp->geometry_b0.records ?
+      cuMemFree(cp->geometry_b0.records) : CUDA_SUCCESS;
+   if (scratch_free == CUDA_SUCCESS)
+      cp->geometry_b0.scratch = 0;
+   if (records_free == CUDA_SUCCESS)
+      cp->geometry_b0.records = 0;
+   if (scratch_free != CUDA_SUCCESS || records_free != CUDA_SUCCESS)
+      cp->geometry_b0.valid = false;
+   bool result_valid = cp->geometry_b0.valid && readable &&
+      complete == cp->geometry_b0.reserved &&
+      cp->geometry_b0.reserved == cp->geometry_b0.final_launches &&
+      classification_ok;
+   fprintf(stderr,
+      "CUDAVK_GEOM_B0 version=1 mode=%u salt=%016" PRIx64
+      " selected_start=%u first_selected=%u final_submit=%" PRIu64
+      " capacity=%u reserved=%" PRIu64 " complete=%" PRIu64
+      " candidates=%" PRIu64 " admitted=%" PRIu64 " reasons=%" PRIu64
+      " classified_raw=%" PRIu64 " classification_ok=%s"
+      " records_bytes=%zu scratch_bytes=%zu allocation_bytes=%zu"
+      " result_valid=%s ex_appending=%" PRIu64 " ex_indirect=%" PRIu64
+      " ex_vs_memory=%" PRIu64 " ex_fs_memory=%" PRIu64
+      " ex_query=%" PRIu64 " ex_abuffer=%" PRIu64 " ex_peel=%" PRIu64
+      " ex_retry=%" PRIu64 " ex_fused_clip=%" PRIu64
+      " ex_unsupported=%" PRIu64 " ex_stage2_launch=%" PRIu64
+      " ex_capacity=%" PRIu64 " ex_scratch=%" PRIu64
+      " ex_hash_launch=%" PRIu64 " ex_queue=%" PRIu64
+      " ex_other=%" PRIu64 " diagnostic_timing_invalid=1\n",
+      cp_debug->geometry_census,
+      cp_geom_b0_salts[cp_debug->geometry_census],
+      cp_debug->geometry_census_submit_start,
+      cp_debug->geometry_census_submit_start + 1,
+      cp->geometry_b0.submit_ordinal, CP_GEOM_B0_CAPACITY,
+      cp->geometry_b0.reserved, complete, cp->geometry_b0.candidates,
+      admitted, reasons, classified_raw,
+      classification_ok ? "yes" : "no",
+      records_bytes, cp->geometry_b0.scratch_bytes,
+      records_bytes + cp->geometry_b0.scratch_bytes,
+      result_valid ? "yes" : "no",
+      cp->geometry_b0.exclusions[0], cp->geometry_b0.exclusions[1],
+      cp->geometry_b0.exclusions[2], cp->geometry_b0.exclusions[3],
+      cp->geometry_b0.exclusions[4], cp->geometry_b0.exclusions[5],
+      cp->geometry_b0.exclusions[6], cp->geometry_b0.exclusions[7],
+      cp->geometry_b0.exclusions[8], cp->geometry_b0.exclusions[9],
+      cp->geometry_b0.exclusions[10], cp->geometry_b0.exclusions[11],
+      cp->geometry_b0.exclusions[12], cp->geometry_b0.exclusions[13],
+      cp->geometry_b0.exclusions[14], cp->geometry_b0.exclusions[15]);
+}
+
 static void
 cp_spec_report(struct cp_context *cp)
 {
@@ -1004,8 +1362,17 @@ cp_context_cleanup(struct cp_context *cp)
    if (!cp || !cp->dev)
       return;
 
-   if (cuCtxSynchronize() != CUDA_SUCCESS)
-      cp_renderer_texture_fatal(cp);
+   if (!cp_debug->geometry_census) {
+      if (cuCtxSynchronize() != CUDA_SUCCESS)
+         cp_renderer_texture_fatal(cp);
+   } else {
+      bool context_sync_ok = cuCtxSynchronize() == CUDA_SUCCESS;
+      if (!context_sync_ok) {
+         cp->geometry_b0.valid = false;
+         cp_renderer_texture_fatal(cp);
+      }
+      cp_geometry_b0_report(cp, context_sync_ok);
+   }
    /* Release the exclusive cache-use lifetime even on a poisoned context. */
    cp_texture_cache_unpin(cp);
    cp_hardware_texture_report(cp);
@@ -1033,6 +1400,13 @@ cp_context_cleanup(struct cp_context *cp)
    free(cp->abuf);
    cp->abuf = NULL;
    cp_scratch_destroy(cp);
+   if (cp_debug->geometry_census) {
+      if (cp->geometry_b0.scratch)
+         cuMemFree(cp->geometry_b0.scratch);
+      if (cp->geometry_b0.records)
+         cuMemFree(cp->geometry_b0.records);
+      cp->geometry_b0.scratch = cp->geometry_b0.records = 0;
+   }
 
    for (unsigned i = 0; i < cp->timer.cap; i++)
       if (cp->timer.events && cp->timer.events[i])
@@ -5085,14 +5459,23 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             fprintf(stderr, "  skipped: no visibility buffer\n");
          return; } while (0);
 
+   bool geometry_clear_ok = true;
    /* Clear visbuf to VISBUF_EMPTY (all-ones). cuMemsetD32 fills 32-bit words
     * which is faster than a kernel launch for a bulk fill. A segment append
     * skips it: the A-buffer passes never touch the visibility buffer, and at
     * a segment per blended batch this was most of the frame's memset traffic.
     * The fallback path re-executes classically and clears its own. */
-   if (!cp->pass.appending)
-      cuMemsetD32Async(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples,
-                       cp->stream);
+   if (!cp->pass.appending) {
+      if (!cp_debug->geometry_census) {
+         cuMemsetD32Async(visbuf, 0xFFFFFFFF,
+                          (size_t)w * h * 2 * fb_samples, cp->stream);
+      } else {
+         geometry_clear_ok = cuMemsetD32Async(visbuf, 0xFFFFFFFF,
+            (size_t)w * h * 2 * fb_samples, cp->stream) == CUDA_SUCCESS;
+         if (!geometry_clear_ok)
+            cp->geometry_b0.valid = false;
+      }
+   }
 
    if (!cp->depthbuf_cleared)
       cp_clear_depthbuf(cp, 1.0f);
@@ -6884,7 +7267,15 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       cp->dscratch.used = shade_dmark;
       if (pass) {
          /* Each pass resolves visibility afresh, minus what has been rejected. */
-         cuMemsetD32Async(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples, cp->stream);
+         if (!cp_debug->geometry_census) {
+            cuMemsetD32Async(visbuf, 0xFFFFFFFF,
+                             (size_t)w * h * 2 * fb_samples, cp->stream);
+         } else {
+            geometry_clear_ok = cuMemsetD32Async(visbuf, 0xFFFFFFFF,
+               (size_t)w * h * 2 * fb_samples, cp->stream) == CUDA_SUCCESS;
+            if (!geometry_clear_ok)
+               cp->geometry_b0.valid = false;
+         }
          rast_args.reject_passes = pass;
       }
       /* Cleared at the start of each interval, not each pass: the question
@@ -6924,14 +7315,24 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * with the preceding pass's kernels. A reusing pass keeps the counts
        * the first pass arrived at — clearing them would leave stages 2 and 3
        * reading an empty queue. */
+      bool geometry_queue_clear_ok = true;
       if (rast_queues.mode != CP_QUEUE_REUSE &&
-          !(fetch_fold && pass == 0))
-         cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream);
+          !(fetch_fold && pass == 0)) {
+         if (!cp_debug->geometry_census) {
+            cuMemsetD32Async(cp->cur_qset.counts, 0, 3, cp->stream);
+         } else {
+            geometry_queue_clear_ok = cuMemsetD32Async(
+               cp->cur_qset.counts, 0, 3, cp->stream) == CUDA_SUCCESS;
+            if (!geometry_queue_clear_ok)
+               cp->geometry_b0.valid = false;
+         }
+      }
 
       /* Stage 1: 1 thread per triangle (small rasterize in place, others queue) */
       cp_nvtx_push("raster");
       CUresult rast_err = CUDA_SUCCESS;
       bool fused_rast = false;
+      bool clip_fallback = false;
       if (pending_clip.pending && rast_queues.mode != CP_QUEUE_REUSE) {
          /* Clip and stage 1 fused; only pass 0 can get here, since the
           * deferred clip is consumed by the first chain and a reusing pass
@@ -6945,6 +7346,7 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          if (fused_rast) {
             pending_clip.pending = false;
          } else {
+            clip_fallback = true;
             cp_warn_fused_rast_refused(rast_err);
          }
          if (!fused_rast &&
@@ -6983,20 +7385,50 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       unsigned s2_blocks = CLAMP((rast_num_triangles + 7) / 8, 1u, 512u);
       unsigned s3_blocks = 2048;
 
-      /* Stage 2: warp-cooperative, grid-strided over the nontrivial queue */
+      /* Stage 2: warp-cooperative, grid-strided over the nontrivial queue.
+       * Flag-off retains the literal original macro/call: no result capture,
+       * census counters or metadata mutation exists on that path. */
       void *s2_params[] = { &rast_args, &rast_queues };
-      CP_LAUNCH_AFTER(fused_rast ? screen->kernels.clip_rast_fused
-                                 : screen->kernels.rasterize_stage1,
-         CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage2,
-         s2_blocks, 1, 1, 256, 1, 1,
-         0, cp->stream, s2_params, NULL);
+      if (!cp_debug->geometry_census) {
+         CP_LAUNCH_AFTER(fused_rast ? screen->kernels.clip_rast_fused
+                                    : screen->kernels.rasterize_stage1,
+            CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage2,
+            s2_blocks, 1, 1, 256, 1, 1,
+            0, cp->stream, s2_params, NULL);
+      } else {
+         CUresult stage2_err = cp_launch_after(cp,
+            screen->kernels.rasterize_stage2,
+            s2_blocks, 1, 1, 256, 1, 1, 0, cp->stream, s2_params, NULL,
+            fused_rast ? screen->kernels.clip_rast_fused
+                       : screen->kernels.rasterize_stage1,
+            CP_PDL_TIER_RASTER);
+         CP_CU_WARN(stage2_err, "cuLaunchKernel");
+         /* Only an immediate-success stage 2 can enqueue a same-stream hash.
+          * This interposition intentionally makes stage 3's PDL predecessor
+          * check decline; diagnostic timing is invalid by definition. */
+         cp_geometry_b0_after_stage2(cp, state, info, &rast_args, &rast_queues,
+            stage2_err, rast_err, fused_rast, clip_fallback, retry, peel,
+            abuf, geometry_clear_ok, geometry_queue_clear_ok, pass,
+            s2_blocks,
+            rast_num_triangles);
+      }
 
-      /* Stage 3: block per tile, grid-strided over the huge-tile queue */
+      /* Stage 3: block per tile, grid-strided over the huge-tile queue. */
       void *s3_params[] = { &rast_args, &rast_queues };
-      CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2,
-         CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage3,
-         s3_blocks, 1, 1, 64, 1, 1,
-         0, cp->stream, s3_params, NULL);
+      if (!cp_debug->geometry_census) {
+         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2,
+            CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage3,
+            s3_blocks, 1, 1, 64, 1, 1,
+            0, cp->stream, s3_params, NULL);
+      } else {
+         CUresult stage3_err = cp_launch_after(cp,
+            screen->kernels.rasterize_stage3,
+            s3_blocks, 1, 1, 64, 1, 1, 0, cp->stream, s3_params, NULL,
+            screen->kernels.rasterize_stage2, CP_PDL_TIER_RASTER);
+         CP_CU_WARN(stage3_err, "cuLaunchKernel");
+         if (stage3_err != CUDA_SUCCESS)
+            cp->geometry_b0.valid = false;
+      }
 
       if (rast_err != CUDA_SUCCESS && cp_debug->debug_draw)
          fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
@@ -9616,6 +10048,35 @@ cp_context_set_framebuffer(struct cp_context *cp, const struct cp_fb_desc *fb,
       cp->plan.fb_reallocs++;
       cp->fb_cap_px = MAX2(cp->fb_cap_px, px);
       cp->fb_cap_px_samples = MAX2(cp->fb_cap_px_samples, px_samples);
+
+      /* cuMemFree of the old framebuffer below is already the synchronous
+       * high-water replacement boundary. Resize the one main-stream Merkle
+       * scratch here, never between stage 2 and stage 3 and never per unit. */
+      if (cp_debug->geometry_census) {
+         struct cp_sha256_merkle_plan plan;
+         uint64_t max_bytes = (uint64_t)cp->fb_cap_px_samples * 8u;
+         if (cp_sha256_merkle_make_plan(max_bytes, &plan) != 0 ||
+             plan.scratch_bytes > SIZE_MAX) {
+            cp->geometry_b0.valid = false;
+         } else if ((size_t)plan.scratch_bytes > cp->geometry_b0.scratch_bytes) {
+            CUresult free_result = cp->geometry_b0.scratch ?
+               cuMemFree(cp->geometry_b0.scratch) : CUDA_SUCCESS;
+            if (free_result != CUDA_SUCCESS) {
+               /* This may be the first observation of prior asynchronous
+                * failure. Keep the pointer for cleanup and invalidate B0. */
+               cp->geometry_b0.valid = false;
+            } else {
+               cp->geometry_b0.scratch = 0;
+               cp->geometry_b0.scratch_bytes = 0;
+               if (cuMemAlloc(&cp->geometry_b0.scratch,
+                              (size_t)plan.scratch_bytes) != CUDA_SUCCESS) {
+                  cp->geometry_b0.valid = false;
+               } else {
+                  cp->geometry_b0.scratch_bytes = (size_t)plan.scratch_bytes;
+               }
+            }
+         }
+      }
 
       if (cp->visbuf)
          cuMemFree(cp->visbuf);

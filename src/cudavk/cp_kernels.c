@@ -35,6 +35,22 @@ static const char cp_vertex_fetch_src[] =
 #include "cp_vertex_fetch.cu.inc"
 ;
 
+/* Diagnostic B0 is a separate pair of modules.  Merely embedding these strings
+ * changes no normal NVRTC program or cache key; they are compiled only when
+ * CUDAVK_GEOMETRY_CENSUS is nonzero. */
+static const char cp_sha256_merkle_src[] =
+#include "cp_sha256_merkle.cu.inc"
+;
+static const char cp_geometry_b0_src[] =
+#include "cp_geometry_b0.cu.inc"
+;
+static const char cp_sha256_merkle_header_src[] =
+#include "cp_sha256_merkle.h.inc"
+;
+static const char cp_geometry_b0_header_src[] =
+#include "cp_geometry_b0.h.inc"
+;
+
 
 /* The physical device owns this cache.  Native exposes one CUDA device per
  * process today; keeping the pointer here also covers lazily compiled sampler
@@ -353,6 +369,96 @@ cp_compile_sampler_variant(int sm_major, int sm_minor,
    return ptx;
 }
 
+
+/* Compile a diagnostic geometry source without perturbing the normal NVRTC
+ * header list or cache keys. */
+static char *
+compile_geometry_source(const char *source, const char *name,
+                        int sm_major, int sm_minor)
+{
+   const char *header_srcs[] = {
+      cp_sha256_merkle_header_src, cp_geometry_b0_header_src,
+   };
+   const char *header_names[] = {
+      "cp_sha256_merkle.h", "cp_geometry_b0.h",
+   };
+   nvrtcProgram prog;
+   if (nvrtcCreateProgram(&prog, source, name, ARRAY_SIZE(header_srcs),
+                          header_srcs, header_names) != NVRTC_SUCCESS)
+      return NULL;
+   char arch[32];
+   snprintf(arch, sizeof(arch), "--gpu-architecture=compute_%d%d",
+            sm_major, sm_minor);
+   const char *opts[] = { arch, "--std=c++14" };
+   cache_key key;
+   bool have_key = false;
+   if (cp_nvrtc_cache) {
+      struct blob b;
+      blob_init(&b);
+      blob_write_string(&b, "cudavk geometry B0 NVRTC PTX v1");
+      int nvrtc_major = 0, nvrtc_minor = 0;
+      nvrtcVersion(&nvrtc_major, &nvrtc_minor);
+      blob_write_uint32(&b, nvrtc_major);
+      blob_write_uint32(&b, nvrtc_minor);
+      blob_write_string(&b, name);
+      blob_write_string(&b, source);
+      blob_write_string(&b, cp_sha256_merkle_header_src);
+      blob_write_string(&b, cp_geometry_b0_header_src);
+      blob_write_string(&b, arch);
+      if (!b.out_of_memory) {
+         disk_cache_compute_key(cp_nvrtc_cache, b.data, b.size, key);
+         have_key = true;
+         size_t size = 0;
+         char *cached = disk_cache_get(cp_nvrtc_cache, key, &size);
+         if (cached && size && cached[size - 1] == '\0') {
+            blob_finish(&b);
+            nvrtcDestroyProgram(&prog);
+            return cached;
+         }
+         free(cached);
+      }
+      blob_finish(&b);
+   }
+   nvrtcResult res = nvrtcCompileProgram(prog, ARRAY_SIZE(opts), opts);
+   if (res != NVRTC_SUCCESS) {
+      size_t size = 0;
+      nvrtcGetProgramLogSize(prog, &size);
+      char *log = malloc(size ? size : 1);
+      if (log) {
+         nvrtcGetProgramLog(prog, log);
+         fprintf(stderr, "cudavk: geometry NVRTC compile failed for %s:\n%s\n",
+                 name, log);
+         free(log);
+      }
+      nvrtcDestroyProgram(&prog);
+      return NULL;
+   }
+   size_t size = 0;
+   nvrtcGetPTXSize(prog, &size);
+   char *ptx = malloc(size);
+   if (!ptx || nvrtcGetPTX(prog, ptx) != NVRTC_SUCCESS) {
+      free(ptx);
+      nvrtcDestroyProgram(&prog);
+      return NULL;
+   }
+   nvrtcDestroyProgram(&prog);
+   if (have_key)
+      disk_cache_put(cp_nvrtc_cache, key, ptx, size, NULL);
+   return ptx;
+}
+
+static bool
+build_geometry_module(CUmodule *out, const char *source, const char *name,
+                      int sm_major, int sm_minor)
+{
+   char *ptx = compile_geometry_source(source, name, sm_major, sm_minor);
+   if (!ptx)
+      return false;
+   CUresult result = cuModuleLoadData(out, ptx);
+   free(ptx);
+   return result == CUDA_SUCCESS;
+}
+
 /* Compile one kernel source and load it as a module. */
 static bool
 build_module(CUmodule *out, const char *src, const char *name,
@@ -515,6 +621,35 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
       goto fail;
    }
 
+   if (cp_debug->geometry_census) {
+      bool sha_ok = build_geometry_module(&k->geometry_sha_module,
+         cp_sha256_merkle_src, "cp_sha256_merkle.cu", sm_major, sm_minor);
+      bool final_ok = build_geometry_module(&k->geometry_final_module,
+         cp_geometry_b0_src, "cp_geometry_b0.cu", sm_major, sm_minor);
+      if (sha_ok) {
+         CUresult leaf_result = cuModuleGetFunction(
+            &k->geometry_sha_leaf, k->geometry_sha_module,
+            "cp_sha256_merkle_leaf_kernel");
+         CUresult node_result = cuModuleGetFunction(
+            &k->geometry_sha_node, k->geometry_sha_module,
+            "cp_sha256_merkle_node_kernel");
+         if (leaf_result != CUDA_SUCCESS)
+            k->geometry_sha_leaf = NULL;
+         if (node_result != CUDA_SUCCESS)
+            k->geometry_sha_node = NULL;
+      }
+      if (final_ok) {
+         CUresult final_result = cuModuleGetFunction(
+            &k->geometry_final, k->geometry_final_module,
+            "cp_geom_b0_final_kernel");
+         if (final_result != CUDA_SUCCESS)
+            k->geometry_final = NULL;
+      }
+      if (!k->geometry_sha_leaf || !k->geometry_sha_node || !k->geometry_final)
+         fprintf(stderr, "cudavk: geometry B0 diagnostic kernels unavailable; "
+                         "run will be invalid\n");
+   }
+
    k->initialized = true;
    return true;
 
@@ -534,6 +669,10 @@ cp_kernels_destroy(struct cp_kernels *k)
       cuModuleUnload(k->fs_module);
    if (k->vfetch_module)
       cuModuleUnload(k->vfetch_module);
+   if (k->geometry_sha_module)
+      cuModuleUnload(k->geometry_sha_module);
+   if (k->geometry_final_module)
+      cuModuleUnload(k->geometry_final_module);
    free(k->sampler_ptx);
    free(k->math_ptx);
    for (unsigned i = 0; i < CP_SAMPLER_OPT_COUNT; i++)
