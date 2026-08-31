@@ -22,7 +22,10 @@ if event.returncode == 0:
     raise SystemExit("event INVALID_VALUE did not fail control child")
 m = re.search(r"result=control .*submit=(-?\d+) wait=(-?\d+) "
               r"counter=(\d+) expected=1024", event.stdout)
-if not m or tuple(map(int, m.groups())) != (-4, 1, 0):
+# Immediate submit reports the callback failure from vkQueueSubmit.  Fully
+# threaded submit has already returned after enqueue, so the same terminal
+# failure is observed by vkDeviceWaitIdle instead.
+if not m or tuple(map(int, m.groups())) not in {(-4, 1, 0), (0, -4, 0)}:
     raise SystemExit("event create fatal result/counter changed")
 if "PASS " in event.stdout or not re.search(
         r"injected fatal cache-create stage=1 before FS attempts=0",

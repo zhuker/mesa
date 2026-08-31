@@ -396,11 +396,17 @@ cpvk_DestroyImage(VkDevice _device, VkImage _image,
    CPVK_CTX_SCOPE(dev);
 
    if (image) {
-      cpvk_memory_note_unbind(dev, image->mem, image);
+      /* A lost device can still have a Mesa submit callback unwinding.  The
+       * void destructor cannot join that worker, so retain the object rather
+       * than expose it to a use-after-free. */
+      if (vk_device_is_lost(&dev->vk))
+         return;
       if (cp_debug->texture_cache) {
-         cpvk_DeviceWaitIdle(_device);
+         if (cpvk_DeviceWaitIdle(_device) != VK_SUCCESS)
+            return;
          cpvk_texture_cache_image_destroy(image);
       }
+      cpvk_memory_note_unbind(dev, image->mem, image);
       vk_image_destroy(&dev->vk, pAllocator, &image->vk);
    }
 }

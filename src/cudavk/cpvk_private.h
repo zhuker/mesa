@@ -68,6 +68,25 @@ struct cpvk_physical_device {
 
 struct cpvk_pending_submit;
 
+#define CPVK_SUBMIT_CENSUS_CAPACITY 131072u
+#define CPVK_SUBMIT_CENSUS_DEPTH_CAP 64u
+
+struct cpvk_submit_census_record {
+   uint64_t internal_ordinal;
+   uint64_t issue_begin_ns;
+   uint64_t issue_end_ns;
+   uint64_t complete_ns;
+   int32_t completion_status;
+   uint32_t command_buffer_count;
+   uint32_t wait_count;
+   uint32_t signal_count;
+   uint32_t queued_depth;
+   bool initialized;
+   bool completion;
+   bool marker;
+   bool depth_capped;
+};
+
 struct cpvk_device {
    struct vk_device vk;
    struct cpvk_physical_device *pdev;
@@ -82,6 +101,10 @@ struct cpvk_device {
    bool submit_worker_stop;
    atomic_bool device_lost;
    struct cpvk_pending_submit *submit_head, *submit_tail;
+
+   struct cpvk_submit_census_record *submit_census_records;
+   uint64_t submit_census_reserved;
+   bool submit_census_overflow;
 
    /* The renderer, and the device it runs on: the same CUDA draw pipeline the
     * Gallium-hosted driver uses, reached through a header with no Gallium in

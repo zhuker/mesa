@@ -214,6 +214,10 @@ if dep_vulkan_loader.found()
   cpvk_test_env = environment()
   cpvk_test_env.set('VK_DRIVER_FILES', cpvk_devenv_icd.full_path())
   cpvk_test_env.set('VK_ICD_FILENAMES', cpvk_devenv_icd.full_path())
+  cpvk_threaded_test_env = environment()
+  cpvk_threaded_test_env.set('VK_DRIVER_FILES', cpvk_devenv_icd.full_path())
+  cpvk_threaded_test_env.set('VK_ICD_FILENAMES', cpvk_devenv_icd.full_path())
+  cpvk_threaded_test_env.set('MESA_VK_ENABLE_SUBMIT_THREAD', '1')
   cpvk_test_names = [
     'cpvk_batch',
     'cpvk_batchbig',
@@ -277,13 +281,19 @@ if dep_vulkan_loader.found()
     'cpvk_wsi',
   ]
   foreach test_name : cpvk_test_names
+    test_env = cpvk_test_env
+    if test_name == 'cpvk_timeline_semaphore'
+      # This is the delayed wait-before-signal DeviceWaitIdle regression. It
+      # must exercise the always-threaded runtime path rather than on-demand.
+      test_env = cpvk_threaded_test_env
+    endif
     test_exe = executable(test_name, files('tests/' + test_name + '.c'),
                           dependencies : dep_vulkan_loader,
                           c_args : ['-Wno-error=missing-prototypes'],
                           build_by_default : false)
     test(test_name, test_exe,
          suite : 'cudavk',
-         env : cpvk_test_env,
+         env : test_env,
          timeout : 120,
          is_parallel : false,
          depends : [libvulkan_cudavk, cpvk_devenv_icd])

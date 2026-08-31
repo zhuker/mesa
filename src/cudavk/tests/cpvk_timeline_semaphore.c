@@ -320,6 +320,11 @@ main(void)
    VkFence fence;
    CHECK(vkCreateFence(device, &fci, NULL, &fence));
    CHECK(vkQueueSubmit(queue, 1, &waiting, fence));
+   /* Under MESA_VK_ENABLE_SUBMIT_THREAD=1 the submit above is still parked on
+    * its not-yet-promised wait when DeviceWaitIdle queues its marker. The late
+    * host signal must release the worker, after which DeviceWaitIdle must drain
+    * the runtime queue and wait for actual completion without hanging. */
+   CHECK(vkDeviceWaitIdle(device));
    int signal_status = 1;
    thrd_join(signaller, &signal_status);
    if (signal_status != 0) {

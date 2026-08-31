@@ -136,6 +136,9 @@ static const struct cp_flag_def flags[] = {
      "report covered and discarded fragment counts per pass; syncs" },
    { "CUDAVK_DEBUG_FS", CP_FLAG_BOOL_PRESENCE, F(debug_fs),
      "dump fragment-shader inputs and outputs per pixel; syncs" },
+   { "CUDAVK_SUBMIT_CENSUS", CP_FLAG_BOOL_VALUE, F(submit_census),
+     "record diagnostic host issue and CUDA completion timestamps per internal "
+     "submit; invalidates timing" },
    { "CUDAVK_DEBUG_FS_VSTEP", CP_FLAG_UINT, F(debug_fs_vstep),
      "with DEBUG_FS, print every Nth pixel", .dflt = 1, .has_range = true, .lo = 1, .hi = UINT32_MAX },
    { "CUDAVK_DEBUG_FS_ROW", CP_FLAG_INT, F(debug_fs_row),

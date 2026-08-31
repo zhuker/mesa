@@ -189,6 +189,7 @@ struct cp_debug {
    bool debug_faces;
 
    /* Tracing, with a value. */
+   bool     submit_census;
    unsigned debug_fs_vstep;   /* print every Nth pixel; clamped to >= 1 */
    int      debug_fs_row;     /* only this framebuffer row, or -1 for all */
 

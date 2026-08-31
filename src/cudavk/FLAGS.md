@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-129 switches.
+130 switches.
 
 ## Tracing
 
@@ -32,6 +32,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_DEBUG_WORK` | bool (presence) | `off` | — | report how much of the shading launch did work; syncs |
 | `CUDAVK_DEBUG_DISCARD` | bool (presence) | `off` | — | report covered and discarded fragment counts per pass; syncs |
 | `CUDAVK_DEBUG_FS` | bool (presence) | `off` | — | dump fragment-shader inputs and outputs per pixel; syncs |
+| `CUDAVK_SUBMIT_CENSUS` | bool (value) | `off` | — | record diagnostic host issue and CUDA completion timestamps per internal submit; invalidates timing |
 | `CUDAVK_DEBUG_FS_VSTEP` | uint | `1` | &ge; 1 | with DEBUG_FS, print every Nth pixel |
 | `CUDAVK_DEBUG_FS_ROW` | int | `-1` | — | with DEBUG_FS, restrict the dump to one framebuffer row |
 | `CUDAVK_DEBUG_LAUNCH` | bool (presence) | `off` | — | trace compute dispatch: bound UBO and SSBO pointers |

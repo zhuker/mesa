@@ -16,7 +16,10 @@ if run.returncode == 0:
     raise SystemExit("FS-argument reservation fault did not fail control child")
 m = re.search(r"result=control .*submit=(-?\d+) wait=(-?\d+) "
               r"counter=(\d+) expected=1024", run.stdout)
-if not m or tuple(map(int, m.groups())) != (-4, 1, 0):
+# Immediate submit reports the callback failure from vkQueueSubmit.  Fully
+# threaded submit has already returned after enqueue, so the same terminal
+# failure is observed by vkDeviceWaitIdle instead.
+if not m or tuple(map(int, m.groups())) not in {(-4, 1, 0), (0, -4, 0)}:
     raise SystemExit("FS-argument fault result/counter changed")
 if "PASS " in run.stdout:
     raise SystemExit("FS-argument fatal unexpectedly reached PASS")

@@ -19,6 +19,9 @@
 #include "vk_util.h"
 #include "util/os_time.h"
 
+#include <inttypes.h>
+#include <time.h>
+
 /* Last: intercepts the CUDA entry points for the iteration 26 census. */
 #include "cp_smallop_tele.h"
 
@@ -42,6 +45,124 @@ struct cpvk_pending_submit {
    struct cpvk_pending_signal signals[];
 };
 
+/* Exists in an allocation only when CUDAVK_SUBMIT_CENSUS is enabled. */
+struct cpvk_submit_census_trailer {
+   uint64_t index;
+   bool valid;
+};
+
+_Static_assert(sizeof(struct cpvk_pending_signal) %
+               _Alignof(struct cpvk_submit_census_trailer) == 0,
+               "census trailer must stay aligned after pending signals");
+_Static_assert(offsetof(struct cpvk_pending_submit, signals) %
+               _Alignof(struct cpvk_submit_census_trailer) == 0,
+               "census trailer must start aligned");
+
+static struct cpvk_submit_census_trailer *
+cpvk_submit_census_trailer(struct cpvk_pending_submit *pending)
+{
+   return (void *)&pending->signals[pending->signal_count];
+}
+
+static uint64_t
+cpvk_submit_census_now(void)
+{
+   struct timespec ts;
+   if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0)
+      return 0;
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t
+cpvk_submit_census_begin(struct cpvk_device *dev, struct vk_queue *queue,
+                         const struct vk_queue_submit *submit)
+{
+   uint64_t index = dev->submit_census_reserved;
+   if (dev->submit_census_reserved != UINT64_MAX)
+      dev->submit_census_reserved++;
+   else
+      dev->submit_census_overflow = true;
+
+   if (index >= CPVK_SUBMIT_CENSUS_CAPACITY) {
+      dev->submit_census_overflow = true;
+      return UINT64_MAX;
+   }
+
+   struct cpvk_submit_census_record *record =
+      &dev->submit_census_records[index];
+   *record = (struct cpvk_submit_census_record) {
+      .internal_ordinal = index,
+      .issue_begin_ns = cpvk_submit_census_now(),
+      .completion_status = -1,
+      .command_buffer_count = submit->command_buffer_count,
+      .wait_count = submit->wait_count,
+      .signal_count = submit->signal_count,
+      .initialized = true,
+      .marker = submit->command_buffer_count == 0,
+   };
+
+   /* This diagnostic snapshot is intentionally bounded. If depth_capped is
+    * true, queued_depth is a floor, not the exact backlog. The current record
+    * is linked in threaded mode and is included in the count. */
+   mtx_lock(&queue->submit.mutex);
+   struct list_head *node = queue->submit.submits.next;
+   while (node != &queue->submit.submits &&
+          record->queued_depth < CPVK_SUBMIT_CENSUS_DEPTH_CAP) {
+      record->queued_depth++;
+      node = node->next;
+   }
+   record->depth_capped = node != &queue->submit.submits;
+   mtx_unlock(&queue->submit.mutex);
+
+   return index;
+}
+
+static void
+cpvk_submit_census_report(struct cpvk_device *dev)
+{
+   uint64_t stored = MIN2(dev->submit_census_reserved,
+                          (uint64_t)CPVK_SUBMIT_CENSUS_CAPACITY);
+   uint64_t complete = 0;
+   bool valid = !dev->submit_census_overflow &&
+                dev->submit_census_reserved <= CPVK_SUBMIT_CENSUS_CAPACITY;
+
+   for (uint64_t i = 0; i < stored; i++) {
+      const struct cpvk_submit_census_record *record =
+         &dev->submit_census_records[i];
+      if (record->completion)
+         complete++;
+      if (!record->initialized || record->internal_ordinal != i ||
+          !record->completion || record->completion_status != CUDA_SUCCESS ||
+          record->issue_begin_ns == 0 ||
+          record->issue_end_ns < record->issue_begin_ns ||
+          record->complete_ns < record->issue_end_ns)
+         valid = false;
+
+      fprintf(stderr,
+              "CUDAVK_SUBMIT_CENSUS_RECORD index=%" PRIu64
+              " internal_ordinal=%" PRIu64
+              " initialized=%u issue_begin_ns=%" PRIu64
+              " issue_end_ns=%" PRIu64 " complete_ns=%" PRIu64
+              " completion=%u status=%d command_buffer_count=%u"
+              " wait_count=%u signal_count=%u marker=%u queued_depth=%u"
+              " depth_capped=%u\n",
+              i, record->internal_ordinal, record->initialized,
+              record->issue_begin_ns, record->issue_end_ns,
+              record->complete_ns, record->completion,
+              record->completion_status, record->command_buffer_count,
+              record->wait_count, record->signal_count, record->marker,
+              record->queued_depth, record->depth_capped);
+   }
+
+   valid &= complete == dev->submit_census_reserved;
+   fprintf(stderr,
+           "CUDAVK_SUBMIT_CENSUS_SUMMARY result_valid=%u capacity=%u"
+           " reserved=%" PRIu64 " complete=%" PRIu64 " overflow=%u\n",
+           valid, CPVK_SUBMIT_CENSUS_CAPACITY,
+           dev->submit_census_reserved, complete,
+           dev->submit_census_overflow);
+}
+
 static int
 cpvk_submit_worker(void *data)
 {
@@ -59,8 +180,22 @@ cpvk_submit_worker(void *data)
       mtx_unlock(&dev->submit_lock);
 
       CUresult status = cuEventSynchronize(pending->done->event);
-      if (status != CUDA_SUCCESS)
+      if (unlikely(cp_debug->submit_census)) {
+         struct cpvk_submit_census_trailer *trailer =
+            cpvk_submit_census_trailer(pending);
+         if (trailer->valid &&
+             trailer->index < CPVK_SUBMIT_CENSUS_CAPACITY) {
+            struct cpvk_submit_census_record *record =
+               &dev->submit_census_records[trailer->index];
+            record->complete_ns = cpvk_submit_census_now();
+            record->completion_status = status;
+            record->completion = true;
+         }
+      }
+      if (status != CUDA_SUCCESS) {
          atomic_store_explicit(&dev->device_lost, true, memory_order_release);
+         vk_device_set_lost(&dev->vk, "cuEventSynchronize failed: %d", status);
+      }
       /* Always unblock Vulkan waiters. They observe DEVICE_LOST on the next
        * queue/device call instead of hanging behind a failed CUDA event. */
       for (uint32_t i = 0; i < pending->signal_count; i++) {
@@ -152,6 +287,10 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
    struct cpvk_device *dev =
       container_of(vk_queue->base.device, struct cpvk_device, vk);
+
+   uint64_t census_index = UINT64_MAX;
+   if (unlikely(cp_debug->submit_census))
+      census_index = cpvk_submit_census_begin(dev, vk_queue, submit);
 
    /* The census divides by this: these captures submit twice per frame, which
     * is the same paired-submit convention every timing number here uses. */
@@ -371,6 +510,14 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    size_t pending_size = sizeof(struct cpvk_pending_submit) +
                          (size_t)submit->signal_count *
                          sizeof(struct cpvk_pending_signal);
+   if (unlikely(cp_debug->submit_census)) {
+      if (pending_size > SIZE_MAX - sizeof(struct cpvk_submit_census_trailer)) {
+         dev->submit_census_overflow = true;
+         return cpvk_submit_abort(dev,
+            vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY));
+      }
+      pending_size += sizeof(struct cpvk_submit_census_trailer);
+   }
    struct cpvk_pending_submit *pending = calloc(1, pending_size);
    if (!pending)
       return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY));
@@ -411,6 +558,18 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    else
       dev->submit_head = pending;
    dev->submit_tail = pending;
+
+   if (unlikely(cp_debug->submit_census) &&
+       census_index != UINT64_MAX) {
+      struct cpvk_submit_census_record *record =
+         &dev->submit_census_records[census_index];
+      record->issue_end_ns = cpvk_submit_census_now();
+      struct cpvk_submit_census_trailer *trailer =
+         cpvk_submit_census_trailer(pending);
+      trailer->index = census_index;
+      trailer->valid = true;
+   }
+
    cnd_signal(&dev->submit_changed);
    mtx_unlock(&dev->submit_lock);
    return VK_SUCCESS;
@@ -474,6 +633,15 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.command_buffer_ops = &cpvk_cmd_buffer_ops;
    dev->pdev = pdev;
    atomic_init(&dev->device_lost, false);
+   if (unlikely(cp_debug->submit_census)) {
+      dev->submit_census_records =
+         calloc(CPVK_SUBMIT_CENSUS_CAPACITY,
+                sizeof(*dev->submit_census_records));
+      if (!dev->submit_census_records) {
+         result = vk_error(pdev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         goto fail_device;
+      }
+   }
 
    /*
     * CUDA 12.8: cuCtxCreate takes three arguments. Code written against
@@ -591,6 +759,8 @@ fail_stream:
    cuCtxPopCurrent(NULL);
    cuCtxDestroy(dev->cu_ctx);
 fail_device:
+   free(dev->submit_census_records);
+   dev->submit_census_records = NULL;
    vk_device_finish(&dev->vk);
 fail_alloc:
    vk_free(alloc, dev);
@@ -605,6 +775,13 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (!dev)
       return;
 
+   /* Drain the Mesa submit worker before stopping the CUDA completion worker:
+    * after vk_queue_finish returns no cpvk_queue_submit callback can append a
+    * new completion record. DeviceWaitIdle reports errors, but destruction
+    * still has to attempt every teardown stage. */
+   (void)cpvk_DeviceWaitIdle(_device);
+   vk_queue_finish(&dev->queue);
+
    /* Not CPVK_CTX_SCOPE: the scope's pop would run after cuCtxDestroy below
     * has freed the very context it would pop. Push here, pop by hand at the
     * one point the context is still alive. */
@@ -612,7 +789,8 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    cuCtxSynchronize();
    cpvk_submit_wait_pending(dev);
    cpvk_submit_worker_finish(dev);
-   vk_queue_finish(&dev->queue);
+   if (unlikely(cp_debug->submit_census))
+      cpvk_submit_census_report(dev);
 
    cpvk_batch_break_report();
    cp_context_cleanup(&dev->renderer);
@@ -631,6 +809,8 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    dev->texture_cache_views = NULL;
    free(dev->texture_batch_workspace);
    dev->texture_batch_workspace = NULL;
+   free(dev->submit_census_records);
+   dev->submit_census_records = NULL;
    simple_mtx_destroy(&dev->shader_cache_lock);
    simple_mtx_destroy(&dev->view_lock);
    simple_mtx_destroy(&dev->texture_cache_lock);
@@ -648,6 +828,10 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_DeviceWaitIdle(VkDevice _device)
 {
+   VkResult result = vk_common_DeviceWaitIdle(_device);
+   if (result != VK_SUCCESS)
+      return result;
+
    VK_FROM_HANDLE(cpvk_device, dev, _device);
    CPVK_CTX_SCOPE(dev);
 
@@ -933,8 +1117,16 @@ cpvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
    if (!mem)
       return;
 
-   if (cp_debug->texture_cache && mem->bindings)
-      cpvk_DeviceWaitIdle(_device);
+   /* Device loss may race a Mesa submit callback which still refers to this
+    * allocation.  Retain terminal-loss resources rather than free live
+    * storage; DestroyDevice joins the runtime worker before tearing down the
+    * CUDA completion machinery. */
+   if (vk_device_is_lost(&dev->vk))
+      return;
+
+   if (cp_debug->texture_cache && mem->bindings &&
+       cpvk_DeviceWaitIdle(_device) != VK_SUCCESS)
+      return;
    while (mem->bindings) {
       struct cpvk_memory_binding *binding = mem->bindings;
       struct cpvk_memory_binding *next = binding->next;

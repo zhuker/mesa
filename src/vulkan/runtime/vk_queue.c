@@ -73,19 +73,19 @@ vk_queue_init(struct vk_queue *queue, struct vk_device *device,
    list_inithead(&queue->submit.submits);
 
    ret = mtx_init(&queue->submit.mutex, mtx_plain);
-   if (ret == thrd_error) {
+   if (ret != thrd_success) {
       result = vk_errorf(queue, VK_ERROR_UNKNOWN, "mtx_init failed");
       goto fail_mutex;
    }
 
    ret = cnd_init(&queue->submit.push);
-   if (ret == thrd_error) {
+   if (ret != thrd_success) {
       result = vk_errorf(queue, VK_ERROR_UNKNOWN, "cnd_init failed");
       goto fail_push;
    }
 
    ret = cnd_init(&queue->submit.pop);
-   if (ret == thrd_error) {
+   if (ret != thrd_success) {
       result = vk_errorf(queue, VK_ERROR_UNKNOWN, "cnd_init failed");
       goto fail_pop;
    }
@@ -108,6 +108,9 @@ fail_pop:
 fail_push:
    mtx_destroy(&queue->submit.mutex);
 fail_mutex:
+   list_del(&queue->link);
+   simple_mtx_destroy(&queue->lock);
+   vk_object_base_finish(&queue->base);
    return result;
 }
 
@@ -740,9 +743,10 @@ vk_queue_submit_thread_func(void *_data)
    while (queue->submit.thread_run) {
       if (list_is_empty(&queue->submit.submits)) {
          int ret = cnd_wait(&queue->submit.push, &queue->submit.mutex);
-         if (ret == thrd_error) {
-            mtx_unlock(&queue->submit.mutex);
+         if (ret != thrd_success) {
             vk_queue_set_lost(queue, "cnd_wait failed");
+            cnd_broadcast(&queue->submit.pop);
+            mtx_unlock(&queue->submit.mutex);
             return 1;
          }
          continue;
@@ -755,17 +759,39 @@ vk_queue_submit_thread_func(void *_data)
       /* Drop the lock while we wait */
       mtx_unlock(&queue->submit.mutex);
 
-      result = vk_sync_wait_many(queue->base.device,
-                                 submit->wait_count, submit->waits,
-                                 VK_SYNC_WAIT_PENDING, UINT64_MAX);
+      /* A dependency which will never be made pending must not pin device
+       * teardown forever after another queue loses the device.  Poll only the
+       * exceptional blocked path so stop/loss can retire this worker. */
+      do {
+         result = vk_sync_wait_many(queue->base.device,
+                                    submit->wait_count, submit->waits,
+                                    VK_SYNC_WAIT_PENDING, 10 * 1000 * 1000ull);
+         if (result != VK_TIMEOUT)
+            break;
+
+         mtx_lock(&queue->submit.mutex);
+         bool stop = !queue->submit.thread_run ||
+                     vk_device_is_lost_no_report(queue->base.device);
+         mtx_unlock(&queue->submit.mutex);
+         if (stop) {
+            result = VK_ERROR_DEVICE_LOST;
+            break;
+         }
+      } while (true);
       if (unlikely(result != VK_SUCCESS)) {
          vk_queue_set_lost(queue, "Wait for time points failed");
+         mtx_lock(&queue->submit.mutex);
+         cnd_broadcast(&queue->submit.pop);
+         mtx_unlock(&queue->submit.mutex);
          return 1;
       }
 
       result = vk_queue_submit_final(queue, submit);
       if (unlikely(result != VK_SUCCESS)) {
          vk_queue_set_lost(queue, "queue::driver_submit failed");
+         mtx_lock(&queue->submit.mutex);
+         cnd_broadcast(&queue->submit.pop);
+         mtx_unlock(&queue->submit.mutex);
          return 1;
       }
 
@@ -803,8 +829,12 @@ vk_queue_start_submit_thread(struct vk_queue *queue)
    ret = thrd_create(&queue->submit.thread,
                      vk_queue_submit_thread_func,
                      queue);
-   if (ret == thrd_error)
+   if (ret != thrd_success) {
+      mtx_lock(&queue->submit.mutex);
+      queue->submit.thread_run = false;
+      mtx_unlock(&queue->submit.mutex);
       return vk_errorf(queue, VK_ERROR_UNKNOWN, "thrd_create failed");
+   }
 
    return VK_SUCCESS;
 }
@@ -822,7 +852,8 @@ vk_queue_stop_submit_thread(struct vk_queue *queue)
 
    thrd_join(queue->submit.thread, NULL);
 
-   assert(list_is_empty(&queue->submit.submits));
+   assert(list_is_empty(&queue->submit.submits) ||
+          vk_device_is_lost_no_report(queue->base.device));
    queue->submit.mode = VK_QUEUE_SUBMIT_MODE_IMMEDIATE;
 }
 
@@ -1478,13 +1509,32 @@ vk_common_QueueWaitIdle(VkQueue _queue)
       return result;
 
    result = vk_queue_signal_sync(queue, sync, 0);
-   if (unlikely(result != VK_SUCCESS))
+   if (unlikely(result != VK_SUCCESS)) {
+      vk_sync_destroy(queue->base.device, sync);
       return result;
+   }
+
+   /* A failed worker callback cannot signal the marker.  Drain first so the
+    * worker's device-loss path wakes this call instead of leaving it blocked
+    * forever in the COMPLETE wait. */
+   if (queue->submit.mode == VK_QUEUE_SUBMIT_MODE_THREADED) {
+      result = vk_queue_drain(queue);
+      if (unlikely(result != VK_SUCCESS)) {
+         /* The marker may still be queued or owned by the submit worker.
+          * Device loss is terminal; retain this small sync rather than free
+          * storage which another thread can still dereference. */
+         return result;
+      }
+   }
 
    result = vk_sync_wait(queue->base.device, sync, 0,
                          VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
 
-   vk_sync_destroy(queue->base.device, sync);
+   /* A loss/error return does not prove that a driver completion callback has
+    * dropped its raw signal pointer.  On the terminal error path, retain the
+    * small sync rather than race that callback. */
+   if (result == VK_SUCCESS)
+      vk_sync_destroy(queue->base.device, sync);
 
    VkResult device_status = vk_device_check_status(queue->base.device);
    if (device_status != VK_SUCCESS)
