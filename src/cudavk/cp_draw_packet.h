@@ -28,6 +28,13 @@ struct cp_render_scope {
    uint32_t attachment_samples;
    uint32_t serial;
 
+   /* Record-time overwrite elimination.  A later full-area scope on the same
+    * colour attachment with LOAD_OP_DONT_CARE/CLEAR makes this scope's
+    * attachment writes dead when its shaders have no side effects. */
+   uint8_t color_load_op;
+   bool full_render_area;
+   bool skip_draws;
+
    /*
     * What the recorded pass will ask of this scope, computed by
     * cpvk_plan_batches() when recording ends. Zero until then. This is the

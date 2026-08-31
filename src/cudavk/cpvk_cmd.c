@@ -879,7 +879,86 @@ cpvk_plan_batches(struct cpvk_cmd_buffer *cmd)
       }
       prev = op;
    }
+
+   /*
+    * Eliminate a render scope whose only result is immediately discarded.
+    *
+    * A full-area scope beginning on the exact same colour subresource with
+    * LOAD_OP_DONT_CARE/CLEAR makes the preceding scope's attachment writes
+    * unobservable.  Keep the proof deliberately narrow: only that scope's
+    * draws and attachment clear may occur before its end, neither shader stage
+    * may write memory, and depth/resolve/query/event operations are excluded.
+    * Mesa's legacy-render-pass lowering places its external dependency between
+    * END and BEGIN as a barrier op; it has no result of its own, so it does not
+    * make dead colour contents observable.
+    *
+    * Leave BEGIN, END and the old clear in the execution list.  Suppressing
+    * only draws is conservative and preserves every ordering operation; the
+    * next scope discards the attachment bytes either way.
+    */
+   for (unsigned i = 0; i + 1 < cmd->num_ops; i++) {
+      if (cmd->ops[i].kind != CPVK_OP_END_RENDER)
+         continue;
+      unsigned next = i + 1;
+      while (next < cmd->num_ops && cmd->ops[next].kind == CPVK_OP_BARRIER)
+         next++;
+      if (next >= cmd->num_ops ||
+          cmd->ops[next].kind != CPVK_OP_BEGIN_RENDER)
+         continue;
+      uint32_t old_i = cmd->ops[i].scope_index;
+      uint32_t new_i = cmd->ops[next].scope_index;
+      if (old_i >= cmd->num_scopes || new_i >= cmd->num_scopes)
+         continue;
+      struct cp_render_scope *old_scope = &cmd->scopes[old_i];
+      const struct cp_render_scope *new_scope = &cmd->scopes[new_i];
+      if (!old_scope->fb.color || old_scope->fb.has_zs ||
+          new_scope->fb.has_zs || !new_scope->full_render_area ||
+          new_scope->color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD ||
+          old_scope->fb.color != new_scope->fb.color ||
+          old_scope->fb.texture_cookie != new_scope->fb.texture_cookie ||
+          old_scope->fb.width != new_scope->fb.width ||
+          old_scope->fb.height != new_scope->fb.height)
+         continue;
+
+      bool safe = true;
+      bool found_begin = false;
+      for (unsigned j = i; j-- > 0;) {
+         const struct cpvk_op *prior = &cmd->ops[j];
+         if (prior->kind == CPVK_OP_BEGIN_RENDER &&
+             prior->scope_index == old_i) {
+            found_begin = true;
+            break;
+         }
+         if (prior->kind == CPVK_OP_CLEAR) {
+            if (prior->clear.depth ||
+                prior->clear.image !=
+                   (struct cpvk_image *)(uintptr_t)old_scope->fb.texture_cookie) {
+               safe = false;
+               break;
+            }
+            continue;
+         }
+         if (prior->kind != CPVK_OP_DRAW || prior->scope_index != old_i) {
+            safe = false;
+            break;
+         }
+         const struct cpvk_pipeline *p = prior->draw_cmd.pipeline;
+         if (!p || (p->vs && p->vs->writes_memory) ||
+                   (p->fs && p->fs->writes_memory)) {
+            safe = false;
+            break;
+         }
+      }
+      if (safe && found_begin) {
+         old_scope->skip_draws = true;
+         if (cp_debug->debug_rt)
+            fprintf(stderr, "dead-scope: serial=%u draws=%u tris=%" PRIu64 "\n",
+                    old_scope->serial, old_scope->planned_draws,
+                    old_scope->planned_tris);
+      }
+   }
 }
+
 
 VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_EndCommandBuffer(VkCommandBuffer commandBuffer)
@@ -1840,6 +1919,13 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       if (scope == CP_RENDER_SCOPE_NONE)
          return;
       cmd->active_scope = scope;
+      cmd->scopes[scope].color_load_op = cat ? cat->loadOp :
+                                             VK_ATTACHMENT_LOAD_OP_LOAD;
+      cmd->scopes[scope].full_render_area =
+         pRenderingInfo->renderArea.offset.x == 0 &&
+         pRenderingInfo->renderArea.offset.y == 0 &&
+         pRenderingInfo->renderArea.extent.width == fb.width &&
+         pRenderingInfo->renderArea.extent.height == fb.height;
 
       struct cpvk_op *op = cpvk_op_alloc(cmd, CPVK_OP_BEGIN_RENDER);
       if (!op)
