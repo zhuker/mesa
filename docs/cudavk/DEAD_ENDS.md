@@ -1532,6 +1532,82 @@ source landed.
 
 ---
 
+## 30. Episode-entry stale-depth Hi-Z at 8-pixel tiles — REFUTED (≤0.103 ms/frame ceiling)
+
+2026-08-30/31, favorite3 real frames (timestamp index 2782 onward).
+Diagnostic branch `cudavk/hiz-census`, commits `fedb1ff1b4a` through
+`615274e9b5e`; no production source merged. Raw control/candidate output:
+`/tmp/hiz-f3-8/` and `/tmp/hiz-f3-8-cand2.log`.
+
+**Tried.** At each normal opaque episode entry, build conservative tile depth
+bounds from the unchanged depth attachment, then replay the shipping
+route-specific raster arithmetic without changing visbuf, depth, color or
+render state. For every small, medium and huge primitive/tile reference, count
+whether the episode-entry bound can reject it before the ordinary raster work.
+The final probe used 8x8 tiles. It audited raw, unclamped queue counts from a
+private per-segment snapshot: the earlier version saved pointers into eight
+reused queue sets, so segment `s + 8` could overwrite segment `s` and make a
+false `shipping_match=yes`. The corrected probe copied both counters on the
+segment stream before reuse and required every snapshot, reducer equality,
+zero queue overflow and successful CUDA completion.
+
+**Valid target-window result.** The compiled replay produced all 6,939 timestamp
+events and the standard stdout hash; 18/18 candidate sentinel dumps equal the
+control. The driver saw eight additional command-bearing virtual-swapchain
+helper submits which bypass the timestamp shim. One occurs before the target,
+so external timestamp 2783 is internal command-bearing submit 2784; the first
+selected episode is exactly that submit. The other helper command buffers carry
+no opaque draws. Thus the 5,957 admitted episodes are the requested real-frame
+population even though the two counter spaces end at 6,939 and 6,947.
+`failed=0`, `reducer_check=ok`, `shipping_match=yes`, `result_valid=yes`,
+36,963/36,963 queue snapshots were present, and both queue-overflow counts were
+zero.
+
+| quantity | before | after | reduction |
+|---|---:|---:|---:|
+| whole valid primitives | 414,649,151 | 406,198,925 | **2.038%** |
+| primitive/tile references | 1,458,883,449 | 1,360,565,811 | **6.739%** |
+| bounding-box pixels | 36,474,987,587 | 33,261,052,256 | **8.811%** |
+| covered pixels | 6,763,694,506 | 5,643,471,136 | **16.562%** |
+| sum of each episode's longest tile list | 9,744,153 | 9,646,707 | **1.000%** |
+| maximum tile list | 7,818 | 7,818 | **0%** |
+
+The class split does not hide a larger prize: reference reductions are 1.656%
+small, 10.282% medium and 6.215% huge; covered-work reductions are 10.250%,
+26.286% and 13.788% respectively.
+
+**Ceiling.** In the clean post-dead-scope trace, the only directly avoidable
+shipping kernels — ordinary `cp_rasterize_stage2` plus stage 3 — occupy 0.623
+ms/frame of union time (0.779 ms/frame summed across streams) over the 412.5
+real-frame slice. Charging the largest measured reduction, covered pixels,
+linearly against the whole union gives only **0.103 ms/frame**; charging the
+reference reduction gives 0.042 ms/frame. Both are optimistic because fixed
+launch/setup work remains and the longest-list sum barely moves. The diagnostic
+itself built 85,384,768 tile bounds by reading 5,464,625,152 depth words — about
+14.3k tiles and 917k words per admitted episode — so a production full-screen
+builder already costs more work than this ceiling can repay. Diagnostic timing
+is intentionally not used.
+
+**Mechanism.** Episode-entry depth is useful on real frames, unlike the loading
+smokes where it rejected nothing, but the useful unit is only a fraction of two
+already-small raster stages. It cannot reduce final fragment shading: those
+losers already do not survive the visibility buffer. A hierarchy that must be
+built or refreshed for each episode has no remaining budget.
+
+**Retry if.** A future renderer already maintains exact conservative tile depth
+metadata as a free by-product, or a target-device trace raises the affected
+stage-2/3 union by several times. Reuse the exact raster arithmetic and private
+queue snapshots; never infer bounds from transformed vertex extrema, and never
+accept a capped/reused queue audit as shipping equality. Do not build a
+full-screen Hi-Z maintenance mechanism for the present captures.
+
+**Cost.** One hardened count-only census, two loading smokes and one corrected
+full target-window sentinel replay. Favorite2 was not run: favorite3's
+optimistic affected-work ceiling is already below the cost class, and a change
+must win on both captures.
+
+---
+
 ## The rules these produced
 
 Each is tied to the evidence that produced it. They are ordered by how often they
