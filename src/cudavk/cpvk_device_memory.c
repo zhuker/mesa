@@ -162,6 +162,9 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
    CPVK_CTX_SCOPE(dev);
 
+   if (cp_debug->shader_census && submit->command_buffer_count)
+      cp_shader_census_submit(&dev->renderer);
+
    /*
     * Wait semaphores, on the device where the sync carries a completion event
     * and on the host where it does not.

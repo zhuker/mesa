@@ -57,6 +57,32 @@
  */
 #define CP_MAX_BATCH_TRIS  (256 * 1024)
 
+/* Diagnostic-only, fixed CPU launch record storage. */
+#define CP_SHADER_CENSUS_CAPACITY 262144u
+#define CP_SHADER_CENSUS_HASH_SIZE 32u
+
+struct cp_shader_census_record {
+   uint64_t submit_ordinal;
+   uint64_t batch_ordinal;
+   uint64_t launch_ordinal;
+   uint64_t total_vertices;
+   unsigned char stage_hash[CP_SHADER_CENSUS_HASH_SIZE];
+   uint32_t grid[3];
+   uint32_t block[3];
+   uint32_t draw_count;
+   int32_t num_regs;
+   int32_t spill_bytes;
+   int32_t blocks_per_sm;
+   int32_t reg_cap;
+   int32_t sm_major;
+   int32_t sm_minor;
+   uint8_t stream_bank; /* 0 main, 1..8 seg0..7, 255 unknown */
+   uint8_t exec_mode;
+   uint8_t fused;
+   uint8_t fetch_runs;
+   uint8_t key_valid;
+};
+
 /*
  * Everything that has to be the same for two consecutive draws to be merged.
  *
@@ -681,6 +707,21 @@ struct cp_context {
     * Set when a draw joins a batch, cleared when cp_draw_execute_batch() returns.
     */
    bool batch_uploads_live;
+
+   /* Diagnostic measurement fields stay at the end. With the flag false the
+    * pointer/counters remain zero and no identity is assigned. */
+   struct {
+      struct cp_shader_census_record *records;
+      uint64_t submit_ordinal;
+      uint64_t batch_ordinal;
+      uint64_t launch_ordinal;
+      uint64_t stored;
+      uint64_t dropped;
+      uint64_t missing_key;
+      uint64_t key_mismatch;
+      uint64_t unknown_stream;
+      bool allocation_ok;
+   } shader_census;
 };
 
 
@@ -1078,6 +1119,7 @@ bool cp_clear_rect_masked(struct cp_context *cp, void *data, uint64_t offset,
 
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 void cp_context_cleanup(struct cp_context *cp);
+void cp_shader_census_submit(struct cp_context *cp);
 
 /*
  * A backstop, not a budget. The arena accumulates across the draws of a frame

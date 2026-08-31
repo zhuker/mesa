@@ -259,6 +259,11 @@ struct cp_shader_binary {
    /* Which VARYING_SLOT_* each I/O slot carries. */
    unsigned in_location[CP_MAX_IO_SLOTS];
    unsigned out_location[CP_MAX_IO_SLOTS];
+
+   /* Diagnostic measurement fields stay at the end. Populated only when
+    * CUDAVK_SHADER_CENSUS is enabled before this binary enters the cache. */
+   unsigned char stage_hash[32];
+   bool stage_hash_valid;
 };
 
 static inline struct cp_shader_exec *

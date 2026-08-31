@@ -987,6 +987,24 @@ cpvk_prim(VkPrimitiveTopology t)
  * NIR will be. The descriptor lowering depends on the pipeline layout as
  * well, so the layout's set numbering goes in beside it.
  */
+static void
+cpvk_shader_census_check_key(struct cpvk_device *dev,
+                             struct cp_shader_binary *bin,
+                             const unsigned char hash[BLAKE3_OUT_LEN])
+{
+   if (!cp_debug->shader_census)
+      return;
+
+   _Static_assert(BLAKE3_OUT_LEN == sizeof(bin->stage_hash),
+                  "shader census preserves the complete stage key");
+   if (!bin->stage_hash_valid ||
+       memcmp(bin->stage_hash, hash, BLAKE3_OUT_LEN) != 0) {
+      /* This lookup holds this device's shader_cache_lock. */
+      dev->renderer.shader_census.key_mismatch++;
+      fprintf(stderr, "CUDAVK_SHADER_CENSUS_ERROR key_propagation=invalid\n");
+   }
+}
+
 static struct cp_shader_binary *
 cpvk_compile_stage(struct cpvk_device *dev,
                    VkPipelineCreateFlags2KHR flags,
@@ -1076,6 +1094,7 @@ cpvk_compile_stage(struct cpvk_device *dev,
    for (unsigned i = 0; i < dev->num_shaders; i++) {
       if (!memcmp(dev->shader_cache[i].hash, hash, sizeof(hash))) {
          struct cp_shader_binary *bin = dev->shader_cache[i].bin;
+         cpvk_shader_census_check_key(dev, bin, hash);
          simple_mtx_unlock(&dev->shader_cache_lock);
          ralloc_free(mem_ctx);
          *result = VK_SUCCESS;
@@ -1227,6 +1246,7 @@ cpvk_compile_stage(struct cpvk_device *dev,
    for (unsigned i = 0; i < dev->num_shaders; i++) {
       if (!memcmp(dev->shader_cache[i].hash, hash, sizeof(hash))) {
          struct cp_shader_binary *cached = dev->shader_cache[i].bin;
+         cpvk_shader_census_check_key(dev, cached, hash);
          simple_mtx_unlock(&dev->shader_cache_lock);
          cp_shader_binary_destroy(bin);
          *result = VK_SUCCESS;
@@ -1244,6 +1264,14 @@ cpvk_compile_stage(struct cpvk_device *dev,
       }
       dev->shader_cache = p;
       dev->max_shaders = want;
+   }
+   /* Publish the final resource-aware compiled-stage cache key on the one
+    * canonical winning binary. A racing loser is destroyed above untagged. */
+   if (cp_debug->shader_census) {
+      _Static_assert(BLAKE3_OUT_LEN == sizeof(bin->stage_hash),
+                     "shader census preserves the complete stage key");
+      memcpy(bin->stage_hash, hash, BLAKE3_OUT_LEN);
+      bin->stage_hash_valid = true;
    }
    memcpy(dev->shader_cache[dev->num_shaders].hash, hash, sizeof(hash));
    dev->shader_cache[dev->num_shaders].bin = bin;

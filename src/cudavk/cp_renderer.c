@@ -102,6 +102,12 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
    cp->main_stream = cp->stream;
    cp->main_stream_serial = cp_texture_stream_serial_alloc(dev);
 
+   if (cp_debug->shader_census) {
+      cp->shader_census.records = calloc(CP_SHADER_CENSUS_CAPACITY,
+                                          sizeof(*cp->shader_census.records));
+      cp->shader_census.allocation_ok = cp->shader_census.records != NULL;
+   }
+
    /* The flush's generation ring; see cp_flush. A failed event creation
     * falls back to the draining flush by leaving flush_retire[0] null. */
    cp->flush_gens = cp_debug->flush_drain ? 1 : CP_FLUSH_GENS;
@@ -982,6 +988,151 @@ cp_hardware_texture_report(struct cp_context *cp)
               cp->hardware_texture.authoritative_oom_retries);
 }
 
+void
+cp_shader_census_submit(struct cp_context *cp)
+{
+   if (!cp_debug->shader_census)
+      return;
+   cp->shader_census.submit_ordinal++;
+   cp->shader_census.batch_ordinal = 0;
+}
+
+static uint8_t
+cp_shader_census_stream_bank(const struct cp_context *cp)
+{
+   if (cp->stream == cp->main_stream)
+      return 0;
+   for (unsigned i = 0; i < CP_PASS_STREAMS; i++)
+      if (cp->stream == cp->seg_streams[i])
+         return i + 1;
+   return UINT8_MAX;
+}
+
+static void
+cp_shader_census_record_vs(struct cp_context *cp,
+                           const struct cp_shader_binary *bin,
+                           const struct cp_shader_exec *exec,
+                           uint64_t batch_ordinal, uint64_t total_vertices,
+                           uint32_t draw_count, uint32_t grid_x,
+                           bool fused, bool fetch_runs)
+{
+   /* This function is called only after the real generated VS launch returned
+    * CUDA_SUCCESS. It performs CPU stores only: no allocation, formatting,
+    * lock, CUDA call, readback, or synchronization is allowed here. */
+   const uint64_t launch = ++cp->shader_census.launch_ordinal;
+   if (!cp->shader_census.records ||
+       cp->shader_census.stored >= CP_SHADER_CENSUS_CAPACITY) {
+      cp->shader_census.dropped++;
+      return;
+   }
+
+   struct cp_shader_census_record *record =
+      &cp->shader_census.records[cp->shader_census.stored++];
+   record->submit_ordinal = cp->shader_census.submit_ordinal;
+   record->batch_ordinal = batch_ordinal;
+   record->launch_ordinal = launch;
+   record->total_vertices = total_vertices;
+   record->grid[0] = grid_x;
+   record->grid[1] = 1;
+   record->grid[2] = 1;
+   record->block[0] = 256;
+   record->block[1] = 1;
+   record->block[2] = 1;
+   record->draw_count = draw_count;
+   record->num_regs = exec->num_regs;
+   record->spill_bytes = exec->spill_bytes;
+   record->blocks_per_sm = exec->blocks_per_sm;
+   record->reg_cap = exec->reg_cap;
+   record->sm_major = bin->sm_major;
+   record->sm_minor = bin->sm_minor;
+   record->stream_bank = cp_shader_census_stream_bank(cp);
+   record->exec_mode = fused ? CP_SHADER_EXEC_VS_FETCH :
+                               CP_SHADER_EXEC_CLASSIC;
+   record->fused = fused;
+   record->fetch_runs = fetch_runs;
+   record->key_valid = bin->stage_hash_valid;
+   if (bin->stage_hash_valid)
+      memcpy(record->stage_hash, bin->stage_hash, sizeof(record->stage_hash));
+   else
+      cp->shader_census.missing_key++;
+   if (record->stream_bank == UINT8_MAX)
+      cp->shader_census.unknown_stream++;
+}
+
+static void
+cp_shader_census_report(struct cp_context *cp, bool context_sync_ok)
+{
+   if (!cp_debug->shader_census)
+      return;
+
+   for (uint64_t i = 0; i < cp->shader_census.stored; i++) {
+      const struct cp_shader_census_record *record =
+         &cp->shader_census.records[i];
+      char hash[CP_SHADER_CENSUS_HASH_SIZE * 2 + 1];
+      for (unsigned j = 0; j < CP_SHADER_CENSUS_HASH_SIZE; j++)
+         snprintf(hash + j * 2, 3, "%02x", record->stage_hash[j]);
+      const char *stream = "unknown";
+      char seg[8];
+      if (record->stream_bank == 0) {
+         stream = "main";
+      } else if (record->stream_bank <= CP_PASS_STREAMS) {
+         snprintf(seg, sizeof(seg), "seg%u", record->stream_bank - 1);
+         stream = seg;
+      }
+      const char *mode = record->exec_mode == CP_SHADER_EXEC_VS_FETCH
+         ? "VS_FETCH" : "CLASSIC";
+      fprintf(stderr,
+         "CUDAVK_SHADER_CENSUS_RECORD version=1 index=%" PRIu64
+         " status=%s stage=VS stage_hash=%s submit=%" PRIu64
+         " batch=%" PRIu64 " launch=%" PRIu64
+         " exec=%s fused=%u fetch_runs=%u total_vertices=%" PRIu64
+         " grid=%ux%ux%u block=%ux%ux%u draws=%u stream=%s"
+         " bank=%u regs=%d spill_bytes=%d blocks_per_sm=%d reg_cap=%d"
+         " sm=%d.%d\n",
+         i, record->key_valid && record->stream_bank != UINT8_MAX
+            ? "complete" : "invalid",
+         hash, record->submit_ordinal, record->batch_ordinal,
+         record->launch_ordinal, mode, record->fused, record->fetch_runs,
+         record->total_vertices, record->grid[0], record->grid[1],
+         record->grid[2], record->block[0], record->block[1],
+         record->block[2], record->draw_count, stream, record->stream_bank,
+         record->num_regs, record->spill_bytes, record->blocks_per_sm,
+         record->reg_cap, record->sm_major, record->sm_minor);
+   }
+
+   const uint64_t key_mismatch = cp->shader_census.key_mismatch;
+   const bool population_ok = context_sync_ok &&
+      cp->shader_census.allocation_ok &&
+      cp->shader_census.launch_ordinal == cp->shader_census.stored &&
+      cp->shader_census.dropped == 0 && cp->shader_census.missing_key == 0 &&
+      cp->shader_census.unknown_stream == 0 && key_mismatch == 0;
+   fprintf(stderr,
+      "CUDAVK_SHADER_CENSUS_SUMMARY version=1 capacity=%u population=%" PRIu64
+      " stored=%" PRIu64 " dropped=%" PRIu64 " missing_key=%" PRIu64
+      " key_mismatch=%" PRIu64 " unknown_stream=%" PRIu64
+      " final_submit=%" PRIu64
+      " context_sync_ok=%s allocation_ok=%s"
+      " complete_population=%s result_valid=%s"
+      " diagnostic_timing_invalid=1 cost_join_required=yes"
+      " production_admitted=no\n",
+      CP_SHADER_CENSUS_CAPACITY, cp->shader_census.launch_ordinal,
+      cp->shader_census.stored, cp->shader_census.dropped,
+      cp->shader_census.missing_key, key_mismatch,
+      cp->shader_census.unknown_stream, cp->shader_census.submit_ordinal,
+      context_sync_ok ? "yes" : "no",
+      cp->shader_census.allocation_ok ? "yes" : "no",
+      population_ok ? "yes" : "no", population_ok ? "yes" : "no");
+}
+
+static void
+cp_shader_census_cleanup(struct cp_context *cp)
+{
+   if (!cp_debug->shader_census)
+      return;
+   free(cp->shader_census.records);
+   memset(&cp->shader_census, 0, sizeof(cp->shader_census));
+}
+
 static void
 cp_spec_report(struct cp_context *cp)
 {
@@ -1004,8 +1155,10 @@ cp_context_cleanup(struct cp_context *cp)
    if (!cp || !cp->dev)
       return;
 
-   if (cuCtxSynchronize() != CUDA_SUCCESS)
+   const CUresult context_sync = cuCtxSynchronize();
+   if (context_sync != CUDA_SUCCESS)
       cp_renderer_texture_fatal(cp);
+   cp_shader_census_report(cp, context_sync == CUDA_SUCCESS);
    /* Release the exclusive cache-use lifetime even on a poisoned context. */
    cp_texture_cache_unpin(cp);
    cp_hardware_texture_report(cp);
@@ -1033,6 +1186,7 @@ cp_context_cleanup(struct cp_context *cp)
    free(cp->abuf);
    cp->abuf = NULL;
    cp_scratch_destroy(cp);
+   cp_shader_census_cleanup(cp);
 
    for (unsigned i = 0; i < cp->timer.cap; i++)
       if (cp->timer.events && cp->timer.events[i])
@@ -4938,6 +5092,8 @@ cp_restore_preclip(const struct cp_pending_clip *clip,
 void
 cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 {
+   const uint64_t shader_census_batch = cp_debug->shader_census
+      ? ++cp->shader_census.batch_ordinal : 0;
    cp->plan.flushes++;
    if (cp_debug->debug_rt)
       fprintf(stderr, "exec-scope: serial=%u color=%p depth=%p\n",
@@ -5913,9 +6069,17 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          }
 
          /* Compiled shaders grid-stride; see the fragment launch. */
+         const uint32_t vs_grid_x =
+            MIN2((total_verts + 255) / 256, 4096u);
          CUresult vs_err = cp_launch(cp, vs_exec->kernel,
-            MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
+            vs_grid_x, 1, 1, 256, 1, 1,
             0, cp->stream, vs_params, NULL);
+
+         if (vs_err == CUDA_SUCCESS && cp_debug->shader_census)
+            cp_shader_census_record_vs(cp, state->vs, vs_exec,
+                                       shader_census_batch, total_verts,
+                                       batch->ndraws, vs_grid_x,
+                                       fused_vfetch, fetch_runs);
 
          if (vs_err == CUDA_SUCCESS) {
             /* The rasterizer reads positions directly from VS output */

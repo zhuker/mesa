@@ -206,6 +206,18 @@ cpvk_devenv_icd = custom_target(
 )
 
 
+# CPU-only diagnostic census validation. These require neither a Vulkan loader
+# nor a CUDA device.
+foreach census_test : [
+  'cp_shader_census_analyze_test',
+  'cp_shader_census_cost_test',
+  'cp_shader_census_static_test',
+]
+  test(census_test, prog_python,
+       args : [files('tests/' + census_test + '.py')],
+       suite : 'cudavk')
+endforeach
+
 # Focused external-API regression suite. These link the Vulkan loader rather
 # than driver internals and select the generated development ICD, so they test
 # the same dispatch and object-lifetime boundary as applications do.
