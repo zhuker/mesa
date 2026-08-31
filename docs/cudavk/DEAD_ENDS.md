@@ -1292,7 +1292,16 @@ copy and is not proposed for the tree.
 reason. A probe on every 29th launch across a full old-capture replay (6,669
 launches) read back the device-built tile queue: median 12 entries, p90 404,
 max 4,434; **17.6% of launches have an empty queue**; and the grid is
-`CLAMP(rast_num_triangle## 25. Device-side episode chaining — CDP2 tails, predicated pre-issue, conditional graphs — REFUTED
+`CLAMP(rast_num_triangles * 8, 512, 2048)`, sized from the triangle count rather
+than from the queue stage 2 builds on the device, so **98.3% of launches have
+queue ≤ grid** and the median launch leaves 500 of 512 blocks idle. The longest
+block holds *one* item. Compaction and rebalancing buy nothing here; only more
+warps per item or more items per launch can — and by the exclusive-fraction rule
+the whole question is worth under 0.4 ms/frame of device time. See entry 10.
+
+---
+
+## 25. Device-side episode chaining — CDP2 tails, predicated pre-issue, conditional graphs — REFUTED
 
 2026-08-30, on the HeadlessStreamer occlusion capture's compiled harness
 (`~/favorite3-cpp`), tree at 0f6e7436db7. Full record with the census and the
