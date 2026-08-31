@@ -1926,6 +1926,122 @@ favorite3 failed admission.
 
 ---
 
+## 35. Exact within-batch post-transform vertex reuse — REFUTED (0.438 ms/frame generous ceiling)
+
+2026-08-31, favorite3 real frames. Diagnostic implementation and analyzers:
+side branch `diag/vertex-reuse-census`, commits `5445711f243` and
+`213d7cdc655`. Data: `/tmp/vertex-reuse-f3` and
+`/tmp/vertex-reuse-cost.json`.
+
+**Proposed.** The renderer executes standalone vertex fetch and the generated
+vertex shader, or their fused form, once per assembled triangle corner.
+Indexed meshes repeat vertices. Reuse the post-transform result for an exact
+within-batch `(draw row, effective vertex_id, instance_id)` key, then rewrite
+primitive references to the unique output. This is not entry 33's cross-frame
+retained geometry: it removes repeated vertex work inside one current batch.
+The initial clean-trace pool appeared large enough to census — generated VS
+plus standalone fetch was about 0.775 ms/frame union-exclusive in the broader
+412.5-frame report.
+
+**Exact diagnostic.** `CUDAVK_VERTEX_REUSE_CENSUS` loads a separate CUDA
+module only when its value boolean is true. After the real VS succeeds, on the
+same stream, its kernel repeats the production `cp_vf_lane_ids()` identity
+calculation but never reads or changes shader output. Exact open addressing
+stores all three original integers; the hash chooses only the first probe.
+The main and eight segment streams have disjoint generation-tagged banks. Old
+grown allocations survive until cleanup, BUSY waits and probes are bounded,
+and generation zero is reserved. Results stay on device until the existing
+context-wide cleanup join; there is no per-batch host read or synchronization.
+Allocation, launch, lane, probe or table failures charge the whole batch
+unique/nonduplicate. Record overflow invalidates the run.
+
+Identity is absolute command-bearing submit plus absolute executed-batch
+ordinal. Slots, banks and pointers are never identity. Records also retain the
+fused/standalone, fetch-ran, indexed and shader-memory-write classes. The
+disabled path does not compile or load the module, allocate, assign identities,
+select banks, scan, launch, report or add a join.
+
+**Correct population and correctness.** Two full compiled favorite3 replays
+both ended with the capture's benign post-output `rc=139`, exactly 6,939
+complete external shim rows and final internal submit 6,947. Both kept stdout
+SHA-256
+`e3f24a1dcdc8568be217d249e480623958e2621b3d4f056ae4c44ad20d08da49`
+and matched all 18 sentinel frames byte for byte. The flag-off suite is 79/79.
+A controlled repeated-index GPU oracle classified 21,573 duplicates out of
+21,600 inputs with the expected 27 row-local unique keys.
+
+Every one of **210,944** executed batches was admitted in both full runs, with
+zero record/table/launch/lane/probe exclusions. All structural fields and
+unique counts repeated exactly; only the non-semantic atomic probe count
+varied. The whole process had 3,545,618,907 inputs and 2,160,968,089 duplicates
+(60.948%). From real internal submit 2,784 onward:
+
+| population | total | duplicates | fraction |
+|---|---:|---:|---:|
+| all | 3,479,473,815 | 2,116,760,651 | **60.836%** |
+| fused VS/fetch | 3,426,230,853 | 2,076,471,075 | **60.605%** |
+| standalone fetch + VS | 53,242,962 | 40,289,576 | **75.671%** |
+| indexed | 3,117,299,295 | 2,106,766,521 | **67.583%** |
+| nonindexed / expanded topology | 362,174,520 | 9,994,130 | **2.759%** |
+
+Count ratios are not the decision metric because shader and fetch costs vary by
+batch.
+
+**Exact clean-trace price.** The calibrated join uses the established 411-frame
+window in `/tmp/postdead/trace.sqlite`, internal submits `[2786,3608)`. That
+trace has no NVTX table. Its fail-closed structural classifier accepts a
+`main` only when its immediate same-stream kernel successor is
+`cp_clip_triangles`, `cp_clip_rast_fused` or
+`cp_clip_rast_fused_abuf`; immediate same-stream `cp_vertex_fetch` identifies
+the standalone form. Runtime launch APIs join to GPU intervals only through
+`correlationId`. It maps all **19,929/19,929** VS records and all
+**3,087/3,087** fetches. Every absolute identity, grid, bank-to-stream mapping
+and fetch shape agrees. The two census runs agree over the selected population.
+Exact integer and fractional calibration fingerprint:
+`6106732e85413b2110fd269fcd5f1d691bcf443361da2d7c1b039cfb0476c187`.
+
+| accounting | ms/frame |
+|---|---:|
+| unweighted VS+fetch summed duration | 1.181784 |
+| unweighted pool union | 0.821026 |
+| unweighted pool union-exclusive | 0.725432 |
+| duplicate-fraction weighted summed duration | 0.582517 |
+| weighted exclusive, maximum active fraction | 0.405892 |
+| weighted exclusive, active-fraction average | 0.384042 |
+| **generous weighted union-exclusive upper** | **0.437503** |
+
+The decision arm is deliberately more generous than max or average weighting:
+for each pool-exclusive half-open span it credits
+`min(1, sum(active duplicate fractions))`. Even that gives only
+**0.437502653 ms/frame**, below the 0.500-ms/frame admission threshold. The
+broader 0.582517 summed duration double-counts concurrent work and is not
+collectible frame time.
+
+**Mechanism and decision.** Stop. The generous ceiling is already short by
+0.062497 ms/frame before building a topology hash/remap, rewriting primitive
+references, scattering unique output, retaining storage, tracking exact buffer
+identity/content versions, or excluding invocation-sensitive semantics.
+`writes_memory` is zero in the selected population, but the driver does not yet
+retain complete subgroup/clock/query/transform-feedback eligibility metadata;
+those unknowns can only lower a realizable pool. No favorite2 replay or
+production cache is justified after favorite3 fails the build gate.
+
+**Retry if.** A later capture or a B200 clean trace raises the exact
+per-batch-weighted union-exclusive pool above 0.5 ms/frame *after* a measured
+remap/build charge. Preserve full row/vertex/instance comparison, independent
+stream banks, absolute submit/batch identity, repeated exact runs, strict shim
+parsing, same-stream structural correlation, conservative unknown charging and
+the union-exclusive decision metric. Do not promote the global duplicate ratio
+or the summed-duration bound to a performance claim.
+
+**Cost.** One diagnostic module/census, CPU hash oracle, no-device actual-source
+NVRTC compile, 15 analyzer tests, eight cost-join tests, one 79-test flag-off
+suite, three focused GPU smokes including the repeated-index oracle, and two
+full favorite3 replays. Favorite2 was not spent after the exact primary-capture
+ceiling failed admission.
+
+---
+
 ## The rules these produced
 
 Each is tied to the evidence that produced it. They are ordered by how often they
