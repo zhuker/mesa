@@ -174,9 +174,9 @@ static const struct cp_flag_def flags[] = {
      "its six faces from where the sampler will look; syncs" },
 
    { "CUDAVK_GEOMETRY_CENSUS", CP_FLAG_UINT, F(geometry_census),
-     "diagnostic B0 post-stage2 visibility-buffer SHA-256 census; 1 and 2 "
-     "select independent fixed domain salts; invalid for timing", .dflt = 0,
-     .has_range = true, .lo = 0, .hi = 2 },
+     "diagnostic visibility-buffer SHA-256 census; 1/2 select separate fixed "
+     "domains, 3 hashes a simultaneous B1R domain pair; invalid for timing",
+     .dflt = 0, .has_range = true, .lo = 0, .hi = 3 },
    { "CUDAVK_GEOMETRY_CENSUS_SUBMIT_START", CP_FLAG_UINT,
      F(geometry_census_submit_start),
      "with GEOMETRY_CENSUS, skip hashing through this absolute internal "

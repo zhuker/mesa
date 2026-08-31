@@ -26,9 +26,19 @@ cp_geom_b0_final_kernel(struct cp_geom_b0_final_args args)
    record->queue_status = (*nontrivial > 1000000u ? 1u : 0u) |
                           (*huge > 2000000u ? 2u : 0u) |
                           (*setup > 1024u ? 4u : 0u);
-   record->status = record->queue_status ? CP_GEOM_B0_STATUS_QUEUE_REJECT :
-                                           CP_GEOM_B0_STATUS_COMPLETE;
+
    const unsigned char *root = (const unsigned char *)args.root;
    for (unsigned i = 0; i < CP_SHA256_MERKLE_DIGEST_BYTES; i++)
       record->sha256[i] = root[i];
+   if (args.root2 && args.output2) {
+      const unsigned char *root2 = (const unsigned char *)args.root2;
+      unsigned char *output2 = (unsigned char *)args.output2;
+      for (unsigned i = 0; i < CP_SHA256_MERKLE_DIGEST_BYTES; i++)
+         output2[i] = root2[i];
+   }
+
+   /* COMPLETE (or the classified queue refusal) is the publication store.
+    * It is deliberately last, after both roots and every record field. */
+   record->status = record->queue_status ? CP_GEOM_B0_STATUS_QUEUE_REJECT :
+                                           CP_GEOM_B0_STATUS_COMPLETE;
 }

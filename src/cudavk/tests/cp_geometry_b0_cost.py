@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Join B0 classifications to a clean Nsight Systems trace.
 
-This is a CPU-only diagnostic.  Its possible-saving number is a necessary-
-condition upper bound from one instrumented trace, not a performance result.
+This is a CPU-only diagnostic, not a performance result.  The project decision
+metric is union-exclusive collectible duration in this clean trace.  It is not
+an unconstrained mathematical upper under arbitrary resource contention.
 """
 from __future__ import annotations
 
@@ -371,12 +372,25 @@ def classification_map(analysis: dict, admitted: dict[tuple[int, int], dict]) ->
     return out
 
 
-def analyze_arm(path: Path, analyzer, units: Sequence[Unit], clips: Sequence[Interval],
-                all_activity: Sequence[Interval], lo: int, hi: int,
-                submit_lo: int, submit_hi: int, frame_origin: int,
-                frame_count: int) -> dict:
+def prepare_log(path: Path, analyzer, frame_origin: int) -> dict:
     records, summary = analyzer.parse_run(path)
-    analysis = analyzer.analyze(records, frame_origin, SUBMITS_PER_FRAME)
+    analysis = analyzer.analyze(records, frame_origin, SUBMITS_PER_FRAME,
+                                mode=summary["mode"])
+    analysis.update(salt=f"{summary['salt_value']:016x}",
+                    salt2=f"{summary['salt2_value']:016x}")
+    return {"path": path, "records": records, "summary": summary,
+            "analysis": analysis}
+
+
+def classification_arm(prepared: dict, analysis: dict, units: Sequence[Unit],
+                       clips: Sequence[Interval],
+                       all_activity: Sequence[Interval], lo: int, hi: int,
+                       submit_lo: int, submit_hi: int, frame_count: int,
+                       arm_kind: str, decision_bearing: bool,
+                       source_logs: Sequence[Path]) -> dict:
+    path = prepared["path"]
+    records = prepared["records"]
+    summary = prepared["summary"]
     admitted = map_admitted_records(records, units, submit_lo, submit_hi)
     classes = classification_map(analysis, admitted)
 
@@ -407,7 +421,11 @@ def analyze_arm(path: Path, analyzer, units: Sequence[Unit], clips: Sequence[Int
     gate_value = recurrent_cost["union_exclusive_ms_per_frame"]
     rejection_condition_holds = gate_value <= GATE_MS_PER_FRAME
     return {
+        "arm": arm_kind,
+        "decision_bearing": decision_bearing,
         "log": str(path),
+        "reference_log": str(path),
+        "source_logs": [str(source) for source in source_logs],
         "salt": f"{summary['salt_value']:016x}",
         "selected_units": len(units),
         "admitted_mapped": len(admitted),
@@ -417,11 +435,21 @@ def analyze_arm(path: Path, analyzer, units: Sequence[Unit], clips: Sequence[Int
         "classification_missing_conservative_recurrent": unknown,
         "all_clip_intervals_conservative_recurrent": len(clips),
         "possible_saving_necessary_condition_upper": recurrent_cost,
+        "possible_saving_necessary_condition_upper_scope": (
+            "clean-trace target duration only; union_exclusive_ms_per_frame is "
+            "the project collectible metric, not an unconstrained upper under "
+            "arbitrary resource contention"
+        ),
         "classified_nonrecurrent_diagnostic_trace_cost": nonrecurrent_cost,
         "gate": {
+            "decision_bearing": decision_bearing,
             "metric": (
                 "possible_saving_necessary_condition_upper."
                 "union_exclusive_ms_per_frame"
+            ),
+            "metric_scope": (
+                "project clean-trace collectible duration; not an unconstrained "
+                "mathematical upper under arbitrary resource contention"
             ),
             "rejection_condition": "<=",
             "threshold_ms_per_frame": GATE_MS_PER_FRAME,
@@ -430,6 +458,65 @@ def analyze_arm(path: Path, analyzer, units: Sequence[Unit], clips: Sequence[Int
             "proposal_survives": not rejection_condition_holds,
         },
     }
+
+
+def analyze_arm(path: Path, analyzer, units: Sequence[Unit], clips: Sequence[Interval],
+                all_activity: Sequence[Interval], lo: int, hi: int,
+                submit_lo: int, submit_hi: int, frame_origin: int,
+                frame_count: int) -> dict:
+    prepared = prepare_log(path, analyzer, frame_origin)
+    return classification_arm(prepared, prepared["analysis"], units, clips,
+                              all_activity, lo, hi, submit_lo, submit_hi,
+                              frame_count, "single_run", True, [path])
+
+
+def aggregate_arms(prepared_logs: Sequence[dict], analyzer,
+                   units: Sequence[Unit], clips: Sequence[Interval],
+                   all_activity: Sequence[Interval], lo: int, hi: int,
+                   submit_lo: int, submit_hi: int, frame_count: int
+                   ) -> tuple[list[dict], dict]:
+    analyses = [prepared["analysis"] for prepared in prepared_logs]
+    modes = [prepared["summary"]["mode"] for prepared in prepared_logs]
+    repeated_mode3 = len(prepared_logs) > 1 and all(mode == 3 for mode in modes)
+    if len(analyses) > 1:
+        try:
+            salt_rerun = analyzer.validate_salt_reruns(analyses)
+        except analyzer.CensusError as error:
+            if 3 in modes:
+                raise CostError(f"invalid mode 3 reruns: {error}") from error
+            # Old single-domain runs are independent diagnostic arms.  Preserve
+            # their costs when their classifications differ, but expose the
+            # failed rerun validation rather than treating them as one decision.
+            salt_rerun = {"checked": True, "valid": False,
+                          "validation_error": str(error)}
+    else:
+        salt_rerun = {"checked": False}
+    if repeated_mode3:
+        if not all(analysis.get("paired_domain_checked") is True and
+                   analysis.get("paired_domain_equal") is True
+                   for analysis in analyses):
+            raise CostError("repeated mode 3 logs lack paired-domain validity")
+        if not (salt_rerun.get("paired_mode3_repeats") is True and
+                salt_rerun.get("population_equal") is True):
+            raise CostError("repeated mode 3 logs lack equal structural populations")
+
+    arms = [classification_arm(
+                prepared, prepared["analysis"], units, clips, all_activity,
+                lo, hi, submit_lo, submit_hi, frame_count,
+                "per_run_diagnostic" if repeated_mode3 else "single_run",
+                not repeated_mode3, [prepared["path"]])
+            for prepared in prepared_logs]
+    if repeated_mode3:
+        union_analysis = dict(analyses[0])
+        union_analysis["membership_classification"] = (
+            salt_rerun["union_recurrent_classification"]
+        )
+        arms.append(classification_arm(
+            prepared_logs[0], union_analysis, units, clips, all_activity,
+            lo, hi, submit_lo, submit_hi, frame_count,
+            "conservative_repeat_union", True,
+            [prepared["path"] for prepared in prepared_logs]))
+    return arms, salt_rerun
 
 
 def run(trace: Path, submits_path: Path, logs: Sequence[Path], frame_origin: int,
@@ -489,15 +576,19 @@ def run(trace: Path, submits_path: Path, logs: Sequence[Path], frame_origin: int
     validate_calibration(calibration)
 
     analyzer = _load_analyzer()
-    arms = [analyze_arm(path, analyzer, units, clip_intervals, all_activity,
-                        lo, hi, submit_lo, submit_hi, frame_origin, frame_count)
-            for path in logs]
+    prepared_logs = [prepare_log(path, analyzer, frame_origin) for path in logs]
+    arms, salt_rerun = aggregate_arms(
+        prepared_logs, analyzer, units, clip_intervals, all_activity,
+        lo, hi, submit_lo, submit_hi, frame_count)
     return {
         "result_kind": "diagnostic_trace_cost",
         "performance_result": False,
         "interpretation": (
-            "The possible-saving value is a necessary-condition upper bound from "
-            "one external clean trace; it is not an application performance result."
+            "These are costs from one external clean trace, not an application "
+            "performance result. The project decision metric is union-exclusive "
+            "collectible duration in that clean trace; it is not an unconstrained "
+            "mathematical upper under arbitrary resource contention. The sum is "
+            "also reported as the broader sum of selected target durations."
         ),
         "trace": str(trace),
         "submit_timestamps": str(submits_path),
@@ -518,6 +609,7 @@ def run(trace: Path, submits_path: Path, logs: Sequence[Path], frame_origin: int
         "full_direct_calibration": calibration,
         "calibration_expected": EXPECTED_CALIBRATION,
         "calibration_tolerance_ms": CALIBRATION_TOLERANCE_MS,
+        "salt_rerun": salt_rerun,
         "arms": arms,
     }
 

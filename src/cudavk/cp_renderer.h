@@ -392,8 +392,9 @@ struct cp_context {
       unsigned  num, cap;
    } timer;
 
-   /* CUDAVK_GEOMETRY_CENSUS B0.  This is diagnostic-only host state plus
-    * the two allocations named here.  Both stay absent in the disabled path. */
+   /* CUDAVK_GEOMETRY_CENSUS B0/B1R. Diagnostic-only host state. All
+    * allocations stay absent in the disabled path; the latter two exist only
+    * for simultaneous-dual-domain mode 3. */
 #define CP_GEOM_B0_EX_APPENDING       0
 #define CP_GEOM_B0_EX_INDIRECT        1
 #define CP_GEOM_B0_EX_VS_MEMORY       2
@@ -413,6 +414,8 @@ struct cp_context {
 #define CP_GEOM_B0_EX_COUNT          16
    struct {
       CUdeviceptr records;            /* managed, exactly 16 MiB */
+      CUdeviceptr second_roots;       /* mode 3 managed, capacity * 32 */
+      CUdeviceptr saved_root;         /* mode 3 device, one 32-byte root */
       CUdeviceptr scratch;            /* device, two Merkle digest planes */
       size_t scratch_bytes;
       uint64_t submit_ordinal;        /* absolute command-bearing submits */
@@ -1057,7 +1060,7 @@ bool cp_abuf_shade(struct cp_context *cp,
 
 void cp_draw_execute_batch(struct cp_context *cp,
                            const struct cp_draw_batch *batch);
-void cp_shade_fragments(struct cp_context *cp,
+bool cp_shade_fragments(struct cp_context *cp,
                         const struct cp_draw_state *state,
                         const struct cp_render_scope *scope,
                         const struct cp_draw_call *info, CUdeviceptr visbuf,

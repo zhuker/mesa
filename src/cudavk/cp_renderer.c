@@ -108,6 +108,8 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
                               dev->kernels.geometry_final;
       const size_t record_bytes = (size_t)CP_GEOM_B0_CAPACITY *
                                   CP_GEOM_B0_RECORD_BYTES;
+      const size_t second_roots_bytes = (size_t)CP_GEOM_B0_CAPACITY *
+                                        CP_SHA256_MERKLE_DIGEST_BYTES;
       if (cuMemAllocManaged(&cp->geometry_b0.records, record_bytes,
                             CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
          cp->geometry_b0.records = 0;
@@ -115,6 +117,27 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
       } else if (cuMemsetD8Async(cp->geometry_b0.records, 0, record_bytes,
                                  cp->stream) != CUDA_SUCCESS) {
          cp->geometry_b0.valid = false;
+      }
+      if (cp_debug->geometry_census == 3) {
+         if (cuMemAllocManaged(&cp->geometry_b0.second_roots,
+                               second_roots_bytes,
+                               CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
+            cp->geometry_b0.second_roots = 0;
+            cp->geometry_b0.valid = false;
+         } else if (cuMemsetD8Async(cp->geometry_b0.second_roots, 0,
+                                    second_roots_bytes,
+                                    cp->stream) != CUDA_SUCCESS) {
+            cp->geometry_b0.valid = false;
+         }
+         if (cuMemAlloc(&cp->geometry_b0.saved_root,
+                        CP_SHA256_MERKLE_DIGEST_BYTES) != CUDA_SUCCESS) {
+            cp->geometry_b0.saved_root = 0;
+            cp->geometry_b0.valid = false;
+         } else if (cuMemsetD8Async(cp->geometry_b0.saved_root, 0,
+                                    CP_SHA256_MERKLE_DIGEST_BYTES,
+                                    cp->stream) != CUDA_SUCCESS) {
+            cp->geometry_b0.valid = false;
+         }
       }
    }
 
@@ -999,12 +1022,16 @@ cp_hardware_texture_report(struct cp_context *cp)
 }
 
 
-static const uint64_t cp_geom_b0_salts[3] = {
+static const uint64_t cp_geom_b0_salts[4] = {
    0, 0x47454f4d42305331ull, 0x47454f4d42305332ull,
+   0x47454f4d42305331ull,
 };
-static const uint64_t cp_geom_b0_regions[3] = {
+static const uint64_t cp_geom_b0_regions[4] = {
    0, 0x5649534230524731ull, 0x5649534230524732ull,
+   0x5649534230524731ull,
 };
+#define CP_GEOM_B0_SALT2   0x47454f4d42305332ull
+#define CP_GEOM_B0_REGION2 0x5649534230524732ull
 
 void
 cp_geometry_b0_submit(struct cp_context *cp, bool has_query, bool has_indirect)
@@ -1031,14 +1058,76 @@ cp_geom_b0_sig_add(uint64_t h, const void *data, size_t size)
 }
 
 static bool
+cp_geometry_b0_hash_root(struct cp_context *cp, CUdeviceptr source,
+                         uint64_t bytes, uint64_t region_id,
+                         const struct cp_sha256_merkle_plan *plan)
+{
+   const uint64_t per_launch =
+      (uint64_t)CP_SHA256_MERKLE_DEFAULT_THREADS *
+      CP_SHA256_MERKLE_MAX_GRID_X;
+   uint64_t first = 0;
+   while (first < plan->leaf_count) {
+      uint64_t work = MIN2(plan->leaf_count - first, per_launch);
+      uint32_t blocks = 0;
+      if (cp_sha256_merkle_launch_blocks(work,
+            CP_SHA256_MERKLE_DEFAULT_THREADS, &blocks) != 0)
+         return false;
+      struct cp_sha256_merkle_leaf_args args = {
+         source, cp->geometry_b0.scratch, bytes, region_id, first, work,
+      };
+      void *params[] = { &args };
+      if (cp_launch(cp, cp->dev->kernels.geometry_sha_leaf,
+                    blocks, 1, 1, CP_SHA256_MERKLE_DEFAULT_THREADS, 1, 1,
+                    0, cp->stream, params, NULL) != CUDA_SUCCESS)
+         return false;
+      first += work;
+   }
+
+   uint64_t count = plan->leaf_count;
+   uint64_t input_offset = 0, output_offset = plan->plane_bytes;
+   uint32_t level = 1;
+   while (count > 1) {
+      uint64_t parents = cp_sha256_merkle_parent_count(count);
+      first = 0;
+      while (first < parents) {
+         uint64_t work = MIN2(parents - first, per_launch);
+         uint32_t blocks = 0;
+         if (cp_sha256_merkle_launch_blocks(work,
+               CP_SHA256_MERKLE_DEFAULT_THREADS, &blocks) != 0)
+            return false;
+         struct cp_sha256_merkle_node_args args = {
+            cp->geometry_b0.scratch + input_offset,
+            cp->geometry_b0.scratch + output_offset,
+            region_id, count, first, work, level, 0,
+         };
+         void *params[] = { &args };
+         if (cp_launch(cp, cp->dev->kernels.geometry_sha_node,
+                       blocks, 1, 1, CP_SHA256_MERKLE_DEFAULT_THREADS, 1, 1,
+                       0, cp->stream, params, NULL) != CUDA_SUCCESS)
+            return false;
+         first += work;
+      }
+      uint64_t swap = input_offset;
+      input_offset = output_offset;
+      output_offset = swap;
+      count = parents;
+      level++;
+   }
+   return true;
+}
+
+static bool
 cp_geometry_b0_launch_hash(struct cp_context *cp, CUdeviceptr source,
                            uint64_t bytes, uint64_t region_id,
                            struct cp_geom_b0_record *record,
                            const struct cp_rast_queues *queues)
 {
    struct cp_sha256_merkle_plan plan;
+   const bool dual = cp_debug->geometry_census == 3;
    if (!cp->geometry_b0.valid || !cp->geometry_b0.records ||
        !cp->geometry_b0.scratch ||
+       (dual && (!cp->geometry_b0.second_roots ||
+                 !cp->geometry_b0.saved_root)) ||
        cp_sha256_merkle_make_plan(bytes, &plan) != 0 ||
        plan.scratch_bytes > cp->geometry_b0.scratch_bytes) {
       cp->geometry_b0.exclusions[CP_GEOM_B0_EX_SCRATCH]++;
@@ -1052,72 +1141,46 @@ cp_geometry_b0_launch_hash(struct cp_context *cp, CUdeviceptr source,
    }
 
    uint64_t slot = cp->geometry_b0.reserved++;
-   const uint64_t per_launch =
-      (uint64_t)CP_SHA256_MERKLE_DEFAULT_THREADS *
-      CP_SHA256_MERKLE_MAX_GRID_X;
-   uint64_t first = 0;
-   while (first < plan.leaf_count) {
-      uint64_t work = MIN2(plan.leaf_count - first, per_launch);
-      uint32_t blocks = 0;
-      if (cp_sha256_merkle_launch_blocks(work,
-            CP_SHA256_MERKLE_DEFAULT_THREADS, &blocks) != 0)
-         goto launch_fail;
-      struct cp_sha256_merkle_leaf_args args = {
-         source, cp->geometry_b0.scratch, bytes, region_id, first, work,
-      };
-      void *params[] = { &args };
-      if (cp_launch(cp, cp->dev->kernels.geometry_sha_leaf,
-                    blocks, 1, 1, CP_SHA256_MERKLE_DEFAULT_THREADS, 1, 1,
-                    0, cp->stream, params, NULL) != CUDA_SUCCESS)
-         goto launch_fail;
-      first += work;
-   }
+   if (!cp_geometry_b0_hash_root(cp, source, bytes, region_id, &plan))
+      goto launch_fail;
 
-   uint64_t count = plan.leaf_count;
-   uint64_t input_offset = 0, output_offset = plan.plane_bytes;
-   uint32_t level = 1;
-   while (count > 1) {
-      uint64_t parents = cp_sha256_merkle_parent_count(count);
-      first = 0;
-      while (first < parents) {
-         uint64_t work = MIN2(parents - first, per_launch);
-         uint32_t blocks = 0;
-         if (cp_sha256_merkle_launch_blocks(work,
-               CP_SHA256_MERKLE_DEFAULT_THREADS, &blocks) != 0)
-            goto launch_fail;
-         struct cp_sha256_merkle_node_args args = {
-            cp->geometry_b0.scratch + input_offset,
-            cp->geometry_b0.scratch + output_offset,
-            region_id, count, first, work, level, 0,
-         };
-         void *params[] = { &args };
-         if (cp_launch(cp, cp->dev->kernels.geometry_sha_node,
-                       blocks, 1, 1, CP_SHA256_MERKLE_DEFAULT_THREADS, 1, 1,
-                       0, cp->stream, params, NULL) != CUDA_SUCCESS)
-            goto launch_fail;
-         first += work;
-      }
-      uint64_t swap = input_offset;
-      input_offset = output_offset;
-      output_offset = swap;
-      count = parents;
-      level++;
+   CUdeviceptr root = cp->geometry_b0.scratch + plan.root_offset;
+   CUdeviceptr root2 = 0;
+   CUdeviceptr output2 = 0;
+   if (dual) {
+      /* Preserve domain 1, then hash the identical source immediately under
+       * domain 2. Both operations are on cp->stream and no source writer is
+       * enqueued between them; the two Merkle passes reuse the same scratch. */
+      if (cuMemcpyDtoDAsync(cp->geometry_b0.saved_root, root,
+                            CP_SHA256_MERKLE_DIGEST_BYTES,
+                            cp->stream) != CUDA_SUCCESS)
+         goto launch_fail;
+      if (!cp_geometry_b0_hash_root(cp, source, bytes,
+                                    CP_GEOM_B0_REGION2, &plan))
+         goto launch_fail;
+      root = cp->geometry_b0.saved_root;
+      root2 = cp->geometry_b0.scratch + plan.root_offset;
+      output2 = cp->geometry_b0.second_roots +
+                slot * CP_SHA256_MERKLE_DIGEST_BYTES;
    }
 
    struct cp_geom_b0_final_args final_args;
    memset(&final_args, 0, sizeof(final_args));
-   final_args.root = cp->geometry_b0.scratch + plan.root_offset;
+   final_args.root = root;
+   final_args.root2 = root2;
    final_args.nontrivial_count = queues->nontrivial_count;
    final_args.huge_count = queues->huge_count;
    final_args.setup_count = queues->setup_count;
    final_args.output = cp->geometry_b0.records +
                        slot * CP_GEOM_B0_RECORD_BYTES;
+   final_args.output2 = output2;
    final_args.record = *record;
    void *final_params[] = { &final_args };
    if (cp_launch(cp, cp->dev->kernels.geometry_final,
                  1, 1, 1, 1, 1, 1, 0, cp->stream,
                  final_params, NULL) != CUDA_SUCCESS)
       goto launch_fail;
+   /* One combined publication kernel covers both roots in mode 3. */
    cp->geometry_b0.final_launches++;
    return true;
 
@@ -1175,7 +1238,8 @@ cp_geometry_b0_after_stage2(struct cp_context *cp,
    if (abuf)
       CP_GEOM_REJECT(CP_GEOM_B0_EX_ABUFFER);
    (void)peel; /* ordinary peel passes are complete same-stream visbuf units */
-   if (retry)
+   /* B0 modes retain their original population. B1R mode 3 adds retry units. */
+   if (retry && cp_debug->geometry_census != 3)
       CP_GEOM_REJECT(CP_GEOM_B0_EX_RETRY);
    if (clip_fallback)
       CP_GEOM_REJECT(CP_GEOM_B0_EX_FUSED_CLIP);
@@ -1203,6 +1267,7 @@ cp_geometry_b0_after_stage2(struct cp_context *cp,
    record.pass = pass;
    record.path = fused_rast ? 1 : 0; /* fused clip+stage1, or ordinary */
    record.predecessor = fused_rast ? 2 : 1;
+   record.retry = retry ? 1 : 0;
    record.stage2_blocks = stage2_blocks;
    record.triangles = triangles;
 
@@ -1210,6 +1275,7 @@ cp_geometry_b0_after_stage2(struct cp_context *cp,
 #define CP_GEOM_SIG(v) sig = cp_geom_b0_sig_add(sig, &(v), sizeof(v))
    CP_GEOM_SIG(record.width); CP_GEOM_SIG(record.height);
    CP_GEOM_SIG(record.samples); CP_GEOM_SIG(record.pass);
+   CP_GEOM_SIG(record.retry);
    CP_GEOM_SIG(record.stage2_blocks); CP_GEOM_SIG(record.triangles);
    CP_GEOM_SIG(info->mode); CP_GEOM_SIG(info->index_size);
    CP_GEOM_SIG(state->blend.enable);
@@ -1230,13 +1296,26 @@ cp_geometry_b0_report(struct cp_context *cp, bool context_sync_ok)
 {
    if (!cp_debug->geometry_census)
       return;
+   const bool dual = cp_debug->geometry_census == 3;
    const size_t records_bytes = (size_t)CP_GEOM_B0_CAPACITY *
                                 CP_GEOM_B0_RECORD_BYTES;
-   bool readable = context_sync_ok && cp->geometry_b0.records;
+   const size_t second_roots_bytes = dual ?
+      (size_t)CP_GEOM_B0_CAPACITY * CP_SHA256_MERKLE_DIGEST_BYTES : 0;
+   bool readable = context_sync_ok && cp->geometry_b0.records &&
+                   (!dual || cp->geometry_b0.second_roots);
    if (readable) {
-      if (cuMemPrefetchAsync(cp->geometry_b0.records, records_bytes,
-                            CU_DEVICE_CPU, cp->stream) != CUDA_SUCCESS ||
-          cuStreamSynchronize(cp->stream) != CUDA_SUCCESS) {
+      CUresult records_prefetch = cuMemPrefetchAsync(
+         cp->geometry_b0.records, records_bytes,
+         CU_DEVICE_CPU, cp->stream);
+      CUresult second_prefetch = CUDA_SUCCESS;
+      if (dual)
+         second_prefetch = cuMemPrefetchAsync(
+            cp->geometry_b0.second_roots, second_roots_bytes,
+            CU_DEVICE_CPU, cp->stream);
+      CUresult prefetch_sync = cuStreamSynchronize(cp->stream);
+      if (records_prefetch != CUDA_SUCCESS ||
+          second_prefetch != CUDA_SUCCESS ||
+          prefetch_sync != CUDA_SUCCESS) {
          cp->geometry_b0.valid = false;
          readable = false;
       }
@@ -1246,10 +1325,12 @@ cp_geometry_b0_report(struct cp_context *cp, bool context_sync_ok)
    if (readable) {
       const struct cp_geom_b0_record *records =
          (const struct cp_geom_b0_record *)(uintptr_t)cp->geometry_b0.records;
+      const unsigned char *second_roots = dual ?
+         (const unsigned char *)(uintptr_t)cp->geometry_b0.second_roots : NULL;
       for (uint64_t i = 0; i < cp->geometry_b0.reserved; i++) {
          const struct cp_geom_b0_record *r = &records[i];
          if (r->magic != CP_GEOM_B0_MAGIC ||
-             r->version != CP_GEOM_B0_VERSION ||
+             r->version != CP_GEOM_B0_VERSION || r->retry > 1 ||
              (r->status != CP_GEOM_B0_STATUS_COMPLETE &&
               r->status != CP_GEOM_B0_STATUS_QUEUE_REJECT))
             continue;
@@ -1259,21 +1340,45 @@ cp_geometry_b0_report(struct cp_context *cp, bool context_sync_ok)
          else
             queue_reject++;
          char digest[65];
-         for (unsigned b = 0; b < 32; b++)
+         for (unsigned b = 0; b < CP_SHA256_MERKLE_DIGEST_BYTES; b++)
             snprintf(digest + 2 * b, 3, "%02x", r->sha256[b]);
-         fprintf(stderr,
-            "CUDAVK_GEOM_B0_RECORD index=%" PRIu64 " status=%u salt=%016" PRIx64
-            " submit=%" PRIu64 " occurrence=%u unit=%u pass=%u path=%u"
-            " predecessor=%u w=%u h=%u samples=%u bytes=%" PRIu64
-            " signature=%016" PRIx64 " stage2_blocks=%u triangles=%u"
-            " nontrivial=%u huge=%u setup=%u queue_status=%u sha256=%s\n",
-            i, r->status, (uint64_t)r->salt,
-            (uint64_t)r->submit_ordinal, r->submit_occurrence,
-            r->unit_ordinal, r->pass, r->path, r->predecessor,
-            r->width, r->height, r->samples, (uint64_t)r->byte_length,
-            (uint64_t)r->structural_signature, r->stage2_blocks, r->triangles,
-            r->nontrivial_count, r->huge_count, r->setup_count,
-            r->queue_status, digest);
+         if (dual) {
+            char digest2[65];
+            const unsigned char *root2 = second_roots +
+               i * CP_SHA256_MERKLE_DIGEST_BYTES;
+            for (unsigned b = 0; b < CP_SHA256_MERKLE_DIGEST_BYTES; b++)
+               snprintf(digest2 + 2 * b, 3, "%02x", root2[b]);
+            fprintf(stderr,
+               "CUDAVK_GEOM_B0_RECORD index=%" PRIu64
+               " status=%u salt=%016" PRIx64
+               " submit=%" PRIu64 " occurrence=%u unit=%u pass=%u path=%u"
+               " predecessor=%u retry=%u w=%u h=%u samples=%u bytes=%" PRIu64
+               " signature=%016" PRIx64 " stage2_blocks=%u triangles=%u"
+               " nontrivial=%u huge=%u setup=%u queue_status=%u"
+               " sha256=%s sha256_2=%s\n",
+               i, r->status, (uint64_t)r->salt,
+               (uint64_t)r->submit_ordinal, r->submit_occurrence,
+               r->unit_ordinal, r->pass, r->path, r->predecessor, r->retry,
+               r->width, r->height, r->samples, (uint64_t)r->byte_length,
+               (uint64_t)r->structural_signature, r->stage2_blocks,
+               r->triangles, r->nontrivial_count, r->huge_count,
+               r->setup_count, r->queue_status, digest, digest2);
+         } else {
+            fprintf(stderr,
+               "CUDAVK_GEOM_B0_RECORD index=%" PRIu64
+               " status=%u salt=%016" PRIx64
+               " submit=%" PRIu64 " occurrence=%u unit=%u pass=%u path=%u"
+               " predecessor=%u retry=%u w=%u h=%u samples=%u bytes=%" PRIu64
+               " signature=%016" PRIx64 " stage2_blocks=%u triangles=%u"
+               " nontrivial=%u huge=%u setup=%u queue_status=%u sha256=%s\n",
+               i, r->status, (uint64_t)r->salt,
+               (uint64_t)r->submit_ordinal, r->submit_occurrence,
+               r->unit_ordinal, r->pass, r->path, r->predecessor, r->retry,
+               r->width, r->height, r->samples, (uint64_t)r->byte_length,
+               (uint64_t)r->structural_signature, r->stage2_blocks,
+               r->triangles, r->nontrivial_count, r->huge_count,
+               r->setup_count, r->queue_status, digest);
+         }
       }
    }
    cp->geometry_b0.exclusions[CP_GEOM_B0_EX_QUEUE] += queue_reject;
@@ -1290,22 +1395,34 @@ cp_geometry_b0_report(struct cp_context *cp, bool context_sync_ok)
       reasons == cp->geometry_b0.candidates - admitted;
    uint64_t classified_raw = admitted > UINT64_MAX - reasons ?
       UINT64_MAX : admitted + reasons;
+
    CUresult scratch_free = cp->geometry_b0.scratch ?
       cuMemFree(cp->geometry_b0.scratch) : CUDA_SUCCESS;
+   CUresult saved_root_free = cp->geometry_b0.saved_root ?
+      cuMemFree(cp->geometry_b0.saved_root) : CUDA_SUCCESS;
+   CUresult second_roots_free = cp->geometry_b0.second_roots ?
+      cuMemFree(cp->geometry_b0.second_roots) : CUDA_SUCCESS;
    CUresult records_free = cp->geometry_b0.records ?
       cuMemFree(cp->geometry_b0.records) : CUDA_SUCCESS;
    if (scratch_free == CUDA_SUCCESS)
       cp->geometry_b0.scratch = 0;
+   if (saved_root_free == CUDA_SUCCESS)
+      cp->geometry_b0.saved_root = 0;
+   if (second_roots_free == CUDA_SUCCESS)
+      cp->geometry_b0.second_roots = 0;
    if (records_free == CUDA_SUCCESS)
       cp->geometry_b0.records = 0;
-   if (scratch_free != CUDA_SUCCESS || records_free != CUDA_SUCCESS)
+   if (scratch_free != CUDA_SUCCESS || saved_root_free != CUDA_SUCCESS ||
+       second_roots_free != CUDA_SUCCESS || records_free != CUDA_SUCCESS)
       cp->geometry_b0.valid = false;
+
    bool result_valid = cp->geometry_b0.valid && readable &&
       complete == cp->geometry_b0.reserved &&
       cp->geometry_b0.reserved == cp->geometry_b0.final_launches &&
       classification_ok;
    fprintf(stderr,
       "CUDAVK_GEOM_B0 version=1 mode=%u salt=%016" PRIx64
+      " salt2=%016" PRIx64 " dual_domain=%s second_roots_bytes=%zu"
       " selected_start=%u first_selected=%u final_submit=%" PRIu64
       " capacity=%u reserved=%" PRIu64 " complete=%" PRIu64
       " candidates=%" PRIu64 " admitted=%" PRIu64 " reasons=%" PRIu64
@@ -1321,6 +1438,8 @@ cp_geometry_b0_report(struct cp_context *cp, bool context_sync_ok)
       " ex_other=%" PRIu64 " diagnostic_timing_invalid=1\n",
       cp_debug->geometry_census,
       cp_geom_b0_salts[cp_debug->geometry_census],
+      dual ? (uint64_t)CP_GEOM_B0_SALT2 : 0,
+      dual ? "yes" : "no", second_roots_bytes,
       cp_debug->geometry_census_submit_start,
       cp_debug->geometry_census_submit_start + 1,
       cp->geometry_b0.submit_ordinal, CP_GEOM_B0_CAPACITY,
@@ -1328,7 +1447,8 @@ cp_geometry_b0_report(struct cp_context *cp, bool context_sync_ok)
       admitted, reasons, classified_raw,
       classification_ok ? "yes" : "no",
       records_bytes, cp->geometry_b0.scratch_bytes,
-      records_bytes + cp->geometry_b0.scratch_bytes,
+      records_bytes + cp->geometry_b0.scratch_bytes + second_roots_bytes +
+         (dual ? CP_SHA256_MERKLE_DIGEST_BYTES : 0),
       result_valid ? "yes" : "no",
       cp->geometry_b0.exclusions[0], cp->geometry_b0.exclusions[1],
       cp->geometry_b0.exclusions[2], cp->geometry_b0.exclusions[3],
@@ -1401,11 +1521,19 @@ cp_context_cleanup(struct cp_context *cp)
    cp->abuf = NULL;
    cp_scratch_destroy(cp);
    if (cp_debug->geometry_census) {
-      if (cp->geometry_b0.scratch)
-         cuMemFree(cp->geometry_b0.scratch);
-      if (cp->geometry_b0.records)
-         cuMemFree(cp->geometry_b0.records);
-      cp->geometry_b0.scratch = cp->geometry_b0.records = 0;
+#define CP_GEOM_B0_FREE(member) do { \
+      if (cp->geometry_b0.member) { \
+         if (cuMemFree(cp->geometry_b0.member) == CUDA_SUCCESS) \
+            cp->geometry_b0.member = 0; \
+         else \
+            cp->geometry_b0.valid = false; \
+      } \
+   } while (0)
+      CP_GEOM_B0_FREE(scratch);
+      CP_GEOM_B0_FREE(saved_root);
+      CP_GEOM_B0_FREE(second_roots);
+      CP_GEOM_B0_FREE(records);
+#undef CP_GEOM_B0_FREE
    }
 
    for (unsigned i = 0; i < cp->timer.cap; i++)
@@ -4316,7 +4444,7 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
  * pixels into a list), run the shader itself one thread per covered pixel, and
  * blend its output into the colour attachment.
  */
-void
+bool
 cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
                    const struct cp_render_scope *scope,
                    const struct cp_draw_call *info,
@@ -4333,6 +4461,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
 {
    struct cp_device *screen = cp->dev;
    struct cp_shader_binary *fs = state->fs;
+   bool required_ok = true;
 
    bool have_fs = cp_shader_has_standalone_exec(fs);
    if (!have_fs || !vs_output_buf || !state->vs ||
@@ -4344,7 +4473,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
                  fs ? (void *)fs->exec[CP_SHADER_EXEC_FUSED].kernel : NULL,
                  fs ? (void *)fs->exec[CP_SHADER_EXEC_INLINE].kernel : NULL,
                  (void *)(uintptr_t)vs_output_buf, (void *)state->vs);
-      return;
+      return false;
    }
 
    unsigned num_fs_inputs = MIN2(fs->nir_num_inputs, CP_MAX_FS_INPUTS);
@@ -4390,7 +4519,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
    if (!pixel_list || !counter || !fs_in || !fs_out || !coverage || !frag_coord ||
        (fs->uses_discard && !discard_mask) ||
        (fs->reads_front_face && !front_face))
-      return;
+      return false;
 
    /*
     * These two are read where they were not written, so they have to start
@@ -4400,10 +4529,13 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
     * turned into double-blended frames the moment the passes started reusing
     * one, which they must, or a 256 layer draw asks for tens of gigabytes.
     */
-   if (!counter_pooled)
-      cuMemsetD32Async(counter, 0, 1, cp->stream);
-   if (discard_mask)
-      cuMemsetD8Async(discard_mask, 0, max_pixels, cp->stream);
+   if (!counter_pooled &&
+       cuMemsetD32Async(counter, 0, 1, cp->stream) != CUDA_SUCCESS)
+      required_ok = false;
+   if (discard_mask &&
+       cuMemsetD8Async(discard_mask, 0, max_pixels,
+                       cp->stream) != CUDA_SUCCESS)
+      required_ok = false;
 
    struct cp_fs_interp_args interp = {
       .visbuf = visbuf,
@@ -4448,11 +4580,11 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       if (!cp->fs_batch.slices) {
          fprintf(stderr, "cudavk: a batch of %u has no slice table; refusing "
                  "to shade it\n", cp->fs_batch.ndraws);
-         return;
+         return false;
       }
       batch_rows = cp_scratch_alloc_device(cp, (size_t)max_pixels * 4);
       if (!batch_rows)
-         return;
+         return false;
       interp.out_batch_rows = batch_rows;
       interp.draw_slices = cp->fs_batch.slices;
       interp.num_draw_slices = cp->fs_batch.ndraws;
@@ -4498,7 +4630,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
    bool use_hw_inline = compact_available &&
       cp_texture_cache_available(cp, state, fs, false);
    if (cp->hardware_texture.fatal)
-      return;
+      return false;
    bool allow_inshader = compact_available &&
       (use_hw_inline || (!cp_debug->no_inline_fs &&
        (!cp_debug->no_fused_interp || cp_debug->force_fused_fs)));
@@ -4589,7 +4721,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       if (interp_err != CUDA_SUCCESS) {
          fprintf(stderr, "cudavk: fs_interpolate launch failed (%d)\n", interp_err);
          cp_texture_cache_unpin(cp);
-         return;
+         return false;
       }
    }
    cp_stage_end(cp, CP_STAGE_INTERPOLATE);
@@ -4607,7 +4739,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
                             front_face, coverage, inshader_interp_dev,
                             interp_inline ? &interp : NULL, num_pixels,
                             0, batch_rows, &fs_kernel))
-      return;
+      return false;
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
    /* TEMPORARY (CUDAVK_ABUFFER): scatter this pass's colours into the
@@ -4696,7 +4828,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
          cp->device_fatal = true;
          if (cp->dev->texture_cache_fatal)
             cp->dev->texture_cache_fatal(cp->dev->texture_cache_private);
-         return;
+         return false;
       }
       cp_texture_attachment_written(cp, &scope->fb);
    }
@@ -4778,7 +4910,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
           (dump_pixels && (!plist_buf || !fin_buf || !fout_buf))) {
          free(vs_out); free(plist_buf); free(fin_buf); free(fout_buf);
          fprintf(stderr, "  (CUDAVK_DEBUG_FS: out of memory)\n");
-         return;
+         return false;
       }
       if (vs_out_bytes)
          cuMemcpyDtoH(vs_out, vs_output_buf, vs_out_bytes);
@@ -4836,6 +4968,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       free(vs_out); free(plist_buf); free(fin_buf); free(fout_buf);
    }
 
+   return required_ok;
 }
 
 
@@ -6574,9 +6707,19 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    }
 
    if (retry) {
-      cuMemsetD8Async(cp->resolved, 0, (size_t)w * h, cp->stream);
-      cuMemsetD32Async(cp->reject, 0xFFFFFFFF,
-                  (size_t)w * h * CP_DISCARD_LAYERS, cp->stream);
+      if (cp_debug->geometry_census != 3) {
+         cuMemsetD8Async(cp->resolved, 0, (size_t)w * h, cp->stream);
+         cuMemsetD32Async(cp->reject, 0xFFFFFFFF,
+                     (size_t)w * h * CP_DISCARD_LAYERS, cp->stream);
+      } else {
+         CUresult resolved_clear = cuMemsetD8Async(
+            cp->resolved, 0, (size_t)w * h, cp->stream);
+         CUresult reject_clear = cuMemsetD32Async(
+            cp->reject, 0xFFFFFFFF,
+            (size_t)w * h * CP_DISCARD_LAYERS, cp->stream);
+         if (resolved_clear != CUDA_SUCCESS || reject_clear != CUDA_SUCCESS)
+            cp->geometry_b0.valid = false;
+      }
       rast_args.reject = cp->reject;
       rast_args.resolved = cp->resolved;
       rast_args.reject_layers = CP_DISCARD_LAYERS;
@@ -7488,17 +7631,20 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * for a colour, just the first two. A depth-only pass runs it for a
        * third reason: the writeback at the end of it is what commits depth,
        * and the shader has to run first because it may discard. */
-      if (color_data || fs_side_effects || depth_commit)
-         cp_shade_fragments(cp, state, &batch->scope, info, visbuf,
-                            rast_args.positions, vs_output_buf,
-                            rast_args.prim_refs, num_triangles, w, h,
-                            color_data,
-                            vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
-                            rast_args.depth_scale, rast_args.depth_translate,
-                            retry ? cp->reject : 0,
-                            retry ? cp->resolved : 0,
-                            pass, 0, 0,
-                            rast_args.blend_peel != 0);
+      if (color_data || fs_side_effects || depth_commit) {
+         bool shade_ok = cp_shade_fragments(
+            cp, state, &batch->scope, info, visbuf,
+            rast_args.positions, vs_output_buf,
+            rast_args.prim_refs, num_triangles, w, h, color_data,
+            vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
+            rast_args.depth_scale, rast_args.depth_translate,
+            retry ? cp->reject : 0, retry ? cp->resolved : 0,
+            pass, 0, 0, rast_args.blend_peel != 0);
+         /* A failed retry shade can leave reject history stale. Refuse the
+          * complete B1R result before a later pass can be admitted. */
+         if (cp_debug->geometry_census == 3 && retry && !shade_ok)
+            cp->geometry_b0.valid = false;
+      }
 
       if (peel) {
          /* Step past what this pass blended, and stop once the interval finds
@@ -8431,7 +8577,7 @@ cp_opaque_finish(struct cp_context *cp)
       cp->fs_batch.ndraws = group_rows;
       cp->fs_batch.slices = seg->slices_dev;
       cp->fs_batch.prim_shift = seg->prim_shift;
-      cp_shade_fragments(cp, &seg->batch.state, &seg->batch.scope,
+      (void)cp_shade_fragments(cp, &seg->batch.state, &seg->batch.scope,
                          &seg->batch.info, cp->visbuf, seg->rast.positions,
                          seg->rast.positions, seg->rast.prim_refs,
                          seg->num_triangles, w, h,

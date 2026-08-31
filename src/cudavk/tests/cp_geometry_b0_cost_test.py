@@ -18,6 +18,29 @@ def launch(name, ds, de, rs, correlation, grid=1):
                        correlation, grid)
 
 
+def mode3_record(index, submit, unit, digest, digest2):
+    return (
+        f"CUDAVK_GEOM_B0_RECORD index={index} status=1 "
+        f"salt=47454f4d42305331 submit={submit} occurrence={submit} "
+        f"unit={unit} pass=0 retry=0 path=0 predecessor=1 w=2 h=3 "
+        f"samples=1 bytes=48 signature=0000000000000001 stage2_blocks={unit} "
+        f"triangles=2 nontrivial=0 huge=0 setup=0 queue_status=0 "
+        f"sha256={digest} sha256_2={digest2}"
+    )
+
+
+def mode3_summary(count, capacity=None):
+    if capacity is None:
+        capacity = count
+    return (
+        "CUDAVK_GEOM_B0 version=1 mode=3 salt=47454f4d42305331 "
+        "salt2=47454f4d42305332 dual_domain=yes "
+        f"second_roots_bytes={capacity * 32} result_valid=yes "
+        f"capacity={capacity} reserved={count} complete={count} "
+        f"candidates={count} admitted={count} reasons=0"
+    )
+
+
 class TestGeometryB0Cost(unittest.TestCase):
     def write(self, text):
         f = tempfile.NamedTemporaryFile("w", delete=False)
@@ -132,10 +155,12 @@ class TestGeometryB0Cost(unittest.TestCase):
         class FakeAnalyzer:
             @staticmethod
             def parse_run(_path):
-                return records, {"salt_value": 0x12}
+                return records, {"mode": 1, "salt_value": 0x12,
+                                 "salt2_value": 0}
 
             @staticmethod
-            def analyze(_records, _origin, _submits_per_frame):
+            def analyze(_records, _origin, _submits_per_frame, mode=None):
+                self.assertEqual(mode, 1)
                 # Unit 2 is missing, unit 3 is unmatched, unit 4 is matched.
                 return {"membership_classification": [
                     (5, 5, 3, 0, False), (5, 5, 4, 0, True),
@@ -152,6 +177,69 @@ class TestGeometryB0Cost(unittest.TestCase):
                          ["sum_ms_per_frame"], 7 / 1_000_000)
         self.assertEqual(result["classified_nonrecurrent_diagnostic_trace_cost"]
                          ["sum_ms_per_frame"], 2 / 1_000_000)
+
+    def test_empty_mode3_is_analyzed_with_explicit_summary_mode(self):
+        analyzer = cost._load_analyzer()
+        path = self.write(mode3_summary(0, capacity=0))
+        prepared = cost.prepare_log(path, analyzer, 10)
+        self.assertEqual(prepared["analysis"]["mode"], 3)
+        self.assertTrue(prepared["analysis"]["paired_domain_checked"])
+        self.assertEqual(prepared["analysis"]["membership_classification"], [])
+
+    def test_repeated_mode3_complementary_flips_use_union_arm(self):
+        analyzer = cost._load_analyzer()
+        a, b, c = "11" * 32, "22" * 32, "33" * 32
+        x, y, z = "44" * 32, "55" * 32, "66" * 32
+        common = [
+            mode3_record(0, 10, 1, a, x),
+            mode3_record(1, 10, 2, b, y),
+        ]
+        paths = [
+            self.write("\n".join(common + [
+                mode3_record(2, 12, 1, a, x),
+                mode3_record(3, 12, 2, c, z), mode3_summary(4),
+            ])),
+            self.write("\n".join(common + [
+                mode3_record(2, 12, 1, c, z),
+                mode3_record(3, 12, 2, b, y), mode3_summary(4),
+            ])),
+        ]
+        prepared = [cost.prepare_log(path, analyzer, 10) for path in paths]
+
+        n = cost.NAMES
+        units = []
+        activity = []
+        for unit, base in ((1, 10), (2, 20)):
+            pred = launch(n["stage1"], base, base + 1, 100 + base,
+                          unit * 2 - 1)
+            stage2 = launch(n["stage2"], base + 1, base + 2,
+                            101 + base, unit * 2, unit)
+            units.append(cost.Unit(12, unit, pred, stage2, None))
+            activity.extend((pred.device, stage2.device))
+        clip = cost.Interval(1, 2)
+        activity.append(clip)
+
+        arms, rerun = cost.aggregate_arms(
+            prepared, analyzer, units, [clip], activity,
+            0, 100, 12, 13, 1)
+        self.assertTrue(rerun["paired_mode3_repeats"])
+        self.assertEqual([arm["arm"] for arm in arms], [
+            "per_run_diagnostic", "per_run_diagnostic",
+            "conservative_repeat_union",
+        ])
+        self.assertEqual([arm["decision_bearing"] for arm in arms],
+                         [False, False, True])
+        self.assertEqual(
+            [(arm["classification_matched_recurrent"],
+              arm["classification_unmatched_nonrecurrent"])
+             for arm in arms], [(1, 1), (1, 1), (2, 0)])
+        union = arms[-1]
+        self.assertEqual(union["source_logs"], [str(path) for path in paths])
+        self.assertEqual(union["reference_log"], str(paths[0]))
+        self.assertEqual(union["all_clip_intervals_conservative_recurrent"], 1)
+        self.assertEqual(
+            union["possible_saving_necessary_condition_upper"]["sum_ms_per_frame"],
+            5 / 1_000_000)
 
     def test_synthetic_sqlite_correlation_join(self):
         db = sqlite3.connect(":memory:")

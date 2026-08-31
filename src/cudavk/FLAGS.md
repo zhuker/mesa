@@ -47,7 +47,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_DEBUG_EPISODE` | bool (presence) | `off` | — | trace episode boundaries: what appended to an episode and what cut it |
 | `CUDAVK_DEBUG_RT` | bool (presence) | `off` | — | trace descriptor writes, the attachments a render pass resolved to, and the first texels either side of an image copy; the copies sync |
 | `CUDAVK_DEBUG_FACES` | bool (presence) | `off` | — | when a cube descriptor is written, read back the first texel of each of its six faces from where the sampler will look; syncs |
-| `CUDAVK_GEOMETRY_CENSUS` | uint | `0` | 0&ndash;2 | diagnostic B0 post-stage2 visibility-buffer SHA-256 census; 1 and 2 select independent fixed domain salts; invalid for timing |
+| `CUDAVK_GEOMETRY_CENSUS` | uint | `0` | 0&ndash;3 | diagnostic visibility-buffer SHA-256 census; 1/2 select separate fixed domains, 3 hashes a simultaneous B1R domain pair; invalid for timing |
 | `CUDAVK_GEOMETRY_CENSUS_SUBMIT_START` | uint | `0` | — | with GEOMETRY_CENSUS, skip hashing through this absolute internal command-bearing submit ordinal |
 
 ## Subsystem switches

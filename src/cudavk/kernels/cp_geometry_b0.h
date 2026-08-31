@@ -26,7 +26,8 @@ struct cp_geom_b0_record {
    unsigned short pass;
    unsigned char path;
    unsigned char predecessor;
-   unsigned short reserved0;
+   unsigned char retry;
+   unsigned char reserved0;
    cp_sha256_merkle_u32 stage2_blocks;
    cp_sha256_merkle_u32 triangles;
    cp_sha256_merkle_u32 nontrivial_count;
@@ -39,22 +40,24 @@ struct cp_geom_b0_record {
 
 struct cp_geom_b0_final_args {
    cp_sha256_merkle_u64 root;
+   cp_sha256_merkle_u64 root2;
    cp_sha256_merkle_u64 nontrivial_count;
    cp_sha256_merkle_u64 huge_count;
    cp_sha256_merkle_u64 setup_count;
    cp_sha256_merkle_u64 output;
+   cp_sha256_merkle_u64 output2;
    struct cp_geom_b0_record record;
 };
 
 #if defined(__cplusplus)
 static_assert(sizeof(struct cp_geom_b0_record) == CP_GEOM_B0_RECORD_BYTES,
               "geometry B0 record ABI");
-static_assert(sizeof(struct cp_geom_b0_final_args) == 168,
+static_assert(sizeof(struct cp_geom_b0_final_args) == 184,
               "geometry B0 final ABI");
 #else
 _Static_assert(sizeof(struct cp_geom_b0_record) == CP_GEOM_B0_RECORD_BYTES,
                "geometry B0 record ABI");
-_Static_assert(sizeof(struct cp_geom_b0_final_args) == 168,
+_Static_assert(sizeof(struct cp_geom_b0_final_args) == 184,
                "geometry B0 final ABI");
 #endif
 
