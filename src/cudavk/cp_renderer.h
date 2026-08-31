@@ -581,6 +581,7 @@ struct cp_context {
       uint64_t structural_depth_calls;
       uint64_t safe_chains;
       uint64_t nvtx_ranges;
+      void *window_domain_handle;
       uint64_t window_range_id;
       uint64_t runs;
       uint64_t singleton_runs;

@@ -123,34 +123,43 @@ cp_nvtx_depthonly_pop(void)
 }
 
 /*
- * The capture window can begin in vkQueueSubmit and end in vkDestroyDevice.
- * Vulkan permits those externally synchronized calls on different threads, so
- * a thread-local push/pop range cannot safely span that lifetime.  A process
- * Start/End range can.  Balance is tracked separately from the returned ID:
- * the header returns zero when no collector is injected, while an injected
- * collector supplies the opaque ID that its matching End consumes.
+ * This capture window can cross threads, so it must be an NVTX process range,
+ * not a thread-local push/pop range.  Nsight Systems 2026.4.1 does not trigger
+ * --capture-range=nvtx for unregistered Start or Push messages.  The working
+ * trigger is a registered string on a named domain.  Track balance separately:
+ * the returned range ID is opaque and is not a collector-presence oracle.
  */
 static inline bool
-cp_nvtx_depthonly_window_start(uint64_t *range_id)
+cp_nvtx_depthonly_window_start(void **domain_handle, uint64_t *range_id)
 {
 #ifdef CP_HAVE_NVTX
-   if (!cp_debug->depthonly_census)
-      return false;
-   *range_id = nvtxRangeStartA("depthonly-window");
+   nvtxDomainHandle_t domain = nvtxDomainCreateA("cudavk-depthonly");
+   nvtxStringHandle_t message =
+      nvtxDomainRegisterStringA(domain, "depthonly-window");
+   nvtxEventAttributes_t attr = { 0 };
+   attr.version = NVTX_VERSION;
+   attr.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+   attr.messageType = NVTX_MESSAGE_TYPE_REGISTERED;
+   attr.message.registered = message;
+   *domain_handle = domain;
+   *range_id = nvtxDomainRangeStartEx(domain, &attr);
    return true;
 #else
+   (void)domain_handle;
    (void)range_id;
    return false;
 #endif
 }
 
 static inline void
-cp_nvtx_depthonly_window_end(uint64_t range_id)
+cp_nvtx_depthonly_window_end(void *domain_handle, uint64_t range_id)
 {
 #ifdef CP_HAVE_NVTX
-   if (cp_debug->depthonly_census)
-      nvtxRangeEnd((nvtxRangeId_t)range_id);
+   nvtxDomainHandle_t domain = (nvtxDomainHandle_t)domain_handle;
+   nvtxDomainRangeEnd(domain, (nvtxRangeId_t)range_id);
+   nvtxDomainDestroy(domain);
 #else
+   (void)domain_handle;
    (void)range_id;
 #endif
 }

@@ -193,6 +193,9 @@ struct cp_debug {
    int      debug_fs_row;     /* only this framebuffer row, or -1 for all */
    /* Skip this many command-bearing internal submits; 0 disables. */
    unsigned depthonly_census;
+   /* Command-submit bounds for one registered NVTX process capture range. */
+   unsigned depthonly_capture_submit_start;
+   unsigned depthonly_capture_submit_end;
 
    /* Subsystem switches. */
    bool no_abuffer;

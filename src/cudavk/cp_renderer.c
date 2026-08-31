@@ -858,24 +858,40 @@ cp_depthonly_run_finish(struct cp_context *cp)
    cp->depthonly.current_direction = 0;
 }
 
+static void
+cp_depthonly_capture_end(struct cp_context *cp)
+{
+   if (!cp->depthonly.window_open)
+      return;
+   cp_nvtx_depthonly_window_end(cp->depthonly.window_domain_handle,
+                                cp->depthonly.window_range_id);
+   cp->depthonly.window_domain_handle = NULL;
+   cp->depthonly.window_range_id = 0;
+   cp->depthonly.window_open = false;
+}
+
 void
 cp_depthonly_census_submit(struct cp_context *cp)
 {
    if (!cp_debug->depthonly_census)
       return;
-   bool was_active = cp->depthonly.active;
    cp->depthonly.submit_ordinal++;
    cp->depthonly.active =
       cp->depthonly.submit_ordinal > cp_debug->depthonly_census;
-   if (!was_active && cp->depthonly.active && !cp->depthonly.window_open) {
-      /* Nsight Systems 2026.4.1 only starts an NVTX capture on a
-       * thread-local push range, not a process Start/End range.  This short,
-       * same-call pair is only the capture trigger; the process range below
-       * remains the cross-thread-safe target-window annotation. */
-      bool trigger = cp_nvtx_depthonly_pushf("depthonly-capture-start");
-      if (trigger)
-         cp_nvtx_depthonly_pop();
+
+   unsigned capture_start = cp_debug->depthonly_capture_submit_start;
+   unsigned capture_end = cp_debug->depthonly_capture_submit_end;
+   if (!capture_start || !capture_end || capture_start >= capture_end)
+      return;
+
+   /* Both bounds count command-bearing internal submits.  End first, before
+    * any work in end+1; if end is the final submit, cleanup closes the range
+    * after its context synchronization instead. */
+   if (cp->depthonly.submit_ordinal == (uint64_t)capture_end + 1) {
+      cp_depthonly_capture_end(cp);
+   } else if (cp->depthonly.submit_ordinal == (uint64_t)capture_start + 1) {
       cp->depthonly.window_open = cp_nvtx_depthonly_window_start(
+         &cp->depthonly.window_domain_handle,
          &cp->depthonly.window_range_id);
    }
 }
@@ -1124,10 +1140,7 @@ cp_context_cleanup(struct cp_context *cp)
       return;
 
    CUresult sync_result = cuCtxSynchronize();
-   if (cp->depthonly.window_open) {
-      cp_nvtx_depthonly_window_end(cp->depthonly.window_range_id);
-      cp->depthonly.window_open = false;
-   }
+   cp_depthonly_capture_end(cp);
    if (sync_result != CUDA_SUCCESS)
       cp_renderer_texture_fatal(cp);
    /* Release the exclusive cache-use lifetime even on a poisoned context. */
