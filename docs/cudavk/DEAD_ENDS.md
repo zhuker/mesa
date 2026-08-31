@@ -84,6 +84,7 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 26 | Emptying the stage3→fs_compact link: interp-in-argblock and compact PDL | 2026-08-30, HeadlessStreamer | REFUTED | INTERP_INLINE **+0.13 ms slower**; COMPACT_PDL inert without it; both in-tree, default off |
 | 27 | Scope-level concurrency: overlapping independent render scopes | 2026-08-30 census | REFUTED | the scope DAG is a chain — 10.0 scopes/frame at depth 8.0–9.0, max width 2 |
 | 28 | Allow hardware-inline fragment shaders whose PTX still uses local memory | 2026-08-30, HeadlessStreamer | REFUTED (wrong frames) | +0.077/+0.036 ms timing, but **15/18 favorite3 and 14/18 favorite2 sentinels differ** |
+| 29 | Reuse device-only scratch high-water instead of the 1 GiB context drain | 2026-08-30, favorite3/favorite2 | REFUTED (below noise) | removes 1.65/1.19 ms blocked, but only +0.037/+0.012 ms post-dead-scope with pair signs disagreeing |
 
 ---
 
@@ -1478,6 +1479,56 @@ a class.
 **Cost.** One flag, two alternating sessions and two 18-frame sentinel pairs;
 all implementation changes stay unmerged. Raw data:
 `/tmp/hwinline-ab/`, `/tmp/hwinline-dumps/`.
+
+---
+
+## 29. Reusing the device-only scratch high-water — REFUTED (below noise)
+
+2026-08-30. Worktrees `~/mesa-scratchprobe` and `~/mesa-scratch2`, not
+merged. Raw alternating sessions: `/tmp/scratchreuse-ab.log` and
+`/tmp/scratch2-ab/`.
+
+**Tried.** Stop treating `dscratch.used > 1 GiB` as a reason for
+`cp_scratch_begin()` to drain the whole CUDA context. Keep the managed-arena
+high-water and both five-overflow safety triggers. Device-only scratch is
+rewound at its episode boundary under stream order, so the byte high-water is
+stale rather than evidence that live allocations still need a context drain.
+
+**Promising because.** Instrumentation attributed **1.65 ms/frame on
+favorite3** and **1.19 ms/frame on favorite2** of main-thread blocking to this
+one trigger. The candidate retained complete submit counts and one stdout hash
+per capture.
+
+**Measured twice.** Before dead-scope elimination, the locked two-round pooled
+result was only +0.038 ms favorite3 and +0.058 ms favorite2. Rebased onto the
+landed dead-scope tree (`~/mesa-scratch2`), strict control/candidate order was
+control, candidate, candidate, control:
+
+| capture | pooled control | pooled candidate | nominal gain |
+|---|---:|---:|---:|
+| favorite3 | 7.6059 ms | 7.5689 ms | **0.0370 ms** |
+| favorite2 | 6.5518 ms | 6.5398 ms | **0.0120 ms** |
+
+The pooled favorite3 number is not decisive: pair 1 makes the candidate 0.0440
+ms slower and pair 2 makes it 0.0920 ms faster. Favorite2 also disagrees in
+sign (+0.0493, then -0.0193 ms), and its pooled 0.0120 ms is below the 0.0143
+ms control spread. Every favorite3 arm has 6,939 valid timestamps and the
+standard hash; every favorite2 arm has 6,965 and its standard hash.
+
+**Mechanism.** The context drain usually waits on useful GPU work. Removing it
+lets the host advance only to the next algorithmic episode/segment dependency,
+which then absorbs almost all of the wait. Blocked host time is not frame time;
+this is the clearest current example, with a 1.2–1.7 ms blocked quantity
+converting into at most a few hundredths.
+
+**Retry if.** Only on B200, or after an architectural change removes the next
+counter dependency, and only with at least four tightly alternating pairs.
+The change is simple and plausibly correct, but it has not earned the sentinel
+and 18-sample sweep cost on this machine. Do not quote the removed blocked time
+as its performance ceiling.
+
+**Cost.** Two count/timing probes and two rebased alternating sessions. No
+source landed.
 
 ---
 
