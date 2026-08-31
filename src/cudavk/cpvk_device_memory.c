@@ -160,6 +160,13 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
+   /* The slot-0 census is aligned to backend submits that actually translate
+    * command buffers. Empty submits implement waits and do not correspond to
+    * capture timestamp submits. One-based: START=N selects the first count
+    * strictly greater than N. */
+   if (cp_debug->opaque_slot0_census && submit->command_buffer_count)
+      dev->renderer.opaque_slot0.submit++;
+
    CPVK_CTX_SCOPE(dev);
 
    /*

@@ -948,6 +948,37 @@ struct cp_abuf_seg_args {
  * primitive range says whether the tile could instead be split into that many
  * ordered passes without breaking blend order.
  */
+/*
+ * Count-only census for the first segment of a normal opaque episode. The
+ * snapshot is taken before segment 1 can touch the shared visibility buffer;
+ * the reducer compares that immutable prefix with the episode's final winners.
+ * These words are global totals, accumulated by the device and read only after
+ * context retirement, so the probe adds no per-episode host readback.
+ */
+#define CP_OPAQUE_SLOT0_REDUCED_EPISODES 0
+#define CP_OPAQUE_SLOT0_CANDIDATE_QUADS  1
+#define CP_OPAQUE_SLOT0_CANDIDATE_LANES  2
+#define CP_OPAQUE_SLOT0_USEFUL_QUADS     3
+#define CP_OPAQUE_SLOT0_USEFUL_LANES     4
+#define CP_OPAQUE_SLOT0_KILLED_QUADS     5
+#define CP_OPAQUE_SLOT0_FINAL_QUADS      6
+#define CP_OPAQUE_SLOT0_FINAL_LANES      7
+#define CP_OPAQUE_SLOT0_FINAL_S0_QUADS   8
+#define CP_OPAQUE_SLOT0_FINAL_S0_LANES   9
+#define CP_OPAQUE_SLOT0_BAD_SNAPSHOT    10
+#define CP_OPAQUE_SLOT0_BAD_FINAL       11
+#define CP_OPAQUE_SLOT0_WORDS           12
+
+struct cp_opaque_slot0_census_args {
+   uint64_t snapshot;       /* uint64 visibility entries after segment 0 */
+   uint64_t final_visbuf;   /* the ordinary episode's final shared visbuf */
+   uint64_t counters;       /* uint64[CP_OPAQUE_SLOT0_WORDS] */
+   uint32_t width;
+   uint32_t height;
+   uint32_t seg0_prim_end;  /* segment 0 is [0, seg0_prim_end) */
+   uint32_t episode_prim_end;
+};
+
 #define CP_TILE_CENSUS_MAX_SHADERS 64
 #define CP_TILE_CENSUS_BINS        65   /* 0..63 shaders, 64 = more */
 #define CP_TILE_CENSUS_LOG         32   /* log2 buckets for the two spreads */

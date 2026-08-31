@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-129 switches.
+131 switches.
 
 ## Tracing
 
@@ -68,6 +68,8 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_VFETCH_SKIP_SEED` | bool (value) | `off` | — | fault injection: a fused draw does not seed the clip and raster counters, and the host still skips their clears -- the negative control for the seeding moving into the fused vertex shader |
 | `CUDAVK_NO_OPAQUE_EPISODE` | bool (value) | `off` | — | disable consecutive opaque-run visibility deferral |
 | `CUDAVK_NO_OPAQUE_STREAMS` | bool (value) | `off` | — | issue an opaque episode's segments back to back on the main stream instead of fanning them over the pass side streams |
+| `CUDAVK_OPAQUE_SLOT0_CENSUS` | bool (value) | `off` | — | count which segment-0 opaque winners survive a later segment; count-only instrumentation whose timing is invalid |
+| `CUDAVK_OPAQUE_SLOT0_CENSUS_SUBMIT_START` | uint | `0` | 0&ndash;100000000 | skip opaque slot-0 census episodes while the 1-based command-buffer- bearing backend-submit count is at most this value; 0 includes the first such submit |
 | `CUDAVK_NO_PDL` | bool (value) | `off` | — | issue every kernel with an ordinary launch again, so that no dependent kernel starts before its predecessor in the same stream has drained; the revert for the programmatic dependent launch default |
 | `CUDAVK_PDL` | uint | `3` | — | how much of the driver runs its dependent kernels with the programmatic stream serialization attribute, so that a kernel may start before its predecessor on the same stream has drained: 0 none, 1 the A-buffer scan chain, 2 also the rasterizer stage links, 3 also the fragment writeback and the segment scatter, 4 also offers stage 1, which is a diagnostic rather than a default: most of those links are expected to refuse themselves and the counters are the measurement. The default is 3; lower it to bisect a regression, raise it to 4 to measure stage 1, and see CUDAVK_NO_PDL for the plain revert. Needs compute capability 9.0 and CUDA 11.8, and any link whose predecessor turns out not to be the named kernel falls back to an ordinary launch |
 | `CUDAVK_NO_SAMPLER_VARIANT` | bool (value) | `off` | — | disable literal-state fragment sampler variants |

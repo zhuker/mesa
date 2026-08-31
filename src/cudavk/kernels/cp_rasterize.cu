@@ -2504,6 +2504,163 @@ cp_tile_census_mark(struct cp_tile_census_args args)
 }
 
 /*
+ * Segment-0 speculative-shading census. The prefix plane is an immutable copy
+ * made before segment 1 is allowed to rasterize. One thread mirrors the direct
+ * compactor's single-sample 2x2 work unit: a distinct primitive in the block is
+ * one fragment-shader quad, while only its winning pixels are covered lanes.
+ * This kernel reads rendering state but writes only census counters.
+ */
+extern "C" __global__ void
+cp_opaque_slot0_census(struct cp_opaque_slot0_census_args args)
+{
+   uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t qw = (args.width + 1u) / 2u;
+   uint32_t qh = (args.height + 1u) / 2u;
+   bool active = q < qw * qh;
+
+   const uint64_t *snapshot =
+      (const uint64_t *)(uintptr_t)args.snapshot;
+   const uint64_t *final_vis =
+      (const uint64_t *)(uintptr_t)args.final_visbuf;
+   unsigned long long *out =
+      (unsigned long long *)(uintptr_t)args.counters;
+
+   uint32_t qx = active ? (q % qw) * 2u : 0u;
+   uint32_t qy = active ? (q / qw) * 2u : 0u;
+   uint64_t snap[4] = { VISBUF_EMPTY, VISBUF_EMPTY,
+                        VISBUF_EMPTY, VISBUF_EMPTY };
+   uint64_t fin[4] = { VISBUF_EMPTY, VISBUF_EMPTY,
+                       VISBUF_EMPTY, VISBUF_EMPTY };
+   bool in_fb[4];
+   uint32_t sprim[4] = {0, 0, 0, 0};
+   uint32_t fprim[4] = {0, 0, 0, 0};
+   uint32_t bad_snapshot = 0, bad_final = 0;
+   uint32_t final_lanes = 0, final_s0_lanes = 0;
+
+   for (uint32_t lane = 0; lane < 4; lane++) {
+      uint32_t x = qx + (lane & 1u);
+      uint32_t y = qy + (lane >> 1u);
+      in_fb[lane] = active && x < args.width && y < args.height;
+      if (!in_fb[lane])
+         continue;
+      size_t pixel = (size_t)y * args.width + x;
+      snap[lane] = snapshot[pixel];
+      fin[lane] = final_vis[pixel];
+      if (snap[lane] != VISBUF_EMPTY) {
+         sprim[lane] = VISBUF_TRIID(snap[lane]);
+         if (sprim[lane] >= args.seg0_prim_end)
+            bad_snapshot++;
+      }
+      if (fin[lane] != VISBUF_EMPTY) {
+         fprim[lane] = VISBUF_TRIID(fin[lane]);
+         final_lanes++;
+         if (fprim[lane] >= args.episode_prim_end)
+            bad_final++;
+         else if (fprim[lane] < args.seg0_prim_end)
+            final_s0_lanes++;
+      }
+   }
+
+   uint32_t candidates[4], ncandidates = 0;
+   for (uint32_t lane = 0; lane < 4; lane++) {
+      if (!in_fb[lane] || snap[lane] == VISBUF_EMPTY ||
+          sprim[lane] >= args.seg0_prim_end)
+         continue;
+      bool seen = false;
+      for (uint32_t i = 0; i < ncandidates; i++)
+         seen |= candidates[i] == sprim[lane];
+      if (!seen)
+         candidates[ncandidates++] = sprim[lane];
+   }
+
+   uint32_t candidate_lanes = 0, useful_quads = 0;
+   uint32_t useful_lanes = 0, killed_quads = 0;
+   for (uint32_t i = 0; i < ncandidates; i++) {
+      uint32_t coverage = 0, survives = 0;
+      for (uint32_t lane = 0; lane < 4; lane++) {
+         if (!in_fb[lane])
+            continue;
+         if (snap[lane] != VISBUF_EMPTY &&
+             sprim[lane] == candidates[i])
+            coverage |= 1u << lane;
+         if (fin[lane] != VISBUF_EMPTY &&
+             fprim[lane] == candidates[i])
+            survives |= 1u << lane;
+      }
+      candidate_lanes += (uint32_t)__popc(coverage);
+      useful_lanes += (uint32_t)__popc(survives);
+      if (survives)
+         useful_quads++;
+      else
+         killed_quads++;
+   }
+
+   uint32_t finals[4], nfinals = 0, nfinals_s0 = 0;
+   for (uint32_t lane = 0; lane < 4; lane++) {
+      if (!in_fb[lane] || fin[lane] == VISBUF_EMPTY ||
+          fprim[lane] >= args.episode_prim_end)
+         continue;
+      bool seen = false;
+      for (uint32_t i = 0; i < nfinals; i++)
+         seen |= finals[i] == fprim[lane];
+      if (!seen) {
+         finals[nfinals++] = fprim[lane];
+         if (fprim[lane] < args.seg0_prim_end)
+            nfinals_s0++;
+      }
+   }
+
+   /* One global atomic per nonzero block total, not one per framebuffer
+    * quad. The latter makes a count-only probe spend its life contending on
+    * twelve words and can perturb the replay far beyond what "timing invalid"
+    * needs to mean. */
+   __shared__ unsigned long long block_counts[CP_OPAQUE_SLOT0_WORDS];
+   if (threadIdx.x < CP_OPAQUE_SLOT0_WORDS)
+      block_counts[threadIdx.x] = 0;
+   __syncthreads();
+
+   if (ncandidates)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_CANDIDATE_QUADS,
+                (unsigned long long)ncandidates);
+   if (candidate_lanes)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_CANDIDATE_LANES,
+                (unsigned long long)candidate_lanes);
+   if (useful_quads)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_USEFUL_QUADS,
+                (unsigned long long)useful_quads);
+   if (useful_lanes)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_USEFUL_LANES,
+                (unsigned long long)useful_lanes);
+   if (killed_quads)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_KILLED_QUADS,
+                (unsigned long long)killed_quads);
+   if (nfinals)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_FINAL_QUADS,
+                (unsigned long long)nfinals);
+   if (final_lanes)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_FINAL_LANES,
+                (unsigned long long)final_lanes);
+   if (nfinals_s0)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_FINAL_S0_QUADS,
+                (unsigned long long)nfinals_s0);
+   if (final_s0_lanes)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_FINAL_S0_LANES,
+                (unsigned long long)final_s0_lanes);
+   if (bad_snapshot)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_BAD_SNAPSHOT,
+                (unsigned long long)bad_snapshot);
+   if (bad_final)
+      atomicAdd(block_counts + CP_OPAQUE_SLOT0_BAD_FINAL,
+                (unsigned long long)bad_final);
+   if (q == 0)
+      block_counts[CP_OPAQUE_SLOT0_REDUCED_EPISODES] = 1;
+   __syncthreads();
+
+   if (threadIdx.x < CP_OPAQUE_SLOT0_WORDS && block_counts[threadIdx.x])
+      atomicAdd(out + threadIdx.x, block_counts[threadIdx.x]);
+}
+
+/*
  * The same marking from the opaque side. Opaque draws never enter the
  * A-buffer's quad stream: their coverage is the shared visibility buffer,
  * one winner per pixel, carrying the episode-global primitive that won it.

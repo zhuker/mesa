@@ -84,6 +84,7 @@ struct cp_kernels {
    CUfunction abuf_seg_scatter;
    CUfunction tile_census_mark;
    CUfunction tile_census_mark_vis;
+   CUfunction opaque_slot0_census;
    CUfunction tile_census_refs;
    CUfunction tile_census_reduce;
    CUfunction abuf_seg_prefix;

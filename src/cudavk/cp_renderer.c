@@ -185,6 +185,7 @@ fail:
  * than moving memory that this draw is already pointing at.
  */
 static void cp_texture_cache_unpin(struct cp_context *cp);
+static void cp_opaque_slot0_invalidate(struct cp_context *cp);
 
 static void
 cp_renderer_texture_fatal(struct cp_context *cp)
@@ -840,6 +841,134 @@ cp_shade_counter_get(struct cp_context *cp)
  * the whole pass was in an array the entire time.
  */
 static void
+cp_opaque_slot0_report(struct cp_context *cp)
+{
+   if (!cp_debug->opaque_slot0_census)
+      return;
+
+   uint64_t words[CP_OPAQUE_SLOT0_WORDS] = {0};
+   bool have_words = cp->opaque_slot0.counters &&
+                     !cp->opaque_slot0.sync_failed;
+   if (have_words)
+      memcpy(words, (const void *)(uintptr_t)cp->opaque_slot0.counters,
+             sizeof(words));
+
+   bool valid = !cp->opaque_slot0.invalid &&
+                !cp->opaque_slot0.sync_failed;
+   if (valid && cp->opaque_slot0.eligible_episodes) {
+      valid &= have_words;
+      valid &= cp->opaque_slot0.submit_first >
+               cp_debug->opaque_slot0_census_submit_start;
+      valid &= cp->opaque_slot0.submit_last >= cp->opaque_slot0.submit_first;
+      valid &= cp->opaque_slot0.submit >= cp->opaque_slot0.submit_last;
+      valid &= cp->opaque_slot0.snapshot_attempts ==
+               cp->opaque_slot0.eligible_episodes;
+      valid &= cp->opaque_slot0.snapshot_ok ==
+               cp->opaque_slot0.eligible_episodes;
+      valid &= cp->opaque_slot0.reducer_launches ==
+               cp->opaque_slot0.eligible_episodes;
+      valid &= words[CP_OPAQUE_SLOT0_REDUCED_EPISODES] ==
+               cp->opaque_slot0.eligible_episodes;
+      valid &= words[CP_OPAQUE_SLOT0_USEFUL_QUADS] +
+               words[CP_OPAQUE_SLOT0_KILLED_QUADS] ==
+               words[CP_OPAQUE_SLOT0_CANDIDATE_QUADS];
+      valid &= words[CP_OPAQUE_SLOT0_USEFUL_LANES] <=
+               words[CP_OPAQUE_SLOT0_CANDIDATE_LANES];
+      valid &= words[CP_OPAQUE_SLOT0_USEFUL_QUADS] ==
+               words[CP_OPAQUE_SLOT0_FINAL_S0_QUADS];
+      valid &= words[CP_OPAQUE_SLOT0_USEFUL_LANES] ==
+               words[CP_OPAQUE_SLOT0_FINAL_S0_LANES];
+      valid &= words[CP_OPAQUE_SLOT0_FINAL_S0_QUADS] <=
+               words[CP_OPAQUE_SLOT0_FINAL_QUADS];
+      valid &= words[CP_OPAQUE_SLOT0_FINAL_S0_LANES] <=
+               words[CP_OPAQUE_SLOT0_FINAL_LANES];
+      valid &= words[CP_OPAQUE_SLOT0_BAD_SNAPSHOT] == 0;
+      valid &= words[CP_OPAQUE_SLOT0_BAD_FINAL] == 0;
+   } else if (valid) {
+      valid &= cp->opaque_slot0.snapshot_attempts == 0;
+      valid &= cp->opaque_slot0.reducer_launches == 0;
+      valid &= cp->opaque_slot0.submit_first == 0;
+      valid &= cp->opaque_slot0.submit_last == 0;
+   }
+   if (!valid)
+      cp->opaque_slot0.invalid = true;
+
+   fprintf(stderr,
+           "cudavk: opaque slot0 census: result_valid=%s "
+           "submit_kind=command_buffer submit_indexing=1-based-internal "
+           "submit_start=%u submit_current=%" PRIu64
+           " skipped_eligible=%" PRIu64
+           " selected_episode_submit_first=%" PRIu64
+           " selected_episode_submit_last=%" PRIu64
+           " eligible=%" PRIu64 " snapshot_attempts=%" PRIu64
+           " snapshot_ok=%" PRIu64 " reducers=%" PRIu64
+           " reduced=%" PRIu64 "\n",
+           valid ? "yes" : "no",
+           cp_debug->opaque_slot0_census_submit_start,
+           cp->opaque_slot0.submit,
+           cp->opaque_slot0.submit_skipped_episodes,
+           cp->opaque_slot0.submit_first, cp->opaque_slot0.submit_last,
+           cp->opaque_slot0.eligible_episodes,
+           cp->opaque_slot0.snapshot_attempts, cp->opaque_slot0.snapshot_ok,
+           cp->opaque_slot0.reducer_launches,
+           have_words ? words[CP_OPAQUE_SLOT0_REDUCED_EPISODES] : 0);
+
+   if (!valid) {
+      fprintf(stderr,
+              "cudavk: opaque slot0 census invalid: aborted=%" PRIu64
+              " alloc=%" PRIu64 " copy=%" PRIu64 " launch=%" PRIu64
+              " missing_reducer=%" PRIu64 " ordering=%" PRIu64
+              " replacement_sync=%" PRIu64 " bounds=%" PRIu64
+              " missing_snapshot=%" PRIu64
+              " sync=%u; totals suppressed\n",
+              cp->opaque_slot0.aborted_appends,
+              cp->opaque_slot0.allocation_failures,
+              cp->opaque_slot0.copy_failures,
+              cp->opaque_slot0.launch_failures,
+              cp->opaque_slot0.missing_reducer,
+              cp->opaque_slot0.ordering_failures,
+              cp->opaque_slot0.replacement_sync_failures,
+              cp->opaque_slot0.bounds_failures,
+              cp->opaque_slot0.missing_snapshot,
+              cp->opaque_slot0.sync_failed ? 1u : 0u);
+      return;
+   }
+
+   double cq = (double)MAX2(words[CP_OPAQUE_SLOT0_CANDIDATE_QUADS],
+                            (uint64_t)1);
+   double cl = (double)MAX2(words[CP_OPAQUE_SLOT0_CANDIDATE_LANES],
+                            (uint64_t)1);
+   double fq = (double)MAX2(words[CP_OPAQUE_SLOT0_FINAL_QUADS],
+                            (uint64_t)1);
+   double fl = (double)MAX2(words[CP_OPAQUE_SLOT0_FINAL_LANES],
+                            (uint64_t)1);
+   fprintf(stderr,
+           "cudavk: opaque slot0 census quads: candidate=%" PRIu64
+           " useful=%" PRIu64 " (%.2f%%) killed=%" PRIu64
+           " (%.2f%%) final_total=%" PRIu64 " useful/final=%.2f%%\n",
+           words[CP_OPAQUE_SLOT0_CANDIDATE_QUADS],
+           words[CP_OPAQUE_SLOT0_USEFUL_QUADS],
+           100.0 * words[CP_OPAQUE_SLOT0_USEFUL_QUADS] / cq,
+           words[CP_OPAQUE_SLOT0_KILLED_QUADS],
+           100.0 * words[CP_OPAQUE_SLOT0_KILLED_QUADS] / cq,
+           words[CP_OPAQUE_SLOT0_FINAL_QUADS],
+           100.0 * words[CP_OPAQUE_SLOT0_USEFUL_QUADS] / fq);
+   fprintf(stderr,
+           "cudavk: opaque slot0 census lanes: candidate=%" PRIu64
+           " useful=%" PRIu64 " (%.2f%%) killed=%" PRIu64
+           " (%.2f%%) final_total=%" PRIu64 " useful/final=%.2f%%\n",
+           words[CP_OPAQUE_SLOT0_CANDIDATE_LANES],
+           words[CP_OPAQUE_SLOT0_USEFUL_LANES],
+           100.0 * words[CP_OPAQUE_SLOT0_USEFUL_LANES] / cl,
+           words[CP_OPAQUE_SLOT0_CANDIDATE_LANES] -
+              words[CP_OPAQUE_SLOT0_USEFUL_LANES],
+           100.0 * (words[CP_OPAQUE_SLOT0_CANDIDATE_LANES] -
+                    words[CP_OPAQUE_SLOT0_USEFUL_LANES]) / cl,
+           words[CP_OPAQUE_SLOT0_FINAL_LANES],
+           100.0 * words[CP_OPAQUE_SLOT0_USEFUL_LANES] / fl);
+}
+
+static void
 cp_plan_report(struct cp_context *cp)
 {
    if (!cp_debug->plan_stats || !cp->plan.merge_tests)
@@ -1004,8 +1133,14 @@ cp_context_cleanup(struct cp_context *cp)
    if (!cp || !cp->dev)
       return;
 
-   if (cuCtxSynchronize() != CUDA_SUCCESS)
+   CUresult cleanup_sync = cuCtxSynchronize();
+   if (cleanup_sync != CUDA_SUCCESS) {
+      if (cp_debug->opaque_slot0_census) {
+         cp->opaque_slot0.sync_failed = true;
+         cp_opaque_slot0_invalidate(cp);
+      }
       cp_renderer_texture_fatal(cp);
+   }
    /* Release the exclusive cache-use lifetime even on a poisoned context. */
    cp_texture_cache_unpin(cp);
    cp_hardware_texture_report(cp);
@@ -1017,6 +1152,7 @@ cp_context_cleanup(struct cp_context *cp)
               cp->fs_launches, cp->fs_blocks,
               (double)cp->fs_blocks / (double)cp->fs_launches, cp->sm_count,
               cp_debug->fs_grid_waves);
+   cp_opaque_slot0_report(cp);
    cp_plan_report(cp);
    if (cp_debug->upload_stats)
       fprintf(stderr, "cudavk: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
@@ -1076,6 +1212,7 @@ cp_context_cleanup(struct cp_context *cp)
       &cp->depthbuf, &cp->sampler_table,
       &cp->tile_census_hist, &cp->tile_census_mask, &cp->tile_census_quads,
       &cp->tile_census_smin, &cp->tile_census_smax, &cp->tile_census_refs,
+      &cp->opaque_slot0.snapshot, &cp->opaque_slot0.counters,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(owned); i++) {
       if (*owned[i])
@@ -7538,6 +7675,240 @@ cp_opaque_side_streams(const struct cp_context *cp)
    return true;
 }
 
+/*
+ * The census is evidence for the production-safe opaque architecture, never
+ * for CUDAVK_UNSAFE_FORCE_OPAQUE. Restate every load-bearing predicate rather
+ * than calling cp_batch_order_free(), whose explicit unsafe relaxation would
+ * otherwise admit the wrong population.
+ */
+static bool
+cp_opaque_slot0_batch_safe(struct cp_context *cp,
+                           const struct cp_draw_batch *batch)
+{
+   const struct cp_draw_state *state = &batch->state;
+   const struct cp_fb_desc *fb = &batch->scope.fb;
+   if (!cp_debug->opaque_slot0_census || cp_debug->unsafe_force_opaque ||
+       cp_debug->tiled_opaque || !cp_opaque_side_streams(cp) || !state->fs ||
+       state->blend.enable || state->fs->uses_discard ||
+       state->fs->writes_memory || !state->depth.depth_enabled ||
+       !state->depth.depth_writemask ||
+       MAX2(batch->scope.attachment_samples, 1u) != 1 || fb->nr_cbufs != 1 ||
+       !fb->color || fb->color_encoding < 0)
+      return false;
+
+   switch (state->depth.depth_func) {
+   case CP_FUNC_LESS:
+   case CP_FUNC_LEQUAL:
+   case CP_FUNC_GREATER:
+   case CP_FUNC_GEQUAL:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static void
+cp_opaque_slot0_invalidate(struct cp_context *cp)
+{
+   if (cp_debug->opaque_slot0_census)
+      cp->opaque_slot0.invalid = true;
+   cp->opaque_slot0.episode_valid = false;
+}
+
+static bool
+cp_opaque_slot0_ensure(struct cp_context *cp, size_t pixels)
+{
+   if (!cp->opaque_slot0.counters) {
+      CUdeviceptr counters = 0;
+      if (cuMemAllocManaged(&counters,
+                            CP_OPAQUE_SLOT0_WORDS * sizeof(uint64_t),
+                            CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
+         cp->opaque_slot0.allocation_failures++;
+         cp_opaque_slot0_invalidate(cp);
+         return false;
+      }
+      if (cuMemsetD32Async(counters, 0, CP_OPAQUE_SLOT0_WORDS * 2,
+                            cp->main_stream) != CUDA_SUCCESS) {
+         cuMemFree(counters);
+         cp->opaque_slot0.allocation_failures++;
+         cp_opaque_slot0_invalidate(cp);
+         return false;
+      }
+      cp->opaque_slot0.counters = counters;
+   }
+
+   if (pixels <= cp->opaque_slot0.capacity_px)
+      return true;
+
+   CUdeviceptr snapshot = 0;
+   if (pixels > SIZE_MAX / sizeof(uint64_t) ||
+       cuMemAlloc(&snapshot, pixels * sizeof(uint64_t)) != CUDA_SUCCESS) {
+      cp->opaque_slot0.allocation_failures++;
+      cp_opaque_slot0_invalidate(cp);
+      return false;
+   }
+   if (cp->opaque_slot0.snapshot) {
+      /* The previous episode's reducer is a queued reader on main. Do not
+       * inherit cuMemFree's legacy synchronising behaviour as an ordering
+       * contract: make retirement explicit before replacing its plane. */
+      if (cuStreamSynchronize(cp->main_stream) != CUDA_SUCCESS) {
+         cuMemFree(snapshot);
+         cp->opaque_slot0.replacement_sync_failures++;
+         cp->opaque_slot0.sync_failed = true;
+         cp_opaque_slot0_invalidate(cp);
+         return false;
+      }
+      if (cuMemFree(cp->opaque_slot0.snapshot) != CUDA_SUCCESS) {
+         cuMemFree(snapshot);
+         cp->opaque_slot0.allocation_failures++;
+         cp_opaque_slot0_invalidate(cp);
+         return false;
+      }
+   }
+   cp->opaque_slot0.snapshot = snapshot;
+   cp->opaque_slot0.capacity_px = pixels;
+   return true;
+}
+
+/*
+ * Called only when a second segment proves that this episode has later raster
+ * work. Segment 0 ran on main. The side-stream gate is recorded after this
+ * copy, so its source cannot change until the immutable snapshot is complete.
+ */
+static void
+cp_opaque_slot0_snapshot(struct cp_context *cp,
+                         const struct cp_draw_batch *next_batch)
+{
+   cp->opaque_slot0.snapshot_attempts++;
+   cp->opaque_slot0.attempted = true;
+   cp->opaque_slot0.episode_valid = false;
+   cp->opaque_slot0.snapshot_submit = cp->opaque_slot0.submit;
+
+   struct cp_pass_seg *seg0 = &cp->pass_segs[0];
+   if (!cp_opaque_slot0_batch_safe(cp, &seg0->batch) ||
+       !cp_opaque_slot0_batch_safe(cp, next_batch) ||
+       cp->stream != cp->main_stream || seg0->prim_base != 0 ||
+       seg0->prim_slots > CP_PRIM_ID_LIMIT) {
+      cp->opaque_slot0.bounds_failures++;
+      cp_opaque_slot0_invalidate(cp);
+      return;
+   }
+
+   size_t pixels = (size_t)cp->pass.w * cp->pass.h;
+   if (!cp->pass.w || !cp->pass.h || pixels / cp->pass.w != cp->pass.h ||
+       !cp_opaque_slot0_ensure(cp, pixels)) {
+      if (cp->pass.w && cp->pass.h &&
+          pixels / cp->pass.w != cp->pass.h) {
+         cp->opaque_slot0.bounds_failures++;
+         cp_opaque_slot0_invalidate(cp);
+      }
+      return;
+   }
+
+   cp_pdl_stream_op();
+   if (cuMemcpyDtoDAsync(cp->opaque_slot0.snapshot, cp->visbuf,
+                         pixels * sizeof(uint64_t), cp->main_stream) !=
+       CUDA_SUCCESS) {
+      cp->opaque_slot0.copy_failures++;
+      cp_opaque_slot0_invalidate(cp);
+      return;
+   }
+
+   cp->opaque_slot0.snapshot_px = pixels;
+   cp->opaque_slot0.seg0_prim_end = seg0->prim_slots;
+   cp->opaque_slot0.episode_valid = true;
+   cp->opaque_slot0.snapshot_ok++;
+}
+
+static bool
+cp_opaque_slot0_episode_safe(struct cp_context *cp,
+                             struct cp_pass_seg *segs, unsigned nsegs)
+{
+   if (nsegs <= 1 || cp_debug->unsafe_force_opaque ||
+       cp_debug->tiled_opaque || !cp_opaque_side_streams(cp))
+      return false;
+   for (unsigned s = 0; s < nsegs; s++)
+      if (!cp_opaque_slot0_batch_safe(cp, &segs[s].batch))
+         return false;
+   return true;
+}
+
+static void
+cp_opaque_slot0_reduce(struct cp_context *cp, struct cp_pass_seg *segs,
+                       unsigned nsegs, unsigned w, unsigned h,
+                       uint32_t episode_prim_end)
+{
+   if (!cp_opaque_slot0_episode_safe(cp, segs, nsegs))
+      return;
+   if (cp->opaque_slot0.submit <=
+       cp_debug->opaque_slot0_census_submit_start) {
+      cp->opaque_slot0.submit_skipped_episodes++;
+      return;
+   }
+   if (!cp->opaque_slot0.submit_first)
+      cp->opaque_slot0.submit_first = cp->opaque_slot0.submit;
+   cp->opaque_slot0.submit_last = cp->opaque_slot0.submit;
+   cp->opaque_slot0.eligible_episodes++;
+
+   if (!cp->opaque_slot0.attempted || !cp->opaque_slot0.episode_valid ||
+       !cp->opaque_slot0.snapshot || !cp->opaque_slot0.counters) {
+      cp->opaque_slot0.missing_snapshot++;
+      cp_opaque_slot0_invalidate(cp);
+      return;
+   }
+   if (!cp->dev->kernels.opaque_slot0_census) {
+      cp->opaque_slot0.missing_reducer++;
+      cp_opaque_slot0_invalidate(cp);
+      return;
+   }
+
+   size_t pixels = (size_t)w * h;
+   uint32_t seg0_end = segs[0].prim_base + segs[0].prim_slots;
+   if (!w || !h || pixels / w != h ||
+       pixels != cp->opaque_slot0.snapshot_px ||
+       pixels > cp->opaque_slot0.capacity_px || segs[0].prim_base != 0 ||
+       seg0_end != cp->opaque_slot0.seg0_prim_end ||
+       cp->opaque_slot0.snapshot_submit != cp->opaque_slot0.submit ||
+       !seg0_end || seg0_end > episode_prim_end ||
+       episode_prim_end > CP_PRIM_ID_LIMIT) {
+      cp->opaque_slot0.bounds_failures++;
+      cp_opaque_slot0_invalidate(cp);
+      return;
+   }
+
+   struct cp_opaque_slot0_census_args args = {
+      .snapshot = cp->opaque_slot0.snapshot,
+      .final_visbuf = cp->visbuf,
+      .counters = cp->opaque_slot0.counters,
+      .width = w,
+      .height = h,
+      .seg0_prim_end = seg0_end,
+      .episode_prim_end = episode_prim_end,
+   };
+   void *params[] = { &args };
+   size_t quad_count = ((size_t)w + 1u) / 2u *
+                       (((size_t)h + 1u) / 2u);
+   if (!quad_count || quad_count > UINT32_MAX) {
+      cp->opaque_slot0.bounds_failures++;
+      cp_opaque_slot0_invalidate(cp);
+      return;
+   }
+   size_t block_count = (quad_count + 255u) / 256u;
+   if (block_count > UINT32_MAX) {
+      cp->opaque_slot0.bounds_failures++;
+      cp_opaque_slot0_invalidate(cp);
+      return;
+   }
+   if (cp_launch(cp, cp->dev->kernels.opaque_slot0_census,
+                 (uint32_t)block_count, 1, 1, 256, 1, 1, 0,
+                 cp->main_stream, params, NULL) != CUDA_SUCCESS) {
+      cp->opaque_slot0.launch_failures++;
+      cp_opaque_slot0_invalidate(cp);
+      return;
+   }
+   cp->opaque_slot0.reducer_launches++;
+}
+
 static bool
 cp_opaque_appendable(struct cp_context *cp,
                      const struct cp_draw_batch *batch)
@@ -7856,11 +8227,16 @@ cp_opaque_finish(struct cp_context *cp)
    struct cp_pass_seg *segs = cp->pass_segs;
    for (unsigned s = 0; s < nsegs; s++) {
       if (segs[s].batch.state.fs && segs[s].batch.state.fs->writes_memory) {
+         if (cp->opaque_slot0.attempted) {
+            cp->opaque_slot0.missing_snapshot++;
+            cp_opaque_slot0_invalidate(cp);
+         }
          cp_pass_fallback(cp, segs, nsegs);
          return;
       }
    }
    unsigned w = cp->pass.w, h = cp->pass.h;
+   uint32_t episode_prim_end = cp->pass.next_prim;
    cp->pass.nsegs = 0;
    cp->pass.next_prim = 0;
    cp->pass.opaque = false;
@@ -7890,8 +8266,16 @@ cp_opaque_finish(struct cp_context *cp)
     * work is not merely wasted: it is the same event record and cross-stream
     * wait a real join costs, which for a one-segment episode is the whole
     * price of the fan-out and none of its benefit. */
-   if (cp_opaque_side_streams(cp) && !cp_pass_join(cp, nsegs - 1))
+   if (cp_opaque_side_streams(cp) && !cp_pass_join(cp, nsegs - 1)) {
+      if (cp->opaque_slot0.attempted) {
+         cp->opaque_slot0.ordering_failures++;
+         cp_opaque_slot0_invalidate(cp);
+      }
       return;
+   }
+
+   if (cp_debug->opaque_slot0_census)
+      cp_opaque_slot0_reduce(cp, segs, nsegs, w, h, episode_prim_end);
 
    if (cp_debug->tiled_opaque &&
        !cp_opaque_tile_visibility(cp, segs, nsegs, w, h)) {
@@ -9352,6 +9736,13 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
 
    if (!cp->pass.nsegs) {
       const struct cp_fb_desc *fb = &cp->batch.scope.fb;
+      if (cp_debug->opaque_slot0_census) {
+         cp->opaque_slot0.attempted = false;
+         cp->opaque_slot0.episode_valid = false;
+         cp->opaque_slot0.snapshot_px = 0;
+         cp->opaque_slot0.seg0_prim_end = 0;
+         cp->opaque_slot0.snapshot_submit = 0;
+      }
       cp->pass.opaque = true;
       cp->pass.w = fb->width;
       cp->pass.h = fb->height;
@@ -9416,8 +9807,19 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
        * the main stream. Recorded here rather than once at episode start, for
        * the reason cp_pass_gate_stream() gives.
        */
-      if (!cp_pass_gate_stream(cp, k))
+      if (before == 1 &&
+          cp->opaque_slot0.submit >
+             cp_debug->opaque_slot0_census_submit_start &&
+          cp_opaque_slot0_batch_safe(cp, &cp->pass_segs[0].batch) &&
+          cp_opaque_slot0_batch_safe(cp, &cp->batch))
+         cp_opaque_slot0_snapshot(cp, &cp->batch);
+      if (!cp_pass_gate_stream(cp, k)) {
+         if (cp->opaque_slot0.attempted) {
+            cp->opaque_slot0.ordering_failures++;
+            cp_opaque_slot0_invalidate(cp);
+         }
          return;
+      }
       cp_stream_set(cp, cp->seg_streams[k]);
       cp->cur_qset = cp->seg_qsets[k];
    }
@@ -9432,6 +9834,10 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    }
 
    if (cp->pass.append_failed || cp->pass.nsegs == before) {
+      if (before == 1 && cp->opaque_slot0.attempted) {
+         cp->opaque_slot0.aborted_appends++;
+         cp_opaque_slot0_invalidate(cp);
+      }
       if (cp_debug->debug_episode)
          fprintf(stderr, "episode-cut: append failed=%d nsegs %u->%u\n",
                  (int)cp->pass.append_failed, before, cp->pass.nsegs);

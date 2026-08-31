@@ -221,6 +221,15 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_OPAQUE_STREAMS", CP_FLAG_BOOL_VALUE, F(no_opaque_streams),
      "issue an opaque episode's segments back to back on the main stream "
      "instead of fanning them over the pass side streams" },
+   { "CUDAVK_OPAQUE_SLOT0_CENSUS", CP_FLAG_BOOL_VALUE,
+     F(opaque_slot0_census),
+     "count which segment-0 opaque winners survive a later segment; count-only "
+     "instrumentation whose timing is invalid" },
+   { "CUDAVK_OPAQUE_SLOT0_CENSUS_SUBMIT_START", CP_FLAG_UINT,
+     F(opaque_slot0_census_submit_start),
+     "skip opaque slot-0 census episodes while the 1-based command-buffer-"
+     "bearing backend-submit count is at most this value; 0 includes the first "
+     "such submit", .dflt = 0, .has_range = true, .lo = 0, .hi = 100000000 },
    { "CUDAVK_NO_PDL", CP_FLAG_BOOL_VALUE, F(no_pdl),
      "issue every kernel with an ordinary launch again, so that no dependent "
      "kernel starts before its predecessor in the same stream has drained; "

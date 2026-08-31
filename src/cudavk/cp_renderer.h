@@ -280,6 +280,41 @@ struct cp_context {
       uint64_t hw_attempt_start;
    } pass;
 
+   /*
+    * CUDAVK_OPAQUE_SLOT0_CENSUS. Segment 0 is copied before segment 1's
+    * side-stream gate, then compared with the final shared visibility buffer.
+    * The plane and counters are census-only; no renderer kernel reads them.
+    */
+   struct {
+      CUdeviceptr snapshot;
+      size_t capacity_px;
+      CUdeviceptr counters;       /* managed uint64[CP_OPAQUE_SLOT0_WORDS] */
+      size_t snapshot_px;
+      uint32_t seg0_prim_end;
+      uint64_t snapshot_submit;
+      uint64_t submit;            /* 1-based command-bearing backend submits */
+      uint64_t submit_skipped_episodes;
+      uint64_t submit_first;      /* selected episode-bearing internal submit */
+      uint64_t submit_last;       /* selected episode-bearing internal submit */
+      bool attempted;             /* this episode tried the pre-segment1 copy */
+      bool episode_valid;         /* that copy is complete and reducible */
+      bool invalid;               /* any selected-population failure is global */
+      bool sync_failed;
+      uint64_t eligible_episodes;
+      uint64_t snapshot_attempts;
+      uint64_t snapshot_ok;
+      uint64_t reducer_launches;
+      uint64_t aborted_appends;
+      uint64_t allocation_failures;
+      uint64_t copy_failures;
+      uint64_t launch_failures;
+      uint64_t missing_reducer;
+      uint64_t ordering_failures;
+      uint64_t replacement_sync_failures;
+      uint64_t bounds_failures;
+      uint64_t missing_snapshot;
+   } opaque_slot0;
+
    /* A merged shading group's concatenated fs-UBO rows, staged here before
     * the upload; sized for the worst episode, allocated on first use. */
    uint64_t *pass_group_ubos;

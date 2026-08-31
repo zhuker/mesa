@@ -450,6 +450,8 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
    cuModuleGetFunction(&k->tile_census_mark, k->module, "cp_tile_census_mark");
    cuModuleGetFunction(&k->tile_census_mark_vis, k->module,
                        "cp_tile_census_mark_vis");
+   cuModuleGetFunction(&k->opaque_slot0_census, k->module,
+                       "cp_opaque_slot0_census");
    cuModuleGetFunction(&k->tile_census_refs, k->module, "cp_tile_census_refs");
    cuModuleGetFunction(&k->tile_census_reduce, k->module,
                        "cp_tile_census_reduce");
