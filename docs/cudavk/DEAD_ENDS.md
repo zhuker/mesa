@@ -83,6 +83,7 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 25 | Device-side episode chaining: CDP2 tails, predicated pre-issue, conditional graphs | 2026-08-30, HeadlessStreamer | REFUTED | a device tail launch costs **7.3–8.7 µs against 1.5 host** on sm_120; the admissible unit is 0.037 ms/frame |
 | 26 | Emptying the stage3→fs_compact link: interp-in-argblock and compact PDL | 2026-08-30, HeadlessStreamer | REFUTED | INTERP_INLINE **+0.13 ms slower**; COMPACT_PDL inert without it; both in-tree, default off |
 | 27 | Scope-level concurrency: overlapping independent render scopes | 2026-08-30 census | REFUTED | the scope DAG is a chain — 10.0 scopes/frame at depth 8.0–9.0, max width 2 |
+| 28 | Allow hardware-inline fragment shaders whose PTX still uses local memory | 2026-08-30, HeadlessStreamer | REFUTED (wrong frames) | +0.077/+0.036 ms timing, but **15/18 favorite3 and 14/18 favorite2 sentinels differ** |
 
 ---
 
@@ -1417,6 +1418,57 @@ flag away) shows width ≥3 over a meaningful share of frames. The
 scheduling machinery should not be built ahead of that number.
 
 **Cost.** Three debug prints, kept in-tree, and one instrumented replay.
+
+---
+
+## 28. Hardware-inline fragment shaders with surviving local memory — REFUTED (wrong frames)
+
+2026-08-30, after dead-scope elimination. Branch
+`cudavk/hw-inline-local-probe`, not merged.
+
+**Tried.** Relax only `cp_compile_nir_one()`'s `.local` veto for the
+same-LLVM hardware-texture interpolation build. Surviving
+`cp_fs_inline_lane` helpers and malformed hardware-texture PTX remained hard
+failures. The flag moved the shaders whose only rejection was local memory
+from `HW_FUSED` to `HW_INLINE`; about 8–9 fragment launches per real frame
+were in the target population.
+
+**Promising because.** The veto was broader than the fused-vertex-fetch
+admission: it rejected any `.local`, without comparing against the shader's
+classic build. The admitted test shader used 92 registers, 8 bytes local and
+2 blocks/SM, against a 203-register fused form tuned down to 126 registers,
+176 bytes local and 2 blocks/SM.
+
+**Measured.** Locked alternating compiled replay, two rounds, complete counts
+and one stdout hash per capture:
+
+| capture | control real median | candidate | apparent gain |
+|---|---:|---:|---:|
+| favorite3 | 7.6041 ms | 7.5270 ms | **0.0771 ms** |
+| favorite2 | 6.5358 ms | 6.5002 ms | **0.0355 ms** |
+
+Those timing numbers are not an acceptable win: the pixel gate fails.
+Candidate/control sentinel dumps differ in **15 of 18 favorite3 frames** and
+**14 of 18 favorite2 frames**, beginning around frame 400. The simple
+texture-cache tests still produced exact pixels; their three suite failures
+were only assertions that the selected mode was `HW_FUSED`. Real shaders are
+the negative control the unit tests lacked.
+
+**Mechanism.** The surviving local storage is semantically load-bearing for
+real generated shaders. Resource counts cannot distinguish a legitimate local
+array/depot from interpolation state that failed scalar replacement, and
+admitting it changes results even though no helper symbol survives. The
+existing all-or-nothing veto is therefore a correctness boundary, not merely
+an occupancy heuristic.
+
+**Retry if.** The local objects are identified individually in LLVM IR and a
+specific one is proven equivalent after SROA, with both captures' sentinel
+frames as the first gate. Never retry by accepting PTX containing `.local` as
+a class.
+
+**Cost.** One flag, two alternating sessions and two 18-frame sentinel pairs;
+all implementation changes stay unmerged. Raw data:
+`/tmp/hwinline-ab/`, `/tmp/hwinline-dumps/`.
 
 ---
 
