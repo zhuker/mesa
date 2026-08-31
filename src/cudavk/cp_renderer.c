@@ -867,9 +867,17 @@ cp_depthonly_census_submit(struct cp_context *cp)
    cp->depthonly.submit_ordinal++;
    cp->depthonly.active =
       cp->depthonly.submit_ordinal > cp_debug->depthonly_census;
-   if (!was_active && cp->depthonly.active && !cp->depthonly.window_open)
+   if (!was_active && cp->depthonly.active && !cp->depthonly.window_open) {
+      /* Nsight Systems 2026.4.1 only starts an NVTX capture on a
+       * thread-local push range, not a process Start/End range.  This short,
+       * same-call pair is only the capture trigger; the process range below
+       * remains the cross-thread-safe target-window annotation. */
+      bool trigger = cp_nvtx_depthonly_pushf("depthonly-capture-start");
+      if (trigger)
+         cp_nvtx_depthonly_pop();
       cp->depthonly.window_open = cp_nvtx_depthonly_window_start(
          &cp->depthonly.window_range_id);
+   }
 }
 
 void
