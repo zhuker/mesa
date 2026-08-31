@@ -212,6 +212,8 @@ struct cp_debug {
    bool opaque_slot0_census;
    unsigned opaque_slot0_census_submit_start;
    unsigned opaque_slot0_census_nvtx_scopes;
+   unsigned opaque_slot0_capture_submit_start;
+   unsigned opaque_slot0_capture_submit_end;
    bool opaque_slot0_census_nvtx_rejected;
    /*
     * Programmatic dependent launch. `pdl` is a level, not a boolean: 0 off,

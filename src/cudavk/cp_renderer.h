@@ -320,8 +320,9 @@ struct cp_context {
       unsigned nvtx_scope_successful_launches;
       bool nvtx_selected_scope_active;
       bool nvtx_counter_overflow;
+      uint64_t nvtx_capture_window_domain_id;
       uint64_t nvtx_capture_window_range_id;
-      bool nvtx_capture_window_active; /* diagnostic outer NVTX range */
+      bool nvtx_capture_window_active; /* registered process capture range */
       bool attempted;             /* this episode tried the pre-segment1 copy */
       bool episode_valid;         /* that copy is complete and reducible */
       bool invalid;               /* any selected-population failure is global */

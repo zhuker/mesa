@@ -235,6 +235,19 @@ static const struct cp_flag_def flags[] = {
      "labels-only clean-trace mode and its required selected eligible episode "
      "scope count; 0 is off and issues no slot-0 labels", .dflt = 0,
      .has_range = true, .lo = 0, .hi = 100000000 },
+   { "CUDAVK_OPAQUE_SLOT0_CAPTURE_SUBMIT_START", CP_FLAG_UINT,
+     F(opaque_slot0_capture_submit_start),
+     "in labels-only mode, start the registered slot0-window capture range "
+     "before command-bearing internal submit START+1; 0 or START >= END "
+     "disables the window, and this bound is independent of census population "
+     "selection", .dflt = 0,
+     .has_range = true, .lo = 0, .hi = 100000000 },
+   { "CUDAVK_OPAQUE_SLOT0_CAPTURE_SUBMIT_END", CP_FLAG_UINT,
+     F(opaque_slot0_capture_submit_end),
+     "in labels-only mode, end the registered slot0-window capture range "
+     "before command-bearing internal submit END+1, or after final cleanup "
+     "synchronization; 0 disables the window", .dflt = 0,
+     .has_range = true, .lo = 0, .hi = 100000000 },
    { "CUDAVK_NO_PDL", CP_FLAG_BOOL_VALUE, F(no_pdl),
      "issue every kernel with an ordinary launch again, so that no dependent "
      "kernel starts before its predecessor in the same stream has drained; "

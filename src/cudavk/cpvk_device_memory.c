@@ -161,26 +161,35 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
-   /* The slot-0 census is aligned to backend submits that actually translate
+   /* The slot-0 proof is aligned to backend submits that actually translate
     * command buffers. Empty submits implement waits and do not correspond to
-    * capture timestamp submits. One-based: START=N selects the first count
-    * strictly greater than N. */
+    * capture timestamp submits. The population and capture bounds use the same
+    * one-based ordinal, but are independent: population START=N selects after
+    * N, while a valid capture START/END includes START+1 through END. */
    if ((cp_debug->opaque_slot0_census ||
         cp_debug->opaque_slot0_census_nvtx_scopes) &&
        submit->command_buffer_count) {
       dev->renderer.opaque_slot0.submit++;
-      if (cp_debug->opaque_slot0_census_nvtx_scopes &&
-          dev->renderer.opaque_slot0.submit >
-             cp_debug->opaque_slot0_census_submit_start &&
-          !dev->renderer.opaque_slot0.nvtx_capture_window_active) {
-         /* Nsight Systems 2026.4.1 starts capture only on a push range.  Keep
-          * that trigger short and same-thread; the process range is the
-          * cross-thread-safe annotation spanning submit through cleanup. */
-         cp_nvtx_push("slot0-capture-start");
-         cp_nvtx_pop();
+      uint64_t ordinal = dev->renderer.opaque_slot0.submit;
+      bool capture_enabled = cp_debug->opaque_slot0_census_nvtx_scopes &&
+         cp_debug->opaque_slot0_capture_submit_start &&
+         cp_debug->opaque_slot0_capture_submit_end >
+            cp_debug->opaque_slot0_capture_submit_start;
+      if (dev->renderer.opaque_slot0.nvtx_capture_window_active &&
+          ordinal ==
+             (uint64_t)cp_debug->opaque_slot0_capture_submit_end + 1) {
+         cp_nvtx_registered_range_end(
+            dev->renderer.opaque_slot0.nvtx_capture_window_domain_id,
+            dev->renderer.opaque_slot0.nvtx_capture_window_range_id);
+         dev->renderer.opaque_slot0.nvtx_capture_window_active = false;
+      }
+      if (capture_enabled &&
+          ordinal ==
+             (uint64_t)cp_debug->opaque_slot0_capture_submit_start + 1) {
          dev->renderer.opaque_slot0.nvtx_capture_window_active =
-            cp_nvtx_range_start(
-               "slot0-window",
+            cp_nvtx_registered_range_start(
+               "cudavk-slot0", "slot0-window",
+               &dev->renderer.opaque_slot0.nvtx_capture_window_domain_id,
                &dev->renderer.opaque_slot0.nvtx_capture_window_range_id);
       }
    }

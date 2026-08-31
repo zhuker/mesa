@@ -1327,7 +1327,9 @@ cp_context_cleanup(struct cp_context *cp)
 
    CUresult cleanup_sync = cuCtxSynchronize();
    if (cp->opaque_slot0.nvtx_capture_window_active) {
-      cp_nvtx_range_end(cp->opaque_slot0.nvtx_capture_window_range_id);
+      cp_nvtx_registered_range_end(
+         cp->opaque_slot0.nvtx_capture_window_domain_id,
+         cp->opaque_slot0.nvtx_capture_window_range_id);
       cp->opaque_slot0.nvtx_capture_window_active = false;
    }
    if (cleanup_sync != CUDA_SUCCESS) {

@@ -87,31 +87,50 @@ cp_nvtx_pop(void)
 /*
  * A process range may begin and end on different threads.  Use it for capture
  * windows that span vkQueueSubmit to vkDestroyDevice; push/pop ranges are
- * thread-local and cannot safely span that Vulkan lifetime.  Track balance
- * separately from the opaque ID because an uninjected collector may return 0.
+ * thread-local and cannot safely span that Vulkan lifetime.  Nsight Systems
+ * 2026.4.1 does not trigger capture on an unregistered push or process range,
+ * so both the domain and message are explicit and the range uses the Ex API.
+ * Track balance separately from the opaque IDs because an uninjected collector
+ * may return 0.
  */
 static inline bool
-cp_nvtx_range_start(const char *name, uint64_t *range_id)
+cp_nvtx_registered_range_start(const char *domain_name, const char *range_name,
+                               uint64_t *domain_id, uint64_t *range_id)
 {
 #ifdef CP_HAVE_NVTX
    if (!cp_nvtx_enabled())
       return false;
-   *range_id = nvtxRangeStartA(name);
+   nvtxDomainHandle_t domain = nvtxDomainCreateA(domain_name);
+   nvtxStringHandle_t message = nvtxDomainRegisterStringA(domain, range_name);
+   nvtxEventAttributes_t attrs = {
+      .version = NVTX_VERSION,
+      .size = NVTX_EVENT_ATTRIB_STRUCT_SIZE,
+      .messageType = NVTX_MESSAGE_TYPE_REGISTERED,
+      .message.registered = message,
+   };
+   *domain_id = (uint64_t)(uintptr_t)domain;
+   *range_id = nvtxDomainRangeStartEx(domain, &attrs);
    return true;
 #else
-   (void)name;
+   (void)domain_name;
+   (void)range_name;
+   (void)domain_id;
    (void)range_id;
    return false;
 #endif
 }
 
 static inline void
-cp_nvtx_range_end(uint64_t range_id)
+cp_nvtx_registered_range_end(uint64_t domain_id, uint64_t range_id)
 {
 #ifdef CP_HAVE_NVTX
-   if (cp_nvtx_enabled())
-      nvtxRangeEnd((nvtxRangeId_t)range_id);
+   if (cp_nvtx_enabled()) {
+      nvtxDomainHandle_t domain = (nvtxDomainHandle_t)(uintptr_t)domain_id;
+      nvtxDomainRangeEnd(domain, (nvtxRangeId_t)range_id);
+      nvtxDomainDestroy(domain);
+   }
 #else
+   (void)domain_id;
    (void)range_id;
 #endif
 }
