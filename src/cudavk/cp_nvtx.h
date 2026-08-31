@@ -84,6 +84,38 @@ cp_nvtx_pop(void)
 #endif
 }
 
+/*
+ * A process range may begin and end on different threads.  Use it for capture
+ * windows that span vkQueueSubmit to vkDestroyDevice; push/pop ranges are
+ * thread-local and cannot safely span that Vulkan lifetime.  Track balance
+ * separately from the opaque ID because an uninjected collector may return 0.
+ */
+static inline bool
+cp_nvtx_range_start(const char *name, uint64_t *range_id)
+{
+#ifdef CP_HAVE_NVTX
+   if (!cp_nvtx_enabled())
+      return false;
+   *range_id = nvtxRangeStartA(name);
+   return true;
+#else
+   (void)name;
+   (void)range_id;
+   return false;
+#endif
+}
+
+static inline void
+cp_nvtx_range_end(uint64_t range_id)
+{
+#ifdef CP_HAVE_NVTX
+   if (cp_nvtx_enabled())
+      nvtxRangeEnd((nvtxRangeId_t)range_id);
+#else
+   (void)range_id;
+#endif
+}
+
 static inline void
 cp_nvtx_mark(const char *name)
 {

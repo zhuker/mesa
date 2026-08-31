@@ -12,6 +12,7 @@
  */
 
 #include "cpvk_private.h"
+#include "cp_nvtx.h"
 
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
@@ -166,8 +167,17 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * strictly greater than N. */
    if ((cp_debug->opaque_slot0_census ||
         cp_debug->opaque_slot0_census_nvtx_scopes) &&
-       submit->command_buffer_count)
+       submit->command_buffer_count) {
       dev->renderer.opaque_slot0.submit++;
+      if (cp_debug->opaque_slot0_census_nvtx_scopes &&
+          dev->renderer.opaque_slot0.submit >
+             cp_debug->opaque_slot0_census_submit_start &&
+          !dev->renderer.opaque_slot0.nvtx_capture_window_active)
+         dev->renderer.opaque_slot0.nvtx_capture_window_active =
+            cp_nvtx_range_start(
+               "slot0-window",
+               &dev->renderer.opaque_slot0.nvtx_capture_window_range_id);
+   }
 
    CPVK_CTX_SCOPE(dev);
 
