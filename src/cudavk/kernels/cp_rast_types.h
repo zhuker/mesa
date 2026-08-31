@@ -960,6 +960,10 @@ struct cp_hiz_census_stats {
    uint64_t tile_probes;
    uint64_t tiles_built;
    uint64_t depth_words_read;
+   uint64_t queue_nontrivial_overflow_observations;
+   uint64_t queue_nontrivial_overflow_excess;
+   uint64_t queue_huge_overflow_observations;
+   uint64_t queue_huge_overflow_excess;
    uint64_t longest_before_sum;
    uint64_t longest_after_sum;
    uint64_t longest_before_max;

@@ -2615,14 +2615,31 @@ cp_hiz_census_build(struct cp_rasterize_args rast,
 
 extern "C" __global__ void
 cp_hiz_census_count(struct cp_rasterize_args rast,
+                    struct cp_rast_queues queues,
                     struct cp_hiz_census_args args)
 {
+   struct cp_hiz_census_stats *st =
+      (struct cp_hiz_census_stats *)(uintptr_t)args.stats;
+   if (!blockIdx.x && !threadIdx.x) {
+      uint32_t nontrivial = queues.nontrivial_count
+         ? *(const uint32_t *)(uintptr_t)queues.nontrivial_count : 0;
+      uint32_t huge = queues.huge_count
+         ? *(const uint32_t *)(uintptr_t)queues.huge_count : 0;
+      if (nontrivial > CP_MAX_NONTRIVIAL) {
+         cp_hiz_add(&st->queue_nontrivial_overflow_observations, 1);
+         cp_hiz_add(&st->queue_nontrivial_overflow_excess,
+                    nontrivial - CP_MAX_NONTRIVIAL);
+      }
+      if (huge > CP_MAX_HUGE_TILES) {
+         cp_hiz_add(&st->queue_huge_overflow_observations, 1);
+         cp_hiz_add(&st->queue_huge_overflow_excess,
+                    huge - CP_MAX_HUGE_TILES);
+      }
+   }
    uint32_t work = blockIdx.x * blockDim.x + threadIdx.x;
    if (work >= cp_num_triangles(&rast))
       return;
    uint32_t tri_id = cp_triangle_id(&rast, work);
-   struct cp_hiz_census_stats *st =
-      (struct cp_hiz_census_stats *)(uintptr_t)args.stats;
    struct cp_tri_setup s;
    if (!setup_triangle(&rast, tri_id, &s)) {
       cp_hiz_add(&st->invalid_prims, 1);
@@ -2699,6 +2716,7 @@ cp_hiz_census_count(struct cp_rasterize_args rast,
                   }
                   float wz = CP_WINDOW_DEPTH(ndc_z, rast.depth_scale,
                                              rast.depth_translate);
+                  covered++;
                   if (!isfinite(wz)) {
                      tile_finite = false;
                      continue;
@@ -2706,7 +2724,6 @@ cp_hiz_census_count(struct cp_rasterize_args rast,
                   uint32_t z = float_to_sortable_uint(wz);
                   zmin = min(zmin, z);
                   zmax = max(zmax, z);
-                  covered++;
                }
             }
          }

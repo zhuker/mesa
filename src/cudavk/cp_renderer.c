@@ -1003,8 +1003,37 @@ cp_hiz_census_report(struct cp_context *cp)
 {
    if (!cp_debug->hiz_census)
       return;
+   if (cp->hiz_census_failed) {
+      /* A failed context sync may make managed memory inaccessible. This line
+       * is deliberately host-only: do not even form a stats dereference. */
+      fprintf(stderr,
+              "hizcensus tile=%u submit_start=%u submit_current=%" PRIu64
+              " submit_skipped_episodes=%" PRIu64 " submit_first=%" PRIu64
+              " submit_last=%" PRIu64 " seen=%" PRIu64 " admitted=%" PRIu64
+              " segments=%" PRIu64 " draws=%" PRIu64
+              " refused_state=%" PRIu64 " refused_stencil=%" PRIu64
+              " refused_fragdepth=%" PRIu64 " refused_mode=%" PRIu64
+              " failed=1 result_valid=no stats=unavailable\n",
+              cp_debug->hiz_census, cp_debug->hiz_census_submit_start,
+              cp->hiz_census_submit, cp->hiz_census_submit_skipped,
+              cp->hiz_census_submit_first, cp->hiz_census_submit_last,
+              cp->hiz_census_seen, cp->hiz_census_admitted,
+              cp->hiz_census_segments, cp->hiz_census_draws,
+              cp->hiz_census_refused_state,
+              cp->hiz_census_refused_stencil,
+              cp->hiz_census_refused_fragdepth,
+              cp->hiz_census_refused_mode);
+      return;
+   }
+
    const struct cp_hiz_census_stats *st =
       (const struct cp_hiz_census_stats *)(uintptr_t)cp->hiz_census_stats;
+   uint64_t episodes = st ? st->episodes : 0;
+   uint64_t queue_overflow = st
+      ? st->queue_nontrivial_overflow_observations +
+        st->queue_huge_overflow_observations : 0;
+   bool reducer_ok = cp->hiz_census_admitted == episodes;
+   bool result_valid = episodes && reducer_ok && !queue_overflow;
    fprintf(stderr,
            "hizcensus tile=%u submit_start=%u submit_current=%" PRIu64
            " submit_skipped_episodes=%" PRIu64 " submit_first=%" PRIu64
@@ -1012,20 +1041,16 @@ cp_hiz_census_report(struct cp_context *cp)
            " reduced=%" PRIu64 " segments=%" PRIu64 " draws=%" PRIu64
            " refused_state=%" PRIu64 " refused_stencil=%" PRIu64
            " refused_fragdepth=%" PRIu64 " refused_mode=%" PRIu64
-           " failed=%d\n",
+           " failed=0 reducer_check=%s shipping_match=%s result_valid=%s\n",
            cp_debug->hiz_census, cp_debug->hiz_census_submit_start,
            cp->hiz_census_submit, cp->hiz_census_submit_skipped,
            cp->hiz_census_submit_first, cp->hiz_census_submit_last,
-           cp->hiz_census_seen, cp->hiz_census_admitted,
-           st ? st->episodes : 0, cp->hiz_census_segments,
-           cp->hiz_census_draws, cp->hiz_census_refused_state,
-           cp->hiz_census_refused_stencil,
-           cp->hiz_census_refused_fragdepth,
-           cp->hiz_census_refused_mode, (int)cp->hiz_census_failed);
-   if (cp->hiz_census_failed) {
-      fprintf(stderr, "hizcensus: launch failed; aggregate is invalid\n");
-      return;
-   }
+           cp->hiz_census_seen, cp->hiz_census_admitted, episodes,
+           cp->hiz_census_segments, cp->hiz_census_draws,
+           cp->hiz_census_refused_state, cp->hiz_census_refused_stencil,
+           cp->hiz_census_refused_fragdepth, cp->hiz_census_refused_mode,
+           reducer_ok ? "ok" : "MISMATCH",
+           queue_overflow ? "no" : "yes", result_valid ? "yes" : "no");
    if (!st || !st->episodes)
       return;
    static const char *classes[CP_HIZ_CENSUS_CLASSES] = {
@@ -1055,14 +1080,21 @@ cp_hiz_census_report(struct cp_context *cp)
            st->empty_coverage_refs, st->equality_blocked_refs, st->tile_probes,
            st->tiles_built, st->depth_words_read);
    fprintf(stderr,
+           "hizcensus queue_nontrivial_overflow_observations=%" PRIu64
+           " queue_nontrivial_overflow_excess=%" PRIu64
+           " queue_huge_overflow_observations=%" PRIu64
+           " queue_huge_overflow_excess=%" PRIu64 "\n",
+           st->queue_nontrivial_overflow_observations,
+           st->queue_nontrivial_overflow_excess,
+           st->queue_huge_overflow_observations,
+           st->queue_huge_overflow_excess);
+   fprintf(stderr,
            "hizcensus longest_sum=%" PRIu64 "->%" PRIu64
            " longest_max=%" PRIu64 "->%" PRIu64
-           " empty_tiles=%" PRIu64 "->%" PRIu64
-           " reducer_check=%s\n",
+           " empty_tiles=%" PRIu64 "->%" PRIu64 "\n",
            st->longest_before_sum, st->longest_after_sum,
            st->longest_before_max, st->longest_after_max,
-           st->empty_tiles_before, st->empty_tiles_after,
-           cp->hiz_census_admitted == st->episodes ? "ok" : "MISMATCH");
+           st->empty_tiles_before, st->empty_tiles_after);
    fprintf(stderr, "hizcensus longest_log2_before:");
    for (unsigned i = 0; i < CP_HIZ_CENSUS_LOG; i++)
       if (st->longest_before_hist[i])
@@ -7639,6 +7671,13 @@ cp_opaque_appendable(struct cp_context *cp,
                  fb->color_encoding);
       return false;
    }
+   /* Stencil is ignored by rendering today, but the census must not lose the
+    * metadata when a pipeline change becomes another episode segment. Only
+    * the diagnostic splits on it; flag-off episode topology is unchanged. */
+   if (cp_debug->hiz_census && cp->pass.opaque && cp->pass.nsegs &&
+       cp->pass_segs[0].batch.state.hiz_stencil_safe !=
+          state->hiz_stencil_safe)
+      return false;
    if (cp->pass.opaque &&
        (cp->pass.nsegs >= CP_PASS_MAX_SEGS ||
         cp->pass.next_prim >= CP_PRIM_ID_LIMIT))
@@ -7933,15 +7972,43 @@ static void cp_tile_census_quads(struct cp_context *cp,
  * still precisely the episode-entry image. All results stay on the device
  * until the already-drained context cleanup report.
  */
+static void
+cp_hiz_census_cuda_fail(struct cp_context *cp, const char *what, CUresult err)
+{
+   if (err == CUDA_SUCCESS)
+      return;
+   const char *name = NULL;
+   cuGetErrorName(err, &name);
+   fprintf(stderr, "cudavk: Hi-Z census %s failed: %s (%d)\n",
+           what, name ? name : "unknown", err);
+   cp->hiz_census_failed = true;
+}
+
+static bool
+cp_hiz_census_free(struct cp_context *cp, CUdeviceptr ptr, const char *what)
+{
+   if (!ptr)
+      return true;
+   CUresult err = cuMemFree(ptr);
+   if (err != CUDA_SUCCESS)
+      cp_hiz_census_cuda_fail(cp, what, err);
+   return err == CUDA_SUCCESS;
+}
+
 static bool
 cp_opaque_hiz_census_alloc(struct cp_context *cp, unsigned ntiles)
 {
    if (!cp->hiz_census_stats) {
-      if (cuMemAllocManaged(&cp->hiz_census_stats,
-                            sizeof(struct cp_hiz_census_stats),
-                            CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+      CUdeviceptr stats = 0;
+      CUresult err = cuMemAllocManaged(&stats,
+                                      sizeof(struct cp_hiz_census_stats),
+                                      CU_MEM_ATTACH_GLOBAL);
+      if (err != CUDA_SUCCESS) {
+         cp_hiz_census_cuda_fail(cp, "stats allocation", err);
          return false;
-      memset((void *)(uintptr_t)cp->hiz_census_stats, 0,
+      }
+      cp->hiz_census_stats = stats;
+      memset((void *)(uintptr_t)stats, 0,
              sizeof(struct cp_hiz_census_stats));
    }
    if (ntiles <= cp->hiz_census_alloc)
@@ -7949,23 +8016,46 @@ cp_opaque_hiz_census_alloc(struct cp_context *cp, unsigned ntiles)
 
    CUdeviceptr depth = 0, before = 0, after = 0;
    size_t bytes = (size_t)ntiles * sizeof(uint32_t);
-   if (cuMemAlloc(&depth, bytes) != CUDA_SUCCESS ||
-       cuMemAlloc(&before, bytes) != CUDA_SUCCESS ||
-       cuMemAlloc(&after, bytes) != CUDA_SUCCESS) {
-      if (depth)
-         cuMemFree(depth);
-      if (before)
-         cuMemFree(before);
-      if (after)
-         cuMemFree(after);
+   CUresult err = cuMemAlloc(&depth, bytes);
+   if (err == CUDA_SUCCESS)
+      err = cuMemAlloc(&before, bytes);
+   if (err == CUDA_SUCCESS)
+      err = cuMemAlloc(&after, bytes);
+   if (err != CUDA_SUCCESS) {
+      cp_hiz_census_cuda_fail(cp, "tile allocation", err);
+      cp_hiz_census_free(cp, depth, "partial depth free");
+      cp_hiz_census_free(cp, before, "partial before free");
+      cp_hiz_census_free(cp, after, "partial after free");
       return false;
    }
-   if (cp->hiz_census_depth)
-      cuMemFree(cp->hiz_census_depth);
-   if (cp->hiz_census_before)
-      cuMemFree(cp->hiz_census_before);
-   if (cp->hiz_census_after)
-      cuMemFree(cp->hiz_census_after);
+
+   bool replaced = true;
+   if (cp->hiz_census_depth &&
+       cp_hiz_census_free(cp, cp->hiz_census_depth,
+                          "old depth replacement free"))
+      cp->hiz_census_depth = 0;
+   else if (cp->hiz_census_depth)
+      replaced = false;
+   if (cp->hiz_census_before &&
+       cp_hiz_census_free(cp, cp->hiz_census_before,
+                          "old before replacement free"))
+      cp->hiz_census_before = 0;
+   else if (cp->hiz_census_before)
+      replaced = false;
+   if (cp->hiz_census_after &&
+       cp_hiz_census_free(cp, cp->hiz_census_after,
+                          "old after replacement free"))
+      cp->hiz_census_after = 0;
+   else if (cp->hiz_census_after)
+      replaced = false;
+   if (!replaced) {
+      cp->hiz_census_alloc = 0;
+      cp_hiz_census_free(cp, depth, "new depth rollback free");
+      cp_hiz_census_free(cp, before, "new before rollback free");
+      cp_hiz_census_free(cp, after, "new after rollback free");
+      return false;
+   }
+
    cp->hiz_census_depth = depth;
    cp->hiz_census_before = before;
    cp->hiz_census_after = after;
@@ -8027,10 +8117,12 @@ cp_opaque_hiz_census(struct cp_context *cp, struct cp_pass_seg *segs,
    unsigned tiles_x = DIV_ROUND_UP(w, tile_edge);
    unsigned tiles_y = DIV_ROUND_UP(h, tile_edge);
    unsigned ntiles = tiles_x * tiles_y;
-   if (!ntiles || !cp_opaque_hiz_census_alloc(cp, ntiles)) {
+   if (!ntiles) {
       cp->hiz_census_refused_state++;
       return;
    }
+   if (!cp_opaque_hiz_census_alloc(cp, ntiles))
+      return;
    struct cp_hiz_census_args args = {
       .hiz = cp->hiz_census_depth,
       .tile_before = cp->hiz_census_before,
@@ -8051,7 +8143,7 @@ cp_opaque_hiz_census(struct cp_context *cp, struct cp_pass_seg *segs,
       unsigned n = segs[s].rast_num_triangles;
       if (!n)
          continue;
-      void *p[] = { &segs[s].rast, &args };
+      void *p[] = { &segs[s].rast, &segs[s].queues, &args };
       err = cp_launch(cp, k->hiz_census_count, DIV_ROUND_UP(n, 256),
                       1, 1, 256, 1, 1, 0, cp->stream, p, NULL);
    }
@@ -8061,11 +8153,7 @@ cp_opaque_hiz_census(struct cp_context *cp, struct cp_pass_seg *segs,
                       cp->stream, rp, NULL);
    }
    if (err != CUDA_SUCCESS) {
-      const char *name = NULL;
-      cuGetErrorName(err, &name);
-      fprintf(stderr, "cudavk: Hi-Z census launch failed: %s (%d)\n",
-              name ? name : "unknown", err);
-      cp->hiz_census_failed = true;
+      cp_hiz_census_cuda_fail(cp, "launch", err);
       return;
    }
    cp->hiz_census_admitted++;
