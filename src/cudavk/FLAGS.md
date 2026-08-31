@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-129 switches.
+130 switches.
 
 ## Tracing
 
@@ -109,6 +109,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_FORCE_PASS_FALLBACK` | bool (value) | `off` | — | make every blended episode take the classic re-execution fallback; the output must be identical, which is what makes it a test |
 | `CUDAVK_TILE_CENSUS` | uint | `0` | 0&ndash;256 | tile edge in pixels for the blended tile-bin shader census; 0 is off, and it changes no rendering |
 | `CUDAVK_TILE_CENSUS_EVERY` | uint | `2000` | 1&ndash;1000000 | report the tile census this often, in episodes |
+| `CUDAVK_HIZ_CENSUS` | bool (value) | `off` | — | count conservative 64-pixel stale-depth rejection in normal opaque episodes; changes no rendering |
 | `CUDAVK_TILED_OPAQUE` | bool (value) | `off` | — | use the experimental opaque episode sort-middle tile rasterizer |
 | `CUDAVK_TILED_OPAQUE_CENSUS` | bool (value) | `off` | — | collect opaque tile population statistics without changing rendering |
 | `CUDAVK_UNSAFE_NO_OVERFLOW` | bool (value) | `off` | — | skip episode overflow readback and assume fragment/quad arrays fit; unsafe diagnostic only |

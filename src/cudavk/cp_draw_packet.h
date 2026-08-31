@@ -57,6 +57,7 @@ struct cp_draw_state {
    struct cp_viewport_state viewport;
    struct cp_raster_state raster;
    struct cp_depth_state depth;
+   bool hiz_stencil_safe;
    struct cp_blend_desc blend;
    uint32_t pipeline_samples;
 

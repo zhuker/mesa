@@ -2556,6 +2556,265 @@ cp_tile_census_mark_vis(struct cp_tile_census_args args)
  * keep the order.
  */
 /*
+ * Count-only stale-depth census for normal opaque episodes.
+ *
+ * The host launches this after all visibility rasterization has joined and
+ * before the first fragment shade. depthbuf is therefore still exactly the
+ * episode-entry image. The count kernel deliberately replays coverage and
+ * depth arithmetic and writes only diagnostic counters: raw vertex extrema
+ * are not a bit-exact bound because rounded barycentrics can overshoot them.
+ */
+static __device__ __forceinline__ unsigned
+cp_hiz_census_func_index(uint32_t func)
+{
+   return func == CP_FUNC_LESS ? 0u : func == CP_FUNC_LEQUAL ? 1u :
+          func == CP_FUNC_GREATER ? 2u : 3u;
+}
+
+static __device__ __forceinline__ void
+cp_hiz_add(uint64_t *p, uint64_t v)
+{
+   atomicAdd((unsigned long long *)p, (unsigned long long)v);
+}
+
+extern "C" __global__ void
+cp_hiz_census_build(struct cp_rasterize_args rast,
+                    struct cp_hiz_census_args args)
+{
+   if (threadIdx.x)
+      return;
+   uint32_t tile = blockIdx.x;
+   uint32_t ntiles = args.tiles_x * args.tiles_y;
+   if (tile >= ntiles)
+      return;
+
+   uint32_t tx = tile % args.tiles_x;
+   uint32_t ty = tile / args.tiles_x;
+   uint32_t x0 = tx * CP_HIZ_CENSUS_TILE;
+   uint32_t y0 = ty * CP_HIZ_CENSUS_TILE;
+   uint32_t x1 = min(x0 + CP_HIZ_CENSUS_TILE, args.width);
+   uint32_t y1 = min(y0 + CP_HIZ_CENSUS_TILE, args.height);
+   bool less = args.depth_func == CP_FUNC_LESS ||
+               args.depth_func == CP_FUNC_LEQUAL;
+   uint32_t z = less ? 0u : 0xffffffffu;
+   const uint32_t *depth = (const uint32_t *)(uintptr_t)rast.depthbuf;
+   for (uint32_t y = y0; y < y1; y++)
+      for (uint32_t x = x0; x < x1; x++) {
+         uint32_t d = depth[(size_t)y * args.width + x];
+         z = less ? max(z, d) : min(z, d);
+      }
+   ((uint32_t *)(uintptr_t)args.hiz)[tile] = z;
+   ((uint32_t *)(uintptr_t)args.tile_before)[tile] = 0;
+   ((uint32_t *)(uintptr_t)args.tile_after)[tile] = 0;
+
+   struct cp_hiz_census_stats *st =
+      (struct cp_hiz_census_stats *)(uintptr_t)args.stats;
+   cp_hiz_add(&st->tiles_built, 1);
+   cp_hiz_add(&st->depth_words_read, (uint64_t)(x1 - x0) * (y1 - y0));
+}
+
+extern "C" __global__ void
+cp_hiz_census_count(struct cp_rasterize_args rast,
+                    struct cp_hiz_census_args args)
+{
+   uint32_t work = blockIdx.x * blockDim.x + threadIdx.x;
+   if (work >= cp_num_triangles(&rast))
+      return;
+   uint32_t tri_id = cp_triangle_id(&rast, work);
+   struct cp_hiz_census_stats *st =
+      (struct cp_hiz_census_stats *)(uintptr_t)args.stats;
+   struct cp_tri_setup s;
+   if (!setup_triangle(&rast, tri_id, &s)) {
+      cp_hiz_add(&st->invalid_prims, 1);
+      return;
+   }
+
+   int bb_w = s.ix_max - s.ix_min + 1;
+   int bb_h = s.iy_max - s.iy_min + 1;
+   int bb_area = bb_w * bb_h;
+   if (bb_area <= 0) {
+      cp_hiz_add(&st->invalid_prims, 1);
+      return;
+   }
+   unsigned cls = bb_area <= CP_SMALL_THRESHOLD ? 0u :
+      bb_area <= (s.is_point ? CP_POINT_THRESHOLD : CP_MEDIUM_THRESHOLD)
+         ? 1u : 2u;
+   unsigned fi = cp_hiz_census_func_index(args.depth_func);
+   uint64_t refs_before = 0, refs_after = 0;
+   uint64_t pixels_before = 0, pixels_after = 0;
+   uint64_t covered_before = 0, covered_after = 0;
+   bool nonfinite = false;
+
+   int tx0 = s.ix_min / (int)CP_HIZ_CENSUS_TILE;
+   int ty0 = s.iy_min / (int)CP_HIZ_CENSUS_TILE;
+   int tx1 = s.ix_max / (int)CP_HIZ_CENSUS_TILE;
+   int ty1 = s.iy_max / (int)CP_HIZ_CENSUS_TILE;
+   for (int ty = ty0; ty <= ty1; ty++) {
+      for (int tx = tx0; tx <= tx1; tx++) {
+         int x0 = max(s.ix_min, tx * (int)CP_HIZ_CENSUS_TILE);
+         int y0 = max(s.iy_min, ty * (int)CP_HIZ_CENSUS_TILE);
+         int x1 = min(s.ix_max, (tx + 1) * (int)CP_HIZ_CENSUS_TILE - 1);
+         int y1 = min(s.iy_max, (ty + 1) * (int)CP_HIZ_CENSUS_TILE - 1);
+         uint64_t area = (uint64_t)(x1 - x0 + 1) * (y1 - y0 + 1);
+         uint32_t zmin = 0xffffffffu, zmax = 0u;
+         uint64_t covered = 0;
+         bool tile_finite = true;
+
+         for (int py = y0; py <= y1; py++) {
+            for (int px = x0; px <= x1; px++) {
+               for (int sm = 0; sm < (int)rast.num_samples; sm++) {
+                  float ox, oy;
+                  cp_sample_pos(rast.num_samples, sm, &ox, &oy);
+                  float cx = (float)px + ox, cy = (float)py + oy;
+                  float ndc_z;
+                  if (s.is_point) {
+                     if (cx < s.pt_x0 || cx >= s.pt_x1 ||
+                         cy < s.pt_y0 || cy >= s.pt_y1)
+                        continue;
+                     ndc_z = s.ndc_z0;
+                  } else {
+                     float e0 = edge_function(s.sx1, s.sy1, s.sx2, s.sy2,
+                                              cx, cy);
+                     float e1 = edge_function(s.sx2, s.sy2, s.sx0, s.sy0,
+                                              cx, cy);
+                     float e2 = edge_function(s.sx0, s.sy0, s.sx1, s.sy1,
+                                              cx, cy);
+                     if (!edge_inside(e0, s.e0_top_left) ||
+                         !edge_inside(e1, s.e1_top_left) ||
+                         !edge_inside(e2, s.e2_top_left))
+                        continue;
+                     float w0 = e0 * s.inv_area;
+                     float w1 = e1 * s.inv_area;
+                     if (cls == 0u) {
+                        /* Match stage 1's separately rounded w2. */
+                        float w2 = 1.0f - w0 - w1;
+                        ndc_z = w0 * s.ndc_z0 + w1 * s.ndc_z1 +
+                                w2 * s.ndc_z2;
+                     } else {
+                        /* Match stages 2 and 3. */
+                        ndc_z = w0 * s.ndc_z0 + w1 * s.ndc_z1 +
+                                (1.0f - w0 - w1) * s.ndc_z2;
+                     }
+                  }
+                  float wz = CP_WINDOW_DEPTH(ndc_z, rast.depth_scale,
+                                             rast.depth_translate);
+                  if (!isfinite(wz)) {
+                     tile_finite = false;
+                     continue;
+                  }
+                  uint32_t z = float_to_sortable_uint(wz);
+                  zmin = min(zmin, z);
+                  zmax = max(zmax, z);
+                  covered++;
+               }
+            }
+         }
+
+         uint32_t tile = (uint32_t)ty * args.tiles_x + (uint32_t)tx;
+         atomicAdd((unsigned int *)(uintptr_t)args.tile_before + tile, 1u);
+         refs_before++;
+         pixels_before += area;
+         covered_before += covered;
+         bool reject = false;
+         bool equality_blocked = false;
+         if (!tile_finite) {
+            nonfinite = true;
+         } else if (!covered) {
+            cp_hiz_add(&st->empty_coverage_refs, 1);
+         } else {
+            uint32_t hz = ((const uint32_t *)(uintptr_t)args.hiz)[tile];
+            switch (args.depth_func) {
+            case CP_FUNC_LESS:    reject = zmin >= hz; break;
+            case CP_FUNC_LEQUAL:
+               reject = zmin > hz;
+               equality_blocked = zmin == hz;
+               break;
+            case CP_FUNC_GREATER: reject = zmax <= hz; break;
+            case CP_FUNC_GEQUAL:
+               reject = zmax < hz;
+               equality_blocked = zmax == hz;
+               break;
+            }
+         }
+         if (!reject) {
+            atomicAdd((unsigned int *)(uintptr_t)args.tile_after + tile, 1u);
+            refs_after++;
+            pixels_after += area;
+            covered_after += covered;
+         }
+         if (equality_blocked)
+            cp_hiz_add(&st->equality_blocked_refs, 1);
+      }
+   }
+
+   cp_hiz_add(&st->valid_prims, 1);
+   cp_hiz_add(&st->prims[cls], 1);
+   cp_hiz_add(&st->refs_before[cls], refs_before);
+   cp_hiz_add(&st->refs_after[cls], refs_after);
+   cp_hiz_add(&st->bbox_pixels_before[cls], pixels_before);
+   cp_hiz_add(&st->bbox_pixels_after[cls], pixels_after);
+   cp_hiz_add(&st->covered_before[cls], covered_before);
+   cp_hiz_add(&st->covered_after[cls], covered_after);
+   cp_hiz_add(&st->refs_by_func[fi], refs_before);
+   cp_hiz_add(&st->kept_by_func[fi], refs_after);
+   cp_hiz_add(&st->tile_probes, refs_before);
+   if (!refs_after)
+      cp_hiz_add(&st->whole_reject[cls], 1);
+   if (nonfinite)
+      cp_hiz_add(&st->nonfinite_prims, 1);
+}
+
+extern "C" __global__ void
+cp_hiz_census_reduce(struct cp_hiz_census_args args)
+{
+   __shared__ uint32_t before[256], after[256];
+   __shared__ uint32_t empty_before[256], empty_after[256];
+   uint32_t tid = threadIdx.x;
+   uint32_t ntiles = args.tiles_x * args.tiles_y;
+   uint32_t mb = 0, ma = 0, eb = 0, ea = 0;
+   const uint32_t *tb = (const uint32_t *)(uintptr_t)args.tile_before;
+   const uint32_t *ta = (const uint32_t *)(uintptr_t)args.tile_after;
+   for (uint32_t i = tid; i < ntiles; i += blockDim.x) {
+      uint32_t b = tb[i], a = ta[i];
+      mb = max(mb, b);
+      ma = max(ma, a);
+      eb += b == 0;
+      ea += a == 0;
+   }
+   before[tid] = mb;
+   after[tid] = ma;
+   empty_before[tid] = eb;
+   empty_after[tid] = ea;
+   __syncthreads();
+   for (uint32_t d = blockDim.x / 2; d; d >>= 1) {
+      if (tid < d) {
+         before[tid] = max(before[tid], before[tid + d]);
+         after[tid] = max(after[tid], after[tid + d]);
+         empty_before[tid] += empty_before[tid + d];
+         empty_after[tid] += empty_after[tid + d];
+      }
+      __syncthreads();
+   }
+   if (!tid) {
+      struct cp_hiz_census_stats *st =
+         (struct cp_hiz_census_stats *)(uintptr_t)args.stats;
+      cp_hiz_add(&st->episodes, 1);
+      cp_hiz_add(&st->longest_before_sum, before[0]);
+      cp_hiz_add(&st->longest_after_sum, after[0]);
+      atomicMax((unsigned long long *)&st->longest_before_max,
+                (unsigned long long)before[0]);
+      atomicMax((unsigned long long *)&st->longest_after_max,
+                (unsigned long long)after[0]);
+      cp_hiz_add(&st->empty_tiles_before, empty_before[0]);
+      cp_hiz_add(&st->empty_tiles_after, empty_after[0]);
+      unsigned lb = before[0] ? 1u + 31u - __clz(before[0]) : 0u;
+      unsigned la = after[0] ? 1u + 31u - __clz(after[0]) : 0u;
+      cp_hiz_add(&st->longest_before_hist[lb], 1);
+      cp_hiz_add(&st->longest_after_hist[la], 1);
+   }
+}
+
+/*
  * The bin's own size, which is a different quantity from the shaded one: a
  * triangle spanning twenty tiles costs twenty references and may shade none
  * of them. This is what sets a tiler's memory ceiling and what the previous

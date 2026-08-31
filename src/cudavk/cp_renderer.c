@@ -998,19 +998,93 @@ cp_spec_report(struct cp_context *cp)
            cp->spec.shaders_unmatchable);
 }
 
+static void
+cp_hiz_census_report(struct cp_context *cp)
+{
+   if (!cp_debug->hiz_census)
+      return;
+   const struct cp_hiz_census_stats *st =
+      (const struct cp_hiz_census_stats *)(uintptr_t)cp->hiz_census_stats;
+   fprintf(stderr,
+           "hizcensus tile=%u seen=%" PRIu64 " admitted=%" PRIu64
+           " reduced=%" PRIu64 " segments=%" PRIu64 " draws=%" PRIu64
+           " refused_state=%" PRIu64 " refused_stencil=%" PRIu64
+           " refused_fragdepth=%" PRIu64 " refused_mode=%" PRIu64
+           " failed=%d\n",
+           CP_HIZ_CENSUS_TILE, cp->hiz_census_seen, cp->hiz_census_admitted,
+           st ? st->episodes : 0, cp->hiz_census_segments,
+           cp->hiz_census_draws, cp->hiz_census_refused_state,
+           cp->hiz_census_refused_stencil,
+           cp->hiz_census_refused_fragdepth,
+           cp->hiz_census_refused_mode, (int)cp->hiz_census_failed);
+   if (cp->hiz_census_failed) {
+      fprintf(stderr, "hizcensus: launch failed; aggregate is invalid\n");
+      return;
+   }
+   if (!st || !st->episodes)
+      return;
+   static const char *classes[CP_HIZ_CENSUS_CLASSES] = {
+      "small", "medium", "huge"
+   };
+   for (unsigned c = 0; c < CP_HIZ_CENSUS_CLASSES; c++)
+      fprintf(stderr,
+              "hizcensus class=%s prims=%" PRIu64 " whole_reject=%" PRIu64
+              " refs=%" PRIu64 "->%" PRIu64 " bbox_pixels=%" PRIu64
+              "->%" PRIu64 " covered=%" PRIu64 "->%" PRIu64 "\n",
+              classes[c], st->prims[c], st->whole_reject[c],
+              st->refs_before[c], st->refs_after[c],
+              st->bbox_pixels_before[c], st->bbox_pixels_after[c],
+              st->covered_before[c], st->covered_after[c]);
+   static const char *funcs[CP_HIZ_CENSUS_FUNCS] = {
+      "LESS", "LEQUAL", "GREATER", "GEQUAL"
+   };
+   for (unsigned f = 0; f < CP_HIZ_CENSUS_FUNCS; f++)
+      fprintf(stderr, "hizcensus func=%s refs=%" PRIu64 "->%" PRIu64 "\n",
+              funcs[f], st->refs_by_func[f], st->kept_by_func[f]);
+   fprintf(stderr,
+           "hizcensus valid=%" PRIu64 " invalid=%" PRIu64
+           " nonfinite=%" PRIu64 " empty_coverage_refs=%" PRIu64
+           " equality_blocked=%" PRIu64 " probes=%" PRIu64
+           " tiles_built=%" PRIu64 " depth_words=%" PRIu64 "\n",
+           st->valid_prims, st->invalid_prims, st->nonfinite_prims,
+           st->empty_coverage_refs, st->equality_blocked_refs, st->tile_probes,
+           st->tiles_built, st->depth_words_read);
+   fprintf(stderr,
+           "hizcensus longest_sum=%" PRIu64 "->%" PRIu64
+           " longest_max=%" PRIu64 "->%" PRIu64
+           " empty_tiles=%" PRIu64 "->%" PRIu64
+           " reducer_check=%s\n",
+           st->longest_before_sum, st->longest_after_sum,
+           st->longest_before_max, st->longest_after_max,
+           st->empty_tiles_before, st->empty_tiles_after,
+           cp->hiz_census_admitted == st->episodes ? "ok" : "MISMATCH");
+   fprintf(stderr, "hizcensus longest_log2_before:");
+   for (unsigned i = 0; i < CP_HIZ_CENSUS_LOG; i++)
+      if (st->longest_before_hist[i])
+         fprintf(stderr, " %u:%" PRIu64, i, st->longest_before_hist[i]);
+   fprintf(stderr, "\nhizcensus longest_log2_after:");
+   for (unsigned i = 0; i < CP_HIZ_CENSUS_LOG; i++)
+      if (st->longest_after_hist[i])
+         fprintf(stderr, " %u:%" PRIu64, i, st->longest_after_hist[i]);
+   fprintf(stderr, "\n");
+}
+
 void
 cp_context_cleanup(struct cp_context *cp)
 {
    if (!cp || !cp->dev)
       return;
 
-   if (cuCtxSynchronize() != CUDA_SUCCESS)
+   if (cuCtxSynchronize() != CUDA_SUCCESS) {
+      cp->hiz_census_failed = cp_debug->hiz_census;
       cp_renderer_texture_fatal(cp);
+   }
    /* Release the exclusive cache-use lifetime even on a poisoned context. */
    cp_texture_cache_unpin(cp);
    cp_hardware_texture_report(cp);
    cp_spec_report(cp);
    cp_vs_census_report();
+   cp_hiz_census_report(cp);
    if (cp_debug->shader_stats && cp->fs_launches)
       fprintf(stderr, "cudavk: fragment grid: %" PRIu64 " launches, %" PRIu64
               " blocks, %.1f blocks/launch, %d SMs, waves=%u\n",
@@ -1076,6 +1150,8 @@ cp_context_cleanup(struct cp_context *cp)
       &cp->depthbuf, &cp->sampler_table,
       &cp->tile_census_hist, &cp->tile_census_mask, &cp->tile_census_quads,
       &cp->tile_census_smin, &cp->tile_census_smax, &cp->tile_census_refs,
+      &cp->hiz_census_stats, &cp->hiz_census_depth,
+      &cp->hiz_census_before, &cp->hiz_census_after,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(owned); i++) {
       if (*owned[i])
@@ -7846,6 +7922,144 @@ static void cp_tile_census_quads(struct cp_context *cp,
                                  struct cp_pass_seg *segs, unsigned nsegs,
                                  unsigned w, unsigned h);
 
+/*
+ * Count-only normal-opaque stale-depth census. It runs after the episode's
+ * visibility streams join and before any winner is shaded, so depthbuf is
+ * still precisely the episode-entry image. All results stay on the device
+ * until the already-drained context cleanup report.
+ */
+static bool
+cp_opaque_hiz_census_alloc(struct cp_context *cp, unsigned ntiles)
+{
+   if (!cp->hiz_census_stats) {
+      if (cuMemAllocManaged(&cp->hiz_census_stats,
+                            sizeof(struct cp_hiz_census_stats),
+                            CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS)
+         return false;
+      memset((void *)(uintptr_t)cp->hiz_census_stats, 0,
+             sizeof(struct cp_hiz_census_stats));
+   }
+   if (ntiles <= cp->hiz_census_alloc)
+      return true;
+
+   CUdeviceptr depth = 0, before = 0, after = 0;
+   size_t bytes = (size_t)ntiles * sizeof(uint32_t);
+   if (cuMemAlloc(&depth, bytes) != CUDA_SUCCESS ||
+       cuMemAlloc(&before, bytes) != CUDA_SUCCESS ||
+       cuMemAlloc(&after, bytes) != CUDA_SUCCESS) {
+      if (depth)
+         cuMemFree(depth);
+      if (before)
+         cuMemFree(before);
+      if (after)
+         cuMemFree(after);
+      return false;
+   }
+   if (cp->hiz_census_depth)
+      cuMemFree(cp->hiz_census_depth);
+   if (cp->hiz_census_before)
+      cuMemFree(cp->hiz_census_before);
+   if (cp->hiz_census_after)
+      cuMemFree(cp->hiz_census_after);
+   cp->hiz_census_depth = depth;
+   cp->hiz_census_before = before;
+   cp->hiz_census_after = after;
+   cp->hiz_census_alloc = ntiles;
+   return true;
+}
+
+static void
+cp_opaque_hiz_census(struct cp_context *cp, struct cp_pass_seg *segs,
+                      unsigned nsegs, unsigned w, unsigned h)
+{
+   if (!cp_debug->hiz_census)
+      return;
+   cp->hiz_census_seen++;
+   struct cp_kernels *k = &cp->dev->kernels;
+   if (cp->hiz_census_failed || cp_debug->unsafe_force_opaque ||
+       cp_debug->tiled_opaque || cp_timing_enabled() ||
+       !k->hiz_census_build || !k->hiz_census_count ||
+       !k->hiz_census_reduce) {
+      cp->hiz_census_refused_mode++;
+      return;
+   }
+   if (!nsegs || !w || !h || !cp->depthbuf) {
+      cp->hiz_census_refused_state++;
+      return;
+   }
+
+   unsigned func = segs[0].batch.state.depth.depth_func;
+   for (unsigned s = 0; s < nsegs; s++) {
+      const struct cp_draw_state *state = &segs[s].batch.state;
+      const struct cp_render_scope *scope = &segs[s].batch.scope;
+      if (!scope->fb.has_zs || MAX2(scope->attachment_samples, 1u) != 1 ||
+          state->blend.enable || !state->depth.depth_enabled ||
+          !state->depth.depth_writemask || state->depth.depth_func != func ||
+          (func != CP_FUNC_LESS && func != CP_FUNC_LEQUAL &&
+           func != CP_FUNC_GREATER && func != CP_FUNC_GEQUAL) ||
+          !state->fs || state->fs->uses_discard || state->fs->writes_memory) {
+         cp->hiz_census_refused_state++;
+         return;
+      }
+      if (!state->hiz_stencil_safe) {
+         cp->hiz_census_refused_stencil++;
+         return;
+      }
+      if (state->fs->writes_frag_depth) {
+         cp->hiz_census_refused_fragdepth++;
+         return;
+      }
+   }
+
+   unsigned tiles_x = DIV_ROUND_UP(w, CP_HIZ_CENSUS_TILE);
+   unsigned tiles_y = DIV_ROUND_UP(h, CP_HIZ_CENSUS_TILE);
+   unsigned ntiles = tiles_x * tiles_y;
+   if (!ntiles || !cp_opaque_hiz_census_alloc(cp, ntiles)) {
+      cp->hiz_census_refused_state++;
+      return;
+   }
+   struct cp_hiz_census_args args = {
+      .hiz = cp->hiz_census_depth,
+      .tile_before = cp->hiz_census_before,
+      .tile_after = cp->hiz_census_after,
+      .stats = cp->hiz_census_stats,
+      .width = w,
+      .height = h,
+      .tiles_x = tiles_x,
+      .tiles_y = tiles_y,
+      .depth_func = func,
+   };
+   CUresult err;
+   void *bp[] = { &segs[0].rast, &args };
+   err = cp_launch(cp, k->hiz_census_build, ntiles, 1, 1, 1, 1, 1, 0,
+                   cp->stream, bp, NULL);
+   for (unsigned s = 0; err == CUDA_SUCCESS && s < nsegs; s++) {
+      unsigned n = segs[s].rast_num_triangles;
+      if (!n)
+         continue;
+      void *p[] = { &segs[s].rast, &args };
+      err = cp_launch(cp, k->hiz_census_count, DIV_ROUND_UP(n, 256),
+                      1, 1, 256, 1, 1, 0, cp->stream, p, NULL);
+   }
+   if (err == CUDA_SUCCESS) {
+      void *rp[] = { &args };
+      err = cp_launch(cp, k->hiz_census_reduce, 1, 1, 1, 256, 1, 1, 0,
+                      cp->stream, rp, NULL);
+   }
+   if (err != CUDA_SUCCESS) {
+      const char *name = NULL;
+      cuGetErrorName(err, &name);
+      fprintf(stderr, "cudavk: Hi-Z census launch failed: %s (%d)\n",
+              name ? name : "unknown", err);
+      cp->hiz_census_failed = true;
+      return;
+   }
+   cp->hiz_census_admitted++;
+   cp->hiz_census_segments += nsegs;
+   for (unsigned s = 0; s < nsegs; s++)
+      cp->hiz_census_draws += segs[s].batch.ndraws;
+}
+
 static void
 cp_opaque_finish(struct cp_context *cp)
 {
@@ -7892,6 +8106,8 @@ cp_opaque_finish(struct cp_context *cp)
     * price of the fan-out and none of its benefit. */
    if (cp_opaque_side_streams(cp) && !cp_pass_join(cp, nsegs - 1))
       return;
+
+   cp_opaque_hiz_census(cp, segs, nsegs, w, h);
 
    if (cp_debug->tiled_opaque &&
        !cp_opaque_tile_visibility(cp, segs, nsegs, w, h)) {

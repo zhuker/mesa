@@ -86,6 +86,9 @@ struct cp_kernels {
    CUfunction tile_census_mark_vis;
    CUfunction tile_census_refs;
    CUfunction tile_census_reduce;
+   CUfunction hiz_census_build;
+   CUfunction hiz_census_count;
+   CUfunction hiz_census_reduce;
    CUfunction abuf_seg_prefix;
    CUfunction abuf_prepare_shade_count;
    CUfunction opaque_tile_count;

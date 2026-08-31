@@ -5117,6 +5117,8 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    bin->nir_num_outputs = nir->num_outputs;
    bin->nir_num_inputs = nir->num_inputs;
    bin->is_fragment = nir->info.stage == MESA_SHADER_FRAGMENT;
+   bin->writes_frag_depth = bin->is_fragment &&
+      (nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_DEPTH));
    bin->vs_num_slots = ctx.vs_num_slots;
    bin->vs_live_slots = ctx.vs_live_slots;
    bin->reads_const_bufs = ctx.reads_const_bufs;

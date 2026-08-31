@@ -317,6 +317,23 @@ struct cp_context {
    uint64_t tile_census_bind_draws; /* draws inside binds, summed */
    bool tile_census_cut;            /* this bind has been interrupted */
 
+   /* Count-only normal-opaque episode-entry stale-depth census. The three
+    * per-tile arrays are grow-only and only 12 bytes per 64-pixel tile. */
+   CUdeviceptr hiz_census_stats;
+   CUdeviceptr hiz_census_depth;
+   CUdeviceptr hiz_census_before;
+   CUdeviceptr hiz_census_after;
+   unsigned hiz_census_alloc;
+   bool hiz_census_failed;
+   uint64_t hiz_census_seen;
+   uint64_t hiz_census_admitted;
+   uint64_t hiz_census_refused_state;
+   uint64_t hiz_census_refused_stencil;
+   uint64_t hiz_census_refused_fragdepth;
+   uint64_t hiz_census_refused_mode;
+   uint64_t hiz_census_segments;
+   uint64_t hiz_census_draws;
+
    /*
     * The episode's side streams. Segment counts, fill relaunches and shades
     * are mutually independent — the per-pixel counts and cursors are

@@ -217,6 +217,9 @@ struct cp_shader_binary {
     * because visibility is resolved before shading. */
    bool uses_discard;
 
+   /* A fragment shader writing gl_FragDepth cannot use geometry-depth Hi-Z. */
+   bool writes_frag_depth;
+
    /* Whether the shader writes globally visible memory. */
    bool writes_memory;
 

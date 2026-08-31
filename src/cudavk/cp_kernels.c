@@ -453,6 +453,12 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
    cuModuleGetFunction(&k->tile_census_refs, k->module, "cp_tile_census_refs");
    cuModuleGetFunction(&k->tile_census_reduce, k->module,
                        "cp_tile_census_reduce");
+   cuModuleGetFunction(&k->hiz_census_build, k->module,
+                       "cp_hiz_census_build");
+   cuModuleGetFunction(&k->hiz_census_count, k->module,
+                       "cp_hiz_census_count");
+   cuModuleGetFunction(&k->hiz_census_reduce, k->module,
+                       "cp_hiz_census_reduce");
    cuModuleGetFunction(&k->abuf_seg_scatter, k->module, "cp_abuf_seg_scatter");
    cuModuleGetFunction(&k->abuf_seg_prefix, k->module, "cp_abuf_seg_prefix");
    cuModuleGetFunction(&k->abuf_prepare_shade_count, k->module,

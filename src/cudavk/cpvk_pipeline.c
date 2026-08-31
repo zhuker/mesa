@@ -1281,6 +1281,7 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
       const VkPipelineDepthStencilStateCreateInfo *dss =
          info->pDepthStencilState;
       bool stencil_visible = false;
+      bool hiz_stencil_safe = true;
       if (dss && dss->stencilTestEnable) {
          const VkStencilOpState *faces[] = { &dss->front, &dss->back };
          for (unsigned f = 0; f < 2; f++) {
@@ -1290,6 +1291,12 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
                 (s->failOp != VK_STENCIL_OP_KEEP ||
                  s->passOp != VK_STENCIL_OP_KEEP ||
                  s->depthFailOp != VK_STENCIL_OP_KEEP));
+            /* A pre-stencil depth rejection may take either the stencil-fail
+             * or depth-fail arm. Pass operations are unreachable when the
+             * census has proved every covered sample fails depth. */
+            hiz_stencil_safe &= !s->writeMask ||
+               (s->failOp == VK_STENCIL_OP_KEEP &&
+                s->depthFailOp == VK_STENCIL_OP_KEEP);
          }
       }
       bool bounds_visible = dss && dss->depthBoundsTestEnable &&
@@ -1324,6 +1331,7 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
       }
       cpvk_pipeline_init_ref(dev, pipeline, pAllocator);
       pipeline->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
+      pipeline->hiz_stencil_safe = hiz_stencil_safe;
 
       /* Both stages through the cache, so identical SPIR-V compiles once and
        * two pipelines built from it share one binary -- which is what lets

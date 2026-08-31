@@ -933,6 +933,58 @@ struct cp_abuf_seg_args {
 };
 
 /*
+ * Count-only episode-entry stale-depth census. The tile edge is deliberately
+ * fixed to the shipping rasterizer's 64-pixel tile for this first probe.
+ * Nothing in rendering reads these buffers.
+ */
+#define CP_HIZ_CENSUS_TILE 64u
+#define CP_HIZ_CENSUS_CLASSES 3u /* small, medium, huge */
+#define CP_HIZ_CENSUS_FUNCS 4u   /* LESS, LEQUAL, GREATER, GEQUAL */
+#define CP_HIZ_CENSUS_LOG 33u /* bucket 0 is zero, then 1 + floor(log2(n)) */
+
+struct cp_hiz_census_stats {
+   uint64_t episodes;
+   uint64_t valid_prims;
+   uint64_t invalid_prims;
+   uint64_t nonfinite_prims;
+   uint64_t prims[CP_HIZ_CENSUS_CLASSES];
+   uint64_t whole_reject[CP_HIZ_CENSUS_CLASSES];
+   uint64_t refs_before[CP_HIZ_CENSUS_CLASSES];
+   uint64_t refs_after[CP_HIZ_CENSUS_CLASSES];
+   uint64_t bbox_pixels_before[CP_HIZ_CENSUS_CLASSES];
+   uint64_t bbox_pixels_after[CP_HIZ_CENSUS_CLASSES];
+   uint64_t covered_before[CP_HIZ_CENSUS_CLASSES];
+   uint64_t covered_after[CP_HIZ_CENSUS_CLASSES];
+   uint64_t refs_by_func[CP_HIZ_CENSUS_FUNCS];
+   uint64_t kept_by_func[CP_HIZ_CENSUS_FUNCS];
+   uint64_t empty_coverage_refs;
+   uint64_t equality_blocked_refs;
+   uint64_t tile_probes;
+   uint64_t tiles_built;
+   uint64_t depth_words_read;
+   uint64_t longest_before_sum;
+   uint64_t longest_after_sum;
+   uint64_t longest_before_max;
+   uint64_t longest_after_max;
+   uint64_t empty_tiles_before;
+   uint64_t empty_tiles_after;
+   uint64_t longest_before_hist[CP_HIZ_CENSUS_LOG];
+   uint64_t longest_after_hist[CP_HIZ_CENSUS_LOG];
+};
+
+struct cp_hiz_census_args {
+   uint64_t hiz;             /* uint32 max (LESS) or min (GREATER) per tile */
+   uint64_t tile_before;     /* uint32 conceptual refs per tile */
+   uint64_t tile_after;      /* uint32 refs surviving stale depth per tile */
+   uint64_t stats;           /* struct cp_hiz_census_stats */
+   uint32_t width;
+   uint32_t height;
+   uint32_t tiles_x;
+   uint32_t tiles_y;
+   uint32_t depth_func;
+};
+
+/*
  * Tile shader census: how many distinct fragment shaders would land in one
  * tile's bin, and whether they arrive in contiguous runs of submission order.
  *
