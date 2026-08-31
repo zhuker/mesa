@@ -1608,6 +1608,150 @@ must win on both captures.
 
 ---
 
+## 31. One-visbuf depth-only chain deferral — REFUTED (0.170 ms/frame whole safe pool)
+
+2026-08-31, favorite3 real frames. Diagnostic branch
+`diag/depthonly-census`, commits `25a4c4f3190` through `7eebcbf44ff`; no
+production source merged. Count/correctness output is under
+`/tmp/depthonly-f3/`; the complete bounded traces are the three overlapping
+registered-NVTX reports under `/tmp/depthonly-chunks/`.
+
+**Tried.** Classify direct `cp_shade_fragments()` calls which produce depth but
+no observable color, multisample coverage, discard/demote, shader memory
+side effect, special fragment output, query observation, peel/retry result or
+unsupported depth result. Consecutive safe calls are the population a future
+one-visbuf-per-scope design could defer and resolve once. Query lifetime is
+tracked over the final flattened primary/secondary stream, not just at the draw
+where a query begins or ends. Each admitted call has a dedicated
+`depthonly-safe submit=... scope_exec=... serial=... run=... chain=...` NVTX
+range around the exact direct shade call and no census CUDA work.
+
+**Correct population.** The unprofiled arm has all 6,939 timestamp events, the
+standard stdout hash and 18/18 exact sentinels. The flag-off suite is 79/79.
+The selected target contains 71,123 direct shade calls, of which 40,184 are
+structurally depth-only and 37,406 are exactly safe. They form 2,876 runs:
+1,120 singleton and 1,756 multi-chain runs containing 36,286 calls, maximum
+length 34. Classification, run sum, run kind/shape and absolute chain/run
+sequence checks all pass; final internal command-bearing submit is 6,947.
+
+**Exact clean-trace price.** A whole-process CUDA trace silently stopped before
+this late population, so the final trace used registered process ranges in
+three overlapping internal-submit windows. Plain NVTX strings are recorded by
+Nsight Systems 2026.4.1 but do not trigger `--capture-range=nvtx`; the domain
+and message must be registered. Overlaps were deduplicated by the complete
+absolute range label, preferring the later report. All 37,406 unique calls are
+present and every one contains exactly one correlated kernel of each expected
+class, joined host launch -> GPU activity by correlation ID:
+
+| selected kernel | launches | device time/frame |
+|---|---:|---:|
+| `cp_fs_compact` | 37,406 | 0.092105 ms |
+| generated FS `main` | 37,406 | 0.053595 ms |
+| `cp_fs_writeback` | 37,406 | 0.024089 ms |
+| **whole direct chain** | **112,218** | **0.169790 ms** |
+
+The selected kernels do not overlap, so summed and union time are identical.
+Nsight emits a generic “might not have collected” diagnostic when each bounded
+capture stops. Completeness here does not rely on that warning being absent: it
+comes from the full 37,406-label identity set, exact overlap equality, three
+kernels per label and complete correlation joins.
+
+**Mechanism.** The earlier broad direct-shade union was 0.693 ms/frame, but only
+0.170 ms/frame belongs to calls the required visibility rewrite may legally
+collect. Even deleting every compact, fragment and writeback kernel in every
+safe run is below the 0.5 ms build gate, before the one-visbuf resolve, state
+retention and final commit cost. Long run counts do not make the affected
+kernel time larger.
+
+**Retry if.** A later capture makes the exact safe-chain union exceed 0.5
+ms/frame, or another already-required mechanism provides the shared visbuf and
+resolve for free. Preserve the lifetime query refusal and exact output/side-
+effect gates. Do not price this proposal from all direct shade calls.
+
+**Cost.** One host/NVTX census, a flag-off suite, two full sentinel replays and
+three bounded CUDA/NVTX reports. Favorite2 was not run because favorite3's
+entire legal pool is only one third of the admission threshold.
+
+---
+
+## 32. Immutable two-slot segment-0 shading overlap — REFUTED (0.036 ms/frame useful chain)
+
+2026-08-31, favorite3 real frames. Diagnostic branch
+`diag/two-slot-census`, commits `f2dcee0a156` through `bb04f1dce67`; no
+production source merged. Count output is under `/tmp/slot0-weight-f3/`; the
+complete clean labels-only trace is the three-report set under
+`/tmp/slot0-chunks/`.
+
+**Tried.** Measure the only correct speculative form left after the mutable-
+visbuf design was rejected: snapshot immutable segment-0 candidates before the
+segment-1 gate, shade them into private provisional storage while later
+segments rasterize, then retain only candidates which are still final winners.
+The census snapshots raw queue evidence on the owning stream, reduces exact
+2x2 quads after the ordinary join, and attributes candidate/useful/killed/final
+quads to full stable 256-bit fragment-shader content identities. It does not
+use pointers, process-local bins or selected ordinals as shader identity.
+
+**Population proof.** Both census and clean labels arms count every nonempty
+physical episode from process start and hash an arm-independent v2 population
+record: command-bearing submit, absolute episode ID, dimensions, primitive end,
+segment count and each ordered segment's primitive base/slots and full shader
+key. Both arms produce 3,759 selected episodes and the identical digest
+`4f8b99ac67fdf356553ebca7f74ee920340ebc54eed812801c4985062c66cc82`.
+The labels arm records 34,765 expected, attempted and successful keyed generated
+FS launches, with zero setup, ID, overflow, active-scope or per-scope mismatch.
+The full replay has 6,939 timestamp events, the standard hash and 18/18 exact
+sentinels; the final branch passes 79/79 tests.
+
+The count-only result is:
+
+| quad quantity | count |
+|---|---:|
+| segment-0 candidates | 43,826,342 |
+| still-useful candidates | 25,563,331 (58.33% of candidates) |
+| overwritten/killed candidates | 18,263,011 (41.67%) |
+| ordinary final quads | 584,640,942 |
+| useful share of ordinary final work | **4.37%** |
+
+**Full-key timing, without scaling a partial trace.** Whole-process CUPTI
+collection reached its event/buffer boundary before the selected population.
+Three overlapping registered-NVTX submit windows cover it instead. Inner
+`fs/<64-hex-key>` ranges were joined to GPU `main` by correlation ID, nested in
+outer `slot0-selected/episode=<absolute>/ordinal=<selected>` ranges, and
+deduplicated by `(absolute episode ID, inner launch ordinal)`, preferring the
+later overlap. The result has exactly 3,759 unique outer episodes and 34,765
+unique keyed launches; every inner range has exactly one generated `main`, and
+overlap keys, grids and kernel sequences agree exactly.
+
+The current serial selected chains cost 0.108640 ms/frame compact, 0.415560
+ms/frame generated FS and 0.032081 ms/frame writeback: **0.556281 ms/frame**
+total. Weighting each full-key chain by that shader's exact useful/final quad
+ratio gives only **0.036406 ms/frame** of useful work which correct speculation
+could hide. Candidate speculation would execute 0.280788 ms/frame at the same
+optimistic linear price, of which **0.244381 ms/frame is killed**. Generated FS
+alone contributes 0.021904 ms/frame useful. These projections already favor
+the proposal: they ignore per-draw fixed cost, private provisional storage,
+extra launches and the one final attachment commit.
+
+**Mechanism.** Aggregate candidate survival looked substantial, but it is
+concentrated in a small share of ordinary shaded work. Full shader weighting
+raises the earlier average-cost estimate, but only to 0.036 ms/frame, while
+wrong speculation costs about seven times as much. The immutable architecture
+is correct in principle; its real population is not economically useful.
+
+**Retry if.** A future capture changes the full-key useful-chain price by more
+than an order of magnitude, or provisional shading becomes a free by-product
+of another renderer. Preserve absolute episode IDs, structural population
+digests and actual attempted/successful launch accounting. Never scale a
+bounded early trace against full census counts, and never compare NVTX host
+timestamps directly with GPU timestamps.
+
+**Cost.** One exact count census, two independent reviews, a 79-test suite, a
+full sentinel replay, a clean full-key labels arm and three bounded CUDA/NVTX
+reports. Favorite2 was not run because favorite3 is two orders of magnitude
+below the build gate after mandatory wasted speculation.
+
+---
+
 ## The rules these produced
 
 Each is tied to the evidence that produced it. They are ordered by how often they
@@ -1686,3 +1830,12 @@ would have saved an iteration.
     kernel on 74.9% of real chain launches (`PERFORMANCE.md` §4). Quote a
     removal lead as a range. The wrong one of these two numbers would have put
     the launch axis at the top of the 2026-08-27 ranking.
+16. **A report file is not a trace-completeness proof.** The favorite3
+    whole-process CUPTI reports stopped CUDA activity before the late selected
+    population while the replay still completed and the report looked valid.
+    Nsight Systems 2026.4.1 records plain NVTX strings but requires a registered
+    domain/message to trigger `--capture-range=nvtx`. Bound large captures,
+    overlap them, deduplicate by absolute work identity and require every
+    expected host launch to have its correlation-ID GPU activity. A generic
+    collection warning is neither proof of loss in that selected set nor proof
+    that the set is complete.
