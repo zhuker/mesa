@@ -312,6 +312,9 @@ cpvk_texture_cache_written(void *private_data, uint64_t image_cookie,
       cpvk_cache_device_loss(dev);
       return;
    }
+   if (cp_debug->debug_tex && image->mem)
+      fprintf(stderr, "written: base=%p\n",
+              (void *)(uintptr_t)(image->mem->dev_ptr + image->offset));
    cpvk_texture_cache_image_written(image, stream);
 }
 
@@ -670,6 +673,9 @@ cpvk_texture_cache_resolve_locked(struct cpvk_device *dev,
       }
    }
    *out = object->object;
+   if (cp_debug->debug_tex && image->mem)
+      fprintf(stderr, "sampled: base=%p\n",
+              (void *)(uintptr_t)(image->mem->dev_ptr + image->offset));
    dev->texture_cache_stats.hits++;
    return CP_TEXTURE_CACHE_READY;
 miss:

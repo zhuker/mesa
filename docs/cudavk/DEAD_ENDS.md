@@ -82,6 +82,7 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 24 | The opaque sort-middle tiling prototype, and a v2 of it | 2026-08-27 audit | REFUTED | best case **2.1–2.6 ms/frame** against the **+2.73 ms** fan-out it has to surrender |
 | 25 | Device-side episode chaining: CDP2 tails, predicated pre-issue, conditional graphs | 2026-08-30, HeadlessStreamer | REFUTED | a device tail launch costs **7.3–8.7 µs against 1.5 host** on sm_120; the admissible unit is 0.037 ms/frame |
 | 26 | Emptying the stage3→fs_compact link: interp-in-argblock and compact PDL | 2026-08-30, HeadlessStreamer | REFUTED | INTERP_INLINE **+0.13 ms slower**; COMPACT_PDL inert without it; both in-tree, default off |
+| 27 | Scope-level concurrency: overlapping independent render scopes | 2026-08-30 census | REFUTED | the scope DAG is a chain — 10.0 scopes/frame at depth 8.0–9.0, max width 2 |
 
 ---
 
@@ -1387,6 +1388,35 @@ queue ≤ grid** and the median launch leaves 500 of 512 blocks idle. The longes
 block holds *one* item. Compaction and rebalancing buy nothing here; only more
 warps per item or more items per launch can — and by the exclusive-fraction rule
 the whole question is worth under 0.4 ms/frame of device time. See entry 10.
+
+---
+
+## 27. Scope-level concurrency — overlapping independent render scopes — REFUTED
+
+2026-08-30, HeadlessStreamer occlusion capture, nothing built. The idea: the
+segment fan-out one level up — run data-independent render scopes' whole
+episode chains concurrently on their own streams, since the frame is
+latency shells at 3–6% SM issue and concurrent chains would overlap for
+free.
+
+**Measured.** A three-print execute-time census (`exec-scope:`/`sampled:`/
+`written:` behind `CUDAVK_DEBUG_RT`+`CUDAVK_DEBUG_TEX`) over the whole
+replay, 1,189 steady-state frames: **10.0 scopes/frame, dependency-DAG
+critical path 9.0, maximum level width 2.0** — parallelism ratio 1.11×.
+With only true read-after-write edges (anti- and output-dependencies
+assumed breakable by copies): depth 8.0, ratio 1.25×. About one adjacent
+scope pair per frame shares a write target (a single scope-fusion
+candidate, ≤0.3 ms class, unpursued).
+
+**Mechanism.** The content is a pipeline, not a fan: each scope samples its
+predecessor's output. There is no independent-cascade population — the
+shadow work feeds the main pass, the main pass feeds the post chain.
+
+**Retry if.** A workload appears whose scope census (the prints are one
+flag away) shows width ≥3 over a meaningful share of frames. The
+scheduling machinery should not be built ahead of that number.
+
+**Cost.** Three debug prints, kept in-tree, and one instrumented replay.
 
 ---
 

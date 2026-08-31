@@ -4939,6 +4939,11 @@ void
 cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 {
    cp->plan.flushes++;
+   if (cp_debug->debug_rt)
+      fprintf(stderr, "exec-scope: serial=%u color=%p depth=%p\n",
+              batch->scope.serial,
+              (void *)(uintptr_t)batch->scope.fb.color,
+              (void *)(uintptr_t)batch->scope.depth.data);
    unsigned batch_draws = batch->ndraws;
    const struct cp_draw_call *info = &batch->info;
    unsigned drawid_offset = batch->drawid_offset;

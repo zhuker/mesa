@@ -1520,6 +1520,9 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
 
+   if (cp_debug->debug_rt)
+      fprintf(stderr, "scope-begin:\n");
+
    const VkRenderingAttachmentInfo *stencil =
       pRenderingInfo->pStencilAttachment;
    bool unsupported_stencil = stencil && stencil->imageView &&
@@ -1653,6 +1656,9 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       dimg = view->image;
       unsigned level = MIN2(view->vk.base_mip_level,
                             CPVK_MAX_MIP_LEVELS - 1);
+      if (cp_debug->debug_rt)
+         fprintf(stderr, "rtdepth: base=%p\n",
+                 (void *)(uintptr_t)(dimg->mem->dev_ptr + dimg->offset));
       if (!cimg) {
          fb.width = u_minify(dimg->vk.extent.width, level);
          fb.height = u_minify(dimg->vk.extent.height, level);
