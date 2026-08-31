@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-129 switches.
+130 switches.
 
 ## Tracing
 
@@ -47,6 +47,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_DEBUG_EPISODE` | bool (presence) | `off` | — | trace episode boundaries: what appended to an episode and what cut it |
 | `CUDAVK_DEBUG_RT` | bool (presence) | `off` | — | trace descriptor writes, the attachments a render pass resolved to, and the first texels either side of an image copy; the copies sync |
 | `CUDAVK_DEBUG_FACES` | bool (presence) | `off` | — | when a cube descriptor is written, read back the first texel of each of its six faces from where the sampler will look; syncs |
+| `CUDAVK_VERTEX_REUSE_CENSUS` | bool (value) | `off` | — | diagnostic exact per-executed-batch post-transform input reuse census; invalid for timing |
 
 ## Subsystem switches
 

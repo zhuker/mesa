@@ -35,6 +35,12 @@ static const char cp_vertex_fetch_src[] =
 #include "cp_vertex_fetch.cu.inc"
 ;
 
+/* A separate diagnostic program.  It is compiled and loaded only when the
+ * value flag is enabled, so the normal NVRTC inputs and modules are unchanged. */
+static const char cp_vertex_reuse_src[] =
+#include "cp_vertex_reuse.cu.inc"
+;
+
 
 /* The physical device owns this cache.  Native exposes one CUDA device per
  * process today; keeping the pointer here also covers lazily compiled sampler
@@ -493,6 +499,22 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
       goto fail;
    cuModuleGetFunction(&k->vertex_fetch, k->vfetch_module, "cp_vertex_fetch");
 
+   if (cp_debug->vertex_reuse_census) {
+      if (!build_module(&k->vertex_reuse_module, cp_vertex_reuse_src,
+                        "cp_vertex_reuse.cu", sm_major, sm_minor)) {
+         fprintf(stderr, "cudavk: vertex reuse census module unavailable; "
+                         "all batches will be excluded\n");
+      } else if (cuModuleGetFunction(&k->vertex_reuse_census,
+                                     k->vertex_reuse_module,
+                                     "cp_vertex_reuse_census") !=
+                 CUDA_SUCCESS) {
+         fprintf(stderr, "cudavk: vertex reuse census entry unavailable; "
+                         "all batches will be excluded\n");
+         cuModuleUnload(k->vertex_reuse_module);
+         k->vertex_reuse_module = NULL;
+      }
+   }
+
    /* Kept as relocatable PTX rather than a module: it is linked into each
     * shader that samples textures, not launched on its own. */
    k->sampler_ptx = compile_sampler_source("cp_sampler.cu", sm_major,
@@ -534,6 +556,8 @@ cp_kernels_destroy(struct cp_kernels *k)
       cuModuleUnload(k->fs_module);
    if (k->vfetch_module)
       cuModuleUnload(k->vfetch_module);
+   if (k->vertex_reuse_module)
+      cuModuleUnload(k->vertex_reuse_module);
    free(k->sampler_ptx);
    free(k->math_ptx);
    for (unsigned i = 0; i < CP_SAMPLER_OPT_COUNT; i++)

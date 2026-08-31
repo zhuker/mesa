@@ -132,8 +132,8 @@ endif
 # into a C string the driver can hand it.
 cpvk_kernel_incs = []
 foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_math.cu', 'cp_fs.cu',
-                  'cp_vertex_fetch.cu', 'cp_rast_types.h', 'cp_fs_interp.h',
-                  'cp_vf_lane.h']
+                  'cp_vertex_fetch.cu', 'cp_vertex_reuse.cu',
+                  'cp_rast_types.h', 'cp_fs_interp.h', 'cp_vf_lane.h']
   cpvk_kernel_incs += custom_target(
     'cpvk_' + kernel + '.inc',
     input : ['kernels/' + kernel],

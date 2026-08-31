@@ -160,6 +160,9 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
+   if (cp_debug->vertex_reuse_census && submit->command_buffer_count)
+      cp_vertex_reuse_submit(&dev->renderer);
+
    CPVK_CTX_SCOPE(dev);
 
    /*

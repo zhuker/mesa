@@ -102,6 +102,27 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
    cp->main_stream = cp->stream;
    cp->main_stream_serial = cp_texture_stream_serial_alloc(dev);
 
+   if (cp_debug->vertex_reuse_census) {
+      const size_t result_bytes = (size_t)CP_VERTEX_REUSE_CAPACITY *
+                                  sizeof(struct cp_vertex_reuse_result);
+      cp->vertex_reuse.meta = calloc(CP_VERTEX_REUSE_CAPACITY,
+                                     sizeof(*cp->vertex_reuse.meta));
+      cp->vertex_reuse.setup_ok = dev->kernels.vertex_reuse_census &&
+                                  cp->vertex_reuse.meta;
+      if (cp->vertex_reuse.setup_ok &&
+          cuMemAlloc(&cp->vertex_reuse.results, result_bytes) == CUDA_SUCCESS) {
+         if (cuMemsetD8(cp->vertex_reuse.results, 0, result_bytes) !=
+             CUDA_SUCCESS) {
+            cuMemFree(cp->vertex_reuse.results);
+            cp->vertex_reuse.results = 0;
+            cp->vertex_reuse.setup_ok = false;
+         }
+      } else {
+         cp->vertex_reuse.results = 0;
+         cp->vertex_reuse.setup_ok = false;
+      }
+   }
+
    /* The flush's generation ring; see cp_flush. A failed event creation
     * falls back to the draining flush by leaving flush_retire[0] null. */
    cp->flush_gens = cp_debug->flush_drain ? 1 : CP_FLUSH_GENS;
@@ -982,6 +1003,289 @@ cp_hardware_texture_report(struct cp_context *cp)
               cp->hardware_texture.authoritative_oom_retries);
 }
 
+
+void
+cp_vertex_reuse_submit(struct cp_context *cp)
+{
+   if (!cp_debug->vertex_reuse_census)
+      return;
+   cp->vertex_reuse.submit_ordinal++;
+   cp->vertex_reuse.batch_ordinal = 0;
+}
+
+_Static_assert(sizeof(struct cp_vertex_fetch_args) == 904,
+               "vertex reuse fetch ABI");
+_Static_assert(sizeof(struct cp_vertex_reuse_result) == 24,
+               "vertex reuse result ABI");
+_Static_assert(offsetof(struct cp_vertex_reuse_result, probes) == 8,
+               "vertex reuse probes ABI");
+_Static_assert(offsetof(struct cp_vertex_reuse_result, overflow) == 16,
+               "vertex reuse overflow ABI");
+_Static_assert(offsetof(struct cp_vertex_reuse_result, bad_lanes) == 20,
+               "vertex reuse bad lanes ABI");
+
+static unsigned
+cp_vertex_reuse_bank_index(const struct cp_context *cp)
+{
+   if (cp->stream == cp->main_stream)
+      return 0;
+   for (unsigned i = 0; i < CP_PASS_STREAMS; i++)
+      if (cp->stream == cp->seg_streams[i])
+         return i + 1;
+   return CP_VERTEX_REUSE_BANKS;
+}
+
+static bool
+cp_vertex_reuse_capacity(uint64_t total, uint32_t *out)
+{
+   if (!total || total > (1ull << 30))
+      return false;
+   uint64_t need = total * 2;
+   uint64_t cap = 2;
+   while (cap < need)
+      cap <<= 1;
+   if (cap > UINT32_MAX)
+      return false;
+   *out = (uint32_t)cap;
+   return true;
+}
+
+/* Called only after the real vertex shader launch, on the same stream. */
+static void
+cp_vertex_reuse_launch(struct cp_context *cp,
+                       const struct cp_vertex_fetch_args *vf,
+                       uint64_t batch_ordinal, bool fused, bool fetch_runs,
+                       bool indexed, bool writes_memory)
+{
+   if (!cp_debug->vertex_reuse_census)
+      return;
+
+   cp->vertex_reuse.population++;
+   if (cp->vertex_reuse.reserved >= CP_VERTEX_REUSE_CAPACITY ||
+       !cp->vertex_reuse.meta) {
+      cp->vertex_reuse.record_overflow++;
+      return;
+   }
+
+   const uint64_t slot = cp->vertex_reuse.reserved++;
+   struct cp_vertex_reuse_meta *m = &cp->vertex_reuse.meta[slot];
+   m->submit_ordinal = cp->vertex_reuse.submit_ordinal;
+   m->batch_ordinal = batch_ordinal;
+   m->total = vf->num_verts;
+   m->fused = fused;
+   m->fetch_runs = fetch_runs;
+   m->indexed = indexed;
+   m->writes_memory = writes_memory;
+   /* writes_memory is available. Subgroup/clock/query/XFB eligibility is not
+    * retained by this driver, so B0 cannot claim the semantic gate complete. */
+   m->semantic_metadata_complete = 0;
+
+   unsigned bank_index = cp_vertex_reuse_bank_index(cp);
+   uint32_t wanted = 0;
+   if (!cp->vertex_reuse.setup_ok ||
+       !cp->dev->kernels.vertex_reuse_census ||
+       !cp_vertex_reuse_capacity(vf->num_verts, &wanted) ||
+       bank_index >= CP_VERTEX_REUSE_BANKS) {
+      m->status = CP_VERTEX_REUSE_EXCLUDED_SETUP;
+      return;
+   }
+   m->bank = bank_index;
+   struct cp_vertex_reuse_bank *bank = &cp->vertex_reuse.banks[bank_index];
+
+   if (bank->capacity < wanted) {
+      struct cp_vertex_reuse_table_alloc *node = calloc(1, sizeof(*node));
+      CUdeviceptr table = 0;
+      size_t bytes = (size_t)wanted * 16u;
+      if (!node || cuMemAlloc(&table, bytes) != CUDA_SUCCESS) {
+         free(node);
+         m->status = CP_VERTEX_REUSE_EXCLUDED_ALLOC;
+         return;
+      }
+      node->ptr = table;
+      node->next = bank->allocations;
+      bank->allocations = node;
+      if (cuMemsetD32Async(table, 0, bytes / sizeof(uint32_t), cp->stream) !=
+          CUDA_SUCCESS) {
+         /* Retain it for cleanup, but never publish uninitialized storage. */
+         m->status = CP_VERTEX_REUSE_EXCLUDED_ALLOC;
+         return;
+      }
+      bank->table = table;
+      bank->capacity = wanted;
+   }
+
+   /* Zero is reserved for never-written entries. The shift leaves one phase
+    * bit; wrapping would make stale entries current, so exclude it. */
+   if (bank->generation >= 0x7fffffffu) {
+      m->status = CP_VERTEX_REUSE_EXCLUDED_SETUP;
+      return;
+   }
+   bank->generation++;
+   m->generation = bank->generation;
+   m->table_capacity = bank->capacity;
+
+   struct cp_vertex_fetch_args vf_arg = *vf;
+   uint64_t table_arg = bank->table;
+   uint64_t result_base = cp->vertex_reuse.results +
+                          slot * sizeof(struct cp_vertex_reuse_result);
+   uint64_t unique_arg = result_base +
+      offsetof(struct cp_vertex_reuse_result, unique);
+   uint64_t probes_arg = result_base +
+      offsetof(struct cp_vertex_reuse_result, probes);
+   uint64_t overflow_arg = result_base +
+      offsetof(struct cp_vertex_reuse_result, overflow);
+   uint64_t bad_lanes_arg = result_base +
+      offsetof(struct cp_vertex_reuse_result, bad_lanes);
+   uint32_t capacity_arg = bank->capacity;
+   uint32_t generation_arg = bank->generation;
+   void *params[] = { &vf_arg, &table_arg, &unique_arg, &probes_arg,
+                      &overflow_arg, &bad_lanes_arg, &capacity_arg,
+                      &generation_arg };
+   unsigned blocks = MIN2((vf->num_verts + 255u) / 256u, 4096u);
+   if (!blocks || cp_launch(cp, cp->dev->kernels.vertex_reuse_census,
+                           blocks, 1, 1, 256, 1, 1, 0, cp->stream,
+                           params, NULL) != CUDA_SUCCESS)
+      m->status = CP_VERTEX_REUSE_EXCLUDED_LAUNCH;
+   else
+      m->status = CP_VERTEX_REUSE_LAUNCHED;
+}
+
+static void
+cp_vertex_reuse_report(struct cp_context *cp, bool context_sync_ok)
+{
+   if (!cp_debug->vertex_reuse_census)
+      return;
+
+   const size_t bytes = (size_t)CP_VERTEX_REUSE_CAPACITY *
+                        sizeof(struct cp_vertex_reuse_result);
+   struct cp_vertex_reuse_result *results = calloc(CP_VERTEX_REUSE_CAPACITY,
+                                                    sizeof(*results));
+   bool readable = context_sync_ok && cp->vertex_reuse.setup_ok && results &&
+      cp->vertex_reuse.results &&
+      cuMemcpyDtoH(results, cp->vertex_reuse.results, bytes) == CUDA_SUCCESS;
+   uint64_t total = 0, unique = 0, duplicate = 0;
+   uint64_t admitted = 0, excluded = 0, table_overflow = 0;
+   uint64_t indexed_total = 0, indexed_duplicate = 0;
+   uint64_t nonindexed_total = 0, nonindexed_duplicate = 0;
+   uint64_t fused_total = 0, fused_duplicate = 0;
+   uint64_t standalone_total = 0, standalone_duplicate = 0;
+
+   for (uint64_t i = 0; i < cp->vertex_reuse.reserved; i++) {
+      const struct cp_vertex_reuse_meta *m = &cp->vertex_reuse.meta[i];
+      const struct cp_vertex_reuse_result zero = {0};
+      const struct cp_vertex_reuse_result *r = readable ? &results[i] : &zero;
+      bool ok = readable && m->status == CP_VERTEX_REUSE_LAUNCHED &&
+                !r->overflow && !r->bad_lanes && r->unique <= m->total;
+      uint64_t u = ok ? r->unique : m->total;
+      uint64_t d = m->total - u;
+      const char *status = "complete";
+      if (!ok) {
+         excluded++;
+         d = 0;
+         u = m->total;
+         if (!readable)
+            status = "excluded_read";
+         else if (m->status == CP_VERTEX_REUSE_EXCLUDED_SETUP)
+            status = "excluded_setup";
+         else if (m->status == CP_VERTEX_REUSE_EXCLUDED_ALLOC)
+            status = "excluded_alloc";
+         else if (m->status == CP_VERTEX_REUSE_EXCLUDED_LAUNCH)
+            status = "excluded_launch";
+         else if (r->overflow) {
+            status = "excluded_table";
+            table_overflow++;
+         } else
+            status = "excluded_lane";
+      } else {
+         admitted++;
+      }
+      total += m->total;
+      unique += u;
+      duplicate += d;
+      if (m->indexed) {
+         indexed_total += m->total;
+         indexed_duplicate += d;
+      } else {
+         nonindexed_total += m->total;
+         nonindexed_duplicate += d;
+      }
+      if (m->fused) {
+         fused_total += m->total;
+         fused_duplicate += d;
+      } else {
+         standalone_total += m->total;
+         standalone_duplicate += d;
+      }
+      fprintf(stderr,
+         "CUDAVK_VERTEX_REUSE_RECORD version=%u index=%" PRIu64
+         " status=%s submit=%" PRIu64 " batch=%" PRIu64
+         " bank=%u generation=%u fused=%u fetch_runs=%u indexed=%u writes_memory=%u"
+         " semantic_metadata_complete=%u total=%" PRIu64
+         " unique=%" PRIu64 " duplicate=%" PRIu64
+         " table_capacity=%u probes=%" PRIu64 " overflow=%u bad_lanes=%u\n",
+         CP_VERTEX_REUSE_VERSION, i, status, m->submit_ordinal,
+         m->batch_ordinal, m->bank, m->generation, m->fused, m->fetch_runs,
+         m->indexed, m->writes_memory, m->semantic_metadata_complete, m->total, u, d,
+         m->table_capacity, r->probes, r->overflow, r->bad_lanes);
+   }
+
+   bool population_ok = cp->vertex_reuse.population ==
+                        cp->vertex_reuse.reserved +
+                        cp->vertex_reuse.record_overflow;
+   bool classification_ok = admitted + excluded == cp->vertex_reuse.reserved &&
+                            indexed_total + nonindexed_total == total &&
+                            fused_total + standalone_total == total;
+   bool result_valid = readable && population_ok && classification_ok &&
+                       cp->vertex_reuse.record_overflow == 0;
+   bool population_screen = total &&
+      (__uint128_t)duplicate * 200u >= (__uint128_t)total * 129u;
+   fprintf(stderr,
+      "CUDAVK_VERTEX_REUSE_SUMMARY version=%u capacity=%u population=%" PRIu64
+      " reserved=%" PRIu64 " complete=%" PRIu64 " admitted=%" PRIu64
+      " excluded=%" PRIu64 " record_overflow=%" PRIu64
+      " table_overflow=%" PRIu64 " final_submit=%" PRIu64
+      " total=%" PRIu64 " unique=%" PRIu64 " duplicate=%" PRIu64
+      " indexed_total=%" PRIu64 " indexed_duplicate=%" PRIu64
+      " nonindexed_total=%" PRIu64 " nonindexed_duplicate=%" PRIu64
+      " fused_total=%" PRIu64 " fused_duplicate=%" PRIu64
+      " standalone_total=%" PRIu64 " standalone_duplicate=%" PRIu64
+      " population_ok=%s classification_ok=%s"
+      " population_screen_64_5=%s cost_join_required=yes"
+      " result_valid=%s diagnostic_timing_invalid=1\n",
+      CP_VERTEX_REUSE_VERSION, CP_VERTEX_REUSE_CAPACITY,
+      cp->vertex_reuse.population, cp->vertex_reuse.reserved,
+      admitted, admitted, excluded,
+      cp->vertex_reuse.record_overflow, table_overflow,
+      cp->vertex_reuse.submit_ordinal, total, unique, duplicate,
+      indexed_total, indexed_duplicate, nonindexed_total,
+      nonindexed_duplicate, fused_total, fused_duplicate, standalone_total, standalone_duplicate,
+      population_ok ? "yes" : "no", classification_ok ? "yes" : "no",
+      population_screen ? "yes" : "no", result_valid ? "yes" : "no");
+   free(results);
+}
+
+static void
+cp_vertex_reuse_cleanup(struct cp_context *cp)
+{
+   if (!cp_debug->vertex_reuse_census)
+      return;
+   if (cp->vertex_reuse.results)
+      cuMemFree(cp->vertex_reuse.results);
+   for (unsigned i = 0; i < CP_VERTEX_REUSE_BANKS; i++) {
+      struct cp_vertex_reuse_table_alloc *node =
+         cp->vertex_reuse.banks[i].allocations;
+      while (node) {
+         struct cp_vertex_reuse_table_alloc *next = node->next;
+         if (node->ptr)
+            cuMemFree(node->ptr);
+         free(node);
+         node = next;
+      }
+   }
+   free(cp->vertex_reuse.meta);
+   memset(&cp->vertex_reuse, 0, sizeof(cp->vertex_reuse));
+}
+
 static void
 cp_spec_report(struct cp_context *cp)
 {
@@ -1004,8 +1308,15 @@ cp_context_cleanup(struct cp_context *cp)
    if (!cp || !cp->dev)
       return;
 
-   if (cuCtxSynchronize() != CUDA_SUCCESS)
-      cp_renderer_texture_fatal(cp);
+   if (!cp_debug->vertex_reuse_census) {
+      if (cuCtxSynchronize() != CUDA_SUCCESS)
+         cp_renderer_texture_fatal(cp);
+   } else {
+      bool sync_ok = cuCtxSynchronize() == CUDA_SUCCESS;
+      if (!sync_ok)
+         cp_renderer_texture_fatal(cp);
+      cp_vertex_reuse_report(cp, sync_ok);
+   }
    /* Release the exclusive cache-use lifetime even on a poisoned context. */
    cp_texture_cache_unpin(cp);
    cp_hardware_texture_report(cp);
@@ -1033,6 +1344,7 @@ cp_context_cleanup(struct cp_context *cp)
    free(cp->abuf);
    cp->abuf = NULL;
    cp_scratch_destroy(cp);
+   cp_vertex_reuse_cleanup(cp);
 
    for (unsigned i = 0; i < cp->timer.cap; i++)
       if (cp->timer.events && cp->timer.events[i])
@@ -4939,6 +5251,8 @@ void
 cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 {
    cp->plan.flushes++;
+   const uint64_t vertex_reuse_batch_ordinal =
+      cp_debug->vertex_reuse_census ? ++cp->vertex_reuse.batch_ordinal : 0;
    if (cp_debug->debug_rt)
       fprintf(stderr, "exec-scope: serial=%u color=%p depth=%p\n",
               batch->scope.serial,
@@ -5916,6 +6230,12 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          CUresult vs_err = cp_launch(cp, vs_exec->kernel,
             MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
             0, cp->stream, vs_params, NULL);
+
+         if (vs_err == CUDA_SUCCESS && cp_debug->vertex_reuse_census)
+            cp_vertex_reuse_launch(cp, &vf_args,
+                                   vertex_reuse_batch_ordinal,
+                                   fused_vfetch, fetch_runs, indexed,
+                                   state->vs->writes_memory);
 
          if (vs_err == CUDA_SUCCESS) {
             /* The rasterizer reads positions directly from VS output */

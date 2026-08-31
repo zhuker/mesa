@@ -172,6 +172,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_DEBUG_FACES", CP_FLAG_BOOL_PRESENCE, F(debug_faces),
      "when a cube descriptor is written, read back the first texel of each of "
      "its six faces from where the sampler will look; syncs" },
+   { "CUDAVK_VERTEX_REUSE_CENSUS", CP_FLAG_BOOL_VALUE,
+     F(vertex_reuse_census),
+     "diagnostic exact per-executed-batch post-transform input reuse census; "
+     "invalid for timing" },
 
    /* ---- subsystem switches ---- */
    { "CUDAVK_NO_ABUFFER", CP_FLAG_BOOL_PRESENCE, F(no_abuffer),

@@ -29,7 +29,6 @@ struct cp_kernels {
    CUmodule module;
    CUmodule clear_module;
    CUmodule fs_module;
-
    /* Clear kernels */
    CUfunction clear_kernel;
    CUfunction clear_depth_kernel;
@@ -121,6 +120,10 @@ struct cp_kernels {
    char *fs_helper_ptx;
 
    bool initialized;
+
+   /* Diagnostic measurement fields stay at the end; see TESTING.md. */
+   CUmodule vertex_reuse_module;
+   CUfunction vertex_reuse_census;
 };
 
 /* Whether the kernels were compiled with the census and A-buffer verification

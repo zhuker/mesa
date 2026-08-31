@@ -21,6 +21,7 @@
 #include <stdio.h>
 
 #include "kernels/cp_rast_types.h"
+#include "cp_vertex_reuse.h"
 
 #include "cp_shader_abi.h"
 
@@ -681,6 +682,20 @@ struct cp_context {
     * Set when a draw joins a batch, cleared when cp_draw_execute_batch() returns.
     */
    bool batch_uploads_live;
+
+   /* Diagnostic measurement fields stay at the end; see TESTING.md. With the
+    * flag false every pointer/counter stays zero and no identity is assigned. */
+   struct {
+      CUdeviceptr results;
+      struct cp_vertex_reuse_meta *meta;
+      struct cp_vertex_reuse_bank banks[CP_VERTEX_REUSE_BANKS];
+      uint64_t submit_ordinal;
+      uint64_t batch_ordinal;
+      uint64_t population;
+      uint64_t reserved;
+      uint64_t record_overflow;
+      bool setup_ok;
+   } vertex_reuse;
 };
 
 
@@ -1078,6 +1093,7 @@ bool cp_clear_rect_masked(struct cp_context *cp, void *data, uint64_t offset,
 
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 void cp_context_cleanup(struct cp_context *cp);
+void cp_vertex_reuse_submit(struct cp_context *cp);
 
 /*
  * A backstop, not a budget. The arena accumulates across the draws of a frame
