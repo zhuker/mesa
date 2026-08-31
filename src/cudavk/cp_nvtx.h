@@ -101,7 +101,12 @@ cp_nvtx_depthonly_pushf(const char *fmt, ...)
    va_start(ap, fmt);
    vsnprintf(buf, sizeof(buf), fmt, ap);
    va_end(ap);
-   return nvtxRangePushA(buf) >= 0;
+   /* NVTX's return value is not a collector-presence oracle: Nsight Systems
+    * 2026.4.1 records the range while this injected call still returns a
+    * negative value. A pushed range must always be popped; report-side range
+    * counts are the evidence that collection occurred. */
+   (void)nvtxRangePushA(buf);
+   return true;
 #else
    (void)fmt;
    return false;
