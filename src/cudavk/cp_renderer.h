@@ -328,7 +328,7 @@ struct cp_context {
    CUdeviceptr hiz_census_queue_snapshots; /* [CP_PASS_MAX_SEGS][2] u32 */
    unsigned hiz_census_alloc;
    bool hiz_census_failed;
-   uint64_t hiz_census_submit;
+   uint64_t hiz_census_submit; /* 1-based command-bearing backend submits */
    uint64_t hiz_census_submit_skipped;
    uint64_t hiz_census_submit_first;
    uint64_t hiz_census_submit_last;

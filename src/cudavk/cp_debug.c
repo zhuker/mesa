@@ -380,8 +380,9 @@ static const struct cp_flag_def flags[] = {
      "changes no rendering", .dflt = 0, .has_range = true, .lo = 0, .hi = 64 },
    { "CUDAVK_HIZ_CENSUS_SUBMIT_START", CP_FLAG_UINT,
      F(hiz_census_submit_start),
-     "skip Hi-Z census episodes while the 1-based queue-submit count is at "
-     "most this value; 0 includes the first submit", .dflt = 0,
+     "skip Hi-Z census episodes while the 1-based command-buffer-bearing "
+     "backend-submit count is at most this value; 0 includes the first such "
+     "submit", .dflt = 0,
      .has_range = true, .lo = 0, .hi = 100000000 },
    { "CUDAVK_TILED_OPAQUE", CP_FLAG_BOOL_VALUE, F(tiled_opaque),
      "use the experimental opaque episode sort-middle tile rasterizer" },

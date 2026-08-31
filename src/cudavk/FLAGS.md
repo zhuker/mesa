@@ -110,7 +110,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_TILE_CENSUS` | uint | `0` | 0&ndash;256 | tile edge in pixels for the blended tile-bin shader census; 0 is off, and it changes no rendering |
 | `CUDAVK_TILE_CENSUS_EVERY` | uint | `2000` | 1&ndash;1000000 | report the tile census this often, in episodes |
 | `CUDAVK_HIZ_CENSUS` | uint | `0` | 0&ndash;64 | tile edge in pixels for conservative stale-depth rejection in normal opaque episodes; 0 is off, 8-64 is the intended census range, and it changes no rendering |
-| `CUDAVK_HIZ_CENSUS_SUBMIT_START` | uint | `0` | 0&ndash;100000000 | skip Hi-Z census episodes while the 1-based queue-submit count is at most this value; 0 includes the first submit |
+| `CUDAVK_HIZ_CENSUS_SUBMIT_START` | uint | `0` | 0&ndash;100000000 | skip Hi-Z census episodes while the 1-based command-buffer-bearing backend-submit count is at most this value; 0 includes the first such submit |
 | `CUDAVK_TILED_OPAQUE` | bool (value) | `off` | — | use the experimental opaque episode sort-middle tile rasterizer |
 | `CUDAVK_TILED_OPAQUE_CENSUS` | bool (value) | `off` | — | collect opaque tile population statistics without changing rendering |
 | `CUDAVK_UNSAFE_NO_OVERFLOW` | bool (value) | `off` | — | skip episode overflow readback and assume fragment/quad arrays fit; unsafe diagnostic only |

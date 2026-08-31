@@ -1020,7 +1020,8 @@ cp_hiz_census_report(struct cp_context *cp)
       /* A failed context sync may make managed memory inaccessible. This line
        * is deliberately host-only: do not even form a stats dereference. */
       fprintf(stderr,
-              "hizcensus tile=%u submit_start=%u submit_current=%" PRIu64
+              "hizcensus tile=%u submit_kind=command_buffer submit_start=%u "
+              "submit_current=%" PRIu64
               " submit_skipped_episodes=%" PRIu64 " submit_first=%" PRIu64
               " submit_last=%" PRIu64 " seen=%" PRIu64 " admitted=%" PRIu64
               " segments=%" PRIu64 " draws=%" PRIu64
@@ -1053,7 +1054,8 @@ cp_hiz_census_report(struct cp_context *cp)
    bool shipping_match = !queue_overflow && snapshot_ok;
    bool result_valid = episodes && reducer_ok && shipping_match;
    fprintf(stderr,
-           "hizcensus tile=%u submit_start=%u submit_current=%" PRIu64
+           "hizcensus tile=%u submit_kind=command_buffer submit_start=%u "
+           "submit_current=%" PRIu64
            " submit_skipped_episodes=%" PRIu64 " submit_first=%" PRIu64
            " submit_last=%" PRIu64 " seen=%" PRIu64 " admitted=%" PRIu64
            " reduced=%" PRIu64 " segments=%" PRIu64 " draws=%" PRIu64
