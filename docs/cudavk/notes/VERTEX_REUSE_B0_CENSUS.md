@@ -90,6 +90,78 @@ subgroup/clock/query/transform-feedback eligibility metadata, so
 Any production reuse design would also need those semantic gates, input
 resource identity and content versions, and versioned descriptor/uniform state.
 
+## Favorite3 result
+
+The implementation is side-branch commit `5445711f243`. Two full compiled
+replays are in `/tmp/vertex-reuse-f3/run1` and `run2`. Both ended with the
+capture's benign post-output `rc=139`, exactly 6,939 complete external shim
+rows and final internal submit 6,947. Both kept stdout SHA-256
+`e3f24a1dcdc8568be217d249e480623958e2621b3d4f056ae4c44ad20d08da49`
+and matched all 18 sentinel frames byte for byte.
+
+Every one of the 210,944 executed batches was admitted. There were no record,
+table, launch, lane or probe exclusions. The two runs agreed on every
+structural field and every exact unique count; only the diagnostic probe count
+varied with atomic scheduling. The whole-process population was 3,545,618,907
+assembled inputs, of which 2,160,968,089 were duplicates (**60.948%**).
+
+For real work, beginning at internal submit 2,784, the count-only population
+was:
+
+| population | total inputs | duplicates | duplicate fraction |
+|---|---:|---:|---:|
+| all real batches | 3,479,473,815 | 2,116,760,651 | **60.836%** |
+| fused VS/fetch | 3,426,230,853 | 2,076,471,075 | **60.605%** |
+| standalone fetch + classic VS | 53,242,962 | 40,289,576 | **75.671%** |
+| indexed | 3,117,299,295 | 2,106,766,521 | **67.583%** |
+| nonindexed, including expanded topology | 362,174,520 | 9,994,130 | **2.759%** |
+
+These ratios are population facts, not the decision metric.
+
+## Clean-trace cost join and decision
+
+`cp_vertex_reuse_cost.py` joins both exact runs to the calibrated 411-frame
+window in `/tmp/postdead/trace.sqlite`. The trace has no NVTX table. The
+fail-closed structural fallback classifies a generated `main` only when its
+immediate same-stream kernel successor is `cp_clip_triangles`,
+`cp_clip_rast_fused` or `cp_clip_rast_fused_abuf`; immediate same-stream
+`cp_vertex_fetch` is the standalone predecessor. Runtime launch APIs join to
+GPU kernels only through `correlationId`.
+
+The join maps all **19,929/19,929** VS records in internal submits
+`[2786,3608)`, plus all **3,087/3,087** standalone fetches. Every absolute
+`(submit,batch)`, grid, bank-to-stream mapping and fetch shape agrees. Exact
+integer calibration and the full fractional result have SHA-256
+`6106732e85413b2110fd269fcd5f1d691bcf443361da2d7c1b039cfb0476c187`.
+
+| clean-trace accounting | ms/frame |
+|---|---:|
+| unweighted VS+fetch summed duration | 1.181784 |
+| unweighted pool union | 0.821026 |
+| unweighted pool union-exclusive | 0.725432 |
+| duplicate-fraction weighted summed duration | 0.582517 |
+| weighted union-exclusive, maximum active fraction | 0.405892 |
+| weighted union-exclusive, active-fraction average | 0.384042 |
+| **generous weighted union-exclusive upper** | **0.437503** |
+
+The decision arm is deliberately more generous than max or average weighting:
+on every pool-exclusive half-open span it credits
+`min(1, sum(active duplicate fractions))`. It still reaches only
+**0.437502653 ms/frame**, below the 0.500-ms/frame admission threshold. This is
+before semantic exclusions, remap/hash construction, reference rewriting,
+extra storage, or cache/version machinery. Vertex reuse therefore does not
+justify a production implementation on favorite3. Favorite2 was not spent
+after the primary capture failed the build gate.
+
+Reproduce the join with:
+
+```
+python3 src/cudavk/tests/cp_vertex_reuse_cost.py \
+  /tmp/vertex-reuse-f3/run1/stderr /tmp/vertex-reuse-f3/run2/stderr \
+  > /tmp/vertex-reuse-cost.json
+python3 src/cudavk/tests/cp_vertex_reuse_cost_test.py -v
+```
+
 ## No-device checks
 
 ```
