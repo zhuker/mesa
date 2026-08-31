@@ -41,6 +41,20 @@ def mode3_summary(count, capacity=None):
     )
 
 
+def mode4_record(index, submit, unit, digest, digest2, isolated=1):
+    return mode3_record(index, submit, unit, digest, digest2).replace(
+        "retry=0", f"retry=0 isolated={isolated}")
+
+
+def mode4_summary(count, capacity=None):
+    if capacity is None:
+        capacity = count
+    return mode3_summary(count, capacity).replace("mode=3", "mode=4") + (
+        " private_banks=9 private_visbuf_bytes=900"
+        " private_scratch_bytes=1800 private_saved_roots_bytes=288"
+    )
+
+
 class TestGeometryB0Cost(unittest.TestCase):
     def write(self, text):
         f = tempfile.NamedTemporaryFile("w", delete=False)
@@ -240,6 +254,70 @@ class TestGeometryB0Cost(unittest.TestCase):
         self.assertEqual(
             union["possible_saving_necessary_condition_upper"]["sum_ms_per_frame"],
             5 / 1_000_000)
+
+    def test_repeated_mode4_complementary_flips_use_union_arm(self):
+        analyzer = cost._load_analyzer()
+        a, b, c = "11" * 32, "22" * 32, "33" * 32
+        x, y, z = "44" * 32, "55" * 32, "66" * 32
+        common = [
+            mode4_record(0, 10, 1, a, x),
+            mode4_record(1, 10, 2, b, y),
+        ]
+        paths = [
+            self.write("\n".join(common + [
+                mode4_record(2, 12, 1, a, x),
+                mode4_record(3, 12, 2, c, z), mode4_summary(4),
+            ])),
+            self.write("\n".join(common + [
+                mode4_record(2, 12, 1, c, z),
+                mode4_record(3, 12, 2, b, y), mode4_summary(4),
+            ])),
+        ]
+        prepared = [cost.prepare_log(path, analyzer, 10) for path in paths]
+
+        n = cost.NAMES
+        units = []
+        activity = []
+        for unit, base in ((1, 10), (2, 20)):
+            pred = launch(n["stage1"], base, base + 1, 100 + base,
+                          unit * 2 - 1)
+            stage2 = launch(n["stage2"], base + 1, base + 2,
+                            101 + base, unit * 2, unit)
+            units.append(cost.Unit(12, unit, pred, stage2, None))
+            activity.extend((pred.device, stage2.device))
+        clip = cost.Interval(1, 2)
+        activity.append(clip)
+
+        arms, rerun = cost.aggregate_arms(
+            prepared, analyzer, units, [clip], activity,
+            0, 100, 12, 13, 1)
+        self.assertTrue(rerun["paired_mode4_repeats"])
+        self.assertEqual([arm["arm"] for arm in arms], [
+            "per_run_diagnostic", "per_run_diagnostic",
+            "conservative_repeat_union",
+        ])
+        self.assertEqual([arm["decision_bearing"] for arm in arms],
+                         [False, False, True])
+        self.assertEqual(
+            [(arm["classification_matched_recurrent"],
+              arm["classification_unmatched_nonrecurrent"])
+             for arm in arms], [(1, 1), (1, 1), (2, 0)])
+        union = arms[-1]
+        self.assertEqual(union["source_logs"], [str(path) for path in paths])
+        self.assertEqual(union["reference_log"], str(paths[0]))
+        self.assertEqual(union["all_clip_intervals_conservative_recurrent"], 1)
+        self.assertEqual(
+            union["possible_saving_necessary_condition_upper"]["sum_ms_per_frame"],
+            5 / 1_000_000)
+
+
+    def test_empty_mode4_is_analyzed_with_explicit_summary_mode(self):
+        analyzer = cost._load_analyzer()
+        path = self.write(mode4_summary(0, capacity=0))
+        prepared = cost.prepare_log(path, analyzer, 10)
+        self.assertEqual(prepared["analysis"]["mode"], 4)
+        self.assertTrue(prepared["analysis"]["paired_domain_checked"])
+        self.assertEqual(prepared["analysis"]["membership_classification"], [])
 
     def test_synthetic_sqlite_correlation_join(self):
         db = sqlite3.connect(":memory:")

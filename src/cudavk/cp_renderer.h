@@ -278,6 +278,7 @@ struct cp_context {
       bool appending;               /* a segment append is inside execute */
       bool append_failed;           /* the append could not take the path */
       bool opaque;                  /* shared-visbuf opaque run, not A-buffer */
+      bool geometry_clear_ok;       /* mode-4 checked episode visbuf clear */
       unsigned w, h;                /* the episode's framebuffer */
       uint64_t hw_attempt_start;
    } pass;
@@ -392,9 +393,10 @@ struct cp_context {
       unsigned  num, cap;
    } timer;
 
-   /* CUDAVK_GEOMETRY_CENSUS B0/B1R. Diagnostic-only host state. All
-    * allocations stay absent in the disabled path; the latter two exist only
-    * for simultaneous-dual-domain mode 3. */
+   /* CUDAVK_GEOMETRY_CENSUS B0/B1R/B1S. Diagnostic-only host state. All
+    * allocations stay absent in the disabled path. Dual-root storage exists
+    * only for simultaneous-dual-domain modes 3 and 4; the nine-bank isolated
+    * storage exists only for mode 4. */
 #define CP_GEOM_B0_EX_APPENDING       0
 #define CP_GEOM_B0_EX_INDIRECT        1
 #define CP_GEOM_B0_EX_VS_MEMORY       2
@@ -418,6 +420,20 @@ struct cp_context {
       CUdeviceptr saved_root;         /* mode 3 device, one 32-byte root */
       CUdeviceptr scratch;            /* device, two Merkle digest planes */
       size_t scratch_bytes;
+      CUdeviceptr private_visbuf;     /* mode 4: nine equal device banks */
+      size_t private_visbuf_bank_bytes;
+      CUdeviceptr private_scratch;    /* mode 4: nine equal Merkle banks */
+      size_t private_scratch_bank_bytes;
+      CUdeviceptr private_saved_roots;/* mode 4: nine disjoint 32-byte roots */
+      struct {
+         struct cp_rasterize_args rast;
+         struct cp_rast_queues queues;
+         struct cp_geom_b0_record record;
+         unsigned triangles;
+         unsigned stage2_blocks;
+         unsigned bank;
+         bool active;
+      } pending;
       uint64_t submit_ordinal;        /* absolute command-bearing submits */
       uint32_t submit_occurrence;     /* low 32 bits of submit ordinal */
       uint32_t unit_ordinal;          /* within the current occurrence */

@@ -45,6 +45,9 @@ def parse_record(line: str) -> dict:
     out["_retry_present"]="retry" in raw
     out["retry"]=int(raw.get("retry","0"),10)
     if out["retry"] not in (0,1): raise CensusError("bad retry")
+    out["_isolated_present"]="isolated" in raw
+    out["isolated"]=int(raw.get("isolated","0"),10)
+    if out["isolated"] not in (0,1): raise CensusError("bad isolated")
     if "sha256_2" in raw:
         if not re.fullmatch(r"[0-9a-f]{64}",raw["sha256_2"]):
             raise CensusError("corrupt sha256_2")
@@ -101,26 +104,57 @@ def parse_run(path: Path) -> tuple[list[dict],dict]:
     if salts and next(iter(salts)) != summary["salt_value"]: raise CensusError("summary/record salt mismatch")
 
     mode=summary["mode"]
-    expected_primary={1:SALT1,2:SALT2,3:SALT1}.get(mode)
+    expected_primary={1:SALT1,2:SALT2,3:SALT1,4:SALT1}.get(mode)
     if expected_primary is None or summary["salt_value"] != expected_primary:
         raise CensusError("mode/salt mismatch")
-    if mode == 3:
+    paired_mode = mode in (3,4)
+    if paired_mode:
         for key in ("salt2","dual_domain","second_roots_bytes"):
             if key not in summary:
-                raise CensusError(f"mode 3 summary missing {key}")
+                raise CensusError(f"mode {mode} summary missing {key}")
         if summary["salt2_value"] != SALT2:
-            raise CensusError("mode 3 salt pair mismatch")
+            raise CensusError(f"mode {mode} salt pair mismatch")
         if summary["dual_domain"] != "yes":
-            raise CensusError("mode 3 is not dual-domain")
+            raise CensusError(f"mode {mode} is not dual-domain")
         if summary["second_roots_bytes"] != summary["capacity"] * 32:
-            raise CensusError("mode 3 second-root allocation mismatch")
+            raise CensusError(f"mode {mode} second-root allocation mismatch")
         for r in recs:
             if not r["_retry_present"]:
-                raise CensusError("mode 3 record missing retry")
+                raise CensusError(f"mode {mode} record missing retry")
             if "sha256_2" not in r:
-                raise CensusError("mode 3 record missing sha256_2")
+                raise CensusError(f"mode {mode} record missing sha256_2")
             if r["sha256_2"] == ZERO_SHA256:
-                raise CensusError("mode 3 record has zero sha256_2")
+                raise CensusError(f"mode {mode} record has zero sha256_2")
+        if mode == 4:
+            private = ("private_banks","private_visbuf_bytes",
+                       "private_scratch_bytes","private_saved_roots_bytes")
+            for key in private:
+                if key not in summary:
+                    raise CensusError(f"mode 4 summary missing {key}")
+                try: summary[key]=int(summary[key],10)
+                except ValueError as error:
+                    raise CensusError(f"bad summary {key}") from error
+                if summary[key] < 0: raise CensusError("negative summary field")
+            banks=summary["private_banks"]
+            if banks not in (0,9):
+                raise CensusError("mode 4 private bank count mismatch")
+            if banks == 0:
+                if any(summary[key] for key in private[1:]):
+                    raise CensusError("mode 4 zero banks have private bytes")
+            else:
+                if summary["private_saved_roots_bytes"] != banks * 32:
+                    raise CensusError("mode 4 private root allocation mismatch")
+                for key in ("private_visbuf_bytes","private_scratch_bytes"):
+                    if summary[key] <= 0 or summary[key] % banks:
+                        raise CensusError(f"mode 4 malformed {key}")
+            if recs and banks != 9:
+                raise CensusError("mode 4 records lack private banks")
+            if recs and summary["private_visbuf_bytes"] // banks < max(
+                    r["bytes"] for r in recs):
+                raise CensusError("mode 4 private visbuf is too small")
+            for r in recs:
+                if not r["_isolated_present"]:
+                    raise CensusError("mode 4 record missing isolated")
     else:
         if summary["salt2_value"] != 0:
             raise CensusError("single-domain mode has a secondary salt")
@@ -130,6 +164,8 @@ def parse_run(path: Path) -> tuple[list[dict],dict]:
             raise CensusError("single-domain mode has second-root storage")
         if any(r.get("sha256_2",ZERO_SHA256) != ZERO_SHA256 for r in recs):
             raise CensusError("single-domain mode has a secondary digest")
+    if mode != 4 and any(r["isolated"] for r in recs):
+        raise CensusError("isolated record outside mode 4")
     return sorted(recs,key=lambda r:r["index"]),summary
 
 def frame_number(submit:int, origin:int, submits_per_frame:int)->int:
@@ -146,25 +182,33 @@ def group_frames(records:list[dict], origin:int|None=None, submits_per_frame:int
     for v in frames.values(): v.sort(key=lambda r:(r["submit"],r["occurrence"],r["unit"],r["index"]))
     return dict(frames),origin
 
-def structural_population(records:list[dict])->list[tuple]:
+def structural_population(records:list[dict],include_isolated:bool=False)->list[tuple]:
     fields=("submit","occurrence","unit","pass","retry","path","predecessor","signature",
             "w","h","samples","bytes","stage2_blocks","triangles")
-    return [tuple(r.get(k,0) if k=="retry" else r[k] for k in fields)
-            for r in records if r["status"]==1]
+    if include_isolated:
+        fields=fields+("isolated",)
+    return [tuple(r.get(k,0) if k in ("retry","isolated") else r[k]
+                  for k in fields) for r in records if r["status"]==1]
 
-def structural_population_digest(records:list[dict])->str:
-    rows=structural_population(records)
+def structural_population_digest(records:list[dict],include_isolated:bool=False)->str:
+    rows=structural_population(records,include_isolated)
     return hashlib.sha256(json.dumps(rows,separators=(",",":")).encode()).hexdigest()
 
-def mode3_record_population(records:list[dict])->list[tuple]:
+def paired_record_population(records:list[dict],include_isolated:bool=False)->list[tuple]:
     fields=("index","status","submit","occurrence","unit","pass","retry",
             "path","predecessor","signature","w","h","samples","bytes",
             "stage2_blocks","triangles","nontrivial","huge","setup","queue_status")
+    if include_isolated:
+        fields=fields+("isolated",)
     return [tuple(r[k] for k in fields) for r in records]
 
+def mode3_record_population(records:list[dict])->list[tuple]:
+    return paired_record_population(records,False)
+
 def recurrence_key(r:dict,digest_field:str="sha256")->tuple:
-    # Pass and retry are absolute population identity, not content identity.
-    return (r["w"],r["h"],r["samples"],r[digest_field])
+    # Projection kind prevents post-stage2 units matching isolated post-stage3
+    # reraster contributions. Pass/retry remain absolute population identity.
+    return (r.get("isolated",0),r["w"],r["h"],r["samples"],r[digest_field])
 
 def _domain_analysis(frames:dict[int,list[dict]],digest_field:str)->dict:
     membership=chronological=compared=0
@@ -199,16 +243,19 @@ def analyze(records:list[dict], origin:int|None=None, submits_per_frame:int=2,
     if mode is None:
         mode=3 if any(r.get("sha256_2",ZERO_SHA256) != ZERO_SHA256
                       for r in records) else 1
-    if mode not in (1,2,3): raise CensusError("bad analysis mode")
-    if mode == 3:
+    if mode not in (1,2,3,4): raise CensusError("bad analysis mode")
+    if mode in (3,4):
         for r in records:
-            if "sha256_2" not in r: raise CensusError("mode 3 record missing sha256_2")
+            if "sha256_2" not in r:
+                raise CensusError(f"mode {mode} record missing sha256_2")
             if r["sha256_2"] == ZERO_SHA256:
-                raise CensusError("mode 3 record has zero sha256_2")
+                raise CensusError(f"mode {mode} record has zero sha256_2")
+            if mode == 4 and not r.get("_isolated_present",False):
+                raise CensusError("mode 4 record missing isolated")
 
     primary=_domain_analysis(frames,"sha256")
     paired={"checked":False}
-    if mode == 3:
+    if mode in (3,4):
         secondary=_domain_analysis(frames,"sha256_2")
         membership_equal=(primary["membership_classification"] ==
                           secondary["membership_classification"])
@@ -234,7 +281,9 @@ def analyze(records:list[dict], origin:int|None=None, submits_per_frame:int=2,
       "verdict_available":False,
       "verdict_unavailable_reason":"requires external clean-trace interval cost join",
       "_mode3_population":mode3_record_population(records) if mode==3 else None,
-      "structural_population_sha256":structural_population_digest(records),
+      "_mode4_population":paired_record_population(records,True) if mode==4 else None,
+      "structural_population_sha256":structural_population_digest(
+          records,include_isolated=mode==4),
       "membership_classification":primary["membership_classification"],
       "chronological_classification":primary["chronological_classification"],
       "paired_domain":paired,
@@ -255,31 +304,38 @@ def _absolute_classification(rows:list[tuple])->tuple[list[tuple],dict[tuple,boo
 def validate_salt_reruns(runs:list[dict])->dict:
     if len(runs)<=1: return {"checked":False}
     modes=[r.get("mode") for r in runs]
-    contains_mode3=any(m==3 or r.get("paired_domain_checked") is True
-                       for m,r in zip(modes,runs))
-    if contains_mode3:
-        if not all(m==3 for m in modes):
-            raise CensusError("cannot mix mode 3 and single-domain reruns")
+    paired_modes={m for m in modes if m in (3,4)}
+    contains_paired=bool(paired_modes) or any(
+        r.get("paired_domain_checked") is True for r in runs)
+    if contains_paired:
+        if len(set(modes)) != 1 or modes[0] not in (3,4):
+            raise CensusError("cannot mix paired and other-mode reruns")
+        paired_mode=modes[0]
         if not all(r.get("paired_domain_checked") is True and
                    r.get("paired_domain_equal") is True for r in runs):
-            raise CensusError("mode 3 rerun lacks paired-domain validity")
+            raise CensusError(f"mode {paired_mode} rerun lacks paired-domain validity")
         expected_salt=f"{SALT1:016x}"; expected_salt2=f"{SALT2:016x}"
         for r in runs:
             if r.get("salt") != expected_salt or r.get("salt2") != expected_salt2:
-                raise CensusError("mode 3 rerun salt pair mismatch")
-        populations=[r.get("_mode3_population") for r in runs]
-        if any(population is None for population in populations) or \
-           any(population != populations[0] for population in populations[1:]):
-            raise CensusError("mode 3 rerun structural populations differ")
+                raise CensusError(f"mode {paired_mode} rerun salt pair mismatch")
+        population_key="_mode3_population" if paired_mode==3 else "_mode4_population"
+        populations=[r.get(population_key) for r in runs]
+        if (any(population is None for population in populations) or
+            any(population != populations[0]
+                for population in populations[1:])):
+            raise CensusError(f"mode {paired_mode} rerun structural populations differ")
         parsed=[_absolute_classification(r["membership_classification"])
                 for r in runs]
         order=parsed[0][0]
         if any(keys != order for keys,_ in parsed[1:]):
-            raise CensusError("mode 3 rerun absolute classification populations differ")
+            raise CensusError(
+                f"mode {paired_mode} rerun absolute classification populations differ")
         maps=[mapping for _,mapping in parsed]
         flips=[key for key in order if len({mapping[key] for mapping in maps})>1]
         union=[key+(any(mapping[key] for mapping in maps),) for key in order]
-        return {"checked":True,"paired_mode3_repeats":True,
+        return {"checked":True,
+                "paired_mode3_repeats":paired_mode==3,
+                "paired_mode4_repeats":paired_mode==4,
                 "population_equal":True,"classification_equal":not flips,
                 "absolute_flip_set":flips,"absolute_flip_count":len(flips),
                 "union_recurrent_classification":union}
@@ -310,5 +366,6 @@ def main():
     rerun=validate_salt_reruns(runs)
     for run in runs:
         run.pop("_mode3_population",None)
+        run.pop("_mode4_population",None)
     print(json.dumps({"runs":runs,"salt_rerun":rerun},sort_keys=True))
 if __name__=="__main__": main()

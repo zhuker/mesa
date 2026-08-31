@@ -139,3 +139,85 @@ For one SHA-256 domain and `N` compared values, the union/birthday collision
 bound is at most `N(N-1)/2^257`. Mode 3 requires equality in both fixed domains
 for its paired classification. This is collision evidence under the SHA-256
 assumption, not a guarantee that separate replay runs produce the same output.
+
+
+## B1S mode 4: isolated ordinary opaque segments
+
+Mode `4` keeps mode 3's simultaneous dual-domain behavior for every existing
+nonappending record, including retries, and adds direct evidence for ordinary
+opaque appending segments. Each record now prints `isolated=0|1`. Nonappending
+records retain the post-stage2 shared-unit projection and use `isolated=0`.
+Appending records use the isolated post-reraster-stage3 projection below and use
+`isolated=1`. The analyzer includes this projection kind in its ordinary
+membership key, `(isolated,w,h,samples,SHA)`. Thus an identical byte digest can
+never make a shared post-stage2 unit match an isolated post-stage3 contribution.
+It also includes `isolated` in mode-4 repeated structural population identity.
+
+A final visibility-buffer mismatch for a whole opaque episode cannot mark every
+segment nonrecurrent. Segments append atomic minima into one shared buffer, and
+partial segment reuse is in scope: one changed segment can change the episode's
+final buffer while other segments made the same contribution as in the prior
+frame. B1S therefore obtains evidence one segment at a time rather than
+propagating one episode verdict.
+
+The population proof is structural. The B0 hook is in the plain raster loop.
+Blended/A-buffer appends record and return before it, as does the tiled opaque
+path. Consequently any `cp->pass.appending` candidate reaching the hook is a
+non-tiled ordinary `cp_opaque_append` segment. Mode 4 still checks opaque,
+pass 0, no A-buffer/retry/peel/path predicate, successful predecessor/stage2 and
+clear chain, and all existing indirect/query/shader-memory/shape safety gates.
+A fused clip+stage1 predecessor is allowed after successful completion: its
+finished clipped positions, primitive references and active-ID map are exactly
+the geometry saved for the ordinary reraster.
+
+After the original stage 3 successfully consumes that segment's queue set, and
+before `cp_pass_record_segment`, mode 4 reissues only ordinary raster stages 1,
+2 and 3 on the same current CUDA stream. It does not refetch vertices or reclip.
+The copied raster arguments retain the completed positions, `prim_refs`, active
+IDs, clip rectangles, scalar raster/depth state, stable episode depth input and
+episode-global `abuf_prim_base`. Census, peel, reject, A-buffer and path fields
+are neutralized. The copied queues use `CP_QUEUE_FILL`; their three counters are
+cleared only after original stage 3 consumed them. Ordinary
+`cp_opaque_finish` does not consume the saved queue contents. The tiled opaque
+path can use the saved queue addresses, but it clears and rebuilds them first;
+that path returns before the B1S hook in any case. The later content reuse is
+the excluded blended A-buffer fill path. Thus this overwrite cannot alter live
+ordinary opaque state.
+
+The reraster targets an all-ones private visibility buffer and is followed by
+both Merkle domains only after reraster stage 3. Its digest is the initialized
+per-segment atomicMin contribution from small, medium and huge primitives
+against the stable episode depth input. The depth buffer is read-only during
+rasterization and opaque episode shading does not run until the segment streams
+are joined at finish. Completed clip allocations likewise remain owned by the
+recorded segment until finish. These lifetime and ordering facts make the
+reraster reproducible without snapshotting the shared visibility buffer.
+
+There are nine device-private banks: bank 0 for the main stream/context queue
+set and banks 1 through 8 for the exact eight side streams/queue sets. Each bank
+has a disjoint visibility range, Merkle scratch range and saved-root range.
+Segments beyond eight reuse the corresponding bank and queue set on the same
+stream, so stream order makes the reuse safe. Managed record/root output slots
+are reserved sequentially on the host and are disjoint. High-water replacement
+occurs only at framebuffer change after the prior pass is finished and joined;
+all allocation/free/clear/launch results are checked. The summary reports
+`private_banks`, `private_visbuf_bytes`, `private_scratch_bytes` and
+`private_saved_roots_bytes`. Any pending, allocation, reraster or hash failure
+adds one exclusion and makes `result_valid=no`; there is no per-unit host sync.
+
+This remains diagnostic-only. The digest exists only after reraster and is not
+an input cache key. Its enabled timing is invalid. Since refetch/reclip is not
+reissued, the cost join still charges every clip interval recurrent. A payload
+match is only a conservative retained-output upper: full raster-payload
+equality implies equality of this initialized digest projection, while a digest
+match can remain a false match for work outside the projection.
+
+The clean B1R conservative upper, **0.5023787810 ms/f**, remains the baseline,
+not a mode-4 result. Mode 4 is sized for all 108086 candidates and is expected
+to admit the former 36963 safe appending candidates in addition to B1R's 71123
+records. The existing absolute `(submit,unit)` cost join therefore directly
+classifies the mapped 6053 appending units. It does not propagate an episode
+classification; uncovered units and all clip work remain recurrent. Repeated
+mode-4 runs require the exact salt pair, paired-domain agreement and identical
+structural population, report absolute flips, and use the conservative OR union
+as the decision-bearing arm.

@@ -478,12 +478,14 @@ def aggregate_arms(prepared_logs: Sequence[dict], analyzer,
     analyses = [prepared["analysis"] for prepared in prepared_logs]
     modes = [prepared["summary"]["mode"] for prepared in prepared_logs]
     repeated_mode3 = len(prepared_logs) > 1 and all(mode == 3 for mode in modes)
+    repeated_mode4 = len(prepared_logs) > 1 and all(mode == 4 for mode in modes)
+    repeated_paired = repeated_mode3 or repeated_mode4
     if len(analyses) > 1:
         try:
             salt_rerun = analyzer.validate_salt_reruns(analyses)
         except analyzer.CensusError as error:
-            if 3 in modes:
-                raise CostError(f"invalid mode 3 reruns: {error}") from error
+            if any(mode in (3,4) for mode in modes):
+                raise CostError(f"invalid paired-domain reruns: {error}") from error
             # Old single-domain runs are independent diagnostic arms.  Preserve
             # their costs when their classifications differ, but expose the
             # failed rerun validation rather than treating them as one decision.
@@ -491,22 +493,25 @@ def aggregate_arms(prepared_logs: Sequence[dict], analyzer,
                           "validation_error": str(error)}
     else:
         salt_rerun = {"checked": False}
-    if repeated_mode3:
+    if repeated_paired:
+        paired_mode = 3 if repeated_mode3 else 4
         if not all(analysis.get("paired_domain_checked") is True and
                    analysis.get("paired_domain_equal") is True
                    for analysis in analyses):
-            raise CostError("repeated mode 3 logs lack paired-domain validity")
-        if not (salt_rerun.get("paired_mode3_repeats") is True and
+            raise CostError(f"repeated mode {paired_mode} logs lack paired-domain validity")
+        repeat_key = f"paired_mode{paired_mode}_repeats"
+        if not (salt_rerun.get(repeat_key) is True and
                 salt_rerun.get("population_equal") is True):
-            raise CostError("repeated mode 3 logs lack equal structural populations")
+            raise CostError(
+                f"repeated mode {paired_mode} logs lack equal structural populations")
 
     arms = [classification_arm(
                 prepared, prepared["analysis"], units, clips, all_activity,
                 lo, hi, submit_lo, submit_hi, frame_count,
-                "per_run_diagnostic" if repeated_mode3 else "single_run",
-                not repeated_mode3, [prepared["path"]])
+                "per_run_diagnostic" if repeated_paired else "single_run",
+                not repeated_paired, [prepared["path"]])
             for prepared in prepared_logs]
-    if repeated_mode3:
+    if repeated_paired:
         union_analysis = dict(analyses[0])
         union_analysis["membership_classification"] = (
             salt_rerun["union_recurrent_classification"]

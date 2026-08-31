@@ -191,7 +191,7 @@ struct cp_debug {
    /* Tracing, with a value. */
    unsigned debug_fs_vstep;   /* print every Nth pixel; clamped to >= 1 */
    int      debug_fs_row;     /* only this framebuffer row, or -1 for all */
-   unsigned geometry_census;  /* B0 salt selector: 0 off, 1/2 independent */
+   unsigned geometry_census;  /* 1/2 B0; 3 dual B1R; 4 dual isolated B1S */
    unsigned geometry_census_submit_start; /* hash command submits after this */
 
    /* Subsystem switches. */

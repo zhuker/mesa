@@ -27,7 +27,7 @@ struct cp_geom_b0_record {
    unsigned char path;
    unsigned char predecessor;
    unsigned char retry;
-   unsigned char reserved0;
+   unsigned char isolated;
    cp_sha256_merkle_u32 stage2_blocks;
    cp_sha256_merkle_u32 triangles;
    cp_sha256_merkle_u32 nontrivial_count;

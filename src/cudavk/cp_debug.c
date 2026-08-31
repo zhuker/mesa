@@ -175,8 +175,9 @@ static const struct cp_flag_def flags[] = {
 
    { "CUDAVK_GEOMETRY_CENSUS", CP_FLAG_UINT, F(geometry_census),
      "diagnostic visibility-buffer SHA-256 census; 1/2 select separate fixed "
-     "domains, 3 hashes a simultaneous B1R domain pair; invalid for timing",
-     .dflt = 0, .has_range = true, .lo = 0, .hi = 3 },
+     "domains, 3 hashes simultaneous B1R domains, 4 adds isolated opaque "
+     "segments; invalid for timing",
+     .dflt = 0, .has_range = true, .lo = 0, .hi = 4 },
    { "CUDAVK_GEOMETRY_CENSUS_SUBMIT_START", CP_FLAG_UINT,
      F(geometry_census_submit_start),
      "with GEOMETRY_CENSUS, skip hashing through this absolute internal "

@@ -5,15 +5,20 @@ P=Path(__file__).with_name("cp_geometry_b0_analyze.py")
 s=importlib.util.spec_from_file_location("b0",P); b0=importlib.util.module_from_spec(s); s.loader.exec_module(b0)
 
 def rec(i,submit,unit,sha="00"*32,salt="47454f4d42305331",status=1,
-        sig="0000000000000001",retry=None,sha2=None,pass_number=0):
+        sig="0000000000000001",retry=None,sha2=None,pass_number=0,
+        isolated=None):
  extra=("" if retry is None else f" retry={retry}")
+ extra+=("" if isolated is None else f" isolated={isolated}")
  extra+=("" if sha2 is None else f" sha256_2={sha2}")
  return (f"CUDAVK_GEOM_B0_RECORD index={i} status={status} salt={salt} submit={submit} occurrence={submit} unit={unit} pass={pass_number} path=0 predecessor=1 w=2 h=3 samples=1 bytes=48 signature={sig} stage2_blocks=1 triangles=2 nontrivial=0 huge=0 setup=0 queue_status={0 if status==1 else 1} sha256={sha}{extra}")
 def summary(n,admitted=None,reasons=0,mode=1):
  if admitted is None: admitted=n
- salt={1:"47454f4d42305331",2:"47454f4d42305332",3:"47454f4d42305331"}[mode]
+ salt={1:"47454f4d42305331",2:"47454f4d42305332",3:"47454f4d42305331",
+       4:"47454f4d42305331"}[mode]
  extra=(" salt2=47454f4d42305332 dual_domain=yes second_roots_bytes=4194304"
-        if mode==3 else "")
+        if mode in (3,4) else "")
+ if mode==4:
+  extra+=" private_banks=9 private_visbuf_bytes=900 private_scratch_bytes=1800 private_saved_roots_bytes=288"
  return f"CUDAVK_GEOM_B0 version=1 mode={mode} salt={salt}{extra} result_valid=yes capacity=131072 reserved={n} complete={n} candidates={admitted+reasons} admitted={admitted} reasons={reasons}"
 class TestB0(unittest.TestCase):
  def write(self,lines):
@@ -159,4 +164,64 @@ class TestB0(unittest.TestCase):
  def test_structural_digest_preserves_absolute_order(self):
   x=[b0.parse_record(rec(0,1,1,sig="1".zfill(16))),b0.parse_record(rec(1,1,2,sig="2".zfill(16)))]
   self.assertNotEqual(b0.structural_population_digest(x),b0.structural_population_digest(x[::-1]))
+ def test_mode4_projection_membership_and_strict_fields(self):
+  a,x="11"*32,"33"*32
+  lines=[rec(0,10,1,a,retry=0,sha2=x,isolated=0),
+         rec(1,12,1,a,retry=0,sha2=x,isolated=1),summary(2,mode=4)]
+  rs,s=b0.parse_run(self.write(lines))
+  out=b0.analyze(rs,10,2,mode=s["mode"])
+  self.assertEqual(out["membership_matches"],0)
+  self.assertTrue(out["paired_domain_equal"])
+  rs,s=b0.parse_run(self.write([
+      rec(0,10,1,a,retry=0,sha2=x,isolated=1),
+      rec(1,12,1,a,retry=0,sha2=x,isolated=1),summary(2,mode=4)]))
+  self.assertEqual(b0.analyze(rs,10,2,mode=4)["membership_matches"],1)
+  with self.assertRaisesRegex(b0.CensusError,"missing isolated"):
+   b0.parse_run(self.write([rec(0,1,1,a,retry=0,sha2=x),summary(1,mode=4)]))
+  with self.assertRaisesRegex(b0.CensusError,"outside mode 4"):
+   b0.parse_run(self.write([rec(0,1,1,a,isolated=1),summary(1)]))
+  for key in ("private_banks","private_visbuf_bytes","private_scratch_bytes",
+              "private_saved_roots_bytes"):
+   bad=" ".join(w for w in summary(0,mode=4).split()
+                if not w.startswith(key+"="))
+   with self.subTest(missing=key):
+    with self.assertRaisesRegex(b0.CensusError,f"summary missing {key}"):
+     b0.parse_run(self.write([bad]))
+  empty=(summary(0,mode=4)
+         .replace("private_banks=9","private_banks=0")
+         .replace("private_visbuf_bytes=900","private_visbuf_bytes=0")
+         .replace("private_scratch_bytes=1800","private_scratch_bytes=0")
+         .replace("private_saved_roots_bytes=288",
+                  "private_saved_roots_bytes=0"))
+  b0.parse_run(self.write([empty]))
+  malformed=summary(0,mode=4).replace("private_visbuf_bytes=900",
+                                       "private_visbuf_bytes=901")
+  with self.assertRaisesRegex(b0.CensusError,"malformed private_visbuf_bytes"):
+   b0.parse_run(self.write([malformed]))
+  too_small=summary(1,mode=4).replace("private_visbuf_bytes=900",
+                                      "private_visbuf_bytes=9")
+  with self.assertRaisesRegex(b0.CensusError,"visbuf is too small"):
+   b0.parse_run(self.write([
+       rec(0,1,1,a,retry=0,sha2=x,isolated=1),too_small]))
+
+ def test_mode4_repeat_flips_union_and_population(self):
+  a,b,x,y="11"*32,"22"*32,"33"*32,"44"*32
+  paths=[self.write([rec(0,10,1,a,retry=0,sha2=x,isolated=1),
+                     rec(1,12,1,a,retry=0,sha2=x,isolated=1),summary(2,mode=4)]),
+         self.write([rec(0,10,1,a,retry=0,sha2=x,isolated=1),
+                     rec(1,12,1,b,retry=0,sha2=y,isolated=1),summary(2,mode=4)])]
+  runs=[]
+  for p in paths:
+   rs,s=b0.parse_run(p); out=b0.analyze(rs,10,2,mode=4)
+   out.update(salt=f"{s['salt_value']:016x}",salt2=f"{s['salt2_value']:016x}")
+   runs.append(out)
+  repeat=b0.validate_salt_reruns(runs)
+  self.assertTrue(repeat["paired_mode4_repeats"])
+  self.assertEqual(repeat["absolute_flip_set"],[(12,12,1,0)])
+  self.assertEqual(repeat["union_recurrent_classification"],[(12,12,1,0,True)])
+  changed=[row[:-1]+(1-row[-1],) for row in runs[1]["_mode4_population"]]
+  bad=dict(runs[1],_mode4_population=changed)
+  with self.assertRaisesRegex(b0.CensusError,"structural populations differ"):
+   b0.validate_salt_reruns([runs[0],bad])
+
 if __name__=="__main__": unittest.main()
