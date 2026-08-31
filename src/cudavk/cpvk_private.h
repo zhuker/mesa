@@ -546,10 +546,17 @@ struct cpvk_copy {
    int dst_encoding;
 };
 
+enum cpvk_query_action {
+   CPVK_QUERY_RESET,
+   CPVK_QUERY_TIMESTAMP,
+   CPVK_QUERY_BEGIN,
+   CPVK_QUERY_END,
+};
+
 struct cpvk_query_op {
    struct cpvk_query_pool *pool;
    uint32_t first, count;
-   bool reset;                       /* else: write a timestamp at `first` */
+   enum cpvk_query_action action;
 };
 
 enum cpvk_op_kind {
@@ -817,6 +824,7 @@ struct cpvk_pipeline {
    struct cp_vertex_elem velem[16];
    unsigned num_velem, vertex_stride;
    unsigned samples;
+   bool alpha_to_coverage;
    enum mesa_prim topology;
    /*
     * Static viewport/scissor. A pipeline that does not declare these dynamic

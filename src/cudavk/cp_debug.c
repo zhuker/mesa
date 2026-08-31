@@ -155,6 +155,9 @@ static const struct cp_flag_def flags[] = {
      "count fragments per draw; also compiles the instrumented kernels in" },
    { "CUDAVK_NVTX", CP_FLAG_BOOL_PRESENCE, F(nvtx),
      "push an NVTX range around each draw and stage, for nsys" },
+   { "CUDAVK_DEPTHONLY_CENSUS", CP_FLAG_UINT, F(depthonly_census),
+     "skip this many command-bearing internal submits, then count exact safe "
+     "depth-only shade chains and label only those chains with NVTX; 0 disables" },
    { "CUDAVK_DEBUG_ROWS", CP_FLAG_BOOL_PRESENCE, F(debug_rows),
      "trace the per-draw tables a batch builds: fragment UBO slots and the "
      "vertex slice table the fragment stage searches" },

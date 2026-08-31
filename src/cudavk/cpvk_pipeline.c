@@ -1483,6 +1483,7 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
        * 98% of them. */
       const VkPipelineMultisampleStateCreateInfo *ms = info->pMultisampleState;
       pipeline->samples = ms ? MAX2((unsigned)ms->rasterizationSamples, 1u) : 1;
+      pipeline->alpha_to_coverage = ms && ms->alphaToCoverageEnable;
 
       const VkPipelineInputAssemblyStateCreateInfo *ia = info->pInputAssemblyState;
       pipeline->topology = ia ? cpvk_prim(ia->topology) : MESA_PRIM_TRIANGLES;

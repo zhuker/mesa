@@ -84,6 +84,39 @@ cp_nvtx_pop(void)
 #endif
 }
 
+/*
+ * The depth-only census deliberately does not enable CUDAVK_NVTX's thousands
+ * of ordinary ranges.  It labels only a census-admitted shade chain, and only
+ * while the census's selected submit window is active.  These are host API
+ * calls; they enqueue no CUDA work.
+ */
+static inline bool
+cp_nvtx_depthonly_pushf(const char *fmt, ...)
+{
+#ifdef CP_HAVE_NVTX
+   if (!cp_debug->depthonly_census)
+      return false;
+   char buf[160];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(buf, sizeof(buf), fmt, ap);
+   va_end(ap);
+   return nvtxRangePushA(buf) >= 0;
+#else
+   (void)fmt;
+   return false;
+#endif
+}
+
+static inline void
+cp_nvtx_depthonly_pop(void)
+{
+#ifdef CP_HAVE_NVTX
+   if (cp_debug->depthonly_census)
+      nvtxRangePop();
+#endif
+}
+
 static inline void
 cp_nvtx_mark(const char *name)
 {

@@ -191,6 +191,8 @@ struct cp_debug {
    /* Tracing, with a value. */
    unsigned debug_fs_vstep;   /* print every Nth pixel; clamped to >= 1 */
    int      debug_fs_row;     /* only this framebuffer row, or -1 for all */
+   /* Skip this many command-bearing internal submits; 0 disables. */
+   unsigned depthonly_census;
 
    /* Subsystem switches. */
    bool no_abuffer;

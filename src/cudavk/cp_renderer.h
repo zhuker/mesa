@@ -568,6 +568,44 @@ struct cp_context {
       uint64_t wait_upload_ns, wait_upload_n;      /* desc-arena HtoD */
    } plan;
 
+   /*
+    * CUDAVK_DEPTHONLY_CENSUS. Host bookkeeping only: no field below is copied
+    * into a CUDA argument block or otherwise belongs to a device ABI.
+    */
+   struct {
+      uint64_t submit_ordinal;       /* enabled command-bearing submits only */
+      uint64_t scope_exec_id;
+      uint64_t chain_seq;
+      uint64_t run_seq;
+      uint64_t direct_shade_calls;
+      uint64_t structural_depth_calls;
+      uint64_t safe_chains;
+      uint64_t nvtx_ranges;
+      uint64_t runs;
+      uint64_t singleton_runs;
+      uint64_t multichain_runs;
+      uint64_t chains_in_multichain_runs;
+      uint64_t run_length_sum;
+      uint64_t max_run;
+      uint64_t cut_unsafe_draw;
+      uint64_t cut_direction;
+      uint64_t cut_nondraw;
+      uint64_t cut_scope_end;
+      uint64_t decline_samples;
+      uint64_t decline_coverage;
+      uint64_t decline_depth;
+      uint64_t decline_discard;
+      uint64_t decline_memory;
+      uint64_t decline_outputs;
+      uint64_t decline_query;
+      uint64_t decline_other;
+      uint64_t current_run_len;
+      unsigned current_direction;
+      uint32_t recorded_scope_serial;
+      bool active;
+      bool scope_open;
+   } depthonly;
+
    /* GPU-resident pipeline state — managed memory, written by CPU on state
     * changes, read by GPU kernels during draws. */
    /* Device-only arena for per-draw scratch buffers. CPU never touches this
@@ -1057,6 +1095,9 @@ void cp_context_set_framebuffer(struct cp_context *cp,
 void cp_render_scope_begin(struct cp_context *cp,
                            const struct cp_render_scope *scope);
 void cp_render_scope_end(struct cp_context *cp);
+/* Host-only census hooks; both return immediately when its uint flag is zero. */
+void cp_depthonly_census_submit(struct cp_context *cp);
+void cp_depthonly_census_nondraw(struct cp_context *cp);
 
 struct glsl_type;
 int cp_type_size_vec4(const struct glsl_type *type, bool bindless);

@@ -34,6 +34,8 @@ struct cp_render_scope {
    uint8_t color_load_op;
    bool full_render_area;
    bool skip_draws;
+   /* Host-only planner fact. Never copied into a kernel argument or ABI. */
+   bool has_query;
 
    /*
     * What the recorded pass will ask of this scope, computed by
@@ -59,6 +61,7 @@ struct cp_draw_state {
    struct cp_depth_state depth;
    struct cp_blend_desc blend;
    uint32_t pipeline_samples;
+   bool alpha_to_coverage;
 
    struct cp_vertex_elem velem[16];
    uint64_t vb_base[16];

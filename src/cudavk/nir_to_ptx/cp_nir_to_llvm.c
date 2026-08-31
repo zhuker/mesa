@@ -5146,6 +5146,15 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
             case nir_intrinsic_terminate_if:
                bin->uses_discard = true;
                break;
+            case nir_intrinsic_demote:
+            case nir_intrinsic_demote_if:
+            case nir_intrinsic_demote_samples:
+               /* The extension is not advertised and execution lowering is
+                * absent. Keep legacy metadata unchanged unless this census is
+                * explicitly proving its conservative admission predicate. */
+               if (cp_debug->depthonly_census)
+                  bin->uses_discard = true;
+               break;
             case nir_intrinsic_load_front_face:
                bin->reads_front_face = true;
                break;

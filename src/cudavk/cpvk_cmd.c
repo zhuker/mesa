@@ -854,9 +854,32 @@ cpvk_plan_batches(struct cpvk_cmd_buffer *cmd)
       cmd->scopes[s].planned_draws = 0;
       cmd->scopes[s].planned_blended_draws = 0;
       cmd->scopes[s].planned_tris = 0;
+      cmd->scopes[s].has_query = false;
    }
+   uint32_t active_scope = CP_RENDER_SCOPE_NONE;
+   unsigned active_queries = 0;
    for (unsigned i = 0; i < cmd->num_ops; i++) {
       struct cpvk_op *op = &cmd->ops[i];
+      if (op->kind == CPVK_OP_BEGIN_RENDER)
+         active_scope = op->scope_index;
+
+      /*
+       * This is the primary's final flattened program, including imported
+       * secondary draws and query markers. A query begun before a scope and
+       * ended after it still covers that scope. Independently, any query or
+       * query-copy command inside a scope excludes it conservatively.
+       */
+      bool query_op = op->kind == CPVK_OP_QUERY ||
+                      op->kind == CPVK_OP_QUERY_COPY;
+      if (active_scope < cmd->num_scopes && (active_queries || query_op))
+         cmd->scopes[active_scope].has_query = true;
+      if (op->kind == CPVK_OP_QUERY &&
+          op->query.action == CPVK_QUERY_BEGIN)
+         active_queries++;
+      else if (op->kind == CPVK_OP_QUERY &&
+               op->query.action == CPVK_QUERY_END && active_queries)
+         active_queries--;
+
       if (op->kind == CPVK_OP_DRAW) {
          struct cpvk_draw_cmd *d = &op->draw_cmd;
          if (op->scope_index < cmd->num_scopes) {
@@ -877,6 +900,8 @@ cpvk_plan_batches(struct cpvk_cmd_buffer *cmd)
             d->plan_mergeable = false;
          }
       }
+      if (op->kind == CPVK_OP_END_RENDER)
+         active_scope = CP_RENDER_SCOPE_NONE;
       prev = op;
    }
 
@@ -2512,6 +2537,9 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
                 memcmp(pa->velem, pb->velem,
                        pa->num_velem * sizeof(pa->velem[0])), "vertex layout");
       CPVK_DIFF(pa->samples != pb->samples, "sample count");
+      CPVK_DIFF(cp_debug->depthonly_census &&
+                pa->alpha_to_coverage != pb->alpha_to_coverage,
+                "alpha to coverage");
    }
    CPVK_DIFF(memcmp(&a->viewport, &b->viewport, sizeof(a->viewport)), "viewport");
    /*
@@ -2642,7 +2670,9 @@ cpvk_draws_episode_compatible(const struct cp_render_scope *sa,
           !memcmp(&pa->raster, &pb->raster, sizeof(pa->raster)) &&
           !memcmp(&pa->depth, &pb->depth, sizeof(pa->depth)) &&
           !memcmp(&pa->blend, &pb->blend, sizeof(pa->blend)) &&
-          pa->samples == pb->samples;
+          pa->samples == pb->samples &&
+          (!cp_debug->depthonly_census ||
+           pa->alpha_to_coverage == pb->alpha_to_coverage);
 }
 
 static bool
@@ -2829,6 +2859,7 @@ cpvk_prepare_draw(struct cpvk_device *dev, const struct cp_render_scope *scope,
    packet->state.depth = p->depth;
    packet->state.blend = p->blend;
    packet->state.pipeline_samples = p->samples;
+   packet->state.alpha_to_coverage = p->alpha_to_coverage;
    memcpy(packet->state.velem, p->velem, sizeof(packet->state.velem));
    memcpy(packet->state.vb_base, d->vb_base, sizeof(packet->state.vb_base));
    packet->state.num_vertex_buffers = d->num_vb;
@@ -4562,7 +4593,8 @@ cpvk_DestroyQueryPool(VkDevice _device, VkQueryPool _pool,
 
 static void
 cpvk_record_query(struct cpvk_cmd_buffer *cmd, struct cpvk_query_pool *pool,
-                  uint32_t first, uint32_t count, bool reset)
+                  uint32_t first, uint32_t count,
+                  enum cpvk_query_action action)
 {
    if (!pool)
       return;
@@ -4574,7 +4606,7 @@ cpvk_record_query(struct cpvk_cmd_buffer *cmd, struct cpvk_query_pool *pool,
    if (!op)
       return;
    op->query = (struct cpvk_query_op) {
-      .pool = pool, .first = first, .count = count, .reset = reset,
+      .pool = pool, .first = first, .count = count, .action = action,
    };
 }
 
@@ -4625,7 +4657,7 @@ cpvk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool _pool,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
    CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
-   cpvk_record_query(cmd, pool, firstQuery, queryCount, true);
+   cpvk_record_query(cmd, pool, firstQuery, queryCount, CPVK_QUERY_RESET);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -4636,7 +4668,7 @@ cpvk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
    CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
-   cpvk_record_query(cmd, pool, query, 1, false);
+   cpvk_record_query(cmd, pool, query, 1, CPVK_QUERY_TIMESTAMP);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -4650,9 +4682,18 @@ cpvk_CmdWriteTimestamp(VkCommandBuffer commandBuffer,
 /* Occlusion and statistics queries: recorded so the pool becomes available,
  * counted as zero because nothing counts them. */
 VKAPI_ATTR void VKAPI_CALL
-cpvk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool pool,
+cpvk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool _pool,
                    uint32_t query, VkQueryControlFlags flags)
 {
+   /* Preserve the old empty command exactly unless the census needs the
+    * lifetime marker for its whole-scope query refusal. */
+   if (!cp_debug->depthonly_census)
+      return;
+   VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
+   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   /* Host-only lifetime marker. Its submit-time executor is a no-op. */
+   cpvk_record_query(cmd, pool, query, 1, CPVK_QUERY_BEGIN);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -4662,7 +4703,7 @@ cpvk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool _pool,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
    CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
-   cpvk_record_query(cmd, pool, query, 1, false);
+   cpvk_record_query(cmd, pool, query, 1, CPVK_QUERY_END);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -4747,7 +4788,7 @@ cpvk_query_complete(void *data)
    const struct cpvk_query_op *q = &cb->op;
 
    mtx_lock(&pool->lock);
-   if (q->reset) {
+   if (q->action == CPVK_QUERY_RESET) {
       for (uint32_t i = 0; i < q->count; i++)
          if (q->first + i < pool->count) {
             pool->results[q->first + i] = 0;
@@ -4829,6 +4870,12 @@ cpvk_execute_query_copy(struct cpvk_device *dev,
 VkResult
 cpvk_execute_query(struct cpvk_device *dev, const struct cpvk_query_op *q)
 {
+   /* Begin exists only to expose lifetime to the host planner. Preserve the
+    * query stub's observable behaviour: it neither orders work nor publishes
+    * availability. End retains the old completion path below. */
+   if (q->action == CPVK_QUERY_BEGIN)
+      return VK_SUCCESS;
+
    /* A query observes everything recorded before it, which includes pass
     * segments a batch flush alone would leave open. */
    cpvk_execute_order_point(dev);

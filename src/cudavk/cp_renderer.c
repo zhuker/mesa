@@ -840,6 +840,113 @@ cp_shade_counter_get(struct cp_context *cp)
  * the whole pass was in an array the entire time.
  */
 static void
+cp_depthonly_run_finish(struct cp_context *cp)
+{
+   uint64_t n = cp->depthonly.current_run_len;
+   if (!n)
+      return;
+   cp->depthonly.runs++;
+   cp->depthonly.run_length_sum += n;
+   cp->depthonly.max_run = MAX2(cp->depthonly.max_run, n);
+   if (n == 1)
+      cp->depthonly.singleton_runs++;
+   else {
+      cp->depthonly.multichain_runs++;
+      cp->depthonly.chains_in_multichain_runs += n;
+   }
+   cp->depthonly.current_run_len = 0;
+   cp->depthonly.current_direction = 0;
+}
+
+void
+cp_depthonly_census_submit(struct cp_context *cp)
+{
+   if (!cp_debug->depthonly_census)
+      return;
+   cp->depthonly.submit_ordinal++;
+   cp->depthonly.active =
+      cp->depthonly.submit_ordinal > cp_debug->depthonly_census;
+}
+
+void
+cp_depthonly_census_nondraw(struct cp_context *cp)
+{
+   if (!cp_debug->depthonly_census || !cp->depthonly.active ||
+       !cp->depthonly.scope_open || !cp->depthonly.current_run_len)
+      return;
+   cp_depthonly_run_finish(cp);
+   cp->depthonly.cut_nondraw++;
+}
+
+static void
+cp_depthonly_census_report(struct cp_context *cp)
+{
+   if (!cp_debug->depthonly_census)
+      return;
+   cp_depthonly_run_finish(cp);
+   uint64_t declines = cp->depthonly.decline_samples +
+      cp->depthonly.decline_coverage + cp->depthonly.decline_depth +
+      cp->depthonly.decline_discard + cp->depthonly.decline_memory +
+      cp->depthonly.decline_outputs + cp->depthonly.decline_query +
+      cp->depthonly.decline_other;
+   bool classification_valid =
+      cp->depthonly.direct_shade_calls == cp->depthonly.safe_chains + declines;
+   bool run_sum_valid =
+      cp->depthonly.run_length_sum == cp->depthonly.safe_chains;
+   bool range_valid =
+      cp->depthonly.nvtx_ranges == cp->depthonly.safe_chains;
+   bool run_kinds_valid = cp->depthonly.runs ==
+      cp->depthonly.singleton_runs + cp->depthonly.multichain_runs;
+   bool run_shape_valid = cp->depthonly.run_length_sum ==
+      cp->depthonly.singleton_runs + cp->depthonly.chains_in_multichain_runs;
+   bool run_seq_valid = cp->depthonly.runs == cp->depthonly.run_seq;
+   bool chain_seq_valid = cp->depthonly.safe_chains == cp->depthonly.chain_seq;
+   bool result_valid = classification_valid && run_sum_valid && range_valid &&
+      run_kinds_valid && run_shape_valid && run_seq_valid && chain_seq_valid;
+   fprintf(stderr,
+           "cudavk: depthonly census: selected_start=command_submit>%u"
+           " first_selected=%" PRIu64 " last_command_submit=%" PRIu64
+           " direct=%" PRIu64 " structural_depth=%" PRIu64
+           " safe_chains=%" PRIu64 " emitted_ranges=%" PRIu64 "\n",
+           cp_debug->depthonly_census,
+           (uint64_t)cp_debug->depthonly_census + 1,
+           cp->depthonly.submit_ordinal, cp->depthonly.direct_shade_calls,
+           cp->depthonly.structural_depth_calls,
+           cp->depthonly.safe_chains, cp->depthonly.nvtx_ranges);
+   fprintf(stderr,
+           "cudavk: depthonly runs: runs=%" PRIu64 " singleton=%" PRIu64
+           " multi=%" PRIu64 " chains_in_multi=%" PRIu64
+           " sum_lengths=%" PRIu64 " max=%" PRIu64 "\n",
+           cp->depthonly.runs, cp->depthonly.singleton_runs,
+           cp->depthonly.multichain_runs,
+           cp->depthonly.chains_in_multichain_runs,
+           cp->depthonly.run_length_sum, cp->depthonly.max_run);
+   fprintf(stderr,
+           "cudavk: depthonly checks: classification=%s run_sum=%s range=%s"
+           " run_kinds=%s run_shape=%s run_seq=%s chain_seq=%s"
+           " result_valid=%s\n",
+           classification_valid ? "ok" : "FAILED",
+           run_sum_valid ? "ok" : "FAILED", range_valid ? "ok" : "FAILED",
+           run_kinds_valid ? "ok" : "FAILED",
+           run_shape_valid ? "ok" : "FAILED",
+           run_seq_valid ? "ok" : "FAILED",
+           chain_seq_valid ? "ok" : "FAILED",
+           result_valid ? "yes" : "no");
+   fprintf(stderr,
+           "cudavk: depthonly cuts: unsafe=%" PRIu64 " direction=%" PRIu64
+           " nondraw=%" PRIu64 " scope_end=%" PRIu64
+           "; declines samples=%" PRIu64 " coverage=%" PRIu64
+           " depth=%" PRIu64 " discard=%" PRIu64 " memory=%" PRIu64
+           " outputs=%" PRIu64 " query=%" PRIu64 " other=%" PRIu64 "\n",
+           cp->depthonly.cut_unsafe_draw, cp->depthonly.cut_direction,
+           cp->depthonly.cut_nondraw, cp->depthonly.cut_scope_end,
+           cp->depthonly.decline_samples, cp->depthonly.decline_coverage,
+           cp->depthonly.decline_depth, cp->depthonly.decline_discard,
+           cp->depthonly.decline_memory, cp->depthonly.decline_outputs,
+           cp->depthonly.decline_query, cp->depthonly.decline_other);
+}
+
+static void
 cp_plan_report(struct cp_context *cp)
 {
    if (!cp_debug->plan_stats || !cp->plan.merge_tests)
@@ -1018,6 +1125,7 @@ cp_context_cleanup(struct cp_context *cp)
               (double)cp->fs_blocks / (double)cp->fs_launches, cp->sm_count,
               cp_debug->fs_grid_waves);
    cp_plan_report(cp);
+   cp_depthonly_census_report(cp);
    if (cp_debug->upload_stats)
       fprintf(stderr, "cudavk: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
               " bytes=%" PRIu64 " empty=%" PRIu64 " coalesce=%d\n",
@@ -4935,6 +5043,110 @@ cp_restore_preclip(const struct cp_pending_clip *clip,
  * before this existed — the batch fields are zero, and the code below reduces
  * to what it was.
  */
+static bool
+cp_depthonly_fs_writes_special(const struct cp_shader_binary *fs)
+{
+   for (unsigned i = 0; i < CP_MAX_IO_SLOTS; i++)
+      if (fs->out_location[i] == FRAG_RESULT_DEPTH ||
+          fs->out_location[i] == FRAG_RESULT_STENCIL ||
+          fs->out_location[i] == FRAG_RESULT_SAMPLE_MASK)
+         return true;
+   return false;
+}
+
+/*
+ * Literal admission for the census.  Do not call cp_batch_order_free(): its
+ * UNSAFE_FORCE_OPAQUE relaxation is useful as a probe and is not a proof.
+ * The caller invokes this only for the ordinary direct cp_shade_fragments()
+ * call, never for A-buffer segment shading.
+ */
+static bool
+cp_depthonly_chain_safe(struct cp_context *cp,
+                        const struct cp_draw_state *state,
+                        const struct cp_render_scope *scope,
+                        void *color_data, bool fs_side_effects,
+                        bool depth_commit, bool retry, bool peel,
+                        bool prim_keyed_visbuf)
+{
+   cp->depthonly.direct_shade_calls++;
+   if (!cp->depthonly.scope_open || color_data || scope->fb.nr_cbufs != 0 ||
+       !scope->fb.has_zs ||
+       !scope->depth.data || !depth_commit || fs_side_effects) {
+      cp->depthonly.decline_other++;
+      return false;
+   }
+   cp->depthonly.structural_depth_calls++;
+   if (MAX2(scope->attachment_samples, 1u) != 1 ||
+       MAX2(state->pipeline_samples, 1u) != 1) {
+      cp->depthonly.decline_samples++;
+      return false;
+   }
+   if (state->alpha_to_coverage) {
+      cp->depthonly.decline_coverage++;
+      return false;
+   }
+   if (!state->depth.depth_enabled || !state->depth.depth_writemask ||
+       state->blend.enable ||
+       (state->depth.depth_func != CP_FUNC_LESS &&
+        state->depth.depth_func != CP_FUNC_LEQUAL &&
+        state->depth.depth_func != CP_FUNC_GREATER &&
+        state->depth.depth_func != CP_FUNC_GEQUAL)) {
+      cp->depthonly.decline_depth++;
+      return false;
+   }
+   if (!state->fs || !cp_shader_has_standalone_exec(state->fs) ||
+       !state->vs || retry || peel || prim_keyed_visbuf) {
+      cp->depthonly.decline_other++;
+      return false;
+   }
+   if (state->fs->uses_discard) {
+      cp->depthonly.decline_discard++;
+      return false;
+   }
+   if (state->fs->writes_memory) {
+      cp->depthonly.decline_memory++;
+      return false;
+   }
+   if (cp_depthonly_fs_writes_special(state->fs)) {
+      cp->depthonly.decline_outputs++;
+      return false;
+   }
+   if (scope->has_query) {
+      cp->depthonly.decline_query++;
+      return false;
+   }
+   return true;
+}
+
+static void
+cp_depthonly_unsafe_draw(struct cp_context *cp)
+{
+   if (!cp->depthonly.current_run_len)
+      return;
+   cp_depthonly_run_finish(cp);
+   cp->depthonly.cut_unsafe_draw++;
+}
+
+static void
+cp_depthonly_safe_chain(struct cp_context *cp,
+                        const struct cp_draw_state *state)
+{
+   unsigned direction = state->depth.depth_func == CP_FUNC_GREATER ||
+                        state->depth.depth_func == CP_FUNC_GEQUAL ? 2 : 1;
+   if (cp->depthonly.current_run_len &&
+       cp->depthonly.current_direction != direction) {
+      cp_depthonly_run_finish(cp);
+      cp->depthonly.cut_direction++;
+   }
+   if (!cp->depthonly.current_run_len) {
+      cp->depthonly.run_seq++;
+      cp->depthonly.current_direction = direction;
+   }
+   cp->depthonly.current_run_len++;
+   cp->depthonly.safe_chains++;
+   cp->depthonly.chain_seq++;
+}
+
 void
 cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 {
@@ -7056,7 +7268,27 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * for a colour, just the first two. A depth-only pass runs it for a
        * third reason: the writeback at the end of it is what commits depth,
        * and the shader has to run first because it may discard. */
-      if (color_data || fs_side_effects || depth_commit)
+      if (color_data || fs_side_effects || depth_commit) {
+         bool depthonly_range = false;
+         /* One cheap outer gate; no census helper is called in flag-off mode. */
+         if (cp_debug->depthonly_census && cp->depthonly.active) {
+            bool depthonly_safe = cp_depthonly_chain_safe(
+               cp, state, &batch->scope, color_data, fs_side_effects,
+               depth_commit, retry, peel, rast_args.blend_peel != 0);
+            if (depthonly_safe) {
+               cp_depthonly_safe_chain(cp, state);
+               depthonly_range = cp_nvtx_depthonly_pushf(
+                  "depthonly-safe submit=%" PRIu64 " scope_exec=%" PRIu64
+                  " serial=%u run=%" PRIu64 " chain=%" PRIu64,
+                  cp->depthonly.submit_ordinal, cp->depthonly.scope_exec_id,
+                  cp->depthonly.recorded_scope_serial, cp->depthonly.run_seq,
+                  cp->depthonly.chain_seq);
+               cp->depthonly.nvtx_ranges += depthonly_range;
+            } else {
+               /* Skipped/dead/empty draws never reach here and do not cut. */
+               cp_depthonly_unsafe_draw(cp);
+            }
+         }
          cp_shade_fragments(cp, state, &batch->scope, info, visbuf,
                             rast_args.positions, vs_output_buf,
                             rast_args.prim_refs, num_triangles, w, h,
@@ -7067,6 +7299,9 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                             retry ? cp->resolved : 0,
                             pass, 0, 0,
                             rast_args.blend_peel != 0);
+         if (depthonly_range)
+            cp_nvtx_depthonly_pop();
+      }
 
       if (peel) {
          /* Step past what this pass blended, and stop once the interval finds
@@ -9547,6 +9782,13 @@ cp_render_scope_begin(struct cp_context *cp, const struct cp_render_scope *scope
    cp_pass_finish(cp);
    cp->pass.scope = *scope;
    cp->pass.scope_open = true;
+   if (cp_debug->depthonly_census && cp->depthonly.active) {
+      /* A scope cannot legally span this boundary; close defensively. */
+      cp_depthonly_run_finish(cp);
+      cp->depthonly.scope_exec_id++;
+      cp->depthonly.recorded_scope_serial = scope->serial;
+      cp->depthonly.scope_open = true;
+   }
    cp_context_set_framebuffer(cp, &scope->fb, scope->attachment_samples);
    if (scope->fb.has_zs) {
       cp->depthbuf_cleared = false;
@@ -9562,6 +9804,13 @@ cp_render_scope_end(struct cp_context *cp)
    if (cp_debug->debug_episode)
       fprintf(stderr, "episode-cut: end_render\n");
    cp_pass_finish(cp);
+   if (cp_debug->depthonly_census) {
+      if (cp->depthonly.active && cp->depthonly.current_run_len) {
+         cp_depthonly_run_finish(cp);
+         cp->depthonly.cut_scope_end++;
+      }
+      cp->depthonly.scope_open = false;
+   }
    if (cp->pass.scope.depth.store)
       cp_depth_attachment_xfer(cp, &cp->pass.scope, true);
    cp->pass.scope_open = false;

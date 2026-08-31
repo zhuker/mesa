@@ -156,9 +156,15 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    /* The census divides by this: these captures submit twice per frame, which
     * is the same paired-submit convention every timing number here uses. */
    cp_smallop_hit(__FILE__, __LINE__, CP_SMALLOP_SUBMIT, 0);
-
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
+
+   /*
+    * Match the calibrated slot census: count only submits carrying command
+    * buffers, and leave even this private ordinal untouched when disabled.
+    */
+   if (cp_debug->depthonly_census && submit->command_buffer_count)
+      cp_depthonly_census_submit(&dev->renderer);
 
    CPVK_CTX_SCOPE(dev);
 
@@ -348,6 +354,16 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             break;
          }
          }
+         /*
+          * Cut after the op: its executor first flushes a pending draw, and
+          * that flushed draw belongs before this boundary. BEGIN/END own
+          * their scope state; skipped draw ops deliberately do neither.
+          */
+         if (cp_debug->depthonly_census &&
+             cmd->ops[o].kind != CPVK_OP_DRAW &&
+             cmd->ops[o].kind != CPVK_OP_BEGIN_RENDER &&
+             cmd->ops[o].kind != CPVK_OP_END_RENDER)
+            cp_depthonly_census_nondraw(&dev->renderer);
          if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
             return cpvk_submit_abort(dev,
                vk_error(dev, VK_ERROR_DEVICE_LOST));
