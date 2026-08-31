@@ -164,7 +164,9 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * command buffers. Empty submits implement waits and do not correspond to
     * capture timestamp submits. One-based: START=N selects the first count
     * strictly greater than N. */
-   if (cp_debug->opaque_slot0_census && submit->command_buffer_count)
+   if ((cp_debug->opaque_slot0_census ||
+        cp_debug->opaque_slot0_census_nvtx_scopes) &&
+       submit->command_buffer_count)
       dev->renderer.opaque_slot0.submit++;
 
    CPVK_CTX_SCOPE(dev);

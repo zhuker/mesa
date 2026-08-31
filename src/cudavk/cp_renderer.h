@@ -15,11 +15,13 @@
 #include "cp_device.h"
 #include "cp_draw_types.h"
 #include "cp_draw_packet.h"
+#include "cp_shader_identity.h"
 
 #include <cuda.h>
 #include <stdbool.h>
 #include <stdio.h>
 
+#include "util/mesa-blake3.h"
 #include "kernels/cp_rast_types.h"
 
 #include "cp_shader_abi.h"
@@ -288,7 +290,10 @@ struct cp_context {
    struct {
       CUdeviceptr snapshot;
       size_t capacity_px;
-      CUdeviceptr counters;       /* managed uint64[CP_OPAQUE_SLOT0_WORDS] */
+      CUdeviceptr counters;       /* managed uint64[CP_OPAQUE_SLOT0_TOTAL_WORDS] */
+      uint8_t shader_keys[CP_OPAQUE_SLOT0_MAX_SHADERS]
+                         [CP_SHADER_STABLE_KEY_BYTES];
+      unsigned num_shader_bins;
       size_t snapshot_px;
       uint32_t seg0_prim_end;
       uint64_t snapshot_submit;
@@ -296,6 +301,25 @@ struct cp_context {
       uint64_t submit_skipped_episodes;
       uint64_t submit_first;      /* selected episode-bearing internal submit */
       uint64_t submit_last;       /* selected episode-bearing internal submit */
+      struct mesa_blake3 population_digest;
+      uint64_t finished_episodes;  /* absolute ID source, all nonempty finishes */
+      uint64_t population_count;  /* selected ordinal, never episode identity */
+      bool population_digest_initialized;
+      bool episode_id_overflow;
+      bool population_count_overflow;
+      uint64_t nvtx_selected_scopes;
+      uint64_t nvtx_submit_first;
+      uint64_t nvtx_submit_last;
+      uint64_t nvtx_missing_ids;
+      uint64_t nvtx_expected_group_launches;
+      uint64_t nvtx_attempted_fs_launches;
+      uint64_t nvtx_successful_fs_launches;
+      uint64_t nvtx_launch_mismatch_scopes;
+      unsigned nvtx_scope_expected_launches;
+      unsigned nvtx_scope_attempted_launches;
+      unsigned nvtx_scope_successful_launches;
+      bool nvtx_selected_scope_active;
+      bool nvtx_counter_overflow;
       bool attempted;             /* this episode tried the pre-segment1 copy */
       bool episode_valid;         /* that copy is complete and reducible */
       bool invalid;               /* any selected-population failure is global */
@@ -313,6 +337,11 @@ struct cp_context {
       uint64_t replacement_sync_failures;
       uint64_t bounds_failures;
       uint64_t missing_snapshot;
+      uint64_t missing_shader_ids;
+      uint64_t shader_bin_overflows;
+      uint64_t shader_range_failures;
+      uint64_t shader_sum_mismatches;
+      uint64_t selected_setup_failures;
    } opaque_slot0;
 
    /* A merged shading group's concatenated fs-UBO rows, staged here before

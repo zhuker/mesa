@@ -2510,6 +2510,36 @@ cp_tile_census_mark(struct cp_tile_census_args args)
  * one fragment-shader quad, while only its winning pixels are covered lanes.
  * This kernel reads rendering state but writes only census counters.
  */
+static_assert(sizeof(struct cp_opaque_slot0_census_args) == 560,
+              "slot0 reducer argument ABI size");
+
+static __device__ __forceinline__ void
+cp_opaque_slot0_add_checked(unsigned long long *out, uint32_t word,
+                            unsigned long long value)
+{
+   if (!value)
+      return;
+   unsigned long long old = atomicAdd(out + word, value);
+   if (old > ~0ull - value)
+      atomicExch(out + CP_OPAQUE_SLOT0_COUNTER_OVERFLOW, 1ull);
+}
+
+static __device__ __forceinline__ uint32_t
+cp_opaque_slot0_prim_bin(const struct cp_opaque_slot0_census_args *args,
+                         uint32_t prim)
+{
+   uint32_t lo = 0, hi = args->nsegs;
+   while (lo < hi) {
+      uint32_t mid = lo + (hi - lo) / 2;
+      if (prim < args->seg_end[mid])
+         hi = mid;
+      else
+         lo = mid + 1;
+   }
+   return lo < args->nsegs ? args->seg_bin[lo]
+                           : CP_OPAQUE_SLOT0_MAX_SHADERS;
+}
+
 extern "C" __global__ void
 cp_opaque_slot0_census(struct cp_opaque_slot0_census_args args)
 {
@@ -2595,7 +2625,7 @@ cp_opaque_slot0_census(struct cp_opaque_slot0_census_args args)
          killed_quads++;
    }
 
-   uint32_t finals[4], nfinals = 0, nfinals_s0 = 0;
+   uint32_t finals[4], final_bins[4], nfinals = 0, nfinals_s0 = 0;
    for (uint32_t lane = 0; lane < 4; lane++) {
       if (!in_fb[lane] || fin[lane] == VISBUF_EMPTY ||
           fprim[lane] >= args.episode_prim_end)
@@ -2604,39 +2634,65 @@ cp_opaque_slot0_census(struct cp_opaque_slot0_census_args args)
       for (uint32_t i = 0; i < nfinals; i++)
          seen |= finals[i] == fprim[lane];
       if (!seen) {
-         finals[nfinals++] = fprim[lane];
+         uint32_t bin = cp_opaque_slot0_prim_bin(&args, fprim[lane]);
+         finals[nfinals] = fprim[lane];
+         final_bins[nfinals] = bin;
+         nfinals++;
+         if (bin >= CP_OPAQUE_SLOT0_MAX_SHADERS)
+            bad_final++;
          if (fprim[lane] < args.seg0_prim_end)
             nfinals_s0++;
       }
    }
 
-   /* One global atomic per nonzero block total, not one per framebuffer
-    * quad. The latter makes a count-only probe spend its life contending on
-    * twelve words and can perturb the replay far beyond what "timing invalid"
-    * needs to mean. */
+   /* Block reduction keeps the count-only probe from issuing one contended
+    * global atomic per framebuffer quad. */
    __shared__ unsigned long long block_counts[CP_OPAQUE_SLOT0_WORDS];
-   if (threadIdx.x < CP_OPAQUE_SLOT0_WORDS)
-      block_counts[threadIdx.x] = 0;
+   __shared__ unsigned long long block_bins[
+      CP_OPAQUE_SLOT0_MAX_SHADERS * CP_OPAQUE_SLOT0_BIN_WORDS];
+   for (uint32_t i = threadIdx.x; i < CP_OPAQUE_SLOT0_WORDS;
+        i += blockDim.x)
+      block_counts[i] = 0;
+   for (uint32_t i = threadIdx.x;
+        i < CP_OPAQUE_SLOT0_MAX_SHADERS * CP_OPAQUE_SLOT0_BIN_WORDS;
+        i += blockDim.x)
+      block_bins[i] = 0;
    __syncthreads();
 
-   if (ncandidates)
+   if (ncandidates) {
       atomicAdd(block_counts + CP_OPAQUE_SLOT0_CANDIDATE_QUADS,
                 (unsigned long long)ncandidates);
+      atomicAdd(block_bins + args.seg_bin[0] * CP_OPAQUE_SLOT0_BIN_WORDS +
+                CP_OPAQUE_SLOT0_BIN_CANDIDATE,
+                (unsigned long long)ncandidates);
+   }
    if (candidate_lanes)
       atomicAdd(block_counts + CP_OPAQUE_SLOT0_CANDIDATE_LANES,
                 (unsigned long long)candidate_lanes);
-   if (useful_quads)
+   if (useful_quads) {
       atomicAdd(block_counts + CP_OPAQUE_SLOT0_USEFUL_QUADS,
                 (unsigned long long)useful_quads);
+      atomicAdd(block_bins + args.seg_bin[0] * CP_OPAQUE_SLOT0_BIN_WORDS +
+                CP_OPAQUE_SLOT0_BIN_USEFUL,
+                (unsigned long long)useful_quads);
+   }
    if (useful_lanes)
       atomicAdd(block_counts + CP_OPAQUE_SLOT0_USEFUL_LANES,
                 (unsigned long long)useful_lanes);
-   if (killed_quads)
+   if (killed_quads) {
       atomicAdd(block_counts + CP_OPAQUE_SLOT0_KILLED_QUADS,
                 (unsigned long long)killed_quads);
+      atomicAdd(block_bins + args.seg_bin[0] * CP_OPAQUE_SLOT0_BIN_WORDS +
+                CP_OPAQUE_SLOT0_BIN_KILLED,
+                (unsigned long long)killed_quads);
+   }
    if (nfinals)
       atomicAdd(block_counts + CP_OPAQUE_SLOT0_FINAL_QUADS,
                 (unsigned long long)nfinals);
+   for (uint32_t i = 0; i < nfinals; i++)
+      if (final_bins[i] < CP_OPAQUE_SLOT0_MAX_SHADERS)
+         atomicAdd(block_bins + final_bins[i] * CP_OPAQUE_SLOT0_BIN_WORDS +
+                   CP_OPAQUE_SLOT0_BIN_FINAL, 1ull);
    if (final_lanes)
       atomicAdd(block_counts + CP_OPAQUE_SLOT0_FINAL_LANES,
                 (unsigned long long)final_lanes);
@@ -2656,18 +2712,16 @@ cp_opaque_slot0_census(struct cp_opaque_slot0_census_args args)
       block_counts[CP_OPAQUE_SLOT0_REDUCED_EPISODES] = 1;
    __syncthreads();
 
-   if (threadIdx.x < CP_OPAQUE_SLOT0_WORDS && block_counts[threadIdx.x])
-      atomicAdd(out + threadIdx.x, block_counts[threadIdx.x]);
+   for (uint32_t i = threadIdx.x; i < CP_OPAQUE_SLOT0_WORDS;
+        i += blockDim.x)
+      cp_opaque_slot0_add_checked(out, i, block_counts[i]);
+   for (uint32_t i = threadIdx.x;
+        i < CP_OPAQUE_SLOT0_MAX_SHADERS * CP_OPAQUE_SLOT0_BIN_WORDS;
+        i += blockDim.x)
+      cp_opaque_slot0_add_checked(out, CP_OPAQUE_SLOT0_BIN_BASE + i,
+                                  block_bins[i]);
 }
 
-/*
- * The same marking from the opaque side. Opaque draws never enter the
- * A-buffer's quad stream: their coverage is the shared visibility buffer,
- * one winner per pixel, carrying the episode-global primitive that won it.
- * A tile only has to be able to *call* the shader of a fragment it shades,
- * and for opaque geometry that is the winner — so this is the right set,
- * not every primitive that touched the tile.
- */
 extern "C" __global__ void
 cp_tile_census_mark_vis(struct cp_tile_census_args args)
 {

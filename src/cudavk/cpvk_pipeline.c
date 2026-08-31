@@ -987,6 +987,22 @@ cpvk_prim(VkPrimitiveTopology t)
  * NIR will be. The descriptor lowering depends on the pipeline layout as
  * well, so the layout's set numbering goes in beside it.
  */
+static void
+cpvk_shader_set_stable_key(struct cp_shader_binary *bin,
+                           const unsigned char hash[BLAKE3_OUT_LEN])
+{
+   static const char hex[] = "0123456789abcdef";
+   _Static_assert(BLAKE3_OUT_LEN == CP_SHADER_STABLE_KEY_BYTES,
+                  "shader identity must retain the full BLAKE3 key");
+   memcpy(bin->stable_key, hash, CP_SHADER_STABLE_KEY_BYTES);
+   for (unsigned i = 0; i < CP_SHADER_STABLE_KEY_BYTES; i++) {
+      bin->stable_key_hex[2 * i] = hex[hash[i] >> 4];
+      bin->stable_key_hex[2 * i + 1] = hex[hash[i] & 15];
+   }
+   bin->stable_key_hex[CP_SHADER_STABLE_KEY_BYTES * 2] = '\0';
+   bin->stable_key_valid = true;
+}
+
 static struct cp_shader_binary *
 cpvk_compile_stage(struct cpvk_device *dev,
                    VkPipelineCreateFlags2KHR flags,
@@ -1220,6 +1236,7 @@ cpvk_compile_stage(struct cpvk_device *dev,
       return NULL;
    }
 
+   cpvk_shader_set_stable_key(bin, hash);
    simple_mtx_lock(&dev->shader_cache_lock);
    /* Another thread may have compiled the same stage while this one was
     * outside the lock. Preserve the cache's pointer-identity invariant and

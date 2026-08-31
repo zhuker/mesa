@@ -211,6 +211,8 @@ struct cp_debug {
    bool no_opaque_streams;
    bool opaque_slot0_census;
    unsigned opaque_slot0_census_submit_start;
+   unsigned opaque_slot0_census_nvtx_scopes;
+   bool opaque_slot0_census_nvtx_rejected;
    /*
     * Programmatic dependent launch. `pdl` is a level, not a boolean: 0 off,
     * 1 the A-buffer scan chain, 2 the rasterizer stage links, 3 the fragment

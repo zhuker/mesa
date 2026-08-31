@@ -968,15 +968,29 @@ struct cp_abuf_seg_args {
 #define CP_OPAQUE_SLOT0_BAD_SNAPSHOT    10
 #define CP_OPAQUE_SLOT0_BAD_FINAL       11
 #define CP_OPAQUE_SLOT0_WORDS           12
+#define CP_OPAQUE_SLOT0_MAX_SHADERS    128
+#define CP_OPAQUE_SLOT0_BIN_WORDS        4
+#define CP_OPAQUE_SLOT0_BIN_CANDIDATE    0
+#define CP_OPAQUE_SLOT0_BIN_USEFUL       1
+#define CP_OPAQUE_SLOT0_BIN_KILLED       2
+#define CP_OPAQUE_SLOT0_BIN_FINAL        3
+#define CP_OPAQUE_SLOT0_BIN_BASE CP_OPAQUE_SLOT0_WORDS
+#define CP_OPAQUE_SLOT0_COUNTER_OVERFLOW \
+   (CP_OPAQUE_SLOT0_BIN_BASE + CP_OPAQUE_SLOT0_MAX_SHADERS * \
+    CP_OPAQUE_SLOT0_BIN_WORDS)
+#define CP_OPAQUE_SLOT0_TOTAL_WORDS (CP_OPAQUE_SLOT0_COUNTER_OVERFLOW + 1)
 
 struct cp_opaque_slot0_census_args {
    uint64_t snapshot;       /* uint64 visibility entries after segment 0 */
    uint64_t final_visbuf;   /* the ordinary episode's final shared visbuf */
-   uint64_t counters;       /* uint64[CP_OPAQUE_SLOT0_WORDS] */
+   uint64_t counters;       /* uint64[CP_OPAQUE_SLOT0_TOTAL_WORDS] */
    uint32_t width;
    uint32_t height;
    uint32_t seg0_prim_end;  /* segment 0 is [0, seg0_prim_end) */
    uint32_t episode_prim_end;
+   uint32_t nsegs;
+   uint32_t seg_end[CP_PASS_MAX_SEGS];
+   uint32_t seg_bin[CP_PASS_MAX_SEGS];
 };
 
 #define CP_TILE_CENSUS_MAX_SHADERS 64

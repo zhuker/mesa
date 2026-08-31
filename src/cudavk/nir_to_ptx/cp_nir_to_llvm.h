@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "cp_shader_identity.h"
+
 struct nir_shader;
 struct nir_tex_instr;
 struct cp_sampler_info;
@@ -187,6 +189,11 @@ enum cp_hw_compile_failure {
 
 struct cp_shader_binary {
    struct cp_shader_exec exec[CP_SHADER_EXEC_COUNT];
+   /* Native pipeline-stage BLAKE3 cache key: stable across processes and used
+    * by diagnostics instead of the allocation address. */
+   uint8_t stable_key[CP_SHADER_STABLE_KEY_BYTES];
+   char stable_key_hex[CP_SHADER_STABLE_KEY_HEX];
+   bool stable_key_valid;
    int sm_major;
    int sm_minor;
    unsigned shared_size;

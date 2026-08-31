@@ -20,6 +20,7 @@
 #include "nir_to_ptx/cp_nir_to_llvm.h"
 
 #include <inttypes.h>
+#include <stddef.h>
 #include "util/os_time.h"
 
 #include "util/u_memory.h"
@@ -30,6 +31,20 @@
 /* Last, because it intercepts the CUDA entry points to take the iteration 26
  * census. Nothing below this line calls them unwrapped. */
 #include "cp_smallop_tele.h"
+
+_Static_assert(sizeof(struct cp_opaque_slot0_census_args) == 560,
+               "slot0 reducer argument ABI size");
+_Static_assert(offsetof(struct cp_opaque_slot0_census_args, counters) == 16,
+               "slot0 reducer counters ABI");
+_Static_assert(offsetof(struct cp_opaque_slot0_census_args, nsegs) == 40,
+               "slot0 reducer nsegs ABI");
+_Static_assert(offsetof(struct cp_opaque_slot0_census_args, seg_end) == 44,
+               "slot0 reducer segment-end ABI");
+_Static_assert(offsetof(struct cp_opaque_slot0_census_args, seg_bin) == 300,
+               "slot0 reducer segment-bin ABI");
+_Static_assert(sizeof(((struct cp_context *)0)->opaque_slot0.shader_keys[0]) ==
+                  CP_SHADER_STABLE_KEY_BYTES,
+               "slot0 shader keys retain the full stable identity");
 
 /* Which caller site produced a descriptor fallback; printed with the
  * hardware-texture stats. Attribution before ranking, rule 14. */
@@ -186,6 +201,10 @@ fail:
  */
 static void cp_texture_cache_unpin(struct cp_context *cp);
 static void cp_opaque_slot0_invalidate(struct cp_context *cp);
+static void cp_opaque_slot0_nvtx_fs_launch_attempt(struct cp_context *cp);
+static void cp_opaque_slot0_nvtx_fs_launch_success(struct cp_context *cp);
+static void cp_opaque_slot0_population_hex(
+   const struct cp_context *cp, char hex[CP_SHADER_STABLE_KEY_HEX]);
 
 static void
 cp_renderer_texture_fatal(struct cp_context *cp)
@@ -843,10 +862,78 @@ cp_shade_counter_get(struct cp_context *cp)
 static void
 cp_opaque_slot0_report(struct cp_context *cp)
 {
+   if (!cp_debug->opaque_slot0_census &&
+       !cp_debug->opaque_slot0_census_nvtx_scopes)
+      return;
+
+   char population_hex[CP_SHADER_STABLE_KEY_HEX];
+   cp_opaque_slot0_population_hex(cp, population_hex);
+   if (cp_debug->opaque_slot0_census_nvtx_scopes) {
+      bool labels_valid = cp_nvtx_enabled() &&
+         !cp->opaque_slot0.invalid &&
+         !cp->opaque_slot0.sync_failed &&
+         !cp->opaque_slot0.nvtx_missing_ids &&
+         !cp->opaque_slot0.selected_setup_failures &&
+         !cp->opaque_slot0.episode_id_overflow &&
+         !cp->opaque_slot0.population_count_overflow &&
+         !cp->opaque_slot0.nvtx_counter_overflow &&
+         !cp->opaque_slot0.nvtx_selected_scope_active &&
+         !cp->opaque_slot0.nvtx_launch_mismatch_scopes &&
+         cp->opaque_slot0.population_digest_initialized &&
+         cp->opaque_slot0.nvtx_selected_scopes ==
+            cp_debug->opaque_slot0_census_nvtx_scopes &&
+         cp->opaque_slot0.population_count ==
+            cp->opaque_slot0.nvtx_selected_scopes &&
+         cp->opaque_slot0.nvtx_expected_group_launches ==
+            cp->opaque_slot0.nvtx_attempted_fs_launches &&
+         cp->opaque_slot0.nvtx_expected_group_launches ==
+            cp->opaque_slot0.nvtx_successful_fs_launches &&
+         cp->opaque_slot0.nvtx_submit_first >
+            cp_debug->opaque_slot0_census_submit_start &&
+         cp->opaque_slot0.nvtx_submit_last >=
+            cp->opaque_slot0.nvtx_submit_first &&
+         cp->opaque_slot0.submit >= cp->opaque_slot0.nvtx_submit_last;
+      fprintf(stderr,
+              "cudavk: opaque slot0 NVTX labels: mode=labels-only "
+              "result_valid=%s submit_kind=command_buffer "
+              "submit_indexing=1-based-internal "
+              "submit_start=%u submit_current=%" PRIu64
+              " finished_episodes=%" PRIu64
+              " selected_scopes=%" PRIu64 " expected_scopes=%u "
+              "selected_episode_submit_first=%" PRIu64 " "
+              "selected_episode_submit_last=%" PRIu64 " "
+              "population_count=%" PRIu64 " population_digest=%s "
+              "expected_group_launches=%" PRIu64 " "
+              "attempted_keyed_fs_launches=%" PRIu64 " "
+              "successful_keyed_fs_launches=%" PRIu64 " "
+              "launch_mismatch_scopes=%" PRIu64 " "
+              "missing_ids=%" PRIu64 " selected_setup=%" PRIu64 " "
+              "episode_id_overflow=%u population_count_overflow=%u "
+              "launch_counter_overflow=%u active_scope=%u\n",
+              labels_valid ? "yes" : "no",
+              cp_debug->opaque_slot0_census_submit_start,
+              cp->opaque_slot0.submit,
+              cp->opaque_slot0.finished_episodes,
+              cp->opaque_slot0.nvtx_selected_scopes,
+              cp_debug->opaque_slot0_census_nvtx_scopes,
+              cp->opaque_slot0.nvtx_submit_first,
+              cp->opaque_slot0.nvtx_submit_last,
+              cp->opaque_slot0.population_count, population_hex,
+              cp->opaque_slot0.nvtx_expected_group_launches,
+              cp->opaque_slot0.nvtx_attempted_fs_launches,
+              cp->opaque_slot0.nvtx_successful_fs_launches,
+              cp->opaque_slot0.nvtx_launch_mismatch_scopes,
+              cp->opaque_slot0.nvtx_missing_ids,
+              cp->opaque_slot0.selected_setup_failures,
+              cp->opaque_slot0.episode_id_overflow ? 1u : 0u,
+              cp->opaque_slot0.population_count_overflow ? 1u : 0u,
+              cp->opaque_slot0.nvtx_counter_overflow ? 1u : 0u,
+              cp->opaque_slot0.nvtx_selected_scope_active ? 1u : 0u);
+   }
    if (!cp_debug->opaque_slot0_census)
       return;
 
-   uint64_t words[CP_OPAQUE_SLOT0_WORDS] = {0};
+   uint64_t words[CP_OPAQUE_SLOT0_TOTAL_WORDS] = {0};
    bool have_words = cp->opaque_slot0.counters &&
                      !cp->opaque_slot0.sync_failed;
    if (have_words)
@@ -854,13 +941,47 @@ cp_opaque_slot0_report(struct cp_context *cp)
              sizeof(words));
 
    bool valid = !cp->opaque_slot0.invalid &&
-                !cp->opaque_slot0.sync_failed;
+                !cp->opaque_slot0.sync_failed &&
+                !cp->opaque_slot0.episode_id_overflow &&
+                !cp->opaque_slot0.population_count_overflow &&
+                !cp->opaque_slot0.missing_shader_ids &&
+                !cp->opaque_slot0.shader_bin_overflows &&
+                !cp->opaque_slot0.shader_range_failures;
+   uint64_t bin_sum[CP_OPAQUE_SLOT0_BIN_WORDS] = {0};
+   bool shader_invariants = true;
+   if (valid && have_words) {
+      valid &= words[CP_OPAQUE_SLOT0_COUNTER_OVERFLOW] == 0;
+      valid &= cp->opaque_slot0.num_shader_bins <=
+               CP_OPAQUE_SLOT0_MAX_SHADERS;
+      for (unsigned i = 0; i < cp->opaque_slot0.num_shader_bins; i++) {
+         const uint64_t *bin = words + CP_OPAQUE_SLOT0_BIN_BASE +
+                               i * CP_OPAQUE_SLOT0_BIN_WORDS;
+         shader_invariants &= bin[CP_OPAQUE_SLOT0_BIN_USEFUL] <=
+            UINT64_MAX - bin[CP_OPAQUE_SLOT0_BIN_KILLED];
+         shader_invariants &= bin[CP_OPAQUE_SLOT0_BIN_CANDIDATE] ==
+            bin[CP_OPAQUE_SLOT0_BIN_USEFUL] +
+            bin[CP_OPAQUE_SLOT0_BIN_KILLED];
+         shader_invariants &= bin[CP_OPAQUE_SLOT0_BIN_USEFUL] <=
+            bin[CP_OPAQUE_SLOT0_BIN_FINAL];
+         for (unsigned j = 0; j < CP_OPAQUE_SLOT0_BIN_WORDS; j++) {
+            uint64_t old = bin_sum[j];
+            bin_sum[j] += bin[j];
+            shader_invariants &= bin_sum[j] >= old;
+         }
+      }
+      valid &= shader_invariants;
+      if (!shader_invariants)
+         cp->opaque_slot0.shader_sum_mismatches++;
+   }
    if (valid && cp->opaque_slot0.eligible_episodes) {
       valid &= have_words;
       valid &= cp->opaque_slot0.submit_first >
                cp_debug->opaque_slot0_census_submit_start;
       valid &= cp->opaque_slot0.submit_last >= cp->opaque_slot0.submit_first;
       valid &= cp->opaque_slot0.submit >= cp->opaque_slot0.submit_last;
+      valid &= cp->opaque_slot0.population_digest_initialized;
+      valid &= cp->opaque_slot0.population_count ==
+               cp->opaque_slot0.eligible_episodes;
       valid &= cp->opaque_slot0.snapshot_attempts ==
                cp->opaque_slot0.eligible_episodes;
       valid &= cp->opaque_slot0.snapshot_ok ==
@@ -869,6 +990,8 @@ cp_opaque_slot0_report(struct cp_context *cp)
                cp->opaque_slot0.eligible_episodes;
       valid &= words[CP_OPAQUE_SLOT0_REDUCED_EPISODES] ==
                cp->opaque_slot0.eligible_episodes;
+      valid &= words[CP_OPAQUE_SLOT0_USEFUL_QUADS] <=
+               UINT64_MAX - words[CP_OPAQUE_SLOT0_KILLED_QUADS];
       valid &= words[CP_OPAQUE_SLOT0_USEFUL_QUADS] +
                words[CP_OPAQUE_SLOT0_KILLED_QUADS] ==
                words[CP_OPAQUE_SLOT0_CANDIDATE_QUADS];
@@ -884,34 +1007,57 @@ cp_opaque_slot0_report(struct cp_context *cp)
                words[CP_OPAQUE_SLOT0_FINAL_LANES];
       valid &= words[CP_OPAQUE_SLOT0_BAD_SNAPSHOT] == 0;
       valid &= words[CP_OPAQUE_SLOT0_BAD_FINAL] == 0;
+      valid &= cp->opaque_slot0.num_shader_bins > 0;
+      bool sums_match =
+         bin_sum[CP_OPAQUE_SLOT0_BIN_CANDIDATE] ==
+            words[CP_OPAQUE_SLOT0_CANDIDATE_QUADS] &&
+         bin_sum[CP_OPAQUE_SLOT0_BIN_USEFUL] ==
+            words[CP_OPAQUE_SLOT0_USEFUL_QUADS] &&
+         bin_sum[CP_OPAQUE_SLOT0_BIN_KILLED] ==
+            words[CP_OPAQUE_SLOT0_KILLED_QUADS] &&
+         bin_sum[CP_OPAQUE_SLOT0_BIN_FINAL] ==
+            words[CP_OPAQUE_SLOT0_FINAL_QUADS];
+      if (!sums_match)
+         cp->opaque_slot0.shader_sum_mismatches++;
+      valid &= sums_match;
    } else if (valid) {
       valid &= cp->opaque_slot0.snapshot_attempts == 0;
       valid &= cp->opaque_slot0.reducer_launches == 0;
       valid &= cp->opaque_slot0.submit_first == 0;
       valid &= cp->opaque_slot0.submit_last == 0;
+      valid &= cp->opaque_slot0.num_shader_bins == 0;
+      valid &= cp->opaque_slot0.population_count == 0;
+      valid &= !cp->opaque_slot0.population_digest_initialized;
    }
    if (!valid)
       cp->opaque_slot0.invalid = true;
 
    fprintf(stderr,
-           "cudavk: opaque slot0 census: result_valid=%s "
-           "submit_kind=command_buffer submit_indexing=1-based-internal "
+           "cudavk: opaque slot0 census: mode=census labels_mode=%s "
+           "result_valid=%s submit_kind=command_buffer "
+           "submit_indexing=1-based-internal "
            "submit_start=%u submit_current=%" PRIu64
+           " finished_episodes=%" PRIu64
            " skipped_eligible=%" PRIu64
            " selected_episode_submit_first=%" PRIu64
            " selected_episode_submit_last=%" PRIu64
            " eligible=%" PRIu64 " snapshot_attempts=%" PRIu64
            " snapshot_ok=%" PRIu64 " reducers=%" PRIu64
-           " reduced=%" PRIu64 "\n",
+           " reduced=%" PRIu64 " population_count=%" PRIu64
+           " population_digest=%s\n",
+           cp_debug->opaque_slot0_census_nvtx_rejected
+              ? "rejected-disabled" : "disabled",
            valid ? "yes" : "no",
            cp_debug->opaque_slot0_census_submit_start,
            cp->opaque_slot0.submit,
+           cp->opaque_slot0.finished_episodes,
            cp->opaque_slot0.submit_skipped_episodes,
            cp->opaque_slot0.submit_first, cp->opaque_slot0.submit_last,
            cp->opaque_slot0.eligible_episodes,
            cp->opaque_slot0.snapshot_attempts, cp->opaque_slot0.snapshot_ok,
            cp->opaque_slot0.reducer_launches,
-           have_words ? words[CP_OPAQUE_SLOT0_REDUCED_EPISODES] : 0);
+           have_words ? words[CP_OPAQUE_SLOT0_REDUCED_EPISODES] : 0,
+           cp->opaque_slot0.population_count, population_hex);
 
    if (!valid) {
       fprintf(stderr,
@@ -919,7 +1065,11 @@ cp_opaque_slot0_report(struct cp_context *cp)
               " alloc=%" PRIu64 " copy=%" PRIu64 " launch=%" PRIu64
               " missing_reducer=%" PRIu64 " ordering=%" PRIu64
               " replacement_sync=%" PRIu64 " bounds=%" PRIu64
-              " missing_snapshot=%" PRIu64
+              " missing_snapshot=%" PRIu64 " missing_shader_id=%" PRIu64
+              " shader_bins_overflow=%" PRIu64 " shader_ranges=%" PRIu64
+              " shader_sums=%" PRIu64 " selected_setup=%" PRIu64
+              " counter_overflow=%" PRIu64
+              " episode_id_overflow=%u population_count_overflow=%u"
               " sync=%u; totals suppressed\n",
               cp->opaque_slot0.aborted_appends,
               cp->opaque_slot0.allocation_failures,
@@ -930,6 +1080,14 @@ cp_opaque_slot0_report(struct cp_context *cp)
               cp->opaque_slot0.replacement_sync_failures,
               cp->opaque_slot0.bounds_failures,
               cp->opaque_slot0.missing_snapshot,
+              cp->opaque_slot0.missing_shader_ids,
+              cp->opaque_slot0.shader_bin_overflows,
+              cp->opaque_slot0.shader_range_failures,
+              cp->opaque_slot0.shader_sum_mismatches,
+              cp->opaque_slot0.selected_setup_failures,
+              have_words ? words[CP_OPAQUE_SLOT0_COUNTER_OVERFLOW] : 0,
+              cp->opaque_slot0.episode_id_overflow ? 1u : 0u,
+              cp->opaque_slot0.population_count_overflow ? 1u : 0u,
               cp->opaque_slot0.sync_failed ? 1u : 0u);
       return;
    }
@@ -966,6 +1124,40 @@ cp_opaque_slot0_report(struct cp_context *cp)
                     words[CP_OPAQUE_SLOT0_USEFUL_LANES]) / cl,
            words[CP_OPAQUE_SLOT0_FINAL_LANES],
            100.0 * words[CP_OPAQUE_SLOT0_USEFUL_LANES] / fl);
+   bool weighting_inputs_valid = true;
+   for (unsigned i = 0; i < cp->opaque_slot0.num_shader_bins; i++) {
+      const uint64_t *bin = words + CP_OPAQUE_SLOT0_BIN_BASE +
+                            i * CP_OPAQUE_SLOT0_BIN_WORDS;
+      if (bin[CP_OPAQUE_SLOT0_BIN_CANDIDATE] &&
+          !bin[CP_OPAQUE_SLOT0_BIN_FINAL])
+         weighting_inputs_valid = false;
+   }
+   fprintf(stderr,
+           "cudavk: opaque slot0 shader weighting: bins=%u "
+           "weighting_inputs_valid=%s projection=optimistic "
+           "per_draw_cost_and_extra_launch_overhead=not_modelled\n",
+           cp->opaque_slot0.num_shader_bins,
+           weighting_inputs_valid ? "yes" : "no");
+   for (unsigned i = 0; i < cp->opaque_slot0.num_shader_bins; i++) {
+      const uint64_t *bin = words + CP_OPAQUE_SLOT0_BIN_BASE +
+                            i * CP_OPAQUE_SLOT0_BIN_WORDS;
+      if (!bin[CP_OPAQUE_SLOT0_BIN_CANDIDATE] &&
+          !bin[CP_OPAQUE_SLOT0_BIN_FINAL])
+         continue;
+      fprintf(stderr, "cudavk: opaque slot0 shader key=");
+      for (unsigned j = 0; j < CP_SHADER_STABLE_KEY_BYTES; j++)
+         fprintf(stderr, "%02x", cp->opaque_slot0.shader_keys[i][j]);
+      fprintf(stderr,
+              " candidate=%" PRIu64 " useful=%" PRIu64
+              " killed=%" PRIu64 " final=%" PRIu64
+              " weightable_by_current_final=%s\n",
+              bin[CP_OPAQUE_SLOT0_BIN_CANDIDATE],
+              bin[CP_OPAQUE_SLOT0_BIN_USEFUL],
+              bin[CP_OPAQUE_SLOT0_BIN_KILLED],
+              bin[CP_OPAQUE_SLOT0_BIN_FINAL],
+              !bin[CP_OPAQUE_SLOT0_BIN_CANDIDATE] ||
+               bin[CP_OPAQUE_SLOT0_BIN_FINAL] ? "yes" : "no");
+   }
 }
 
 static void
@@ -1135,7 +1327,8 @@ cp_context_cleanup(struct cp_context *cp)
 
    CUresult cleanup_sync = cuCtxSynchronize();
    if (cleanup_sync != CUDA_SUCCESS) {
-      if (cp_debug->opaque_slot0_census) {
+      if (cp_debug->opaque_slot0_census ||
+          cp_debug->opaque_slot0_census_nvtx_scopes) {
          cp->opaque_slot0.sync_failed = true;
          cp_opaque_slot0_invalidate(cp);
       }
@@ -3979,7 +4172,14 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
    void *fs_params[] = { &fs_arg_ptr };
    {
       /* Scoped: the launch check returns out of the middle. */
-      CP_NVTX_SCOPE("fs");
+      char fs_nvtx_keyed[3 + CP_SHADER_STABLE_KEY_HEX];
+      const char *fs_nvtx_name = "fs";
+      if (cp->opaque_slot0.nvtx_selected_scope_active) {
+         snprintf(fs_nvtx_keyed, sizeof(fs_nvtx_keyed), "fs/%s",
+                  fs->stable_key_valid ? fs->stable_key_hex : "missing");
+         fs_nvtx_name = fs_nvtx_keyed;
+      }
+      CP_NVTX_SCOPE(fs_nvtx_name);
       /* TEMPORARY: recorded here rather than by the caller so that a timing of
        * the shader does not also contain the two small host-to-device copies
        * above, which are the ABI rather than the shading. */
@@ -4035,9 +4235,14 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
       cp->hardware_texture.fs_attempts++;
       cp->fs_launches++;
       cp->fs_blocks += fs_blocks;
+      /* Count only the actual main launch attempt. Pre-launch setup failures
+       * never reach this point, and success means cp_launch itself succeeded. */
+      cp_opaque_slot0_nvtx_fs_launch_attempt(cp);
       CUresult fs_err = cp_launch(cp, launch_kernel, fs_blocks,
                                        1, 1, 256, 1, 1, 0, cp->stream,
                                        fs_params, NULL);
+      if (fs_err == CUDA_SUCCESS)
+         cp_opaque_slot0_nvtx_fs_launch_success(cp);
       if (launched && fs_err == CUDA_SUCCESS)
          *launched = launch_kernel;
       cp_texture_cache_unpin(cp);
@@ -7687,8 +7892,8 @@ cp_opaque_slot0_batch_safe(struct cp_context *cp,
 {
    const struct cp_draw_state *state = &batch->state;
    const struct cp_fb_desc *fb = &batch->scope.fb;
-   if (!cp_debug->opaque_slot0_census || cp_debug->unsafe_force_opaque ||
-       cp_debug->tiled_opaque || !cp_opaque_side_streams(cp) || !state->fs ||
+   if (cp_debug->unsafe_force_opaque || cp_debug->tiled_opaque ||
+       !cp_opaque_side_streams(cp) || !state->fs ||
        state->blend.enable || state->fs->uses_discard ||
        state->fs->writes_memory || !state->depth.depth_enabled ||
        !state->depth.depth_writemask ||
@@ -7715,19 +7920,102 @@ cp_opaque_slot0_invalidate(struct cp_context *cp)
    cp->opaque_slot0.episode_valid = false;
 }
 
+static void
+cp_opaque_slot0_selected_setup_failure(struct cp_context *cp, bool selected)
+{
+   if (!selected)
+      return;
+   cp->opaque_slot0.selected_setup_failures++;
+   cp_opaque_slot0_invalidate(cp);
+}
+
+static bool
+cp_opaque_slot0_nvtx_count_add(struct cp_context *cp, uint64_t *counter,
+                               uint64_t add)
+{
+   if (*counter > UINT64_MAX - add) {
+      cp->opaque_slot0.nvtx_counter_overflow = true;
+      cp_opaque_slot0_invalidate(cp);
+      return false;
+   }
+   *counter += add;
+   return true;
+}
+
+static void
+cp_opaque_slot0_nvtx_fs_launch_attempt(struct cp_context *cp)
+{
+   if (!cp->opaque_slot0.nvtx_selected_scope_active)
+      return;
+   if (cp->opaque_slot0.nvtx_scope_attempted_launches == UINT_MAX) {
+      cp->opaque_slot0.nvtx_counter_overflow = true;
+      cp_opaque_slot0_invalidate(cp);
+   } else {
+      cp->opaque_slot0.nvtx_scope_attempted_launches++;
+   }
+   cp_opaque_slot0_nvtx_count_add(
+      cp, &cp->opaque_slot0.nvtx_attempted_fs_launches, 1);
+}
+
+static void
+cp_opaque_slot0_nvtx_fs_launch_success(struct cp_context *cp)
+{
+   if (!cp->opaque_slot0.nvtx_selected_scope_active)
+      return;
+   if (cp->opaque_slot0.nvtx_scope_successful_launches == UINT_MAX) {
+      cp->opaque_slot0.nvtx_counter_overflow = true;
+      cp_opaque_slot0_invalidate(cp);
+   } else {
+      cp->opaque_slot0.nvtx_scope_successful_launches++;
+   }
+   cp_opaque_slot0_nvtx_count_add(
+      cp, &cp->opaque_slot0.nvtx_successful_fs_launches, 1);
+}
+
+static void
+cp_opaque_slot0_nvtx_scope_begin(struct cp_context *cp, unsigned ngroups)
+{
+   if (cp->opaque_slot0.nvtx_selected_scope_active || !ngroups) {
+      cp_opaque_slot0_nvtx_count_add(
+         cp, &cp->opaque_slot0.nvtx_launch_mismatch_scopes, 1);
+      cp_opaque_slot0_invalidate(cp);
+   }
+   cp->opaque_slot0.nvtx_selected_scope_active = true;
+   cp->opaque_slot0.nvtx_scope_expected_launches = ngroups;
+   cp->opaque_slot0.nvtx_scope_attempted_launches = 0;
+   cp->opaque_slot0.nvtx_scope_successful_launches = 0;
+   cp_opaque_slot0_nvtx_count_add(
+      cp, &cp->opaque_slot0.nvtx_expected_group_launches, ngroups);
+}
+
+static void
+cp_opaque_slot0_nvtx_scope_end(struct cp_context *cp)
+{
+   if (!cp->opaque_slot0.nvtx_selected_scope_active ||
+       cp->opaque_slot0.nvtx_scope_attempted_launches !=
+          cp->opaque_slot0.nvtx_scope_expected_launches ||
+       cp->opaque_slot0.nvtx_scope_successful_launches !=
+          cp->opaque_slot0.nvtx_scope_expected_launches) {
+      cp_opaque_slot0_nvtx_count_add(
+         cp, &cp->opaque_slot0.nvtx_launch_mismatch_scopes, 1);
+      cp_opaque_slot0_invalidate(cp);
+   }
+   cp->opaque_slot0.nvtx_selected_scope_active = false;
+}
+
 static bool
 cp_opaque_slot0_ensure(struct cp_context *cp, size_t pixels)
 {
    if (!cp->opaque_slot0.counters) {
       CUdeviceptr counters = 0;
       if (cuMemAllocManaged(&counters,
-                            CP_OPAQUE_SLOT0_WORDS * sizeof(uint64_t),
+                            CP_OPAQUE_SLOT0_TOTAL_WORDS * sizeof(uint64_t),
                             CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
          cp->opaque_slot0.allocation_failures++;
          cp_opaque_slot0_invalidate(cp);
          return false;
       }
-      if (cuMemsetD32Async(counters, 0, CP_OPAQUE_SLOT0_WORDS * 2,
+      if (cuMemsetD32Async(counters, 0, CP_OPAQUE_SLOT0_TOTAL_WORDS * 2,
                             cp->main_stream) != CUDA_SUCCESS) {
          cuMemFree(counters);
          cp->opaque_slot0.allocation_failures++;
@@ -7834,46 +8122,127 @@ cp_opaque_slot0_episode_safe(struct cp_context *cp,
 }
 
 static void
+cp_opaque_slot0_digest_u64(struct mesa_blake3 *digest, uint64_t value)
+{
+   uint8_t le[8];
+   for (unsigned i = 0; i < sizeof(le); i++)
+      le[i] = (uint8_t)(value >> (8 * i));
+   _mesa_blake3_update(digest, le, sizeof(le));
+}
+
+static bool
+cp_opaque_slot0_population_commit(struct cp_context *cp,
+                                  struct cp_pass_seg *segs, unsigned nsegs,
+                                  unsigned w, unsigned h,
+                                  uint32_t episode_prim_end,
+                                  uint64_t episode_id, uint64_t *ordinal_out)
+{
+   /* This is a sequence of fixed-width fields. Every integer is explicitly
+    * little-endian, and every shader contributes the full stable BLAKE3 key.
+    * The absolute finish ID identifies the physical episode; the selected
+    * ordinal is only a report/label sequence number and is not hashed. */
+   static const char domain[] = "cudavk opaque slot0 selected population v2";
+   if (cp->opaque_slot0.population_count == UINT64_MAX) {
+      cp->opaque_slot0.population_count_overflow = true;
+      cp_opaque_slot0_invalidate(cp);
+      return false;
+   }
+   if (!cp->opaque_slot0.population_digest_initialized) {
+      _mesa_blake3_init(&cp->opaque_slot0.population_digest);
+      _mesa_blake3_update(&cp->opaque_slot0.population_digest,
+                          domain, sizeof(domain));
+      cp->opaque_slot0.population_digest_initialized = true;
+   }
+   uint64_t ordinal = ++cp->opaque_slot0.population_count;
+   cp_opaque_slot0_digest_u64(&cp->opaque_slot0.population_digest,
+                              cp->opaque_slot0.submit);
+   cp_opaque_slot0_digest_u64(&cp->opaque_slot0.population_digest, episode_id);
+   cp_opaque_slot0_digest_u64(&cp->opaque_slot0.population_digest, w);
+   cp_opaque_slot0_digest_u64(&cp->opaque_slot0.population_digest, h);
+   cp_opaque_slot0_digest_u64(&cp->opaque_slot0.population_digest,
+                              episode_prim_end);
+   cp_opaque_slot0_digest_u64(&cp->opaque_slot0.population_digest, nsegs);
+   for (unsigned s = 0; s < nsegs; s++) {
+      cp_opaque_slot0_digest_u64(&cp->opaque_slot0.population_digest,
+                                 segs[s].prim_base);
+      cp_opaque_slot0_digest_u64(&cp->opaque_slot0.population_digest,
+                                 segs[s].prim_slots);
+      _mesa_blake3_update(&cp->opaque_slot0.population_digest,
+                          segs[s].batch.state.fs->stable_key,
+                          CP_SHADER_STABLE_KEY_BYTES);
+   }
+   *ordinal_out = ordinal;
+   return true;
+}
+
+static void
+cp_opaque_slot0_population_hex(const struct cp_context *cp,
+                               char hex[CP_SHADER_STABLE_KEY_HEX])
+{
+   static const char digits[] = "0123456789abcdef";
+   uint8_t key[CP_SHADER_STABLE_KEY_BYTES] = {0};
+   if (cp->opaque_slot0.population_digest_initialized) {
+      struct mesa_blake3 copy = cp->opaque_slot0.population_digest;
+      _mesa_blake3_final(&copy, key);
+   }
+   for (unsigned i = 0; i < sizeof(key); i++) {
+      hex[2 * i] = digits[key[i] >> 4];
+      hex[2 * i + 1] = digits[key[i] & 15];
+   }
+   hex[sizeof(key) * 2] = '\0';
+}
+
+static int
+cp_opaque_slot0_shader_bin(struct cp_context *cp,
+                           const struct cp_shader_binary *fs)
+{
+   if (!fs || !fs->stable_key_valid) {
+      cp->opaque_slot0.missing_shader_ids++;
+      cp_opaque_slot0_invalidate(cp);
+      return -1;
+   }
+   for (unsigned i = 0; i < cp->opaque_slot0.num_shader_bins; i++)
+      if (!memcmp(cp->opaque_slot0.shader_keys[i], fs->stable_key,
+                  CP_SHADER_STABLE_KEY_BYTES))
+         return (int)i;
+   if (cp->opaque_slot0.num_shader_bins == CP_OPAQUE_SLOT0_MAX_SHADERS) {
+      cp->opaque_slot0.shader_bin_overflows++;
+      cp_opaque_slot0_invalidate(cp);
+      return -1;
+   }
+   unsigned bin = cp->opaque_slot0.num_shader_bins++;
+   memcpy(cp->opaque_slot0.shader_keys[bin], fs->stable_key,
+          CP_SHADER_STABLE_KEY_BYTES);
+   return (int)bin;
+}
+
+static bool
 cp_opaque_slot0_reduce(struct cp_context *cp, struct cp_pass_seg *segs,
                        unsigned nsegs, unsigned w, unsigned h,
                        uint32_t episode_prim_end)
 {
-   if (!cp_opaque_slot0_episode_safe(cp, segs, nsegs))
-      return;
-   if (cp->opaque_slot0.submit <=
-       cp_debug->opaque_slot0_census_submit_start) {
-      cp->opaque_slot0.submit_skipped_episodes++;
-      return;
-   }
-   if (!cp->opaque_slot0.submit_first)
-      cp->opaque_slot0.submit_first = cp->opaque_slot0.submit;
-   cp->opaque_slot0.submit_last = cp->opaque_slot0.submit;
-   cp->opaque_slot0.eligible_episodes++;
-
    if (!cp->opaque_slot0.attempted || !cp->opaque_slot0.episode_valid ||
        !cp->opaque_slot0.snapshot || !cp->opaque_slot0.counters) {
       cp->opaque_slot0.missing_snapshot++;
       cp_opaque_slot0_invalidate(cp);
-      return;
+      return false;
    }
    if (!cp->dev->kernels.opaque_slot0_census) {
       cp->opaque_slot0.missing_reducer++;
       cp_opaque_slot0_invalidate(cp);
-      return;
+      return false;
    }
 
    size_t pixels = (size_t)w * h;
-   uint32_t seg0_end = segs[0].prim_base + segs[0].prim_slots;
-   if (!w || !h || pixels / w != h ||
-       pixels != cp->opaque_slot0.snapshot_px ||
-       pixels > cp->opaque_slot0.capacity_px || segs[0].prim_base != 0 ||
-       seg0_end != cp->opaque_slot0.seg0_prim_end ||
+   if (!w || !h || w == UINT32_MAX || h == UINT32_MAX ||
+       pixels / w != h || pixels != cp->opaque_slot0.snapshot_px ||
+       pixels > cp->opaque_slot0.capacity_px ||
        cp->opaque_slot0.snapshot_submit != cp->opaque_slot0.submit ||
-       !seg0_end || seg0_end > episode_prim_end ||
+       !nsegs || nsegs > CP_PASS_MAX_SEGS ||
        episode_prim_end > CP_PRIM_ID_LIMIT) {
       cp->opaque_slot0.bounds_failures++;
       cp_opaque_slot0_invalidate(cp);
-      return;
+      return false;
    }
 
    struct cp_opaque_slot0_census_args args = {
@@ -7882,31 +8251,53 @@ cp_opaque_slot0_reduce(struct cp_context *cp, struct cp_pass_seg *segs,
       .counters = cp->opaque_slot0.counters,
       .width = w,
       .height = h,
-      .seg0_prim_end = seg0_end,
       .episode_prim_end = episode_prim_end,
+      .nsegs = nsegs,
    };
+   uint32_t expected_base = 0;
+   for (unsigned s = 0; s < nsegs; s++) {
+      uint64_t end64 = (uint64_t)segs[s].prim_base + segs[s].prim_slots;
+      int bin = cp_opaque_slot0_shader_bin(cp, segs[s].batch.state.fs);
+      if (segs[s].prim_base != expected_base || end64 > UINT32_MAX ||
+          end64 <= expected_base || bin < 0) {
+         cp->opaque_slot0.shader_range_failures++;
+         cp_opaque_slot0_invalidate(cp);
+         return false;
+      }
+      args.seg_end[s] = (uint32_t)end64;
+      args.seg_bin[s] = (uint32_t)bin;
+      expected_base = (uint32_t)end64;
+   }
+   args.seg0_prim_end = args.seg_end[0];
+   if (args.seg0_prim_end != cp->opaque_slot0.seg0_prim_end ||
+       expected_base != episode_prim_end) {
+      cp->opaque_slot0.shader_range_failures++;
+      cp_opaque_slot0_invalidate(cp);
+      return false;
+   }
    void *params[] = { &args };
    size_t quad_count = ((size_t)w + 1u) / 2u *
                        (((size_t)h + 1u) / 2u);
    if (!quad_count || quad_count > UINT32_MAX) {
       cp->opaque_slot0.bounds_failures++;
       cp_opaque_slot0_invalidate(cp);
-      return;
+      return false;
    }
    size_t block_count = (quad_count + 255u) / 256u;
    if (block_count > UINT32_MAX) {
       cp->opaque_slot0.bounds_failures++;
       cp_opaque_slot0_invalidate(cp);
-      return;
+      return false;
    }
    if (cp_launch(cp, cp->dev->kernels.opaque_slot0_census,
                  (uint32_t)block_count, 1, 1, 256, 1, 1, 0,
                  cp->main_stream, params, NULL) != CUDA_SUCCESS) {
       cp->opaque_slot0.launch_failures++;
       cp_opaque_slot0_invalidate(cp);
-      return;
+      return false;
    }
    cp->opaque_slot0.reducer_launches++;
+   return true;
 }
 
 static bool
@@ -8224,6 +8615,25 @@ cp_opaque_finish(struct cp_context *cp)
    if (!nsegs)
       return;
 
+   /* Assign the physical episode identity before safety tests, selection,
+    * allocation, joining, or any other fallible proof work. Both exclusive
+    * proof arms advance from process start; flag-off leaves renderer state
+    * completely untouched. */
+   bool slot0_proof_enabled = cp_debug->opaque_slot0_census ||
+                              cp_debug->opaque_slot0_census_nvtx_scopes;
+   uint64_t slot0_episode_id = 0;
+   if (slot0_proof_enabled) {
+      if (cp->opaque_slot0.finished_episodes == UINT64_MAX) {
+         slot0_episode_id = UINT64_MAX;
+         cp->opaque_slot0.episode_id_overflow = true;
+         cp_opaque_slot0_invalidate(cp);
+      } else {
+         slot0_episode_id = ++cp->opaque_slot0.finished_episodes;
+      }
+   }
+   unsigned w = cp->pass.w, h = cp->pass.h;
+   uint32_t episode_prim_end = cp->pass.next_prim;
+
    struct cp_pass_seg *segs = cp->pass_segs;
    for (unsigned s = 0; s < nsegs; s++) {
       if (segs[s].batch.state.fs && segs[s].batch.state.fs->writes_memory) {
@@ -8235,8 +8645,29 @@ cp_opaque_finish(struct cp_context *cp)
          return;
       }
    }
-   unsigned w = cp->pass.w, h = cp->pass.h;
-   uint32_t episode_prim_end = cp->pass.next_prim;
+   bool slot0_episode_safe = slot0_proof_enabled &&
+                             cp_opaque_slot0_episode_safe(cp, segs, nsegs);
+   bool slot0_after_start = slot0_proof_enabled &&
+                            cp->opaque_slot0.submit >
+                               cp_debug->opaque_slot0_census_submit_start;
+   bool slot0_census_selected = cp_debug->opaque_slot0_census &&
+                                slot0_episode_safe && slot0_after_start;
+   bool slot0_nvtx_selected =
+      cp_debug->opaque_slot0_census_nvtx_scopes && cp_nvtx_enabled() &&
+      slot0_episode_safe && slot0_after_start;
+   bool slot0_candidate_selected = slot0_census_selected ||
+                                   slot0_nvtx_selected;
+   if (cp_debug->opaque_slot0_census && slot0_episode_safe &&
+       !slot0_after_start)
+      cp->opaque_slot0.submit_skipped_episodes++;
+   bool slot0_nvtx_ids_valid = true;
+   if (slot0_nvtx_selected) {
+      for (unsigned s = 0; s < nsegs; s++)
+         slot0_nvtx_ids_valid &= segs[s].batch.state.fs &&
+                                 segs[s].batch.state.fs->stable_key_valid;
+      if (!slot0_nvtx_ids_valid)
+         cp->opaque_slot0.nvtx_missing_ids++;
+   }
    cp->pass.nsegs = 0;
    cp->pass.next_prim = 0;
    cp->pass.opaque = false;
@@ -8271,11 +8702,9 @@ cp_opaque_finish(struct cp_context *cp)
          cp->opaque_slot0.ordering_failures++;
          cp_opaque_slot0_invalidate(cp);
       }
+      cp_opaque_slot0_selected_setup_failure(cp, slot0_candidate_selected);
       return;
    }
-
-   if (cp_debug->opaque_slot0_census)
-      cp_opaque_slot0_reduce(cp, segs, nsegs, w, h, episode_prim_end);
 
    if (cp_debug->tiled_opaque &&
        !cp_opaque_tile_visibility(cp, segs, nsegs, w, h)) {
@@ -8316,6 +8745,7 @@ cp_opaque_finish(struct cp_context *cp)
          malloc((size_t)CP_PASS_MAX_SEGS * CP_MAX_BATCH_DRAWS *
                 CP_ARG_UBO_STRIDE * sizeof(uint64_t));
       if (!cp->pass_group_ubos) {
+         cp_opaque_slot0_selected_setup_failure(cp, slot0_candidate_selected);
          cp_pass_fallback(cp, segs, nsegs);
          return;
       }
@@ -8349,6 +8779,7 @@ cp_opaque_finish(struct cp_context *cp)
    CUdeviceptr ranges_dev = cp_upload(cp, ranges,
                                       (size_t)nranges * sizeof(ranges[0]));
    if (!ranges_dev) {
+      cp_opaque_slot0_selected_setup_failure(cp, slot0_candidate_selected);
       cp_pass_fallback(cp, segs, nsegs);
       return;
    }
@@ -8356,6 +8787,7 @@ cp_opaque_finish(struct cp_context *cp)
    const struct cp_fb_desc *fb = &segs[0].batch.scope.fb;
    void *color_data = fb->color;
    if (!color_data) {
+      cp_opaque_slot0_selected_setup_failure(cp, slot0_candidate_selected);
       cp_pass_fallback(cp, segs, nsegs);
       return;
    }
@@ -8363,6 +8795,46 @@ cp_opaque_finish(struct cp_context *cp)
    struct cp_fs_batch saved_fs_batch = cp->fs_batch;
    size_t shade_mark = cp->scratch.used;
    size_t shade_dmark = cp->dscratch.used;
+   bool slot0_reducer_ready = true;
+   if (slot0_census_selected) {
+      slot0_reducer_ready = cp_opaque_slot0_reduce(
+         cp, segs, nsegs, w, h, episode_prim_end);
+      if (!slot0_reducer_ready)
+         cp_opaque_slot0_selected_setup_failure(cp, true);
+   }
+   bool slot0_nvtx_scope = slot0_nvtx_selected && slot0_nvtx_ids_valid;
+   bool slot0_population_selected =
+      (slot0_census_selected && slot0_reducer_ready) || slot0_nvtx_scope;
+   uint64_t slot0_ordinal = 0;
+   bool slot0_population_committed = false;
+   if (slot0_population_selected && !cp->opaque_slot0.episode_id_overflow) {
+      slot0_population_committed = cp_opaque_slot0_population_commit(
+         cp, segs, nsegs, w, h, episode_prim_end, slot0_episode_id,
+         &slot0_ordinal);
+   }
+   if (slot0_population_selected && !slot0_population_committed)
+      cp_opaque_slot0_selected_setup_failure(cp, true);
+   slot0_nvtx_scope &= slot0_population_committed;
+   if (slot0_population_committed) {
+      if (slot0_census_selected) {
+         cp->opaque_slot0.eligible_episodes++;
+         if (!cp->opaque_slot0.submit_first)
+            cp->opaque_slot0.submit_first = cp->opaque_slot0.submit;
+         cp->opaque_slot0.submit_last = cp->opaque_slot0.submit;
+      } else {
+         cp_opaque_slot0_nvtx_count_add(
+            cp, &cp->opaque_slot0.nvtx_selected_scopes, 1);
+         if (!cp->opaque_slot0.nvtx_submit_first)
+            cp->opaque_slot0.nvtx_submit_first = cp->opaque_slot0.submit;
+         cp->opaque_slot0.nvtx_submit_last = cp->opaque_slot0.submit;
+      }
+   }
+   if (slot0_nvtx_scope) {
+      cp_nvtx_pushf("slot0-selected/episode=%" PRIu64
+                    "/ordinal=%" PRIu64,
+                    slot0_episode_id, slot0_ordinal);
+      cp_opaque_slot0_nvtx_scope_begin(cp, ngroups);
+   }
    for (unsigned g = 0; g < ngroups; g++) {
       struct cp_pass_seg *seg = &segs[group_first[g]];
       unsigned group_rows = 0;
@@ -8397,6 +8869,10 @@ cp_opaque_finish(struct cp_context *cp)
                          /* A segment never runs the peel loop, so its
                           * visibility buffer is keyed on depth. */
                          false);
+   }
+   if (slot0_nvtx_scope) {
+      cp_opaque_slot0_nvtx_scope_end(cp);
+      cp_nvtx_pop();
    }
    cp->fs_batch = saved_fs_batch;
 }
@@ -9807,7 +10283,7 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
        * the main stream. Recorded here rather than once at episode start, for
        * the reason cp_pass_gate_stream() gives.
        */
-      if (before == 1 &&
+      if (cp_debug->opaque_slot0_census && before == 1 &&
           cp->opaque_slot0.submit >
              cp_debug->opaque_slot0_census_submit_start &&
           cp_opaque_slot0_batch_safe(cp, &cp->pass_segs[0].batch) &&

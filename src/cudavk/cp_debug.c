@@ -230,6 +230,11 @@ static const struct cp_flag_def flags[] = {
      "skip opaque slot-0 census episodes while the 1-based command-buffer-"
      "bearing backend-submit count is at most this value; 0 includes the first "
      "such submit", .dflt = 0, .has_range = true, .lo = 0, .hi = 100000000 },
+   { "CUDAVK_OPAQUE_SLOT0_CENSUS_NVTX_SCOPES", CP_FLAG_UINT,
+     F(opaque_slot0_census_nvtx_scopes),
+     "labels-only clean-trace mode and its required selected eligible episode "
+     "scope count; 0 is off and issues no slot-0 labels", .dflt = 0,
+     .has_range = true, .lo = 0, .hi = 100000000 },
    { "CUDAVK_NO_PDL", CP_FLAG_BOOL_VALUE, F(no_pdl),
      "issue every kernel with an ordinary launch again, so that no dependent "
      "kernel starts before its predecessor in the same stream has drained; "
@@ -763,6 +768,18 @@ apply_couplings(void)
     */
    if (debug_state.no_pdl)
       debug_state.pdl = 0;
+
+   /* The census changes GPU scheduling; the labels-only arm exists precisely
+    * to keep a clean trace free of those operations. A process cannot be both
+    * measurement arms. Prefer the count result and disable labels loudly. */
+   if (debug_state.opaque_slot0_census &&
+       debug_state.opaque_slot0_census_nvtx_scopes) {
+      fprintf(stderr, "cudavk: CUDAVK_OPAQUE_SLOT0_CENSUS and "
+              "CUDAVK_OPAQUE_SLOT0_CENSUS_NVTX_SCOPES are mutually "
+              "exclusive; disabling the labels-only mode\n");
+      debug_state.opaque_slot0_census_nvtx_scopes = 0;
+      debug_state.opaque_slot0_census_nvtx_rejected = true;
+   }
 }
 
 /*
