@@ -85,6 +85,11 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 27 | Scope-level concurrency: overlapping independent render scopes | 2026-08-30 census | REFUTED | the scope DAG is a chain — 10.0 scopes/frame at depth 8.0–9.0, max width 2 |
 | 28 | Allow hardware-inline fragment shaders whose PTX still uses local memory | 2026-08-30, HeadlessStreamer | REFUTED (wrong frames) | +0.077/+0.036 ms timing, but **15/18 favorite3 and 14/18 favorite2 sentinels differ** |
 | 29 | Reuse device-only scratch high-water instead of the 1 GiB context drain | 2026-08-30, favorite3/favorite2 | REFUTED (below noise) | removes 1.65/1.19 ms blocked, but only +0.037/+0.012 ms post-dead-scope with pair signs disagreeing |
+| 30 | Episode-entry stale-depth Hi-Z at 8-pixel tiles | 2026-08-30, favorite3 | REFUTED | complete admitted pool is at most **0.103 ms/frame** |
+| 31 | One-visbuf depth-only chain deferral | 2026-08-30, favorite3 | REFUTED | complete compact + shader + writeback safe pool is **0.170 ms/frame** |
+| 32 | Immutable two-slot segment-0 shading overlap | 2026-08-30, favorite3 | REFUTED | useful compact + shader + writeback pool is **0.036 ms/frame** |
+| 33 | Cross-frame retained raster-output recurrence | 2026-08-31, favorite3 | REFUTED | isolated appending census leaves only **0.206 ms/frame** collectible union-exclusive |
+| 34 | Fully threaded Mesa runtime submit | 2026-08-31, favorite3 | REFUTED | completion-aware alternating census improves only **0.126 ms/frame** |
 
 ---
 
@@ -1828,6 +1833,96 @@ replays, a 79-test flag-off suite, exact hashes and 18/18 sentinels per B1S run.
 Favorite2 was not run because favorite3's complete generous pool is already far
 below the build gate; a production change must win on both captures, but no
 production change exists here.
+
+---
+
+## 34. Fully threaded Mesa runtime submit — REFUTED (0.126 ms/frame completion gain)
+
+2026-08-31, favorite3 real frames. Reproducible diagnostic implementation and
+analyzer: side branch `diag/threaded-submit-census`, commit `d16ec485935e`.
+Measurement data: `/tmp/threaded-submit-f3-census`.
+
+**Proposed.** Force Mesa's assisted-timeline runtime into fully threaded submit
+with `MESA_VK_ENABLE_SUBMIT_THREAD=1`. The application thread would enqueue
+recorded work while the existing single renderer owner translated the previous
+submit and blocked in its ordinary device waits. This did not claim to remove
+CUDA work. It was the only remaining host-side candidate with an honest
+0.500-ms/frame admission possibility: the post-dead-scope run had 1.673
+ms/frame of GPU idle and 1.437 ms/frame in timed renderer waits.
+
+**Why pre-submit timing is invalid.** In fully threaded mode `vkQueueSubmit`
+returns after enqueue. `submit_shim` therefore timestamps queue admission, not
+CUDA completion, and can make work that is merely running ahead look free. The
+diagnostic recorded `CLOCK_MONOTONIC_RAW` at driver-callback entry, after the
+pending CUDA completion record was linked, and after `cuEventSynchronize`
+returned. The decision metric is the interval from the first to last target
+**completion**, divided by 2,078 frame transitions. Enqueue timing is retained
+only as a cross-check.
+
+**Correctness work needed even for the experiment.** Current Mesa/cudavk
+lifecycle was not safe to force fully threaded across a complete replay. The
+diagnostic branch drains runtime work in QueueWaitIdle and DeviceWaitIdle,
+finishes Mesa's queue before stopping cudavk's completion worker, broadcasts
+worker failures, bounds WAIT_PENDING polling so cross-queue loss cannot strand
+teardown, retains live marker/resource storage on terminal loss, propagates
+CUDA completion failures to Mesa device loss, and moves image metadata mutation
+after its conditional wait. A delayed wait-before-signal DeviceWaitIdle case
+covers the lost-marker hang. These changes are diagnostic branch work only;
+the measured result below does not justify merging them.
+
+**Population and target.** Each arm had 6,939 external shim submits, 6,947
+command-bearing records and 1,663 signal-only runtime markers, for 8,610
+complete census records with no overflow. External target submit 2,782 maps to
+absolute command-bearing position 2,783 because one virtual-swapchain helper
+precedes it. Runtime markers are interspersed, so that position mapped to
+absolute record ordinal 3,114 in all four measured arms; it is not valid to use
+2,783 as a record ordinal or infer frame parity from it. The selected range has
+4,164 command-bearing records and 2,079 frames.
+
+**Correctness gates.** Every arm ended with favorite3's benign post-output
+`rc=139`, exactly 6,939 complete shim timestamps, the standard stdout SHA-256
+`e3f24a1dcdc8568be217d249e480623958e2621b3d4f056ae4c44ad20d08da49`,
+and `result_valid=1`. Before measurement the existing suite passed 79/79 with
+`MESA_VK_ENABLE_SUBMIT_THREAD` absent, `=0` and `=1`; the focused timeline test
+passed all three direct arms; static audits and all 11 analyzer tests passed.
+Fault-injection expectations distinguish the same terminal error reported
+synchronously by `vkQueueSubmit` from its fully threaded report by
+`vkDeviceWaitIdle`.
+
+**Alternating completion measurement.** All figures are diagnostic because the
+census itself records clocks and fixed records. Both arms carry the same census.
+
+| arm | Mesa thread | completion ms/frame | issue-begin ms/frame | enqueue ms/frame | target depth p95/max |
+|---|---:|---:|---:|---:|---:|
+| c1 | 0 | 8.549611 | 8.552320 | 8.539533 | 0 / 0 |
+| t1 | 1 | 8.264747 | 8.267166 | 8.256351 | 1 / 2 |
+| c2 | 0 | 8.301126 | 8.303556 | 8.290263 | 0 / 0 |
+| t2 | 1 | 8.333623 | 8.336444 | 8.326683 | 1 / 2 |
+| median | — | **8.425368 → 8.299185** | **8.427938 → 8.301805** | **8.414898 → 8.291517** | — |
+
+The completion-aware gain is only **0.126184 ms/frame**. Issue-begin and enqueue
+deltas agree at 0.126132 and 0.123381 ms/frame. Threaded target depth was p95 1
+and maximum 2, so this is not an unbounded-run-ahead artefact. It misses the
+0.500-ms/frame admission threshold by 0.373816 ms/frame.
+
+**Decision.** Stop. Favorite2, bounded-depth sweeps, full-frame shared dump
+comparison and a production merge are not justified because the primary
+capture already fails the build gate. Do not time this mode with pre-submit
+shim medians and do not repeat the lifecycle implementation without first
+showing at least 0.500 ms/frame in completion-aware favorite3 data.
+
+**Retry if.** A later workload has materially more application recording or
+decode work available to overlap, or a renderer wait population whose measured
+completion-throughput gain exceeds 0.500 ms/frame. Preserve explicit
+external-to-command calibration, filter signal-only markers without treating
+the filtered ordinal as an absolute record ID, alternate arms in one session,
+and require bounded depth plus both-capture correctness before shipping.
+
+**Cost.** One lifecycle/census implementation, independent concurrency review,
+three 79-test suite arms, three focused timeline arms, 11 analyzer tests, one
+failed analysis invocation that exposed marker-vs-command ordinal ambiguity,
+and four valid full favorite3 census arms. No favorite2 replay was spent after
+favorite3 failed admission.
 
 ---
 
