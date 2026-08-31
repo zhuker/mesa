@@ -1752,6 +1752,85 @@ below the build gate after mandatory wasted speculation.
 
 ---
 
+
+## 33. Cross-frame retained raster-output recurrence — REFUTED (0.206 ms/frame collectible upper)
+
+2026-08-31, favorite3 real frames. Diagnostic branch
+`diag/geometry-reuse-census`, commits `ffb03c80361` through `ade83f5b5ef`; no
+production source merged. Full-run output is under `/tmp/geometry-b1s-f3/`, and
+the clean cost join is `/tmp/geometry-b1s-f3/cost.json` against
+`/tmp/postdead/trace.sqlite`.
+
+**Tried.** Establish the largest sound population for a resource-versioned
+cross-frame cache of transformed/rasterized geometry before designing the
+cache. B0 hashed each safe post-stage2 visibility output with an exact,
+domain-separated SHA-256 Merkle tree. B1R admitted retry units and hashed two
+fixed domains back-to-back on the same snapshot, separating collision/domain
+behavior from replay scheduling variation. B1S directly covered ordinary
+opaque appending segments: after their original stage 3 consumed the live queue
+set, it rerasterized that one segment on the same stream into an initialized
+private visibility buffer and hashed the isolated small/medium/huge atomicMin
+contribution. Nine disjoint visibility/SHA banks cover the main and eight side
+streams; reuse beyond eight is same-stream ordered. A whole-episode final hash
+was deliberately rejected because one changed segment cannot prove every other
+segment changed, and partial segment reuse was in scope.
+
+The digest is a generous retained-output necessary condition, not a realizable
+input key. Full reusable raster payload equality implies equality of the hashed
+projection; digest equality may remain a false match. Raw setup structs were
+never hashed: `cp_setup_cache_entry` contains padding and inactive variant bytes,
+so doing so would read indeterminate data. Clip remains 100% recurrent because
+B1S rerasterizes completed clipped geometry rather than refetching or clipping.
+
+**Correct population and correctness.** Both mode-4 runs completed 6,939
+external and 6,947 internal command-bearing submits, kept the standard stdout
+hash, and matched all 18 sentinel frames byte for byte. The flag-off suite is
+79/79. Each run published all **108,086** candidates: 108,086 admitted, zero
+appending/retry/other exclusions, `classification_ok=yes`, and
+`result_valid=yes`. Both SHA domains produced identical classifications within
+each snapshot. Across 2,079 frame transitions, 107,995 records were compared;
+the runs found 42,391 and 42,448 membership matches. Absolute structural
+population was identical and 205 classifications flipped between executions,
+so the decision arm conservatively treats a unit recurrent if either run saw a
+match. Enabled timing is invalid: the diagnostic reraster/hash storage alone
+reached 2.325 GB.
+
+**Exact clean-trace price.** The repeated-run OR arm maps all 13,937 selected
+clean-trace units: 4,438 recurrent matches, 9,464 observed nonmatches, 35 missing
+values charged recurrent, and zero excluded/unadmitted units. All 3,553 clip
+intervals stay recurrent. The generous retained-output figures are:
+
+| accounting | ms/frame |
+|---|---:|
+| summed target duration | **0.356183** |
+| target union | **0.318789** |
+| project union-exclusive collectible duration | **0.206136** |
+
+The individual union-exclusive diagnostics are 0.206113 and 0.206075 ms/frame.
+The decision value is less than half the 0.500 ms/frame admission threshold.
+Even the broader summed target-duration bound is below the threshold.
+
+**Mechanism.** A production design would still need canonical semantic setup
+serialization, resource versions, stable lookup, retained device storage,
+invalidation and a post-key collection point. The complete generous population
+cannot fund that machinery. No geometry cache or serialization implementation
+is justified for these captures.
+
+**Retry if.** A later capture raises the exact repeated-run retained-output
+collectible pool above 0.5 ms/frame on a clean trace. Preserve absolute
+submit/unit identities, simultaneous domains, repeated-run OR classification,
+private per-segment evidence for appending work, and conservative clip/unknown
+charging. Never infer per-segment nonrecurrence from a whole-episode mismatch or
+hash uninitialized setup tails.
+
+**Cost.** One GPU SHA oracle, B0 and retry-inclusive B1R runs, two full B1S
+replays, a 79-test flag-off suite, exact hashes and 18/18 sentinels per B1S run.
+Favorite2 was not run because favorite3's complete generous pool is already far
+below the build gate; a production change must win on both captures, but no
+production change exists here.
+
+---
+
 ## The rules these produced
 
 Each is tied to the evidence that produced it. They are ordered by how often they
