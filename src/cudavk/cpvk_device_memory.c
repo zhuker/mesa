@@ -172,11 +172,17 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       if (cp_debug->opaque_slot0_census_nvtx_scopes &&
           dev->renderer.opaque_slot0.submit >
              cp_debug->opaque_slot0_census_submit_start &&
-          !dev->renderer.opaque_slot0.nvtx_capture_window_active)
+          !dev->renderer.opaque_slot0.nvtx_capture_window_active) {
+         /* Nsight Systems 2026.4.1 starts capture only on a push range.  Keep
+          * that trigger short and same-thread; the process range is the
+          * cross-thread-safe annotation spanning submit through cleanup. */
+         cp_nvtx_push("slot0-capture-start");
+         cp_nvtx_pop();
          dev->renderer.opaque_slot0.nvtx_capture_window_active =
             cp_nvtx_range_start(
                "slot0-window",
                &dev->renderer.opaque_slot0.nvtx_capture_window_range_id);
+      }
    }
 
    CPVK_CTX_SCOPE(dev);
