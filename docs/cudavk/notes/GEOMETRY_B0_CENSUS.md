@@ -221,3 +221,40 @@ classification; uncovered units and all clip work remain recurrent. Repeated
 mode-4 runs require the exact salt pair, paired-domain agreement and identical
 structural population, report absolute flips, and use the conservative OR union
 as the decision-bearing arm.
+
+
+## B1S result: retained-output geometry reuse is closed
+
+Two complete favorite3 mode-4 runs used the same diagnostic build. Each run
+finished all 6,939 externally observed submits and 6,947 internal
+command-bearing submits, retained the standard stdout hash
+`e3f24a1dcdc8568be217d249e480623958e2621b3d4f056ae4c44ad20d08da49`,
+and matched all 18 sentinel frames byte for byte. The replay's post-completion
+`rc=139` remained the known benign harness teardown result.
+
+Each run admitted and published all 108,086 candidates. There were no
+appending, retry or other exclusions, `classification_ok=yes`, and
+`result_valid=yes`. Both SHA domains classified every same-snapshot record
+identically. Across 2,079 frame transitions, the runs compared 107,995 records
+and found 42,391 and 42,448 membership matches. Their absolute structural
+populations were identical; 205 classifications flipped between executions.
+The conservative repeated-run decision arm therefore treats a unit as recurrent
+if either execution observed recurrence.
+
+The clean 411-frame trace join selected 13,937 units. The conservative OR arm
+contains 4,438 recurrent matches, 9,464 observed nonmatches, 35 missing values
+charged recurrent, and zero excluded/unadmitted units. All 3,553 clip intervals
+remain charged recurrent. Its generous retained-output collectible figures are:
+
+- summed target duration: **0.3561830365 ms/frame**;
+- target union: **0.3187892263 ms/frame**;
+- project union-exclusive collectible duration: **0.2061364599 ms/frame**.
+
+The individual union-exclusive diagnostics were 0.2061131800 and
+0.2060749538 ms/frame. The conservative repeated-run result is far below the
+0.500 ms/frame admission gate. Even the broader summed target-duration bound is
+below the gate. Thus retained post-raster geometry reuse is closed before any
+production cache mechanism: no raw-setup serialization, resource-versioned
+lookup, or cache implementation is justified. These numbers are census results,
+not enabled-mode performance results; mode 4 reraster and hashing timing is
+invalid by construction.
