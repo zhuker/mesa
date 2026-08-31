@@ -473,6 +473,17 @@ scales with the batch and the arena has a hard limit.
 `cp_batch_flush_why()` names the reason a batch ended;
 `CUDAVK_DEBUG_BATCHDIFF` names the field two draws disagreed on.
 
+At command-buffer end, the same record-time planner also removes draws from a
+render scope whose only attachment result is immediately discarded. Admission
+is intentionally narrow: the following scope covers the full same colour
+subresource and begins with `LOAD_OP_DONT_CARE` or `CLEAR`; the old scope has no
+depth attachment, resolve, query, event or unrelated operation; and neither
+shader stage writes memory. Mesa's legacy-render-pass lowering may put a barrier
+between the two scope markers, which does not make discarded colour contents
+observable. The begin/end markers, barrier and old clear remain in the op list;
+only provably dead draws are suppressed. `CUDAVK_DEBUG_RT` prints each admitted
+scope as `dead-scope:`.
+
 ### 4.2 Pass episodes (blended)
 
 Consecutive **blended** batches share one A-buffer build, one drain and one

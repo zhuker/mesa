@@ -325,8 +325,9 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
             if (s >= cmd->num_scopes)
                return cpvk_submit_abort(dev, vk_error(dev, VK_ERROR_DEVICE_LOST));
             assert(cmd->ops[o].draw_cmd.scope_index == s);
-            cpvk_execute_draw_cmd(dev, &cmd->scopes[s],
-                                  &cmd->ops[o].draw_cmd);
+            if (!cmd->scopes[s].skip_draws)
+               cpvk_execute_draw_cmd(dev, &cmd->scopes[s],
+                                     &cmd->ops[o].draw_cmd);
             break;
          }
          case CPVK_OP_DISPATCH: {
