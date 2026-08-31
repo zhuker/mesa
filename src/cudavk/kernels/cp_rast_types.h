@@ -933,11 +933,9 @@ struct cp_abuf_seg_args {
 };
 
 /*
- * Count-only episode-entry stale-depth census. The tile edge is deliberately
- * fixed to the shipping rasterizer's 64-pixel tile for this first probe.
- * Nothing in rendering reads these buffers.
+ * Count-only episode-entry stale-depth census. Nothing in rendering reads
+ * these buffers; tile_edge selects the one-level summary at run time.
  */
-#define CP_HIZ_CENSUS_TILE 64u
 #define CP_HIZ_CENSUS_CLASSES 3u /* small, medium, huge */
 #define CP_HIZ_CENSUS_FUNCS 4u   /* LESS, LEQUAL, GREATER, GEQUAL */
 #define CP_HIZ_CENSUS_LOG 33u /* bucket 0 is zero, then 1 + floor(log2(n)) */
@@ -981,6 +979,7 @@ struct cp_hiz_census_args {
    uint32_t height;
    uint32_t tiles_x;
    uint32_t tiles_y;
+   uint32_t tile_edge;
    uint32_t depth_func;
 };
 

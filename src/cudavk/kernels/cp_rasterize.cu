@@ -2590,10 +2590,10 @@ cp_hiz_census_build(struct cp_rasterize_args rast,
 
    uint32_t tx = tile % args.tiles_x;
    uint32_t ty = tile / args.tiles_x;
-   uint32_t x0 = tx * CP_HIZ_CENSUS_TILE;
-   uint32_t y0 = ty * CP_HIZ_CENSUS_TILE;
-   uint32_t x1 = min(x0 + CP_HIZ_CENSUS_TILE, args.width);
-   uint32_t y1 = min(y0 + CP_HIZ_CENSUS_TILE, args.height);
+   uint32_t x0 = tx * args.tile_edge;
+   uint32_t y0 = ty * args.tile_edge;
+   uint32_t x1 = min(x0 + args.tile_edge, args.width);
+   uint32_t y1 = min(y0 + args.tile_edge, args.height);
    bool less = args.depth_func == CP_FUNC_LESS ||
                args.depth_func == CP_FUNC_LEQUAL;
    uint32_t z = less ? 0u : 0xffffffffu;
@@ -2645,16 +2645,17 @@ cp_hiz_census_count(struct cp_rasterize_args rast,
    uint64_t covered_before = 0, covered_after = 0;
    bool nonfinite = false;
 
-   int tx0 = s.ix_min / (int)CP_HIZ_CENSUS_TILE;
-   int ty0 = s.iy_min / (int)CP_HIZ_CENSUS_TILE;
-   int tx1 = s.ix_max / (int)CP_HIZ_CENSUS_TILE;
-   int ty1 = s.iy_max / (int)CP_HIZ_CENSUS_TILE;
+   int edge = (int)args.tile_edge;
+   int tx0 = s.ix_min / edge;
+   int ty0 = s.iy_min / edge;
+   int tx1 = s.ix_max / edge;
+   int ty1 = s.iy_max / edge;
    for (int ty = ty0; ty <= ty1; ty++) {
       for (int tx = tx0; tx <= tx1; tx++) {
-         int x0 = max(s.ix_min, tx * (int)CP_HIZ_CENSUS_TILE);
-         int y0 = max(s.iy_min, ty * (int)CP_HIZ_CENSUS_TILE);
-         int x1 = min(s.ix_max, (tx + 1) * (int)CP_HIZ_CENSUS_TILE - 1);
-         int y1 = min(s.iy_max, (ty + 1) * (int)CP_HIZ_CENSUS_TILE - 1);
+         int x0 = max(s.ix_min, tx * edge);
+         int y0 = max(s.iy_min, ty * edge);
+         int x1 = min(s.ix_max, (tx + 1) * edge - 1);
+         int y1 = min(s.iy_max, (ty + 1) * edge - 1);
          uint64_t area = (uint64_t)(x1 - x0 + 1) * (y1 - y0 + 1);
          uint32_t zmin = 0xffffffffu, zmax = 0u;
          uint64_t covered = 0;

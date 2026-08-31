@@ -374,9 +374,15 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_TILE_CENSUS_EVERY", CP_FLAG_UINT, F(tile_census_every),
      "report the tile census this often, in episodes", .dflt = 2000,
      .has_range = true, .lo = 1, .hi = 1000000 },
-   { "CUDAVK_HIZ_CENSUS", CP_FLAG_BOOL_VALUE, F(hiz_census),
-     "count conservative 64-pixel stale-depth rejection in normal opaque "
-     "episodes; changes no rendering" },
+   { "CUDAVK_HIZ_CENSUS", CP_FLAG_UINT, F(hiz_census),
+     "tile edge in pixels for conservative stale-depth rejection in normal "
+     "opaque episodes; 0 is off, 8-64 is the intended census range, and it "
+     "changes no rendering", .dflt = 0, .has_range = true, .lo = 0, .hi = 64 },
+   { "CUDAVK_HIZ_CENSUS_SUBMIT_START", CP_FLAG_UINT,
+     F(hiz_census_submit_start),
+     "skip Hi-Z census episodes while the 1-based queue-submit count is at "
+     "most this value; 0 includes the first submit", .dflt = 0,
+     .has_range = true, .lo = 0, .hi = 100000000 },
    { "CUDAVK_TILED_OPAQUE", CP_FLAG_BOOL_VALUE, F(tiled_opaque),
      "use the experimental opaque episode sort-middle tile rasterizer" },
    { "CUDAVK_TILED_OPAQUE_CENSUS", CP_FLAG_BOOL_VALUE,

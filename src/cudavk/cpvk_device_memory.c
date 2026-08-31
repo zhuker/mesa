@@ -160,6 +160,10 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
+   /* One-based so START=N includes zero-based submit index N: count N+1 is
+    * the first value greater than the configured cutoff. */
+   dev->renderer.hiz_census_submit++;
+
    CPVK_CTX_SCOPE(dev);
 
    /*

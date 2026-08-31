@@ -1006,12 +1006,17 @@ cp_hiz_census_report(struct cp_context *cp)
    const struct cp_hiz_census_stats *st =
       (const struct cp_hiz_census_stats *)(uintptr_t)cp->hiz_census_stats;
    fprintf(stderr,
-           "hizcensus tile=%u seen=%" PRIu64 " admitted=%" PRIu64
+           "hizcensus tile=%u submit_start=%u submit_current=%" PRIu64
+           " submit_skipped_episodes=%" PRIu64 " submit_first=%" PRIu64
+           " submit_last=%" PRIu64 " seen=%" PRIu64 " admitted=%" PRIu64
            " reduced=%" PRIu64 " segments=%" PRIu64 " draws=%" PRIu64
            " refused_state=%" PRIu64 " refused_stencil=%" PRIu64
            " refused_fragdepth=%" PRIu64 " refused_mode=%" PRIu64
            " failed=%d\n",
-           CP_HIZ_CENSUS_TILE, cp->hiz_census_seen, cp->hiz_census_admitted,
+           cp_debug->hiz_census, cp_debug->hiz_census_submit_start,
+           cp->hiz_census_submit, cp->hiz_census_submit_skipped,
+           cp->hiz_census_submit_first, cp->hiz_census_submit_last,
+           cp->hiz_census_seen, cp->hiz_census_admitted,
            st ? st->episodes : 0, cp->hiz_census_segments,
            cp->hiz_census_draws, cp->hiz_census_refused_state,
            cp->hiz_census_refused_stencil,
@@ -7974,6 +7979,13 @@ cp_opaque_hiz_census(struct cp_context *cp, struct cp_pass_seg *segs,
 {
    if (!cp_debug->hiz_census)
       return;
+   if (cp->hiz_census_submit <= cp_debug->hiz_census_submit_start) {
+      cp->hiz_census_submit_skipped++;
+      return;
+   }
+   if (!cp->hiz_census_submit_first)
+      cp->hiz_census_submit_first = cp->hiz_census_submit;
+   cp->hiz_census_submit_last = cp->hiz_census_submit;
    cp->hiz_census_seen++;
    struct cp_kernels *k = &cp->dev->kernels;
    if (cp->hiz_census_failed || cp_debug->unsafe_force_opaque ||
@@ -8011,8 +8023,9 @@ cp_opaque_hiz_census(struct cp_context *cp, struct cp_pass_seg *segs,
       }
    }
 
-   unsigned tiles_x = DIV_ROUND_UP(w, CP_HIZ_CENSUS_TILE);
-   unsigned tiles_y = DIV_ROUND_UP(h, CP_HIZ_CENSUS_TILE);
+   unsigned tile_edge = cp_debug->hiz_census;
+   unsigned tiles_x = DIV_ROUND_UP(w, tile_edge);
+   unsigned tiles_y = DIV_ROUND_UP(h, tile_edge);
    unsigned ntiles = tiles_x * tiles_y;
    if (!ntiles || !cp_opaque_hiz_census_alloc(cp, ntiles)) {
       cp->hiz_census_refused_state++;
@@ -8027,6 +8040,7 @@ cp_opaque_hiz_census(struct cp_context *cp, struct cp_pass_seg *segs,
       .height = h,
       .tiles_x = tiles_x,
       .tiles_y = tiles_y,
+      .tile_edge = tile_edge,
       .depth_func = func,
    };
    CUresult err;

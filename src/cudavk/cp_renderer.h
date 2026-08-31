@@ -318,13 +318,17 @@ struct cp_context {
    bool tile_census_cut;            /* this bind has been interrupted */
 
    /* Count-only normal-opaque episode-entry stale-depth census. The three
-    * per-tile arrays are grow-only and only 12 bytes per 64-pixel tile. */
+    * per-tile arrays are grow-only and use 12 bytes per selected tile. */
    CUdeviceptr hiz_census_stats;
    CUdeviceptr hiz_census_depth;
    CUdeviceptr hiz_census_before;
    CUdeviceptr hiz_census_after;
    unsigned hiz_census_alloc;
    bool hiz_census_failed;
+   uint64_t hiz_census_submit;
+   uint64_t hiz_census_submit_skipped;
+   uint64_t hiz_census_submit_first;
+   uint64_t hiz_census_submit_last;
    uint64_t hiz_census_seen;
    uint64_t hiz_census_admitted;
    uint64_t hiz_census_refused_state;

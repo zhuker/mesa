@@ -265,7 +265,8 @@ struct cp_debug {
    bool force_pass_fallback;
    unsigned tile_census;
    unsigned tile_census_every;
-   bool hiz_census;
+   unsigned hiz_census;
+   unsigned hiz_census_submit_start;
    bool tiled_opaque;
    bool tiled_opaque_census;
    bool unsafe_no_overflow;
