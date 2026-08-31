@@ -59,6 +59,9 @@ cp_texture_stream_serial_alloc(struct cp_device *dev)
    return 0;
 }
 
+static void cp_hiz_census_cuda_fail(struct cp_context *cp,
+                                      const char *what, CUresult err);
+
 bool
 cp_context_init(struct cp_context *cp, struct cp_device *dev)
 {
@@ -101,6 +104,16 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
       goto fail;
    cp->main_stream = cp->stream;
    cp->main_stream_serial = cp_texture_stream_serial_alloc(dev);
+
+   /* Census-only raw queue counts. Failure invalidates the diagnostic but may
+    * not prevent the renderer context from being created. */
+   if (cp_debug->hiz_census) {
+      CUresult err = cuMemAlloc(&cp->hiz_census_queue_snapshots,
+                                (size_t)CP_PASS_MAX_SEGS * 2 *
+                                   sizeof(uint32_t));
+      if (err != CUDA_SUCCESS)
+         cp_hiz_census_cuda_fail(cp, "queue snapshot allocation", err);
+   }
 
    /* The flush's generation ring; see cp_flush. A failed event creation
     * falls back to the draining flush by leaving flush_retire[0] null. */
@@ -1011,6 +1024,7 @@ cp_hiz_census_report(struct cp_context *cp)
               " submit_skipped_episodes=%" PRIu64 " submit_first=%" PRIu64
               " submit_last=%" PRIu64 " seen=%" PRIu64 " admitted=%" PRIu64
               " segments=%" PRIu64 " draws=%" PRIu64
+              " queue_snapshots=%" PRIu64 " snapshot_missing=%" PRIu64
               " refused_state=%" PRIu64 " refused_stencil=%" PRIu64
               " refused_fragdepth=%" PRIu64 " refused_mode=%" PRIu64
               " failed=1 result_valid=no stats=unavailable\n",
@@ -1019,6 +1033,8 @@ cp_hiz_census_report(struct cp_context *cp)
               cp->hiz_census_submit_first, cp->hiz_census_submit_last,
               cp->hiz_census_seen, cp->hiz_census_admitted,
               cp->hiz_census_segments, cp->hiz_census_draws,
+              cp->hiz_census_queue_snapshots_ok,
+              cp->hiz_census_queue_snapshots_missing,
               cp->hiz_census_refused_state,
               cp->hiz_census_refused_stencil,
               cp->hiz_census_refused_fragdepth,
@@ -1033,12 +1049,15 @@ cp_hiz_census_report(struct cp_context *cp)
       ? st->queue_nontrivial_overflow_observations +
         st->queue_huge_overflow_observations : 0;
    bool reducer_ok = cp->hiz_census_admitted == episodes;
-   bool result_valid = episodes && reducer_ok && !queue_overflow;
+   bool snapshot_ok = !cp->hiz_census_queue_snapshots_missing;
+   bool shipping_match = !queue_overflow && snapshot_ok;
+   bool result_valid = episodes && reducer_ok && shipping_match;
    fprintf(stderr,
            "hizcensus tile=%u submit_start=%u submit_current=%" PRIu64
            " submit_skipped_episodes=%" PRIu64 " submit_first=%" PRIu64
            " submit_last=%" PRIu64 " seen=%" PRIu64 " admitted=%" PRIu64
            " reduced=%" PRIu64 " segments=%" PRIu64 " draws=%" PRIu64
+           " queue_snapshots=%" PRIu64 " snapshot_missing=%" PRIu64
            " refused_state=%" PRIu64 " refused_stencil=%" PRIu64
            " refused_fragdepth=%" PRIu64 " refused_mode=%" PRIu64
            " failed=0 reducer_check=%s shipping_match=%s result_valid=%s\n",
@@ -1047,10 +1066,12 @@ cp_hiz_census_report(struct cp_context *cp)
            cp->hiz_census_submit_first, cp->hiz_census_submit_last,
            cp->hiz_census_seen, cp->hiz_census_admitted, episodes,
            cp->hiz_census_segments, cp->hiz_census_draws,
+           cp->hiz_census_queue_snapshots_ok,
+           cp->hiz_census_queue_snapshots_missing,
            cp->hiz_census_refused_state, cp->hiz_census_refused_stencil,
            cp->hiz_census_refused_fragdepth, cp->hiz_census_refused_mode,
            reducer_ok ? "ok" : "MISMATCH",
-           queue_overflow ? "no" : "yes", result_valid ? "yes" : "no");
+           shipping_match ? "yes" : "no", result_valid ? "yes" : "no");
    if (!st || !st->episodes)
       return;
    static const char *classes[CP_HIZ_CENSUS_CLASSES] = {
@@ -1189,6 +1210,7 @@ cp_context_cleanup(struct cp_context *cp)
       &cp->tile_census_smin, &cp->tile_census_smax, &cp->tile_census_refs,
       &cp->hiz_census_stats, &cp->hiz_census_depth,
       &cp->hiz_census_before, &cp->hiz_census_after,
+      &cp->hiz_census_queue_snapshots,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(owned); i++) {
       if (*owned[i])
@@ -8112,6 +8134,16 @@ cp_opaque_hiz_census(struct cp_context *cp, struct cp_pass_seg *segs,
          return;
       }
    }
+   for (unsigned s = 0; s < nsegs; s++) {
+      if (!segs[s].hiz_queue_snapshot_valid ||
+          !segs[s].hiz_queue_counts) {
+         fprintf(stderr,
+                 "cudavk: Hi-Z census segment %u has no queue snapshot\n", s);
+         cp->hiz_census_queue_snapshots_missing++;
+         cp->hiz_census_failed = true;
+         return;
+      }
+   }
 
    unsigned tile_edge = cp_debug->hiz_census;
    unsigned tiles_x = DIV_ROUND_UP(w, tile_edge);
@@ -8143,7 +8175,10 @@ cp_opaque_hiz_census(struct cp_context *cp, struct cp_pass_seg *segs,
       unsigned n = segs[s].rast_num_triangles;
       if (!n)
          continue;
-      void *p[] = { &segs[s].rast, &segs[s].queues, &args };
+      struct cp_rast_queues queues = segs[s].queues;
+      queues.nontrivial_count = segs[s].hiz_queue_counts;
+      queues.huge_count = segs[s].hiz_queue_counts + sizeof(uint32_t);
+      void *p[] = { &segs[s].rast, &queues, &args };
       err = cp_launch(cp, k->hiz_census_count, DIV_ROUND_UP(n, 256),
                       1, 1, 256, 1, 1, 0, cp->stream, p, NULL);
    }
@@ -9491,7 +9526,8 @@ cp_pass_record_segment(struct cp_context *cp,
 {
    if (!cp->pass.nsegs)
       cp->pass.hw_attempt_start = cp->hardware_texture.fs_attempts;
-   struct cp_pass_seg *sg = &cp->pass_segs[cp->pass.nsegs];
+   unsigned seg = cp->pass.nsegs;
+   struct cp_pass_seg *sg = &cp->pass_segs[seg];
 
    sg->rast = *aa;
    sg->queues = *queues;
@@ -9502,6 +9538,40 @@ cp_pass_record_segment(struct cp_context *cp,
    sg->prim_shift = cp->fs_batch.prim_shift;
    sg->batch = *batch;
    sg->slices_dev = cp->fs_batch.slices;
+   sg->hiz_queue_counts = 0;
+   sg->hiz_queue_snapshot_valid = false;
+
+   /* A segment stream's queue set is reused every CP_PASS_STREAMS segments.
+    * Preserve the raw, unclamped shipping counters after all three raster
+    * stages and before a later segment clears that queue set. These copies are
+    * diagnostic-only and stay ordered behind the raster launches on this same
+    * stream. */
+   if (cp_debug->hiz_census && cp->pass.opaque &&
+       cp->hiz_census_submit > cp_debug->hiz_census_submit_start &&
+       !cp_debug->tiled_opaque && !cp->hiz_census_failed) {
+      if (cp->hiz_census_queue_snapshots) {
+         CUdeviceptr dst = cp->hiz_census_queue_snapshots +
+                           (size_t)seg * 2 * sizeof(uint32_t);
+         CUresult err = CUDA_ERROR_INVALID_VALUE;
+         if (queues->nontrivial_count && queues->huge_count) {
+            err = cuMemcpyDtoDAsync(dst, queues->nontrivial_count,
+                                    sizeof(uint32_t), cp->stream);
+            if (err == CUDA_SUCCESS)
+               err = cuMemcpyDtoDAsync(dst + sizeof(uint32_t),
+                                       queues->huge_count,
+                                       sizeof(uint32_t), cp->stream);
+         }
+         if (err == CUDA_SUCCESS) {
+            sg->hiz_queue_counts = dst;
+            sg->hiz_queue_snapshot_valid = true;
+            cp->hiz_census_queue_snapshots_ok++;
+         } else {
+            cp_hiz_census_cuda_fail(cp, "queue snapshot copy", err);
+         }
+      }
+      if (!sg->hiz_queue_snapshot_valid)
+         cp->hiz_census_queue_snapshots_missing++;
+   }
 
    if (cp->pass.nsegs == 0) {
       cp->pass.w = aa->width;

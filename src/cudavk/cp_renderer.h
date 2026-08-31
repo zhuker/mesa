@@ -265,6 +265,8 @@ struct cp_context {
       /* Complete immutable shading/fallback snapshot. */
       struct cp_draw_batch batch;
       CUdeviceptr slices_dev;
+      CUdeviceptr hiz_queue_counts; /* private [nontrivial, huge] snapshot */
+      bool hiz_queue_snapshot_valid;
    } *pass_segs;                    /* [CP_PASS_MAX_SEGS], at context create */
 
    struct {
@@ -323,6 +325,7 @@ struct cp_context {
    CUdeviceptr hiz_census_depth;
    CUdeviceptr hiz_census_before;
    CUdeviceptr hiz_census_after;
+   CUdeviceptr hiz_census_queue_snapshots; /* [CP_PASS_MAX_SEGS][2] u32 */
    unsigned hiz_census_alloc;
    bool hiz_census_failed;
    uint64_t hiz_census_submit;
@@ -337,6 +340,8 @@ struct cp_context {
    uint64_t hiz_census_refused_mode;
    uint64_t hiz_census_segments;
    uint64_t hiz_census_draws;
+   uint64_t hiz_census_queue_snapshots_ok;
+   uint64_t hiz_census_queue_snapshots_missing;
 
    /*
     * The episode's side streams. Segment counts, fill relaunches and shades
