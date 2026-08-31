@@ -122,6 +122,39 @@ cp_nvtx_depthonly_pop(void)
 #endif
 }
 
+/*
+ * The capture window can begin in vkQueueSubmit and end in vkDestroyDevice.
+ * Vulkan permits those externally synchronized calls on different threads, so
+ * a thread-local push/pop range cannot safely span that lifetime.  A process
+ * Start/End range can.  Balance is tracked separately from the returned ID:
+ * the header returns zero when no collector is injected, while an injected
+ * collector supplies the opaque ID that its matching End consumes.
+ */
+static inline bool
+cp_nvtx_depthonly_window_start(uint64_t *range_id)
+{
+#ifdef CP_HAVE_NVTX
+   if (!cp_debug->depthonly_census)
+      return false;
+   *range_id = nvtxRangeStartA("depthonly-window");
+   return true;
+#else
+   (void)range_id;
+   return false;
+#endif
+}
+
+static inline void
+cp_nvtx_depthonly_window_end(uint64_t range_id)
+{
+#ifdef CP_HAVE_NVTX
+   if (cp_debug->depthonly_census)
+      nvtxRangeEnd((nvtxRangeId_t)range_id);
+#else
+   (void)range_id;
+#endif
+}
+
 static inline void
 cp_nvtx_mark(const char *name)
 {

@@ -581,6 +581,7 @@ struct cp_context {
       uint64_t structural_depth_calls;
       uint64_t safe_chains;
       uint64_t nvtx_ranges;
+      uint64_t window_range_id;
       uint64_t runs;
       uint64_t singleton_runs;
       uint64_t multichain_runs;
@@ -604,6 +605,7 @@ struct cp_context {
       uint32_t recorded_scope_serial;
       bool active;
       bool scope_open;
+      bool window_open;
    } depthonly;
 
    /* GPU-resident pipeline state — managed memory, written by CPU on state

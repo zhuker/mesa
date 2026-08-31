@@ -863,9 +863,13 @@ cp_depthonly_census_submit(struct cp_context *cp)
 {
    if (!cp_debug->depthonly_census)
       return;
+   bool was_active = cp->depthonly.active;
    cp->depthonly.submit_ordinal++;
    cp->depthonly.active =
       cp->depthonly.submit_ordinal > cp_debug->depthonly_census;
+   if (!was_active && cp->depthonly.active && !cp->depthonly.window_open)
+      cp->depthonly.window_open = cp_nvtx_depthonly_window_start(
+         &cp->depthonly.window_range_id);
 }
 
 void
@@ -1111,7 +1115,12 @@ cp_context_cleanup(struct cp_context *cp)
    if (!cp || !cp->dev)
       return;
 
-   if (cuCtxSynchronize() != CUDA_SUCCESS)
+   CUresult sync_result = cuCtxSynchronize();
+   if (cp->depthonly.window_open) {
+      cp_nvtx_depthonly_window_end(cp->depthonly.window_range_id);
+      cp->depthonly.window_open = false;
+   }
+   if (sync_result != CUDA_SUCCESS)
       cp_renderer_texture_fatal(cp);
    /* Release the exclusive cache-use lifetime even on a poisoned context. */
    cp_texture_cache_unpin(cp);
