@@ -92,6 +92,7 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 34 | Fully threaded Mesa runtime submit | 2026-08-31, favorite3 | REFUTED | completion-aware alternating census improves only **0.126 ms/frame** |
 | 35 | Exact within-batch post-transform vertex reuse | 2026-08-31, favorite3 | REFUTED | generous weighted union-exclusive upper is only **0.438 ms/frame** |
 | 36 | Renderer 2: scope-level tile-binned shading | 2026-08-31, both captures | REFUTED at design | walk is **129x** cheaper than entry 24, yet the ceiling is **0.409 ms/frame** and the impossible upper bound still lands at **5.21 ms** against a 5.0 goal |
+| 37 | Host-visible memory residency advice (the B200 "page ping-pong") | 2026-09-01, both GPUs | REFUTED, **and its premise was a profiler artefact** | the migration it targeted exists only under nsys 2026.1.3; the advice costs +1.98 ms/frame on RTX and +0.36 on B200 |
 
 ---
 
@@ -2206,3 +2207,54 @@ segmentation and cut counters are now real — all three were structurally dead
 number the old census printed was zero). And `cp_tri_setup` at 80 B straddles
 32 B sectors; padding it to 96 B removes about a third of the walk's read
 traffic, unrelated to this verdict.
+
+---
+
+## 37. Host-visible memory residency advice — REFUTED, and its premise was a profiler artefact
+
+2026-09-01. Probe flag `CUDAVK_HOSTMEM_ADVICE` (reverted, not in the tree).
+
+**The lead.** A post-pin B200 trace showed about 1.9 MB/frame of unified-memory
+migration through five host-visible regions — roughly 940 KB each way, 4 KB
+pages, `migrationCause` split PREFETCH 2.75 GB / COHERENCE 463 MB — costing
+0.242 ms/frame, where the same replay on RTX 5090 showed **none**. The obvious
+reading was that the B200's UVM heuristics were speculatively bouncing pages
+the RTX left alone, and that advising residency would recover it.
+
+**The measurement.** A flag applied `SET_ACCESSED_BY` (mode 1) and
+additionally `SET_PREFERRED_LOCATION` host (mode 2) to every host-visible
+managed allocation. Three-round alternating A/B, full submit populations,
+standard hashes, sentinels clean:
+
+| arm | favorite3 | delta |
+|---|---:|---:|
+| RTX control / advice=2 | 6.6413 / 8.6166 | **+1.98** |
+| B200 control / advice=2 | 10.9151 / 11.2724 | **+0.36** |
+
+It is slower on both, so the mechanism is refuted on its own terms.
+
+**Then the premise collapsed.** The two hosts had been traced with different
+Nsight Systems builds — B200 2026.1.3, RTX 2026.4.1. Installing the *identical*
+2026.4.1 package on the B200 (md5-verified) and re-tracing the same replay with
+the same flags reports **zero UVM rows**, exactly like the RTX. A deliberate
+managed-memory ping-pong compiled and traced on the B200 under 2026.4.1 does
+report migration (640 MB / 624 MB), so the newer tool is not blind to it there.
+**The migration this lead was built on is reported only by nsys 2026.1.3.**
+
+**Two rules come out of it.**
+
+1. **Align profiler versions before comparing hosts, and not only for
+   host-side time.** The existing warning covers CUDA API timing; this one is
+   worse, because a version difference *manufactured a whole activity class*
+   that does not exist. Any cross-host claim needs one profiler build, and a
+   positive control that the build can see the thing being claimed.
+2. **The B200 needs at least three alternating rounds of one pair.** Its
+   session-to-session drift is 0.3-1.3 ms/frame — the identical mode-2
+   configuration measured 9.80-10.02 in one session and 11.14-11.28 in the
+   next. An early two-run probe inside that band read as -0.65 and was
+   reported as promising; the controlled A/B reversed the sign. RTX drift is
+   about 0.06, so B200 evidence needs the stricter design.
+
+**Retry if.** Never in this form. If a future trace shows UVM migration during
+a replay, reproduce it under two profiler builds with a positive control
+before designing anything against it.

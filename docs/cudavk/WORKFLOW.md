@@ -201,6 +201,20 @@ median, so a number quoted without its window is not comparable to anything.
 Quote the whole-relevant-window median as the headline, and name the band
 explicitly whenever a band median is used.
 
+### 4.05 One profiler build across hosts, with a positive control
+
+Traces from different Nsight Systems builds are not comparable, and the risk
+is larger than timing skew: nsys 2026.1.3 reported about 1.9 MB/frame of
+unified-memory migration for a replay in which 2026.4.1 — the same flags, the
+same binary, the same host — reports none at all (dead end 37). A driver flag
+was written against that phantom before the versions were aligned.
+
+So: install the same package on every host being compared, verify it by
+checksum, and before believing any activity class is absent or present, run a
+positive control that provokes it (a deliberate managed ping-pong for UVM, and
+so on). The B200 also needs at least three alternating rounds per arm, because
+its session drift reaches 1.3 ms/frame against the RTX's 0.06.
+
 ### 4.1 A frame is the interval between every *other* submit
 
 The captures submit **twice per frame**, so submit boundaries are not frame
