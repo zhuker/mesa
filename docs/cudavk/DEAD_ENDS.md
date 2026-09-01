@@ -1099,6 +1099,19 @@ doing. **Halving the register count cannot help**; per-item efficiency is
 already 3× better. What this closes for good is any launch-count forecast for a
 merge whose launches are currently concurrent (entry 22).
 
+**Retried on B200 (2026-08-31), still no signal.** The retry clause was built
+exactly as written: `diag/wide-merge2` commit `61c8586b9a1` distributes
+width-2 merged chunks across the existing side streams (width bounded by the
+queue-set aliasing, so 4 concurrent chains against the loop's measured 2.19×),
+reuses the original merged device bodies, and passes all static gates with the
+flag off byte-identical. On B200 — where the launch price is higher and the
+SM array twice as wide — the screened medians were: default band
+10.81–11.14 ms, `CUDAVK_NO_ABUF_APPEND=1` alone 10.86, plus
+`CUDAVK_WIDE_MERGE2=1` 11.01. No arm left the session noise band, matching
+entry 22's arithmetic (launch credit scaled by the kept overlap bounds the
+upside near 0.07 ms). The branch is kept for reference; do not re-measure
+without a mechanism that changes the bound itself.
+
 ---
 
 ## 21. Merging the A-buffer count-phase launches — REFUTED
