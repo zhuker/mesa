@@ -182,6 +182,25 @@ of the test target would be an improvement.
 
 These are not style. Each one has produced a wrong published answer.
 
+### 4.0 Which frames count, per capture
+
+Both HeadlessStreamer captures open with a full-screen loading page. Those
+frames are **not** the workload and are excluded from every median. The start
+frame is a property of the capture, not a shared constant, and applying one
+capture's window to the other is a mistake this project has already made:
+
+| capture | real work starts | external submit index | heavy segment (absolute frames) |
+|---|---:|---:|---|
+| favorite3 | frame **1391** | 2782 | ~2150-3150 |
+| favorite2 | frame **1388** | 2776 | **~2735 to the end** |
+
+Absolute frame *N* is external submit index *2N*, because a frame is two
+submits (4.1). The heavy segment is where the frame time roughly doubles;
+both captures also contain light stretches that sit well under the whole-run
+median, so a number quoted without its window is not comparable to anything.
+Quote the whole-relevant-window median as the headline, and name the band
+explicitly whenever a band median is used.
+
 ### 4.1 A frame is the interval between every *other* submit
 
 The captures submit **twice per frame**, so submit boundaries are not frame

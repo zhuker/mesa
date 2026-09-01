@@ -18,15 +18,23 @@ any GPU-consumed usage bit are untouched, so UBO/SSBO paging behavior is
 unchanged. The application is unchanged.
 
 Measured, strictly alternating three-round A/B in single sessions, paired
-submit medians over real frames (external submit 2782 on), every run with the
-standard stdout hash, full timestamp population, and 18/18 sentinels:
+submit medians over each capture's own real-work window (favorite3 frame 1391
+= submit 2782; favorite2 frame 1388 = submit 2776 - see WORKFLOW.md 4.0),
+every run with the standard stdout hash, full timestamp population, and 18/18
+sentinels:
 
 | capture | GPU | control | pinned | delta |
 |---|---|---:|---:|---:|
 | favorite3 | RTX 5090 | 7.6048 | 6.6757 | -0.9291 |
-| favorite2 | RTX 5090 | 6.5433 | 5.4800 | -1.0633 |
+| favorite2 | RTX 5090 | 6.5461 | 5.4804 | -1.0657 |
 | favorite3 | B200 | 12.188 | 10.789 | -1.399 |
-| favorite2 | B200 | 10.566 | 8.967 | -1.599 |
+| favorite2 | B200 | 10.5662 | 8.9763 | -1.5899 |
+
+The favorite2 rows were first published against favorite3's window (submit
+2782); recomputed on the correct 2776 window they move by under 0.01 ms and
+the conclusion is unchanged. Band medians on RTX favorite2, pinned arm, show
+where the remaining work is: light band (frames 1388-2734) **4.7949**, heavy
+band (frames 2735+) **6.0461**.
 
 The RTX win exceeds its raw memcpy pool because the migration cycle also
 serialized against dependent stream work. The B200 pinned-arm trace confirms
