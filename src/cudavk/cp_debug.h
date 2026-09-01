@@ -325,6 +325,7 @@ struct cp_debug {
    struct cp_opt_int medium_threshold;
    struct cp_opt_int point_threshold;
    struct cp_opt_int tile_bound;
+   bool no_host_pin_readback;
 };
 
 /*

@@ -490,7 +490,12 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    case CP_CTX_SCHED_BLOCKING: ctx_flags = CU_CTX_SCHED_BLOCKING_SYNC; break;
    default:                    ctx_flags = CU_CTX_SCHED_AUTO; break;
    }
+#if CUDA_VERSION >= 13000
+   /* CUDA 13 renamed cuCtxCreate to the v4 signature with leading params. */
+   if (cuCtxCreate(&dev->cu_ctx, NULL, ctx_flags, pdev->cu_dev) != CUDA_SUCCESS) {
+#else
    if (cuCtxCreate(&dev->cu_ctx, ctx_flags, pdev->cu_dev) != CUDA_SUCCESS) {
+#endif
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_device;
    }
@@ -1098,6 +1103,37 @@ cpvk_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
       buffer->offset = pBindInfos[i].memoryOffset;
       cpvk_memory_note_bind(cpvk_device_from_handle(_device), mem,
                             buffer->offset, buffer->vk.size, buffer, NULL);
+
+      /*
+       * A transfer-destination-only buffer in a managed allocation is a
+       * readback target: the device writes it once per copy and only the
+       * host ever reads it. Leaving those pages to migrate makes the
+       * per-frame image copy crawl and bounces the pages back and forth
+       * (measured 2.4 ms/frame on B200). Advising them host-resident with
+       * device access turns the copy into a straight bus write. Advisory
+       * only: failures change nothing.
+       */
+      if (!cp_debug->no_host_pin_readback && mem && mem->host_ptr &&
+          buffer->vk.size &&
+          !(buffer->vk.usage & ~(VK_BUFFER_USAGE_2_TRANSFER_DST_BIT))) {
+         struct cpvk_device *dev = cpvk_device_from_handle(_device);
+         CPVK_CTX_SCOPE(dev);
+         CUdeviceptr ptr = mem->dev_ptr + pBindInfos[i].memoryOffset;
+#if CUDA_VERSION >= 13000
+         CUmemLocation host_loc = { .type = CU_MEM_LOCATION_TYPE_HOST };
+         CUmemLocation dev_loc = { .type = CU_MEM_LOCATION_TYPE_DEVICE,
+                                   .id = dev->pdev->cu_dev };
+         cuMemAdvise(ptr, buffer->vk.size,
+                     CU_MEM_ADVISE_SET_PREFERRED_LOCATION, host_loc);
+         cuMemAdvise(ptr, buffer->vk.size,
+                     CU_MEM_ADVISE_SET_ACCESSED_BY, dev_loc);
+#else
+         cuMemAdvise(ptr, buffer->vk.size,
+                     CU_MEM_ADVISE_SET_PREFERRED_LOCATION, CU_DEVICE_CPU);
+         cuMemAdvise(ptr, buffer->vk.size,
+                     CU_MEM_ADVISE_SET_ACCESSED_BY, dev->pdev->cu_dev);
+#endif
+      }
       if (mem && pBindInfos[i].memoryOffset + buffer->vk.size > mem->vk.size)
          fprintf(stderr, "cudavk: buffer of %llu bytes bound at %llu into an "
                  "allocation of %llu -- it does not fit\n",

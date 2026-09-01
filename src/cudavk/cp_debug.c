@@ -174,6 +174,9 @@ static const struct cp_flag_def flags[] = {
      "its six faces from where the sampler will look; syncs" },
 
    /* ---- subsystem switches ---- */
+   { "CUDAVK_NO_HOST_PIN_READBACK", CP_FLAG_BOOL_VALUE, F(no_host_pin_readback),
+     "do not advise transfer-dst-only managed buffer ranges host-resident; "
+     "the per-frame readback copy goes back to migrating its pages" },
    { "CUDAVK_NO_ABUFFER", CP_FLAG_BOOL_PRESENCE, F(no_abuffer),
      "disable the A-buffer; blended draws go back to the direct path" },
    { "CUDAVK_NO_ABUF_BATCH", CP_FLAG_BOOL_PRESENCE, F(no_abuf_batch),

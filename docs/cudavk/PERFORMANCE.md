@@ -106,6 +106,7 @@ hashes. They do not sum to today's number.
 | vertex fetch fused into the vertex shader | `CUDAVK_NO_FUSED_VFETCH` | 16.0194 → 16.5119 (+0.4925) | 5.9928 → 6.0715 (+0.0787) |
 | A-buffer scan and quad fusions | `CUDAVK_NO_ABUF_FUSE_SCAN`, `CUDAVK_NO_ABUF_FUSE_QUAD` | 15.7488 → 15.9696 (+0.2208) | 5.8777 → 5.9685 (+0.0907) |
 | programmatic dependent launch | `CUDAVK_NO_PDL` | 12.7826 → 13.1641 (+0.3815) | 5.6936 → 5.8458 (+0.1522) |
+| host-pinned readback pages | `CUDAVK_NO_HOST_PIN_READBACK` | favorite3 6.6757 → 7.6048 (+0.9291), favorite2 5.4800 → 6.5433 (+1.0633) | B200: favorite3 10.789 → 12.188 (+1.399), favorite2 8.967 → 10.566 (+1.599) |
 
 Every switch is in the registry (`../../src/cudavk/FLAGS.md`, 97 entries), and
 each of these reverts restores its old path exactly.
