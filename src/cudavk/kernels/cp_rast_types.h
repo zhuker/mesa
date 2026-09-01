@@ -962,11 +962,23 @@ struct cp_abuf_seg_args {
  *                            render scope; the host reads and zeroes it at
  *                            every per-scope report, so unlike the rest of
  *                            the histogram it never accumulates
+ *   [RUN_REFS + slot]        scope scratch: references binned by the run
+ *                            (renderer2 M1 segmentation, one slot per run of
+ *                            the scope, the last slot holding every run past
+ *                            the table). Read and zeroed with [GLOBALS + 6].
  */
 #define CP_TILE_CENSUS_SHADED  (CP_TILE_CENSUS_BINS * 4)
 #define CP_TILE_CENSUS_REFS    (CP_TILE_CENSUS_SHADED + CP_TILE_CENSUS_LOG)
 #define CP_TILE_CENSUS_GLOBALS (CP_TILE_CENSUS_REFS + CP_TILE_CENSUS_LOG)
-#define CP_TILE_CENSUS_WORDS   (CP_TILE_CENSUS_GLOBALS + 8)
+/*
+ * Runs a scope's segmentation census reports one by one. M0 measured at most
+ * 349 draws in a render scope, so a scope cannot hold more runs than that;
+ * this is a reporting bound, not a correctness one, and the last slot is the
+ * aggregate of every run past it.
+ */
+#define CP_TILE_CENSUS_RUNS    64
+#define CP_TILE_CENSUS_RUN_REFS (CP_TILE_CENSUS_GLOBALS + 8)
+#define CP_TILE_CENSUS_WORDS   (CP_TILE_CENSUS_RUN_REFS + CP_TILE_CENSUS_RUNS)
 
 struct cp_tile_census_args {
    uint64_t quad_prim;      /* uint32 per quad: episode-global primitive */
@@ -991,7 +1003,10 @@ struct cp_tile_census_args {
    uint32_t tiles_x;
    uint32_t tiles_y;
    uint32_t nshaders;
-   uint32_t pad;
+   /* Which run of the current render scope the references this launch bins
+    * belong to; CP_TILE_CENSUS_RUNS - 1 is the overflow slot. Only
+    * cp_tile_census_refs reads it. */
+   uint32_t run_slot;
 };
 
 struct cp_abuf_seg_prefix_args {

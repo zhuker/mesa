@@ -8211,13 +8211,18 @@ cp_tile_census_common(struct cp_context *cp, struct cp_pass_seg *segs,
    for (unsigned s = 0; s < nsegs; s++)
       cp->tile_census_scope_draws += segs[s].batch.ndraws;
 
-   /* How large the bin itself would be, which the shaded counts cannot say. */
+   /* How large the bin itself would be, which the shaded counts cannot say.
+    * Each launch also charges its references to the run the segment was drawn
+    * in, which is why the arguments are per segment rather than shared. */
    if (cp->dev->kernels.tile_census_refs) {
       for (unsigned s = 0; s < nsegs; s++) {
          unsigned n = segs[s].rast_num_triangles;
          if (!n)
             continue;
-         void *p[] = { &segs[s].rast, ca };
+         struct cp_tile_census_args rca = *ca;
+         rca.run_slot = MIN2(cp->tile_census_seg_run[s],
+                             (uint32_t)CP_TILE_CENSUS_RUNS - 1u);
+         void *p[] = { &segs[s].rast, &rca };
          CP_LAUNCH(cp->dev->kernels.tile_census_refs,
                    MIN2((n + 255) / 256, 1024u), 1, 1, 256, 1, 1, 0,
                    cp->stream, p, NULL);
@@ -8410,16 +8415,127 @@ cp_tile_census_reduce_pass(struct cp_context *cp)
 }
 
 /*
+ * The run segmentation census (renderer2 M1 design, section 1.2).
+ *
+ * A run is a maximal sequence of consecutive draws in one render scope that a
+ * tile walk could take whole. The predicate is the existing one — the front
+ * end's cpvk_draws_episode_compatible() for the state, cp_batch_order_free()
+ * plus the framebuffer conditions for the opaque class, the per-draw A-buffer
+ * admission for the blended one — so the front end evaluates it and reports
+ * here, and this file only keeps the table and prints it.
+ *
+ * Two things make the accounting exact rather than approximate:
+ *
+ * - The run index advances when a run *opens*, never when one closes. A cut
+ *   op closes the run it interrupted but leaves the index alone, so the flush
+ *   that op performs — and every segment that flush records — still stamps
+ *   the run its draws were issued in.
+ * - References are charged per segment, from the stamp cp_pass_record_segment
+ *   took, not from whatever run happens to be open when the episode finally
+ *   marks. An episode can mark arbitrarily later than its draws: a class
+ *   change that keeps episode-compatible state closes the previous episode
+ *   only when the *next* batch tries to append.
+ *
+ * A draw that never reaches an episode (the classic path) is still counted in
+ * its run's draws and batches, but contributes no references, exactly as it
+ * contributes none to the scope line's refs_total.
+ */
+static struct cp_tile_census_run *
+cp_tile_census_run_slot(struct cp_context *cp)
+{
+   return &cp->tile_census_run_table[MIN2(cp->tile_census_run,
+                                          (uint32_t)CP_TILE_CENSUS_RUNS - 1u)];
+}
+
+/* Reporting only: the overflow slot folds runs of more than one class. */
+#define CP_TILE_RUN_MIXED 3
+
+static void
+cp_tile_census_run_close(struct cp_context *cp, uint8_t why)
+{
+   struct cp_tile_census_run *r = cp_tile_census_run_slot(cp);
+   /* The reason that closed one of many folded runs is not the reason for
+    * their aggregate, and saying so is cheaper than implying otherwise. */
+   r->end = cp->tile_census_run < (uint32_t)CP_TILE_CENSUS_RUNS - 1u
+      ? why : (uint8_t)CP_TILE_RUN_END_AGGREGATE;
+   cp->tile_census_run_open = false;
+}
+
+void
+cp_tile_census_run_draw(struct cp_context *cp,
+                        enum cp_tile_census_run_class cls,
+                        bool episode_compatible, bool new_batch)
+{
+   bool cont = cp->tile_census_run_open && episode_compatible &&
+               (uint8_t)cls == cp->tile_census_run_class;
+   if (!cont) {
+      if (cp->tile_census_run_open)
+         cp_tile_census_run_close(cp, episode_compatible
+                                         ? (uint8_t)CP_TILE_RUN_END_CLASS
+                                         : (uint8_t)CP_TILE_RUN_END_STATE);
+      /* The first run of a scope is index 0, so the index only advances
+       * between runs and always names the open one. */
+      if (cp->tile_census_runs)
+         cp->tile_census_run++;
+      cp->tile_census_runs++;
+      cp->tile_census_run_open = true;
+      cp->tile_census_run_class = (uint8_t)cls;
+
+      struct cp_tile_census_run *r = cp_tile_census_run_slot(cp);
+      if (cp->tile_census_run < (uint32_t)CP_TILE_CENSUS_RUNS - 1u) {
+         r->cls = (uint8_t)cls;
+         r->draws = 0;
+         r->batches = 0;
+      } else if (r->end != CP_TILE_RUN_END_OPEN || r->draws) {
+         /* Already folding: keep the class only while it agrees. */
+         if (r->cls != (uint8_t)cls)
+            r->cls = CP_TILE_RUN_MIXED;
+      } else {
+         r->cls = (uint8_t)cls;
+      }
+      r->end = CP_TILE_RUN_END_OPEN;
+   }
+
+   struct cp_tile_census_run *r = cp_tile_census_run_slot(cp);
+   r->draws++;
+   if (new_batch)
+      r->batches++;
+}
+
+/*
  * Was the bind really the interval a tile could have stayed resident? These
  * are the things that read or write the attachment while one is open, which
  * would force a real tiler to flush and reload the tile mid-pass. Recorded
  * by kind rather than lumped, because they have different answers: a copy
  * can often be deferred, a host map cannot.
+ *
+ * They are also exactly the ops that cut a run, so this is where the run
+ * census learns why one ended.
  */
 void
 cp_tile_census_cut(struct cp_context *cp, enum cp_tile_census_cut_kind kind)
 {
-   if (!cp_debug->tile_census || !cp->tile_census_open)
+   if (!cp_debug->tile_census)
+      return;
+
+   /*
+    * The run census first, and outside the tile_census_open test: a run is a
+    * front-end sequence of draws, so an op cuts it whether or not any episode
+    * has marked yet. The run index is deliberately *not* advanced here — the
+    * flush this op is about to do still stamps its segments with the run they
+    * were drawn in.
+    */
+   if (cp->tile_census_run_open) {
+      static const uint8_t reason[] = {
+         [CP_TILE_CUT_MAP]     = CP_TILE_RUN_END_CUT_MAP,
+         [CP_TILE_CUT_COPY]    = CP_TILE_RUN_END_CUT_COPY,
+         [CP_TILE_CUT_FLUSH]   = CP_TILE_RUN_END_CUT_FLUSH,
+         [CP_TILE_CUT_COMPUTE] = CP_TILE_RUN_END_CUT_COMPUTE,
+      };
+      cp_tile_census_run_close(cp, reason[kind]);
+   }
+
+   if (!cp->tile_census_open)
       return;
    switch (kind) {
    case CP_TILE_CUT_MAP:     cp->tile_census_cut_map++;     break;
@@ -8428,6 +8544,90 @@ cp_tile_census_cut(struct cp_context *cp, enum cp_tile_census_cut_kind kind)
    case CP_TILE_CUT_COMPUTE: cp->tile_census_cut_compute++; break;
    }
    cp->tile_census_cut = true;
+}
+
+/*
+ * The per-scope run segmentation report (renderer2 M1). Two record kinds,
+ * both KEY=VALUE in the style of the scope line above:
+ *
+ *   tilecensus-runs-v1  one per render scope, always emitted, so the
+ *                       population is complete and pairs 1:1 with the
+ *                       tilecensus-scope-v1 line of the same ordinal;
+ *   tilecensus-run-v1   one per run, up to CP_TILE_CENSUS_RUNS of them, the
+ *                       last being the aggregate of every run past the table.
+ *
+ * LEADING_OPAQUE_PREFIX is the summary line's prefix_* keys: the scope's first
+ * run when that run is opaque, and zero when the scope opens blended. That is
+ * the number M1 section 5.4 test 1 is about — a scope whose prefix is empty
+ * offers the smallest M2 slice no work at all.
+ */
+static void
+cp_tile_census_run_report(struct cp_context *cp, const uint64_t *run_refs)
+{
+   static const char *const class_name[] = {
+      [CP_TILE_RUN_OPAQUE]  = "opaque",
+      [CP_TILE_RUN_BLENDED] = "blended",
+      [CP_TILE_RUN_OTHER]   = "other",
+      [CP_TILE_RUN_MIXED]   = "mixed",
+   };
+   static const char *const end_name[] = {
+      [CP_TILE_RUN_END_OPEN]        = "open",
+      [CP_TILE_RUN_END_STATE]       = "state",
+      [CP_TILE_RUN_END_CLASS]       = "class",
+      [CP_TILE_RUN_END_CUT_MAP]     = "cut_map",
+      [CP_TILE_RUN_END_CUT_COPY]    = "cut_copy",
+      [CP_TILE_RUN_END_CUT_FLUSH]   = "cut_flush",
+      [CP_TILE_RUN_END_CUT_COMPUTE] = "cut_compute",
+      [CP_TILE_RUN_END_SCOPE]       = "scope_end",
+      [CP_TILE_RUN_END_AGGREGATE]   = "aggregate",
+   };
+
+   /* The scope ends the last run, and it is the only reason left that is not
+    * a property of the draws. Closing it here is also what guarantees no
+    * reported run ever carries end=open. */
+   if (cp->tile_census_run_open)
+      cp_tile_census_run_close(cp, (uint8_t)CP_TILE_RUN_END_SCOPE);
+
+   unsigned reported = MIN2(cp->tile_census_runs,
+                            (uint32_t)CP_TILE_CENSUS_RUNS);
+   uint32_t draws = 0, batches = 0;
+   uint64_t refs = 0;
+   for (unsigned i = 0; i < reported; i++) {
+      draws += cp->tile_census_run_table[i].draws;
+      batches += cp->tile_census_run_table[i].batches;
+      refs += run_refs[i];
+   }
+
+   const struct cp_tile_census_run *first = &cp->tile_census_run_table[0];
+   bool opaque_prefix =
+      cp->tile_census_runs && first->cls == CP_TILE_RUN_OPAQUE;
+
+   fprintf(stderr,
+           "tilecensus-runs-v1 scope=%" PRIu64 " submit=%" PRIu64
+           " runs=%u reported=%u draws=%u batches=%u refs=%" PRIu64
+           " prefix_class=%s prefix_draws=%u prefix_batches=%u"
+           " prefix_refs=%" PRIu64 "\n",
+           cp->tile_census_scope_ord, cp->tile_census_submit,
+           cp->tile_census_runs, reported, draws, batches, refs,
+           opaque_prefix ? "opaque" : "none",
+           opaque_prefix ? first->draws : 0,
+           opaque_prefix ? first->batches : 0,
+           opaque_prefix ? run_refs[0] : (uint64_t)0);
+
+   for (unsigned i = 0; i < reported; i++) {
+      const struct cp_tile_census_run *r = &cp->tile_census_run_table[i];
+      fprintf(stderr,
+              "tilecensus-run-v1 scope=%" PRIu64 " run=%u class=%s draws=%u"
+              " batches=%u refs=%" PRIu64 " end=%s\n",
+              cp->tile_census_scope_ord, i, class_name[r->cls], r->draws,
+              r->batches, run_refs[i], end_name[r->end]);
+   }
+
+   cp->tile_census_run = 0;
+   cp->tile_census_runs = 0;
+   cp->tile_census_run_open = false;
+   cp->tile_census_run_class = 0;
+   memset(cp->tile_census_run_table, 0, sizeof(cp->tile_census_run_table));
 }
 
 /*
@@ -8456,6 +8656,7 @@ cp_tile_census_scope_report(struct cp_context *cp)
    uint64_t refs_total = 0, tris = 0;
    uint64_t hist[CP_TILE_CENSUS_SCOPE_LOG] = { 0 };
    uint32_t refs_max = 0, nonempty = 0;
+   uint64_t run_refs[CP_TILE_CENSUS_RUNS] = { 0 };
 
    if (marked) {
       cuStreamSynchronize(cp->stream);
@@ -8486,6 +8687,14 @@ cp_tile_census_scope_report(struct cp_context *cp)
                         CP_TILE_CENSUS_GLOBALS;
          tris = gl[6];
          gl[6] = 0;
+         /* Same scratch discipline for the per-run reference totals: each
+          * refs launch charged its own segment's run. */
+         uint64_t *rr = (uint64_t *)(uintptr_t)cp->tile_census_hist +
+                        CP_TILE_CENSUS_RUN_REFS;
+         for (unsigned i = 0; i < CP_TILE_CENSUS_RUNS; i++) {
+            run_refs[i] = rr[i];
+            rr[i] = 0;
+         }
       }
    }
 
@@ -8515,6 +8724,8 @@ cp_tile_census_scope_report(struct cp_context *cp)
    for (unsigned b = 0; b < CP_TILE_CENSUS_SCOPE_LOG; b++)
       fprintf(stderr, "%s%" PRIu64, b ? "," : "", hist[b]);
    fputc('\n', stderr);
+
+   cp_tile_census_run_report(cp, run_refs);
 
    cp->tile_census_scope_draws = 0;
    cp->tile_census_scope_batches = 0;
@@ -9313,6 +9524,13 @@ cp_pass_record_segment(struct cp_context *cp,
    sg->prim_shift = cp->fs_batch.prim_shift;
    sg->batch = *batch;
    sg->slices_dev = cp->fs_batch.slices;
+
+   /* The run this segment's draws were issued in, for the census's per-run
+    * reference attribution. Taken here rather than at mark time because an
+    * episode can mark long after the run that drew it closed. One branch
+    * with the flag unset. */
+   if (cp_debug->tile_census)
+      cp->tile_census_seg_run[cp->pass.nsegs] = cp->tile_census_run;
 
    if (cp->pass.nsegs == 0) {
       cp->pass.w = aa->width;

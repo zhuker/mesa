@@ -373,8 +373,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_TILE_CENSUS", CP_FLAG_UINT, F(tile_census),
      "tile edge in pixels for the tile-bin census over both the blended and "
      "the opaque stream; emits one machine-readable tilecensus-scope-v1 line "
-     "per render scope; 0 is off; it changes no rendering but its per-scope "
-     "sync makes every timing number of the run invalid", .dflt = 0,
+     "and one tilecensus-runs-v1 run segmentation summary per render scope, "
+     "with a tilecensus-run-v1 line per run; 0 is off; it changes no "
+     "rendering but its per-scope sync makes every timing number of the run "
+     "invalid", .dflt = 0,
      .has_range = true, .lo = 0, .hi = 256 },
    { "CUDAVK_TILE_CENSUS_EVERY", CP_FLAG_UINT, F(tile_census_every),
      "report the tile census this often, in episodes", .dflt = 2000,

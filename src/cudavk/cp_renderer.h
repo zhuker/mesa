@@ -334,6 +334,31 @@ struct cp_context {
    uint32_t *tile_census_refs_host;     /* grow-only, tile_census_alloc u32s */
 
    /*
+    * The per-scope run segmentation census (renderer2 M1 section 1.2). The
+    * table is a fixed member of the context, not an allocation: with the flag
+    * unset nothing here is read or written, and with it set no draw allocates.
+    *
+    * tile_census_run is the index of the run currently *open*, and it only
+    * advances when a new run opens — which happens at a draw, never at a cut.
+    * That is what makes the reference attribution below order-independent:
+    * every batch flushed by a cut, and every segment recorded by it, still
+    * stamps the run it was drawn in, however much later its episode marks.
+    */
+   uint32_t tile_census_run;            /* index of the open/last run */
+   uint32_t tile_census_runs;           /* runs opened this scope */
+   bool tile_census_run_open;
+   uint8_t tile_census_run_class;       /* enum cp_tile_census_run_class */
+   struct cp_tile_census_run {
+      uint8_t cls;                      /* enum cp_tile_census_run_class */
+      uint8_t end;                      /* enum cp_tile_census_run_end */
+      uint32_t draws;
+      uint32_t batches;
+   } tile_census_run_table[CP_TILE_CENSUS_RUNS];
+   /* The run each recorded segment was drawn in, parallel to pass_segs, so a
+    * reference count can be charged to a run at mark time. */
+   uint32_t tile_census_seg_run[CP_PASS_MAX_SEGS];
+
+   /*
     * The episode's side streams. Segment counts, fill relaunches and shades
     * are mutually independent — the per-pixel counts and cursors are
     * order-free atomics whose order the sort erases, and the dense shading
@@ -1156,5 +1181,47 @@ enum cp_tile_census_cut_kind {
    CP_TILE_CUT_MAP, CP_TILE_CUT_COPY, CP_TILE_CUT_FLUSH, CP_TILE_CUT_COMPUTE
 };
 void cp_tile_census_cut(struct cp_context *cp, enum cp_tile_census_cut_kind k);
+
+/*
+ * The renderer2 M1 run census (RENDERER2_M1_DESIGN.md section 1.2).
+ *
+ * A *run* is a maximal sequence of consecutive draws in one render scope that
+ * a tile walk could take whole: episode-compatible state, one class, and no
+ * non-draw op in between. The front end owns the predicate, because it is the
+ * only place that sees consecutive draws and their pipelines; this is the
+ * interface it reports through, and every call is gated on the flag at the
+ * call site so that an uncensused build makes one branch per draw and none
+ * per op.
+ *
+ * The class a draw belongs to. OPAQUE is cp_batch_order_free() plus the
+ * framebuffer conditions of cp_opaque_appendable(); BLENDED is the per-draw
+ * A-buffer admission cp_draw_execute enforces; OTHER is the M1 charter's
+ * "everything else falls through", and a run of it is one a tile walk would
+ * hand back to the existing renderer draw by draw.
+ */
+enum cp_tile_census_run_class {
+   CP_TILE_RUN_OPAQUE, CP_TILE_RUN_BLENDED, CP_TILE_RUN_OTHER
+};
+
+/*
+ * Why a run ended — the whole point of the census, because a run that ends on
+ * a cut op is one a tile walk could have kept if the op moved, while a run
+ * that ends on state is one the predicate genuinely refuses. The four cut
+ * reasons are the kinds cp_tile_census_cut() already separates.
+ */
+enum cp_tile_census_run_end {
+   CP_TILE_RUN_END_OPEN,        /* still open; never reported */
+   CP_TILE_RUN_END_STATE,       /* the next draw is not episode-compatible */
+   CP_TILE_RUN_END_CLASS,       /* the next draw is of the other class */
+   CP_TILE_RUN_END_CUT_MAP,
+   CP_TILE_RUN_END_CUT_COPY,
+   CP_TILE_RUN_END_CUT_FLUSH,
+   CP_TILE_RUN_END_CUT_COMPUTE,
+   CP_TILE_RUN_END_SCOPE,       /* the render scope ended under it */
+   CP_TILE_RUN_END_AGGREGATE,   /* the overflow slot: many runs in one line */
+};
+void cp_tile_census_run_draw(struct cp_context *cp,
+                             enum cp_tile_census_run_class cls,
+                             bool episode_compatible, bool new_batch);
 
 #endif /* CP_RENDERER_H */

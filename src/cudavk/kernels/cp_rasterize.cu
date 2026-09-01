@@ -2575,6 +2575,11 @@ cp_tile_census_refs(struct cp_rasterize_args rast,
       atomicAdd((unsigned long long *)(uintptr_t)args.hist +
                    CP_TILE_CENSUS_GLOBALS + 6,
                 (unsigned long long)n);
+   /* The same references, counted a second time against the run this launch
+    * belongs to (renderer2 M1 segmentation). Accumulated in a register and
+    * added once per thread: a per-reference atomic on one word would serialize
+    * the whole kernel on it, and the number wanted is a total. */
+   uint32_t run_refs = 0;
    for (uint32_t work = blockIdx.x * blockDim.x + threadIdx.x; work < n;
         work += gridDim.x * blockDim.x) {
       uint32_t tri = cp_triangle_id(&rast, work);
@@ -2586,9 +2591,18 @@ cp_tile_census_refs(struct cp_rasterize_args rast,
       uint32_t tx1 = (uint32_t)setup.ix_max / args.tile;
       uint32_t ty1 = (uint32_t)setup.iy_max / args.tile;
       for (uint32_t ty = ty0; ty <= ty1 && ty < args.tiles_y; ty++)
-         for (uint32_t tx = tx0; tx <= tx1 && tx < args.tiles_x; tx++)
+         for (uint32_t tx = tx0; tx <= tx1 && tx < args.tiles_x; tx++) {
             atomicAdd((unsigned int *)(uintptr_t)args.tile_refs +
                          ty * args.tiles_x + tx, 1u);
+            run_refs++;
+         }
+   }
+   if (run_refs) {
+      uint32_t slot = args.run_slot < CP_TILE_CENSUS_RUNS
+         ? args.run_slot : CP_TILE_CENSUS_RUNS - 1;
+      atomicAdd((unsigned long long *)(uintptr_t)args.hist +
+                   CP_TILE_CENSUS_RUN_REFS + slot,
+                (unsigned long long)run_refs);
    }
 }
 

@@ -147,6 +147,59 @@ cpvk_submit_abort(struct cpvk_device *dev, VkResult result)
    return result;
 }
 
+/*
+ * The tile census's residency cut, per recorded op (renderer2 M1 section 1.2,
+ * and the four counters cp_renderer.c has printed since M0 with no caller to
+ * fill them).
+ *
+ * The kinds are the ones cp_tile_census_cut() separates, and they are
+ * separated because their answers differ:
+ *
+ *   COMPUTE  a dispatch — it reads or writes what the scope is rendering, and
+ *            a tiler would have to resolve the tile for it;
+ *   COPY     a copy or a fill — a transfer against the same memory, and the
+ *            kind that "can often be deferred";
+ *   MAP      an op that drains the stream and reads device memory on the host
+ *            mid-scope: the query copy here, and the indirect draw at its own
+ *            site, since a draw op is otherwise never a cut. An indirect
+ *            dispatch reads back too, but it is already counted COMPUTE here
+ *            and one op is one cut;
+ *   FLUSH    an order point that observes rendering without reading it back —
+ *            barriers, events, timestamp queries — and a mid-scope clear,
+ *            which writes the attachment outright.
+ *
+ * BEGIN_RENDER, END_RENDER and DRAW are not cuts: the first two delimit the
+ * accumulation interval and the third is what the interval is made of.
+ */
+static void
+cpvk_census_op_cut(struct cpvk_device *dev, enum cpvk_op_kind kind)
+{
+   switch (kind) {
+   case CPVK_OP_BEGIN_RENDER:
+   case CPVK_OP_END_RENDER:
+   case CPVK_OP_DRAW:
+      return;
+   case CPVK_OP_DISPATCH:
+      cp_tile_census_cut(&dev->renderer, CP_TILE_CUT_COMPUTE);
+      return;
+   case CPVK_OP_COPY:
+   case CPVK_OP_FILL:
+      cp_tile_census_cut(&dev->renderer, CP_TILE_CUT_COPY);
+      return;
+   case CPVK_OP_QUERY_COPY:
+      cp_tile_census_cut(&dev->renderer, CP_TILE_CUT_MAP);
+      return;
+   case CPVK_OP_CLEAR:
+   case CPVK_OP_QUERY:
+   case CPVK_OP_BARRIER:
+   case CPVK_OP_EVENT_SET:
+   case CPVK_OP_EVENT_RESET:
+   case CPVK_OP_EVENT_WAIT:
+      cp_tile_census_cut(&dev->renderer, CP_TILE_CUT_FLUSH);
+      return;
+   }
+}
+
 static VkResult
 cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
@@ -269,6 +322,12 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
       /* In record order: a clear after a draw must not run before it. */
       for (unsigned o = 0; o < cmd->num_ops; o++) {
+         /* The census's residency and run cuts, at the op table itself
+          * (renderer2 M1 section 1.2): this loop is the one place every
+          * non-draw op passes through, so wiring it here cannot miss one and
+          * cannot double-count one. One branch per op with the flag unset. */
+         if (cp_debug->tile_census)
+            cpvk_census_op_cut(dev, cmd->ops[o].kind);
          switch (cmd->ops[o].kind) {
          case CPVK_OP_BEGIN_RENDER: {
             uint32_t s = cmd->ops[o].scope_index;

@@ -108,7 +108,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_NO_PRIM_REFS` | bool (value) | `off` | — | copy every accepted clipped primitive into contiguous scratch instead of publishing a reference to immutable vertex-shader output |
 | `CUDAVK_NO_SETUP_CACHE` | bool (value) | `off` | — | recompute huge-primitive setup independently in every stage-3 tile |
 | `CUDAVK_FORCE_PASS_FALLBACK` | bool (value) | `off` | — | make every blended episode take the classic re-execution fallback; the output must be identical, which is what makes it a test |
-| `CUDAVK_TILE_CENSUS` | uint | `0` | 0&ndash;256 | tile edge in pixels for the tile-bin census over both the blended and the opaque stream; emits one machine-readable tilecensus-scope-v1 line per render scope; 0 is off; it changes no rendering but its per-scope sync makes every timing number of the run invalid |
+| `CUDAVK_TILE_CENSUS` | uint | `0` | 0&ndash;256 | tile edge in pixels for the tile-bin census over both the blended and the opaque stream; emits one machine-readable tilecensus-scope-v1 line and one tilecensus-runs-v1 run segmentation summary per render scope, with a tilecensus-run-v1 line per run; 0 is off; it changes no rendering but its per-scope sync makes every timing number of the run invalid |
 | `CUDAVK_TILE_CENSUS_EVERY` | uint | `2000` | 1&ndash;1000000 | report the tile census this often, in episodes |
 | `CUDAVK_TILED_OPAQUE` | bool (value) | `off` | — | use the experimental opaque episode sort-middle tile rasterizer |
 | `CUDAVK_TILED_OPAQUE_CENSUS` | bool (value) | `off` | — | collect opaque tile population statistics without changing rendering |

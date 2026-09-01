@@ -2736,6 +2736,44 @@ cpvk_pipeline_order_free(const struct cpvk_pipeline *p)
    }
 }
 
+/*
+ * The renderer2 M1 run class of one draw (RENDERER2_M1_DESIGN.md section 1.2),
+ * for the run census only — it decides nothing about rendering.
+ *
+ * OPAQUE is cpvk_pipeline_order_free() — the front end's copy of
+ * cp_batch_order_free() — plus the framebuffer conditions
+ * cp_opaque_appendable() adds. BLENDED is the per-draw A-buffer admission
+ * cp_draw_execute enforces: no fragment memory writes, one sample, no depth
+ * write, one colour attachment, an encodable colour format. Everything else
+ * is OTHER, which is the charter's "falls through to the existing renderer".
+ *
+ * Read from the pipeline and the scope, both of which the front end already
+ * holds; no renderer state is consulted, so it costs a draw nothing beyond
+ * the branch that reaches it.
+ */
+static enum cp_tile_census_run_class
+cpvk_census_run_class(const struct cp_render_scope *scope,
+                      const struct cpvk_draw_cmd *d)
+{
+   const struct cpvk_pipeline *p = d->pipeline;
+   if (!p || !p->fs || !scope)
+      return CP_TILE_RUN_OTHER;
+
+   const struct cp_fb_desc *fb = &scope->fb;
+   /* Shared by both classes: the framebuffer either episode can render to. */
+   if (p->fs->writes_memory || MAX2(scope->attachment_samples, 1u) != 1 ||
+       fb->nr_cbufs != 1 || !fb->color || fb->color_encoding < 0)
+      return CP_TILE_RUN_OTHER;
+
+   if (cpvk_pipeline_order_free(p))
+      return CP_TILE_RUN_OPAQUE;
+   /* A draw that writes depth changes the depth-test outcome between peel
+    * passes, so the A-buffer refuses it whatever else is true of it. */
+   if (p->depth.depth_writemask)
+      return CP_TILE_RUN_OTHER;
+   return CP_TILE_RUN_BLENDED;
+}
+
 static bool
 cpvk_batch_eligible(struct cpvk_device *dev,
                     const struct cp_render_scope *scope,
@@ -2896,6 +2934,11 @@ cpvk_execute_draw_indirect(struct cpvk_device *dev,
                            const struct cp_render_scope *scope,
                            const struct cpvk_draw_cmd *d)
 {
+   /* An order point and a host read of device memory in the middle of a
+    * render scope: the census's map cut, and one that ends the run whatever
+    * the resolved draws turn out to be. */
+   if (cp_debug->tile_census)
+      cp_tile_census_cut(&dev->renderer, CP_TILE_CUT_MAP);
    cpvk_execute_order_point(dev);
    if (cuStreamSynchronize(dev->renderer.stream) != CUDA_SUCCESS) {
       fprintf(stderr, "cudavk: indirect draw could not drain the stream\n");
@@ -2997,6 +3040,27 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
       /* With the previous batch submitted, an eligible draw starts a fresh
        * batch which can become the next segment. */
       batch_ok = cpvk_batch_can_join(dev, scope, d, &batch_blended);
+   }
+
+   /*
+    * The renderer2 M1 run census, and the only place the run predicate can be
+    * evaluated: it needs this draw, the one before it, and both their scopes.
+    *
+    * Placed after the flush above rather than before it, so that the episode
+    * a state break closes still belongs to the run that drew it — the run
+    * index only moves from here.
+    *
+    * A batch is begun by this draw when the batcher took it and nothing is
+    * pending; a draw the batcher refused executes alone and is its own batch.
+    * One branch per draw with the flag unset.
+    */
+   if (cp_debug->tile_census) {
+      bool compatible = dev->prev_draw_valid && dev->prev_draw &&
+                        cpvk_draws_episode_compatible(scope, d,
+                                                      dev->prev_scope,
+                                                      dev->prev_draw);
+      cp_tile_census_run_draw(cp, cpvk_census_run_class(scope, d), compatible,
+                              !batch_ok || !cp->batch.pending);
    }
 
    dev->prev_draw = d;
