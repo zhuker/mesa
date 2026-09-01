@@ -88,3 +88,38 @@ rerun the census at 32 before fixing the tile size.
 4. Hot-tile serial ceiling ~13-15k refs at 16 px - the walk kernel budget
    must be sized against this, with early-out doing the heavy lifting on the
    opaque runs.
+
+
+## Appendix: tile-size sensitivity (32 px), added after the M0 gate
+
+Same build, `CUDAVK_TILE_CENSUS=32`, both captures replayed again with valid
+hashes and full timestamp populations; analyzer clean. Logs
+`/tmp/renderer2-m0-t32/`.
+
+| | f3 16 px | f3 32 px | f2 16 px | f2 32 px |
+|---|---:|---:|---:|---:|
+| tile refs, whole run | 855.2M | 599.7M | 798.2M | 577.4M |
+| non-empty scope-tiles | 7.28M | 1.93M | 6.85M | 1.83M |
+| refs_max p50 (hottest tile, median scope) | 237 | 303 | 24 | 37 |
+| refs_max p99 | 12,823 | **20,721** | 10,096 | **15,828** |
+| refs_max max | 14,814 | 22,351 | 13,259 | 21,519 |
+| refs / post-clip triangle | 1.163 | 0.816 | 1.113 | 0.805 |
+
+**Reading the sub-1.0 refs/triangle at 32 px.** A triangle cannot bin into
+fewer than one tile, so a ratio below 1 means a material share of post-clip
+triangles produce *no* tile reference at all (degenerate, back-facing, or
+off-screen after clip) while still counting in `tris_postclip`. Solving the
+two ratios gives at least ~18% zero-reference triangles on favorite3 (~19% on
+favorite2), with visible triangles touching about 1.4x more 16 px tiles than
+32 px tiles. Both readings are consistent across the two captures. This is a
+census-interpretation caveat, not a defect — but it means `tris_postclip` is
+**not** a binning-work estimator; `refs_total` is.
+
+**Tile size decision: 16 px for the walk.** 32 px halves binning work, but
+the walk is one block per tile and entry 24's measured lesson is that the
+longest block sets the kernel's duration. 32 px raises the p99 serial tile
+list by 62% (f3) and 57% (f2) while cutting available parallelism from 3,600
+blocks to 900 — about 6 blocks per SM on a 148-SM B200, too little slack for
+the tail-heavy distribution measured above. 16 px keeps ~21-24 blocks/SM and
+a p99 serial budget of ~13k refs, which is the number the walk kernel must be
+designed against. Revisit only with a measured walk kernel in hand.
