@@ -108,6 +108,29 @@ hashes. They do not sum to today's number.
 | programmatic dependent launch | `CUDAVK_NO_PDL` | 12.7826 → 13.1641 (+0.3815) | 5.6936 → 5.8458 (+0.1522) |
 | host-pinned readback pages | `CUDAVK_NO_HOST_PIN_READBACK` | favorite3 6.6757 → 7.6048 (+0.9291), favorite2 5.4800 → 6.5433 (+1.0633) | B200: favorite3 10.789 → 12.188 (+1.399), favorite2 8.967 → 10.566 (+1.599) |
 
+
+### What it is worth against the software rasterizer
+
+Same tree, same two captures, same host: `lavapipe`/llvmpipe built from this
+checkout (`-Dvulkan-drivers=swrast`) against cudavk with all defaults, on an
+RTX 5090 and a 32-thread Ryzen 9 9950X3D. Paired-submit medians on each
+capture's own window (4.0); full submit populations on every run.
+
+| capture | window | cudavk | llvmpipe | speedup |
+|---|---|---:|---:|---:|
+| favorite3 | relevant (1391+) | 6.669 | 50.09 | **7.5x** |
+| favorite3 | heavy (2200-3150) | 8.240 | 58.45 | 7.1x |
+| favorite2 | relevant (1388+) | 5.466 | 42.53 | **7.8x** |
+| favorite2 | heavy (2735+) | 6.020 | 42.77 | 7.1x |
+
+The ratio is remarkably flat across both captures and both bands, which says
+the two implementations are limited by the same shape of work rather than by
+different bottlenecks. Note llvmpipe replays these captures correctly and to
+completion, so it remains the practical correctness reference the sweep uses
+(`TESTING.md`); this table is about cost, not coverage. Rendering was not
+compared pixel-wise here - the replay's stdout differs only in memory-type
+remapping warnings, not in output.
+
 Every switch is in the registry (`../../src/cudavk/FLAGS.md`, 97 entries), and
 each of these reverts restores its old path exactly.
 
