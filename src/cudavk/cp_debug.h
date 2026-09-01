@@ -326,6 +326,14 @@ struct cp_debug {
    struct cp_opt_int point_threshold;
    struct cp_opt_int tile_bound;
    bool no_host_pin_readback;
+
+   /* THE WIDE MERGE, RETRY FORM. Last on purpose: a field inserted beside
+    * its neighbours above shifts every later offset, and then every function
+    * that reads a later flag changes machine code for no reason. Appending
+    * keeps the flag-off binary instruction for instruction what it was,
+    * which is what makes the inertness of an experiment checkable with
+    * objdump. */
+   bool wide_merge2;
 };
 
 /*

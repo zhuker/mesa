@@ -1414,6 +1414,61 @@ static_assert(sizeof(struct cp_rast_queues) == 56, "raster queue launch ABI");
 _Static_assert(sizeof(struct cp_rast_queues) == 56, "raster queue launch ABI");
 #endif
 
+/*
+ * THE RASTER MERGE: one raster stage over several segments in one launch.
+ *
+ * The two structs above are the launch-wide arguments of one segment's
+ * rasterization, and they are exactly what a launch spanning several segments
+ * can no longer pass by value -- the same sentence cp_seg_range says about the
+ * interpolator's arguments, one layer down. So they become a per-item record
+ * and the launch carries a table of them.
+ *
+ * The block -> item map is a prefix over the per-item block counts, and the
+ * prefix rather than a uniform stride is the whole point: item i owns blocks
+ * [block_base[i], block_base[i+1]), so the block it runs as is
+ * blockIdx.x - block_base[i] out of block_base[i+1] - block_base[i], which is
+ * bit for bit the (blockIdx.x, gridDim.x) pair that block would have seen in
+ * the segment's own launch. Nothing about the work assignment changes; only
+ * how many launches carry it. That is what makes the merge an experiment about
+ * launch count and about nothing else.
+ *
+ * The prefix travels by value in the launch's own arguments -- it is 40 bytes
+ * -- so the map costs constant-bank reads and no global traffic at all. Only
+ * the 400 byte record itself is uploaded.
+ *
+ * CP_RAST_MERGE_MAX is CP_PASS_STREAMS and that is not a coincidence: segment
+ * s rasterizes into queue set s % CP_PASS_STREAMS, so segments s and s + 8
+ * share one nontrivial queue, one huge queue and one setup cache. Today they
+ * are serialised by sharing a stream. A merged launch would run them at the
+ * same time into the same queue, which is a data race and not a merge, so a
+ * chunk may never span more than the queue-set pool, and two chunks that
+ * reuse a queue set must stay ordered.
+ *
+ * The first form of this merge (DEAD_ENDS.md entry 20) chunked at the full
+ * pool width and ran every chunk on one stream, which made every pair of
+ * chunks conflict and cost the fan-out's concurrency: overlap fell from
+ * 2.19x to 1.37x and the frame lost 0.410 ms while removing 298.8 launches.
+ * The retry form chunks NARROWER than the pool and issues each chunk on the
+ * side stream of its own first segment, so two chunks share a stream exactly
+ * when they share a queue set -- the per-segment loop's own ordering
+ * mechanism -- and disjoint chunks run concurrently. The chunk width is host
+ * policy, in cp_pass_finish(); this bound is the ABI's.
+ */
+#define CP_RAST_MERGE_MAX 8u
+
+/* One merged item: everything a single-segment launch passed by value. */
+struct cp_rast_item {
+   struct cp_rasterize_args args;
+   struct cp_rast_queues queues;
+};
+
+/* The merged launch's own arguments: the block -> item prefix and the table. */
+struct cp_rast_merge_args {
+   uint64_t items;                            /* const struct cp_rast_item * */
+   uint32_t nitems;
+   uint32_t block_base[CP_RAST_MERGE_MAX + 1];
+};
+
 #define CP_MAX_VERTEX_ELEMENTS_VF 16
 #define CP_MAX_VERTEX_BUFFERS_VF 16
 

@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-130 switches.
+131 switches.
 
 ## Tracing
 
@@ -96,6 +96,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_FLUSH_DRAIN` | bool (value) | `off` | — | restore the draining flush: cp_flush waits for the whole device and rewinds the arenas in place instead of ping-ponging generations |
 | `CUDAVK_NO_SEG_MERGE` | bool (value) | `off` | — | disable merged shading groups: every episode segment shades in its own launch group, as before |
 | `CUDAVK_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |
+| `CUDAVK_WIDE_MERGE2` | bool (value) | `off` | — | rasterize the episode's fill relaunches in merged launches of two segments per stage, with the chunks fanned out over four of the side streams, instead of one triple per segment on eight; needs NO_ABUF_APPEND to reach the relaunch loop at all |
 | `CUDAVK_NO_FUSED_ABUF_INTERP` | bool (value) | `off` | — | launch A-buffer interpolation separately instead of calling it from the generated fragment shader; performance experiment only |
 | `CUDAVK_NO_FUSED_INTERP` | bool (value) | `off` | — | restore the direct shade path's separate cp_fs_interpolate launch instead of the slim compaction plus in-shader interpolation |
 | `CUDAVK_NO_COUNTER_POOL` | bool (value) | `off` | — | restore the per-shade cuMemsetD32Async that zeroes the direct path's slot counter instead of handing counters out of a pre-zeroed device pool; the revert for the shade-chain counter pool |

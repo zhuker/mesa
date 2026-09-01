@@ -159,7 +159,7 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
     * reproduce. Unset means the header's default.
     */
    char small_opt[64], medium_opt[64], point_opt[64], tilebound_opt[64];
-   const char *opts[10];
+   const char *opts[11];
    unsigned num_opts = 0;
    opts[num_opts++] = arch_opt;
    opts[num_opts++] = "--std=c++14";
@@ -178,6 +178,12 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
       snprintf(pdl_opt, sizeof(pdl_opt), "-DCP_PDL=%u", pdl);
       opts[num_opts++] = pdl_opt;
    }
+   /* THE WIDE MERGE, RETRY FORM, on the same terms as the PDL level above:
+    * only the rasterizer holds the merged entry points, and the define is
+    * part of the NVRTC cache key, so the off arm keeps -- and re-uses -- the
+    * exact module every existing measurement was taken with. */
+   if (cp_debug->wide_merge2 && !strcmp(name, "cp_rasterize.cu"))
+      opts[num_opts++] = "-DCP_RAST_MERGE=1";
 
    if (cp_debug->small_threshold.set) {
       snprintf(small_opt, sizeof(small_opt), "-DCP_SMALL_THRESHOLD=%d",
@@ -420,6 +426,18 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
                        "cp_rasterize_stage2_abuf");
    cuModuleGetFunction(&k->rasterize_stage3_abuf, k->module,
                        "cp_rasterize_stage3_abuf");
+
+   /* THE WIDE MERGE, present only in a module compiled with CP_RAST_MERGE.
+    * cuModuleGetFunction leaves the handle untouched and returns an error
+    * when the symbol is absent, which is why these are not warned about. */
+   if (cp_debug->wide_merge2) {
+      cuModuleGetFunction(&k->rasterize_stage1_abuf_merged, k->module,
+                          "cp_rasterize_stage1_abuf_merged");
+      cuModuleGetFunction(&k->rasterize_stage2_abuf_merged, k->module,
+                          "cp_rasterize_stage2_abuf_merged");
+      cuModuleGetFunction(&k->rasterize_stage3_abuf_merged, k->module,
+                          "cp_rasterize_stage3_abuf_merged");
+   }
 
    cuModuleGetFunction(&k->clip_rast_fused, k->module, "cp_clip_rast_fused");
    cuModuleGetFunction(&k->clip_rast_fused_abuf, k->module,

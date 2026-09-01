@@ -65,6 +65,15 @@
 #define CP_PDL_WAIT4() do { } while (0)
 #endif
 
+/*
+ * THE WIDE MERGE. Defined by cp_kernels.c only when CUDAVK_WIDE_MERGE2
+ * is set, so that the default binary is the one every existing number was
+ * measured with and the merged entry points do not exist in it at all.
+ */
+#ifndef CP_RAST_MERGE
+#define CP_RAST_MERGE 0
+#endif
+
 #define PACK_VISBUF(depth_uint, tri_id) \
    (((uint64_t)(depth_uint) << 32) | (uint64_t)(~(uint32_t)(tri_id)))
 #define VISBUF_DEPTH(packed) ((uint32_t)((packed) >> 32))
@@ -912,8 +921,19 @@ cp_rast_small_or_defer(struct cp_rasterize_args *args,
  */
 template <bool ABUF>
 static __device__ __forceinline__ void
-cp_rasterize_stage1_body(struct cp_rasterize_args args, struct cp_rast_queues queues)
+cp_rasterize_stage1_body(struct cp_rasterize_args args,
+                         struct cp_rast_queues queues,
+                         uint32_t bid, uint32_t nblk)
 {
+   /*
+    * The block index and the grid width arrive as arguments rather than being
+    * read from blockIdx/gridDim, so that one launch can carry several
+    * segments: a merged entry point hands each block the pair it would have
+    * been given by its own segment's launch. The single-segment entry points
+    * below pass blockIdx.x and gridDim.x, which is what the body used to read
+    * directly, so nothing about them changes.
+    */
+   (void)nblk;
    /*
     * Tier 4, and the wait goes first because nothing here is independent of
     * whatever ran in front of it. The triangle count and the active-id map are
@@ -926,7 +946,7 @@ cp_rasterize_stage1_body(struct cp_rasterize_args args, struct cp_rast_queues qu
     */
    CP_PDL_WAIT4();
 
-   uint32_t work = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t work = bid * blockDim.x + threadIdx.x;
    /* After clipping the count lives on the device, so the grid is sized for
     * the worst case and each thread bounds itself. */
    if (work >= cp_num_triangles(&args))
@@ -948,11 +968,15 @@ cp_rasterize_stage1_body(struct cp_rasterize_args args, struct cp_rast_queues qu
  */
 template <bool ABUF>
 static __device__ __forceinline__ void
-cp_rasterize_stage2_body(struct cp_rasterize_args args, struct cp_rast_queues queues)
+cp_rasterize_stage2_body(struct cp_rasterize_args args,
+                         struct cp_rast_queues queues,
+                         uint32_t bid, uint32_t nblk)
 {
+   /* See stage 1: the pair is passed, not read, so that a merged launch can
+    * give each block its own segment's view of the grid. */
    uint32_t lane_id = threadIdx.x % 32;
-   uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-   uint32_t num_warps = (gridDim.x * blockDim.x) / 32;
+   uint32_t warp_id = (bid * blockDim.x + threadIdx.x) / 32;
+   uint32_t num_warps = (nblk * blockDim.x) / 32;
 
    uint32_t *nt_counter = (uint32_t *)(uintptr_t)queues.nontrivial_count;
 
@@ -1173,8 +1197,11 @@ cp_clip_rast_fused_body(struct cp_clip_args cargs,
  */
 template <bool ABUF>
 static __device__ __forceinline__ void
-cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues queues)
+cp_rasterize_stage3_body(struct cp_rasterize_args args,
+                         struct cp_rast_queues queues,
+                         uint32_t bid, uint32_t nblk)
 {
+   /* See stage 1. */
    uint32_t *huge_counter = (uint32_t *)(uintptr_t)queues.huge_count;
 
    /* Tier 2. Same shape as stage 2, and the same admission: the tile count and
@@ -1206,8 +1233,8 @@ cp_rasterize_stage3_body(struct cp_rasterize_args args, struct cp_rast_queues qu
     * guard the shared setup — a lane leaving the loop while its neighbours
     * wait at __syncthreads() is what turns a dropped tile into a hang.
     */
-   for (uint32_t tile_idx = blockIdx.x; tile_idx < num_tiles;
-        tile_idx += gridDim.x) {
+   for (uint32_t tile_idx = bid; tile_idx < num_tiles;
+        tile_idx += nblk) {
       uint32_t tri_id = huge_queue[tile_idx].tri_id;
       int tile_x = (int)huge_queue[tile_idx].tile_x;
       int tile_y = (int)huge_queue[tile_idx].tile_y;
@@ -1391,7 +1418,7 @@ cp_rasterize_stage1(struct cp_rasterize_args args, struct cp_rast_queues queues)
        (!!*(const volatile uint32_t *)(uintptr_t)args.path_flag) !=
           !!args.path_value)
       return;
-   cp_rasterize_stage1_body<false>(args, queues);
+   cp_rasterize_stage1_body<false>(args, queues, blockIdx.x, gridDim.x);
 }
 
 extern "C" __global__ void
@@ -1401,7 +1428,7 @@ cp_rasterize_stage2(struct cp_rasterize_args args, struct cp_rast_queues queues)
        (!!*(const volatile uint32_t *)(uintptr_t)args.path_flag) !=
           !!args.path_value)
       return;
-   cp_rasterize_stage2_body<false>(args, queues);
+   cp_rasterize_stage2_body<false>(args, queues, blockIdx.x, gridDim.x);
 }
 
 extern "C" __global__ void
@@ -1411,29 +1438,123 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
        (!!*(const volatile uint32_t *)(uintptr_t)args.path_flag) !=
           !!args.path_value)
       return;
-   cp_rasterize_stage3_body<false>(args, queues);
+   cp_rasterize_stage3_body<false>(args, queues, blockIdx.x, gridDim.x);
 }
 
 extern "C" __global__ void
 cp_rasterize_stage1_abuf(struct cp_rasterize_args args,
                          struct cp_rast_queues queues)
 {
-   cp_rasterize_stage1_body<true>(args, queues);
+   cp_rasterize_stage1_body<true>(args, queues, blockIdx.x, gridDim.x);
 }
 
 extern "C" __global__ void
 cp_rasterize_stage2_abuf(struct cp_rasterize_args args,
                          struct cp_rast_queues queues)
 {
-   cp_rasterize_stage2_body<true>(args, queues);
+   cp_rasterize_stage2_body<true>(args, queues, blockIdx.x, gridDim.x);
 }
 
 extern "C" __global__ void
 cp_rasterize_stage3_abuf(struct cp_rasterize_args args,
                          struct cp_rast_queues queues)
 {
-   cp_rasterize_stage3_body<true>(args, queues);
+   cp_rasterize_stage3_body<true>(args, queues, blockIdx.x, gridDim.x);
 }
+
+#if CP_RAST_MERGE
+/*
+ * THE WIDE MERGE: the same three stages, over several segments per launch.
+ *
+ * Compiled only when CUDAVK_WIDE_MERGE2 asked for them, for the reason the
+ * PDL tiers are compiled per level: a binary that carries an experiment's
+ * kernels is not the binary the control was measured with, and NVRTC caches
+ * per option string, so the off arm keeps the module it always had.
+ *
+ * Each block resolves its item from the prefix, then runs the identical body
+ * with the (block, grid) pair its segment's own launch would have handed it.
+ * The resolve is a walk over at most CP_RAST_MERGE_MAX - 1 comparisons against
+ * a by-value array, i.e. constant-bank reads: no global memory is touched to
+ * find the item, and the loop is short enough that every block in the launch
+ * takes the same handful of cycles for it.
+ *
+ * Where the item's own record is read matters for PDL. The record is host data
+ * uploaded before the launch, never a predecessor kernel's output, so reading
+ * it above the wait is legal -- and for stages 2 and 3, whose comment says
+ * there is nothing to hoist above the wait, this load IS the preamble the
+ * link never had. The stage-1 link is expected to decline anyway, because the
+ * item-table upload flushes immediately in front of it and the epoch check
+ * refuses a link across a flush.
+ *
+ * The record is staged through shared memory rather than read field by field
+ * from global, and that is a register-pressure decision with a number behind
+ * it. A launch-wide argument sits in the constant bank, which ptxas may
+ * re-read at any point for free; an argument reached through a runtime item
+ * index may not, so it keeps values live instead. Measured with ptxas -O3 at
+ * sm_90, stage 3 goes 59 -> 117 registers reading the record straight from
+ * global, 123 through a __constant__ array, and 104 through this shared copy;
+ * stage 2 goes 48 -> 121 / 121 / 113 and stage 1 40 -> 70 / 71 / 64. The
+ * shared form is the cheapest of the three and it is still not free -- that
+ * cost is a known confound of this experiment and is written down in
+ * item4_merge.md, not hidden here.
+ */
+static __device__ __forceinline__ uint32_t
+cp_rast_merge_item(const struct cp_rast_merge_args *m, uint32_t bid)
+{
+   uint32_t item = 0;
+   while (item + 1u < m->nitems && bid >= m->block_base[item + 1u])
+      item++;
+   return item;
+}
+
+static __device__ __forceinline__ void
+cp_rast_merge_load(struct cp_rast_item *dst, const struct cp_rast_item *src)
+{
+   uint32_t *d = (uint32_t *)dst;
+   const uint32_t *s = (const uint32_t *)src;
+   for (uint32_t i = threadIdx.x; i < sizeof(*dst) / 4; i += blockDim.x)
+      d[i] = s[i];
+}
+
+extern "C" __global__ void
+cp_rasterize_stage1_abuf_merged(struct cp_rast_merge_args m)
+{
+   __shared__ struct cp_rast_item sh_it;
+   uint32_t item = cp_rast_merge_item(&m, blockIdx.x);
+   cp_rast_merge_load(&sh_it,
+      (const struct cp_rast_item *)(uintptr_t)m.items + item);
+   __syncthreads();
+   cp_rasterize_stage1_body<true>(sh_it.args, sh_it.queues,
+                                  blockIdx.x - m.block_base[item],
+                                  m.block_base[item + 1] - m.block_base[item]);
+}
+
+extern "C" __global__ void
+cp_rasterize_stage2_abuf_merged(struct cp_rast_merge_args m)
+{
+   __shared__ struct cp_rast_item sh_it;
+   uint32_t item = cp_rast_merge_item(&m, blockIdx.x);
+   cp_rast_merge_load(&sh_it,
+      (const struct cp_rast_item *)(uintptr_t)m.items + item);
+   __syncthreads();
+   cp_rasterize_stage2_body<true>(sh_it.args, sh_it.queues,
+                                  blockIdx.x - m.block_base[item],
+                                  m.block_base[item + 1] - m.block_base[item]);
+}
+
+extern "C" __global__ void
+cp_rasterize_stage3_abuf_merged(struct cp_rast_merge_args m)
+{
+   __shared__ struct cp_rast_item sh_it;
+   uint32_t item = cp_rast_merge_item(&m, blockIdx.x);
+   cp_rast_merge_load(&sh_it,
+      (const struct cp_rast_item *)(uintptr_t)m.items + item);
+   __syncthreads();
+   cp_rasterize_stage3_body<true>(sh_it.args, sh_it.queues,
+                                  blockIdx.x - m.block_base[item],
+                                  m.block_base[item + 1] - m.block_base[item]);
+}
+#endif /* CP_RAST_MERGE */
 
 /*
  * The fused clip+stage1 forms, in the same two specialisations. The host
