@@ -4,8 +4,19 @@ Census build `57ff264ddb8`, `CUDAVK_TILE_CENSUS=16`, full replays of both
 captures on RTX 5090. Both runs kept their standard stdout hashes and full
 timestamp populations (favorite3 rc=139/6,939 rows, favorite2 rc=0/6,965) and
 pass the strict analyzer. Logs: `/tmp/renderer2-m0/{favorite3,favorite2}/stderr`.
-All numbers below are real frames only (absolute submit > 2782). Census
-timing is invalid by construction and none is quoted.
+All numbers below are real frames only, using **each capture's own window**
+(favorite3 frame 1391 = submit 2782; favorite2 frame 1388 = submit 2776; see
+WORKFLOW.md 4.0). The favorite2 figures in the tables below were first taken
+on favorite3's window; on the correct one the scope population moves from
+17,014 to 17,038 real scopes (4,184 -> 4,190 drawing scopes) and no
+percentile in this document changes. Census timing is invalid by construction
+and none is quoted.
+
+Both captures also contain a **heavy segment** where frame time roughly
+doubles - favorite3 ~absolute frames 2150-3150, favorite2 ~2735 to the end -
+and that segment is where the 5.0-ms goal is actually contested. The M0
+distributions here are whole-window; a band-split census is a cheap follow-up
+if M2 needs it.
 
 ## Scope population
 
