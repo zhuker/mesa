@@ -16,6 +16,7 @@ when the work started.
 
 | you want to | read |
 |---|---|
+| build, install and use it from scratch | `docs/cudavk/GETTING_STARTED.md` |
 | change the driver | `docs/cudavk/ARCHITECTURE.md` |
 | run a measured iteration | `docs/cudavk/WORKFLOW.md` |
 | know what is slow and what it costs to fix | `docs/cudavk/PERFORMANCE.md` |
