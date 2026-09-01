@@ -316,6 +316,22 @@ struct cp_context {
    uint64_t tile_census_cut_flush, tile_census_cut_compute;
    uint64_t tile_census_bind_draws; /* draws inside binds, summed */
    bool tile_census_cut;            /* this bind has been interrupted */
+   /*
+    * The per-render-scope report (renderer2 M0). Everything here is touched
+    * only under cp_debug->tile_census: with the flag unset there is no new
+    * work, no increment and no allocation on any path. The refs readback and
+    * the stream synchronization it needs make every timing number of a
+    * censused run invalid, and the report header says so.
+    */
+   uint64_t tile_census_scope_ord;      /* scope report lines emitted */
+   uint64_t tile_census_submit;         /* command-bearing submits, absolute */
+   uint32_t tile_census_scope_draws;    /* draws marked into the census */
+   uint32_t tile_census_scope_batches;  /* segments marked into the census */
+   uint32_t tile_census_scope_solo_draws;   /* draws on the unmarked path */
+   uint32_t tile_census_scope_solo_batches; /* batches on the unmarked path */
+   uint8_t tile_census_scope_class;     /* bit 0 opaque marks, bit 1 blended */
+   bool tile_census_header_done;        /* the one-line header was printed */
+   uint32_t *tile_census_refs_host;     /* grow-only, tile_census_alloc u32s */
 
    /*
     * The episode's side streams. Segment counts, fill relaunches and shades

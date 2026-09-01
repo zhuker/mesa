@@ -326,6 +326,11 @@ if dep_vulkan_loader.found()
   test('cp_launch_audit', prog_python,
        args : [files('tests/cp_launch_audit.py')],
        suite : 'cudavk')
+  # The tile-census per-scope log analyzer must keep rejecting what it
+  # promises to reject; runs on synthetic logs, no driver or GPU involved.
+  test('cp_tile_census_analyze', prog_python,
+       args : [files('tests/cp_tile_census_analyze_test.py')],
+       suite : 'cudavk')
   # The two forms of the fetch must agree, in every state the flags allow.
   test('cpvk_vfetch_gate', prog_python,
        args : [files('tests/cpvk_vfetch_gate.py'), cpvk_vfetch_exe],

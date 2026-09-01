@@ -1009,6 +1009,10 @@ cp_context_cleanup(struct cp_context *cp)
    /* Release the exclusive cache-use lifetime even on a poisoned context. */
    cp_texture_cache_unpin(cp);
    cp_hardware_texture_report(cp);
+   /* A process that dies inside a render scope still owes that scope's
+    * census line; a closed scope already reported and this is a no-op. */
+   if (cp_debug->tile_census && cp->tile_census_open)
+      cp_tile_census_end_pass(cp);
    cp_spec_report(cp);
    cp_vs_census_report();
    if (cp_debug->shader_stats && cp->fs_launches)
@@ -1087,6 +1091,8 @@ cp_context_cleanup(struct cp_context *cp)
    cp->hardware_texture.resolve_workspace = NULL;
    free(cp->pass_segs);
    free(cp->pass_group_ubos);
+   free(cp->tile_census_refs_host);
+   cp->tile_census_refs_host = NULL;
 }
 
 /* Per-stage timing for a draw, printed under CUDAVK_DEBUG_TIME. See
@@ -8045,6 +8051,14 @@ cp_opaque_finish(struct cp_context *cp)
 static void
 cp_tile_census_reduce_pass(struct cp_context *cp);
 
+/* The per-scope report's host-side histogram: log2 buckets over per-tile
+ * reference counts, bucket b holding tiles with refs in [2^b, 2^(b+1)) and
+ * the last bucket holding everything at 64k and above. Host-only layout —
+ * nothing device-side depends on it. */
+#define CP_TILE_CENSUS_SCOPE_LOG 17
+#define CP_TILE_CENSUS_SCOPE_OPAQUE  1u
+#define CP_TILE_CENSUS_SCOPE_BLENDED 2u
+
 /* The distinct fragment shader a tile kernel would have to dispatch on is
  * the compiled binary, not the shading group, so this dedups binaries over
  * the whole bind. */
@@ -8110,6 +8124,14 @@ cp_tile_census_begin(struct cp_context *cp, unsigned w, unsigned h)
           cuMemAlloc(&cp->tile_census_refs, (size_t)ntiles * 4) ||
           cuMemAlloc(&cp->tile_census_smin, per) ||
           cuMemAlloc(&cp->tile_census_smax, per)) {
+         cp->tile_census_alloc = 0;
+         return false;
+      }
+      /* The host mirror the per-scope report reads tile_refs back into;
+       * grow-only, and it exists only under the flag like everything here. */
+      free(cp->tile_census_refs_host);
+      cp->tile_census_refs_host = malloc((size_t)ntiles * 4);
+      if (!cp->tile_census_refs_host) {
          cp->tile_census_alloc = 0;
          return false;
       }
@@ -8183,6 +8205,12 @@ cp_tile_census_common(struct cp_context *cp, struct cp_pass_seg *segs,
    for (unsigned s = 0; s < nsegs; s++)
       cp->tile_census_marked_draws += segs[s].batch.ndraws;
 
+   /* The per-scope slice of the same counts: a segment is one appended
+    * batch, and its draws are the rows the shading table would need. */
+   cp->tile_census_scope_batches += nsegs;
+   for (unsigned s = 0; s < nsegs; s++)
+      cp->tile_census_scope_draws += segs[s].batch.ndraws;
+
    /* How large the bin itself would be, which the shaded counts cannot say. */
    if (cp->dev->kernels.tile_census_refs) {
       for (unsigned s = 0; s < nsegs; s++) {
@@ -8212,6 +8240,8 @@ cp_tile_census_quads(struct cp_context *cp, struct cp_pass_seg *segs,
        !cp_tile_census_common(cp, segs, nsegs, &ca))
       return;
 
+   cp->tile_census_scope_class |= CP_TILE_CENSUS_SCOPE_BLENDED;
+
    ca.quad_prim = ab->quad_prim;
    ca.quad_block = ab->quad_block;
    ca.num_quads_dev = ab->bsum3;
@@ -8236,6 +8266,8 @@ cp_tile_census_visbuf(struct cp_context *cp, struct cp_pass_seg *segs,
        !cp_tile_census_begin(cp, w, h) ||
        !cp_tile_census_common(cp, segs, nsegs, &ca))
       return;
+
+   cp->tile_census_scope_class |= CP_TILE_CENSUS_SCOPE_OPAQUE;
 
    ca.visbuf = cp->visbuf;
    ca.width = w;
@@ -8398,11 +8430,108 @@ cp_tile_census_cut(struct cp_context *cp, enum cp_tile_census_cut_kind kind)
    cp->tile_census_cut = true;
 }
 
+/*
+ * The per-render-scope report (renderer2 M0). One machine-readable line per
+ * render scope, always emitted — a scope whose draws all took the unmarked
+ * path still reports, with zeros, so a log is a complete population and an
+ * analyzer can demand contiguous ordinals. Reading tile_refs back and the
+ * stream synchronization it needs are why the header declares every timing
+ * number of a censused run invalid.
+ */
+static void
+cp_tile_census_scope_report(struct cp_context *cp)
+{
+   if (!cp->tile_census_header_done) {
+      cp->tile_census_header_done = true;
+      fprintf(stderr, "tilecensus-scope-v1 header tile=%u timing=invalid\n",
+              cp_debug->tile_census);
+   }
+
+   /* The class bits are only ever set by a mark that ran on this scope, so
+    * they also say whether tiles_x/tiles_y/nfs/refs describe this scope or
+    * are stale leftovers of the previous one. */
+   bool marked = cp->tile_census_scope_class != 0;
+   unsigned ntiles = marked
+      ? cp->tile_census_tiles_x * cp->tile_census_tiles_y : 0;
+   uint64_t refs_total = 0, tris = 0;
+   uint64_t hist[CP_TILE_CENSUS_SCOPE_LOG] = { 0 };
+   uint32_t refs_max = 0, nonempty = 0;
+
+   if (marked) {
+      cuStreamSynchronize(cp->stream);
+      if (ntiles && cp->tile_census_refs_host &&
+          ntiles <= cp->tile_census_alloc &&
+          cuMemcpyDtoH(cp->tile_census_refs_host, cp->tile_census_refs,
+                       (size_t)ntiles * 4) == CUDA_SUCCESS) {
+         for (unsigned t = 0; t < ntiles; t++) {
+            uint32_t r = cp->tile_census_refs_host[t];
+            if (!r)
+               continue;
+            nonempty++;
+            refs_total += r;
+            if (r > refs_max)
+               refs_max = r;
+            unsigned b = 0;
+            for (uint32_t v = r; v > 1; v >>= 1)
+               b++;
+            if (b >= CP_TILE_CENSUS_SCOPE_LOG)
+               b = CP_TILE_CENSUS_SCOPE_LOG - 1;
+            hist[b]++;
+         }
+      }
+      /* The device-summed post-clip triangle count, read and reset here:
+       * GLOBALS + 6 is scope scratch, not part of the cumulative census. */
+      if (cp->tile_census_hist) {
+         uint64_t *gl = (uint64_t *)(uintptr_t)cp->tile_census_hist +
+                        CP_TILE_CENSUS_GLOBALS;
+         tris = gl[6];
+         gl[6] = 0;
+      }
+   }
+
+   const char *cls = "none";
+   if (cp->tile_census_scope_class ==
+       (CP_TILE_CENSUS_SCOPE_OPAQUE | CP_TILE_CENSUS_SCOPE_BLENDED))
+      cls = "mixed";
+   else if (cp->tile_census_scope_class == CP_TILE_CENSUS_SCOPE_OPAQUE)
+      cls = "opaque";
+   else if (cp->tile_census_scope_class == CP_TILE_CENSUS_SCOPE_BLENDED)
+      cls = "blended";
+
+   cp->tile_census_scope_ord++;
+   fprintf(stderr,
+           "tilecensus-scope-v1 scope=%" PRIu64 " submit=%" PRIu64
+           " class=%s draws=%u solo_draws=%u batches=%u solo_batches=%u"
+           " fs_binaries=%u tris_postclip=%" PRIu64 " tile=%u"
+           " tiles_x=%u tiles_y=%u nonempty_tiles=%u refs_total=%" PRIu64
+           " refs_max=%u hist=",
+           cp->tile_census_scope_ord, cp->tile_census_submit, cls,
+           cp->tile_census_scope_draws, cp->tile_census_scope_solo_draws,
+           cp->tile_census_scope_batches, cp->tile_census_scope_solo_batches,
+           marked ? cp->tile_census_nfs : 0, tris, cp_debug->tile_census,
+           marked ? cp->tile_census_tiles_x : 0,
+           marked ? cp->tile_census_tiles_y : 0,
+           nonempty, refs_total, refs_max);
+   for (unsigned b = 0; b < CP_TILE_CENSUS_SCOPE_LOG; b++)
+      fprintf(stderr, "%s%" PRIu64, b ? "," : "", hist[b]);
+   fputc('\n', stderr);
+
+   cp->tile_census_scope_draws = 0;
+   cp->tile_census_scope_batches = 0;
+   cp->tile_census_scope_solo_draws = 0;
+   cp->tile_census_scope_solo_batches = 0;
+   cp->tile_census_scope_class = 0;
+}
+
 void
 cp_tile_census_end_pass(struct cp_context *cp)
 {
-   if (cp_debug->tile_census)
-      cp_tile_census_reduce_pass(cp);
+   if (!cp_debug->tile_census)
+      return;
+   /* Reduce first — a no-op when no mark opened the census — so the
+    * cumulative histogram and the per-scope line close together. */
+   cp_tile_census_reduce_pass(cp);
+   cp_tile_census_scope_report(cp);
 }
 
 static bool
@@ -9514,6 +9643,10 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
    /* Whatever the episode holds was submitted before these draws. */
    cp_pass_finish(cp);
    cp->tile_census_solo += ndraws;
+   if (cp_debug->tile_census) {
+      cp->tile_census_scope_solo_draws += ndraws;
+      cp->tile_census_scope_solo_batches++;
+   }
    cp_draw_execute_batch(cp, &cp->batch);
 }
 
@@ -9545,6 +9678,11 @@ cp_render_scope_begin(struct cp_context *cp, const struct cp_render_scope *scope
    if (cp_debug->debug_episode)
       fprintf(stderr, "episode-cut: begin_render\n");
    cp_pass_finish(cp);
+   /* An unpaired begin — the previous scope never ended — must not leak its
+    * census accumulation into this scope. With paired begin/end (all of
+    * Vulkan) the end already reported and this is a no-op. */
+   if (cp_debug->tile_census && cp->pass.scope_open)
+      cp_tile_census_end_pass(cp);
    cp->pass.scope = *scope;
    cp->pass.scope_open = true;
    cp_context_set_framebuffer(cp, &scope->fb, scope->attachment_samples);
@@ -9562,6 +9700,13 @@ cp_render_scope_end(struct cp_context *cp)
    if (cp_debug->debug_episode)
       fprintf(stderr, "episode-cut: end_render\n");
    cp_pass_finish(cp);
+   /* The render scope is the census's accumulation unit — the framebuffer
+    * bind its comment names — so this is where the reducer runs and the
+    * per-scope line is emitted, after the scope's last episode has marked.
+    * cp_pass_finish() alone cannot be the site: it closes episodes, of which
+    * a scope has many, and the census accumulates across all of them. */
+   if (cp_debug->tile_census)
+      cp_tile_census_end_pass(cp);
    if (cp->pass.scope.depth.store)
       cp_depth_attachment_xfer(cp, &cp->pass.scope, true);
    cp->pass.scope_open = false;

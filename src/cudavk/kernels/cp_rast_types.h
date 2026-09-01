@@ -958,6 +958,10 @@ struct cp_abuf_seg_args {
  *   [REFS]                   log2(primitive references per tile), tiles
  *   [GLOBALS + 0..5]         max refs/tile, max shaded/tile, total refs,
  *                            total shaded, tiles with refs, tiles shaded
+ *   [GLOBALS + 6]            scope scratch: post-clip triangles binned this
+ *                            render scope; the host reads and zeroes it at
+ *                            every per-scope report, so unlike the rest of
+ *                            the histogram it never accumulates
  */
 #define CP_TILE_CENSUS_SHADED  (CP_TILE_CENSUS_BINS * 4)
 #define CP_TILE_CENSUS_REFS    (CP_TILE_CENSUS_SHADED + CP_TILE_CENSUS_LOG)

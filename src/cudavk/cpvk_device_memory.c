@@ -157,6 +157,11 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * is the same paired-submit convention every timing number here uses. */
    cp_smallop_hit(__FILE__, __LINE__, CP_SMALLOP_SUBMIT, 0);
 
+   /* The tile census attributes every render scope to an absolute
+    * command-bearing submit; one branch when the flag is unset. */
+   if (cp_debug->tile_census && submit->command_buffer_count)
+      dev->renderer.tile_census_submit++;
+
    if (atomic_load_explicit(&dev->device_lost, memory_order_acquire))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 

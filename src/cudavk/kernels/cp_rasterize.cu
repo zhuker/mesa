@@ -2568,6 +2568,13 @@ cp_tile_census_refs(struct cp_rasterize_args rast,
                     struct cp_tile_census_args args)
 {
    uint32_t n = cp_num_triangles(&rast);
+   /* The scope's post-clip triangle total: one add per segment launch into
+    * the histogram's scope-scratch word, which the host reads and resets at
+    * every render scope report. Only the host knows the pre-clip count. */
+   if (blockIdx.x == 0 && threadIdx.x == 0)
+      atomicAdd((unsigned long long *)(uintptr_t)args.hist +
+                   CP_TILE_CENSUS_GLOBALS + 6,
+                (unsigned long long)n);
    for (uint32_t work = blockIdx.x * blockDim.x + threadIdx.x; work < n;
         work += gridDim.x * blockDim.x) {
       uint32_t tri = cp_triangle_id(&rast, work);

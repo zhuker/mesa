@@ -371,9 +371,11 @@ static const struct cp_flag_def flags[] = {
      "make every blended episode take the classic re-execution fallback; the "
      "output must be identical, which is what makes it a test" },
    { "CUDAVK_TILE_CENSUS", CP_FLAG_UINT, F(tile_census),
-     "tile edge in pixels for the blended tile-bin shader census; 0 is off, "
-     "and it changes no rendering", .dflt = 0, .has_range = true,
-     .lo = 0, .hi = 256 },
+     "tile edge in pixels for the tile-bin census over both the blended and "
+     "the opaque stream; emits one machine-readable tilecensus-scope-v1 line "
+     "per render scope; 0 is off; it changes no rendering but its per-scope "
+     "sync makes every timing number of the run invalid", .dflt = 0,
+     .has_range = true, .lo = 0, .hi = 256 },
    { "CUDAVK_TILE_CENSUS_EVERY", CP_FLAG_UINT, F(tile_census_every),
      "report the tile census this often, in episodes", .dflt = 2000,
      .has_range = true, .lo = 1, .hi = 1000000 },
