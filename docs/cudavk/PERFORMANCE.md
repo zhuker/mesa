@@ -111,52 +111,44 @@ hashes. They do not sum to today's number.
 
 ### What it is worth against the software rasterizer
 
-Same tree, same two captures, same host: `lavapipe`/llvmpipe built from this
-checkout (`-Dvulkan-drivers=swrast`) against cudavk with all defaults, on an
-RTX 5090 and a 32-thread Ryzen 9 9950X3D. Paired-submit medians on each
-capture's own window (4.0); full submit populations on every run.
+Same tree, same captures, same hosts, **both drivers built release**
+(`-Dbuildtype=release -Db_ndebug=true`); paired-submit medians on each
+capture's own window (4.0), full submit populations on every run.
 
 | capture | window | cudavk | llvmpipe | speedup |
 |---|---|---:|---:|---:|
-| favorite3 | relevant (1391+) | 6.669 | 50.09 | **7.5x** |
-| favorite3 | heavy (2200-3150) | 8.240 | 58.45 | 7.1x |
-| favorite2 | relevant (1388+) | 5.466 | 42.53 | **7.8x** |
-| favorite2 | heavy (2735+) | 6.020 | 42.77 | 7.1x |
+| favorite3 | relevant (1391+) | 6.679 | 46.40 | **6.9x** |
+| favorite3 | heavy (2200-3150) | 8.318 | 54.02 | 6.5x |
+| favorite2 | relevant (1388+) | 5.487 | 39.72 | **7.2x** |
+| favorite2 | heavy (2735+) | 6.054 | 39.90 | 6.6x |
 
-The ratio is remarkably flat across both captures and both bands, which says
-the two implementations are limited by the same shape of work rather than by
-different bottlenecks. Note llvmpipe replays these captures correctly and to
-completion, so it remains the practical correctness reference the sweep uses
-(`TESTING.md`); this table is about cost, not coverage. Rendering was not
-compared pixel-wise here - the replay's stdout differs only in memory-type
-remapping warnings, not in output.
+RTX 5090 against a 32-thread Ryzen 9 9950X3D. On the B200 host (152-thread
+Xeon Platinum 8559C) llvmpipe release is **66.19 / 56.41** ms on the two
+captures against cudavk's 10.79 / 8.97 - **6.1x / 6.3x**. More cores did not
+help it: that host's llvmpipe is *slower* than the desktop's despite 4.75x the
+threads, so this workload is single-thread-bound in the software rasterizer
+much as it is latency-bound on the GPU.
 
-Every switch is in the registry (`../../src/cudavk/FLAGS.md`, 97 entries), and
-each of these reverts restores its old path exactly.
+The ratio is flat across captures, bands and hosts, which says both
+implementations are limited by the same shape of work rather than by different
+bottlenecks - consistent with dead end 36, where the time is vertex/fragment
+arithmetic that no scheduler removes.
 
-The texture-cache row is the largest single lever in the driver, and it is also
-the newest default. It was opt-in through iterations 24 to 28 and every number
-in this document from iteration 24 on was taken with it enabled.
+**Build type matters for llvmpipe and not for cudavk**, which is worth knowing
+before quoting either. Alternating two-round A/B, same session:
 
-The PDL row is the newest and is the only default here that removes no work at
-all: the same kernels run, with the same grids and the same arguments, in the
-same stream order. What changes is that a dependent kernel may start before its
-predecessor has drained. That row is decisive rather than AB/BA — 6 runs per
-arm on old and 4 on Crossroads, strictly alternating in one session, disjoint
-IQRs, p = 0.0011 and 0.0143 one-sided.
+| | debugoptimized | release | delta |
+|---|---:|---:|---:|
+| cudavk favorite3 | 6.6799 | 6.6791 | -0.0008 (noise) |
+| cudavk favorite2 | 5.4849 | 5.4871 | +0.0022 (noise) |
+| llvmpipe favorite3 | 50.09 | 46.40 | **-7.4%** |
+| llvmpipe favorite2 | 42.53 | 39.72 | **-6.6%** |
 
-Its three levels are additive, which was checked rather than assumed: measured
-separately the steps are +0.1430, +0.1859 and +0.0637 ms on old, summing to
-+0.392 against the direct +0.4342. All three shorten the same episode drain, so
-a shared bottom would have shown as a direct figure *smaller* than the sum.
-
-`CUDAVK_NO_PDL` is the revert and gives back the pre-PDL driver exactly —
-including the one host-side reorder this work needs, which is gated on the
-level being at least 1 for that reason. `CUDAVK_PDL` is a *level* — 0, 1, 2 or
-3 — and lowering it is how a regression is bisected to a group of links without
-rebuilding. Each level compiles in only its own waits, so a level is a binary,
-not just a branch: level 1 is bit for bit the binary level 1 was measured
-with.
+cudavk is indifferent because its frame is device time and CUDA API calls, not
+host arithmetic - the shipping `debugoptimized` configuration in
+`GETTING_STARTED.md` costs nothing. llvmpipe rasterizes on the CPU, so its
+asserts are in the hot path. Rendering was not compared pixel-wise here; the
+replays' stdout differs only in memory-type remapping warnings.
 
 ---
 
