@@ -90,6 +90,8 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 32 | Immutable two-slot segment-0 shading overlap | 2026-08-30, favorite3 | REFUTED | useful compact + shader + writeback pool is **0.036 ms/frame** |
 | 33 | Cross-frame retained raster-output recurrence | 2026-08-31, favorite3 | REFUTED | isolated appending census leaves only **0.206 ms/frame** collectible union-exclusive |
 | 34 | Fully threaded Mesa runtime submit | 2026-08-31, favorite3 | REFUTED | completion-aware alternating census improves only **0.126 ms/frame** |
+| 35 | Exact within-batch post-transform vertex reuse | 2026-08-31, favorite3 | REFUTED | generous weighted union-exclusive upper is only **0.438 ms/frame** |
+| 36 | Renderer 2: scope-level tile-binned shading | 2026-08-31, both captures | REFUTED at design | walk is **129x** cheaper than entry 24, yet the ceiling is **0.409 ms/frame** and the impossible upper bound still lands at **5.21 ms** against a 5.0 goal |
 
 ---
 
@@ -2142,3 +2144,65 @@ would have saved an iteration.
     expected host launch to have its correlation-ID GPU activity. A generic
     collection warning is neither proof of loss in that selected set nor proof
     that the set is complete.
+
+---
+
+## 36. Renderer 2 — scope-level tile-binned shading — REFUTED at design
+
+2026-08-31. Branch `redesign/tilewalk` (kept), documents
+`notes/RENDERER2_{DESIGN,STATE_SURVEY,M0_RESULTS,M1_DESIGN,M1_FANOUT,M1_RUNS,M1_WALKBENCH,VERDICT}.md`.
+This is the renderer-level rewrite the iteration campaign was exhausted
+against: bin a render scope's post-clip triangles into 16 px tiles once, then
+walk each tile front-to-back with per-tile occlusion, replacing the per-batch
+raster/compact/writeback chain.
+
+**Reached M1 and stopped there, on arithmetic, before writing a kernel.**
+
+**The walk itself passes, decisively.** A standalone benchmark
+(`tests/cp_tilewalk_bench.cu`, one thread per reference, shared `uint64[256]`
+visbuf, depth-ceiling early-out) measures **26.5 cycles per reference**
+conservative and **7.8** with the early-out, against entry 24's **3,409** —
+129x and 434x. Inverting entry 24's one-block-per-reference barrier design is
+the fix, and the early-out is bit-identical over 921,600 resolved pixels.
+**Keep this result**; it is the only published cost for this shape on sm_120.
+
+**Three terms kill it anyway.** Displaced pool 1.4623 ms/frame (RTX heavy
+band, per-kernel union-exclusive), less walk 0.092–0.255, less bin pass ~0.13,
+less the **measured** fan-out surrender 0.66–0.84
+(`CUDAVK_NO_OPAQUE_STREAMS=1`, three-round alternating A/B, both captures):
+
+| scoping | best | worst | midpoint |
+|---|---:|---:|---:|
+| full design | 0.580 | 0.237 | **0.409** |
+| opaque-only first slice | 0.267 | −0.076 | **0.096** |
+| walk entirely free | 0.672 | 0.492 | 0.582 |
+
+The gate is 0.500. **A free walk still only reaches 0.582** — the walk was
+never the binding term; the surrender and the undisplaced pools are.
+
+**And the upper bound is above the goal.** favorite3 is 6.676 with a 1.676
+gap to 5.0. Best conceivable net (0.710) lands at **5.966**; removing the
+*entire* displaced pool at zero cost and surrendering nothing — impossible —
+lands at **5.214**. Tile binning does not contain the goal, because the pools
+it displaces are not where the time is. The time is generated VS 0.689,
+generated FS 0.678, `cp_clip_rast_fused` 0.592 and memcpy 0.490: vertex and
+fragment arithmetic plus copies, which a different scheduler does not shrink.
+
+**It also reproduces entry 24's signature.** On a realistic scope grid the
+hottest tile's block is 346,128 of ~362,000 kernel cycles — **one block is 94%
+of the grid's duration**, average SM busy 13.9%. So a tiled walk does *not*
+hand back the concurrency it takes from the opaque fan-out; splitting hot
+tiles across blocks with a merge is the known fix and was deliberately not
+built, because entry 24's retry clause requires the ceiling to exceed the
+surrender first, and it does not.
+
+**Retry if.** The undisplaced pools shrink (a workload whose cost is raster
+rather than shading), *or* the fan-out stops being worth 0.66–0.84, *and* hot
+tiles are split across blocks. Not before all three.
+
+**Two by-products worth keeping.** The per-scope tile census, run
+segmentation and cut counters are now real — all three were structurally dead
+(`cp_tile_census_end_pass` and `cp_tile_census_cut` had no callers, so every
+number the old census printed was zero). And `cp_tri_setup` at 80 B straddles
+32 B sectors; padding it to 96 B removes about a third of the walk's read
+traffic, unrelated to this verdict.
