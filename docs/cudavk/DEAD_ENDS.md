@@ -2255,6 +2255,16 @@ run — a deliberate ping-pong probe that showed migration under 2026.4.1. But
 the path that loses the data. A positive control must reproduce the measured
 workload's *exit behaviour*, not just its activity class.
 
+**Root cause found and fixed, 2026-09-02.** The harness's SIGSEGV was a
+use-after-free in `favorite3.cpp`: it called `vkDeviceWaitIdle` on a device
+`src/frame_0000_2908.cpp` had already destroyed, under a comment asserting the
+capture never destroys it. With that call removed the harness exits 0, and a
+full-length trace with no `--duration` now records **169,040 UVM rows and
+3.9 GB of migration** — so the earlier 99,999 figures were partial flushes,
+not a record cap, and the true migration volume is larger than either. The
+harness fix also restored 23 lines of stdout and 8 shim timestamps that every
+previous run had discarded (WORKFLOW 3.1).
+
 **Then the premise collapsed (WRONG — see the correction above).** The two hosts had been traced with different
 Nsight Systems builds — B200 2026.1.3, RTX 2026.4.1. Installing the *identical*
 2026.4.1 package on the B200 (md5-verified) and re-tracing the same replay with

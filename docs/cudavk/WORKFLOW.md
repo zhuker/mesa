@@ -195,9 +195,9 @@ replay floor of its own that sits on top of whatever the driver does.
 |---|---|---|
 | harness | `~/favorite3-cpp/out` | `~/favorite2-cpp/out` |
 | binary | `./build/vulkan_app`, run from that directory | same |
-| complete shim rows | **6,939** | **6,965** |
-| expected exit code | **139** — SIGSEGV *after* complete output, benign | **0** |
-| stdout SHA-256 | `e3f24a1dcdc8568be217d249e480623958e2621b3d4f056ae4c44ad20d08da49` | `0240ff4ec576c62b49461a384d90e0c25463f69ecdaf1b2286e92d14264d947e` |
+| complete shim rows | **6,947** | **6,965** |
+| expected exit code | **0** | **0** |
+| stdout SHA-256 | `e4a60a7156141649a4c16660f674025af7b9fc3fe2702f4f57845527075d058d` | `0240ff4ec576c62b49461a384d90e0c25463f69ecdaf1b2286e92d14264d947e` |
 | real work starts | frame 1391 = submit 2782 | frame 1388 = submit 2776 |
 | heavy band | frames ~2200-3150 | frames 2735 to the end |
 
@@ -230,10 +230,22 @@ stdout hash matches, the row count matches, and the sentinels are byte-equal to
 the control set. A replay that dies early produces a fast, meaningless median —
 this has happened and looked like an 8 ms win (4.4).
 
-**The shim's torn tail is expected on favorite3.** The process dies during
-teardown, so the last line can be a bare number with no newline. Accept exactly
-one such fragment at end of file and reject anything else; do not "fix" it by
-trimming blindly, because a genuinely truncated run must still fail.
+**A torn tail is now a failure, not an expectation.** Until 2026-09-02 the
+favorite3 harness ended in SIGSEGV: `favorite3.cpp` called `vkDeviceWaitIdle`
+on a device that `src/frame_0000_2908.cpp` had already destroyed, on the false
+premise that the capture never destroys it. That fault discarded whatever was
+still buffered — **23 lines of stdout, its last line cut mid-word, and 8 shim
+timestamps** — so the gates this project used for months (`rc=139`, 6,939 rows,
+"tolerate one torn numeric fragment") were all describing truncated output. It
+also dropped the final CUPTI activity buffer, which is how an entire activity
+class read as zero and put a wrong conclusion into DEAD_ENDS 37.
+
+The offending call is removed. favorite3 now exits **0** with **6,947** rows
+and a newline-terminated file, verified identical over three runs, with all 18
+sentinels bit-identical to the pre-fix control — the rendering never changed,
+only what survived the exit. **Any torn tail or non-zero exit now means a real
+failure.** favorite2's equivalent teardown patch is legitimate (no frame there
+destroys the device) and is unchanged.
 
 ### 3.2 Sentinels: what actually proves the image
 
