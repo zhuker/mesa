@@ -141,7 +141,14 @@ replay is **3,022 submits** and a Crossroads replay is **2,994**
 commits, 3.06 ms, no work removed by either.
 
 `docs/cudavk/GFXRECONSTRUCT.md` is how a capture is taken, read and turned
-into frames. To replay one:
+into frames.
+
+**The `gfxrecon-replay` path below is the older method.** It still works and is
+how the two captures in the table above were measured, but every number taken
+since is from the compiled harnesses in 3.1, which do not carry a replayer's
+own floor. Read 3.1 before measuring anything today.
+
+To replay one through gfxrecon:
 
 ```bash
 GFX=~/gfxreconstruct/build
