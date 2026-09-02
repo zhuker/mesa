@@ -174,6 +174,10 @@ static const struct cp_flag_def flags[] = {
      "its six faces from where the sampler will look; syncs" },
 
    /* ---- subsystem switches ---- */
+   { "CUDAVK_NO_APPEND_PREFILTER", CP_FLAG_BOOL_VALUE, F(no_append_prefilter),
+     "let a blended batch enter a pass episode even when the A-buffer arm is "
+     "certain to refuse it, so its vertex work runs on a side stream and is "
+     "then repeated on the main stream, as it did before the prefilter" },
    { "CUDAVK_NO_HOST_PIN_READBACK", CP_FLAG_BOOL_VALUE, F(no_host_pin_readback),
      "do not advise transfer-dst-only managed buffer ranges host-resident; "
      "the per-frame readback copy goes back to migrating its pages" },

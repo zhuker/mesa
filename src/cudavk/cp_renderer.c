@@ -7448,6 +7448,52 @@ cp_pass_appendable(struct cp_context *cp,
    if (cp->pass.nsegs >= CP_PASS_MAX_SEGS ||
        cp->pass.next_prim >= CP_PRIM_ID_LIMIT)
       return false;
+
+   /*
+    * Refuse here what the A-buffer arm would refuse after the vertex work.
+    *
+    * cp_draw_execute_batch() decides A-buffer eligibility only once it has
+    * the post-clip triangle count, and an append that is refused there has
+    * already run its vertex fetch, vertex shader and clip on a side stream.
+    * cp_pass_append() then joins every side stream, closes the episode and
+    * re-executes the whole batch on the main stream, so that geometry work
+    * is done twice and the main stream waits through the first copy of it.
+    * The comment at that site calls the case rare; on favorite3 it fires
+    * about nine times a frame -- every cp_clip_triangles launch in a
+    * post-pin heavy-band trace, 9,400 of them, is on a side stream with a
+    * matching main-stream re-execution behind it.
+    *
+    * Every input to that decision except the triangle count is known here,
+    * before anything is issued. The triangle-count floor is deliberately not
+    * reproduced: cp_pass_append() already applies it from the pre-clip count
+    * and it defaults off.
+    *
+    * A refusal lands the batch at cp_pass_finish() + cp_draw_execute_batch()
+    * on the main stream -- exactly where the back-out puts it, minus the
+    * duplicated geometry and the join.
+    */
+   if (!cp_debug->no_append_prefilter) {
+      const struct cp_draw_state *st = &batch->state;
+      const struct cp_fb_desc *fb = &batch->scope.fb;
+      const bool color_data = fb->color != NULL;
+      const bool retry = st->fs && st->fs->uses_discard &&
+                         cp->reject && cp->resolved && color_data;
+      /*
+       * writes_memory is refused at the top of this function, so peel's
+       * side-effect arm cannot fire here and the test reduces to the
+       * blended-with-colour case.
+       */
+      const bool peel = !retry && cp->peel_next &&
+                        screen->kernels.peel_advance &&
+                        color_data && st->blend.enable;
+      if (!peel ||
+          MAX2(batch->scope.attachment_samples, 1u) != 1 ||
+          st->depth.depth_writemask ||
+          fb->nr_cbufs != 1 ||
+          fb->color_encoding < 0)
+         return false;
+   }
+
    if (!cp->pass_segs) {
       cp->pass_segs = calloc(CP_PASS_MAX_SEGS, sizeof(*cp->pass_segs));
       if (!cp->pass_segs)
