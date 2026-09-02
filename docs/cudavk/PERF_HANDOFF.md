@@ -12,8 +12,11 @@ window (WORKFLOW.md 4.0), all defaults, clean environment:
 
 | capture | RTX 5090 (sm_120) | B200 (sm_100) |
 |---|---:|---:|
-| favorite3 | **6.676** | **10.79** |
-| favorite2 | **5.480** | **8.97** |
+| favorite3 | **6.447** | 10.79 (pre-lead-A) |
+| favorite2 | **5.233** | 8.97 (pre-lead-A) |
+
+The RTX figures include the 2026-09-02 append prefilter (-0.24 on both
+captures). The B200 has not been re-measured since; its host was unreachable.
 
 Reference points: llvmpipe from this tree, release build, is 46.40 / 39.72 on
 the same two captures — cudavk is **6.9x / 7.2x** faster. Rendering is
