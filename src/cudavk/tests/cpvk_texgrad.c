@@ -7,7 +7,7 @@
  *
  *    lambda = log2(max(|dPdx * size|, |dPdy * size|))
  *
- * Every normal-mapped surface shader in the Roblox capture samples that way,
+ * Every normal-mapped surface shader in the capture samples that way,
  * and cudavk did not implement it: `nir_texop_txd` was not in emit_tex()'s
  * supported set in `cp_nir_to_llvm.c`, so every textureGrad() in every shader
  * returned the placeholder constant (0, 0, 0, 1) -- silently, with no warning

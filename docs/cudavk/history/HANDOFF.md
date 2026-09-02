@@ -13,7 +13,7 @@
 > `../PERFORMANCE.md`, `../DEAD_ENDS.md`. What the old driver could do that the
 > new one cannot is in `../GALLIUM_RETIREMENT.md`.
 
-# cudapipe — CUDA Software Rasterizer for Roblox
+# cudapipe — CUDA Software Rasterizer
 
 ## What This Is
 
@@ -21,7 +21,7 @@ A Mesa Vulkan ICD (`libvulkan_cudapipe.so`) that rasterizes on NVIDIA GPUs using
 CUDA compute kernels instead of fixed-function hardware. It reuses lavapipe as
 the Vulkan frontend and replaces the Gallium driver underneath.
 
-The feature set is driven by what Roblox's HeadlessStreamer actually requires,
+The feature set is driven by what the HeadlessStreamer capture actually requires,
 measured from a GFXReconstruct capture — see
 `src/gallium/drivers/cudapipe/tests/headless_streamer_requirements.txt`.
 

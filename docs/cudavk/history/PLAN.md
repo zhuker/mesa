@@ -2,12 +2,12 @@
 
 ## Context
 
-A GPU without fixed-function rasterization hardware needs to render Roblox games via Vulkan. We create a new Mesa Vulkan ICD (`libvulkan_cudapipe.so`) that performs rasterization in CUDA compute kernels, inspired by CuRast's visibility-buffer approach. Only Vulkan is targeted (no GL). The Roblox engine requires Vulkan 1.0, vertex+fragment+compute stages, 32 textures, 4 MRTs, dynamic UBOs, storage buffers/images, and compute shaders for light culling.
+A GPU without fixed-function rasterization hardware needs to render game content via Vulkan. We create a new Mesa Vulkan ICD (`libvulkan_cudapipe.so`) that performs rasterization in CUDA compute kernels, inspired by CuRast's visibility-buffer approach. Only Vulkan is targeted (no GL). The target engine requires Vulkan 1.0, vertex+fragment+compute stages, 32 textures, 4 MRTs, dynamic UBOs, storage buffers/images, and compute shaders for light culling.
 
 ## Architecture
 
 ```
-Roblox (SPIR-V shaders, Vulkan 1.0)
+The target application (SPIR-V shaders, Vulkan 1.0)
     │
     ▼
 Lavapipe Frontend (reused as-is)
@@ -52,7 +52,7 @@ NVIDIA GPU (compute-only)
 - Simplifies initial implementation; can migrate to explicit copies later for perf
 
 ### 4. Synchronization: one CUstream, CUevent for fences
-- Single stream per Vulkan queue (Roblox uses one queue family)
+- Single stream per Vulkan queue (the application uses one queue family)
 - `pipe_fence_handle` wraps CUevent; `fence_finish` calls `cuEventSynchronize`
 - Pipeline barriers within a stream are no-ops (CUDA stream is ordered)
 
@@ -129,10 +129,10 @@ Reference files:
 - Clear/load/store ops, CUevent fences, image blit kernel (mipmap gen)
 - **Milestone**: dEQP-VK.renderpass.* pass
 
-### Phase 7: Roblox validation
+### Phase 7: application validation
 - Indexed draws (uint16/uint32), 4 MRTs, depth formats, dynamic viewport/scissor
 - Compare output against lavapipe reference
-- **Milestone**: Roblox client renders a game scene
+- **Milestone**: the client renders a game scene
 
 ## Target Configuration
 
@@ -141,7 +141,7 @@ Reference files:
 - **CUDA**: 12+ — nvJitLink available for cross-module LTO between shaders and rasterizer kernels
 - **PTX target**: `sm_75` minimum, compile with `-arch=sm_75` for broadest Turing+ compatibility
 
-Headless simplifies Phase 0 significantly: no WSI, no surface extensions, no pipe_loader winsys. The lavapipe frontend's headless path (used by RCC/Thumbnailer in Roblox) already supports `VK_NULL_HANDLE` surface.
+Headless simplifies Phase 0 significantly: no WSI, no surface extensions, no pipe_loader winsys. The lavapipe frontend's headless path (used by the headless services) already supports `VK_NULL_HANDLE` surface.
 
 ## External Dependencies
 
@@ -184,7 +184,7 @@ Additional tools:
 - **Piglit** — simpler/faster Mesa tests
 - **Trace replay** — `traces-lavapipe.toml` pattern for frame comparison
 - **Validation layers** — always run with `VK_LAYER_KHRONOS_validation`
-- Roblox only needed for final Phase 7 integration
+- the target application only needed for final Phase 7 integration
 
 ## Risks
 

@@ -32,7 +32,7 @@ Large triangles serialize the entire GPU.
 Threshold: bounding box ≤ `SMALL_THRESHOLD` pixels (e.g., 64 or 128).
 
 Keeps the current approach — it's already optimal for small triangles (which
-are the majority in the Roblox workload). Additions:
+are the majority in this workload). Additions:
 
 - **Precompute edge function gradients** once per triangle:
   ```
