@@ -1,3 +1,18 @@
+> **HISTORICAL — describes the retired Gallium-hosted driver.**
+>
+> This document is from 2026-08-24 and describes `libvulkan_cudapipe.so` in
+> `src/gallium/drivers/cudapipe/`, which no longer exists: that driver was
+> replaced by the native ICD in `src/cudavk` and removed. Its build command,
+> file paths and flag names are all wrong for the current tree. It is kept
+> because the reasoning and measurements behind the Gallium-era decisions are
+> still the record of how the driver got its shape.
+>
+> For the current driver read, in order:
+> `../GETTING_STARTED.md` (build, install, run), `../../../CUDAVK.md` (index),
+> `../PERF_HANDOFF.md` (where performance stands and what is closed),
+> `../PERFORMANCE.md`, `../DEAD_ENDS.md`. What the old driver could do that the
+> new one cannot is in `../GALLIUM_RETIREMENT.md`.
+
 # cudapipe — CUDA Software Rasterizer for Roblox
 
 ## What This Is
