@@ -317,7 +317,15 @@ was written against that phantom before the versions were aligned.
 So: install the same package on every host being compared, verify it by
 checksum, and before believing any activity class is absent or present, run a
 positive control that provokes it (a deliberate managed ping-pong for UVM, and
-so on). The B200 also needs at least three alternating rounds per arm, because
+so on).
+
+**And make the control exit the way the workload exits.** The control run here
+was a clean-exiting probe while every harness run dies by SIGSEGV in teardown,
+which drops the final CUPTI buffer — so an entire activity class read as zero
+and a wrong conclusion was committed (entry 37's correction). When the workload
+crashes, either end collection early with `--duration` or reproduce the crash
+in the control. Treat a count of exactly **99,999** as a record cap rather than
+a measurement: it appears in traces from both nsys builds. The B200 also needs at least three alternating rounds per arm, because
 its session drift reaches 1.3 ms/frame against the RTX's 0.06.
 
 ### 4.1 A frame is the interval between every *other* submit

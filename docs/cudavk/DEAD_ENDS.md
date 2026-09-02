@@ -1108,8 +1108,8 @@ exactly as written: `diag/wide-merge2` commit `61c8586b9a1` distributes
 width-2 merged chunks across the existing side streams (width bounded by the
 queue-set aliasing, so 4 concurrent chains against the loop's measured 2.19×),
 reuses the original merged device bodies, and passes all static gates with the
-flag off byte-identical. On B200 — where the launch price is higher and the
-SM array twice as wide — the screened medians were: default band
+flag off byte-identical. On B200 — where the launch price is higher (and the
+SM array is in fact *narrower*: 148 against the RTX 5090's 170) — the screened medians were: default band
 10.81–11.14 ms, `CUDAVK_NO_ABUF_APPEND=1` alone 10.86, plus
 `CUDAVK_WIDE_MERGE2=1` 11.01. No arm left the session noise band, matching
 entry 22's arithmetic (launch credit scaled by the kept overlap bounds the
@@ -2234,7 +2234,28 @@ standard hashes, sentinels clean:
 
 It is slower on both, so the mechanism is refuted on its own terms.
 
-**Then the premise collapsed.** The two hosts had been traced with different
+**CORRECTION, 2026-09-02: the premise-collapse below is itself wrong.** The
+"zero UVM rows under 2026.4.1" was a **dropped CUPTI buffer**, not an absence.
+Every harness run exits by SIGSEGV during teardown, and the final activity
+buffer is never flushed. Re-run with `--duration` ending *before* the crash,
+same 2026.4.1 build, same RTX: **99,999 UVM rows, 1,338 MB host-to-device and
+1,180 MB device-to-host.** The figure 99,999 is a record cap and appears again
+in the B200 2026.1.3 trace, whose four cause buckets sum to exactly 99,999 —
+so both traces were truncated and every migration volume quoted here is a
+**floor**, not a measurement.
+
+**Unified-memory migration is therefore real on both GPUs**, and the paragraph
+below is retained only to show how the wrong conclusion was reached. What does
+*not* change: the mechanism stays refuted, because it was refuted by frame-time
+A/B (+1.98 ms/frame RTX, +0.36 B200), which no profiler touches.
+
+The flaw was in the positive control. WORKFLOW 4.05 required one, and one was
+run — a deliberate ping-pong probe that showed migration under 2026.4.1. But
+**that probe exits cleanly and the harness does not**, so it never exercised
+the path that loses the data. A positive control must reproduce the measured
+workload's *exit behaviour*, not just its activity class.
+
+**Then the premise collapsed (WRONG — see the correction above).** The two hosts had been traced with different
 Nsight Systems builds — B200 2026.1.3, RTX 2026.4.1. Installing the *identical*
 2026.4.1 package on the B200 (md5-verified) and re-tracing the same replay with
 the same flags reports **zero UVM rows**, exactly like the RTX. A deliberate
