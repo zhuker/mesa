@@ -93,6 +93,7 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 35 | Exact within-batch post-transform vertex reuse | 2026-08-31, favorite3 | REFUTED | generous weighted union-exclusive upper is only **0.438 ms/frame** |
 | 36 | Renderer 2: scope-level tile-binned shading | 2026-08-31, both captures | REFUTED at design | walk is **129x** cheaper than entry 24, yet the ceiling is **0.409 ms/frame** and the impossible upper bound still lands at **5.21 ms** against a 5.0 goal |
 | 37 | Host-visible memory residency advice (the B200 "page ping-pong") | 2026-09-01, both GPUs | REFUTED, **and its premise was a profiler artefact** | the migration it targeted exists only under nsys 2026.1.3; the advice costs +1.98 ms/frame on RTX and +0.36 on B200 |
+| 38 | More pass side streams than 8 (16 and 32 lanes) | 2026-09-01, both captures | MEASURED, **declined on cost** | real but small: favorite2 -0.084 ms/frame at 16 lanes, favorite3 neutral, for **+153 MB** of device memory |
 
 ---
 
@@ -2258,3 +2259,58 @@ report migration (640 MB / 624 MB), so the newer tool is not blind to it there.
 **Retry if.** Never in this form. If a future trace shows UVM migration during
 a replay, reproduce it under two profiler builds with a positive control
 before designing anything against it.
+
+---
+
+## 38. More pass side streams than 8 — MEASURED, and declined on cost
+
+2026-09-01. Both captures, RTX 5090, three alternating rounds per arm, every
+run with its standard stdout hash, full timestamp population and 18/18
+sentinels. Experiment branch `exp/streams16` (deleted; the change is one line).
+
+**Tried.** `CP_PASS_STREAMS` has been a hard-coded 8 since the fan-out was
+built, with no flag and no record of it ever being tuned. It was raised to 16
+and 32 and measured.
+
+**Promising because.** The fan-out is load-bearing — surrendering it costs
+0.66-0.84 ms/frame (entry 36) — and the ncu counters taken the same day show
+these kernels occupy **3-25% occupancy at 0.5-12% of peak SM throughput** on
+both sm_120 and sm_100. The device plainly has room for more concurrent lanes.
+
+**Measured**, favorite2 (the capture that showed signal), whole window and
+heavy band:
+
+| lanes | whole | heavy | vs 8 |
+|---|---:|---:|---|
+| 8 | 5.5021 | 6.0552 | — |
+| 16 | 5.4178 | 5.9319 | **-0.084 / -0.123**, arms disjoint |
+| 32 | 5.4104 | 5.9132 | -0.092 / -0.142, arms disjoint |
+
+Reproduced in a second independent session (-0.062 whole). On favorite3 the
+same change measured -0.029 with **overlapping arms**, so neutral rather than
+positive. The knee is at 16: doubling again buys 0.007 ms more.
+
+**The cost, and why it was declined.** Every lane owns its own rasterizer
+queue set — `nontrivial` 4 MB + `huge_tiles` 16 MB + `counts` + an 86 KB setup
+cache = **19.2 MB per lane**. 8 lanes cost 153 MB; 16 cost 306; 32 cost 613.
+So the price of -0.084 ms/frame on one capture is **+153 MB of device memory**,
+and -0.092 costs +460 MB.
+
+That gain is below this project's 0.500 ms/frame admission gate by 6x, and
+below every default already in `PERFORMANCE.md` §1 — the smallest of those is
++0.0907 ms on its weaker capture, and it costs no memory at all. A 1.5%
+median on one capture is not worth a fifth of a gigabyte on a GPU where the
+A-buffer already grows into the same budget. **Kept at 8.**
+
+**Retry if.** Device memory stops being scarce *and* the workload carries more
+concurrent segments per episode than these captures do (entry 24 records the
+fan-out's value swinging 2.73 ms to 0.076 ms across captures on exactly that
+property), *or* the per-lane queue sets are made to share their large
+allocations so extra lanes are close to free — that last one changes the trade
+rather than the measurement, and is the only version worth building.
+
+**Method note.** The 8-lane constant had never been tuned, and nothing in the
+tree said so. When a hard-coded constant sits in a load-bearing mechanism,
+measure it once and write the number down even when the answer is "leave it" —
+this entry exists so the next person spends ten minutes reading instead of an
+afternoon rebuilding.
