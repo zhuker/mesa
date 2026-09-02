@@ -176,6 +176,104 @@ index. The built `.so` lives outside the repo today
 (`~/claude-scratchpad/perf16/fps_plugin.so`); building it from the tree as part
 of the test target would be an improvement.
 
+### 3.1 The compiled harnesses — how every current number is taken
+
+The two captures above are replayed through `gfxrecon-replay`. **Everything
+measured since is not**: `favorite3` and `favorite2` are the same captures
+compiled to C++ by gfxreconstruct's `tocpp` path and built into standalone
+binaries. They are the timing oracle, because `gfxrecon-replay` imposes a
+replay floor of its own that sits on top of whatever the driver does.
+
+| | favorite3 | favorite2 |
+|---|---|---|
+| harness | `~/favorite3-cpp/out` | `~/favorite2-cpp/out` |
+| binary | `./build/vulkan_app`, run from that directory | same |
+| complete shim rows | **6,939** | **6,965** |
+| expected exit code | **139** — SIGSEGV *after* complete output, benign | **0** |
+| stdout SHA-256 | `e3f24a1dcdc8568be217d249e480623958e2621b3d4f056ae4c44ad20d08da49` | `0240ff4ec576c62b49461a384d90e0c25463f69ecdaf1b2286e92d14264d947e` |
+| real work starts | frame 1391 = submit 2782 | frame 1388 = submit 2776 |
+| heavy band | frames ~2200-3150 | frames 2735 to the end |
+
+Absolute frame *N* is submit index *2N* (4.1). The stdout hash is **replay
+warnings, not rendered pixels** — it is identical between an RTX 5090 and a
+B200 and between cudavk and a different driver would differ only in memory-type
+remapping. It proves the replay took the same path; it does not prove the
+image. The sentinel dumps below are what prove the image.
+
+**One run, with every gate:**
+
+```bash
+exec 9>/tmp/cudavk-gpu.lock && flock 9          # the GPU must be exclusively ours (4.11)
+nvidia-smi --query-compute-apps=pid --format=csv,noheader   # must be empty
+
+cd ~/favorite3-cpp/out
+env DUMP_DIR=/tmp/run1 DUMP_EVERY=200 DUMP_MAX=20 \
+    LD_PRELOAD=$HOME/favorite-cpp/submit_shim.so SUBMIT_TS_FILE=/tmp/run1/ts.txt \
+    VK_DRIVER_FILES=$PWD/../../mesa/build-cudavk/src/cudavk/cudavk_devenv_icd.x86_64.json \
+    timeout 4000 ./build/vulkan_app > /tmp/run1/stdout 2> /tmp/run1/stderr
+echo "rc=$?  hash=$(sha256sum /tmp/run1/stdout | cut -c1-16)  rows=$(wc -l < /tmp/run1/ts.txt)"
+```
+
+`submit_shim.so` interposes `vkQueueSubmit` and writes one `<ns> <index>` line
+per submit to `SUBMIT_TS_FILE`. `DUMP_EVERY=200 DUMP_MAX=20` writes 18
+`frame_*.bin` sentinel images.
+
+**A run is invalid unless all four hold**: the exit code matches the table, the
+stdout hash matches, the row count matches, and the sentinels are byte-equal to
+the control set. A replay that dies early produces a fast, meaningless median —
+this has happened and looked like an 8 ms win (4.4).
+
+**The shim's torn tail is expected on favorite3.** The process dies during
+teardown, so the last line can be a bare number with no newline. Accept exactly
+one such fragment at end of file and reject anything else; do not "fix" it by
+trimming blindly, because a genuinely truncated run must still fail.
+
+### 3.2 Sentinels: what actually proves the image
+
+The 18 dumped frames are compared byte-for-byte against a control set produced
+by a known-good build. **The controls live outside the repo and outside `/tmp`
+persistence guarantees**, so they are regenerated, not archived:
+
+```bash
+# controls = the same 18 frames from the build you are comparing against
+cmp <(sha256sum ctrl/frame_*.bin | awk '{print $1}') \
+    <(sha256sum cand/frame_*.bin | awk '{print $1}')
+```
+
+**Regenerate the control whenever the driver's output legitimately changes, and
+date it.** A stale control set cost real time here: favorite2's stored controls
+disagreed with the current driver on 9 of 18 frames, which read as a B200
+rendering defect until the same comparison was run on the RTX and failed
+identically. The rule that follows: **before believing a sentinel failure,
+reproduce it on a second host or against a freshly generated control.**
+
+### 3.3 The A/B recipe
+
+```
+for round in 1 2 3:  control run, then candidate run     # one session, alternating
+```
+
+Three rounds per arm, both arms in one session, medians taken per run and then
+a median of those. **Accept only if the arms are disjoint** — the slowest run
+of the better arm still beats the fastest run of the worse one. The RTX drifts
+about 0.06 ms/frame between sessions; **the B200 drifts 0.3-1.3**, which is why
+three rounds is a floor there and a two-run probe on that host is worth nothing
+(a probe read -0.65 ms and the controlled A/B reversed its sign — dead end 37).
+
+Per-run medians, with each capture on its own window:
+
+```python
+rows = [l.split() for l in open(ts).read().splitlines() if len(l.split()) == 2]
+ts_ns = [int(r[0]) for r in rows]
+lo = 1391 * 2          # favorite3; favorite2 is 1388 * 2
+d  = [(ts_ns[i+2] - ts_ns[i]) / 1e6 for i in range(lo, len(ts_ns) - 2, 2)]
+median(d)              # the headline number
+```
+
+For a band, stop at the band's last frame instead of the end. Quote the
+whole-window median as the headline and name the band explicitly whenever a
+band median is used (4.0).
+
 ---
 
 ## 4. Measurement conventions
