@@ -964,7 +964,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 cpvk_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_plan_batches(cmd);
    return vk_command_buffer_end(&cmd->vk);
 }
@@ -976,7 +976,7 @@ cpvk_CmdBindPipeline(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_pipeline, pipeline, _pipeline);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!cpvk_cmd_retain_pipeline(cmd, pipeline)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -1181,7 +1181,7 @@ cpvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
                      uint32_t groupCountZ)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!cmd->compute_pipeline)
       return;
@@ -1597,7 +1597,7 @@ cpvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                        const VkRenderingInfo *pRenderingInfo)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (cp_debug->debug_rt)
       fprintf(stderr, "scope-begin:\n");
@@ -1985,7 +1985,7 @@ cpvk_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
                            const VkDeviceSize *pStrides)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    for (uint32_t i = 0; i < bindingCount; i++) {
       unsigned b = firstBinding + i;
@@ -2003,7 +2003,7 @@ cpvk_CmdPushConstants2(VkCommandBuffer commandBuffer,
                        const VkPushConstantsInfo *pInfo)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (pInfo->offset + pInfo->size > CPVK_MAX_PUSH_BYTES)
       return;
@@ -2043,7 +2043,7 @@ cpvk_CmdBindIndexBuffer2(VkCommandBuffer commandBuffer, VkBuffer _buffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_buffer, buf, _buffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    cmd->index_ptr = (buf && buf->mem)
       ? (const void *)(uintptr_t)(buf->mem->dev_ptr + buf->offset + offset)
@@ -2065,7 +2065,7 @@ cpvk_CmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t count,
                              const VkViewport *pViewports)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!count)
       return;
@@ -2092,7 +2092,7 @@ cpvk_CmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t count,
                             const VkRect2D *pScissors)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!count)
       return;
@@ -2160,7 +2160,7 @@ cpvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
              uint32_t firstInstance)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_draw_cmd(cmd, vertexCount, firstVertex, instanceCount,
                     firstInstance, 0, false);
 }
@@ -2171,7 +2171,7 @@ cpvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
                     int32_t vertexOffset, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_draw_cmd(cmd, indexCount, firstIndex, instanceCount, firstInstance,
                     vertexOffset, true);
 }
@@ -2219,7 +2219,7 @@ cpvk_CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_buffer, buf, buffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_draw_indirect(cmd, buf, offset, drawCount, stride, false);
 }
 
@@ -2230,7 +2230,7 @@ cpvk_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_buffer, buf, buffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_draw_indirect(cmd, buf, offset, drawCount, stride, true);
 }
 
@@ -3071,7 +3071,7 @@ cpvk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_buffer, dst, dstBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!dst || !dst->mem)
       return;
@@ -3161,7 +3161,7 @@ cpvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_buffer, src, pInfo->srcBuffer);
    VK_FROM_HANDLE(cpvk_buffer, dst, pInfo->dstBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!src || !dst || !src->mem || !dst->mem)
       return;
@@ -3303,7 +3303,7 @@ cpvk_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_image, img, image);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!img || !img->mem) {
       cpvk_clear_refuse(cmd, "vkCmdClearColorImage on an image with no memory");
@@ -3352,7 +3352,7 @@ cpvk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage image,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_image, img, image);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!img || !img->mem) {
       cpvk_clear_refuse(cmd,
@@ -3460,7 +3460,7 @@ cpvk_CmdClearAttachments(VkCommandBuffer commandBuffer,
                          uint32_t rectCount, const VkClearRect *pRects)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    /*
     * A secondary command buffer recorded with RENDER_PASS_CONTINUE inherits
@@ -3603,7 +3603,7 @@ cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_image, src, pInfo->srcImage);
    VK_FROM_HANDLE(cpvk_image, dst, pInfo->dstImage);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    for (uint32_t i = 0; i < pInfo->regionCount; i++) {
       const VkImageCopy2 *r = &pInfo->pRegions[i];
@@ -3695,7 +3695,7 @@ cpvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_buffer, buf, pInfo->srcBuffer);
    VK_FROM_HANDLE(cpvk_image, img, pInfo->dstImage);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!buf || !buf->mem)
       return;
@@ -3774,7 +3774,7 @@ cpvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_image, img, pInfo->srcImage);
    VK_FROM_HANDLE(cpvk_buffer, buf, pInfo->dstBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!buf || !buf->mem)
       return;
@@ -3858,7 +3858,7 @@ cpvk_CmdBlitImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_image, src, pInfo->srcImage);
    VK_FROM_HANDLE(cpvk_image, dst, pInfo->dstImage);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    for (uint32_t i = 0; i < pInfo->regionCount; i++) {
       const VkImageBlit2 *r = &pInfo->pRegions[i];
@@ -3953,7 +3953,7 @@ VKAPI_ATTR void VKAPI_CALL
 cpvk_CmdEndRendering(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    /* The colour resolve is ordered before the explicit end marker. */
    if (cmd->resolve_valid) {
@@ -3994,7 +3994,7 @@ cpvk_CmdResolveImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_image, src, pInfo->srcImage);
    VK_FROM_HANDLE(cpvk_image, dst, pInfo->dstImage);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    for (uint32_t i = 0; i < pInfo->regionCount; i++) {
       const VkImageResolve2 *r = &pInfo->pRegions[i];
@@ -4156,7 +4156,7 @@ cpvk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_event, event, _event);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_event(cmd, event, CPVK_OP_EVENT_SET);
 }
 
@@ -4166,7 +4166,7 @@ cpvk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_event, event, _event);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_event(cmd, event, CPVK_OP_EVENT_RESET);
 }
 
@@ -4176,7 +4176,7 @@ cpvk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
                     const VkDependencyInfo *pDependencyInfos)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    for (uint32_t i = 0; i < eventCount; i++) {
       VK_FROM_HANDLE(cpvk_event, event, pEvents[i]);
       cpvk_record_event(cmd, event, CPVK_OP_EVENT_WAIT);
@@ -4189,7 +4189,7 @@ cpvk_CmdSetEvent(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_event, event, _event);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_event(cmd, event, CPVK_OP_EVENT_SET);
 }
 
@@ -4199,7 +4199,7 @@ cpvk_CmdResetEvent(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_event, event, _event);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_event(cmd, event, CPVK_OP_EVENT_RESET);
 }
 
@@ -4216,7 +4216,7 @@ cpvk_CmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount,
                    const VkImageMemoryBarrier *pImageMemoryBarriers)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    for (uint32_t i = 0; i < eventCount; i++) {
       VK_FROM_HANDLE(cpvk_event, event, pEvents[i]);
       cpvk_record_event(cmd, event, CPVK_OP_EVENT_WAIT);
@@ -4236,7 +4236,7 @@ cpvk_CmdPipelineBarrier(VkCommandBuffer commandBuffer,
                         const VkImageMemoryBarrier *pImageMemoryBarriers)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_op_alloc(cmd, CPVK_OP_BARRIER);
 }
 
@@ -4245,7 +4245,7 @@ cpvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                          const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_op_alloc(cmd, CPVK_OP_BARRIER);
 }
 
@@ -4599,7 +4599,7 @@ cpvk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool _pool,
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
    VK_FROM_HANDLE(cpvk_buffer, dst, dstBuffer);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
 
    if (!pool || !dst || !dst->mem || !queryCount)
       return;
@@ -4624,7 +4624,7 @@ cpvk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool _pool,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_query(cmd, pool, firstQuery, queryCount, true);
 }
 
@@ -4635,7 +4635,7 @@ cpvk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_query(cmd, pool, query, 1, false);
 }
 
@@ -4661,7 +4661,7 @@ cpvk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool _pool,
 {
    VK_FROM_HANDLE(cpvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(cpvk_query_pool, pool, _pool);
-   CPVK_CTX_SCOPE(cpvk_cmd_buffer_device(cmd));
+   CPVK_CTX_SCOPE_RECORD(cpvk_cmd_buffer_device(cmd));
    cpvk_record_query(cmd, pool, query, 1, false);
 }
 

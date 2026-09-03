@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-132 switches.
+133 switches.
 
 ## Tracing
 
@@ -153,6 +153,7 @@ deliberately: someone's script sets one of these to 0 today.
 |---|---|---|---|---|
 | `CUDAVK_CTX_SCHED` | enum | `auto` | — | GPU-wait behaviour: auto \| spin \| yield \| blocking; blocking only helps on an idle machine, yield only under CPU contention |
 | `CUDAVK_CTX_CHECK` | bool (presence) | `off` | — | verify every CUDA call runs in this device's context; names the caller that escaped an entry-point scope |
+| `CUDAVK_NO_CTX_SCOPE_TRIM` | bool (value) | `off` | — | push and pop this device's CUDA context in the record-only command entry points again -- the draws, the binds, the barriers, the events and the recorded copies -- none of which reaches a CUDA call, so the pair protects nothing there; set it if CUDAVK_CTX_CHECK starts naming one of them, which means a CUDA call has appeared under a trimmed entry point |
 
 ## Small-allocation arena
 

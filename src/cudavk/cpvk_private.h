@@ -217,6 +217,37 @@ cpvk_ctx_leave(const CUresult *pushed)
       = cuCtxPushCurrent((dev)->cu_ctx)
 
 /*
+ * The same scope for an entry point that only *records* into the command
+ * buffer: no CUDA call is reachable from it, so there is no context to make
+ * current and the push/pop pair costs two driver calls to protect nothing.
+ * A heavy frame records about 900 of them.
+ *
+ * "Reachable" is the whole call graph, not the function body -- the record
+ * paths that do allocate (cpvk_arena_append growing the descriptor arena,
+ * cpvk_execute_dispatch, the deferred-execute path in
+ * cpvk_CmdExecuteCommands, cpvk_CmdUpdateBuffer, cpvk_BeginCommandBuffer)
+ * keep the real scope. CUDAVK_CTX_CHECK stays the proof: its chokepoints sit
+ * at cp_launch, cpvk_arena_append and the allocators, so a CUDA call that
+ * later appears under a trimmed entry point names itself instead of running
+ * in whatever context the application left current. CUDAVK_NO_CTX_SCOPE_TRIM
+ * puts the pair back.
+ *
+ * cpvk_ctx_leave pops only what was pushed, so the not-pushed case is any
+ * non-CUDA_SUCCESS value; CUDA_ERROR_INVALID_CONTEXT is the honest one.
+ */
+static inline CUresult
+cpvk_ctx_push_record(struct cpvk_device *dev)
+{
+   if (!cp_debug->no_ctx_scope_trim)
+      return CUDA_ERROR_INVALID_CONTEXT;
+   return cuCtxPushCurrent(dev->cu_ctx);
+}
+
+#define CPVK_CTX_SCOPE_RECORD(dev)                                            \
+   CUresult _cpvk_ctx_pushed __attribute__((cleanup(cpvk_ctx_leave), unused)) \
+      = cpvk_ctx_push_record(dev)
+
+/*
  * A memory type index picks the allocator, and the three of them are the split
  * session 13 had to negotiate with lavapipe through two new pipe_screen hooks.
  * Here they are simply what the driver does.
