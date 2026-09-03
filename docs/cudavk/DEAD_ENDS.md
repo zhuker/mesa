@@ -94,6 +94,7 @@ in `docs/cudavk/PERFORMANCE.md`.
 | 36 | Renderer 2: scope-level tile-binned shading | 2026-08-31, both captures | REFUTED at design | walk is **129x** cheaper than entry 24, yet the ceiling is **0.409 ms/frame** and the impossible upper bound still lands at **5.21 ms** against a 5.0 goal |
 | 37 | Host-visible memory residency advice (the B200 "page ping-pong") | 2026-09-01, both GPUs | REFUTED, **and its premise was a profiler artefact** | the migration it targeted exists only under nsys 2026.1.3; the advice costs +1.98 ms/frame on RTX and +0.36 on B200 |
 | 38 | More pass side streams than 8 (16 and 32 lanes) | 2026-09-01, both captures | MEASURED, **declined on cost** | real but small: favorite2 -0.084 ms/frame at 16 lanes, favorite3 neutral, for **+153 MB** of device memory |
+| 39 | Hoisting the shade chain's argument blocks above the rasterizer | 2026-09-02, both captures | REFUTED | two copies became one, and the frame got **slower**: +0.085/+0.045 ms/frame, arms disjoint |
 
 ---
 
@@ -2345,3 +2346,68 @@ tree said so. When a hard-coded constant sits in a load-bearing mechanism,
 measure it once and write the number down even when the answer is "leave it" —
 this entry exists so the next person spends ten minutes reading instead of an
 afternoon rebuilding.
+
+---
+
+## 39. Hoisting the shade chain's argument blocks above the rasterizer — REFUTED
+
+2026-09-02. Branch `exp/argblock-hoist` commit `738dd40114f` (kept, not merged).
+Flag `CUDAVK_NO_ARGBLOCK_HOIST`. Proposed as "lead B" of
+`notes/PERF_ANALYSIS_2026-09-02.md` at 0.18-0.30 ms/frame.
+
+**Tried.** Every direct shade chain runs `cp_rasterize_stage3` -> copy ->
+`cp_fs_compact` -> copy -> FS on one stream. Those copies are not explicit
+`cuMemcpy` calls: `cp_upload_end()` leaves a block *owed* and the next
+`cp_launch()` flushes it, so each copy is the following launch paying for a
+block reserved after the previous one. Measured on a post-lead-A trace, 966
+frames: a copy-free dependent link is **0.26 us**, the two copied links are
+**3.55 and 3.65 us**, at 44.0 and 66.4 per frame — about **0.37 ms/frame** of
+link excess. The change reserves and closes both blocks earlier so one flush
+carries them.
+
+**A correction found while building it, worth keeping.** The obvious target —
+reserve immediately above the stage-3 launch so *its* flush carries the bytes —
+is wrong: **stage 3's flush is empty**, so a reservation there creates a copy
+instead of riding one. Two independent facts say so: the copy census has no
+copy class in front of any rasterizer stage, and the measured 0.26 us
+stage2->stage3 link could not be that short if a flush sat in it. The
+implementation therefore hoisted above the *whole rasterizer group*, turning
+two copies into one rather than zero, with a predicted -0.10 to -0.22.
+
+**Measured**, three-round alternating A/B in one session per capture, RTX 5090,
+control = `CUDAVK_NO_ARGBLOCK_HOIST=1`, all runs exiting 0 with their standard
+hashes, full timestamp populations and zero sentinel mismatches:
+
+| arm | favorite3 whole | favorite3 heavy | favorite2 whole | favorite2 heavy |
+|---|---:|---:|---:|---:|
+| hoist | **+0.0848** | +0.1300 | **+0.0446** | +0.0584 |
+| hoist + `CUDAVK_COMPACT_PDL=1` | +0.0315 | +0.0801 | +0.0373 | +0.0336 |
+
+Arms disjoint in the wrong direction on both captures. The PDL the hoist
+unlocks recovers about half the loss on favorite3 — consistent with its own
+~0.12 estimate, and the first time `COMPACT_PDL` was measured without
+`INTERP_INLINE` (dead end 26 only measured it on top of that) — but the hoist's
+cost exceeds what the PDL returns.
+
+**Why, and this is inference rather than a traced mechanism** (the confirming
+trace failed to record kernels and was not retaken): the merged copy was moved
+onto the link in front of the whole rasterizer group, which is the batch's
+critical path, and away from two tail links that were already device-paced.
+Fewer copies is not the same as cheaper copies.
+
+**The rule this sharpens.** Entry 22 says a launch-removal credit is only
+collectable where the launches were serial. The same caution applies to
+*relocation*: **moving a device operation pays only if the link it lands on is
+cheaper than the links it leaves, and that has to be measured on the arm that
+moves it.** A link's nominal cost when idle does not predict what it costs
+when a copy is placed in it.
+
+**Retry if.** The remaining half of the original idea is untested and is a
+different change: move the clip's scratch allocations above the *vertex shader*
+launch, where a copy already exists (107/frame, on a link that is host- or
+gate-paced 79% of the time), and prepare the shade blocks there too. Then both
+copies vanish into an existing copy instead of forming a new one. The branch's
+report sizes it at -3.16 us per chain, about -0.21 ms/frame, and notes it moves
+the clip-refusal fallbacks and takes the preparation out of the peel loop — so
+it needs its own flag and its own A/B. **The arithmetic in this entry is not
+evidence for that one**; it is evidence that placement is what decides.
