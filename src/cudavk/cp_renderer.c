@@ -5434,7 +5434,7 @@ cp_vslane_stream(const struct cp_context *cp)
 static bool
 cp_vslane_available(const struct cp_context *cp)
 {
-   return cp_debug->vs_lane && !cp_debug->no_upload_coalesce &&
+   return !cp_debug->no_vs_lane && !cp_debug->no_upload_coalesce &&
           !cp_timing_enabled() && !cp_debug->debug_vfetch;
 }
 
@@ -5606,7 +5606,7 @@ static void cp_draw_execute_batch_inner(struct cp_context *cp,
 void
 cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 {
-   if (!cp_debug->vs_lane) {
+   if (!!cp_debug->no_vs_lane) {
       cp_draw_execute_batch_inner(cp, batch);
       return;
    }

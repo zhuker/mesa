@@ -217,7 +217,7 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_FETCH_FOLD", CP_FLAG_BOOL_VALUE, F(no_fetch_fold),
      "clear the clip and raster queue counters with their own device clears "
      "again instead of seeding them inside cp_vertex_fetch" },
-   { "CUDAVK_VS_LANE", CP_FLAG_BOOL_VALUE, F(vs_lane),
+   { "CUDAVK_NO_VS_LANE", CP_FLAG_BOOL_VALUE, F(no_vs_lane),
      "run a direct batch's fused vertex shader on a side stream, joined "
      "before its clip, so it overlaps the previous batch's shading; the "
      "batch's queue-counter seeding falls back to its own clears" },

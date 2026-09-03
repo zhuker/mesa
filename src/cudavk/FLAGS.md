@@ -65,7 +65,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_NO_UPLOAD_COALESCE` | bool (value) | `off` | — | send one host-to-device copy per upload block again instead of one per launch boundary |
 | `CUDAVK_UPLOAD_FLUSH_FAIL_AT` | uint | `0` | — | fault injection: fail the Nth coalesced upload flush |
 | `CUDAVK_NO_FETCH_FOLD` | bool (value) | `off` | — | clear the clip and raster queue counters with their own device clears again instead of seeding them inside cp_vertex_fetch |
-| `CUDAVK_VS_LANE` | bool (value) | `off` | — | run a direct batch's fused vertex shader on a side stream, joined before its clip, so it overlaps the previous batch's shading; the batch's queue-counter seeding falls back to its own clears |
+| `CUDAVK_NO_VS_LANE` | bool (value) | `off` | — | run a direct batch's fused vertex shader on a side stream, joined before its clip, so it overlaps the previous batch's shading; the batch's queue-counter seeding falls back to its own clears |
 | `CUDAVK_FUSED_VFETCH` | bool (value) | `on` | — | gather vertex attributes inside the vertex shader, from bitcode inlined into it, instead of launching cp_vertex_fetch before it |
 | `CUDAVK_NO_FUSED_VFETCH` | bool (value) | `off` | — | do not even build the fused vertex execution: the resource-isolated control, and the revert once the fusion is the default |
 | `CUDAVK_FS_GRID_WAVES` | uint | `0` | — | size the fragment grid to fill the machine this many times over and let it grid-stride, instead of covering the framebuffer's worst case; 0 keeps the 4096-block cap, which is the only bound either way |
