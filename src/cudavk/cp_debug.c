@@ -228,6 +228,14 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_OPAQUE_STREAMS", CP_FLAG_BOOL_VALUE, F(no_opaque_streams),
      "issue an opaque episode's segments back to back on the main stream "
      "instead of fanning them over the pass side streams" },
+   { "CUDAVK_NO_EPISODE_GATE_ONCE", CP_FLAG_BOOL_VALUE,
+     F(no_episode_gate_once),
+     "record an opaque episode's stream gate once per segment on the main "
+     "stream again, behind segment 0's launches, so no side segment starts "
+     "until segment 0 has finished, instead of recording it once after the "
+     "episode's clears and sending each segment's owed uniform rows on its "
+     "own stream; implied by CUDAVK_NO_UPLOAD_COALESCE, which leaves no owed "
+     "span to send" },
    { "CUDAVK_NO_PDL", CP_FLAG_BOOL_VALUE, F(no_pdl),
      "issue every kernel with an ordinary launch again, so that no dependent "
      "kernel starts before its predecessor in the same stream has drained; "

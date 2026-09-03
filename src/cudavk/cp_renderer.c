@@ -460,8 +460,16 @@ cp_upload_begin(struct cp_context *cp, size_t size, void **host_out)
  * span of the same length. arena_flushed is tracked alongside rather than
  * recomputed, so the two can never drift silently.
  */
-CUresult
-cp_upload_flush(struct cp_context *cp)
+/*
+ * The owed span, bounded above by `limit` host bytes.
+ *
+ * cp_upload_flush() below is this with no limit, and is what every other site
+ * calls. The bounded form exists for one caller: the opaque episode's segment
+ * switch, which sends part of the span on the stream it is leaving and part on
+ * the one it is entering, and must not guess where the boundary is.
+ */
+static CUresult
+cp_upload_flush_upto(struct cp_context *cp, size_t limit)
 {
    if (cp_debug->no_upload_coalesce)
       return CUDA_SUCCESS;
@@ -469,6 +477,7 @@ cp_upload_flush(struct cp_context *cp)
    /* An open reservation holds the watermark back: its bytes are still being
     * written, and nothing has been launched that could refer to it. */
    size_t hi = MIN2(cp->upload_offset, cp->upload_open_lo);
+   hi = MIN2(hi, limit);
    if (hi <= cp->upload_flushed) {
       cp->upload.empty++;
       return CUDA_SUCCESS;
@@ -501,6 +510,12 @@ cp_upload_flush(struct cp_context *cp)
    cp->upload.flushes++;
    cp->upload.bytes += len;
    return CUDA_SUCCESS;
+}
+
+CUresult
+cp_upload_flush(struct cp_context *cp)
+{
+   return cp_upload_flush_upto(cp, SIZE_MAX);
 }
 
 /* The one place a kernel is launched, and so the one place the owed span has
@@ -625,6 +640,30 @@ cp_stream_set(struct cp_context *cp, CUstream stream)
       return;
    cp_upload_flush(cp);
    cp->stream = stream;
+}
+
+/*
+ * The other way round: switch first, then send the owed span on the stream
+ * being entered.
+ *
+ * cp_stream_set() sends the span on the stream it leaves, which is right when
+ * the bytes belong to work already issued there. It is wrong when the bytes
+ * were reserved *for* the stream being entered and nothing on that stream is
+ * ordered behind the leaving stream -- the copy would then be unordered
+ * against the kernels that read it. Carrying the span across puts the copy in
+ * front of those kernels on their own stream.
+ *
+ * The caller owns the split: whatever in the span is not the entered stream's
+ * has to have been sent already. cp_opaque_append() is the only caller and
+ * cp_upload_flush_upto() is how it does that.
+ */
+static CUresult
+cp_stream_set_carry(struct cp_context *cp, CUstream stream)
+{
+   if (cp->stream == stream)
+      return CUDA_SUCCESS;
+   cp->stream = stream;
+   return cp_upload_flush(cp);
 }
 
 /* Send a block reserved above, once the caller has finished writing it. */
@@ -7670,6 +7709,13 @@ cp_pass_join(struct cp_context *cp, unsigned nsegs)
  * intermittently, and it is not a race between segments — serialising the
  * segments with cuStreamSynchronize() does not fix it, because the unordered
  * pair is a main-stream copy against a side-stream kernel.
+ *
+ * The opaque episode no longer takes this path by default: it records the gate
+ * once and sends the segment's rows on the segment's own stream, which orders
+ * the same pair the other way round. See cp_opaque_append(). This remains the
+ * blended path's gate, the opaque path's revert
+ * (CUDAVK_NO_EPISODE_GATE_ONCE), and what CUDAVK_NO_UPLOAD_COALESCE forces,
+ * because with that flag there is no owed span left to reorder.
  */
 static bool
 cp_pass_gate_stream(struct cp_context *cp, unsigned k)
@@ -9418,12 +9464,52 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
           * the main stream, and the latch makes the lazy call a no-op for
           * every segment.
           *
-          * Both clears land on the main stream ahead of the gate each segment
-          * records for itself below, so no segment can run before them.
+          * Both clears land on the main stream ahead of the gate below, so no
+          * segment can run before them.
           */
          if (!cp->depthbuf_cleared)
             cp_clear_depthbuf(cp, 1.0f);
       }
+
+      /*
+       * The gate, recorded once for the whole episode, here -- behind the two
+       * clears and in front of everything the segments do.
+       *
+       * It used to be recorded per segment, on the main stream, at the moment
+       * the segment was issued. That put it behind segment 0's whole launch
+       * chain as well, because segment 0 stays on the main stream and is
+       * issued first, so no side segment could start until segment 0 had
+       * finished. The main and side streams then never overlap at all.
+       *
+       * What the per-segment record also did, and what has to be replaced
+       * rather than dropped, is cover the segment's own uniform rows: they are
+       * still owed in the upload ring at the switch, and a gate recorded
+       * before them does not order the copy that fills them against the
+       * kernels that read them. cp_pass_gate_stream()'s comment records the
+       * corruption that caused. The switch below sends them on the segment's
+       * own stream instead, in front of its kernels.
+       *
+       * CUDAVK_NO_UPLOAD_COALESCE is excluded because with it there is no owed
+       * span to move: cp_upload_end() issues each block's copy immediately, on
+       * whatever stream is current, which during recording is the main one --
+       * so a gate recorded here would sit in front of those copies with
+       * nothing to reorder them. That flag keeps the per-segment gate.
+       */
+      cp->pass.gate_once = side && !cp_debug->no_episode_gate_once &&
+                           !cp_debug->no_upload_coalesce;
+      cp->pass.gated = 0;
+      if (cp->pass.gate_once) {
+         /* Owed first, then the event: the main stream's readers of anything
+          * reserved before the episode are on the main stream, and recording
+          * the gate behind the copy is what lets the mark below start at a
+          * span that is empty. */
+         if (cp_upload_flush(cp) != CUDA_SUCCESS ||
+             cuEventRecord(cp->pass_gate, cp->stream) != CUDA_SUCCESS) {
+            cp_renderer_texture_fatal(cp);
+            return;
+         }
+      }
+      cp->pass.upload_mark = cp->upload_offset;
    }
 
    unsigned before = cp->pass.nsegs;
@@ -9454,17 +9540,70 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    bool seg_side = side && cp->pass.nsegs > 0;
    if (seg_side) {
       unsigned k = (cp->pass.nsegs - 1) % CP_PASS_STREAMS;
-      /*
-       * The gate is what orders this segment behind the episode's clears and
-       * behind everything else the main stream has issued since the previous
-       * segment — in particular the upload span this segment's own uniform
-       * rows are sitting in, which cp_stream_set() below is about to send on
-       * the main stream. Recorded here rather than once at episode start, for
-       * the reason cp_pass_gate_stream() gives.
-       */
-      if (!cp_pass_gate_stream(cp, k))
-         return;
-      cp_stream_set(cp, cp->seg_streams[k]);
+      if (!cp->pass.gate_once) {
+         /*
+          * The gate is what orders this segment behind the episode's clears
+          * and behind everything else the main stream has issued since the
+          * previous segment — in particular the upload span this segment's own
+          * uniform rows are sitting in, which cp_stream_set() below is about
+          * to send on the main stream. Recorded here rather than once at
+          * episode start, for the reason cp_pass_gate_stream() gives.
+          */
+         if (!cp_pass_gate_stream(cp, k))
+            return;
+         cp_stream_set(cp, cp->seg_streams[k]);
+      } else {
+         /*
+          * The episode recorded its gate once, after the clears, so this
+          * segment is free to run while segment 0 still does. Two things
+          * follow from that, and both are here.
+          *
+          * The wait, once per stream. cuStreamWaitEvent captures the event
+          * where it was recorded, so a second wait on the same stream would
+          * add the same edge again; a segment reusing stream k is already
+          * behind the first one's wait, and behind the earlier segment
+          * itself, which is stream order.
+          *
+          * The owed span, split. Everything reserved at or before the
+          * previous append returned goes out on the main stream, where it was
+          * reserved and where its readers are — that is the shipping
+          * sequence, kept for exactly the bytes this function cannot claim.
+          * What is left was reserved during the recording of this segment's
+          * own draws, which is cpvk_prepare_draw()'s two push blocks per draw
+          * and nothing else, and it rides the segment's own stream in front
+          * of the kernels that read it.
+          *
+          * The mark is fail-safe in one direction. Stale, wrapped or simply
+          * ahead of the truth, it only moves more of the span onto the main
+          * stream, which is the sequence CUDAVK_NO_EPISODE_GATE_ONCE restores.
+          * It can never move a byte reserved before this segment onto a side
+          * stream.
+          */
+         size_t owed = cp->upload_offset > cp->upload_flushed ?
+                       cp->upload_offset - cp->upload_flushed : 0;
+         if (cp_upload_flush_upto(cp, cp->pass.upload_mark) != CUDA_SUCCESS)
+            return;
+         if (!(cp->pass.gated & (1u << k))) {
+            if (cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0) !=
+                CUDA_SUCCESS) {
+               cp_renderer_texture_fatal(cp);
+               return;
+            }
+            cp->pass.gated |= 1u << k;
+         }
+         size_t carried = cp->upload_offset > cp->upload_flushed ?
+                          cp->upload_offset - cp->upload_flushed : 0;
+         if (cp_debug->debug_episode)
+            fprintf(stderr, "gate-once: seg=%u stream=%u owed=%zu "
+                    "main=%zu carried=%zu\n", cp->pass.nsegs, k, owed,
+                    owed - carried, carried);
+         if (cp_stream_set_carry(cp, cp->seg_streams[k]) != CUDA_SUCCESS) {
+            /* The switch happened before the copy that failed, so the context
+             * would be left pointing at a side stream. */
+            cp->stream = saved_stream;
+            return;
+         }
+      }
       cp->cur_qset = cp->seg_qsets[k];
    }
 
@@ -9476,6 +9615,9 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
       cp_stream_set(cp, saved_stream);
       cp->cur_qset = saved_qset;
    }
+   /* The boundary the next segment splits its owed span at: everything
+    * reserved up to here belongs to work already issued. */
+   cp->pass.upload_mark = cp->upload_offset;
 
    if (cp->pass.append_failed || cp->pass.nsegs == before) {
       if (cp_debug->debug_episode)

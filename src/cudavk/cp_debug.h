@@ -209,6 +209,7 @@ struct cp_debug {
    unsigned upload_flush_fail_at;
    bool no_opaque_episode;
    bool no_opaque_streams;
+   bool no_episode_gate_once;
    /*
     * Programmatic dependent launch. `pdl` is a level, not a boolean: 0 off,
     * 1 the A-buffer scan chain, 2 the rasterizer stage links, 3 the fragment

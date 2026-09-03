@@ -21,8 +21,10 @@ DELAY=${DELAY:-5}
 
 [ -x "$PERF" ] || { echo "perf not found: $PERF" >&2; exit 1; }
 command -v "$OFFCPU" >/dev/null || { echo "$OFFCPU not found" >&2; exit 1; }
-sudo -n true 2>/dev/null || {
-    echo "sudo credentials are not cached; run 'sudo -v' first" >&2
+sudo -n true 2>/dev/null || sudo -ln "$OFFCPU" >/dev/null 2>&1 || {
+    echo "cannot run $OFFCPU as root without a password." >&2
+    echo "Either run 'sudo -v' first, or install a NOPASSWD sudoers rule:" >&2
+    echo "  <user> ALL=(root) NOPASSWD: $(command -v "$OFFCPU" || echo "$OFFCPU")" >&2
     exit 1
 }
 

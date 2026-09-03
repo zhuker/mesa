@@ -278,6 +278,25 @@ struct cp_context {
       bool opaque;                  /* shared-visbuf opaque run, not A-buffer */
       unsigned w, h;                /* the episode's framebuffer */
       uint64_t hw_attempt_start;
+      /*
+       * The opaque episode's gate, recorded once after its clears rather than
+       * once per segment (CUDAVK_NO_EPISODE_GATE_ONCE reverts).
+       *
+       * gate_once is latched at episode start, so a segment can never take a
+       * different arm from the one that decided whether pass_gate was
+       * recorded. gated is the set of side streams already waiting on it: the
+       * wait captures the event where it was recorded, so one wait per stream
+       * per episode is all the ordering there is to buy.
+       *
+       * upload_mark is the upload ring's host watermark as of the previous
+       * append -- the boundary between bytes that are some earlier caller's
+       * and bytes that are this segment's uniform rows. See the switch in
+       * cp_opaque_append() for why the split exists and why the mark is
+       * fail-safe in the conservative direction.
+       */
+      bool gate_once;
+      uint32_t gated;
+      size_t upload_mark;
    } pass;
 
    /* A merged shading group's concatenated fs-UBO rows, staged here before
