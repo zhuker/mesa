@@ -26,6 +26,8 @@ LABEL=${2:?label}
 CTRL_ENV=$3
 CAND_ENV=${4:-}
 ROUNDS=${5:-3}
+CTRL_WRAP=${CTRL_WRAP:-}      # command prefix for the control arm, e.g. taskset -c 0-47
+CAND_WRAP=${CAND_WRAP:-}      # ... and for the candidate arm
 MESA=${MESA:-$HOME/mesa}
 # The venv python only exists on the workstation; the B200 workspace has none.
 # Nothing here needs numpy, so fall back to whatever python3 is on PATH rather
@@ -61,15 +63,19 @@ cd "$APP" || exit 1
 echo "capture=$CAP icd=$ICD rounds=$ROUNDS"
 echo "control   : ${CTRL_ENV:-<none>}"
 echo "candidate : ${CAND_ENV:-<defaults>}"
+[ -n "$CTRL_WRAP$CAND_WRAP" ] && echo "wrappers  : c=[${CTRL_WRAP:-none}] n=[${CAND_WRAP:-none}]"
 
 fail=0
 for r in $(seq 1 "$ROUNDS"); do
   for arm in c n; do
     d=$OUT/$arm$r; mkdir -p "$d"
-    case $arm in c) E=$CTRL_ENV;; n) E=$CAND_ENV;; esac
+    case $arm in c) E=$CTRL_ENV; WRAP=$CTRL_WRAP;; n) E=$CAND_ENV; WRAP=$CAND_WRAP;; esac
+    # An arm may differ by how the process is launched, not only by its
+    # environment -- CPU binding is the case this exists for, since the B200's
+    # GPU hangs off one socket of two and the app is allowed on both.
     env $E DUMP_DIR="$d" DUMP_EVERY=200 DUMP_MAX=20 LD_PRELOAD="$SHIM" \
         SUBMIT_TS_FILE="$d/ts.txt" VK_DRIVER_FILES="$ICD" \
-        timeout 6000 ./build/vulkan_app >"$d/stdout" 2>"$d/stderr"
+        $WRAP timeout 6000 ./build/vulkan_app >"$d/stdout" 2>"$d/stderr"
     rc=$?; h=$(sha256sum "$d/stdout" | cut -d' ' -f1); n=$(wc -l < "$d/ts.txt")
     bad=$($PY - "$CTRLFRAMES" "$d" <<'PY'
 import sys, glob, os, hashlib
