@@ -2411,3 +2411,65 @@ report sizes it at -3.16 us per chain, about -0.21 ms/frame, and notes it moves
 the clip-refusal fallbacks and takes the preparation out of the peel loop — so
 it needs its own flag and its own A/B. **The arithmetic in this entry is not
 evidence for that one**; it is evidence that placement is what decides.
+
+## 40. The memory residuals (D, E, K): refuted as a class on a measured ceiling
+
+**What it was.** Three items from the 2026-09-02 analysis, each proposing to
+move a small driver allocation out of managed memory: **D**, the fused vertex
+fetch's `vfetch_vid`/`vfetch_iid` tables out of managed scratch into the pinned
+upload arena (estimated 0.07-0.15 on the heavy band); **E**, `cp->peel_any` and
+the TRANSFER_SRC-only staging buffers pinned host-resident (0.07-0.14); **K**,
+the UBO ring as device memory with a pinned shadow (0.07-0.25).
+
+**Why they are closed together.** They are one population -- unified-memory
+page-fault stall -- and that population was never measured, only estimated per
+item. It is now, and it is smaller than the sum of the estimates.
+
+A page-fault trace of favorite3 (`nsys profile --cuda-um-cpu-page-faults=true
+--cuda-um-gpu-page-faults=true`, 911 real frames):
+
+| | |
+|---|---:|
+| GPU page-fault events | 8,626 |
+| pages migrated | 125,966 (138/frame) |
+| CPU faults on managed pages | 26,307 (29/frame) |
+| **total GPU fault stall** | **0.3735 ms/frame** |
+
+**0.3735 ms/frame is the ceiling for D, E and K put together**, and it is
+generous twice over: it counts every fault's full service time as if none of it
+overlapped other work, and it assumes a perfect fix that eliminates all of it.
+The admission gate for a new mechanism here is 0.500 ms/frame. The whole class
+does not clear it even when all three are built and all three work perfectly.
+
+The distribution makes it worse for these three specifically. The faults land
+in exactly **two** managed regions, and they are not evenly weighted:
+
+| region | span | pages/frame | share |
+|---|---:|---:|---:|
+| 0x70dbdc189000 | 21.46 MB | 124.6 | **90.1%** |
+| 0x70db21800000 | 4.20 MB | 13.7 | 9.9% |
+
+The second region faults **exactly once per frame** (911 events over 911
+frames) across a 4.2 MB span -- one whole-buffer touch per frame, which is the
+shape D and K describe. It is worth **0.037 ms/frame**. The small driver
+allocations these three items target cannot be the 21.5 MB region, so the
+realistic budget for all three is a tenth of a millisecond, not the 0.21-0.54
+the estimates summed to.
+
+**What this does not say.** It does not identify the 21.5 MB region, which owns
+0.336 ms/frame on its own. That is an app-side `vkAllocateMemory` mapped
+managed (`cpvk_device_memory.c:807`), not one of the driver's own scratch
+buffers, and it is the only part of this class that was ever big enough to
+matter. Entry 37 already measured the obvious lever on it -- forcing residency
+-- and it made the frame *slower* (+1.98 ms RTX). A narrower attack on that one
+region is the only version of this idea still worth anyone's time, and it
+belongs to the same conversation as the readback fence, because both are about
+what the application asks for rather than how the driver serves it.
+
+**The rule.** Three items estimated separately summed to more than their shared
+population contains. Estimates that share a mechanism have to be sized against
+that mechanism once, before any of them is built -- which is the same rule
+entry 24 and the renderer2 redesign (36) were closed by, applied earlier and
+for a tenth of the cost. The trace that settled all three took nine minutes and
+was only possible because the harness stopped crashing, which is its own
+argument for fixing the tools first.
