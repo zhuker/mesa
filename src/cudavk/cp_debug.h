@@ -300,6 +300,7 @@ struct cp_debug {
    /* CUDA context. */
    int      ctx_sched;           /* enum cp_ctx_sched */
    bool     ctx_check;
+   bool     no_ctx_scope_trim;
 
    /* Small-allocation arena. */
    int      small_alloc;         /* enum cp_arena_mode */

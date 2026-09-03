@@ -477,6 +477,13 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_CTX_CHECK", CP_FLAG_BOOL_PRESENCE, F(ctx_check),
      "verify every CUDA call runs in this device's context; names the caller "
      "that escaped an entry-point scope" },
+   { "CUDAVK_NO_CTX_SCOPE_TRIM", CP_FLAG_BOOL_VALUE, F(no_ctx_scope_trim),
+     "push and pop this device's CUDA context in the record-only command "
+     "entry points again -- the draws, the binds, the barriers, the events "
+     "and the recorded copies -- none of which reaches a CUDA call, so the "
+     "pair protects nothing there; set it if CUDAVK_CTX_CHECK starts naming "
+     "one of them, which means a CUDA call has appeared under a trimmed "
+     "entry point" },
 
    /* ---- small-allocation arena ---- */
    { "CUDAVK_SMALL_ALLOC", CP_FLAG_ENUM, F(small_alloc),
