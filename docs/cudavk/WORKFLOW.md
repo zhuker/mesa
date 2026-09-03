@@ -268,6 +268,22 @@ reproduce it on a second host or against a freshly generated control.**
 
 ### 3.3 The A/B recipe
 
+`src/cudavk/tests/cp_harness_ab.sh` is this recipe as a script, and using it
+is preferable to retyping the loop:
+
+```bash
+cp_harness_ab.sh favorite3 vslane "CUDAVK_NO_VS_LANE=1"        # control arm's env
+ICD=~/mesa-worktree/build/src/cudavk/cudavk_devenv_icd.x86_64.json   cp_harness_ab.sh favorite2 mychange "CUDAVK_NO_MYCHANGE=1"   # measure a branch
+```
+
+It alternates the arms in one session, runs the gates on every run, and
+**refuses to print a median if any gate fails**. It also checks the ICD exists
+before starting, because a wrong build path silently produces twelve aborted
+runs that look like data. `cp_harness_timeline.sh` renders every frame of
+either capture to a page, the way `cp_make_timeline.sh` does for the gfxr pair.
+
+The recipe it implements:
+
 ```
 for round in 1 2 3:  control run, then candidate run     # one session, alternating
 ```
