@@ -11,8 +11,9 @@
 #
 #   ~/timelines/harness/CAPTURE/index.html
 #
-# Both pages fetch nothing, but serve them anyway for consistent relative paths:
-#   python3 -m http.server -d ~/timelines 8000
+# The page is self-contained, but a static server over the home directory is
+# already the way these are read here:
+#   http://localhost:8000/timelines/harness/CAPTURE/index.html
 set -uo pipefail
 CAP=${1:?usage: cp_harness_timeline.sh favorite2|favorite3 [ENV=VALUE ...]}
 shift || true
