@@ -329,6 +329,7 @@ struct cp_debug {
    struct cp_opt_int tile_bound;
    bool no_host_pin_readback;
    bool no_append_prefilter;
+   bool no_layered_copy3d;
 };
 
 /*

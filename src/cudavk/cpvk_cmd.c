@@ -3054,6 +3054,41 @@ cpvk_record_copy(struct cpvk_cmd_buffer *cmd)
 }
 
 /*
+ * May the planes of a layered copy be carried as one 3D copy?
+ *
+ * A layered image copy is recorded one operation per plane, and each of those
+ * is a cuMemcpy2DAsync plus a texture-cache cuEventRecord at submit. A render
+ * frame's submit head is 32 of each for one 32x32x16 image, issued onto an
+ * idle device -- 178 us of host issue for 64 KB.
+ *
+ * CUDA_MEMCPY3D has no arbitrary plane stride: it derives one as pitch *
+ * Height. So the merge is exact only where each side's plane stride is a whole
+ * number of its own rows and that number covers the rows being copied.
+ * Everything this driver lays out satisfies it -- a level is
+ * row_stride * h * d and a staged buffer image is its row * bufferImageHeight
+ * -- but an application names the buffer geometry, so a region that does not
+ * fit keeps the per-plane loop rather than getting a rounded stride.
+ *
+ * Both strides must also be uniform across the whole sequence, which is a
+ * property of the caller: a buffer-image copy of several array layers of
+ * several depth slices at once has two different strides interleaved and is
+ * therefore never merged.
+ */
+static bool
+cpvk_copy_slices_fit(size_t src_stride, size_t dst_stride,
+                     size_t src_pitch, size_t dst_pitch,
+                     size_t rows, unsigned slices)
+{
+   if (cp_debug->no_layered_copy3d || slices < 2 || !rows)
+      return false;
+   if (!src_pitch || !dst_pitch || !src_stride || !dst_stride)
+      return false;
+   if (src_stride % src_pitch || dst_stride % dst_pitch)
+      return false;
+   return src_stride / src_pitch >= rows && dst_stride / dst_pitch >= rows;
+}
+
+/*
  * vkCmdFillBuffer.
  *
  * Implemented here rather than left to the runtime: vk_common_CmdFillBuffer
@@ -3655,7 +3690,12 @@ cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
       /* A copy has one sequence of slices. A slice is a z plane for a 3D
        * image and an array layer otherwise; multiplying layerCount by depth
        * would turn a valid 2D-array <-> 3D copy into N squared copies. */
-      for (unsigned s = 0; s < slices; s++) {
+      size_t src_step = src_3d ? src_slice : src->level_size[sl];
+      size_t dst_step = dst_3d ? dst_slice : dst->level_size[dl];
+      unsigned merged = cpvk_copy_slices_fit(src_step, dst_step, sp, dp,
+                                             copy_rows, slices) ? slices : 1;
+
+      for (unsigned s = 0; s < slices; s += merged) {
          uint64_t src_plane = src_3d
             ? (uint64_t)(r->srcOffset.z + (int32_t)s) * src_slice
             : (uint64_t)(r->srcSubresource.baseArrayLayer + s) *
@@ -3675,6 +3715,9 @@ cpvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
             .dst_pitch = dp,
             .width_bytes = copy_row,
             .rows = copy_rows,
+            .slices = merged > 1 ? merged : 0,
+            .src_slice = merged > 1 ? src_step : 0,
+            .dst_slice = merged > 1 ? dst_step : 0,
             .src_end = cpvk_image_end(src),
             .dst_end = cpvk_image_end(dst),
          };
@@ -3733,36 +3776,49 @@ cpvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
       unsigned layers = MAX2(r->imageSubresource.layerCount, 1u);
       unsigned depth = MAX2(r->imageExtent.depth, 1u);
 
-      /* Array layers and 3D depth slices are consecutive buffer images.  The
+      /*
+       * Array layers and 3D depth slices are consecutive buffer images.  The
        * old 2D-only loop copied slice zero of a 3D upload and the sampler then
-       * read uninitialised slices as its z coordinate changed. */
-      for (unsigned l = 0; l < layers; l++) {
-         for (unsigned z = 0; z < depth; z++) {
-            struct cpvk_copy *c = cpvk_record_copy(cmd);
-            if (!c)
-               return;
-            *c = (struct cpvk_copy) {
-               .dst_image = img,
-               .src = buf->mem->dev_ptr + buf->offset + r->bufferOffset +
-                      ((size_t)l * depth + z) * src_slice,
-               .dst = ib +
-                      (size_t)(r->imageSubresource.baseArrayLayer + l) *
-                         img->level_size[level] +
-                      (size_t)(r->imageOffset.z + (int32_t)z) * dst_slice +
-                      (size_t)util_format_get_nblocksy(
-                         pfmt, r->imageOffset.y) * ip +
-                      (size_t)util_format_get_nblocksx(
-                         pfmt, r->imageOffset.x) * bpp,
-               .src_pitch = src_row,
-               .dst_pitch = ip,
-               .width_bytes = copy_row,
-               .rows = copy_rows,
-               /* Both ends bounded: this is the path that uploads every
-                * texture and every mip level in a capture. */
-               .src_end = buf->mem->dev_ptr + buf->offset + buf->vk.size,
-               .dst_end = cpvk_image_end(img),
-            };
-         }
+       * read uninitialised slices as its z coordinate changed.
+       *
+       * The two nest and their image-side strides differ, so a sequence of
+       * both has two strides interleaved and cannot be one 3D copy; only a
+       * run of layers at one depth, or of depth slices in one layer, can.
+       */
+      unsigned run = (depth == 1) ? layers : (layers == 1) ? depth : 1;
+      size_t dst_step = (depth == 1) ? img->level_size[level] : dst_slice;
+      unsigned merged = cpvk_copy_slices_fit(src_slice, dst_step, src_row, ip,
+                                             copy_rows, run) ? run : 1;
+
+      for (unsigned s = 0; s < layers * depth; s += merged) {
+         unsigned l = s / depth, z = s % depth;
+         struct cpvk_copy *c = cpvk_record_copy(cmd);
+         if (!c)
+            return;
+         *c = (struct cpvk_copy) {
+            .dst_image = img,
+            .src = buf->mem->dev_ptr + buf->offset + r->bufferOffset +
+                   ((size_t)l * depth + z) * src_slice,
+            .dst = ib +
+                   (size_t)(r->imageSubresource.baseArrayLayer + l) *
+                      img->level_size[level] +
+                   (size_t)(r->imageOffset.z + (int32_t)z) * dst_slice +
+                   (size_t)util_format_get_nblocksy(
+                      pfmt, r->imageOffset.y) * ip +
+                   (size_t)util_format_get_nblocksx(
+                      pfmt, r->imageOffset.x) * bpp,
+            .src_pitch = src_row,
+            .dst_pitch = ip,
+            .width_bytes = copy_row,
+            .rows = copy_rows,
+            .slices = merged > 1 ? merged : 0,
+            .src_slice = merged > 1 ? src_slice : 0,
+            .dst_slice = merged > 1 ? dst_step : 0,
+            /* Both ends bounded: this is the path that uploads every
+             * texture and every mip level in a capture. */
+            .src_end = buf->mem->dev_ptr + buf->offset + buf->vk.size,
+            .dst_end = cpvk_image_end(img),
+         };
       }
    }
 }
@@ -3800,31 +3856,43 @@ cpvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
       unsigned layers = MAX2(r->imageSubresource.layerCount, 1u);
       unsigned depth = MAX2(r->imageExtent.depth, 1u);
 
-      for (unsigned l = 0; l < layers; l++) {
-         for (unsigned z = 0; z < depth; z++) {
-            struct cpvk_copy *c = cpvk_record_copy(cmd);
-            if (!c)
-               return;
-            *c = (struct cpvk_copy) {
-               .src = ib +
-                      (size_t)(r->imageSubresource.baseArrayLayer + l) *
-                         img->level_size[level] +
-                      (size_t)(r->imageOffset.z + (int32_t)z) * src_slice +
-                      (size_t)util_format_get_nblocksy(
-                         pfmt, r->imageOffset.y) * ip +
-                      (size_t)util_format_get_nblocksx(
-                         pfmt, r->imageOffset.x) * bpp,
-               .dst = buf->mem->dev_ptr + buf->offset + r->bufferOffset +
-                      ((size_t)l * depth + z) * dst_slice,
-               .src_pitch = ip,
-               .dst_pitch = dst_row,
-               .width_bytes = (size_t)util_format_get_nblocksx(
-                  pfmt, r->imageExtent.width) * bpp,
-               .rows = util_format_get_nblocksy(pfmt, r->imageExtent.height),
-               .src_end = cpvk_image_end(img),
-               .dst_end = buf->mem->dev_ptr + buf->offset + buf->vk.size,
-            };
-         }
+      /* One stride on each side, as in the upload above: a run of layers at
+       * one depth, or of depth slices in one layer, and nothing else. */
+      size_t copy_row = (size_t)util_format_get_nblocksx(
+         pfmt, r->imageExtent.width) * bpp;
+      unsigned copy_rows = util_format_get_nblocksy(pfmt,
+                                                    r->imageExtent.height);
+      unsigned run = (depth == 1) ? layers : (layers == 1) ? depth : 1;
+      size_t src_step = (depth == 1) ? img->level_size[level] : src_slice;
+      unsigned merged = cpvk_copy_slices_fit(src_step, dst_slice, ip, dst_row,
+                                             copy_rows, run) ? run : 1;
+
+      for (unsigned s = 0; s < layers * depth; s += merged) {
+         unsigned l = s / depth, z = s % depth;
+         struct cpvk_copy *c = cpvk_record_copy(cmd);
+         if (!c)
+            return;
+         *c = (struct cpvk_copy) {
+            .src = ib +
+                   (size_t)(r->imageSubresource.baseArrayLayer + l) *
+                      img->level_size[level] +
+                   (size_t)(r->imageOffset.z + (int32_t)z) * src_slice +
+                   (size_t)util_format_get_nblocksy(
+                      pfmt, r->imageOffset.y) * ip +
+                   (size_t)util_format_get_nblocksx(
+                      pfmt, r->imageOffset.x) * bpp,
+            .dst = buf->mem->dev_ptr + buf->offset + r->bufferOffset +
+                   ((size_t)l * depth + z) * dst_slice,
+            .src_pitch = ip,
+            .dst_pitch = dst_row,
+            .width_bytes = copy_row,
+            .rows = copy_rows,
+            .slices = merged > 1 ? merged : 0,
+            .src_slice = merged > 1 ? src_step : 0,
+            .dst_slice = merged > 1 ? dst_slice : 0,
+            .src_end = cpvk_image_end(img),
+            .dst_end = buf->mem->dev_ptr + buf->offset + buf->vk.size,
+         };
       }
    }
 }
@@ -4324,30 +4392,48 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
     * tests below do not apply to it -- they rejected three perfectly good mip
     * downscales before this line existed.
     */
+   /* A merged layered copy reaches `slices - 1` plane strides further on each
+    * side, and its planes have to be a whole number of rows apart -- that is
+    * the only stride CUDA_MEMCPY3D can express. Both are checked here as well
+    * as at record time, because this block is what stands between a wrong
+    * region and a fault inside libcuda. */
+   unsigned planes = c->slices > 1 ? c->slices : 1;
+   uint64_t src_planes = (uint64_t)(planes - 1) * c->src_slice;
+   uint64_t dst_planes = (uint64_t)(planes - 1) * c->dst_slice;
+
    uint64_t src_reach = c->src_w ? 0 :
-                        c->src + (uint64_t)(c->rows ? c->rows - 1 : 0) *
+                        c->src + src_planes +
+                        (uint64_t)(c->rows ? c->rows - 1 : 0) *
                         (c->src_pitch ? c->src_pitch : c->width_bytes) +
                         c->width_bytes;
    uint64_t dst_reach = c->src_w ? 0 :
-                        c->dst + (uint64_t)(c->rows ? c->rows - 1 : 0) *
+                        c->dst + dst_planes +
+                        (uint64_t)(c->rows ? c->rows - 1 : 0) *
                         (c->dst_pitch ? c->dst_pitch : c->width_bytes) +
                         c->width_bytes;
 
-   if (!c->src || !c->dst || !c->width_bytes || !c->rows ||
+   bool bad_planes = planes > 1 &&
+      (!c->src_pitch || !c->dst_pitch ||
+       c->src_slice % c->src_pitch || c->dst_slice % c->dst_pitch ||
+       c->src_slice / c->src_pitch < c->rows ||
+       c->dst_slice / c->dst_pitch < c->rows);
+
+   if (!c->src || !c->dst || !c->width_bytes || !c->rows || bad_planes ||
        (!c->src_w && c->src_pitch && c->src_pitch < c->width_bytes) ||
        (!c->src_w && c->dst_pitch && c->dst_pitch < c->width_bytes) ||
        (c->src_end && src_reach > c->src_end) ||
        (c->dst_end && dst_reach > c->dst_end)) {
-      fprintf(stderr, "cudavk: refusing copy src=%p dst=%p %zux%zu "
-              "pitch %zu->%zu reach %p/%p ends %p/%p\n",
+      fprintf(stderr, "cudavk: refusing copy src=%p dst=%p %zux%zu x%u "
+              "pitch %zu->%zu slice %zu->%zu reach %p/%p ends %p/%p\n",
               (void *)(uintptr_t)c->src, (void *)(uintptr_t)c->dst,
-              c->width_bytes, c->rows, c->src_pitch, c->dst_pitch,
+              c->width_bytes, c->rows, planes, c->src_pitch, c->dst_pitch,
+              c->src_slice, c->dst_slice,
               (void *)(uintptr_t)src_reach, (void *)(uintptr_t)dst_reach,
               (void *)(uintptr_t)c->src_end, (void *)(uintptr_t)c->dst_end);
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
    }
 
-   if (c->rows <= 1 && !c->src_pitch && !c->dst_pitch) {
+   if (planes == 1 && c->rows <= 1 && !c->src_pitch && !c->dst_pitch) {
       if (cuMemcpyDtoDAsync(c->dst, c->src, c->width_bytes,
                             cp->stream) != CUDA_SUCCESS)
          return vk_error(dev, VK_ERROR_DEVICE_LOST);
@@ -4456,18 +4542,43 @@ cpvk_execute_copy(struct cpvk_device *dev, const struct cpvk_copy *c)
    }
 
 
-   CUDA_MEMCPY2D m = {
-      .srcMemoryType = CU_MEMORYTYPE_DEVICE,
-      .srcDevice = c->src,
-      .srcPitch = c->src_pitch ? c->src_pitch : c->width_bytes,
-      .dstMemoryType = CU_MEMORYTYPE_DEVICE,
-      .dstDevice = c->dst,
-      .dstPitch = c->dst_pitch ? c->dst_pitch : c->width_bytes,
-      .WidthInBytes = c->width_bytes,
-      .Height = c->rows,
-   };
-   if (cuMemcpy2DAsync(&m, cp->stream) != CUDA_SUCCESS)
-      return vk_error(dev, VK_ERROR_DEVICE_LOST);
+   if (planes > 1) {
+      /*
+       * The layered form: one call for what was one call per plane, and one
+       * texture-cache event for what was one per plane, since the whole
+       * sequence is now a single recorded operation. The plane stride is
+       * pitch * Height by construction -- checked above -- so this addresses
+       * exactly the bytes the per-plane loop did.
+       */
+      CUDA_MEMCPY3D m3 = {
+         .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+         .srcDevice = c->src,
+         .srcPitch = c->src_pitch,
+         .srcHeight = c->src_slice / c->src_pitch,
+         .dstMemoryType = CU_MEMORYTYPE_DEVICE,
+         .dstDevice = c->dst,
+         .dstPitch = c->dst_pitch,
+         .dstHeight = c->dst_slice / c->dst_pitch,
+         .WidthInBytes = c->width_bytes,
+         .Height = c->rows,
+         .Depth = planes,
+      };
+      if (cuMemcpy3DAsync(&m3, cp->stream) != CUDA_SUCCESS)
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+   } else {
+      CUDA_MEMCPY2D m = {
+         .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+         .srcDevice = c->src,
+         .srcPitch = c->src_pitch ? c->src_pitch : c->width_bytes,
+         .dstMemoryType = CU_MEMORYTYPE_DEVICE,
+         .dstDevice = c->dst,
+         .dstPitch = c->dst_pitch ? c->dst_pitch : c->width_bytes,
+         .WidthInBytes = c->width_bytes,
+         .Height = c->rows,
+      };
+      if (cuMemcpy2DAsync(&m, cp->stream) != CUDA_SUCCESS)
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+   }
 
    if (cp_debug->debug_rt) {
       /* And what landed, read back from the destination this copy just
