@@ -19,7 +19,7 @@ records what it could do that this cannot, and how to restore it from the
 - `docs/cudavk/TESTING.md` — how correctness is decided.
 - `docs/cudavk/PERFORMANCE.md` — where the time goes and what removing work costs.
 - `docs/cudavk/DEAD_ENDS.md` — **read before optimising anything.** Fifteen
-  entries: fourteen directions built or probed and closed with measurements,
+  entries: fifteen directions built or probed and closed with measurements,
   one parked with a known next step. Re-running one of them by accident is the
   most expensive mistake available here, and one entry exists precisely because
   a narrow path was rejected on coverage and later paid 5.84 ms once the
@@ -110,10 +110,16 @@ instructions on 5% of cycles, with a third of its SMs active. Any claim that a
 sample is "kernel-bound" on a busy percentage alone is unsupported — that
 number only says a kernel was resident.
 
-**The driver is currently host-bound, and that is measured.** It blocks about
-seventeen times a frame and spends about 12.44 ms of a 15.74 ms frame waiting;
-device idle is 4.16 ms, almost exactly host issue time. Removing device
-operations is close to exhausted — see `docs/cudavk/PERFORMANCE.md`.
+**The driver was host-bound; it is no longer, and that is measured.** That
+claim once read seventeen blocks and 12.44 ms of a 15.74 ms frame spent
+waiting. After the 2026-09-02/03 work it blocks **7.25 times a frame for
+1.325 ms of a 5.94 ms frame** (`CUDAVK_PLAN_STATS` reports the four sites),
+and that 1.325 ms is the GPU finishing rather than the host being slow:
+injecting 0.449 ms/frame of host busy-work *before* the largest wait does not
+move the frame at all (`DEAD_ENDS` 41). Removing device operations was close
+to exhausted already — see `docs/cudavk/PERFORMANCE.md`. Removing host waits
+is now exhausted too, and the cheap test for any further such idea is to
+inject host time into the wait and see whether the frame notices.
 
 **Both counter modes need enough frames to be meaningful.** A sample's process
 is mostly shader compilation and teardown; ten frames of `instancing` measures
