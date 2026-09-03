@@ -567,6 +567,17 @@ struct cpvk_copy {
     */
    uint64_t src_end, dst_end;
 
+   /*
+    * A layered copy carried as one operation: `slices` planes, each
+    * `src_slice`/`dst_slice` bytes after the one before it. Zero or one is
+    * the plain 2D copy above and the only shape anything but an image copy
+    * records. The submit head of a render frame was 32 two-kilobyte
+    * cuMemcpy2DAsync calls and 32 cuEventRecords for one layered image;
+    * merged it is one cuMemcpy3DAsync and one event.
+    */
+   unsigned slices;
+   size_t src_slice, dst_slice;
+
    /* A multisample resolve: average `samples` planes `sample_stride` apart.
     * `encoding` is the source's cp_color_encoding, which the resolve kernel
     * needs to decode and re-encode the texels; -1 when it is not known and
