@@ -360,6 +360,68 @@ struct cp_context {
    struct cp_queue_set cur_qset;
 
    /*
+    * CUDAVK_VS_LANE: the vertex shader of a direct batch, on a side stream.
+    *
+    * A direct batch's chain is one stream, so batch k+1's vertex shader
+    * cannot start until batch k's fragment work has finished, although it
+    * reads nothing that work writes. Issuing it on one of the pass side
+    * streams instead lets the two overlap; everything after it -- the clip,
+    * the rasterizer, the shade chain -- stays on the main stream, joined to
+    * the lane by `done` before the clip can run. Only the vertex shader may
+    * move: raster stage 1 reads the depth buffer the previous batch's
+    * writeback commits, writes the visibility buffer its compaction is still
+    * reading, and appends to the queue set its stages 2 and 3 are draining.
+    *
+    * `gate[]` is what makes the run-ahead legal in the other direction. One
+    * is recorded on the main stream at the top of every batch, before any of
+    * that batch's work, and the lane waits on the *previous* batch's mark:
+    * everything the main stream had issued before batch k is therefore done
+    * before the lane's vertex shader starts, and only batch k's own chain is
+    * overlapped. Two marks alternate because a wait captures the event where
+    * it was recorded, so the mark for the next batch may be re-recorded while
+    * the previous one is still being waited on.
+    *
+    * `slot[]` holds the vertex shader's output, which on this path may not
+    * come from the device scratch arena: that arena rewinds to zero at every
+    * batch, so batch k+1's allocations alias batch k's, and on the main
+    * stream that is safe only because the streams serialise. Two slots
+    * alternate, and the same gate proves the reuse: the lane's shader for
+    * batch j waits on the mark recorded at the top of batch j-1, which is
+    * behind the whole chain of batch j-2 -- the batch whose slot it is about
+    * to overwrite.
+    */
+   struct {
+      CUevent gate[2];
+      CUevent done;
+      unsigned gate_next;        /* which mark the next batch records into */
+      unsigned gate_wait;        /* the mark this batch's lane waits on */
+      bool gate_valid;           /* a previous batch's mark exists */
+      bool ready;                /* this batch is eligible so far */
+      CUdeviceptr slot[2];
+      size_t slot_size[2];
+      unsigned slot_next;
+      /* The main stream's tail as the previous batch left it: nothing may
+       * have been enqueued between it and this batch's mark, or the mark no
+       * longer stands for "everything before the previous batch's chain".
+       * cp->launches counts kernels, cp_devop_epoch everything else. */
+      uint64_t launches_at_end;
+      uint64_t epoch_at_end;
+      /*
+       * And what the previous batch was, because the mark only bounds when
+       * its work runs, not what it wrote. Two things the previous batch may
+       * have written are not covered by the disjointness above: memory
+       * through a shader (an SSBO or a storage image), and its own colour
+       * attachment, which a later render scope is free to sample. So the
+       * lane runs ahead only of a batch in the same render scope whose
+       * shaders wrote no memory.
+       */
+      struct cp_render_scope prev_scope;
+      bool prev_scope_valid;
+      bool prev_writes_memory;
+      uint64_t taken, refused;   /* reported under CUDAVK_PLAN_STATS */
+   } vslane;
+
+   /*
     * What the fragment shader launches of the draw now running should hand to
     * CP_ARG_SLOT_UBO_TABLE. Set once at the top of cp_draw_execute_batch() so that
     * it cannot carry from one draw to the next, and read by

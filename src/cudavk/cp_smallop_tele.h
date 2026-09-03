@@ -23,6 +23,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The epoch every wrapper below moves. Its own header, so that a file which
+ * enqueues work without wanting the census interception can move it too. */
+#include "cp_devop.h"
+
 enum cp_smallop_kind {
    CP_SMALLOP_HTOD_ASYNC,
    CP_SMALLOP_HTOD_SYNC,
@@ -54,18 +58,10 @@ void cp_smallop_report(void);
  * That turns "no memset can be sitting there" from a claim about the source
  * into something the code checks.
  *
- * Off unless CUDAVK_PDL is set, and then one relaxed increment per small
- * operation, next to a CUDA call that costs a microsecond.
+ * The epoch itself lives in cp_devop.h and is always counted -- CUDAVK_VS_LANE
+ * needs it with no debug flag set. cp_pdl_watch only arms the PDL attribute.
  */
 extern bool cp_pdl_watch;
-extern uint64_t cp_pdl_epoch;
-
-static inline void
-cp_pdl_stream_op(void)
-{
-   if (cp_pdl_watch)
-      __atomic_fetch_add(&cp_pdl_epoch, 1, __ATOMIC_RELAXED);
-}
 
 static inline void
 cp_smallop_hit(const char *file, int line, enum cp_smallop_kind kind,
@@ -85,7 +81,7 @@ cp_smallop_htod_async(const char *f, int l, CUdeviceptr dst, const void *src,
                       size_t n, CUstream s)
 {
    cp_smallop_hit(f, l, CP_SMALLOP_HTOD_ASYNC, n);
-   cp_pdl_stream_op();
+   cp_devop_note();
    return cuMemcpyHtoDAsync(dst, src, n, s);
 }
 
@@ -94,7 +90,7 @@ static inline CUresult
 cp_smallop_htod_async_raw(CUdeviceptr dst, const void *src, size_t n,
                           CUstream s)
 {
-   cp_pdl_stream_op();
+   cp_devop_note();
    return cuMemcpyHtoDAsync(dst, src, n, s);
 }
 
@@ -118,7 +114,7 @@ cp_smallop_memset32_async(const char *f, int l, CUdeviceptr dst, unsigned v,
                           size_t n, CUstream s)
 {
    cp_smallop_hit(f, l, CP_SMALLOP_MEMSET_ASYNC, n * 4);
-   cp_pdl_stream_op();
+   cp_devop_note();
    return cuMemsetD32Async(dst, v, n, s);
 }
 
@@ -127,7 +123,7 @@ cp_smallop_memset8_async(const char *f, int l, CUdeviceptr dst,
                          unsigned char v, size_t n, CUstream s)
 {
    cp_smallop_hit(f, l, CP_SMALLOP_MEMSET_ASYNC, n);
-   cp_pdl_stream_op();
+   cp_devop_note();
    return cuMemsetD8Async(dst, v, n, s);
 }
 
@@ -147,22 +143,55 @@ cp_smallop_memset8(const char *f, int l, CUdeviceptr dst, unsigned char v,
 static inline CUresult
 cp_pdl_event_record(CUevent e, CUstream s)
 {
-   cp_pdl_stream_op();
+   cp_devop_note();
    return cuEventRecord(e, s);
 }
 
 static inline CUresult
 cp_pdl_stream_wait_event(CUstream s, CUevent e, unsigned int flags)
 {
-   cp_pdl_stream_op();
+   cp_devop_note();
    return cuStreamWaitEvent(s, e, flags);
 }
 
 static inline CUresult
 cp_pdl_dtoh_async(void *dst, CUdeviceptr src, size_t n, CUstream s)
 {
-   cp_pdl_stream_op();
+   cp_devop_note();
    return cuMemcpyDtoHAsync(dst, src, n, s);
+}
+
+/* The four the interception did not cover until CUDAVK_VS_LANE needed the
+ * epoch to mean every enqueue: the image copies, the buffer-to-buffer copy
+ * and the host callbacks in cpvk_cmd.c, all of them issued on the renderer's
+ * main stream between draws. A PDL predecessor was already wrong across one
+ * of these; nothing measured it because they are rare. */
+static inline CUresult
+cp_devop_memcpy2d_async(const CUDA_MEMCPY2D *copy, CUstream s)
+{
+   cp_devop_note();
+   return cuMemcpy2DAsync(copy, s);
+}
+
+static inline CUresult
+cp_devop_memcpy3d_async(const CUDA_MEMCPY3D *copy, CUstream s)
+{
+   cp_devop_note();
+   return cuMemcpy3DAsync(copy, s);
+}
+
+static inline CUresult
+cp_devop_dtod_async(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream s)
+{
+   cp_devop_note();
+   return cuMemcpyDtoDAsync(dst, src, n, s);
+}
+
+static inline CUresult
+cp_devop_launch_host_func(CUstream s, CUhostFn fn, void *user)
+{
+   cp_devop_note();
+   return cuLaunchHostFunc(s, fn, user);
 }
 
 static inline CUresult
@@ -184,6 +213,10 @@ cp_smallop_ctxsync(const char *f, int l)
 #undef cuEventRecord
 #undef cuStreamWaitEvent
 #undef cuMemcpyDtoHAsync
+#undef cuMemcpy2DAsync
+#undef cuMemcpy3DAsync
+#undef cuMemcpyDtoDAsync
+#undef cuLaunchHostFunc
 
 #define cuMemcpyHtoDAsync(d, s, n, st) \
    cp_smallop_htod_async(__FILE__, __LINE__, (d), (s), (n), (st))
@@ -201,5 +234,9 @@ cp_smallop_ctxsync(const char *f, int l)
 #define cuEventRecord(e, st) cp_pdl_event_record((e), (st))
 #define cuStreamWaitEvent(st, e, fl) cp_pdl_stream_wait_event((st), (e), (fl))
 #define cuMemcpyDtoHAsync(d, s, n, st) cp_pdl_dtoh_async((d), (s), (n), (st))
+#define cuMemcpy2DAsync(c, st) cp_devop_memcpy2d_async((c), (st))
+#define cuMemcpy3DAsync(c, st) cp_devop_memcpy3d_async((c), (st))
+#define cuMemcpyDtoDAsync(d, s, n, st) cp_devop_dtod_async((d), (s), (n), (st))
+#define cuLaunchHostFunc(st, f, u) cp_devop_launch_host_func((st), (f), (u))
 
 #endif /* CP_SMALLOP_TELE_H */
