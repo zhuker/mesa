@@ -2473,3 +2473,58 @@ entry 24 and the renderer2 redesign (36) were closed by, applied earlier and
 for a tenth of the cost. The trace that settled all three took nine minutes and
 was only possible because the harness stopped crashing, which is its own
 argument for fixing the tools first.
+
+## 41. Device-decided episodes (G): the wait it removes is the GPU's, not the host's
+
+**What it was.** The last open driver-side lead, and the one carried longest:
+let the device decide episode sizing so the renderer stops reading back
+counters and blocking on them. The 2026-09-02 analysis modelled it at 0.50 ms
+oracle, 0.2-0.4 realistic, and specified a one-to-two day "oracle replay" to
+price it -- record every read-back value, replay it without waiting.
+
+**What was measured instead.** The driver already reports what it waits for
+(`CUDAVK_PLAN_STATS`), and already carries the iteration-29 conversion probe at
+the drain (`CUDAVK_WAIT_SPIN_BEFORE_US`). Neither needed a line of code.
+
+The population, favorite3, 3,473 frames:
+
+| wait site | total | per frame | each |
+|---|---:|---:|---:|
+| episode drain | 3,196.1 ms | **0.920** | 246 us |
+| segment counters | 1,019.2 ms | 0.294 | 200 us |
+| peel checks | 365.8 ms | 0.105 | 93 us |
+| desc uploads | 20.3 ms | 0.006 | 6 us |
+| **total** | **4,601.4 ms** | **1.325** | |
+
+Larger than the model. And entirely uncollectible, which the probe shows by
+injecting **pure host busy-work before the drain's sync** and measuring the
+frame (3 alternating rounds each, every gate passed):
+
+| injected per frame | whole delta | heavy delta |
+|---:|---:|---:|
+| 0.224 ms | +0.0111 | -0.0133 |
+| 0.449 ms | -0.0032 | +0.0341 |
+
+**0.449 ms/frame of host time was added and the frame did not move.** Both arms
+overlap at both levels, against a session drift of 0.06. The host arrives at
+that sync at least 120 us early on every one of its 3.74 calls per frame: the
+wait is the GPU finishing, not the host being slow.
+
+**Therefore G collects nothing**, and no implementation of it can do better --
+device-decided episodes remove a wait whose time is not the host's to reclaim.
+The oracle replay would have measured the same zero after one to two days of
+building it.
+
+**The rule, and it is the same one as entry 40.** A wait is not a cost until
+something is shown to be waiting *for the host*. Blocked host time was already
+excluded from frame-time credit by this project's rules; what this adds is the
+cheap positive test -- **inject host time into the wait and see whether the
+frame notices**. Absorption is a direct measurement of slack, it takes six runs,
+and it is available at any site that can be made to spin. Ask it before
+designing a mechanism to remove a sync.
+
+**What it changes beyond G.** The driver is no longer host-bound in the way
+`CLAUDE.md` described (seventeen blocks, 12.44 ms of a 15.74 ms frame waiting).
+It blocks **7.25 times a frame for 1.325 ms of a 5.94 ms frame**, and that
+1.325 is GPU-paced. The remaining distance to the 5.0 goal is not on the host
+side of the driver.
