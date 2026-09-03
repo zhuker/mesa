@@ -174,6 +174,12 @@ static const struct cp_flag_def flags[] = {
      "its six faces from where the sampler will look; syncs" },
 
    /* ---- subsystem switches ---- */
+   { "CUDAVK_NO_ARGBLOCK_HOIST", CP_FLAG_BOOL_VALUE, F(no_argblock_hoist),
+     "reserve the direct shade chain's interpolation and fragment argument "
+     "blocks where they are read instead of before the rasterizer, so their "
+     "upload flushes stand as host-to-device copies in the stage 3 to "
+     "compaction and compaction to shader links, as they did before the "
+     "hoist" },
    { "CUDAVK_NO_APPEND_PREFILTER", CP_FLAG_BOOL_VALUE, F(no_append_prefilter),
      "let a blended batch enter a pass episode even when the A-buffer arm is "
      "certain to refuse it, so its vertex work runs on a side stream and is "

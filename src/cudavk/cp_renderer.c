@@ -3500,26 +3500,38 @@ cp_texture_cache_available(struct cp_context *cp,
    return true;
 }
 
+/*
+ * What cp_fs_args_prepare() resolved and reserved, so that the fragment
+ * shader's launch can happen later than its argument block's upload.
+ *
+ * The block is the second of the two the direct shade chain uploads. Left
+ * owed until the launch itself, its flush copy lands in the
+ * cp_fs_compact -> shader link; reserving and closing it before the caller's
+ * rasterizer launches is what empties that link. Nothing here is a decision
+ * the launch repeats -- the execution, the module and the device block are
+ * fixed at reservation time, exactly as they were when the two halves were
+ * one function.
+ */
+struct cp_fs_launch {
+   struct cp_shader_exec *exec;
+   CUmodule module;
+   enum cp_shader_exec_mode mode;
+   CUdeviceptr args_dev;
+   bool use_sampler_variant;
+};
+
 static bool
-cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
-                    struct cp_shader_binary *fs,
-                    enum cp_shader_exec_mode mode,
-                    CUdeviceptr counter, CUdeviceptr fs_in,
-                    unsigned fs_in_stride, CUdeviceptr fs_out,
-                    CUdeviceptr frag_coord, CUdeviceptr discard_mask,
-                    CUdeviceptr front_face, CUdeviceptr coverage,
-                    CUdeviceptr fused_interp,
-                    const struct cp_fs_interp_args *interp_inline,
-                    unsigned num_threads,
-                    CUevent ev_before,
-                    CUdeviceptr batch_rows, CUfunction *launched)
+cp_fs_args_prepare(struct cp_context *cp, const struct cp_draw_state *state,
+                   struct cp_shader_binary *fs,
+                   enum cp_shader_exec_mode mode,
+                   CUdeviceptr counter, CUdeviceptr fs_in,
+                   unsigned fs_in_stride, CUdeviceptr fs_out,
+                   CUdeviceptr frag_coord, CUdeviceptr discard_mask,
+                   CUdeviceptr front_face, CUdeviceptr coverage,
+                   CUdeviceptr fused_interp,
+                   const struct cp_fs_interp_args *interp_inline,
+                   CUdeviceptr batch_rows, struct cp_fs_launch *out)
 {
-   /* Which kernel actually ran, for a caller that wants to name it as the
-    * predecessor of its own launch. A shader has five possible executions and
-    * a pending tune can retarget the launch to an alternate binary, so the
-    * caller cannot work this out from the mode it asked for. */
-   if (launched)
-      *launched = NULL;
    struct cp_shader_exec *base_exec = &fs->exec[mode];
    if (!base_exec->kernel && mode == CP_SHADER_EXEC_CLASSIC &&
        fs->exec[CP_SHADER_EXEC_FUSED].kernel) {
@@ -3663,7 +3675,6 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
    }
 
    CUmodule launch_module = launch_exec->module;
-   CUfunction launch_kernel = launch_exec->kernel;
 
    if (cp_debug->debug_tex && !fs->tex_descs_reported) {
       fs->tex_descs_reported = true;
@@ -3838,7 +3849,37 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
       }
    }
 
-   void *fs_arg_ptr = (void *)(uintptr_t)fs_args_dev;
+   out->exec = launch_exec;
+   out->module = launch_module;
+   out->mode = exec_mode;
+   out->args_dev = fs_args_dev;
+   out->use_sampler_variant = use_sampler_variant;
+   return true;
+}
+
+/*
+ * Launch the execution cp_fs_args_prepare() resolved, against the argument
+ * block it reserved. Nothing is written into that block here: whatever flush
+ * carried its bytes has already happened, and a store after it would not
+ * reach the device.
+ */
+static bool
+cp_fs_launch_prepared(struct cp_context *cp, struct cp_shader_binary *fs,
+                      const struct cp_fs_launch *prep, unsigned num_threads,
+                      CUevent ev_before, CUfunction *launched)
+{
+   /* Which kernel actually ran, for a caller that wants to name it as the
+    * predecessor of its own launch. A shader has five possible executions and
+    * a pending tune can retarget the launch to an alternate binary, so the
+    * caller cannot work this out from the mode it asked for. */
+   if (launched)
+      *launched = NULL;
+   struct cp_shader_exec *launch_exec = prep->exec;
+   enum cp_shader_exec_mode exec_mode = prep->mode;
+   bool use_sampler_variant = prep->use_sampler_variant;
+   CUfunction launch_kernel = launch_exec->kernel;
+
+   void *fs_arg_ptr = (void *)(uintptr_t)prep->args_dev;
    void *fs_params[] = { &fs_arg_ptr };
    {
       /* Scoped: the launch check returns out of the middle. */
@@ -3936,29 +3977,131 @@ cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
 }
 
 /*
+ * Reserve the argument block and launch straight away -- the shape the two
+ * halves above had before the direct path learnt to separate them. The
+ * A-buffer shade has no earlier launch of its own to hang the reservation on,
+ * so it keeps this form.
+ */
+static bool
+cp_fs_launch_shader(struct cp_context *cp, const struct cp_draw_state *state,
+                    struct cp_shader_binary *fs,
+                    enum cp_shader_exec_mode mode,
+                    CUdeviceptr counter, CUdeviceptr fs_in,
+                    unsigned fs_in_stride, CUdeviceptr fs_out,
+                    CUdeviceptr frag_coord, CUdeviceptr discard_mask,
+                    CUdeviceptr front_face, CUdeviceptr coverage,
+                    CUdeviceptr fused_interp,
+                    const struct cp_fs_interp_args *interp_inline,
+                    unsigned num_threads,
+                    CUevent ev_before,
+                    CUdeviceptr batch_rows, CUfunction *launched)
+{
+   struct cp_fs_launch prep;
+   if (!cp_fs_args_prepare(cp, state, fs, mode, counter, fs_in, fs_in_stride,
+                           fs_out, frag_coord, discard_mask, front_face,
+                           coverage, fused_interp, interp_inline, batch_rows,
+                           &prep)) {
+      if (launched)
+         *launched = NULL;
+      return false;
+   }
+   return cp_fs_launch_prepared(cp, fs, &prep, num_threads, ev_before,
+                                launched);
+}
+
+/*
  * Run the fragment shader over every pixel the rasterizer covered.
  *
  * Three launches: gather the shader's inputs (which also compacts the covered
  * pixels into a list), run the shader itself one thread per covered pixel, and
  * blend its output into the colour attachment.
+ *
+ * In two halves, because the host work and the launches want to happen at
+ * different points on the stream.
  */
-void
-cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
-                   const struct cp_render_scope *scope,
-                   const struct cp_draw_call *info,
-                   CUdeviceptr visbuf, CUdeviceptr positions,
-                   CUdeviceptr vs_output_buf, CUdeviceptr prim_refs,
-                   unsigned num_triangles,
-                   unsigned w, unsigned h, void *color_data,
-                   float vp_scale_x, float vp_scale_y,
-                   float vp_trans_x, float vp_trans_y,
-                   float depth_scale, float depth_translate,
-                   CUdeviceptr reject, CUdeviceptr resolved,
-                   unsigned reject_pass, CUdeviceptr seg_ranges,
-                   unsigned num_seg_ranges, bool prim_keyed_visbuf)
+
+/*
+ * Everything the direct shade chain settles on the host, held between the
+ * reservation of its two argument blocks and the launches that read them.
+ *
+ * The chain uploads two blocks: the fused-interpolation block, which
+ * cp_fs_compact takes by value and the shader reads from memory, and the
+ * shader's own argument block. Written where they are read, each one leaves a
+ * span owed in the upload ring that the next launch's flush turns into a
+ * host-to-device copy standing in the stage3 -> compaction and
+ * compaction -> shader links. Split in two, a caller can reserve, write and
+ * close both blocks before it issues the rasterizer, and the flush that
+ * carries them is one the caller was performing anyway.
+ *
+ * Nothing here may be written after the flush that sends it, so every field
+ * of both blocks is settled in cp_shade_prepare() and read-only afterwards;
+ * the launch half only names them.
+ */
+struct cp_shade_prep {
+   const struct cp_draw_state *state;
+   const struct cp_render_scope *scope;
+   CUdeviceptr visbuf;
+   CUdeviceptr vs_output_buf;
+   unsigned num_triangles;
+   unsigned w, h;
+   void *color_data;
+   CUdeviceptr reject, resolved;
+   unsigned reject_pass;
+   bool prim_keyed_visbuf;
+
+   unsigned num_fs_inputs, num_vs_outputs;
+   unsigned max_pixels, fs_in_stride, fs_out_stride;
+   CUdeviceptr pixel_list, counter, fs_in, fs_out, coverage, frag_coord;
+   CUdeviceptr discard_mask, front_face, batch_rows, dbg_slot;
+
+   /* Uploaded, or carried by value into cp_fs_compact. */
+   struct cp_fs_interp_args interp;
+   CUdeviceptr inshader_interp_dev;
+   bool interp_inline;
+   bool inshader_ready;
+
+   /* The second block, and which execution reads it. `fs_args_ready` says
+    * whether it has been reserved yet: a caller with an earlier launch to
+    * hang it on asks for it up front, and one without leaves it to
+    * cp_shade_run(), which reserves it exactly where the launch does. */
+   enum cp_shader_exec_mode fs_mode;
+   bool fs_args_ready;
+   struct cp_fs_launch fs;
+};
+
+/*
+ * Reserve and write everything the shade chain's kernels read from memory,
+ * without issuing any of them.
+ *
+ * `hoist_fs_args` reserves the shader's argument block here too. Without it
+ * only the interpolation block is reserved and the shader's is left to
+ * cp_shade_run(), which takes it after the compaction has been launched --
+ * where it always was, and where CUDAVK_NO_ARGBLOCK_HOIST puts it back.
+ *
+ * Returns false when this draw has no fragment stage to run, or when a
+ * reservation was refused -- in both cases nothing is left to launch, which
+ * is what cp_shade_fragments() did at the same points.
+ */
+static bool
+cp_shade_prepare(struct cp_context *cp, const struct cp_draw_state *state,
+                 const struct cp_render_scope *scope,
+                 const struct cp_draw_call *info,
+                 CUdeviceptr visbuf, CUdeviceptr positions,
+                 CUdeviceptr vs_output_buf, CUdeviceptr prim_refs,
+                 unsigned num_triangles,
+                 unsigned w, unsigned h, void *color_data,
+                 float vp_scale_x, float vp_scale_y,
+                 float vp_trans_x, float vp_trans_y,
+                 float depth_scale, float depth_translate,
+                 CUdeviceptr reject, CUdeviceptr resolved,
+                 unsigned reject_pass, CUdeviceptr seg_ranges,
+                 unsigned num_seg_ranges, bool prim_keyed_visbuf,
+                 bool hoist_fs_args, struct cp_shade_prep *prep)
 {
    struct cp_device *screen = cp->dev;
    struct cp_shader_binary *fs = state->fs;
+
+   memset(prep, 0, sizeof(*prep));
 
    bool have_fs = cp_shader_has_standalone_exec(fs);
    if (!have_fs || !vs_output_buf || !state->vs ||
@@ -3970,7 +4113,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
                  fs ? (void *)fs->exec[CP_SHADER_EXEC_FUSED].kernel : NULL,
                  fs ? (void *)fs->exec[CP_SHADER_EXEC_INLINE].kernel : NULL,
                  (void *)(uintptr_t)vs_output_buf, (void *)state->vs);
-      return;
+      return false;
    }
 
    unsigned num_fs_inputs = MIN2(fs->nir_num_inputs, CP_MAX_FS_INPUTS);
@@ -4016,7 +4159,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
    if (!pixel_list || !counter || !fs_in || !fs_out || !coverage || !frag_coord ||
        (fs->uses_discard && !discard_mask) ||
        (fs->reads_front_face && !front_face))
-      return;
+      return false;
 
    /*
     * These two are read where they were not written, so they have to start
@@ -4074,11 +4217,11 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       if (!cp->fs_batch.slices) {
          fprintf(stderr, "cudavk: a batch of %u has no slice table; refusing "
                  "to shade it\n", cp->fs_batch.ndraws);
-         return;
+         return false;
       }
       batch_rows = cp_scratch_alloc_device(cp, (size_t)max_pixels * 4);
       if (!batch_rows)
-         return;
+         return false;
       interp.out_batch_rows = batch_rows;
       interp.draw_slices = cp->fs_batch.slices;
       interp.num_draw_slices = cp->fs_batch.ndraws;
@@ -4124,7 +4267,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
    bool use_hw_inline = compact_available &&
       cp_texture_cache_available(cp, state, fs, false);
    if (cp->hardware_texture.fatal)
-      return;
+      return false;
    bool allow_inshader = compact_available &&
       (use_hw_inline || (!cp_debug->no_inline_fs &&
        (!cp_debug->no_fused_interp || cp_debug->force_fused_fs)));
@@ -4181,7 +4324,96 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
    }
    bool inshader_ready = interp_inline || inshader_interp_dev;
 
-   void *interp_params[] = { &interp };
+
+   enum cp_shader_exec_mode fs_mode = inshader_ready
+      ? inshader_mode : CP_SHADER_EXEC_CLASSIC;
+
+   /*
+    * The shader's argument block, beside the interpolation block above so
+    * that both are owed to the same flush -- which is what lets a caller who
+    * prepares before its own rasterizer launch leave neither of the shade
+    * chain's two links carrying a copy. Declined, it is taken in
+    * cp_shade_run() at the point the launch always took it.
+    */
+   if (hoist_fs_args) {
+      if (!cp_fs_args_prepare(cp, state, fs, fs_mode, counter, fs_in,
+                              fs_in_stride, fs_out, frag_coord, discard_mask,
+                              front_face, coverage, inshader_interp_dev,
+                              interp_inline ? &interp : NULL, batch_rows,
+                              &prep->fs))
+         return false;
+      prep->fs_args_ready = true;
+   }
+
+   prep->state = state;
+   prep->scope = scope;
+   prep->visbuf = visbuf;
+   prep->vs_output_buf = vs_output_buf;
+   prep->num_triangles = num_triangles;
+   prep->w = w;
+   prep->h = h;
+   prep->color_data = color_data;
+   prep->reject = reject;
+   prep->resolved = resolved;
+   prep->reject_pass = reject_pass;
+   prep->prim_keyed_visbuf = prim_keyed_visbuf;
+   prep->num_fs_inputs = num_fs_inputs;
+   prep->num_vs_outputs = num_vs_outputs;
+   prep->max_pixels = max_pixels;
+   prep->fs_in_stride = fs_in_stride;
+   prep->fs_out_stride = fs_out_stride;
+   prep->pixel_list = pixel_list;
+   prep->counter = counter;
+   prep->fs_in = fs_in;
+   prep->fs_out = fs_out;
+   prep->coverage = coverage;
+   prep->frag_coord = frag_coord;
+   prep->discard_mask = discard_mask;
+   prep->front_face = front_face;
+   prep->batch_rows = batch_rows;
+   prep->dbg_slot = dbg_slot;
+   prep->interp = interp;
+   prep->inshader_interp_dev = inshader_interp_dev;
+   prep->interp_inline = interp_inline;
+   prep->inshader_ready = inshader_ready;
+   prep->fs_mode = fs_mode;
+   return true;
+}
+
+/*
+ * Issue the chain: the compaction (or the classic interpolator), the shader
+ * against the block cp_shade_prepare() reserved, and the writeback.
+ */
+static void
+cp_shade_run(struct cp_context *cp, struct cp_shade_prep *prep)
+{
+   struct cp_device *screen = cp->dev;
+   const struct cp_draw_state *state = prep->state;
+   const struct cp_render_scope *scope = prep->scope;
+   struct cp_shader_binary *fs = state->fs;
+   const struct cp_fs_interp_args *interpp = &prep->interp;
+   CUdeviceptr visbuf = prep->visbuf;
+   CUdeviceptr vs_output_buf = prep->vs_output_buf;
+   unsigned num_triangles = prep->num_triangles;
+   unsigned w = prep->w, h = prep->h;
+   void *color_data = prep->color_data;
+   CUdeviceptr reject = prep->reject, resolved = prep->resolved;
+   unsigned reject_pass = prep->reject_pass;
+   bool prim_keyed_visbuf = prep->prim_keyed_visbuf;
+   unsigned num_fs_inputs = prep->num_fs_inputs;
+   unsigned num_vs_outputs = prep->num_vs_outputs;
+   unsigned max_pixels = prep->max_pixels;
+   unsigned fs_in_stride = prep->fs_in_stride;
+   unsigned fs_out_stride = prep->fs_out_stride;
+   CUdeviceptr pixel_list = prep->pixel_list;
+   CUdeviceptr counter = prep->counter;
+   CUdeviceptr fs_in = prep->fs_in, fs_out = prep->fs_out;
+   CUdeviceptr coverage = prep->coverage, frag_coord = prep->frag_coord;
+   CUdeviceptr discard_mask = prep->discard_mask;
+   CUdeviceptr dbg_slot = prep->dbg_slot;
+   bool inshader_ready = prep->inshader_ready;
+
+   void *interp_params[] = { &prep->interp };
    {
       /* Scoped rather than pushed and popped, because the launch check below
        * returns out of the middle of it. */
@@ -4195,12 +4427,13 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
        * The compaction's wait is its first instruction, so it may claim any
        * kernel as its predecessor (CP_PDL_ANY): the last rasterizer stage on
        * the plain path, the previous group's writeback in an episode. Where
-       * a clear or a copy sits in the link — the interpolation-block upload
-       * unless CUDAVK_INTERP_INLINE moved it, the discard-mask clear, a
-       * range-table upload — the epoch check declines the attribute and the
-       * launch stays ordinary. Both flags default off: the measured story is
-       * in their registry entries. The classic interpolator carries no wait
-       * and must not claim one.
+       * a clear or a copy sits in the link — a range-table upload, and until
+       * the hoist the interpolation-block upload and the discard-mask clear —
+       * the epoch check declines the attribute and the launch stays ordinary.
+       * With the argument-block hoist on, a direct shade leaves that link
+       * empty, so CUDAVK_COMPACT_PDL has something to take; it is still off
+       * by default, and DEAD_ENDS 26 is what it has to beat. The classic
+       * interpolator carries no wait and must not claim one.
        */
       CUresult interp_err;
       if (inshader_ready && cp_debug->compact_pdl)
@@ -4225,14 +4458,22 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
     * early for threads beyond it. This avoids a sync just to read the count. */
    unsigned num_pixels = max_pixels;
 
-   enum cp_shader_exec_mode fs_mode = inshader_ready
-      ? inshader_mode : CP_SHADER_EXEC_CLASSIC;
+   /* Not hoisted: reserve the shader's argument block here, between the
+    * compaction's launch and the shader's, which is where it sat before the
+    * two halves were separated. Its flush copy stands in this link. */
+   if (!prep->fs_args_ready) {
+      if (!cp_fs_args_prepare(cp, state, fs, prep->fs_mode, counter, fs_in,
+                              fs_in_stride, fs_out, frag_coord, discard_mask,
+                              prep->front_face, coverage,
+                              prep->inshader_interp_dev,
+                              prep->interp_inline ? &prep->interp : NULL,
+                              prep->batch_rows, &prep->fs))
+         return;
+      prep->fs_args_ready = true;
+   }
+
    CUfunction fs_kernel = NULL;
-   if (!cp_fs_launch_shader(cp, state, fs, fs_mode, counter, fs_in,
-                            fs_in_stride, fs_out, frag_coord, discard_mask,
-                            front_face, coverage, inshader_interp_dev,
-                            interp_inline ? &interp : NULL, num_pixels,
-                            0, batch_rows, &fs_kernel))
+   if (!cp_fs_launch_prepared(cp, fs, &prep->fs, num_pixels, 0, &fs_kernel))
       return;
    cp_stage_end(cp, CP_STAGE_FRAGMENT);
 
@@ -4428,7 +4669,7 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
       }
       for (unsigned i = 0; i < num_fs_inputs; i++)
          fprintf(stderr, "  fs_in[%u] <- vs slot %d (loc %u)\n", i,
-                 interp.input_vs_slot[i], fs->in_location[i]);
+                 interpp->input_vs_slot[i], fs->in_location[i]);
       const uint32_t *plist = plist_buf;
       const float *fin = fin_buf;
       const float *fout = fout_buf;
@@ -4463,6 +4704,38 @@ cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
    }
 
 }
+
+/*
+ * Prepare and run at the same point, which is what every caller did before
+ * the reservations could be hoisted, and what a caller with no earlier launch
+ * of its own still wants.
+ */
+void
+cp_shade_fragments(struct cp_context *cp, const struct cp_draw_state *state,
+                   const struct cp_render_scope *scope,
+                   const struct cp_draw_call *info,
+                   CUdeviceptr visbuf, CUdeviceptr positions,
+                   CUdeviceptr vs_output_buf, CUdeviceptr prim_refs,
+                   unsigned num_triangles,
+                   unsigned w, unsigned h, void *color_data,
+                   float vp_scale_x, float vp_scale_y,
+                   float vp_trans_x, float vp_trans_y,
+                   float depth_scale, float depth_translate,
+                   CUdeviceptr reject, CUdeviceptr resolved,
+                   unsigned reject_pass, CUdeviceptr seg_ranges,
+                   unsigned num_seg_ranges, bool prim_keyed_visbuf)
+{
+   struct cp_shade_prep prep;
+   if (!cp_shade_prepare(cp, state, scope, info, visbuf, positions,
+                         vs_output_buf, prim_refs, num_triangles, w, h,
+                         color_data, vp_scale_x, vp_scale_y, vp_trans_x,
+                         vp_trans_y, depth_scale, depth_translate, reject,
+                         resolved, reject_pass, seg_ranges, num_seg_ranges,
+                         prim_keyed_visbuf, false, &prep))
+      return;
+   cp_shade_run(cp, &prep);
+}
+
 
 
 bool
@@ -6139,6 +6412,12 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
    bool depth_commit = !color_data && fb->has_zs &&
                        state->depth.depth_writemask;
 
+   /* Whether the fragment stage runs at all, which decides both where the
+    * shade chain is issued and whether its argument blocks are worth
+    * reserving early. Nothing in the pass loop below changes any of the
+    * three. */
+   bool shade_this_draw = color_data || fs_side_effects || depth_commit;
+
    /*
     * Blended geometry needs every layer, not the nearest one. The visibility
     * buffer resolves a single fragment per pixel, which is what makes opaque
@@ -6919,6 +7198,49 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          rast_args.census_depth = pass == 0 ? census_depth_buf : 0;
       }
 
+      /*
+       * The shade chain's two argument blocks, reserved, written and closed
+       * here rather than where the kernels that read them are launched.
+       *
+       * cp_upload_begin() leaves a block owed and the next cp_launch() flushes
+       * the owed span, so a block written between two launches turns into a
+       * host-to-device copy standing in the link between them. Written where
+       * they are read, these two put one copy in the stage 3 -> cp_fs_compact
+       * link and one in the cp_fs_compact -> shader link — the two links this
+       * chain cannot overlap anything with, since it is one stream and the
+       * device paces it. Closed here, their bytes are owed to the flush the
+       * first rasterizer launch below performs, and the shade chain issues
+       * nothing but kernels.
+       *
+       * It has to be *closed* here, not merely begun: an open reservation
+       * holds the flush watermark back (see cp_upload_begin_checked), so a
+       * block still open at the rasterizer launch would hold that launch's
+       * own arguments back with it.
+       *
+       * Not for an appending segment: this pass ends at cp_pass_record_segment
+       * below and shades nothing, so preparing would reserve and upload for a
+       * chain that never runs. Both of that path's exits are above and below
+       * this point and both test the same condition.
+       */
+      struct cp_shade_prep shade_prep;
+      bool shade_prepped = false;
+      bool shade_hoisted = false;
+      if (shade_this_draw && !cp_debug->no_argblock_hoist &&
+          !(cp->pass.appending && cp->pass.opaque)) {
+         shade_hoisted = true;
+         shade_prepped =
+            cp_shade_prepare(cp, state, &batch->scope, info, visbuf,
+                             rast_args.positions, vs_output_buf,
+                             rast_args.prim_refs, num_triangles, w, h,
+                             color_data,
+                             vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
+                             rast_args.depth_scale, rast_args.depth_translate,
+                             retry ? cp->reject : 0,
+                             retry ? cp->resolved : 0,
+                             pass, 0, 0,
+                             rast_args.blend_peel != 0, true, &shade_prep);
+      }
+
       /* Both counters in one call; they are adjacent for this reason. The
        * memset is enqueued on the default stream, so it serializes properly
        * with the preceding pass's kernels. A reusing pass keeps the counts
@@ -6951,6 +7273,18 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
              !cp_flush_pending_clip(cp, screen, &pending_clip)) {
             cp_restore_preclip(&pending_clip, &rast_args, &vs_output_buf,
                                &rast_num_triangles, &cp->fs_batch.prim_shift);
+            /*
+             * Both the fused chain and the classic clip were refused, so the
+             * geometry the shade chain will read is the unclipped buffer
+             * again — which is not what the blocks reserved above describe.
+             * Drop them and let the shade below build its own; the bytes
+             * already owed are harmless and this is a double launch failure.
+             */
+            if (shade_prepped) {
+               cp_texture_cache_unpin(cp);
+               shade_prepped = false;
+            }
+            shade_hoisted = false;
          }
       }
       void *s1_params[] = { &rast_args, &rast_queues };
@@ -7056,17 +7390,28 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
        * for a colour, just the first two. A depth-only pass runs it for a
        * third reason: the writeback at the end of it is what commits depth,
        * and the shader has to run first because it may discard. */
-      if (color_data || fs_side_effects || depth_commit)
-         cp_shade_fragments(cp, state, &batch->scope, info, visbuf,
-                            rast_args.positions, vs_output_buf,
-                            rast_args.prim_refs, num_triangles, w, h,
-                            color_data,
-                            vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
-                            rast_args.depth_scale, rast_args.depth_translate,
-                            retry ? cp->reject : 0,
-                            retry ? cp->resolved : 0,
-                            pass, 0, 0,
-                            rast_args.blend_peel != 0);
+      /*
+       * Prepared above the rasterizer, or here — where the reservations sat
+       * before the hoist, and where CUDAVK_NO_ARGBLOCK_HOIST puts them back.
+       * A hoisted preparation that refused is a refusal to shade: every one
+       * of its exits is settled before the rasterizer runs and none of them
+       * changes its mind afterwards.
+       */
+      if (shade_this_draw) {
+         if (shade_prepped)
+            cp_shade_run(cp, &shade_prep);
+         else if (!shade_hoisted)
+            cp_shade_fragments(cp, state, &batch->scope, info, visbuf,
+                               rast_args.positions, vs_output_buf,
+                               rast_args.prim_refs, num_triangles, w, h,
+                               color_data,
+                               vp_scale_x, vp_scale_y, vp_trans_x, vp_trans_y,
+                               rast_args.depth_scale, rast_args.depth_translate,
+                               retry ? cp->reject : 0,
+                               retry ? cp->resolved : 0,
+                               pass, 0, 0,
+                               rast_args.blend_peel != 0);
+      }
 
       if (peel) {
          /* Step past what this pass blended, and stop once the interval finds
