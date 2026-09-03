@@ -58,6 +58,12 @@
 #include "vk_sync.h"
 #include "util/timespec.h"
 
+/* The enqueue epoch only, not the census interception: this file's one stream
+ * operation has to be visible to CUDAVK_VS_LANE's "nothing was issued in
+ * between" check, because a semaphore wait enqueued between two batches is
+ * exactly the ordering a run-ahead vertex shader must not step over. */
+#include "cp_devop.h"
+
 struct cpvk_sync {
    struct vk_sync vk;
    mtx_t lock;
@@ -216,6 +222,7 @@ cpvk_sync_gpu_wait(struct vk_device *device, struct vk_sync *vk_sync,
    /* The reference above is what makes this safe outside the lock: the sync
     * may be reset or destroyed by another thread while the event is being
     * enqueued, and the event still exists until this unref. */
+   cp_devop_note();
    CUresult r = cuStreamWaitEvent(stream, ev->event, CU_EVENT_WAIT_DEFAULT);
    cpvk_cuevent_unref(cpvk_device_from_vk(device), ev);
    return r == CUDA_SUCCESS;

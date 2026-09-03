@@ -68,8 +68,8 @@ cp_context_init(struct cp_context *cp, struct cp_device *dev)
    /*
     * Arm the predecessor epoch only when a PDL launch can actually happen:
     * the flag is on AND the modules were built with the waits. When it is off
-    * the interception in cp_smallop_tele.h is one predictable branch, the
-    * same shape as the upload census next to it. Never cleared, because a
+    * the interception in cp_smallop_tele.h costs the enqueue epoch's one
+    * relaxed increment and nothing else. Never cleared, because a
     * second context on an older device must not switch off the checking the
     * first one relies on.
     */
@@ -555,8 +555,7 @@ cp_launch_after(struct cp_context *cp, CUfunction f,
       return err;
    cp->launches++;
 
-   uint64_t epoch = cp_pdl_watch ?
-      __atomic_load_n(&cp_pdl_epoch, __ATOMIC_RELAXED) : 0;
+   uint64_t epoch = cp_devop_now();
    /* CP_PDL_ANY drops the identity comparison and nothing else; see the
     * macro's comment for why that is sound only for a secondary whose wait is
     * its first instruction. */
@@ -940,6 +939,12 @@ cp_plan_report(struct cp_context *cp)
               100.0 * (double)cp->pdl_taken /
                  (double)(cp->pdl_taken + cp->pdl_declined),
               cp->pdl_declined, cp->pdl_failed ? ", driver refused" : "");
+   /* The lane fires per batch or not at all, and a run where it never fired
+    * looks exactly like a run without the flag. */
+   if (cp->vslane.taken + cp->vslane.refused)
+      fprintf(stderr, "cudavk: vertex lane: %" PRIu64 " batches ran their "
+              "vertex shader on the side stream, %" PRIu64 " refused\n",
+              cp->vslane.taken, cp->vslane.refused);
    if (cp->plan.plan_hits + cp->plan.plan_misses)
       fprintf(stderr, "cudavk: batch plan answered %" PRIu64 " of %" PRIu64
               " merge decisions (%.1f%%)\n", cp->plan.plan_hits,
@@ -1092,6 +1097,17 @@ cp_context_cleanup(struct cp_context *cp)
    }
    if (cp->pass_gate)
       cuEventDestroy(cp->pass_gate);
+   /* The vertex lane's marks and its two output buffers. The context was
+    * synchronised at the top of this function, so nothing is under them. */
+   for (unsigned i = 0; i < 2; i++) {
+      if (cp->vslane.gate[i])
+         cuEventDestroy(cp->vslane.gate[i]);
+      if (cp->vslane.slot[i])
+         cuMemFree(cp->vslane.slot[i]);
+   }
+   if (cp->vslane.done)
+      cuEventDestroy(cp->vslane.done);
+   memset(&cp->vslane, 0, sizeof(cp->vslane));
    if (cp->stream)
       cuStreamDestroy(cp->stream);
    if (cp->upload_host)
@@ -5286,6 +5302,319 @@ cp_restore_preclip(const struct cp_pending_clip *clip,
    *fs_prim_shift = clip->fs_prim_shift;
 }
 
+
+/* ---- CUDAVK_VS_LANE: the vertex shader on a side stream ---------------- */
+
+/*
+ * A direct batch's whole chain runs on the main stream, so batch k+1's vertex
+ * shader cannot start until batch k's last fragment kernel has finished --
+ * although it reads nothing that batch k writes. Issuing that one launch on
+ * one of the pass side streams instead lets the two overlap, and joining the
+ * lane back before the clip leaves every other stage exactly where it was.
+ *
+ * The dependency set, which is the whole of this feature. Batch k+1 may not
+ * run any of these ahead of batch k's shade chain:
+ *
+ *   - raster stage 1 reads cp->depthbuf, which cp_fs_writeback writes for the
+ *     samples batch k's fragments won;
+ *   - stage 1 writes cp->visbuf, the single per-context visibility buffer
+ *     that batch k's cp_fs_compact is still reading;
+ *   - stage 1 appends into cur_qset, which batch k's stages 2 and 3 drain;
+ *   - stage 1 reads cp->reject, which batch k's writeback fills for the
+ *     discard-retry passes.
+ *
+ * The vertex shader touches none of them. What it does touch, and what this
+ * code exists to keep disjoint:
+ *
+ *   1. Its output buffer. cp->dscratch rewinds to zero at every batch, so
+ *      batch k+1's allocations alias batch k's live buffers, and on one
+ *      stream that is safe only because the stream serialises. The lane's
+ *      output comes from cp->vslane.slot[] instead -- two buffers, used by
+ *      alternate lane batches (see cp_vslane_output).
+ *   2. Its argument rows in the upload arena. They are reserved after the
+ *      previous batch's chain was issued -- cpvk_execute_draw_cmd() flushes
+ *      the previous batch before cpvk_prepare_draw() reserves anything for
+ *      this one -- so at the switch they are still owed, and
+ *      cp_stream_set_carry() sends them on the lane in front of the shader
+ *      that reads them. A flush that had already sent them on the main
+ *      stream would be a hazard, and moves the epoch, so the mark below
+ *      refuses the lane instead.
+ *   3. The queue counters. Under fetch_fold the fused shader zeroes
+ *      cur_qset.counts, which batch k's stages 2 and 3 are still reading. A
+ *      lane batch therefore does not fold: it takes the CUDAVK_NO_FETCH_FOLD
+ *      path for itself, where the raster pass clears the three words on the
+ *      main stream, in front of its own stage 1 and behind batch k's drain.
+ *      No new code and no new kernel; the cost is one 3-word clear per lane
+ *      batch, which CUDAVK_NO_FETCH_FOLD prices from above.
+ *
+ * Ordering in the other direction is one event. cp->vslane.gate[] is recorded
+ * on the main stream at the top of every batch, before any of that batch's
+ * work, and the lane waits on the mark the *previous* batch recorded: every
+ * copy, clear, dispatch, semaphore wait and kernel the main stream had issued
+ * before batch k is therefore complete before the lane starts, and only batch
+ * k's own chain is overlapped. That is only true while nothing else was
+ * enqueued between the mark and the launch, which is what the device-op mark
+ * below checks rather than asserts -- cp->launches counts kernels and
+ * cp_devop_epoch counts everything else.
+ *
+ * The same mark is what makes two output slots enough. The lane shader of
+ * batch j waits on the mark recorded at the top of batch j-1, which sits
+ * behind the entire chain of batch j-2 -- the last batch to have used the
+ * slot j is about to overwrite.
+ *
+ * Every path out of cp_draw_execute_batch() has joined the lane, so nothing
+ * outside this file can see it: the arena generations, cp_scratch_reset(),
+ * the submit completion events and cp_flush() all reason about the main
+ * stream, and the main stream waits for the lane before the clip.
+ */
+
+static void cp_pass_streams_init(struct cp_context *cp);
+
+/* What the main stream had enqueued at some point of a batch. */
+struct cp_devop_mark {
+   uint64_t launches;   /* kernels: cp_launch() is the only site */
+   uint64_t flushes;    /* coalesced upload copies actually issued */
+   uint64_t epoch;      /* every other enqueue; see cp_devop.h */
+};
+
+static struct cp_devop_mark
+cp_devop_mark_take(const struct cp_context *cp)
+{
+   struct cp_devop_mark m = { cp->launches, cp->upload.flushes,
+                              cp_devop_now() };
+   return m;
+}
+
+/*
+ * Whether nothing has been enqueued since `m`, allowing `clears` operations
+ * the caller can name. The allowance exists for one site: the visibility and
+ * depth clears at the top of a batch, which the vertex shader does not read.
+ */
+static bool
+cp_devop_quiet_since(const struct cp_context *cp, struct cp_devop_mark m,
+                     unsigned clears)
+{
+   return cp->launches == m.launches && cp->upload.flushes == m.flushes &&
+          cp_devop_now() - m.epoch <= clears;
+}
+
+/*
+ * The lane's stream: the last of the episode side streams.
+ *
+ * Any of the eight would be correct -- the lane's ordering is the two events
+ * and nothing else -- and this is the least contended one: cp_opaque_append()
+ * only reaches it at its eighth segment and cp_pass_append() at its seventh,
+ * so on a frame of one- and two-segment episodes nothing else has queued
+ * anything on it. Reusing them rather than creating a ninth stream keeps the
+ * teardown, the failure path and the "episodes run on the main stream"
+ * fallback in one place.
+ */
+static CUstream
+cp_vslane_stream(const struct cp_context *cp)
+{
+   return cp->seg_streams[CP_PASS_STREAMS - 1];
+}
+
+/*
+ * Three exclusions, and each of them is a correctness exclusion rather than a
+ * performance one.
+ *
+ * Without upload coalescing cp_upload_end() copies every block the moment it
+ * is written, on whatever stream is current -- the main one during recording.
+ * The lane's shader would then read rows whose copy it is not ordered behind,
+ * which is the corruption cp_pass_gate_stream() describes.
+ *
+ * CUDAVK_DEBUG_TIME differences consecutive events recorded on cp->stream, and
+ * an interval that spans two streams means nothing; the opaque fan-out refuses
+ * itself for the same reason.
+ *
+ * CUDAVK_DEBUG_VFETCH synchronises inside the vertex block to read the packed
+ * input back, and the classic fetch it traces is not on this path anyway.
+ */
+static bool
+cp_vslane_available(const struct cp_context *cp)
+{
+   return cp_debug->vs_lane && !cp_debug->no_upload_coalesce &&
+          !cp_timing_enabled() && !cp_debug->debug_vfetch;
+}
+
+/*
+ * Mark the main stream at the top of a batch, and decide whether the previous
+ * batch's mark still stands for everything issued before that batch.
+ *
+ * Deliberately not a flush point. The owed span at this moment is this
+ * batch's own uniform rows, and they have to reach the lane rather than the
+ * main stream; recording the mark in front of them is what lets the lane
+ * carry them.
+ */
+static void
+cp_vslane_arm(struct cp_context *cp, const struct cp_draw_batch *batch)
+{
+   cp->vslane.ready = false;
+   if (!cp_vslane_available(cp) || cp->pass.appending ||
+       cp->stream != cp->main_stream)
+      return;
+
+   cp_pass_streams_init(cp);
+   if (!cp_vslane_stream(cp))
+      return;
+
+   if (!cp->vslane.done &&
+       (cuEventCreate(&cp->vslane.done, CU_EVENT_DISABLE_TIMING) !=
+           CUDA_SUCCESS ||
+        cuEventCreate(&cp->vslane.gate[0], CU_EVENT_DISABLE_TIMING) !=
+           CUDA_SUCCESS ||
+        cuEventCreate(&cp->vslane.gate[1], CU_EVENT_DISABLE_TIMING) !=
+           CUDA_SUCCESS))
+      return;   /* whatever was created is destroyed at teardown */
+
+   /*
+    * Nothing enqueued since the previous batch left, and the previous batch
+    * is one this batch's vertex shader cannot be reading the output of: the
+    * same render scope, so its colour attachment is not something this draw
+    * may legally sample, and no shader of it wrote memory of its own. Those
+    * two are what the mark cannot say, because they are about what the
+    * overlapped batch wrote rather than about when it ran.
+    */
+   bool quiet = cp->vslane.gate_valid &&
+                cp->launches == cp->vslane.launches_at_end &&
+                cp_devop_now() == cp->vslane.epoch_at_end &&
+                cp->vslane.prev_scope_valid &&
+                !cp->vslane.prev_writes_memory &&
+                !memcmp(&cp->vslane.prev_scope, &batch->scope,
+                        sizeof(batch->scope));
+
+   unsigned rec = cp->vslane.gate_next;
+   if (cuEventRecord(cp->vslane.gate[rec], cp->stream) != CUDA_SUCCESS) {
+      cp->vslane.gate_valid = false;
+      return;
+   }
+   /* This batch waits on the mark the previous one recorded, and the next
+    * batch records into that same slot -- by then this batch's wait has been
+    * issued, and a wait captures the event where it was recorded. */
+   cp->vslane.gate_wait = rec ^ 1;
+   cp->vslane.gate_next = rec ^ 1;
+   cp->vslane.gate_valid = true;
+   cp->vslane.ready = quiet;
+   if (!quiet)
+      cp->vslane.refused++;
+}
+
+/* The main stream's tail as this batch leaves it. Anything enqueued between
+ * here and the next batch's mark makes that mark useless, and is what the
+ * comparison in cp_vslane_arm() is looking for. */
+static void
+cp_vslane_disarm(struct cp_context *cp, const struct cp_draw_batch *batch)
+{
+   const struct cp_draw_state *state = &batch->state;
+   cp->vslane.ready = false;
+   cp->vslane.launches_at_end = cp->launches;
+   cp->vslane.epoch_at_end = cp_devop_now();
+   cp->vslane.prev_scope = batch->scope;
+   cp->vslane.prev_scope_valid = true;
+   cp->vslane.prev_writes_memory =
+      (state->fs && state->fs->writes_memory) ||
+      (state->vs && state->vs->writes_memory);
+}
+
+/*
+ * The lane's output buffer for this batch.
+ *
+ * Grown like the device scratch arena and retired the same way: the buffer it
+ * replaces may still be under the previous lane shader, so it goes on the
+ * overflow list that cp_scratch_reset() frees once the whole context has
+ * drained. A full list refuses the lane instead of freeing anything early.
+ */
+static CUdeviceptr
+cp_vslane_output(struct cp_context *cp, size_t bytes)
+{
+   unsigned k = cp->vslane.slot_next & 1u;
+   if (cp->vslane.slot_size[k] >= bytes)
+      return cp->vslane.slot[k];
+   if (bytes > CP_SCRATCH_MAX_BYTES)
+      return 0;
+   if (cp->vslane.slot[k] &&
+       cp->dscratch.num_overflow >= ARRAY_SIZE(cp->dscratch.overflow))
+      return 0;
+
+   size_t want = MAX2(bytes, cp->vslane.slot_size[k] * 2);
+   want = MIN2(want, (size_t)CP_SCRATCH_MAX_BYTES);
+   CUdeviceptr base;
+   if (cp_mem_alloc_retry(cp, &base, want) != CUDA_SUCCESS)
+      return 0;
+   if (cp->vslane.slot[k])
+      cp->dscratch.overflow[cp->dscratch.num_overflow++] = cp->vslane.slot[k];
+   cp->vslane.slot[k] = base;
+   cp->vslane.slot_size[k] = want;
+   return base;
+}
+
+/* Switch to the lane, behind the previous batch's mark, carrying this batch's
+ * owed rows onto it. */
+static bool
+cp_vslane_enter(struct cp_context *cp)
+{
+   CUstream lane = cp_vslane_stream(cp);
+   if (cuStreamWaitEvent(lane, cp->vslane.gate[cp->vslane.gate_wait], 0) !=
+       CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return false;
+   }
+   if (cp_stream_set_carry(cp, lane) != CUDA_SUCCESS) {
+      /* The switch happened before the copy that failed. */
+      cp->stream = cp->main_stream;
+      return false;
+   }
+   return true;
+}
+
+/*
+ * Back to the main stream, which then waits for the shader.
+ *
+ * The owed span first and the event behind it, for the reason
+ * cp_pass_gate_stream() gives from the other side: an event recorded in front
+ * of a copy does not order the copy. Nothing is owed here in practice -- the
+ * launch flushed -- but the sequence is the one that stays correct if a later
+ * change reserves something between the two.
+ */
+static void
+cp_vslane_join(struct cp_context *cp)
+{
+   CUstream lane = cp->stream;
+   cp_stream_set(cp, cp->main_stream);
+   if (cuEventRecord(cp->vslane.done, lane) != CUDA_SUCCESS ||
+       cuStreamWaitEvent(cp->main_stream, cp->vslane.done, 0) != CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return;
+   }
+   cp->vslane.slot_next ^= 1u;
+   cp->vslane.taken++;
+}
+
+static void cp_draw_execute_batch_inner(struct cp_context *cp,
+                                        const struct cp_draw_batch *batch);
+
+/*
+ * The batch, with the vertex lane armed around it.
+ *
+ * The arming is here rather than inside because the body has two dozen early
+ * returns, and the mark the next batch reads has to be left behind by all of
+ * them. A stale mark cannot become unsafe: the comparison in cp_vslane_arm()
+ * only passes when nothing at all was enqueued since, and every path that
+ * returns early has recorded this batch's own mark, which moves the epoch.
+ */
+void
+cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
+{
+   if (!cp_debug->vs_lane) {
+      cp_draw_execute_batch_inner(cp, batch);
+      return;
+   }
+   cp_vslane_arm(cp, batch);
+   cp_draw_execute_batch_inner(cp, batch);
+   cp_vslane_disarm(cp, batch);
+}
+
 /*
  * Run one draw, or one batch of them, through the whole pipeline.
  *
@@ -5296,10 +5625,16 @@ cp_restore_preclip(const struct cp_pending_clip *clip,
  * before this existed — the batch fields are zero, and the code below reduces
  * to what it was.
  */
-void
-cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
+static void
+cp_draw_execute_batch_inner(struct cp_context *cp,
+                            const struct cp_draw_batch *batch)
 {
    cp->plan.flushes++;
+   /* Where the main stream stood when this batch began; see the vertex lane
+    * above. Nothing between here and the two clears below may enqueue
+    * anything, and the check after them says so. */
+   const struct cp_devop_mark vsl_top = cp_devop_mark_take(cp);
+   struct cp_devop_mark vsl_mark = vsl_top;
    if (cp_debug->debug_rt)
       fprintf(stderr, "exec-scope: serial=%u color=%p depth=%p\n",
               batch->scope.serial,
@@ -5478,6 +5813,20 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 
    if (!cp->depthbuf_cleared)
       cp_clear_depthbuf(cp, 1.0f);
+
+   /*
+    * The two clears above are the only device operations a batch issues
+    * before its vertex shader, and the shader reads neither the visibility
+    * buffer nor the depth buffer. Everything else -- an upload flush, a
+    * kernel, an event -- would break what the lane's mark stands for, so the
+    * allowance is exactly two and the mark for the launch site is taken
+    * here, behind them.
+    */
+   if (cp->vslane.ready && !cp_devop_quiet_since(cp, vsl_top, 2)) {
+      cp->vslane.ready = false;
+      cp->vslane.refused++;
+   }
+   vsl_mark = cp_devop_mark_take(cp);
 
    /* For now: read vertex positions directly from the first bound vertex buffer.
     * Assume positions are at offset 0 as float4 (x,y,z,w).
@@ -5823,8 +6172,6 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
          unsigned num_vs_outputs = state->vs->nir_num_outputs ? state->vs->nir_num_outputs : 2;
          unsigned out_stride = num_vs_outputs * 16;
 
-         vs_output_buf = cp_scratch_alloc_device(cp, (size_t)total_verts * out_stride);
-
          /*
           * Whether this draw's vertex shader gathers its own attributes.
           *
@@ -5844,6 +6191,36 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
             !cp_debug->debug_vfetch &&
             state->vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel &&
             state->num_vertex_elements <= CP_MAX_VERTEX_ELEMENTS_VF;
+
+         /*
+          * CUDAVK_VS_LANE, decided here because the shader's output buffer
+          * comes from somewhere else when it is taken -- see the lane's
+          * comment above cp_devop_mark_take() for why the device scratch
+          * arena cannot hold it.
+          *
+          * The fused form only. The classic path launches cp_vertex_fetch and
+          * clears the packed input buffer before the shader, so its lane
+          * would have to carry four more device outputs across two
+          * allocation-failure returns; the fused shader writes exactly one
+          * buffer, which is what makes the isolation argument a sentence
+          * rather than a list. It is also the default and the majority of
+          * these launches.
+          *
+          * A refusal here is silent and complete: everything below is what it
+          * was, on the main stream, with the seeding folded as usual.
+          */
+         bool vs_lane_out = fused_vfetch && cp->vslane.ready;
+         if (vs_lane_out) {
+            vs_output_buf =
+               cp_vslane_output(cp, (size_t)total_verts * out_stride);
+            /* No slot, no lane: the shader may not run there and write into
+             * the arena the next batch is about to rewind over. */
+            if (!vs_output_buf)
+               vs_lane_out = false;
+         }
+         if (!vs_output_buf)
+            vs_output_buf =
+               cp_scratch_alloc_device(cp, (size_t)total_verts * out_stride);
 
          /* Build VS input buffer on GPU: the vertex fetch kernel gathers
           * attributes in parallel, one thread per assembled vertex. */
@@ -6102,7 +6479,22 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
           * reverted for every admitted shader.
           */
          const bool vs_runs = total_verts > 0;
-         fetch_fold = !cp_debug->no_fetch_fold &&
+         /*
+          * A lane batch does not fold. The three words the seeding zeroes are
+          * cur_qset.counts, which the previous batch's stages 2 and 3 are
+          * still reading while the lane shader runs; taking the
+          * CUDAVK_NO_FETCH_FOLD arm for this batch alone puts their clear
+          * back on the main stream, in front of this batch's stage 1 and
+          * behind the previous batch's drain. That is the whole seed
+          * fallback: no new kernel, no new clear site, and the flag prices it
+          * from above by doing it for every batch.
+          *
+          * Read from vs_lane_out rather than from the launch site's final
+          * decision, which is later: a batch that suppresses the fold and
+          * then stays on the main stream pays a clear it did not need, which
+          * is a cost and not a hazard.
+          */
+         fetch_fold = !cp_debug->no_fetch_fold && !vs_lane_out &&
                       (fused_vfetch ? vs_runs : fetch_runs);
 
          /*
@@ -6496,10 +6888,40 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
                p_atomic_inc(&state->vs->vs_census->launches_fused);
          }
 
+         /*
+          * The lane, taken here and given back at the join below.
+          *
+          * The mark is re-checked because it is the launch that matters: the
+          * argument block above may have wrapped the upload ring, and a wrap
+          * flushes and drains. Nothing between the clears and this point may
+          * have been enqueued on the main stream, or the previous batch's
+          * mark no longer covers what this shader reads.
+          *
+          * A refusal costs the batch nothing but its overlap: the launch
+          * below is unchanged, on cp->stream, which is still the main one.
+          * The output buffer stays where it was allocated -- writing a lane
+          * slot from the main stream is ordered behind everything -- and the
+          * slot still rotates, so the two-batch reuse distance holds either
+          * way.
+          */
+         const bool vs_lane = vs_lane_out &&
+                              cp_devop_quiet_since(cp, vsl_mark, 0) &&
+                              cp_vslane_enter(cp);
+         if (vs_lane_out && !vs_lane) {
+            cp->vslane.refused++;
+            cp->vslane.slot_next ^= 1u;
+         }
+
          /* Compiled shaders grid-stride; see the fragment launch. */
          CUresult vs_err = cp_launch(cp, vs_exec->kernel,
             MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
             0, cp->stream, vs_params, NULL);
+
+         /* Whatever the launch did, the main stream owns the rest of this
+          * batch: the join is unconditional so that no path out of this
+          * function can leave work on the lane unordered. */
+         if (vs_lane)
+            cp_vslane_join(cp);
 
          if (vs_err == CUDA_SUCCESS) {
             /* The rasterizer reads positions directly from VS output */

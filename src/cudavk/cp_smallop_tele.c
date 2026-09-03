@@ -19,9 +19,10 @@
 
 bool cp_smallop_enabled = false;
 
-/* See cp_smallop_tele.h: the PDL predecessor epoch, armed by CUDAVK_PDL. */
+/* See cp_smallop_tele.h: CUDAVK_PDL arms the launch attribute. */
 bool cp_pdl_watch = false;
-uint64_t cp_pdl_epoch = 0;
+/* See cp_devop.h: the enqueue epoch, always counted. */
+uint64_t cp_devop_epoch = 0;
 
 #define CP_SMALLOP_SLOTS 512u
 

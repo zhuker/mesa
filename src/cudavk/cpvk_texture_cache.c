@@ -1,5 +1,6 @@
 #include "cpvk_private.h"
 #include "cp_debug.h"
+#include "cp_devop.h"
 #include "util/u_math.h"
 
 #include <inttypes.h>
@@ -287,6 +288,10 @@ cpvk_texture_cache_image_written(struct cpvk_image *image, CUstream stream)
       if (err != CUDA_SUCCESS)
          goto fail;
    }
+   /* Enqueued on the renderer's main stream, between draws. See cp_devop.h:
+    * every such operation has to move the epoch, or a side-lane vertex
+    * shader could be let past ordering this establishes. */
+   cp_devop_note();
    err = cuEventRecord(image->writer_event, stream);
    if (err != CUDA_SUCCESS)
       goto fail;
@@ -326,11 +331,18 @@ cpvk_cache_rebuild(struct cpvk_image *image, CUstream stream,
    struct cpvk_texture_cache *cache = image->texture_cache;
    CUresult err;
    if (image->writer_event_valid) {
+      cp_devop_note();
       err = cuStreamWaitEvent(stream, image->writer_event, 0);
       if (err != CUDA_SUCCESS)
          goto device_fail;
    }
 
+   /* One note for the whole rebuild: the conversion launches, the array
+    * copies and the ready record below are all enqueues on the caller's
+    * stream, and the epoch's readers ask whether any happened, not how
+    * many. This launch is the one cp_launch_audit.py exempts, so it is also
+    * the one launch cp->launches does not count. */
+   cp_devop_note();
    for (unsigned l = 0; l < image->vk.mip_levels; l++) {
       unsigned w = MAX2(image->vk.extent.width >> l, 1u);
       unsigned h = MAX2(image->vk.extent.height >> l, 1u);
@@ -647,6 +659,7 @@ cpvk_texture_cache_resolve_locked(struct cpvk_device *dev,
          break;
       }
    if (!memo_hit) {
+      cp_devop_note();
       CUresult err = cuStreamWaitEvent(stream, cache->ready, 0);
       if (err != CUDA_SUCCESS) {
          cpvk_cache_device_loss(dev);

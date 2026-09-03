@@ -210,6 +210,9 @@ struct cp_debug {
    bool no_opaque_episode;
    bool no_opaque_streams;
    bool no_episode_gate_once;
+   /* Opt-in, unlike the reverts around it: the vertex-shader side lane is off
+    * until it has been measured on both captures. See cp_vslane_arm(). */
+   bool vs_lane;
    /*
     * Programmatic dependent launch. `pdl` is a level, not a boolean: 0 off,
     * 1 the A-buffer scan chain, 2 the rasterizer stage links, 3 the fragment
