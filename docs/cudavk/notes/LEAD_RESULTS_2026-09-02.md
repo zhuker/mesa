@@ -11,6 +11,15 @@ the control arm.
 **Standing now**: favorite3 **5.940**, favorite2 **5.022** — a 11.0% and 8.4%
 reduction, with favorite2 within 0.022 ms of the 5.0 goal.
 
+**On the B200** the same set is worth more: favorite3 10.868 -> **9.883**
+(-0.985) and favorite2 8.961 -> **8.283** (-0.678), measured as a set with
+every switch reverted in the control arm, all twelve runs passing their gates.
+That is 2.5x and 9.7x the RTX gain, which is what these changes should do --
+they remove host-side serialisation and the B200 is the more latency-bound
+host. Its favorite2 heavy band overlapped (that host drifts 0.3-1.3 ms between
+sessions); every other band was disjoint. Individual attribution on the B200
+was not measured, only the set.
+
 ## Built and measured
 
 | lead | predicted | measured (f3 / f2) | verdict |
