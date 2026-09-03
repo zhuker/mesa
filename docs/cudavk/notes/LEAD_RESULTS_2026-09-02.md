@@ -22,8 +22,6 @@ reduction, with favorite2 within 0.022 ms of the 5.0 goal.
 | **F** VS run-ahead on a side lane | 0.3-0.5 heavy | **-0.3194 / -0.0475** | **LANDED** `a76d2926825` |
 | **G-ctx** record-only context scope | 0.07 | pair below | **LANDED** `3756a6d576f` |
 | **F-head** one `cuMemcpy3DAsync` per layered copy | 0.06-0.10 | pair: -0.0032 / -0.0351 | **LANDED** `1f97dffa4f7` |
-| **I** shadow visibility clears | 0.06-0.09 | — | **REFUTED from the code**: the 19 shadow "batches" are unbatchable single draws |
-| **L** long `cp_clip_rast_fused` launches | 0.2-0.4 | — | **REFUTED by ncu**: 48 active cycles in 10,869 elapsed; the duration is stream sharing, and summing it is summed concurrent time |
 
 Total landed: **-0.736 on favorite3, -0.458 on favorite2** (11.0% and 8.4%).
 The four later changes measured **-0.3908 / -0.0699 together**, sub-additive
