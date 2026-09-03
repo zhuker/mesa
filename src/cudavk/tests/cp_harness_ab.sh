@@ -19,7 +19,11 @@
 set -uo pipefail
 CAP=${1:?usage: cp_harness_ab.sh CAPTURE LABEL "CONTROL_ENV" ["CAND_ENV"] [ROUNDS]}
 LABEL=${2:?label}
-CTRL_ENV=${3:?control env, e.g. "CUDAVK_NO_FOO=1"}
+# An empty control arm is legitimate and common: control = shipping defaults,
+# candidate = one flag added. Requiring a non-empty string here rejected every
+# probe of that shape, so only the count is checked.
+[ $# -ge 3 ] || { echo 'usage: cp_harness_ab.sh CAPTURE LABEL "CONTROL_ENV" ["CAND_ENV"] [ROUNDS]' >&2; exit 2; }
+CTRL_ENV=$3
 CAND_ENV=${4:-}
 ROUNDS=${5:-3}
 MESA=${MESA:-$HOME/mesa}
