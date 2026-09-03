@@ -71,9 +71,11 @@ for CAP in favorite2 favorite3; do
   rm -rf "$OUT/raw"
 
   echo "[4/4] Building the page"
-  "$PY" "$FR" page "$OUT/frames" --submits "$OUT/timing/submits.txt" \
-      --capture "$CAP" --iteration "$ITER" \
-      --real-start "$REAL" --heavy-start "$HEAVY" -o "$OUT/index.html" || exit 1
+  # The same page cp_gfxr_timeline.sh builds -- chart, seek, frame view. Do not
+  # write another one: one timeline format for all four captures is the point.
+  "$PY" "$MESA/src/cudavk/tests/cp_gfxr_frames.py" timeline \
+      "$OUT/timing/submits.txt" "$OUT/frames" --per-frame 2 \
+      --title "$CAP - $ITER" -o "$OUT/index.html" || exit 1
 done
 
 "$PY" "$MESA/src/cudavk/tests/cp_timeline_index.py"

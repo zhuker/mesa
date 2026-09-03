@@ -366,11 +366,20 @@ def manifest_regions(dump_dir):
 
 
 def manifest_files(dump_dir):
-    """Dumped transfer filenames in replay order."""
+    """Dumped transfer filenames in replay order.
+
+    A gfxr replay writes a manifest naming every dumped transfer. The compiled
+    tocpp harnesses (favorite2/favorite3) write frame_NNNNNN.bin themselves and
+    have no manifest, so when there is none, fall back to the frame files in
+    name order -- which is replay order for that dump. This is what lets one
+    timeline page serve both kinds of capture.
+    """
     found = [f for f in os.listdir(dump_dir)
              if f.endswith("_dr.json") or f.endswith("_rd.json")]
     if not found:
-        return []
+        harness = sorted(f for f in os.listdir(dump_dir)
+                         if f.startswith("frame_") and f.endswith(".png"))
+        return harness
     try:
         doc = json.load(open(os.path.join(dump_dir, found[0])))
     except (ValueError, OSError):

@@ -37,24 +37,8 @@ def capture_row(path):
 
 
 def harness_row(path):
-    """A compiled-harness capture (favorite2/favorite3).
-
-    Same shape as capture_row, but the headline is the median over that
-    capture's own real-work window rather than the whole replay: these two
-    open with about 1,390 loading frames that are not the workload
-    (WORKFLOW.md 4.0), and a whole-replay median is dominated by them.
-    """
-    row = capture_row(path)
-    stats = os.path.join(path, "frames", "frames.json")
-    if row["exists"] and os.path.exists(stats):
-        try:
-            j = json.load(open(stats))["stats"]
-            row["median"] = j.get("median_real") or row["median"]
-            row["window"] = "real %d+" % j.get("real_start", 0)
-            row["pngs"] = j.get("frames", row["pngs"])
-        except (OSError, ValueError, KeyError):
-            pass
-    return row
+    """A compiled-harness capture (favorite2/favorite3): the same shape."""
+    return capture_row(path)
 
 
 def desc_for(label):
