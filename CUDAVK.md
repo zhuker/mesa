@@ -18,6 +18,7 @@ when the work started.
 |---|---|
 | build, install and use it from scratch | `docs/cudavk/GETTING_STARTED.md` |
 | pick up the performance work | `docs/cudavk/PERF_HANDOFF.md` |
+| see how the 2026-09-02 leads turned out | `docs/cudavk/notes/LEAD_RESULTS_2026-09-02.md` |
 | change the driver | `docs/cudavk/ARCHITECTURE.md` |
 | run a measured iteration | `docs/cudavk/WORKFLOW.md` |
 | know what is slow and what it costs to fix | `docs/cudavk/PERFORMANCE.md` |

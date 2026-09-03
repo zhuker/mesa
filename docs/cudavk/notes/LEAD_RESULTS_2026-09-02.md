@@ -1,0 +1,103 @@
+# Outcome ledger: the 2026-09-02 analysis leads
+
+`PERF_ANALYSIS_2026-09-02.md` proposed a ranked set of leads against a driver
+that the previous campaign had declared exhausted. This is what each one turned
+out to be worth when built and measured. Every figure below is an RTX 5090
+paired-submit median, each capture on its own window (`WORKFLOW.md` 3.1), from a
+three-round alternating A/B in one session with the change's own revert flag as
+the control arm.
+
+**Standing at the start**: favorite3 6.676, favorite2 5.480.
+**Standing now**: favorite3 **6.354**, favorite2 **5.121**.
+
+## Built and measured
+
+| lead | predicted | measured (f3 / f2) | verdict |
+|---|---|---|---|
+| **A** refuse un-appendable blended batches before the vertex work | 0.25-0.33 heavy, 0.20-0.28 light | **-0.2416 / -0.2355** | **LANDED** `f2fadd0c3b4` |
+| **C** record the opaque episode gate once | 0.13-0.19 heavy, 0.19-0.27 light | **-0.1045 / -0.1184** | **LANDED** `21de64eed0a` |
+| **B** hoist the shade chain's argument blocks above the rasterizer | 0.18-0.30 | **+0.0848 / +0.0446** | **REFUTED**, dead end 39 |
+
+Total landed: **-0.346 on favorite3, -0.354 on favorite2**, about 5.2% and 6.5%.
+
+### A — the failed-append back-out
+Blended batches that the A-buffer arm was certain to refuse were still admitted
+into a pass episode, ran vertex fetch, VS and clip on a side stream, backed
+out, forced a join of all eight side streams, and re-executed whole on the main
+stream. The code comment called it rare; it was **9.3 times per frame**. The
+refusal moved to `cp_pass_appendable()`, where every input to that decision
+except the triangle count is already known. Mechanism falsifier: side-stream
+`cp_clip_triangles` launches **9,400 -> 0**.
+
+### C — the episode gate
+Every side segment's gate was recorded on the main stream *after* segment 0's
+launch chain, so none could start until segment 0 finished. Recording it once
+after the episode's clears lets them overlap. Sized at a 0.434 ms/frame upper
+bound (13.94 episodes/frame, segment-0 chain 61.1 us, side burst 284.8 us);
+collected about a quarter of that. Required a switch-then-flush so each
+segment's uniform rows land on its own stream, bounded by a fail-safe mark.
+
+### B — the argument-block hoist
+The copies between `stage3 -> fs_compact -> FS` are the coalesced upload flush
+paying for blocks reserved after the previous launch: a copy-free dependent
+link is 0.26 us, the copied ones 3.55 and 3.65, at 44 and 66 per frame. Hoisting
+turned two copies into one and the frame got **slower**, on both captures, with
+disjoint arms — even with the `COMPACT_PDL` it unlocks. See dead end 39 for the
+rule it sharpened.
+
+## Not attempted, and why
+
+| lead | predicted | why not |
+|---|---|---|
+| F — VS run-ahead | 0.3-0.5 heavy | live; has a free probe (`CUDAVK_NO_FETCH_FOLD=1` prices its fallback) |
+| G — device-decided episodes | 0.2-0.4 realistic | live; the "oracle replay" prices it without building anything |
+| E' — full kernel-parameter ABI | 0.1-0.3 beyond B | B refuted; needs a `.local` census first |
+| I — fewer visibility-buffer clears | 0.06-0.09 whole | live, small |
+| D, E, F-head, G-ctx — memory residuals, submit head, context scope | 0.02-0.15 each | live, small; D/E/K want one page-fault trace |
+| L — long `cp_clip_rast_fused` launches | 0.2-0.4, unverified | needs one ncu pass on those launch ordinals |
+| §3.4 — application readback fence, scope count | 0.5-1.1 | outside the driver |
+
+The B-refutation's own next step — moving the clip's scratch allocations above
+the **vertex shader** launch, where a copy already exists on a host-paced link —
+is untested and is the only version of B worth building.
+
+## What the analysis got right, and wrong
+
+**Right, and this is the substantive point**: it found real structure in traces
+this campaign had already taken and read the other way. Leads A and C were both
+mechanisms nobody had seen, both confirmed exactly as described, and A's
+prediction (0.25-0.33 heavy) bracketed the measurement (0.27). Its central
+disagreement with the previous handoff — that the pools are per-launch fixed
+latency rather than "clock-bound arithmetic" — is supported by the ncu counters
+(0.5-15% of peak SM throughput, 3-25% occupancy).
+
+**Wrong in three places**, each verified here:
+1. Its section 1.1 per-frame counts divide by ~870 frames while the text claims
+   1,024, inflating every count there by ~16% (846 kernels against a measured
+   727.6). Its ms/frame figures do not carry the error.
+2. Its frame decomposition sums to 8.29 ms against the 7.17 ms frame it claims
+   to decompose.
+3. Lead B was predicted at 0.18-0.30 and measured a regression.
+
+**And one thing it caught that this project had gotten wrong**: dead end 37's
+"the UVM migration exists only under nsys 2026.1.3" was itself an artefact. The
+harness crashed in teardown on every run, dropping the final CUPTI buffer, so
+an entire activity class read as zero. Root-caused and fixed (see below); the
+refuted *mechanism* stays refuted, since that was decided by frame-time A/B.
+
+## Side effects of the work, which outlast the leads
+
+- **The favorite3 harness no longer crashes.** `favorite3.cpp` called
+  `vkDeviceWaitIdle` on a device `frame_0000_2908.cpp` had already destroyed,
+  under a comment asserting the capture never destroys it. That fault had been
+  discarding **23 lines of stdout, 8 shim timestamps and every trace's final
+  activity buffer** on every run since the harness was made. New gates: exit 0,
+  6,947 rows, hash `e4a60a71...`, no torn tail (`WORKFLOW.md` 3.1).
+- **99,999 was never a record cap** — it is one partial buffer flush. A clean
+  run records 169,040 UVM rows.
+- **`multithreading` is not bit-deterministic**: 20 runs give 20 hashes. Its
+  historical corruption is invisible to a hash gate and needs the 20-run
+  tolerance compare established here (baseline band: worst diff 2084-2089).
+- **`WORKFLOW.md` now documents how a measurement is actually run** — the
+  harnesses, their gates, the A/B recipe and the per-capture frame windows —
+  which existed only in session memory before.

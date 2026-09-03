@@ -12,8 +12,8 @@ window (WORKFLOW.md 4.0), all defaults, clean environment:
 
 | capture | RTX 5090 (sm_120) | B200 (sm_100) |
 |---|---:|---:|
-| favorite3 | **6.447** | 10.79 (pre-lead-A) |
-| favorite2 | **5.233** | 8.97 (pre-lead-A) |
+| favorite3 | **6.354** | 10.79 (pre-lead-A/C) |
+| favorite2 | **5.121** | 8.97 (pre-lead-A/C) |
 
 The RTX figures include the 2026-09-02 append prefilter (-0.24 on both
 captures). The B200 has not been re-measured since; its host was unreachable.
