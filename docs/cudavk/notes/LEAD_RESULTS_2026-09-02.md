@@ -72,10 +72,10 @@ rule it sharpened.
 
 | lead | predicted | state |
 |---|---|---|
-| **G** device-decided episodes (stop waiting on readbacks) | 0.2-0.4 realistic | live, and the largest remaining driver-side item. Its "oracle replay" probe prices it without building anything. Note it does **not** compose with F, which has now landed — with the VS lane hiding much of the host, G's ceiling is likely lower than 0.4 |
+| **G** device-decided episodes (stop waiting on readbacks) | 0.2-0.4 predicted, **unsized** | the last open driver-side item, and the only one not yet priced. It does **not** compose with F: the VS lane already hides much of the host time G was meant to recover, so its ceiling is below 0.4 and possibly below the 0.500 gate on its own. **Size it with the oracle-replay probe before building anything** — that is the rule entry 40 was just written to enforce |
 | **E'** full kernel-parameter ABI | 0.1-0.3 beyond B | needs a `.local` census of every generated kernel first; B2 already collected the host-side part without an ABI change |
 | **H** alpha-test retry convergence check | 0.03-0.08 heavy, ~0 whole | never attempted. Retry draws occur in about a third of frames, so it cannot move a whole-window median; it is a mean-only item |
-| **D, E, K** scratch tables out of managed memory, pin `peel_any` and staging, UBO ring | 0.02-0.15 each | live and small; all three want one page-fault nsys trace, which is now cheap because the harness no longer crashes |
+| ~~**D, E, K**~~ scratch tables out of managed memory, pin `peel_any` and staging, UBO ring | 0.02-0.15 each | **CLOSED** — `DEAD_ENDS` 40. The page-fault trace was taken and sized all three at once: total UM fault stall is **0.3735 ms/frame** for every managed buffer in the process, below the 0.500 gate before any of them is built, and 90% of it belongs to one 21.5 MB app allocation none of these three touch. Their real budget is **0.037** |
 | **§3.4** application readback fence, readback fill, scope count | 0.5-1.1 | outside the driver — the largest single remaining item anywhere, and it needs the application owner |
 
 ## What the analysis got right, and wrong
