@@ -279,8 +279,14 @@ ICD=~/mesa-worktree/build/src/cudavk/cudavk_devenv_icd.x86_64.json   cp_harness_
 It alternates the arms in one session, runs the gates on every run, and
 **refuses to print a median if any gate fails**. It also checks the ICD exists
 before starting, because a wrong build path silently produces twelve aborted
-runs that look like data. `cp_harness_timeline.sh` renders every frame of
-either capture to a page, the way `cp_make_timeline.sh` does for the gfxr pair.
+runs that look like data. `cp_harness_timeline.sh ITERATION` renders every frame of **both** compiled
+harnesses to a page, the way `cp_make_timeline.sh` does for the gfxr pair, and
+under the same contract: the label is the label `cp_iterate.sh` was given, so
+the row in `~/timelines/index.html` carries that iteration's description and
+commit and joins to its row in `iterations.html`. The index has a column per
+capture, and its headline for the two harnesses is the median over each one's
+own real-work window rather than the whole replay -- a whole-replay median is
+dominated by the ~1,390 loading frames.
 
 The recipe it implements:
 
