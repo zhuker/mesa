@@ -8,7 +8,8 @@ three-round alternating A/B in one session with the change's own revert flag as
 the control arm.
 
 **Standing at the start**: favorite3 6.676, favorite2 5.480.
-**Standing now**: favorite3 **6.354**, favorite2 **5.121**.
+**Standing now**: favorite3 **5.940**, favorite2 **5.022** — a 11.0% and 8.4%
+reduction, with favorite2 within 0.022 ms of the 5.0 goal.
 
 ## Built and measured
 
@@ -17,8 +18,16 @@ the control arm.
 | **A** refuse un-appendable blended batches before the vertex work | 0.25-0.33 heavy, 0.20-0.28 light | **-0.2416 / -0.2355** | **LANDED** `f2fadd0c3b4` |
 | **C** record the opaque episode gate once | 0.13-0.19 heavy, 0.19-0.27 light | **-0.1045 / -0.1184** | **LANDED** `21de64eed0a` |
 | **B** hoist the shade chain's argument blocks above the rasterizer | 0.18-0.30 | **+0.0848 / +0.0446** | **REFUTED**, dead end 39 |
+| **B2** the same hoist, but above the *vertex* launch | ~0.21 | **-0.1337 / -0.0326** | **LANDED** `b6f9e6577fc` |
+| **F** VS run-ahead on a side lane | 0.3-0.5 heavy | **-0.3194 / -0.0475** | **LANDED** `a76d2926825` |
+| **G-ctx** record-only context scope | 0.07 | pair below | **LANDED** `3756a6d576f` |
+| **F-head** one `cuMemcpy3DAsync` per layered copy | 0.06-0.10 | pair: -0.0032 / -0.0351 | **LANDED** `1f97dffa4f7` |
+| **I** shadow visibility clears | 0.06-0.09 | — | **REFUTED from the code**: the 19 shadow "batches" are unbatchable single draws |
+| **L** long `cp_clip_rast_fused` launches | 0.2-0.4 | — | **REFUTED by ncu**: 48 active cycles in 10,869 elapsed; the duration is stream sharing, and summing it is summed concurrent time |
 
-Total landed: **-0.346 on favorite3, -0.354 on favorite2**, about 5.2% and 6.5%.
+Total landed: **-0.736 on favorite3, -0.458 on favorite2** (11.0% and 8.4%).
+The four later changes measured **-0.3908 / -0.0699 together**, sub-additive
+against a -0.456 / -0.115 sum because three of them shorten the same chain.
 
 ### A — the failed-append back-out
 Blended batches that the A-buffer arm was certain to refuse were still admitted
