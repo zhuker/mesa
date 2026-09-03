@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-134 switches.
+135 switches.
 
 ## Tracing
 
@@ -52,6 +52,7 @@ deliberately: someone's script sets one of these to 0 today.
 
 | variable | type | default | range | meaning |
 |---|---|---|---|---|
+| `CUDAVK_NO_CLIP_ALLOC_HOIST` | bool (value) | `off` | — | allocate the clip stage's scratch below the vertex shader's launch and reserve the direct shade chain's interpolation and fragment argument blocks where they are read, so their upload flushes stand as host-to-device copies in the stage 3 to compaction and compaction to shader links instead of riding the flush the vertex launch already performs |
 | `CUDAVK_NO_APPEND_PREFILTER` | bool (value) | `off` | — | let a blended batch enter a pass episode even when the A-buffer arm is certain to refuse it, so its vertex work runs on a side stream and is then repeated on the main stream, as it did before the prefilter |
 | `CUDAVK_NO_LAYERED_COPY3D` | bool (value) | `off` | — | record a layered image copy as one operation per layer again, so each layer is its own cuMemcpy2DAsync and its own texture-cache event, instead of the single cuMemcpy3DAsync the merge issues where both sides' layer strides are exact multiples of their row pitch |
 | `CUDAVK_NO_HOST_PIN_READBACK` | bool (value) | `off` | — | do not advise transfer-dst-only managed buffer ranges host-resident; the per-frame readback copy goes back to migrating its pages |

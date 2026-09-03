@@ -174,6 +174,13 @@ static const struct cp_flag_def flags[] = {
      "its six faces from where the sampler will look; syncs" },
 
    /* ---- subsystem switches ---- */
+   { "CUDAVK_NO_CLIP_ALLOC_HOIST", CP_FLAG_BOOL_VALUE, F(no_clip_alloc_hoist),
+     "allocate the clip stage's scratch below the vertex shader's launch and "
+     "reserve the direct shade chain's interpolation and fragment argument "
+     "blocks where they are read, so their upload flushes stand as "
+     "host-to-device copies in the stage 3 to compaction and compaction to "
+     "shader links instead of riding the flush the vertex launch already "
+     "performs" },
    { "CUDAVK_NO_APPEND_PREFILTER", CP_FLAG_BOOL_VALUE, F(no_append_prefilter),
      "let a blended batch enter a pass episode even when the A-buffer arm is "
      "certain to refuse it, so its vertex work runs on a side stream and is "
@@ -583,6 +590,12 @@ static const struct {
     * the arm it already gets, and =0 would appear to select the old one and
     * would not. */
    { "CUDAVK_OPAQUE_STREAMS",          "CUDAVK_NO_OPAQUE_STREAMS" },
+   /* Never on a merged branch, and listed anyway: the hoist that name
+    * reverted was measured and refuted (DEAD_ENDS 39), and the branch that
+    * carried it was A/B'd with CUDAVK_NO_ARGBLOCK_HOIST=1 exported as the
+    * control arm. A shell that still has it would silently control nothing
+    * here, which is the failure this whole table exists for. */
+   { "CUDAVK_NO_ARGBLOCK_HOIST",       "CUDAVK_NO_CLIP_ALLOC_HOIST" },
 
    { "CPVK_DEBUG_ROWS",                "CUDAVK_DEBUG_ROWS" },
    { "CPVK_DEBUG_CLIP",                "CUDAVK_DEBUG_CLIP" },
