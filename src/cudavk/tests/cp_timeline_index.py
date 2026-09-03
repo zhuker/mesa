@@ -36,6 +36,27 @@ def capture_row(path):
             "submits": submits, "frames": submits // 2, "pngs": pngs}
 
 
+def harness_row(path):
+    """A compiled-harness capture (favorite2/favorite3).
+
+    Same shape as capture_row, but the headline is the median over that
+    capture's own real-work window rather than the whole replay: these two
+    open with about 1,390 loading frames that are not the workload
+    (WORKFLOW.md 4.0), and a whole-replay median is dominated by them.
+    """
+    row = capture_row(path)
+    stats = os.path.join(path, "frames", "frames.json")
+    if row["exists"] and os.path.exists(stats):
+        try:
+            j = json.load(open(stats))["stats"]
+            row["median"] = j.get("median_real") or row["median"]
+            row["window"] = "real %d+" % j.get("real_start", 0)
+            row["pngs"] = j.get("frames", row["pngs"])
+        except (OSError, ValueError, KeyError):
+            pass
+    return row
+
+
 def desc_for(label):
     p = os.path.join(ITERROOT, label, "iteration.json")
     if not os.path.exists(p):
@@ -44,7 +65,10 @@ def desc_for(label):
         j = json.load(open(p))
     except (OSError, ValueError):
         return "", ""
-    return j.get("desc", "") or "", (j.get("commit") or "")[:11]
+    # cp_iter_report.py records this as "description"; reading "desc" left the
+    # column empty for every iteration ever rendered. Both are accepted now.
+    text = j.get("description") or j.get("desc") or ""
+    return text, (j.get("commit") or "")[:11]
 
 
 rows = []
@@ -53,10 +77,12 @@ for label in sorted(os.listdir(ROOT)):
     if not os.path.isdir(d) or label.startswith("."):
         continue
     old, cross = capture_row(os.path.join(d, "old")), capture_row(os.path.join(d, "cross"))
-    if not (old["exists"] or cross["exists"]):
+    f2 = harness_row(os.path.join(d, "favorite2"))
+    f3 = harness_row(os.path.join(d, "favorite3"))
+    if not (old["exists"] or cross["exists"] or f2["exists"] or f3["exists"]):
         continue
     desc, commit = desc_for(label)
-    rows.append((label, old, cross, desc, commit))
+    rows.append((label, old, cross, f2, f3, desc, commit))
 rows.sort(key=lambda r: os.path.getmtime(os.path.join(ROOT, r[0])), reverse=True)
 
 
@@ -64,8 +90,10 @@ def cell(label, name, c):
     if not c["exists"]:
         return '<td class="none">—</td>'
     med = f'{c["median"]:.2f}' if c["median"] else "—"
+    win = c.get("window")
+    sub = f'{c["pngs"]} png · {win}' if win else f'{c["frames"]} frames · {c["pngs"]} png'
     return (f'<td><a href="{html.escape(label)}/{name}/index.html">{med} ms</a>'
-            f'<span class="sub">{c["frames"]} frames · {c["pngs"]} png</span></td>')
+            f'<span class="sub">{sub}</span></td>')
 
 
 out = ["""<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -87,10 +115,12 @@ paired-submit median — a frame is two <code>vkQueueSubmit</code> events, media
 Labels match <code>cp_iterate.sh</code>, so a row here and a row in
 <a href="../git/Vulkan/build/iter/iterations.html">iterations.html</a> are the same iteration.</p>
 <table><thead><tr><th>iteration</th><th>old capture</th><th>Crossroads</th>
+<th>favorite2</th><th>favorite3</th>
 <th>commit</th><th class="desc">what it was</th></tr></thead><tbody>"""]
-for label, old, cross, desc, commit in rows:
-    out.append("<tr><td><b>%s</b></td>%s%s<td><code>%s</code></td><td class=\"desc\">%s</td></tr>"
+for label, old, cross, f2, f3, desc, commit in rows:
+    out.append("<tr><td><b>%s</b></td>%s%s%s%s<td><code>%s</code></td><td class=\"desc\">%s</td></tr>"
                % (html.escape(label), cell(label, "old", old), cell(label, "cross", cross),
+                  cell(label, "favorite2", f2), cell(label, "favorite3", f3),
                   html.escape(commit or "—"), html.escape(desc or "")))
 out.append("</tbody></table></body></html>")
 open(os.path.join(ROOT, "index.html"), "w").write("\n".join(out))

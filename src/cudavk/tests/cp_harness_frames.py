@@ -101,7 +101,7 @@ figcaption{font-size:11px;color:#aaa;padding-top:3px;display:flex;justify-conten
 .k{display:inline-block;margin-right:14px} .k b{color:#fff}
 input{background:#222;color:#ddd;border:1px solid #444;border-radius:3px;padding:4px 7px}
 </style>
-<h1>%(cap)s &mdash; every frame</h1>
+<h1>%(cap)s &mdash; every frame <span style="color:#666;font-weight:400">%(iter)s</span></h1>
 <div class=sub>
 <span class=k>frames <b>%(n)d</b></span>
 <span class=k>median all <b>%(ma).3f ms</b></span>
@@ -131,7 +131,8 @@ document.getElementById('f').addEventListener('input',draw); draw();
 </script>""" % {"cap": args.capture, "n": stats["frames"], "ma": stats["median_all"],
                 "mr": stats["median_real"], "mh": stats["median_heavy"],
                 "rs": real, "hs": str(heavy) + "+" if heavy else "n/a",
-                "data": json.dumps({"rows": rows})}
+                "data": json.dumps({"rows": rows}),
+                "iter": ("&middot; " + args.iteration) if args.iteration else ""}
     open(args.output, "w").write(html)
     print("wrote %s  (%d frames, median real %.3f ms)"
           % (args.output, stats["frames"], stats["median_real"]))
@@ -145,6 +146,7 @@ def main():
     a.add_argument("--thumb", type=int, default=320); a.set_defaults(fn=cmd_png)
     b = sub.add_parser("page"); b.add_argument("outdir")
     b.add_argument("--submits", required=True); b.add_argument("--capture", required=True)
+    b.add_argument("--iteration", default="")
     b.add_argument("--real-start", type=int, default=0)
     b.add_argument("--heavy-start", type=int, default=0)
     b.add_argument("-o", "--output", required=True); b.set_defaults(fn=cmd_page)

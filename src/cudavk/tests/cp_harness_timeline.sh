@@ -1,38 +1,36 @@
 #!/usr/bin/env bash
-# Full-frame timeline for a compiled harness capture, both captures alike.
+# Full-frame timelines of BOTH compiled-harness captures for one iteration.
 #
-#   cp_harness_timeline.sh CAPTURE [ENV=VALUE ...]      CAPTURE = favorite2|favorite3
+#   cp_harness_timeline.sh ITERATION [ENV=VALUE ...]
 #
-# cp_make_timeline.sh does this for the two gfxr captures. The captures that
-# decide this project are the compiled tocpp harnesses, and nothing showed what
-# they draw. Same contract as that script: one label per arm, a timing pass that
-# dumps nothing so the numbers keep the paired-submit convention, then a dump
-# pass, then one page.
+# The same contract as cp_make_timeline.sh, which does this for the two gfxr
+# captures: the label is the label cp_iterate.sh was given, so a row in
+# ~/timelines/index.html and a row in ~/git/Vulkan/build/iter/iterations.html
+# are the same iteration and the index reads that iteration's DESC and commit.
+# Using a different label buys two half-records that cannot be joined.
 #
-#   ~/timelines/harness/CAPTURE/index.html
+#   ~/timelines/ITERATION/favorite2/index.html
+#   ~/timelines/ITERATION/favorite3/index.html
 #
-# The page is self-contained, but a static server over the home directory is
-# already the way these are read here:
-#   http://localhost:8000/timelines/harness/CAPTURE/index.html
+# Extra arguments are environment assignments handed to both replays, which is
+# how an arm is selected -- one iteration per arm, not one iteration with two
+# meanings:
+#
+#   cp_harness_timeline.sh vslane-off CUDAVK_NO_VS_LANE=1
+#
+# A pair costs about 6 GB of PNG and roughly fifteen minutes. Every frame is
+# dumped raw, encoded, and the raw removed. Read them through the static
+# server over the home directory:
+#   http://localhost:8000/timelines/ITERATION/favorite2/index.html
 set -uo pipefail
-CAP=${1:?usage: cp_harness_timeline.sh favorite2|favorite3 [ENV=VALUE ...]}
+ITER=${1:?usage: cp_harness_timeline.sh ITERATION [ENV=VALUE ...]}
 shift || true
 MESA=${MESA:-$HOME/mesa}
 PY=${PY:-$MESA/venv/bin/python3}
 ICD=${ICD:-$MESA/build-cudavk/src/cudavk/cudavk_devenv_icd.x86_64.json}
 SHIM=${SHIM:-$HOME/favorite-cpp/submit_shim.so}
 FR=$MESA/src/cudavk/tests/cp_harness_frames.py
-OUT=${OUT:-$HOME/timelines/harness/$CAP}
-
-# Each capture's own real-work window; see WORKFLOW.md 4.0. A frame is two
-# submits, so absolute frame N is submit index 2N.
-case "$CAP" in
-  favorite3) REAL=1391; HEAVY=2200;;
-  favorite2) REAL=1388; HEAVY=2735;;
-  *) echo "unknown capture $CAP (favorite2|favorite3)" >&2; exit 2;;
-esac
-APP=$HOME/$CAP-cpp/out
-[ -x "$APP/build/vulkan_app" ] || { echo "no harness at $APP/build/vulkan_app" >&2; exit 2; }
+ROOT=${ROOT:-$HOME/timelines}
 
 exec 9>/tmp/cudavk-gpu.lock
 flock 9
@@ -40,26 +38,44 @@ if nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q '[0-9]'; 
   echo "another process holds the GPU" >&2; exit 2
 fi
 
-rm -rf "$OUT"; mkdir -p "$OUT/raw"
-cd "$APP" || exit 1
+for CAP in favorite2 favorite3; do
+  case "$CAP" in
+    favorite3) REAL=1391; HEAVY=2200;;
+    favorite2) REAL=1388; HEAVY=2735;;
+  esac
+  APP=$HOME/$CAP-cpp/out
+  [ -x "$APP/build/vulkan_app" ] || { echo "no harness at $APP" >&2; exit 2; }
+  OUT=$ROOT/$ITER/$CAP
+  # Same refusal as cp_gfxr_timeline.sh: a re-render wants the old one removed
+  # on purpose, so a half-overwritten pair cannot be read as a whole one.
+  [ -e "$OUT" ] && { echo "$OUT exists; remove it to re-render" >&2; exit 2; }
+  mkdir -p "$OUT/timing" "$OUT/frames" "$OUT/raw"
+  cd "$APP" || exit 1
 
-echo "[1/4] Timing pass (no dumps, so the median keeps its meaning)"
-env "$@" LD_PRELOAD="$SHIM" SUBMIT_TS_FILE="$OUT/submits.txt" VK_DRIVER_FILES="$ICD" \
-    timeout 6000 ./build/vulkan_app >"$OUT/timing.stdout" 2>"$OUT/timing.stderr"
-echo "    rc=$? rows=$(wc -l < "$OUT/submits.txt")"
+  echo "=== $ITER / $CAP ==="
+  echo "[1/4] Timing pass (dumps nothing, so the median keeps its meaning)"
+  env "$@" LD_PRELOAD="$SHIM" SUBMIT_TS_FILE="$OUT/timing/submits.txt" \
+      VK_DRIVER_FILES="$ICD" timeout 6000 ./build/vulkan_app \
+      >"$OUT/timing/stdout" 2>"$OUT/timing/stderr"
+  echo "    rc=$? rows=$(wc -l < "$OUT/timing/submits.txt")"
 
-echo "[2/4] Dump pass (every frame)"
-env "$@" DUMP_DIR="$OUT/raw" DUMP_EVERY=1 DUMP_MAX=100000 \
-    LD_PRELOAD="$SHIM" SUBMIT_TS_FILE="$OUT/dump_submits.txt" VK_DRIVER_FILES="$ICD" \
-    timeout 6000 ./build/vulkan_app >"$OUT/dump.stdout" 2>"$OUT/dump.stderr"
-echo "    rc=$? frames=$(ls "$OUT/raw"/frame_*.bin 2>/dev/null | wc -l)"
+  echo "[2/4] Dump pass (every frame)"
+  env "$@" DUMP_DIR="$OUT/raw" DUMP_EVERY=1 DUMP_MAX=100000 \
+      LD_PRELOAD="$SHIM" SUBMIT_TS_FILE="$OUT/dump_submits.txt" \
+      VK_DRIVER_FILES="$ICD" timeout 6000 ./build/vulkan_app \
+      >"$OUT/dump.stdout" 2>"$OUT/dump.stderr"
+  echo "    rc=$? frames=$(ls "$OUT/raw"/frame_*.bin 2>/dev/null | wc -l)"
 
-echo "[3/4] Encoding PNGs and thumbnails"
-"$PY" "$FR" png "$OUT/raw" "$OUT" || exit 1
-rm -rf "$OUT/raw"
+  echo "[3/4] Encoding PNGs and thumbnails"
+  "$PY" "$FR" png "$OUT/raw" "$OUT/frames" || exit 1
+  rm -rf "$OUT/raw"
 
-echo "[4/4] Building the page"
-"$PY" "$FR" page "$OUT" --submits "$OUT/submits.txt" --capture "$CAP" \
-    --real-start "$REAL" --heavy-start "$HEAVY" -o "$OUT/index.html" || exit 1
-du -sh "$OUT"
-echo "TIMELINE $CAP DONE -> $OUT/index.html"
+  echo "[4/4] Building the page"
+  "$PY" "$FR" page "$OUT/frames" --submits "$OUT/timing/submits.txt" \
+      --capture "$CAP" --iteration "$ITER" \
+      --real-start "$REAL" --heavy-start "$HEAVY" -o "$OUT/index.html" || exit 1
+done
+
+"$PY" "$MESA/src/cudavk/tests/cp_timeline_index.py"
+du -sh "$ROOT/$ITER"
+echo "TIMELINE $ITER DONE -> $ROOT/$ITER/{favorite2,favorite3}/index.html"
