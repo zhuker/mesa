@@ -23,7 +23,13 @@ CTRL_ENV=${3:?control env, e.g. "CUDAVK_NO_FOO=1"}
 CAND_ENV=${4:-}
 ROUNDS=${5:-3}
 MESA=${MESA:-$HOME/mesa}
+# The venv python only exists on the workstation; the B200 workspace has none.
+# Nothing here needs numpy, so fall back to whatever python3 is on PATH rather
+# than failing every sentinel check and reporting a gate failure that is really
+# a missing interpreter.
 PY=${PY:-$MESA/venv/bin/python3}
+[ -x "$PY" ] || PY=$(command -v python3)
+[ -x "$PY" ] || { echo "no python3" >&2; exit 2; }
 ICD=${ICD:-$MESA/build-cudavk/src/cudavk/cudavk_devenv_icd.x86_64.json}
 SHIM=${SHIM:-$HOME/favorite-cpp/submit_shim.so}
 OUT=${OUT:-/tmp/harness-ab/$LABEL}
