@@ -332,11 +332,8 @@ struct cp_debug {
    struct cp_opt_int tile_bound;
    bool no_host_pin_readback;
    bool no_append_prefilter;
-<<<<<<< HEAD
    bool no_layered_copy3d;
-=======
    bool no_clip_alloc_hoist;
->>>>>>> 309f5235664 (cudavk: allocate the clip's scratch above the vertex launch and prepare the shade chain there)
 };
 
 /*
