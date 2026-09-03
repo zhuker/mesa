@@ -72,11 +72,19 @@ rule it sharpened.
 
 | lead | predicted | state |
 |---|---|---|
-| ~~**G**~~ device-decided episodes (stop waiting on readbacks) | 0.2-0.4 predicted | **CLOSED** — `DEAD_ENDS` 41. Priced with two tools already in the tree, no oracle build: the four waits total **1.325 ms/frame**, and injecting **0.449 ms/frame** of host busy-work before the largest one does not move the frame. The wait is the GPU finishing; G collects ~0 |
 | **E'** full kernel-parameter ABI | 0.1-0.3 beyond B | needs a `.local` census of every generated kernel first; B2 already collected the host-side part without an ABI change |
 | **H** alpha-test retry convergence check | 0.03-0.08 heavy, ~0 whole | never attempted. Retry draws occur in about a third of frames, so it cannot move a whole-window median; it is a mean-only item |
-| ~~**D, E, K**~~ scratch tables out of managed memory, pin `peel_any` and staging, UBO ring | 0.02-0.15 each | **CLOSED** — `DEAD_ENDS` 40. The page-fault trace was taken and sized all three at once: total UM fault stall is **0.3735 ms/frame** for every managed buffer in the process, below the 0.500 gate before any of them is built, and 90% of it belongs to one 21.5 MB app allocation none of these three touch. Their real budget is **0.037** |
 | **§3.4** application readback fence, readback fill, scope count | 0.5-1.1 | outside the driver — the largest single remaining item anywhere, and it needs the application owner |
+
+## Closed during this campaign's follow-up
+
+Both were closed by measuring the population they shared, before building
+anything — see `DEAD_ENDS` 40 and 41.
+
+| lead | predicted | outcome |
+|---|---|---|
+| ~~**G**~~ device-decided episodes (stop waiting on readbacks) | 0.2-0.4 predicted | **CLOSED** — `DEAD_ENDS` 41. Priced with two tools already in the tree, no oracle build: the four waits total **1.325 ms/frame**, and injecting **0.449 ms/frame** of host busy-work before the largest one does not move the frame. The wait is the GPU finishing; G collects ~0 |
+| ~~**D, E, K**~~ scratch tables out of managed memory, pin `peel_any` and staging, UBO ring | 0.02-0.15 each | **CLOSED** — `DEAD_ENDS` 40. The page-fault trace was taken and sized all three at once: total UM fault stall is **0.3735 ms/frame** for every managed buffer in the process, below the 0.500 gate before any of them is built, and 90% of it belongs to one 21.5 MB app allocation none of these three touch. Their real budget is **0.037** |
 
 ## What the analysis got right, and wrong
 
