@@ -12,11 +12,15 @@ window (WORKFLOW.md 4.0), all defaults, clean environment:
 
 | capture | RTX 5090 (sm_120) | B200 (sm_100) |
 |---|---:|---:|
-| favorite3 | **5.940** | 10.79 (stale: pre-2026-09-02 work) |
-| favorite2 | **5.022** | 8.97 (stale: pre-2026-09-02 work) |
+| favorite3 | **5.940** | **9.883** |
+| favorite2 | **5.022** | **8.283** |
 
-The RTX figures include the 2026-09-02 append prefilter (-0.24 on both
-captures). The B200 has not been re-measured since; its host was unreachable.
+Both hosts now include everything landed on 2026-09-02/03. The five changes
+were validated on the B200 as a set (control = every switch reverted): they are
+worth **-0.985 ms/frame on favorite3 and -0.678 on favorite2 there**, against
+-0.391 and -0.070 on the RTX -- 2.5x and 9.7x more, because every one of them
+is host-side scheduling and the B200 is the more latency-bound host. Individual
+attribution on the B200 was not measured, only the set.
 
 Reference points: llvmpipe from this tree, release build, is 46.40 / 39.72 on
 the same two captures — cudavk is **6.9x / 7.2x** faster. Rendering is
