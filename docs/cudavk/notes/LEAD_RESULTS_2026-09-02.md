@@ -54,21 +54,22 @@ turned two copies into one and the frame got **slower**, on both captures, with
 disjoint arms — even with the `COMPACT_PDL` it unlocks. See dead end 39 for the
 rule it sharpened.
 
-## Not attempted, and why
+## Refuted without building
 
-| lead | predicted | why not |
+| lead | predicted | why |
 |---|---|---|
-| F — VS run-ahead | 0.3-0.5 heavy | live; has a free probe (`CUDAVK_NO_FETCH_FOLD=1` prices its fallback) |
-| G — device-decided episodes | 0.2-0.4 realistic | live; the "oracle replay" prices it without building anything |
-| E' — full kernel-parameter ABI | 0.1-0.3 beyond B | B refuted; needs a `.local` census first |
-| I — fewer visibility-buffer clears | 0.06-0.09 whole | live, small |
-| D, E, F-head, G-ctx — memory residuals, submit head, context scope | 0.02-0.15 each | live, small; D/E/K want one page-fault trace |
-| L — long `cp_clip_rast_fused` launches | 0.2-0.4, unverified | needs one ncu pass on those launch ordinals |
-| §3.4 — application readback fence, scope count | 0.5-1.1 | outside the driver |
+| **I** shadow visibility clears | 0.06-0.09 whole | premise wrong: a depth-only scope has `colorAttachmentCount 0`, so `cpvk_batch_structural` refuses every draw in it. The 19 shadow "batches" per heavy frame are unbatchable single draws and no key relaxation merges them (`notes/SHADOW_VISBUF_CLEARS.md`) |
+| **L** long `cp_clip_rast_fused` launches | 0.2-0.4 | ncu: a `grid=1` launch does **48 active cycles in 10,869 elapsed** (1/170 — one SM). The 200-400 us wall time is sharing the machine with seven side streams, and totalling it is summed concurrent duration, which the union-exclusive rule refuses |
 
-The B-refutation's own next step — moving the clip's scratch allocations above
-the **vertex shader** launch, where a copy already exists on a host-paced link —
-is untested and is the only version of B worth building.
+## Still open
+
+| lead | predicted | state |
+|---|---|---|
+| **G** device-decided episodes (stop waiting on readbacks) | 0.2-0.4 realistic | live, and the largest remaining driver-side item. Its "oracle replay" probe prices it without building anything. Note it does **not** compose with F, which has now landed — with the VS lane hiding much of the host, G's ceiling is likely lower than 0.4 |
+| **E'** full kernel-parameter ABI | 0.1-0.3 beyond B | needs a `.local` census of every generated kernel first; B2 already collected the host-side part without an ABI change |
+| **H** alpha-test retry convergence check | 0.03-0.08 heavy, ~0 whole | never attempted. Retry draws occur in about a third of frames, so it cannot move a whole-window median; it is a mean-only item |
+| **D, E, K** scratch tables out of managed memory, pin `peel_any` and staging, UBO ring | 0.02-0.15 each | live and small; all three want one page-fault nsys trace, which is now cheap because the harness no longer crashes |
+| **§3.4** application readback fence, readback fill, scope count | 0.5-1.1 | outside the driver — the largest single remaining item anywhere, and it needs the application owner |
 
 ## What the analysis got right, and wrong
 
