@@ -279,16 +279,9 @@ ICD=~/mesa-worktree/build/src/cudavk/cudavk_devenv_icd.x86_64.json   cp_harness_
 It alternates the arms in one session, runs the gates on every run, and
 **refuses to print a median if any gate fails**. It also checks the ICD exists
 before starting, because a wrong build path silently produces twelve aborted
-runs that look like data. `cp_harness_timeline.sh ITERATION` renders every frame of **both** compiled
-harnesses to a page, the way `cp_make_timeline.sh` does for the gfxr pair, and
-under the same contract: the label is the label `cp_iterate.sh` was given, so
-the row in `~/timelines/index.html` carries that iteration's description and
-commit and joins to its row in `iterations.html`. The index has a column per
-capture, and its headline for the two harnesses is the median over each one's
-own real-work window rather than the whole replay -- a whole-replay median is
-dominated by the ~1,390 loading frames.
+runs that look like data.
 
-The recipe it implements:
+The recipe it implements:The recipe it implements:
 
 ```
 for round in 1 2 3:  control run, then candidate run     # one session, alternating
@@ -749,64 +742,72 @@ is its long form.
 ### Frame timelines, one per iteration
 
 `cp_iterate.sh` answers "did it stay correct while it got faster" over eighteen
-samples at sixty frames. The two captures are the workloads that actually
-matter, and neither the sweep nor the replay harness ever shows you what they
-rendered. `cp_make_timeline.sh` does, for every frame of both captures:
+samples at sixty frames. The four captures are the workloads that actually
+matter, and neither the sweep nor a replay ever shows you what they rendered.
+Two commands do, for every frame:
 
 ```bash
-src/cudavk/tests/cp_make_timeline.sh ITERATION [ENV=VALUE ...]
+src/cudavk/tests/cp_make_timeline.sh    ITERATION [ENV=VALUE ...]   # old + Crossroads (gfxr)
+src/cudavk/tests/cp_harness_timeline.sh ITERATION [ENV=VALUE ...]   # favorite2 + favorite3 (tocpp)
 ```
 
-It waits for an idle GPU, renders both captures through `cp_gfxr_timeline.sh`,
-and rebuilds the page over all of them:
+Both wait for an idle GPU, render every frame, and rebuild the index over all
+of them:
 
 ```
 ~/timelines/
-    index.html                  a row per iteration, both captures linked
+    index.html                  a row per iteration, a column per capture
     ITERATION/
         old/index.html          the old capture, every frame
-        cross/index.html        Crossroads, every frame
+        cross/index.html        Crossroads
+        favorite2/index.html    favorite2
+        favorite3/index.html    favorite3
 ```
 
-The label is the same label `cp_iterate.sh` was given. A row in
+**All four pages are the same page.** It is built by one generator,
+`cp_gfxr_frames.py timeline`: a canvas chart of frame time, a seek slider, and
+the selected frame full size, with arrow-key stepping. **Do not write another
+one.** The harness dumps have no gfxr transfer manifest, so `manifest_files()`
+falls back to `frame_*.png` in name order — that fallback is the whole reason
+one page serves both kinds of capture, and a second page format would split the
+record in half. `cp_harness_frames.py` only decodes the harness's raw
+`frame_NNNNNN.bin` + `.meta` into PNGs; it builds nothing.
+
+**The label is the same label `cp_iterate.sh` was given.** A row in
 `~/timelines/index.html` and a row in `~/git/Vulkan/build/iter/iterations.html`
-are then the same iteration, and the index reads that iteration's `DESC` and
-commit out of its `iteration.json` when it exists. Using a different label here
-buys two half-records that cannot be joined.
-
-Extra arguments are environment assignments handed to both replays, which is
-how an arm is selected — one iteration per arm, not one iteration with two
-meanings:
+are then the same iteration, and the index reads that iteration's description
+and commit out of its `iteration.json`. Using a different label here buys two
+half-records that cannot be joined. Extra arguments are environment assignments
+handed to every replay, which is how an arm is selected — one iteration per
+arm, not one iteration with two meanings:
 
 ```bash
-src/cudavk/tests/cp_make_timeline.sh streams-off
-src/cudavk/tests/cp_make_timeline.sh streams-on CUDAVK_OPAQUE_STREAMS=1
+src/cudavk/tests/cp_harness_timeline.sh vslane-off CUDAVK_NO_VS_LANE=1
 ```
 
-Three things are worth knowing before the first run:
+Four things are worth knowing before the first run:
 
-- **A pair costs about 12 GB and a few minutes.** Every frame is dumped as a
-  raw readback and encoded to png, 1,510 frames on old and 1,496 on Crossroads.
-  `cp_gfxr_timeline.sh` refuses to write into a directory that already exists,
+- **A harness pair costs about 5.5 GB of PNG and roughly fifteen minutes**; the
+  gfxr pair about 12 GB. Every frame is dumped raw, encoded, and the raw
+  removed. Both scripts refuse to write into a directory that already exists,
   so a re-render wants the old one removed on purpose.
-- **The median on the index page is recomputed, not copied.** It is the
-  paired-submit median — a frame is two `vkQueueSubmit` events,
-  `median(diff(ts[::2])[50:])` — taken from each run's own
-  `timing/submits.txt`, so it follows the same convention as every other number
-  in this document. It is measured while dumping nothing, in the timing replay
-  of the pair.
-- **Both pages must be served over HTTP.** They fetch their data at load time,
-  so a `file://` URL shows an empty page.
+- **The harness pair replays twice on purpose**: a timing pass that dumps
+  nothing, then a dump pass. The median comes from the timing pass, so it keeps
+  the paired-submit convention instead of measuring the cost of writing 13 GB.
+- **The index median is the whole replay, for every capture**, which is what
+  makes the columns comparable. For favorite2 and favorite3 that includes about
+  1,390 loading frames, so it reads well below the real-work medians quoted
+  everywhere else (4.0). The chart on the page shows both plainly: a flat
+  loading plateau, then the real work.
+- **Read them through the static server already running over the home
+  directory**, not a new one:
+  `http://localhost:8000/timelines/ITERATION/favorite2/index.html`.
 
-```bash
-python3 -m http.server -d ~/timelines 8000   # then http://localhost:8000/index.html
-```
-
-The index is rebuilt from what is on disk rather than appended to, for the
-reason `cp_iter_report.py page` is: an iteration that was rendered and then
-stayed invisible until someone remembered a second command is a record that
-does not describe the work. Run `cp_timeline_index.py` by hand only after
-moving or deleting a directory underneath it.
+`cp_timeline_index.py` rebuilds the index from what is on disk rather than
+appending to it, for the reason `cp_iter_report.py page` does: an iteration
+that was rendered and then stayed invisible until someone remembered a second
+command is a record that does not describe the work. Both scripts call it. Run
+it by hand only after moving or deleting a directory underneath it.
 
 ---
 
