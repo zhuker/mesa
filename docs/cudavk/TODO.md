@@ -217,6 +217,21 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
 
    Appended for the same reason items 10, 11 and 12 were.
 
+
+14. **favorite3 frame 3225 is shaded wrong against the native driver.** The
+    first frame-by-frame comparison with NVIDIA's own driver (580.173.02, same
+    GPU, same command stream -- `notes/NATIVE_DRIVER_REFERENCE.md`) agrees to
+    within +-2 on 99.89% of bytes across the sampled frames, except this one:
+    **20% of its pixels differ by more than 8**, a large snow surface in the
+    lower left is shaded differently, and the whole frame is darker (mean 158.1
+    against 166.8). Same geometry and same UI, so this is shading, not
+    rasterisation precision. It is invisible to the suite by construction --
+    the sentinel controls compare cudavk against cudavk, so a defect present in
+    every cudavk run cannot fail them. The reference render
+    (`~/timelines/native-nvidia/`) is the oracle; the neighbouring frames 3200
+    and 3250 are clean, so whatever it is switches on for a small number of
+    frames.
+
 ## Vulkan surface not implemented
 
 The driver advertises Vulkan 1.1. The Gallium driver that was removed advertised

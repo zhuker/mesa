@@ -12,15 +12,25 @@ window (WORKFLOW.md 4.0), all defaults, clean environment:
 
 | capture | RTX 5090 (sm_120) | B200 (sm_100) |
 |---|---:|---:|
+> **The floor is 0.522 / 0.502 ms.** The same GPU runs the same submits on
+> NVIDIA's own driver 10-11x faster than cudavk does
+> (`notes/NATIVE_DRIVER_REFERENCE.md`, measured 2026-09-03). Read that before
+> planning optimisation work: the remaining distance to the 5.0 goal is ~1.7%
+> of the gap to a real driver, and no lead in the ledger addresses the
+> architecture that gap belongs to.
+
 | favorite3 | **5.940** | **9.883** |
 | favorite2 | **5.022** | **8.283** |
 
-Both hosts now include everything landed on 2026-09-02/03. The five changes
-were validated on the B200 as a set (control = every switch reverted): they are
-worth **-0.985 ms/frame on favorite3 and -0.678 on favorite2 there**, against
--0.391 and -0.070 on the RTX -- 2.5x and 9.7x more, because every one of them
-is host-side scheduling and the B200 is the more latency-bound host. Individual
-attribution on the B200 was not measured, only the set.
+Both hosts now include everything landed on 2026-09-02/03. The six changes
+were validated on the B200 as one set (control = all six revert switches on,
+three alternating rounds, every gate passed): they are worth **-0.985 ms/frame
+on favorite3 (heavy band -1.403) and -0.678 on favorite2 there**, against
+-0.736 and -0.458 for the same six on the RTX -- **1.3x and 1.5x**, consistent
+with host-side scheduling changes on the more latency-bound host. favorite2's
+heavy band overlapped and is inconclusive. Individual attribution on the B200
+was not measured, only the set. (`notes/LEAD_RESULTS_2026-09-02.md` has the
+run.)
 
 Reference points: llvmpipe from this tree, release build, is 46.40 / 39.72 on
 the same two captures — cudavk is **6.9x / 7.2x** faster. Rendering is
