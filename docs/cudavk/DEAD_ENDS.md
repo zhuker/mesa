@@ -2528,3 +2528,58 @@ designing a mechanism to remove a sync.
 It blocks **7.25 times a frame for 1.325 ms of a 5.94 ms frame**, and that
 1.325 is GPU-paced. The remaining distance to the 5.0 goal is not on the host
 side of the driver.
+
+## 42. The kernel-parameter ABI (E'): the census says no headroom, the pool says no prize
+
+**What it was.** Carry the per-draw argument table in the kernel's own
+parameters instead of uploading it as an argument block, removing one
+host-to-device copy per launch. The 2026-09-02 analysis priced it at 0.1-0.3
+"beyond B" and made one thing a precondition: **a `.local` census of every
+generated kernel before any timing claim**, because a parameter table that is
+indexed dynamically is copied to local memory, and the kernels that would carry
+it are the ones with the least room.
+
+**The census, which the driver could already produce.** `measure_shader_cost()`
+has always read `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES`; `CUDAVK_SHADER_STATS=1`
+prints it. One favorite3 run, 254 shader reports:
+
+| stage | n | regs p50 | already spilling | max spill | after the register cap |
+|---|---:|---:|---:|---:|---|
+| fragment fused | 69 | 203 | 37 | 192 B | **69/69 spill, up to 400 B/thread** |
+| fragment hardware fused | 20 | 198 | 20 | 96 B | **20/20 spill, up to 288 B** |
+| fragment hardware inline | 46 | 104 | 17 | 48 B | 5/6, up to 64 B |
+| MESA_SHADER_VERTEX | 48 | 64 | 17 | 96 B | — |
+| vertex fused-fetch | 48 | 71 | 17 | 96 B | — |
+| MESA_SHADER_COMPUTE | 1 | 77 | 0 | 0 | — |
+
+**There is no headroom on the fragment path.** Those shaders run at 203
+registers, are capped to 128 to buy a second block per SM, and that cap already
+costs 168-400 bytes per thread of local traffic. Every one of the 69 fused
+fragment shaders spills after the cap. An ABI that adds dynamically indexed
+per-thread state lands precisely there -- on the kernels that issue 65.4 of the
+launches per frame and are already trading spill for occupancy.
+
+**And the prize is smaller than the gate.** Union-exclusive on the RTX at HEAD:
+
+| pool | ms/frame | launches/frame |
+|---|---:|---:|
+| all kernels | 4.0091 | 692.83 |
+| all memcpy | 0.4508 | 249.22 |
+| **memcpy HtoD** | **0.1042** | 169.34 |
+
+E' can remove at most the argument-block share of **0.1042 ms/frame** of device
+time -- deleting *every* host-to-device copy in the frame, argument blocks,
+uploads and all, is worth a tenth of a millisecond. The host side it also
+removes (~98 calls a frame) is the kind of host time `DEAD_ENDS` 41 measured as
+absorbed: injecting 0.449 ms/frame before the drain does not move the frame.
+
+**Refuted on both halves independently.** The mechanism has no room on the
+kernels that would carry it, and the population it targets is a fifth of the
+0.500 admission gate. Neither depends on the other, and the census that decided
+the first half took one run of a flag that has existed all along.
+
+**The rule, third time.** Entries 40 and 41 closed by measuring a shared
+population before building; this one closes by reading a number the driver was
+already computing. Before implementing an idea, ask what the driver already
+knows -- `CUDAVK_SHADER_STATS`, `CUDAVK_PLAN_STATS` and `CUDAVK_UPLOAD_STATS`
+between them priced three leads this week without a line of new code.
