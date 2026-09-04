@@ -2583,3 +2583,45 @@ population before building; this one closes by reading a number the driver was
 already computing. Before implementing an idea, ask what the driver already
 knows -- `CUDAVK_SHADER_STATS`, `CUDAVK_PLAN_STATS` and `CUDAVK_UPLOAD_STATS`
 between them priced three leads this week without a line of new code.
+
+## 43. The alpha-test retry convergence check (H): the population is a tenth of the gate
+
+**What it was.** `passes = retry ? CP_DISCARD_LAYERS : ...` sets **eight** fixed
+passes for an alpha-tested draw and the loop has **no early exit** -- so the
+proposal was to check whether the discard set converged and stop. Predicted
+0.03-0.08 on the heavy band, ~0 whole. Never attempted.
+
+**Measured, with the NVTX ranges the loop already pushes.** `CUDAVK_NVTX=1`
+names every pass; one `nsys -t cuda,nvtx` run of favorite3 counts them:
+
+| range | count | total ms |
+|---|---:|---:|
+| pass 0 | 54,372 | 595.6 |
+| pass 1 | 987 | 18.8 |
+| pass 2 | 987 | 81.6 |
+| pass 3 | 534 | 10.1 |
+| pass 4 | 534 | 9.9 |
+| pass 5 | 534 | 10.0 |
+| pass 6 | 534 | 29.6 |
+| pass 7 | 341 | 6.5 |
+
+**Every pass after the first, across the whole run, is 4,451 ranges and 166.5
+ms -- 1.28 passes and 0.0479 ms per frame.** That is the entire population a
+convergence check could act on, and a convergence check cannot claim all of it:
+the passes a draw genuinely needs are in there too. The admission gate is 0.500
+ms/frame. H is a **tenth** of it before any implementation, which confirms the
+analysis's own corrected estimate (0.03-0.08 heavy, ~0 whole) rather than
+overturning it.
+
+**A by-product worth keeping.** The loop does not blindly run eight passes: the
+counts decay 987, 987, 534, 534, 534, 534, 341. Draws leave it for reasons that
+already exist -- `peel_passes` is `MIN2(CP_BLEND_LAYERS, num_triangles)` and the
+same counter serves the peel loop -- so the "eight fixed passes" reading of the
+constant overstates what actually runs. Anyone re-opening this should count the
+ranges first; it takes one traced run.
+
+**The rule, again.** Three leads closed this week by measuring the population
+before building the mechanism (40, 41, 42), and this is the fourth. In every
+case the instrument already existed: `CUDAVK_PLAN_STATS`, `CUDAVK_SHADER_STATS`,
+`CUDAVK_UPLOAD_STATS`, and here `CUDAVK_NVTX`. **The driver knows more about
+itself than the ledger does.**

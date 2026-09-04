@@ -11,14 +11,20 @@ the control arm.
 **Standing now**: favorite3 **5.940**, favorite2 **5.022** — a 11.0% and 8.4%
 reduction, with favorite2 within 0.022 ms of the 5.0 goal.
 
-**On the B200** the same set is worth more: favorite3 10.868 -> **9.883**
-(-0.985) and favorite2 8.961 -> **8.283** (-0.678), measured as a set with
-every switch reverted in the control arm, all twelve runs passing their gates.
-That is 2.5x and 9.7x the RTX gain, which is what these changes should do --
-they remove host-side serialisation and the B200 is the more latency-bound
-host. Its favorite2 heavy band overlapped (that host drifts 0.3-1.3 ms between
-sessions); every other band was disjoint. Individual attribution on the B200
-was not measured, only the set.
+**On the B200** the same six changes are worth more: favorite3 10.868 ->
+**9.883** (-0.985; heavy band 13.057 -> 11.654, -1.403) and favorite2 8.961 ->
+**8.283** (-0.678), measured as one set with all six switches reverted in the
+control arm (`CUDAVK_NO_VS_LANE`, `_CLIP_ALLOC_HOIST`, `_APPEND_PREFILTER`,
+`_EPISODE_GATE_ONCE`, `_CTX_SCOPE_TRIM`, `_LAYERED_COPY3D`; three alternating
+rounds, all twelve runs passing their gates). Against the same six on the RTX
+(-0.736 / -0.458) that is **1.3x and 1.5x**, consistent with changes that
+remove host-side serialisation on the more latency-bound host. (An earlier
+version of this paragraph quoted 2.5x and 9.7x; those divided by the RTX
+result of the four later changes alone, -0.391 / -0.070, not by the set the
+B200 control actually reverted.) favorite2's heavy band overlapped (-0.486,
+inconclusive; that host drifts 0.3-1.3 ms between sessions); every other band
+was disjoint. Individual attribution on the B200 was not measured, only the
+set.
 
 ## Built and measured
 
@@ -72,8 +78,8 @@ rule it sharpened.
 
 | lead | predicted | state |
 |---|---|---|
-| **E'** full kernel-parameter ABI | 0.1-0.3 beyond B | needs a `.local` census of every generated kernel first; B2 already collected the host-side part without an ABI change |
-| **H** alpha-test retry convergence check | 0.03-0.08 heavy, ~0 whole | never attempted. Retry draws occur in about a third of frames, so it cannot move a whole-window median; it is a mean-only item |
+| ~~**E'**~~ full kernel-parameter ABI | 0.1-0.3 | **CLOSED** — `DEAD_ENDS` 42. The `.local` census ran (`CUDAVK_SHADER_STATS`): all 69 fused fragment shaders spill after the register cap, up to 400 B/thread, so the ABI has no headroom on the kernels that would carry it; and every HtoD copy in the frame is 0.1042 ms device time, a fifth of the gate |
+| ~~**H**~~ alpha-test retry convergence check | 0.03-0.08 heavy, ~0 whole | **CLOSED** — `DEAD_ENDS` 43. NVTX pass census: every pass after the first is 1.28 passes and **0.0479 ms/frame**, a tenth of the gate, and a convergence check cannot claim all of it |
 | **§3.4** application readback fence, readback fill, scope count | 0.5-1.1 | outside the driver — the largest single remaining item anywhere, and it needs the application owner |
 
 ## Closed during this campaign's follow-up
