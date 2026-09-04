@@ -44,9 +44,36 @@ passed):
 | favorite2 heavy | 9.3385 | 9.3835 | +0.0450 | overlap |
 
 favorite3's whole-window arms are disjoint at a delta of 0.50, which is at the
-edge of what that host can adjudicate (drift 0.3-1.3). It is free and it is
-one flag on the launch line, but **it wants a second session before it becomes
-a documented default**, and favorite2 says the effect is not universal.
+edge of what that host can adjudicate (drift 0.3-1.3).
+
+**It did not replicate, and the claim is withdrawn.** A second session ran the
+experiment that separates the two mechanisms `taskset` conflates -- CPU
+placement and page placement -- on favorite3, three alternating rounds each,
+every gate passed:
+
+| arm | whole | heavy | arms |
+|---|---:|---:|---|
+| session 1: `taskset` near vs unbound | **-0.5012** | -0.1413 | disjoint |
+| session 2: `numactl --membind=0` (memory near, CPU free) | +0.0327 | +0.0857 | overlap |
+| session 2: `numactl --cpunodebind=0` (CPU near, memory follows) | -0.2587 | -0.0206 | overlap |
+
+Neither arm reproduces it. The CPU-only arm points the same way but at half
+the size, its arms overlap, and it is **not sign-consistent** -- the candidate
+wins two rounds of three (9.759/9.500, 9.437/9.661, 9.938/9.385). Against a
+host that drifts 0.3-1.3 ms between sessions, that is drift, not an effect.
+
+**So there is no NUMA win to adopt, and the question of "flag or source
+change" does not arise.** What survives is a real negative and a useful one:
+
+- **Page placement is not the mechanism.** Binding memory to the GPU's node
+  alone changes nothing (+0.03). The 1.83 ms/frame of UM fault stall in 1.5 is
+  therefore **not** far-node placement, which removes the most obvious
+  explanation for it and rules out a `numactl`-shaped fix for item 2.
+- **A single disjoint A/B on this host is not a result.** Yesterday's arms were
+  disjoint and its rounds tight, and it was still drift. Three alternating
+  rounds bound the noise *within* a session; they say nothing about the drift
+  *between* sessions, which on the B200 is larger. Anything under ~0.5 ms here
+  needs two sessions before it is written down as a number.
 
 To measure it the A/B tool gained `CTRL_WRAP`/`CAND_WRAP`: an arm may now
 differ by how the process is launched, not only by its environment.
@@ -236,9 +263,9 @@ measured. This is the next piece of work, not a result.
 
 ## 6. Ranked, for whoever picks this up
 
-1. **CPU-bind the process to the GPU's socket** -- 0.50 on favorite3, free, one
-   flag on the launch line. Wants a second session and a favorite2 explanation
-   before it is made a default.
+1. ~~**CPU-bind the process to the GPU's socket**~~ -- **WITHDRAWN**, see 0.
+   It did not replicate in a second session, and memory-only binding shows the
+   page-placement mechanism is absent. No action.
 2. **The 30.9 MB managed app allocation** -- 1.83 ms/frame of fault stall, 4.8x
    the RTX. Needs a mechanism that is not `SET_ACCESSED_BY` (`DEAD_ENDS` 37
    measured that at +0.36 here).
