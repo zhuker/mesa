@@ -28,6 +28,11 @@ CAND_ENV=${4:-}
 ROUNDS=${5:-3}
 CTRL_WRAP=${CTRL_WRAP:-}      # command prefix for the control arm, e.g. taskset -c 0-47
 CAND_WRAP=${CAND_WRAP:-}      # ... and for the candidate arm
+# A per-arm ICD, for a change that is NOT behind a flag -- a build constant, or
+# a branch with no revert switch. Without this, measuring two builds means two
+# sessions, and between-session drift is exactly what a 3-round A/B cannot see.
+CTRL_ICD=${CTRL_ICD:-$ICD}
+CAND_ICD=${CAND_ICD:-$ICD}
 MESA=${MESA:-$HOME/mesa}
 # The venv python only exists on the workstation; the B200 workspace has none.
 # Nothing here needs numpy, so fall back to whatever python3 is on PATH rather
@@ -51,6 +56,7 @@ case "$CAP" in
 esac
 APP=$HOME/$CAP-cpp/out
 [ -x "$APP/build/vulkan_app" ] || { echo "no harness at $APP" >&2; exit 2; }
+for i in "$CTRL_ICD" "$CAND_ICD"; do [ -f "$i" ] || { echo "no ICD at $i" >&2; exit 2; }; done
 [ -f "$ICD" ] || { echo "no ICD at $ICD" >&2; exit 2; }   # the lead-F mistake
 
 exec 9>/tmp/cudavk-gpu.lock
@@ -64,17 +70,22 @@ echo "capture=$CAP icd=$ICD rounds=$ROUNDS"
 echo "control   : ${CTRL_ENV:-<none>}"
 echo "candidate : ${CAND_ENV:-<defaults>}"
 [ -n "$CTRL_WRAP$CAND_WRAP" ] && echo "wrappers  : c=[${CTRL_WRAP:-none}] n=[${CAND_WRAP:-none}]"
+[ "$CTRL_ICD" != "$CAND_ICD" ] && echo "builds    : c=$CTRL_ICD
+            n=$CAND_ICD"
 
 fail=0
 for r in $(seq 1 "$ROUNDS"); do
   for arm in c n; do
     d=$OUT/$arm$r; mkdir -p "$d"
-    case $arm in c) E=$CTRL_ENV; WRAP=$CTRL_WRAP;; n) E=$CAND_ENV; WRAP=$CAND_WRAP;; esac
+    case $arm in
+      c) E=$CTRL_ENV; WRAP=$CTRL_WRAP; A_ICD=$CTRL_ICD;;
+      n) E=$CAND_ENV; WRAP=$CAND_WRAP; A_ICD=$CAND_ICD;;
+    esac
     # An arm may differ by how the process is launched, not only by its
     # environment -- CPU binding is the case this exists for, since the B200's
     # GPU hangs off one socket of two and the app is allowed on both.
     env $E DUMP_DIR="$d" DUMP_EVERY=200 DUMP_MAX=20 LD_PRELOAD="$SHIM" \
-        SUBMIT_TS_FILE="$d/ts.txt" VK_DRIVER_FILES="$ICD" \
+        SUBMIT_TS_FILE="$d/ts.txt" VK_DRIVER_FILES="$A_ICD" \
         $WRAP timeout 6000 ./build/vulkan_app >"$d/stdout" 2>"$d/stderr"
     rc=$?; h=$(sha256sum "$d/stdout" | cut -d' ' -f1); n=$(wc -l < "$d/ts.txt")
     bad=$($PY - "$CTRLFRAMES" "$d" <<'PY'
