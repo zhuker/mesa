@@ -9,12 +9,29 @@
 # loader is gone, so vkCreateInstance returns -9 (INCOMPATIBLE_DRIVER) and every
 # run aborts with rc=134 before writing a timestamp. That failure looks like a
 # broken experiment and is not one; it has cost three sessions.
+# The package list this rebuilds from lives in docs/cudavk/notes/B200_WORKSPACE.md.
 set -u
 echo "== host =="; hostname
-sudo apt-get update -qq >/dev/null 2>&1
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-     libvulkan1 vulkan-tools numactl zstd rsync \
-     >/dev/null 2>&1
+STASH_OK=1
+for so in libLLVM.so.18.1 libvulkan.so.1; do
+  [ -e "$HOME/lib/$so" ] || STASH_OK=0
+done
+if [ "$STASH_OK" = 1 ]; then
+  echo "== \$HOME/lib stash intact; no apt needed =="
+else
+  echo "== stash incomplete; rebuilding it from packages =="
+  sudo apt-get update -qq >/dev/null 2>&1
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+       libllvm18 libvulkan1 vulkan-tools numactl zstd rsync >/dev/null 2>&1
+  mkdir -p "$HOME/lib" "$HOME/bin"
+  for so in libLLVM.so.18.1 libvulkan.so.1; do
+    src=$(ldconfig -p | awk -v n="$so" '$1==n {print $NF; exit}')
+    [ -n "${src:-}" ] && cp -L "$src" "$HOME/lib/"
+  done
+  for b in numactl taskset; do p=$(command -v $b) && cp -L "$p" "$HOME/bin/"; done
+fi
+export LD_LIBRARY_PATH=$HOME/lib
+export PATH=$HOME/bin:$PATH
 echo "== what the runs need =="
 for f in libvulkan1 numactl; do printf '  %-12s ' "$f"; dpkg -s $f >/dev/null 2>&1 && echo present || echo MISSING; done
 printf '  %-12s ' taskset; command -v taskset >/dev/null && echo present || echo MISSING
@@ -27,6 +44,10 @@ for p in mesa/build/src/cudavk/libvulkan_cudavk.so \
   printf '  %-52s ' "$p"; [ -e "$HOME/$p" ] && echo ok || echo MISSING
 done
 echo "== does the ICD load? =="
+LD_LIBRARY_PATH=$HOME/lib \
 VK_DRIVER_FILES=$HOME/mesa/build/src/cudavk/cudavk_devenv_icd.x86_64.json \
   vulkaninfo --summary 2>/dev/null | grep -E "driverName|deviceName" | head -2 \
   || echo "  ICD STILL NOT LOADING"
+echo "== every run needs these two lines =="
+echo "  export LD_LIBRARY_PATH=\$HOME/lib"
+echo "  export PATH=\$HOME/bin:\$PATH"
