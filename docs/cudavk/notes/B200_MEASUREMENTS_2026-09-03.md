@@ -269,8 +269,14 @@ measured. This is the next piece of work, not a result.
 2. **The 30.9 MB managed app allocation** -- 1.83 ms/frame of fault stall, 4.8x
    the RTX. Needs a mechanism that is not `SET_ACCESSED_BY` (`DEAD_ENDS` 37
    measured that at +0.36 here).
-3. **`CP_PASS_STREAMS=16`** -- a rebuild, and this host has the memory the RTX
-   did not.
+3. **`CP_PASS_STREAMS=16`** -- **session 1 measured, no effect on favorite2**:
+   8 lanes 9.6692 vs 16 lanes 9.6773 whole (+0.008), heavy -0.035, arms
+   overlapping. On the RTX this capture was the one that showed signal
+   (-0.084, disjoint). favorite3 did not run -- the host went down mid-A/B.
+   The "more lanes pay more on a latency-bound host" hypothesis is
+   **unsupported so far**; one more session would close it. The two builds
+   alternated inside one session via the new per-arm ICD, so this is not a
+   between-session artefact.
 4. **The count-phase merge** -- reopened by measurement, needs its own A/B.
 5. **The §4 price table** -- required before any forecast for this host.
 

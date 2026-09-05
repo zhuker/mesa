@@ -68,7 +68,12 @@ versions are not comparable on host-side time (`WORKFLOW.md`). `ncu` needs
     python3-mako python3-yaml pkg-config bison flex libvulkan-dev
     libxcb1-dev libx11-dev zstd rsync
 
-Two build notes that cost time once each: the CUDA 13 toolkit there needs the
+`meson` from apt is **1.3.2 and too old** -- the project requires >= 1.4.0, so
+install it with `pip3 install --user "meson>=1.4"` and put `~/.local/bin` on
+`PATH`. A build directory copied from another tree does not relocate either;
+configure a fresh one.
+
+Two further build notes that cost time once each: the CUDA 13 toolkit there needs the
 `cuCtxCreate` guard that is already in `main`, and `favorite3-cpp/out/build`
 was configured with **Makefiles**, so `ninja` fails in it -- configure a fresh
 Ninja build directory rather than debugging that one.
