@@ -10,8 +10,6 @@ before optimising anything.
 Compiled-replay paired-submit medians, each capture on its own real-work
 window (WORKFLOW.md 4.0), all defaults, clean environment:
 
-| capture | RTX 5090 (sm_120) | B200 (sm_100) |
-|---|---:|---:|
 > **The floor is 0.522 / 0.502 ms.** The same GPU runs the same submits on
 > NVIDIA's own driver 10-11x faster than cudavk does
 > (`notes/NATIVE_DRIVER_REFERENCE.md`, measured 2026-09-03). Read that before
@@ -19,8 +17,26 @@ window (WORKFLOW.md 4.0), all defaults, clean environment:
 > of the gap to a real driver, and no lead in the ledger addresses the
 > architecture that gap belongs to.
 
+| capture | RTX 5090 (sm_120) | B200 (sm_100) |
+|---|---:|---:|
 | favorite3 | **5.940** | **9.883** |
 | favorite2 | **5.022** | **8.283** |
+
+**Against the previous release**, measured 2026-09-05 with both drivers
+alternating run-by-run in one session (`CTRL_ICD`/`CAND_ICD`), same harness
+binary, all twelve runs passing their gates and every arm disjoint:
+
+| capture | band | cudavk-0.0.1 | cudavk-0.0.2 | delta | |
+|---|---|---:|---:|---:|---:|
+| favorite3 | whole | 6.6823 | **5.9213** | -0.7610 | **-11.4%** |
+| favorite3 | heavy | 8.2369 | 7.2881 | -0.9487 | -11.5% |
+| favorite2 | whole | 5.4947 | **5.0433** | -0.4514 | -8.2% |
+| favorite2 | heavy | 6.0580 | 5.6064 | -0.4515 | -7.5% |
+
+Six changes account for it: the append prefilter, the episode stream gate, the
+clip-scratch hoist, the vertex side lane, the context-scope trim and the
+layered copy merge. Both builds produce **0 sentinel mismatches against the
+same control**, so the two releases render identically.
 
 Both hosts now include everything landed on 2026-09-02/03. The six changes
 were validated on the B200 as one set (control = all six revert switches on,
