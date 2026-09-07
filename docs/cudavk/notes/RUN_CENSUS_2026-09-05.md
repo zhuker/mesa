@@ -1,6 +1,19 @@
-# Probe 1: the run census
+# The redesign probes (P0 and P1)
 
-`REDESIGN_PLAN_2026-09-05.md` §7 probe 1, run at HEAD on both captures with
+All six pre-build gates of `REDESIGN_PLAN_2026-09-05.md` §7. **All pass.**
+
+| probe | gate | favorite3 | favorite2 | |
+|---|---|---|---|---|
+| 1 run census | admitted >= 60% of references | **99.1%** | **99.2%** | pass |
+| 2 identities/run | p99 <= 64 | **18** | **13** | pass |
+| 3 stencil | none in candidate runs | **0** | **0** | pass |
+| 4 split walk | p99 chunk <= 30 us, merge <= 10% | **10.0 us, 1.3%** | — | pass |
+| 5 bin pass | <= 0.15 ms/heavy frame | **0.055 ms** | — | pass |
+| 6 `.local` baseline | recorded | `DEAD_ENDS` 42 | | done |
+
+## Probe 1: the run census
+
+Run at HEAD on both captures with
 `CUDAVK_RUN_CENSUS=1`. Host-side only: it classifies every draw the way the
 run-level renderer would and counts the runs it would form. It changes no
 rendering decision.
@@ -94,6 +107,61 @@ stencil fields, so there is nothing for a run to disagree about.
 
 This is a limitation of the *driver*, recorded in `TODO.md` ("full stencil
 state"), not of the redesign: both renderers ignore stencil identically.
+
+## Probe 4: hot-tile splitting
+
+`src/cudavk/tests/cp_tilewalk_bench.cu`, extended with chunk splitting and an
+`atomicMin` merge. RTX 5090, the M0 mixed grid (3,600 tiles, 1,744 non-empty,
+hot tile pinned to M0's p99 of 12,823 references).
+
+| arrangement | chunks | p50 | p99 | max | walk wall |
+|---|---:|---:|---:|---:|---:|
+| unsplit, one block per tile | 3,600 | 0.22 us | 23.88 us | 34.61 us | 0.0435 ms |
+| **chunk 512** | 3,968 | 2.18 | **10.03** | 11.28 | **0.0221 ms** |
+| chunk 1024 | 3,737 | 1.27 | 16.32 | 19.15 | 0.0281 ms |
+| chunk 2048 | 3,644 | 0.24 | 26.12 | 31.47 | 0.0395 ms |
+
+The `atomicMin` merge costs **0.8-1.3%**, an order of magnitude inside its 10%
+gate. Splitting is order-independent, so it changes no result.
+
+**Splitting does not merely fix the tail; it halves the walk.** 0.0435 ->
+0.0221 ms at chunk 512, because 3,968 evenly sized blocks fill 170 SMs where
+3,600 wildly uneven ones do not. Dead end 24 and Renderer 2 both died on the
+one-block signature (94% of a grid's duration in one block); at chunk 512 the
+worst block is 11.28 us against a 0.0221 ms kernel.
+
+## Probe 5: the bin pass
+
+`src/cudavk/tests/cp_binpass_bench.cu`, new. 354,000 post-clip triangles into
+3,600 tiles of 16 px, count -> scan -> scatter, every list exactly sized from
+a device count (sizing from a worst-case bound is dead end 11).
+
+| phase | ms |
+|---|---:|
+| count | 0.0144 |
+| scan | 0.0061 |
+| scatter | 0.0346 |
+| **total** | **0.0551** |
+
+Gate 0.15 ms/heavy frame: **passes with 2.7x margin**, and the generator emits
+**1.685 references per triangle** against M0's measured 1.16, so the real
+input is lighter than the one measured. The device's reference count matches
+the host's expectation exactly (596,415), which is the correctness check on
+the scan and the cursors.
+
+For scale, this replaces `clip_all` 0.520 + `stage2` 0.187 + `stage3` 0.392 =
+**1.099 ms/frame** of union-exclusive device time.
+
+## Where that leaves the plan's arithmetic
+
+Walk 0.0221 ms/scope at 2.02 drawing scopes = 0.045 ms/frame, plus bin 0.055 =
+**0.10 ms/frame** for walk + bin, against the plan's ESTIMATED 0.25-0.5 for
+walk + bin + compaction. The two new kernels are cheaper than the plan
+budgeted, and they displace 1.099 ms/frame. Compaction is not yet measured.
+
+This does **not** validate the frame-time estimate. Device time is not frame
+time (`PERFORMANCE.md` §5.1), the M2 A/B is the only thing that settles it,
+and the plan's own gate stands: **>= 1.0 ms/frame on the heavy band or stop.**
 
 ## Next gates
 
