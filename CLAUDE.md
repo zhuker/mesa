@@ -112,8 +112,9 @@ number only says a kernel was resident.
 
 **The driver was host-bound; it is no longer, and that is measured.** That
 claim once read seventeen blocks and 12.44 ms of a 15.74 ms frame spent
-waiting. After the 2026-09-02/03 work it blocks **7.25 times a frame for
-1.325 ms of a 5.94 ms frame** (`CUDAVK_PLAN_STATS` reports the four sites),
+waiting. After the 2026-09-02/03 work it blocks **12.2 times for 2.21 ms of a
+5.94 ms real frame** at the four sites `CUDAVK_PLAN_STATS` times, or 18.3
+times counting every sync kind in a trace,
 and that 1.325 ms is the GPU finishing rather than the host being slow:
 injecting 0.449 ms/frame of host busy-work *before* the largest wait does not
 move the frame at all (`DEAD_ENDS` 41). Removing device operations was close

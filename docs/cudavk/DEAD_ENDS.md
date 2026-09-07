@@ -2494,7 +2494,13 @@ The population, favorite3, 3,473 frames:
 | segment counters | 1,019.2 ms | 0.294 | 200 us |
 | peel checks | 365.8 ms | 0.105 | 93 us |
 | desc uploads | 20.3 ms | 0.006 | 6 us |
-| **total** | **4,601.4 ms** | **1.325** | |
+| **total** | **4,601.4 ms** | **2.209** | |
+
+(Per **real** frame, 2,083 of them -- the window the 5.94 ms median is taken
+over. Dividing the same totals by all 3,473 frames gives 1.325, which is the
+figure this entry first carried and which silently compared a whole-run
+average against a real-window median. The counts below are per real frame for
+the same reason: 3.74 drains/frame becomes 6.24.)
 
 Larger than the model. And entirely uncollectible, which the probe shows by
 injecting **pure host busy-work before the drain's sync** and measuring the
