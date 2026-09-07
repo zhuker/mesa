@@ -2914,3 +2914,377 @@ cp_opaque_tile_raster(struct cp_opaque_tile_raster_args args)
             [py * args.width + px] = winner[j];
    }
 }
+
+
+/*
+ * The chunk-split opaque tile walk (REDESIGN_PLAN_2026-09-05.md M2).
+ *
+ * cp_opaque_tile_raster above walks a tile's references ONE AT A TIME, with
+ * thread 0 doing each setup and a __syncthreads between them, so a tile with
+ * 12,823 references costs 12,823 serial iterations and one block holds the
+ * whole grid up. That is dead end 24's signature exactly, and it is why both
+ * previous tiling attempts were refused.
+ *
+ * This inverts it, as RENDERER2_M1_WALKBENCH.md measured at 26.5 cycles per
+ * reference against entry 24's 3,409:
+ *
+ *   - one thread per REFERENCE, so every setup happens in parallel;
+ *   - the tile's visibility lives in shared memory, resolved by atomicMin on
+ *     the same packed word the rest of the driver uses;
+ *   - a tile whose list is longer than CP_RUN_CHUNK is split into several
+ *     blocks at bin time, from counts the scan already produced -- no dynamic
+ *     claiming (dead end 2), no persistent kernel;
+ *   - blocks merge into the global visibility buffer with atomicMin, which is
+ *     order-independent, so splitting a tile cannot change the result.
+ *
+ * Probe 4 measured the split at chunk 512: p99 block 10.03 us against 23.88
+ * unsplit, and the whole walk 0.0221 ms against 0.0435.
+ */
+extern "C" __global__ __launch_bounds__(256) void
+cp_opaque_tile_raster_split(struct cp_opaque_tile_raster_args args,
+                            uint64_t chunk_off, uint64_t chunk_n,
+                            uint64_t chunk_tile, uint32_t nchunks)
+{
+   if (blockIdx.x >= nchunks || *(const uint32_t *)(uintptr_t)args.overflow)
+      return;
+   const uint32_t n = ((const uint32_t *)(uintptr_t)chunk_n)[blockIdx.x];
+   if (!n)
+      return;
+   const uint32_t tile = ((const uint32_t *)(uintptr_t)chunk_tile)[blockIdx.x];
+   const uint32_t off = ((const uint32_t *)(uintptr_t)chunk_off)[blockIdx.x];
+
+   const uint32_t tx = tile % args.tiles_x;
+   const uint32_t ty = tile / args.tiles_x;
+   const uint32_t x0 = tx * CP_OPAQUE_TILE_SIZE;
+   const uint32_t y0 = ty * CP_OPAQUE_TILE_SIZE;
+
+   const struct cp_rasterize_args *rasts =
+      (const struct cp_rasterize_args *)(uintptr_t)args.rast_args;
+   const struct cp_opaque_tile_ref *refs =
+      (const struct cp_opaque_tile_ref *)(uintptr_t)args.tile_refs;
+
+   /* 32x32 pixels, one packed visibility word each: 8 KB of shared. */
+   __shared__ unsigned long long vis[CP_OPAQUE_TILE_SIZE * CP_OPAQUE_TILE_SIZE];
+   for (uint32_t p = threadIdx.x;
+        p < CP_OPAQUE_TILE_SIZE * CP_OPAQUE_TILE_SIZE; p += blockDim.x)
+      vis[p] = VISBUF_EMPTY;
+   __syncthreads();
+
+   for (uint32_t base = 0; base < n; base += blockDim.x) {
+      const uint32_t k = base + threadIdx.x;
+      if (k >= n)
+         break;
+      const struct cp_opaque_tile_ref ref = refs[off + k];
+      if (ref.segment >= args.num_segments)
+         continue;
+      struct cp_rasterize_args rast = rasts[ref.segment];   /* setup_triangle
+                                                             * takes it by
+                                                             * non-const ptr */
+      const uint32_t global_prim = ref.global_prim;
+      const uint32_t local_prim = global_prim - rast.abuf_prim_base;
+      struct cp_tri_setup setup;
+      if (!setup_triangle(&rast, local_prim, &setup))
+         continue;
+
+      /* Only this tile's share of the triangle. */
+      int px0 = max((int)x0, setup.ix_min);
+      int px1 = min((int)(x0 + CP_OPAQUE_TILE_SIZE - 1), setup.ix_max);
+      int py0 = max((int)y0, setup.iy_min);
+      int py1 = min((int)(y0 + CP_OPAQUE_TILE_SIZE - 1), setup.iy_max);
+      for (int py = py0; py <= py1; py++) {
+         if ((uint32_t)py >= args.height)
+            break;
+         for (int px = px0; px <= px1; px++) {
+            if ((uint32_t)px >= args.width)
+               break;
+            if (cp_tri_rejected(&rast, local_prim, px, py))
+               continue;
+            float sx = (float)px + 0.5f, sy = (float)py + 0.5f;
+            float ndc_z;
+            if (setup.is_point) {
+               if (sx < setup.pt_x0 || sx >= setup.pt_x1 ||
+                   sy < setup.pt_y0 || sy >= setup.pt_y1)
+                  continue;
+               ndc_z = setup.ndc_z0;
+            } else {
+               float e0 = edge_function(setup.sx1, setup.sy1, setup.sx2,
+                                        setup.sy2, sx, sy);
+               float e1 = edge_function(setup.sx2, setup.sy2, setup.sx0,
+                                        setup.sy0, sx, sy);
+               float e2 = edge_function(setup.sx0, setup.sy0, setup.sx1,
+                                        setup.sy1, sx, sy);
+               if (!edge_inside(e0, setup.e0_top_left) ||
+                   !edge_inside(e1, setup.e1_top_left) ||
+                   !edge_inside(e2, setup.e2_top_left))
+                  continue;
+               float w0 = e0 * setup.inv_area;
+               float w1 = e1 * setup.inv_area;
+               ndc_z = w0 * setup.ndc_z0 + w1 * setup.ndc_z1 +
+                       (1.0f - w0 - w1) * setup.ndc_z2;
+            }
+            uint32_t depth = float_to_sortable_uint(
+               CP_WINDOW_DEPTH(ndc_z, rast.depth_scale, rast.depth_translate));
+            uint32_t pixel = (uint32_t)py * args.width + (uint32_t)px;
+            if (!cp_opaque_depth_pass(&rast, pixel, depth))
+               continue;
+            uint32_t key = rast.depth_key_invert ? ~depth : depth;
+            atomicMin(&vis[((uint32_t)py - y0) * CP_OPAQUE_TILE_SIZE +
+                           ((uint32_t)px - x0)],
+                      (unsigned long long)PACK_VISBUF(key, global_prim));
+         }
+      }
+   }
+   __syncthreads();
+
+   /* Merge. atomicMin because a split tile has several blocks here, and
+    * because the unsplit case then behaves identically. */
+   uint64_t *visbuf = (uint64_t *)(uintptr_t)rasts[0].framebuffer;
+   for (uint32_t p = threadIdx.x;
+        p < CP_OPAQUE_TILE_SIZE * CP_OPAQUE_TILE_SIZE; p += blockDim.x) {
+      if (vis[p] == VISBUF_EMPTY)
+         continue;
+      uint32_t px = x0 + p % CP_OPAQUE_TILE_SIZE;
+      uint32_t py = y0 + p / CP_OPAQUE_TILE_SIZE;
+      if (px < args.width && py < args.height)
+         atomicMin((unsigned long long *)&visbuf[(size_t)py * args.width + px],
+                   (unsigned long long)vis[p]);
+   }
+}
+
+
+/* ==================================================================== *
+ * The run-level renderer's kernels (REDESIGN_PLAN_2026-09-05.md, M2).
+ *
+ * A *run* is a maximal sequence of consecutive opaque draws in one scope.
+ * Instead of one clip/raster/shade chain per batch, a run is rendered with
+ * one clip-and-bin, one tile walk, one compaction and one shade launch per
+ * fragment-shader identity. Probe 1 measured one opaque run per frame
+ * holding 91-95% of the triangles at 164-181 draws; probes 4 and 5 measured
+ * the two kernels below at 0.10 ms/frame against the 1.099 ms/frame of
+ * clip_all + stage2 + stage3 they displace.
+ *
+ * Everything here is gated by CUDAVK_RENDERER2 and unreachable with it off.
+ * ==================================================================== */
+
+
+/*
+ * Bin pass, phase 1: how many tile references each triangle makes.
+ *
+ * Counting before scattering costs the setup read twice and leaves every
+ * list exactly sized. Sizing from a worst-case bound instead is dead end 11.
+ */
+extern "C" __global__ void
+cp_run_bin_count(const struct cp_tri_setup *__restrict__ setups,
+                 uint32_t nsetups, uint32_t *__restrict__ counts,
+                 uint32_t tiles_x, uint32_t tiles_y)
+{
+   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= nsetups)
+      return;
+   const struct cp_tri_setup s = setups[i];
+   if (s.ix_max < s.ix_min || s.iy_max < s.iy_min)
+      return;                                   /* culled or empty */
+   int tx0 = s.ix_min / CP_RUN_TILE, tx1 = s.ix_max / CP_RUN_TILE;
+   int ty0 = s.iy_min / CP_RUN_TILE, ty1 = s.iy_max / CP_RUN_TILE;
+   tx0 = max(tx0, 0); ty0 = max(ty0, 0);
+   tx1 = min(tx1, (int)tiles_x - 1); ty1 = min(ty1, (int)tiles_y - 1);
+   for (int ty = ty0; ty <= ty1; ty++)
+      for (int tx = tx0; tx <= tx1; tx++)
+         atomicAdd(&counts[ty * tiles_x + tx], 1u);
+}
+
+/* Bin pass, phase 2: exclusive prefix sum over the tile counters, one block. */
+extern "C" __global__ void
+cp_run_bin_scan(const uint32_t *__restrict__ counts,
+                uint32_t *__restrict__ offs, uint32_t *__restrict__ total,
+                uint32_t ntiles)
+{
+   __shared__ uint32_t s[1024];
+   uint32_t acc = 0;
+   for (uint32_t base = 0; base < ntiles; base += 1024) {
+      uint32_t i = base + threadIdx.x;
+      uint32_t v = (i < ntiles) ? counts[i] : 0u;
+      s[threadIdx.x] = v;
+      __syncthreads();
+      for (uint32_t d = 1; d < 1024; d <<= 1) {
+         uint32_t x = (threadIdx.x >= d) ? s[threadIdx.x - d] : 0u;
+         __syncthreads();
+         s[threadIdx.x] += x;
+         __syncthreads();
+      }
+      if (i < ntiles)
+         offs[i] = acc + s[threadIdx.x] - v;
+      uint32_t blocksum = s[1023];
+      __syncthreads();
+      acc += blocksum;
+   }
+   if (threadIdx.x == 0)
+      *total = acc;
+}
+
+/* Bin pass, phase 3: write the dense per-tile reference lists. */
+extern "C" __global__ void
+cp_run_bin_scatter(const struct cp_tri_setup *__restrict__ setups,
+                   uint32_t nsetups, const uint32_t *__restrict__ offs,
+                   uint32_t *__restrict__ cursor, uint32_t *__restrict__ refs,
+                   uint32_t tiles_x, uint32_t tiles_y)
+{
+   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= nsetups)
+      return;
+   const struct cp_tri_setup s = setups[i];
+   if (s.ix_max < s.ix_min || s.iy_max < s.iy_min)
+      return;
+   int tx0 = s.ix_min / CP_RUN_TILE, tx1 = s.ix_max / CP_RUN_TILE;
+   int ty0 = s.iy_min / CP_RUN_TILE, ty1 = s.iy_max / CP_RUN_TILE;
+   tx0 = max(tx0, 0); ty0 = max(ty0, 0);
+   tx1 = min(tx1, (int)tiles_x - 1); ty1 = min(ty1, (int)tiles_y - 1);
+   for (int ty = ty0; ty <= ty1; ty++)
+      for (int tx = tx0; tx <= tx1; tx++) {
+         uint32_t tile = ty * tiles_x + tx;
+         uint32_t slot = atomicAdd(&cursor[tile], 1u);
+         refs[offs[tile] + slot] = i;
+      }
+}
+
+/*
+ * Chunk descriptors, built on the device from the counts the scan produced.
+ * A tile whose list exceeds CP_RUN_CHUNK becomes several consecutive chunks,
+ * each its own block -- the answer to dead end 24's one-block signature, and
+ * decided from counts rather than by claiming work at run time (dead end 2).
+ */
+extern "C" __global__ void
+cp_run_chunk_count(const uint32_t *__restrict__ counts, uint32_t ntiles,
+                   uint32_t *__restrict__ nchunks)
+{
+   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= ntiles)
+      return;
+   uint32_t n = counts[i];
+   uint32_t c = n ? ((n + CP_RUN_CHUNK - 1) / CP_RUN_CHUNK) : 0u;
+   if (c)
+      atomicAdd(nchunks, c);
+}
+
+extern "C" __global__ void
+cp_run_chunk_build(const uint32_t *__restrict__ counts,
+                   const uint32_t *__restrict__ offs, uint32_t ntiles,
+                   uint32_t *__restrict__ chunk_off,
+                   uint32_t *__restrict__ chunk_n,
+                   uint32_t *__restrict__ chunk_tile,
+                   uint32_t *__restrict__ cursor, uint32_t cap)
+{
+   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= ntiles)
+      return;
+   uint32_t n = counts[i];
+   if (!n)
+      return;
+   uint32_t c = (n + CP_RUN_CHUNK - 1) / CP_RUN_CHUNK;
+   uint32_t base = atomicAdd(cursor, c);
+   for (uint32_t k = 0; k < c && base + k < cap; k++) {
+      uint32_t s = k * CP_RUN_CHUNK;
+      chunk_off[base + k] = offs[i] + s;
+      chunk_n[base + k] = min(n - s, (uint32_t)CP_RUN_CHUNK);
+      chunk_tile[base + k] = i;
+   }
+}
+
+/*
+ * The tile walk: one block per chunk, one thread per reference, visibility
+ * resolved in shared memory by atomicMin on the same packed word the existing
+ * rasterizer uses, then merged into the global visibility buffer with the
+ * same atomicMin -- which is order-independent, so chunking changes nothing.
+ *
+ * This is the inverted mapping RENDERER2_M1_WALKBENCH.md measured at 26.5
+ * cycles per reference conservative and 7.8 with the early-out, against dead
+ * end 24's 3,409.
+ */
+extern "C" __global__ __launch_bounds__(CP_RUN_TILE_PIX) void
+cp_run_tile_walk(const struct cp_tri_setup *__restrict__ setups,
+                 const uint32_t *__restrict__ refs,
+                 const uint32_t *__restrict__ chunk_off,
+                 const uint32_t *__restrict__ chunk_n,
+                 const uint32_t *__restrict__ chunk_tile,
+                 uint64_t *__restrict__ visbuf,
+                 uint32_t width, uint32_t height, uint32_t tiles_x)
+{
+   __shared__ unsigned long long vis[CP_RUN_TILE_PIX];
+   const uint32_t tid = threadIdx.x;
+   const uint32_t tile = chunk_tile[blockIdx.x];
+   const uint32_t off = chunk_off[blockIdx.x];
+   const uint32_t n = chunk_n[blockIdx.x];
+
+   const uint32_t tile_x = (tile % tiles_x) * CP_RUN_TILE;
+   const uint32_t tile_y = (tile / tiles_x) * CP_RUN_TILE;
+
+   vis[tid] = VISBUF_EMPTY;
+   __syncthreads();
+
+   const uint32_t px = tile_x + (tid % CP_RUN_TILE);
+   const uint32_t py = tile_y + (tid / CP_RUN_TILE);
+
+   for (uint32_t base = 0; base < n; base += CP_RUN_TILE_PIX) {
+      uint32_t k = base + tid;
+      if (k < n) {
+         uint32_t sidx = refs[off + k];
+         const struct cp_tri_setup s = setups[sidx];
+         /* Every pixel of this tile against this one triangle. The thread
+          * owns a reference, not a pixel, so it walks the tile's pixels. */
+         int x0 = max((int)tile_x, s.ix_min), x1 = min((int)tile_x + CP_RUN_TILE - 1, s.ix_max);
+         int y0 = max((int)tile_y, s.iy_min), y1 = min((int)tile_y + CP_RUN_TILE - 1, s.iy_max);
+         for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+               if ((uint32_t)x >= width || (uint32_t)y >= height)
+                  continue;
+               float cx = (float)x + 0.5f, cy = (float)y + 0.5f;
+               float e0 = edge_function(s.sx1, s.sy1, s.sx2, s.sy2, cx, cy);
+               float e1 = edge_function(s.sx2, s.sy2, s.sx0, s.sy0, cx, cy);
+               float e2 = edge_function(s.sx0, s.sy0, s.sx1, s.sy1, cx, cy);
+               if (!edge_inside(e0, s.e0_top_left) ||
+                   !edge_inside(e1, s.e1_top_left) ||
+                   !edge_inside(e2, s.e2_top_left))
+                  continue;
+               float b0 = e0 * s.inv_area, b1 = e1 * s.inv_area;
+               float b2 = 1.0f - b0 - b1;
+               float z = b0 * s.ndc_z0 + b1 * s.ndc_z1 + b2 * s.ndc_z2;
+               uint32_t du = float_to_sortable_uint(z);
+               uint32_t lx = (uint32_t)x - tile_x, ly = (uint32_t)y - tile_y;
+               atomicMin(&vis[ly * CP_RUN_TILE + lx],
+                         (unsigned long long)PACK_VISBUF(du, sidx));
+            }
+         }
+      }
+   }
+   __syncthreads();
+
+   if (px < width && py < height && vis[tid] != VISBUF_EMPTY)
+      atomicMin((unsigned long long *)&visbuf[(size_t)py * width + px],
+                (unsigned long long)vis[tid]);
+}
+
+/*
+ * Compaction: per fragment-shader identity, the dense list of pixels whose
+ * winner belongs to it. tri_ident maps a setup index to an identity slot,
+ * which the host filled from the run's per-draw identity table.
+ */
+extern "C" __global__ void
+cp_run_compact(const uint64_t *__restrict__ visbuf, uint32_t npix,
+               const uint8_t *__restrict__ tri_ident,
+               uint32_t nident, uint32_t stride,
+               uint32_t *__restrict__ lists, uint32_t *__restrict__ counts)
+{
+   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= npix)
+      return;
+   uint64_t e = visbuf[i];
+   if (e == VISBUF_EMPTY)
+      return;
+   uint32_t tri = VISBUF_TRIID(e);
+   uint32_t id = tri_ident[tri];
+   if (id >= nident)
+      return;
+   uint32_t slot = atomicAdd(&counts[id], 1u);
+   if (slot < stride)
+      lists[(size_t)id * stride + slot] = i;
+}

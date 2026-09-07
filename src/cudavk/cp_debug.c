@@ -113,6 +113,10 @@ static const struct cp_flag_def flags[] = {
      "trace every draw: geometry, attachments, and why a draw was skipped" },
    { "CUDAVK_DEBUG_TEX", CP_FLAG_BOOL_PRESENCE, F(debug_tex),
      "trace sampler and texture-handle setup" },
+   { "CUDAVK_NO_TILE_SPLIT", CP_FLAG_BOOL_VALUE, F(no_tile_split),
+     "walk a tiled-opaque tile with one block per tile again, serially over "
+     "its references, instead of splitting long tile lists into chunks of "
+     "512 resolved one thread per reference (REDESIGN_PLAN_2026-09-05 M2)" },
    { "CUDAVK_RUN_CENSUS", CP_FLAG_BOOL_VALUE, F(run_census),
      "count the runs the run-level redesign would render as one unit -- "
      "maximal sequences of consecutive same-class draws in one scope -- and "

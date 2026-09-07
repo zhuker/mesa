@@ -9073,8 +9073,41 @@ cp_opaque_tile_visibility(struct cp_context *cp, struct cp_pass_seg *segs,
       .height = h,
    };
    void *raster_params[] = { &raster };
+   /*
+    * The split walk (REDESIGN_PLAN_2026-09-05.md M2). cp_opaque_tile_raster
+    * gives one block a whole tile and walks its references serially, which is
+    * dead end 24's one-block signature; the split form gives each block at
+    * most CP_RUN_CHUNK references of one tile and resolves them in parallel.
+    *
+    * The chunk count is a device quantity, so the grid is the upper bound
+    * ntiles + capacity/CP_RUN_CHUNK and a block with no chunk returns at once
+    * -- idle blocks are free (dead end 9), and reading the real count back
+    * would put a host round trip inside the episode.
+    */
+   if (!cp_debug->no_tile_split && screen->kernels.opaque_tile_raster_split &&
+       screen->kernels.run_chunk_build) {
+      uint32_t chunk_cap = ntiles + CP_MAX_OPAQUE_TILE_REFS / CP_RUN_CHUNK + 1;
+      CUdeviceptr c_off = cp_scratch_alloc_device(cp, (size_t)chunk_cap * 4);
+      CUdeviceptr c_n = cp_scratch_alloc_device(cp, (size_t)chunk_cap * 4);
+      CUdeviceptr c_tile = cp_scratch_alloc_device(cp, (size_t)chunk_cap * 4);
+      CUdeviceptr c_cur = cp_scratch_alloc_device(cp, 4);
+      if (c_off && c_n && c_tile && c_cur) {
+         cuMemsetD32Async(c_n, 0, chunk_cap, cp->stream);
+         cuMemsetD32Async(c_cur, 0, 1, cp->stream);
+         void *cb[] = { &counts, &offsets, &ntiles, &c_off, &c_n, &c_tile,
+                        &c_cur, &chunk_cap };
+         CP_LAUNCH(screen->kernels.run_chunk_build,
+                   DIV_ROUND_UP(ntiles, 256), 1, 1, 256, 1, 1, 0,
+                   cp->stream, cb, NULL);
+         void *sp[] = { &raster, &c_off, &c_n, &c_tile, &chunk_cap };
+         CP_LAUNCH(screen->kernels.opaque_tile_raster_split, chunk_cap, 1, 1,
+                   256, 1, 1, 0, cp->stream, sp, NULL);
+         goto walk_done;
+      }
+   }
    CP_LAUNCH(screen->kernels.opaque_tile_raster, ntiles, 1, 1,
              256, 1, 1, 0, cp->stream, raster_params, NULL);
+walk_done:;
 
    /* The tiled kernel returns immediately when overflow is nonzero. Enqueue
     * the ordinary raster stages behind it with the inverse predicate, so the

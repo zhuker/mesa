@@ -399,6 +399,15 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
 
    if (!build_module(&k->module, cp_rasterize_src, "cp_rasterize.cu", sm_major, sm_minor))
       goto fail;
+   cuModuleGetFunction(&k->opaque_tile_raster_split, k->module,
+                       "cp_opaque_tile_raster_split");
+   cuModuleGetFunction(&k->run_bin_count, k->module, "cp_run_bin_count");
+   cuModuleGetFunction(&k->run_bin_scan, k->module, "cp_run_bin_scan");
+   cuModuleGetFunction(&k->run_bin_scatter, k->module, "cp_run_bin_scatter");
+   cuModuleGetFunction(&k->run_chunk_count, k->module, "cp_run_chunk_count");
+   cuModuleGetFunction(&k->run_chunk_build, k->module, "cp_run_chunk_build");
+   cuModuleGetFunction(&k->run_tile_walk, k->module, "cp_run_tile_walk");
+   cuModuleGetFunction(&k->run_compact, k->module, "cp_run_compact");
    cuModuleGetFunction(&k->rasterize_stage1, k->module, "cp_rasterize_stage1");
    cuModuleGetFunction(&k->rasterize_stage2, k->module, "cp_rasterize_stage2");
    cuModuleGetFunction(&k->rasterize_stage3, k->module, "cp_rasterize_stage3");

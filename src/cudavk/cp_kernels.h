@@ -43,6 +43,12 @@ struct cp_kernels {
    /* Rasterization kernels (3-stage adaptive) */
    CUfunction rasterize_triangles; /* alias for stage1, used by legacy code */
    CUfunction rasterize_stage1;
+   /* The run-level renderer (REDESIGN_PLAN_2026-09-05.md M2); all unreachable
+    * unless CUDAVK_RENDERER2 is set. */
+   CUfunction run_bin_count, run_bin_scan, run_bin_scatter;
+   CUfunction run_chunk_count, run_chunk_build;
+   CUfunction run_tile_walk, run_compact;
+   CUfunction opaque_tile_raster_split;
    CUfunction rasterize_stage2;
    CUfunction rasterize_stage3;
    /* The same three with the A-buffer's count/fill branch compiled in. Only

@@ -1006,6 +1006,15 @@ struct cp_abuf_shade_count_args {
 };
 
 #define CP_OPAQUE_TILE_SIZE 32u
+
+/* The run-level walk (REDESIGN_PLAN_2026-09-05.md M2). A tile list longer
+ * than CP_RUN_CHUNK is split into that many references per block, decided at
+ * bin time from the counts the scan produced. Probe 4 measured the knee at
+ * 512: p99 block 10.03 us against 23.88 unsplit, whole walk 0.0221 vs 0.0435
+ * ms. Host and device both need it, so it lives here. */
+#define CP_RUN_TILE 16
+#define CP_RUN_TILE_PIX (CP_RUN_TILE * CP_RUN_TILE)
+#define CP_RUN_CHUNK 512u
 #define CP_MAX_OPAQUE_TILE_REFS 2000000u
 
 struct cp_opaque_tile_ref {
