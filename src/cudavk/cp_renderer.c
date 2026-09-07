@@ -3711,6 +3711,10 @@ cp_fs_args_prepare(struct cp_context *cp, const struct cp_draw_state *state,
    if (cp_shader_exec_is_hardware(exec_mode))
       assert(!use_sampler_variant);
 
+   /* Probe 2: this is the identity the run-level renderer would need one
+    * shade launch for (REDESIGN_PLAN_2026-09-05.md §7). Watching only. */
+   cp_run_census_identity(cp, fs, launch_exec);
+
    /*
     * Specialisation is invisible when it stops working, so count it. A
     * shader whose sampler handles the specialiser could not match still
@@ -8399,8 +8403,38 @@ cp_run_census_close(struct cp_context *cp)
    for (uint64_t n = rc->cur_draws; n > 1 && b < 11; n >>= 1)
       b++;
    rc->len_hist[rc->cls][b]++;
+   rc->id_hist[rc->cls][MIN2(rc->nids, (unsigned)CP_RUN_ID_MAX)]++;
+   if (rc->ids_overflow)
+      rc->id_overflows++;
    rc->cls = CP_RUN_NONE;
    rc->cur_draws = rc->cur_tris = 0;
+   rc->nids = 0;
+   rc->ids_overflow = false;
+}
+
+/*
+ * Probe 2. Called where cp_fs_args_prepare() has settled which kernel this
+ * draw will actually launch: that pointer is the identity, because the
+ * variant and the tune alternate are already folded into it.
+ */
+void
+cp_run_census_identity(struct cp_context *cp, const void *fs, const void *exec)
+{
+   if (!cp_debug->run_census)
+      return;
+   struct cp_run_census *rc = &cp->run_census;
+   if (rc->cls == CP_RUN_NONE)
+      return;
+   for (unsigned i = 0; i < rc->nids; i++)
+      if (rc->ids[i][0] == fs && rc->ids[i][1] == exec)
+         return;
+   if (rc->nids == CP_RUN_ID_MAX) {
+      rc->ids_overflow = true;
+      return;
+   }
+   rc->ids[rc->nids][0] = fs;
+   rc->ids[rc->nids][1] = exec;
+   rc->nids++;
 }
 
 void
@@ -8488,6 +8522,33 @@ cp_run_census_report(struct cp_context *cp)
    fprintf(stderr, "cudavk:   run ends: %" PRIu64 " scope, %" PRIu64
            " class change, %" PRIu64 " flush\n",
            rc->break_scope, rc->break_class, rc->break_flush);
+   for (unsigned k = CP_RUN_OPAQUE; k < CP_RUN_CLASSES; k++) {
+      if (!rc->runs[k])
+         continue;
+      uint64_t seen = 0, tot = 0;
+      for (unsigned q = 0; q <= CP_RUN_ID_MAX; q++) {
+         seen += rc->id_hist[k][q];
+         tot += rc->id_hist[k][q] * q;
+      }
+      if (!seen)
+         continue;
+      uint64_t acc = 0; unsigned p50 = 0, p90 = 0, p99 = 0, mx = 0;
+      for (unsigned q = 0; q <= CP_RUN_ID_MAX; q++) {
+         if (!rc->id_hist[k][q])
+            continue;
+         mx = q;
+         acc += rc->id_hist[k][q];
+         if (!p50 && acc * 100 >= seen * 50) p50 = q;
+         if (!p90 && acc * 100 >= seen * 90) p90 = q;
+         if (!p99 && acc * 100 >= seen * 99) p99 = q;
+      }
+      fprintf(stderr, "cudavk:   %-11s fs identities/run: mean %.2f p50 %u "
+              "p90 %u p99 %u max %u   (plan gate: p99 <= 64)\n",
+              name[k], (double)tot / (double)seen, p50, p90, p99, mx);
+   }
+   if (rc->id_overflows)
+      fprintf(stderr, "cudavk:   WARNING %" PRIu64 " runs exceeded %u tracked "
+              "identities\n", rc->id_overflows, (unsigned)CP_RUN_ID_MAX);
    for (unsigned k = CP_RUN_OPAQUE; k < CP_RUN_CLASSES; k++) {
       if (!rc->runs[k])
          continue;

@@ -62,6 +62,39 @@ exactly the draws the relaxation targets. The hook moved to
 
 **A census of a decision must be taken upstream of that decision.**
 
+## Probe 2: fragment-shader identities per run
+
+The identity is the `(binary, resolved exec)` pair `cp_fs_args_prepare()`
+settles on; that pointer already folds in exec mode, sampler variant and tune
+alternate, so it is the plan's four axes and it is exactly what one shade
+launch would cover. **Gate: stop if p99 exceeds 64.**
+
+| class | favorite3 mean / p50 / p90 / p99 / max | favorite2 |
+|---|---|---|
+| opaque | 12.75 / 13 / 17 / **18** / 18 | 11.00 / 11 / 13 / **13** / 13 |
+| depth-only | 1.00 / 1 / 1 / 1 / 2 | 1.00 / 1 / 1 / 1 / 1 |
+| blended | 1.41 / 1 / 3 / 4 / 5 | 1.41 / 1 / 3 / 3 / 4 |
+| fallthrough | 1.00 / 1 / 1 / 1 / 1 | 1.00 / 1 / 1 / 1 / 1 |
+
+No run exceeded the 128 tracked identities. **Passes with a 3.5x margin.**
+
+The number that matters for the design: **an opaque run of 181 draws needs
+13-18 shade launches**. Add one geometry launch per VS identity, one clip+bin,
+one walk and one compaction and the run costs roughly 20-25 launches where
+today its ~110 batch chains cost several hundred.
+
+## Probe 3: stencil and alpha-to-coverage
+
+**No code needed; the driver already answers it.** `cpvk_pipeline.c` computes
+`stencil_visible` -- a stencil configuration that would change pixels -- and
+announces it once per process before ignoring it. **Neither capture emits that
+line**, so no candidate run contains stencil the redesign would break. The
+driver has no alpha-to-coverage state at all, and `cp_draw_state` carries no
+stencil fields, so there is nothing for a run to disagree about.
+
+This is a limitation of the *driver*, recorded in `TODO.md` ("full stencil
+state"), not of the redesign: both renderers ignore stencil identically.
+
 ## Next gates
 
 Probe 2 (four-axis identity census per run, stop if p99 > 64), probe 3

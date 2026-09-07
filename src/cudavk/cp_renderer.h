@@ -214,6 +214,18 @@ struct cp_run_census {
    /* run length histogram, log2 buckets of draws per run */
    uint64_t len_hist[CP_RUN_CLASSES][12];
 
+   /* Probe 2: distinct fragment-shader identities inside the current run.
+    * The identity is the (binary, resolved exec) pair cp_fs_args_prepare
+    * settles on -- that pointer already encodes exec mode, sampler variant
+    * and tune alternate, which are the plan's four axes. One shade launch
+    * per distinct pair is what the run-level renderer would issue. */
+#define CP_RUN_ID_MAX 128
+   const void *ids[CP_RUN_ID_MAX][2];
+   unsigned nids;
+   bool ids_overflow;
+   uint64_t id_hist[CP_RUN_CLASSES][CP_RUN_ID_MAX + 1];
+   uint64_t id_overflows;
+
    /* why runs ended */
    uint64_t break_scope, break_class, break_flush;
 
@@ -1264,6 +1276,8 @@ void cp_stage_end(struct cp_context *cp, int stage);
 void cp_run_census_draw(struct cp_context *cp,
                         const struct cp_draw_packet *packet, unsigned tris);
 void cp_run_census_break(struct cp_context *cp, bool scope_change);
+void cp_run_census_identity(struct cp_context *cp, const void *fs,
+                            const void *exec);
 void cp_run_census_report(struct cp_context *cp);
 
 enum cp_tile_census_cut_kind {
