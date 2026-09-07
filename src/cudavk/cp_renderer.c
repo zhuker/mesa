@@ -1062,6 +1062,7 @@ cp_context_cleanup(struct cp_context *cp)
               (double)cp->fs_blocks / (double)cp->fs_launches, cp->sm_count,
               cp_debug->fs_grid_waves);
    cp_plan_report(cp);
+   cp_run_census_report(cp);
    if (cp_debug->upload_stats)
       fprintf(stderr, "cudavk: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
               " bytes=%" PRIu64 " empty=%" PRIu64 " coalesce=%d\n",
@@ -8338,6 +8339,166 @@ cp_batch_begin_packet(struct cp_context *cp,
    cp->batch.blended = blended;
 }
 
+
+/*
+ * ---- Run census (REDESIGN_PLAN_2026-09-05.md, probe 1) ----
+ *
+ * Classify each draw the way the run-level redesign would, extend or close
+ * the current run, and report the shares at teardown. This is the probe that
+ * decides whether that plan is built at all: its gate is that admitted runs
+ * hold at least 60% of a frame's triangles.
+ *
+ * Triangles stand in for tile references here. The M0 census measured 1.16
+ * references per triangle with no strong per-draw skew
+ * (RENDERER2_M0_RESULTS.md), so the share is the same quantity to within that
+ * factor -- and a share is what the gate tests, not an absolute.
+ */
+static enum cp_run_class
+cp_run_classify(const struct cp_draw_packet *packet)
+{
+   const struct cp_draw_state *st = &packet->state;
+   const struct cp_fb_desc *fb = &packet->scope->fb;
+   const bool one_sample = MAX2(packet->scope->attachment_samples, 1u) == 1;
+   const bool side_effects = st->fs && st->fs->writes_memory;
+
+   if (!st->fs || side_effects || !one_sample)
+      return CP_RUN_FALLTHROUGH;
+
+   if (cp_batch_order_free(st)) {
+      /* The plan's relaxation: an order-free draw with no colour attachment
+       * is a depth-only run. Today cpvk_batch_structural refuses it because
+       * colorAttachmentCount is 0, so the shadow scope runs one chain and one
+       * full visibility clear per draw (SHADOW_VISBUF_CLEARS.md). */
+      if (fb->nr_cbufs == 0 || !fb->color)
+         return CP_RUN_DEPTH_ONLY;
+      if (fb->nr_cbufs == 1 && fb->color_encoding >= 0)
+         return CP_RUN_OPAQUE;
+      return CP_RUN_FALLTHROUGH;
+   }
+
+   /* Blended: the A-buffer's own admission. */
+   if (!st->depth.depth_writemask && fb->nr_cbufs == 1 && fb->color &&
+       fb->color_encoding >= 0)
+      return CP_RUN_BLENDED;
+
+   return CP_RUN_FALLTHROUGH;
+}
+
+static void
+cp_run_census_close(struct cp_context *cp)
+{
+   struct cp_run_census *rc = &cp->run_census;
+   if (rc->cls == CP_RUN_NONE || !rc->cur_draws)
+      return;
+   rc->runs[rc->cls]++;
+   rc->draws[rc->cls] += rc->cur_draws;
+   rc->tris[rc->cls] += rc->cur_tris;
+   if (rc->cur_draws > rc->longest_draws[rc->cls])
+      rc->longest_draws[rc->cls] = rc->cur_draws;
+   unsigned b = 0;
+   for (uint64_t n = rc->cur_draws; n > 1 && b < 11; n >>= 1)
+      b++;
+   rc->len_hist[rc->cls][b]++;
+   rc->cls = CP_RUN_NONE;
+   rc->cur_draws = rc->cur_tris = 0;
+}
+
+void
+cp_run_census_break(struct cp_context *cp, bool scope_change)
+{
+   if (!cp_debug->run_census)
+      return;
+   struct cp_run_census *rc = &cp->run_census;
+   if (rc->cls != CP_RUN_NONE) {
+      if (scope_change)
+         rc->break_scope++;
+      else
+         rc->break_flush++;
+   }
+   if (scope_change)
+      rc->scopes++;
+   cp_run_census_close(cp);
+}
+
+void
+cp_run_census_draw(struct cp_context *cp, const struct cp_draw_packet *packet,
+                   unsigned tris)
+{
+   if (!cp_debug->run_census)
+      return;
+   struct cp_run_census *rc = &cp->run_census;
+   enum cp_run_class cls = cp_run_classify(packet);
+
+   rc->total_draws++;
+   rc->total_tris += tris;
+
+   if (rc->cls != CP_RUN_NONE &&
+       (cls != rc->cls || packet->scope->serial != rc->scope_serial)) {
+      if (cls != rc->cls)
+         rc->break_class++;
+      else
+         rc->break_scope++;
+      cp_run_census_close(cp);
+   }
+   rc->cls = cls;
+   rc->scope_serial = packet->scope->serial;
+   rc->cur_draws++;
+   rc->cur_tris += tris;
+}
+
+void
+cp_run_census_report(struct cp_context *cp)
+{
+   if (!cp_debug->run_census)
+      return;
+   cp_run_census_close(cp);
+   struct cp_run_census *rc = &cp->run_census;
+   if (!rc->total_draws)
+      return;
+   static const char *const name[CP_RUN_CLASSES] = {
+      "none", "opaque", "depth-only", "blended", "fallthrough"
+   };
+   fprintf(stderr,
+           "cudavk: run census: %" PRIu64 " draws, %" PRIu64 " triangles, %"
+           PRIu64 " scopes\n", rc->total_draws, rc->total_tris, rc->scopes);
+   uint64_t admitted_tris = 0, admitted_runs = 0, admitted_draws = 0;
+   for (unsigned k = CP_RUN_OPAQUE; k < CP_RUN_CLASSES; k++) {
+      if (!rc->runs[k])
+         continue;
+      fprintf(stderr,
+              "cudavk:   %-11s runs %7" PRIu64 "  draws %8" PRIu64
+              " (%.1f/run, longest %" PRIu64 ")  triangles %10" PRIu64
+              " (%.1f%% of frame)\n",
+              name[k], rc->runs[k], rc->draws[k],
+              (double)rc->draws[k] / (double)rc->runs[k],
+              rc->longest_draws[k], rc->tris[k],
+              100.0 * (double)rc->tris[k] / (double)rc->total_tris);
+      if (k != CP_RUN_FALLTHROUGH) {
+         admitted_tris += rc->tris[k];
+         admitted_runs += rc->runs[k];
+         admitted_draws += rc->draws[k];
+      }
+   }
+   fprintf(stderr,
+           "cudavk:   ADMITTED   runs %7" PRIu64 "  draws %8" PRIu64
+           "  triangles %10" PRIu64 "  = %.1f%% of the frame's triangles"
+           "   (plan gate: 60%%)\n",
+           admitted_runs, admitted_draws, admitted_tris,
+           100.0 * (double)admitted_tris / (double)rc->total_tris);
+   fprintf(stderr, "cudavk:   run ends: %" PRIu64 " scope, %" PRIu64
+           " class change, %" PRIu64 " flush\n",
+           rc->break_scope, rc->break_class, rc->break_flush);
+   for (unsigned k = CP_RUN_OPAQUE; k < CP_RUN_CLASSES; k++) {
+      if (!rc->runs[k])
+         continue;
+      fprintf(stderr, "cudavk:   %-11s draws/run log2:", name[k]);
+      for (unsigned b = 0; b < 12; b++)
+         if (rc->len_hist[k][b])
+            fprintf(stderr, " %u:%" PRIu64, 1u << b, rc->len_hist[k][b]);
+      fprintf(stderr, "\n");
+   }
+}
+
 /* Snapshot this packet's range and per-draw rows into batch-owned storage. */
 void
 cp_batch_record_packet(struct cp_context *cp,
@@ -10692,6 +10853,7 @@ void
 cp_render_scope_begin(struct cp_context *cp, const struct cp_render_scope *scope)
 {
    cp->plan.scopes++;
+   cp_run_census_break(cp, true);
    cp_batch_flush_why(cp, "framebuffer");
    if (cp_debug->debug_episode)
       fprintf(stderr, "episode-cut: begin_render\n");

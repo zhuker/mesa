@@ -113,6 +113,11 @@ static const struct cp_flag_def flags[] = {
      "trace every draw: geometry, attachments, and why a draw was skipped" },
    { "CUDAVK_DEBUG_TEX", CP_FLAG_BOOL_PRESENCE, F(debug_tex),
      "trace sampler and texture-handle setup" },
+   { "CUDAVK_RUN_CENSUS", CP_FLAG_BOOL_VALUE, F(run_census),
+     "count the runs the run-level redesign would render as one unit -- "
+     "maximal sequences of consecutive same-class draws in one scope -- and "
+     "report at teardown what share of the frame's triangles they hold. "
+     "Watches only; changes no rendering decision (REDESIGN_PLAN_2026-09-05)" },
    { "CUDAVK_PLAN_STATS", CP_FLAG_BOOL_VALUE, F(plan_stats),
      "report at teardown what deciding one draw at a time costs: batch keys "
      "built, pairwise merge tests, flushes, pass episodes closed and every "

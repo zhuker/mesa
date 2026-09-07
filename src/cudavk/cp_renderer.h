@@ -179,6 +179,48 @@ struct cp_draw_batch {
       struct cp_rect scissors[CP_MAX_BATCH_DRAWS];
 };
 
+/*
+ * ---- Run census (REDESIGN_PLAN_2026-09-05.md, probe 1) ----
+ *
+ * A *run* is the unit that plan proposes to render with one short wide
+ * pipeline: a maximal sequence of consecutive draws in one render scope,
+ * same class, with no episode-breaking operation between them. This counts
+ * them at HEAD, on the real draw stream, before any kernel is written --
+ * the plan's gate is that admitted runs hold >= 60% of a frame's triangles.
+ *
+ * It decides nothing about how a draw is rendered; it only watches.
+ */
+enum cp_run_class {
+   CP_RUN_NONE = 0,
+   CP_RUN_OPAQUE,      /* order-free, would be one opaque run */
+   CP_RUN_DEPTH_ONLY,  /* order-free with no colour attachment: the plan's
+                        * one relaxation -- refused by the batch key today */
+   CP_RUN_BLENDED,     /* A-buffer admissible */
+   CP_RUN_FALLTHROUGH, /* discard, side effects, multisample, ... */
+   CP_RUN_CLASSES
+};
+
+struct cp_run_census {
+   /* the run being accumulated */
+   enum cp_run_class cls;
+   uint32_t scope_serial;
+   uint64_t cur_draws, cur_tris;
+
+   /* closed runs, per class */
+   uint64_t runs[CP_RUN_CLASSES];
+   uint64_t draws[CP_RUN_CLASSES];
+   uint64_t tris[CP_RUN_CLASSES];
+   uint64_t longest_draws[CP_RUN_CLASSES];
+   /* run length histogram, log2 buckets of draws per run */
+   uint64_t len_hist[CP_RUN_CLASSES][12];
+
+   /* why runs ended */
+   uint64_t break_scope, break_class, break_flush;
+
+   /* denominators */
+   uint64_t total_draws, total_tris, scopes;
+};
+
 struct cp_context {
 
    /* Per-renderer A-buffer storage: every CUDA pointer belongs to this
@@ -458,6 +500,8 @@ struct cp_context {
    CUstream main_stream;
    uint64_t main_stream_serial;
    uint64_t seg_stream_serial[CP_PASS_STREAMS];
+
+   struct cp_run_census run_census;
 
    /*
     * Per-stage draw timing under CUDAVK_DEBUG_TIME, on CUDA events recorded
@@ -1216,6 +1260,11 @@ void cp_scratch_reset(struct cp_context *cp);
 void cp_scratch_destroy(struct cp_context *cp);
 bool cp_timing_enabled(void);
 void cp_stage_end(struct cp_context *cp, int stage);
+
+void cp_run_census_draw(struct cp_context *cp,
+                        const struct cp_draw_packet *packet, unsigned tris);
+void cp_run_census_break(struct cp_context *cp, bool scope_change);
+void cp_run_census_report(struct cp_context *cp);
 
 enum cp_tile_census_cut_kind {
    CP_TILE_CUT_MAP, CP_TILE_CUT_COPY, CP_TILE_CUT_FLUSH, CP_TILE_CUT_COMPUTE

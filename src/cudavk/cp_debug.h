@@ -170,6 +170,7 @@ struct cp_debug {
    bool spec_stats;
    bool texture_cache_stats;
    bool plan_stats;
+   bool run_census;
    bool debug_vfetch;
    bool debug_work;
    bool debug_discard;

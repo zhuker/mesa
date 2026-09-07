@@ -3006,6 +3006,17 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
    struct cp_draw_packet packet;
    cpvk_prepare_draw(dev, scope, d, &packet);
 
+   /*
+    * The run census watches the draw stream itself, before the batching
+    * decision below -- a draw the batcher refuses is still a draw, and the
+    * depth-only shadow draws the redesign wants to collect into one run are
+    * exactly the ones that take the direct path (SHADOW_VISBUF_CLEARS.md).
+    * Hooking cp_batch_record_packet instead made the census blind to them.
+    */
+   cp_run_census_draw(cp, &packet,
+                      cp_triangles_for_draw(d->call.mode, d->range.count) *
+                      MAX2(d->call.instance_count, 1u));
+
    /* The renderer takes draw state through explicit launch arguments and
     * immutable batch snapshots; no device-global mutable state is published. */
 
