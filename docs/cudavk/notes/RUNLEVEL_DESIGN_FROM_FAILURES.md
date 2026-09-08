@@ -124,6 +124,31 @@ that collects it must first give it up.
 because the only remaining mechanism for closing the gap is self-cancelling,
 and that is now measured rather than argued.
 
+## The hybrid, priced too
+
+A clip-only merge surrenders less overlap than the full one: the raster stages
+keep fanning out per segment, and only the clip is gathered into one grid.
+
+    gains  clip idle share                   +0.47 ms
+    loses  clip's share of the fan-out       -0.17 ms   (19% of 0.871, clip's
+                                                         share of the core pool)
+    net                                      +0.30 ms
+
+It is the best of the family, and it is still not close:
+
+| variant | frame | vs native |
+|---|---:|---:|
+| today | 5.198 | 9.96x |
+| 16 streams | 5.147 | 9.86x |
+| **clip-only merge (best case)** | **4.896** | **9.38x** |
+| full merge | 5.398 | 10.34x |
+| **4x target** | **2.088** | **4.00x** |
+
+Every variant of the last remaining mechanism lands between 9.4x and 10.0x.
+None is within a factor of two of the objective, so none of them changes the
+verdict -- they only choose how much of a ~0.3 ms improvement is worth a
+pipeline rewrite.
+
 ## Superseded: what else to measure before building
 ## Probe 2, answered: capacity is not a blocker either
 
@@ -186,6 +211,31 @@ that collects it must first give it up.
 **Final verdict: 4x is unreachable.** Not because the work forbids it, but
 because the only remaining mechanism for closing the gap is self-cancelling,
 and that is now measured rather than argued.
+
+## The hybrid, priced too
+
+A clip-only merge surrenders less overlap than the full one: the raster stages
+keep fanning out per segment, and only the clip is gathered into one grid.
+
+    gains  clip idle share                   +0.47 ms
+    loses  clip's share of the fan-out       -0.17 ms   (19% of 0.871, clip's
+                                                         share of the core pool)
+    net                                      +0.30 ms
+
+It is the best of the family, and it is still not close:
+
+| variant | frame | vs native |
+|---|---:|---:|
+| today | 5.198 | 9.96x |
+| 16 streams | 5.147 | 9.86x |
+| **clip-only merge (best case)** | **4.896** | **9.38x** |
+| full merge | 5.398 | 10.34x |
+| **4x target** | **2.088** | **4.00x** |
+
+Every variant of the last remaining mechanism lands between 9.4x and 10.0x.
+None is within a factor of two of the objective, so none of them changes the
+verdict -- they only choose how much of a ~0.3 ms improvement is worth a
+pipeline rewrite.
 
 ## Superseded: what else to measure before building
 1. **The join cost**: merging requires all segments' vertex and clip work
