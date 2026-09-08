@@ -55,6 +55,8 @@ struct cp_kernels {
    CUfunction clip_rast_fused_abuf;
    CUfunction clip_triangles;
    CUfunction run_clip_setup_tile_count;
+   CUfunction run_clip_setup_direct;
+   CUfunction run_clip_direct_raster;
    CUfunction run_clip_bin_check_counts;
    CUfunction run_clip_bin_fill;
    CUfunction run_clip_bin_validate_cursors;

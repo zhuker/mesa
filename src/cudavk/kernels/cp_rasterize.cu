@@ -703,6 +703,148 @@ cp_run_clip_setup_tile_count(struct cp_run_clip_bin_args args)
    }
 }
 
+/* Direct successor to the tile-count arm.  Clipping and exact setup happen
+ * once.  The completed setup is compacted for the persistent warp raster
+ * below.  No visibility writes occur in this stage, so any capacity error
+ * leaves the classic inverse arm free to consume the complete clipped slots. */
+extern "C" __global__ void
+cp_run_clip_setup_direct(struct cp_run_clip_bin_args args)
+{
+   uint32_t seg_idx = blockIdx.y;
+   if (seg_idx >= args.num_segments)
+      return;
+   uint32_t *errors = (uint32_t *)(uintptr_t)args.overflow;
+   if (seg_idx >= CP_RUN_CLIP_BIN_MAX_SEGS) {
+      if (blockIdx.x == 0 && threadIdx.x == 0)
+         atomicOr(errors, CP_RUN_CLIP_BIN_ERR_SEGMENT_BOUNDS);
+      return;
+   }
+   const struct cp_run_clip_bin_device_segment *segments =
+      (const struct cp_run_clip_bin_device_segment *)(uintptr_t)args.segments;
+   struct cp_run_clip_bin_device_segment seg = segments[seg_idx];
+   struct cp_clip_args clip = seg.clip;
+   struct cp_rasterize_args rast = seg.rast;
+   if (!clip.stable || !clip.num_slots || clip.num_slots > CP_MAX_CLIP_SLOTS) {
+      if (blockIdx.x == 0 && threadIdx.x == 0)
+         atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS);
+      return;
+   }
+   clip.active_ids = 0;
+   rast.positions = clip.out; rast.prim_refs = clip.prim_refs;
+   rast.num_triangles = clip.max_triangles;
+   rast.num_varyings = clip.num_slots - 1u;
+   rast.tri_count = 0; rast.active_ids = 0;
+   struct cp_run_clip_direct_live *live =
+      (struct cp_run_clip_direct_live *)(uintptr_t)args.live;
+   uint32_t *live_count = (uint32_t *)(uintptr_t)args.live_count;
+   for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x;
+        tri < clip.num_triangles; tri += blockDim.x * gridDim.x) {
+      uint32_t emitted[CP_CLIP_MAX_OUT];
+      int n = cp_clip_one(&clip, tri, emitted);
+      for (int i = 0; i < n; i++) {
+         uint32_t local = emitted[i], stable = seg.prim_base + local;
+         if (stable < seg.prim_base || stable >= args.total_slots) {
+            atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS); continue;
+         }
+         struct cp_tri_setup setup = {};
+         if (!setup_triangle(&rast, local, &setup))
+            continue;
+         uint32_t at = atomicAdd(live_count, 1u);
+         if (at >= args.live_capacity) {
+            atomicOr(errors, CP_RUN_CLIP_BIN_ERR_LIVE_BOUNDS); continue;
+         }
+         live[at].setup = setup;
+         live[at].stable_prim = stable;
+         live[at].segment = seg_idx;
+      }
+   }
+}
+
+/* One warp claims one compact setup at a time.  Its lanes stride the complete
+ * bbox, so fullscreen and other large triangles are safe without a threshold,
+ * queue capacity, or cooperative-launch requirement.  This is visibility
+ * only: cp_opaque_finish_common shades and performs the first real depth write. */
+extern "C" __global__ void
+cp_run_clip_direct_raster(struct cp_run_clip_direct_raster_args args)
+{
+   uint32_t *errors = (uint32_t *)(uintptr_t)args.errors;
+   if (*errors)
+      return;
+   uint32_t n = *(const uint32_t *)(uintptr_t)args.live_count;
+   if (n > args.live_capacity) {
+      atomicOr(errors, CP_RUN_CLIP_BIN_ERR_LIVE_BOUNDS);
+      n = args.live_capacity;
+   }
+   uint32_t lane = threadIdx.x & 31u;
+   uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+   uint32_t warps = (gridDim.x * blockDim.x) >> 5;
+   const struct cp_run_clip_direct_live *live =
+      (const struct cp_run_clip_direct_live *)(uintptr_t)args.live;
+   const struct cp_run_clip_bin_device_segment *segments =
+      (const struct cp_run_clip_bin_device_segment *)(uintptr_t)args.segments;
+   for (uint32_t i = warp; i < n; i += warps) {
+      struct cp_run_clip_direct_live rec = live[i];
+      if (rec.segment >= args.num_segments || rec.segment >= CP_RUN_CLIP_BIN_MAX_SEGS ||
+          rec.stable_prim >= args.total_slots) {
+         if (lane == 0) atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS);
+         continue;
+      }
+      struct cp_rasterize_args rast = segments[rec.segment].rast;
+      uint32_t base = segments[rec.segment].prim_base;
+      if (rec.stable_prim < base ||
+          rec.stable_prim - base >= segments[rec.segment].clip.max_triangles) {
+         if (lane == 0) atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS);
+         continue;
+      }
+      uint32_t local = rec.stable_prim - base;
+      struct cp_tri_setup setup = rec.setup;
+      int64_t bw = (int64_t)setup.ix_max - setup.ix_min + 1;
+      int64_t bh = (int64_t)setup.iy_max - setup.iy_min + 1;
+      uint64_t area = bw > 0 && bh > 0 ? (uint64_t)bw * (uint64_t)bh : 0;
+      for (uint64_t p = lane; p < area; p += 32) {
+         int px = setup.ix_min + (int)(p % (uint64_t)bw);
+         int py = setup.iy_min + (int)(p / (uint64_t)bw);
+         uint32_t pixel = (uint32_t)py * rast.width + (uint32_t)px;
+         if (rast.reject && rast.reject_passes) {
+            const uint32_t *rej=(const uint32_t *)(uintptr_t)rast.reject +
+               (size_t)pixel * rast.reject_layers;
+            bool rejected = false;
+            for (uint32_t q=0;q<rast.reject_passes;q++)
+               if (rej[q] == local) rejected=true;
+            if (rejected) continue;
+         }
+         float sx = (float)px + 0.5f, sy = (float)py + 0.5f, z;
+         if (setup.is_point) {
+            if (sx < setup.pt_x0 || sx >= setup.pt_x1 ||
+                sy < setup.pt_y0 || sy >= setup.pt_y1) continue;
+            z = setup.ndc_z0;
+         } else {
+            float e0 = edge_function(setup.sx1,setup.sy1,setup.sx2,setup.sy2,sx,sy);
+            float e1 = edge_function(setup.sx2,setup.sy2,setup.sx0,setup.sy0,sx,sy);
+            float e2 = edge_function(setup.sx0,setup.sy0,setup.sx1,setup.sy1,sx,sy);
+            if (!edge_inside(e0,setup.e0_top_left) ||
+                !edge_inside(e1,setup.e1_top_left) ||
+                !edge_inside(e2,setup.e2_top_left)) continue;
+            float w0 = e0 * setup.inv_area, w1 = e1 * setup.inv_area;
+            z = w0 * setup.ndc_z0 + w1 * setup.ndc_z1 +
+                (1.0f - w0 - w1) * setup.ndc_z2;
+         }
+         uint32_t depth = float_to_sortable_uint(
+            CP_WINDOW_DEPTH(z,rast.depth_scale,rast.depth_translate));
+         if (rast.depth_test && rast.depthbuf) {
+            uint32_t prev =
+               ((const uint32_t *)(uintptr_t)rast.depthbuf)[pixel];
+            bool pass = rast.depth_func == CP_FUNC_LEQUAL ? depth <= prev :
+                        rast.depth_func == CP_FUNC_GEQUAL ? depth >= prev : false;
+            if (!pass) continue;
+         }
+         uint32_t key = rast.depth_key_invert ? ~depth : depth;
+         atomicMin((unsigned long long *)(uintptr_t)rast.framebuffer + pixel,
+                   (unsigned long long)PACK_VISBUF(key,rec.stable_prim));
+      }
+   }
+}
+
 /* Check the uint32 tile-count sum in uint64 before the existing uint32
  * exclusive scan. If it exceeds dense-list capacity, later fill and visibility
  * kernels observe errors and return without consuming wrapped offsets. Launch

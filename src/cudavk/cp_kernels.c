@@ -405,6 +405,10 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
    cuModuleGetFunction(&k->clip_triangles, k->module, "cp_clip_triangles");
    cuModuleGetFunction(&k->run_clip_setup_tile_count, k->module,
                        "cp_run_clip_setup_tile_count");
+   cuModuleGetFunction(&k->run_clip_setup_direct, k->module,
+                       "cp_run_clip_setup_direct");
+   cuModuleGetFunction(&k->run_clip_direct_raster, k->module,
+                       "cp_run_clip_direct_raster");
    cuModuleGetFunction(&k->run_clip_bin_check_counts, k->module,
                        "cp_run_clip_bin_check_counts");
    cuModuleGetFunction(&k->run_clip_bin_fill, k->module,
