@@ -539,6 +539,33 @@ That closes the search:
 Two of three paid, and the third cost one build and one A/B to disprove --
 which is the right price for an idea whose upside was another 1 ms.
 
+## A by-product: the redesign's hardest piece may be unnecessary
+
+`cpvk_draws_mergeable()` defines **22** break labels. Over a full favorite3
+replay, exactly **three** fire: vertex shader (95,448), fragment shader
+(38,263) and rasterizer (100). The other nineteen -- depth state, blend state,
+topology, **vertex layout**, sample count, viewport, scissor, indirect, index
+size, index buffer, start instance, vertex offset, instance count, vertex
+buffer count, vertex buffers, push constant size -- never fire once.
+
+Vertex layout is tested at position 8 and vertex shader at position 2, so
+layout is *masked* rather than proven constant. But the inference still holds
+and it is the useful one: **every pair of draws that agrees on shaders,
+rasterizer, depth, blend and topology also agrees on its vertex layout**, in
+134,000 comparisons without exception.
+
+`REDESIGN_PLAN` 3.2 calls per-draw vertex layout rows the hard part of M2 --
+an ABI change on the kernels carrying 110 launches a frame, with dead end 14
+(20 -> 108 registers) as the failure mode and dead end 42's `.local` census as
+the gate. **On these captures it is not needed.** Grouping a run's draws by
+vertex-shader identity delivers a uniform layout for free, so a run-level
+geometry launch can concatenate their vertex ranges with the launch-wide
+`elem_*` arrays exactly as they are today.
+
+That does not change the design's value -- merging vertex launches alone is
+worth 0.02-0.04 ms -- but it removes its largest implementation risk, and it
+should be re-checked on any capture before relying on it.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
