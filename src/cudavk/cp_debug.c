@@ -113,6 +113,10 @@ static const struct cp_flag_def flags[] = {
      "trace every draw: geometry, attachments, and why a draw was skipped" },
    { "CUDAVK_DEBUG_TEX", CP_FLAG_BOOL_PRESENCE, F(debug_tex),
      "trace sampler and texture-handle setup" },
+   { "CUDAVK_NO_DEPTH_ONLY_BATCH", CP_FLAG_BOOL_VALUE, F(no_depth_only_batch),
+     "refuse to batch draws in a scope with no colour attachment again, so a "
+     "shadow scope runs one chain and one full visibility clear per draw "
+     "instead of batching them" },
    { "CUDAVK_NO_WIDE_EPISODE", CP_FLAG_BOOL_VALUE, F(no_wide_episode),
      "compare viewport, rasterizer and depth state before letting two "
      "order-free draws share an opaque episode again; every consumer of "

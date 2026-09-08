@@ -2413,8 +2413,28 @@ cpvk_batch_structural(struct cpvk_device *dev, const struct cp_render_scope *sco
    if (!d->num_vb || !d->vb_base[0])
       return false;
 
-   if (!scope->fb.nr_cbufs || !scope->fb.color || !cp->visbuf || !cp->depthbuf)
+   if (!cp->visbuf || !cp->depthbuf)
       return false;
+   /*
+    * A depth-only scope has no colour attachment. Refusing to batch there is
+    * what made a shadow scope run one chain, and one full visibility clear,
+    * per draw -- 18 draws a frame on favorite3. The renderer has had a
+    * depth-only path for a long time; only the batcher refused it, and only
+    * because this test asked for a colour buffer it never needed.
+    *
+    * Batching them is worth -0.66 ms/frame whole and -1.16 heavy on
+    * favorite3, -0.32 heavy on favorite2, with output bit-identical and all
+    * 18 sentinels matching on both captures.
+    *
+    * Nothing blended or side-effecting may join: the shade chain in such a
+    * scope exists only to let a fragment discard.
+    */
+   if (!scope->fb.nr_cbufs || !scope->fb.color) {
+      if (cp_debug->no_depth_only_batch)
+         return false;
+      if (!p->fs || p->fs->writes_memory || p->blend.enable)
+         return false;
+   }
 
    uint64_t tris = (uint64_t)cp_triangles_for_draw(d->call.mode,
                                                    d->range.count) *
