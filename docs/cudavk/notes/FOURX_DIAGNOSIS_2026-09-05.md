@@ -414,7 +414,60 @@ assumption about cycles per instruction, and no estimate of what a rewrite
 might achieve: it is measured device work against the target, with every
 identified saving already subtracted.
 
-## Verdict
+## Every pool accounted, and the honest margin
+
+The previous section subtracted savings from four pools. There are seventeen.
+With all of them, and the run-level design applied to each:
+
+| pool | now | after | saves |
+|---|---:|---:|---:|
+| clip_all + stage2 + stage3 + stage3_abuf -> bin+walk | 1.189 | 0.150 | 1.039 |
+| fragment shading, overdraw removed (0.729 / 2.29) | 0.729 | 0.318 | 0.411 |
+| fs_compact -> one compaction per run | 0.368 | 0.100 | 0.268 |
+| fs_writeback fused into the shade | 0.109 | 0.000 | 0.109 |
+| abuf_support (the walk emits sorted lists) | 0.198 | 0.100 | 0.098 |
+| memset: one visibility clear per run, not per batch | 0.258 | 0.100 | 0.158 |
+| **total** | | | **2.083** |
+
+    device work now                4.718 ms/frame
+    device work after everything   2.635 ms/frame
+    4x native target               2.088 ms/frame
+    over target by                 1.26x
+
+**So the final margin is 1.26x, not the 1.48x of the previous section** (which
+used an incomplete pool list), and not the "below the floor" of the section
+before that (which treated the frame boundary as fixed).
+
+## Verdict: not achieved, and NOT proven unreachable
+
+A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
+time in this document that a confident conclusion was overturned by the next
+measurement. The estimates above are built from separately measured pools, and
+this project's own record is that such sums are **sub-additive in both
+directions**: the 2026-09-02 lead set summed to -0.456 and measured -0.391,
+while the B200 validation summed lower than it measured.
+
+What is established:
+
+- **The objective is not met**: favorite3 12.52x / 8.73x / 5.53x native by
+  band, favorite2 10.80x / 9.04x / 5.50x.
+- **Every flag-level lever is exhausted**: 14 tested, 10 refuted, and the
+  frame time is invariant across the whole register/spill curve.
+- **The remaining work is three unbuilt structural pools** totalling 2.08 ms
+  of device time plus roughly 0.56 ms of frame-boundary host cost, which would
+  land favorite3 near **2.6 ms device / ~5x native** -- a real and worthwhile
+  target, and short of 4x by about a quarter.
+- **Only building it can settle whether 4x is reachable.** The largest single
+  item, frame-wide deferred shading worth 0.41 ms, has a yield that no counter
+  can predict, because transparency and multi-pass effects reclaim part of the
+  2.29x overdraw.
+
+Five corrections were made to this document while writing it: the frame
+boundary is not fixed; overdraw is 2.29x and not 12x; occupancy is not a
+sufficient argument because cycles-per-instruction is not constant; the
+fragment pool must be quoted union-exclusive, not summed over kernels all
+named `main`; and the pool list must be complete before subtracting. Each
+overturned the conclusion that preceded it.
 
 **Not proven unreachable, and not yet reachable.** The arithmetic:
 
@@ -459,8 +512,8 @@ the per-fragment gather of vertex attributes and texture fetches, which is
 what a hardware rasteriser does in fixed-function units and a compute kernel
 cannot avoid.
 
-**Conclusion: 4x on the heavy band is very probably unreachable, but the
-margin is 1.27x and I will not call it proven.** Three successive attempts to
+**Conclusion: 4x is not achieved, the margin is 1.26x on device work alone,
+and it is not proven unreachable.** Three successive attempts to
 prove it have each been broken by a lever I had not measured (the frame
 boundary, then overdraw). The binding constraint is the applications' own
 shaders -- 203 registers of live values, and a frame time invariant across the
