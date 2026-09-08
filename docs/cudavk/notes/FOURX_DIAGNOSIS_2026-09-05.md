@@ -345,6 +345,32 @@ cycles-per-instruction as fixed. Every cap from 64 to 203 -- including the
 zero-spill end -- lands within 0.06 ms of the same frame, except 64 which is
 0.52 ms worse.
 
+## Overdraw, measured -- the last lever, and it narrows the gap
+
+`CUDAVK_DEBUG_DISCARD` counts covered fragments per shade pass:
+
+| | |
+|---|---:|
+| shade passes per frame | 35.0 |
+| fragments shaded per frame | **2,110,375** |
+| framebuffer pixels | 921,600 |
+| **overdraw** | **2.29x** |
+
+Normal for a game frame, and **not** the large redundancy I suspected -- the
+per-batch visibility buffer is backed by a depth test at raster time, so
+occlusion between batches is already rejected before shading.
+
+But 2.29x is still the ceiling of one more lever: a renderer that resolved
+visibility across the **whole frame** and shaded each pixel once would divide
+the fragment pool by 2.29, from 2.77 to 1.21 ms heavy -- **1.56 ms**, the
+largest single item still on the table and larger than anything else measured.
+
+    heavy 7.288
+      - structural launch work        -2.20
+      - frame-boundary host cost      -0.56
+      - overdraw (frame-wide deferred) -1.56
+      = 2.97 ms          4x target 2.33 ms   -- short by 1.27x
+
 ## Verdict
 
 **Not proven unreachable, and not yet reachable.** The arithmetic:
@@ -390,14 +416,19 @@ the per-fragment gather of vertex attributes and texture fetches, which is
 what a hardware rasteriser does in fixed-function units and a compute kernel
 cannot avoid.
 
-**Conclusion: 4x on the heavy band is unreachable, and the binding constraint
-is the applications' own shaders.**
+**Conclusion: 4x on the heavy band is very probably unreachable, but the
+margin is 1.27x and I will not call it proven.** Three successive attempts to
+prove it have each been broken by a lever I had not measured (the frame
+boundary, then overdraw). The binding constraint is the applications' own
+shaders -- 203 registers of live values, and a frame time invariant across the
+whole register/spill curve -- but the accounting no longer has the comfortable
+margin the earlier drafts claimed.
 
     heavy 7.288
       - structural launch work (measured, available)     -2.20
       - frame-boundary host cost (cudavk's share)        -0.56
-      - fragment shading, best case at its occupancy      -0.70
-      = 3.83 ms          4x target 2.33 ms
+      - overdraw removal, frame-wide deferred shading    -1.56
+      = 2.97 ms          4x target 2.33 ms
 
 Closing the remaining 1.5 ms needs fragment shading 4.9x faster. That requires
 about 36% of peak instruction issue; **the register file cannot deliver it at
