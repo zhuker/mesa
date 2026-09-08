@@ -233,20 +233,25 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
     frames.
 
 
-15. **nsys CUDA traces now lose the kernel activity buffer.** Two captures of
-    the current build (`-t cuda`, once with `--delay=14` and once with
-    `--delay=20 --duration=12`) exported a sqlite with
-    `CUPTI_ACTIVITY_KIND_MEMCPY`, `..._MEMSET` and `..._RUNTIME` present and
-    **`CUPTI_ACTIVITY_KIND_KERNEL` entirely absent**, so no per-kernel
-    analysis is possible. Traces taken earlier the same day
-    (`/tmp/rtx-head.sqlite`, same flags plus the UM page-fault options) have
-    the table. `DEAD_ENDS` 37 records the related failure -- a dropped CUPTI
-    buffer that looks like an absent activity class -- and its rule applies:
-    **a trace missing an activity class is invalid until a positive control
-    reproduces the workload's exit behaviour.** Until this is diagnosed, the
-    per-pool numbers in `notes/FOURX_DIAGNOSIS_2026-09-05.md` are the ones
-    from before the 2026-09-05 batching changes, and they are stale by
-    -0.733 ms/frame of removed launches.
+15. **nsys CUDA traces lose the kernel activity buffer -- RESOLVED 2026-09-05,
+    the cause was `--delay`/`--duration`, not CUPTI.** The two failing captures
+    both used a capture window (`--delay=14`, `--delay=20 --duration=12`). A
+    plain full-run capture of the same build, same flags, no window --
+
+        nsys profile -t cuda -o /tmp/kb ./build/vulkan_app
+
+    -- exports `CUPTI_ACTIVITY_KIND_KERNEL` with **1,163,280 rows** alongside
+    MEMCPY 543,689, MEMSET 199,921 and RUNTIME 2,374,270. So the activity class
+    was never absent; a windowed capture of this workload drops it, and the
+    window is the variable to avoid. The trace is kept at `/tmp/kb.nsys-rep`
+    and `/tmp/kb.sqlite` (19.7 s span, whole replay, post-wins build).
+
+    Two things this cost, both recorded because they are the general lesson:
+    the original report blamed CUPTI and stood for a day as a blocker on all
+    per-kernel analysis, and the first attempt to reproduce it here failed
+    twice more -- once on a wrong binary path, once on `CUDAVK_FRAME_LIMIT`,
+    **a flag that does not exist and that I invented rather than looked up**.
+    `CUDAVK_HELP=1` lists every real one.
 
 ## Vulkan surface not implemented
 
