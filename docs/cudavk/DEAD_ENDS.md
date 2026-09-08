@@ -2790,6 +2790,37 @@ its summed 2.25 ms instead of its union-exclusive 0.729.
    16 px tiles quarter the pixels for ~1.5x the references and measure
    *worse*, which a microbenchmark over a synthetic tile list cannot show.
 
+## Why every one of them failed: the merge and the fan-out want the same idle
+
+The five results above have a single cause, measured 2026-09-05:
+
+    the opaque stream fan-out is worth   0.871 ms whole / 1.100 heavy
+                                          (CUDAVK_NO_OPAQUE_STREAMS=1, disjoint)
+
+    a full run-level merge would collect  clip 0.47 + raster 0.60 = +1.07 ms
+    and must surrender the fan-out                                  -0.87 ms
+    net                                                             +0.20 ms
+
+Clip and rasterisation run at roughly **10% work share** -- 2,598 implied
+instructions per triangle against ~200 real -- so they look like 1 ms of
+recoverable idle. **They are not.** That idle is what eight streams are
+already overlapping. Once clip and the raster stages are one launch each there
+is nothing left to overlap, so the merge and the fan-out are collecting the
+same microseconds and cannot both have them.
+
+This is why every attempt lost, and why they lost roughly in proportion to how
+much overlap they gave up: the tile walk surrendered all segment concurrency
+(+1.57 to +2.51), merged stage 3 surrendered queue concurrency (+0.147), and
+the full merge is projected at +0.20.
+
+**The consequence for the 4x question.** The real work in a frame is only
+about 1.638 ms against a 2.088 ms budget, so the *work* does not forbid the
+target. What forbids it is that the 3.5 ms separating work from frame is idle
+the fan-out is already hiding, and no scheme can collect it without first
+surrendering it.
+
 **The rule.** Before pricing a merge, check whether the launches being merged
 already overlap. If a pool's union-exclusive time is well below its summed
-time, the fan-out is already collecting most of what the merge would.
+time, the fan-out is already collecting most of what the merge would -- and
+if the pool's *work share* is low, that is evidence of overlap being exploited,
+not of waste waiting to be reclaimed.
