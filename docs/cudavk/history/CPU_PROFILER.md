@@ -11,11 +11,15 @@ CUPTI distortion that makes traced runs untrustworthy for host-side cost
 perf is the engine for all of this. Its interactive TUI is the weak part;
 skip it and use the text outputs.
 
-For a repeatable paired capture, use the repository wrapper after caching
-sudo credentials:
+For a repeatable paired capture, use the repository wrapper:
 
-    sudo -v
     tests/cp_cpu_profile.sh /tmp/cpu-profile 30 -- ./demo --offscreen
+
+`offcputime` needs root. This machine carries a NOPASSWD sudoers rule for
+exactly `/usr/sbin/offcputime-bpfcc`, so **no `sudo -v` is required** and the
+script is safe to run unattended. Elsewhere, either cache credentials with
+`sudo -v` first or install the same one-line rule; the script accepts both and
+prints the rule to add when it finds neither.
 
 It writes `oncpu.folded`, `oncpu-flat.txt`, `offcpu.folded`, the raw
 `perf.data`, and the target log. `DELAY=seconds` controls how much startup is
@@ -88,6 +92,52 @@ device interval before attempting to optimize instructions inside that caller.
   `difffolded.pl` (FlameGraph repo) or plain awk joins on the stack string.
   Compare counts as fractions of total samples, not absolutes — run lengths
   differ.
+
+## Reading the blocked half: futexes, ioctls and driver waits
+
+`offcpu.folded` for this driver is dominated by a handful of shapes, and they
+mean different things:
+
+| Leaf shape | What it is | What to do |
+|---|---|---|
+| `futex_wait` under a driver thread | contention on a lock this driver holds | find the holder in the on-CPU profile; shorten the critical section |
+| `ioctl` into `nvidia*` | submission or fence wait handed to the kernel driver | this is device wait, not host cost; pair it with the device interval before touching it |
+| `schedule` under `cuStreamSynchronize` | a real block on the device | count the **sum over every synchronisation site**, not one site |
+| `poll` / `epoll_wait` on the display path | presentation, usually not the frame | exclude before ranking |
+
+`futex_wait` is the only one of the four that is unambiguously host-side waste.
+The other three are the device telling the host to wait, and removing one just
+moves the backlog to the next synchronisation downstream. `TESTING.md`,
+"Finding where the time goes", question 5, has the measurement behind that.
+
+Beware the reverse case: CUDA synchronisation may busy-spin rather than block.
+Then `cuStreamSynchronize` is prominent in the **on-CPU** profile and nearly
+absent from `offcputime`. It is still wait time. Confirm by the caller stack
+and a low IPC (`perf stat -e cycles,instructions`), and do not optimise
+instructions inside the spin.
+
+## The portable half of this document
+
+Everything here that is not about this driver now lives in a reusable agent
+skill:
+
+    ~/.prime/agent/skills/linux-perf/SKILL.md
+      references/topics/off-cpu.md
+      references/topics/cpu-hotspots.md
+      references/topics/syscalls.md
+
+That skill covers permission gates and how to unlock them, DWARF unwinding,
+folded and flat profiles, annotation, off-CPU capture, and diffing two runs —
+generically, with every command tagged verified or blocked. Use it in other
+projects. It was merged from this document and from
+`github.com/caomengxuan666/perf-skills`, whose original had no DWARF guidance
+and no off-CPU coverage at all.
+
+**What stays here, because it is false elsewhere:** `cp_gpu_busy.sh` answers
+host-bound versus kernel-bound first and attaches no profiler; CUPTI inflates
+every `cuLaunchKernel` and this driver issues thousands per frame; GPU busy
+percentage is not GPU work; and every compiled shader is a CUDA kernel named
+`main`.
 
 ## If sampling ever stops being enough
 

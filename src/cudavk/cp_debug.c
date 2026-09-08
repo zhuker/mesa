@@ -127,6 +127,15 @@ static const struct cp_flag_def flags[] = {
      "maximal sequences of consecutive same-class draws in one scope -- and "
      "report at teardown what share of the frame's triangles they hold. "
      "Watches only; changes no rendering decision (REDESIGN_PLAN_2026-09-05)" },
+   { "CUDAVK_RUN_GEOMETRY", CP_FLAG_BOOL_VALUE, F(run_geometry),
+     "collect each opaque run and launch compatible groups of one-draw "
+     "triangle-list members through one fused vertex shader. Default-off M2 "
+     "step; multi-draw members and downstream stages stay on the old path" },
+   { "CUDAVK_RUN_CLIP_BIN", CP_FLAG_BOOL_VALUE, F(run_clip_bin),
+     "preflight at most 64 side-effect-free triangle-list batches and build "
+     "stable run-global clip/bin descriptors before grouped geometry. "
+     "Default-off structural M2 step; requires CUDAVK_RUN_GEOMETRY and uses "
+     "the exact old path until the run-wide CUDA pass lands" },
    { "CUDAVK_PLAN_STATS", CP_FLAG_BOOL_VALUE, F(plan_stats),
      "report at teardown what deciding one draw at a time costs: batch keys "
      "built, pairwise merge tests, flushes, pass episodes closed and every "

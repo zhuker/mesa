@@ -290,6 +290,9 @@ if dep_vulkan_loader.found()
     if test_name == 'cpvk_sampler_two_bindings'
       cpvk_texture_cache_test_exe = test_exe
     endif
+    if test_name == 'cpvk_batchbig'
+      cpvk_batchbig_exe = test_exe
+    endif
     if test_name == 'cpvk_texture_cache_no_replay'
       cpvk_texture_cache_no_replay_exe = test_exe
     endif
@@ -300,6 +303,32 @@ if dep_vulkan_loader.found()
       cpvk_texgrad_exe = test_exe
     endif
   endforeach
+
+  test('cpvk_run_geometry_gate', prog_python,
+       args : [files('tests/cpvk_run_geometry_gate.py'), cpvk_batchbig_exe],
+       suite : 'cudavk', env : cpvk_test_env, timeout : 300,
+       is_parallel : false,
+       depends : [libvulkan_cudavk, cpvk_devenv_icd])
+
+  # Standalone device equivalence gate for the next default-off M2 slice. It
+  # compares the run kernel with the existing per-segment clip path and shared
+  # setup math; the renderer does not launch the new kernel yet.
+  cpvk_nvcc = find_program('nvcc', required : false)
+  if cpvk_nvcc.found()
+    cp_run_clip_bin_gate = custom_target(
+      'cp_run_clip_bin_gate',
+      input : files('tests/cp_run_clip_bin_gate.cu'),
+      output : 'cp_run_clip_bin_gate',
+      command : [cpvk_nvcc, '-arch=sm_75', '-std=c++17', '-O2',
+                 '-I' + meson.current_source_dir() + '/kernels',
+                 '@INPUT@', '-o', '@OUTPUT@'],
+      depend_files : files('kernels/cp_rasterize.cu',
+                           'kernels/cp_rast_types.h'),
+      build_by_default : false,
+    )
+    test('cp_run_clip_bin_gate', cp_run_clip_bin_gate,
+         suite : 'cudavk', timeout : 120, is_parallel : false)
+  endif
 
   # The vertex fetch, in the shapes neither replay capture contains: every
   # conversion class, a sparse set of attribute locations, a per-instance
