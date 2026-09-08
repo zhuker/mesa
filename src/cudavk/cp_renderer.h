@@ -234,6 +234,15 @@ struct cp_run_census {
    uint32_t ep_samples;
    bool have_ep;
 
+   /* why an OPAQUE episode was cut: the reason string cp_batch_flush_why
+    * was given, how often, and how many segments it was holding. Pointers
+    * compare by identity because every caller passes a literal. */
+#define CP_RUN_CUT_MAX 24
+   const char *cut_why[CP_RUN_CUT_MAX];
+   uint64_t cut_n[CP_RUN_CUT_MAX], cut_segs[CP_RUN_CUT_MAX];
+   unsigned ncut;
+   uint64_t cut_state, cut_ineligible, cut_nopending;
+
    /* why runs ended */
    uint64_t break_scope, break_class, break_state, break_flush;
 

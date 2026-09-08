@@ -2989,6 +2989,18 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
       if (can_defer)
          eligible = cpvk_batch_eligible(dev, scope, d, &batch_blended);
 
+      if (cp_debug->run_census && cp->pass.nsegs && cp->pass.opaque &&
+          !(can_defer && eligible)) {
+         /* Which half refuses: the episode-wide state having changed, or the
+          * draw not being batchable at all. The plan's depth-only relaxation
+          * only helps the second. */
+         if (!cp->batch.pending)
+            cp->run_census.cut_nopending++;
+         else if (!can_defer)
+            cp->run_census.cut_state++;
+         else
+            cp->run_census.cut_ineligible++;
+      }
       if (can_defer && eligible)
          cp_batch_flush_defer_why(cp, "the next draw starts a segment");
       else

@@ -8571,6 +8571,17 @@ cp_run_census_report(struct cp_context *cp)
               "p90 %u p99 %u max %u   (plan gate: p99 <= 64)\n",
               name[k], (double)tot / (double)seen, p50, p90, p99, mx);
    }
+   if (rc->cut_state || rc->cut_ineligible || rc->cut_nopending)
+      fprintf(stderr, "cudavk:   opaque cuts: %" PRIu64 " episode state changed,"
+              " %" PRIu64 " draw not batchable, %" PRIu64 " no batch pending\n",
+              rc->cut_state, rc->cut_ineligible, rc->cut_nopending);
+   if (rc->ncut) {
+      fprintf(stderr, "cudavk:   opaque episode cuts, by reason:\n");
+      for (unsigned i = 0; i < rc->ncut; i++)
+         fprintf(stderr, "cudavk:     %-28s %8" PRIu64 " cuts, %6.2f segs each\n",
+                 rc->cut_why[i], rc->cut_n[i],
+                 (double)rc->cut_segs[i] / (double)rc->cut_n[i]);
+   }
    if (rc->id_overflows)
       fprintf(stderr, "cudavk:   WARNING %" PRIu64 " runs exceeded %u tracked "
               "identities\n", rc->id_overflows, (unsigned)CP_RUN_ID_MAX);
@@ -10955,6 +10966,27 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
    if (cp_debug->debug_episode && cp->pass.nsegs)
       fprintf(stderr, "episode-cut: flush_why=%s nsegs=%u\n", why,
               cp->pass.nsegs);
+   /*
+    * Which reason actually ends an OPAQUE episode, and how many segments it
+    * was holding. The corrected run census says 74 draws are episode
+    * compatible; real opaque episodes hold 6.21 segments. This says where
+    * the other 3.7x goes, and whether any of it is the driver's own doing
+    * rather than the workload's. Counting only, under CUDAVK_RUN_CENSUS.
+    */
+   if (cp_debug->run_census && cp->pass.nsegs && cp->pass.opaque) {
+      struct cp_run_census *rc = &cp->run_census;
+      unsigned k = rc->ncut;
+      for (unsigned i = 0; i < rc->ncut; i++)
+         if (rc->cut_why[i] == why) { k = i; break; }
+      if (k == rc->ncut && rc->ncut < CP_RUN_CUT_MAX) {
+         rc->cut_why[k] = why;
+         rc->ncut++;
+      }
+      if (k < CP_RUN_CUT_MAX) {
+         rc->cut_n[k]++;
+         rc->cut_segs[k] += cp->pass.nsegs;
+      }
+   }
    cp_pass_finish(cp);
 }
 
