@@ -515,6 +515,30 @@ supply it -- bin+walk -- measured 1.8 ms worse than doing nothing.
 That is the state: not a proof of impossibility, but an accounting in which
 every known item is priced and the total falls short by a factor of 1.6.
 
+## The predicate search, closed: three tried, two landed, one refuted
+
+The same lens was applied a third time. `cp_opaque_appendable()` carries the
+**same** colour-attachment requirement that `cpvk_batch_structural()` did, so
+depth-only batches could batch but not form an opaque episode -- exactly the
+relaxation `REDESIGN_PLAN` 3.1 names.
+
+Relaxed, it is **correct** (bit-identical, 18/18 sentinels, exact hash) and
+episodes go 2,919 -> 5,795 with 5,437 new segments. And it is **slower**:
+**+0.089 whole, +0.179 heavy, arms disjoint.** The new episodes average 1.9
+segments, and episode setup costs more than one shared visibility pass over
+two segments saves. Kept on `redesign/runlevel` as evidence; not landed.
+
+That closes the search:
+
+| predicate relaxed | correct? | result |
+|---|---|---|
+| episode-wide viewport/raster/depth comparison | yes | **-0.076 / -0.150 landed** |
+| colour attachment required to batch | yes | **-0.657 / -1.151 landed** |
+| colour attachment required to form an episode | yes | +0.089 / +0.179 **refuted** |
+
+Two of three paid, and the third cost one build and one A/B to disprove --
+which is the right price for an idea whose upside was another 1 ms.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
