@@ -206,6 +206,32 @@ iterations have ever been spent here.
 
 ---
 
+### Post-2026-09-05 note: the pool graphs targeted has since shrunk by 80%
+
+Entry 1's premise was **3.29 ms/frame of sub-20 µs device-idle gaps**
+(iteration 12). Re-measured on the post-wins build from a full-run CUDA trace
+(`/tmp/kb.sqlite`, 1,163,280 kernels, whole replay):
+
+    total device idle        3.242 ms/frame
+    of which sub-20 us       0.660 ms/frame   (773,220 gaps)
+
+**0.66 against 3.29 -- an 80% reduction in exactly the pool graphs were built
+to capture**, and the trace still carries CUPTI's per-launch inflation, so the
+true figure is lower.
+
+What collected it was not a graph. It was making episodes longer -- wide
+episodes took them from 6.21 to 12.84 segments, and depth-only batching folded
+in draws that used to break them. A longer episode issues the same work in
+fewer, larger launches, which is the effect a captured graph would have had,
+without needing the launch sequence to repeat. Entry 1 failed on key reuse
+(318,454 candidate tails, 65,905 exact keys); the predicate changes never
+needed a key at all.
+
+**The lesson, which generalises past graphs:** when a mechanism is refused
+because a *pattern* is not reusable, check whether the pattern can be made
+rarer instead of captured. Two one-line predicate changes beat a caching
+scheme aimed at the same milliseconds.
+
 ## 2. Persistent and dynamic-claim raster schedulers — REFUTED
 
 Iteration 21, with iteration 3's producer-local variant as the first refutation.
