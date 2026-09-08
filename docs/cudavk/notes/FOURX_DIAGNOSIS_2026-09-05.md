@@ -888,6 +888,44 @@ collected in full, the floor becomes 2.67 ms against a 2.088 ms target --
 remaining candidate for the ~5x ceiling, not for the objective, and it costs
 weeks rather than an afternoon.
 
+## RETRACTED AGAIN: the floor was priced at measured cost, not at work
+
+Every "unreachable" verdict in this document -- including the 1.47x floor
+above -- prices clip and raster at their **measured** cost. But this document
+also measures that those pools are mostly idle lanes:
+
+| term | measured | work share | work |
+|---|---:|---:|---:|
+| FS | 0.729 | 100% (register-bound, verified) | 0.729 |
+| VS | 0.434 | 30% (70% per-launch floor) | 0.130 |
+| clip | 0.520 | ~10% (2,598 implied instr/triangle vs ~200 real) | 0.052 |
+| raster | 0.669 | ~10% (2,028 implied instr/reference vs tens) | 0.067 |
+| vertex_fetch | 0.125 | ~50% | 0.062 |
+| memcpy | 0.221 | 100% (real bytes) | 0.221 |
+| **work-only core** | | | **1.262** |
+| + application record/decode | | | 0.376 |
+| **= true work floor** | | | **1.638 ms** |
+
+**The 4x target is 2.088 ms. The work floor is 1.638 ms. The target sits ABOVE
+the work.**
+
+So the frame is not dominated by rendering work -- it is dominated by machine
+underutilisation, and 4x is **not forbidden by physics or by the workload**.
+It is forbidden only by the fact that every attempt so far to collect that
+idle time has cost more than it recovered.
+
+**Corrected verdict: 4x is not proven unreachable.** It requires a renderer
+that keeps the machine busy through clip and rasterisation -- which is exactly
+what `REDESIGN_PLAN_2026-09-05.md` proposes and estimates at 2.5-3.5 ms heavy.
+Five partial attempts at that redesign failed, each for a diagnosed reason
+(queue-set lifetime, sequential drains, per-block cost, semantic ordering).
+None of them was the full pipeline, and the full pipeline is the only
+configuration in which the idle time is collectable.
+
+**What is proven** is narrower and still useful: no flag, no predicate, no
+partial merge and no hardware shortcut reaches the target, and the remaining
+distance is entirely machine utilisation rather than work.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
