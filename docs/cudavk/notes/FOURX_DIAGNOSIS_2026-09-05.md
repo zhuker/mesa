@@ -643,6 +643,15 @@ gap between 0.150 ms in a benchmark and +1.8 ms in the driver is the bin pass
 running over a whole episode's triangles to accelerate a fraction of them,
 plus a walk that pays per-tile setup the classic stages avoid.
 
+**Second integration attempt, also refuted.** The gap looked like tile size:
+the walk's work is references x tile_pixels, so 16 px tiles should cost ~2.7x
+less (a quarter the pixels for ~1.5x the references), and probe 4's cheap
+figure was measured at 16 px. Built and measured, 16 px is **worse**: +2.09
+ms/frame whole against +1.57 at 32 px, +2.51 heavy against +1.80. Four times
+the tiles means four times the blocks and the bin references to feed them.
+**The walk is bound by per-tile and per-block cost, not by pixel tests**, which
+is exactly what a microbenchmark over a synthetic tile list cannot show.
+
 **That is the honest terminus.** Not "the arithmetic forbids it" -- the
 arithmetic permits it if and only if that one integration works, and the one
 attempt failed by an order of magnitude. Anyone resuming should start there,
