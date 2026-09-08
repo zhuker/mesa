@@ -765,6 +765,38 @@ made that error -- the first was quoting the fragment pool at 2.25 ms.
 remainder, and this one is now refuted by construction rather than by
 argument.
 
+## Final correction: the memcpy pool, and the true margin
+
+The core figure above used `memcpy` at 0.451 ms/frame, measured before the
+2026-09-05 wins. Re-measured on the current build (the MEMCPY table survives
+in traces that lose the kernel table, `TODO` 15):
+
+| kind | per frame | ms/frame | MB/frame |
+|---|---:|---:|---:|
+| HtoD | 142.9 | 0.138 | 0.43 |
+| UVM HtoD | 30.8 | 0.045 | 0.67 |
+| UVM DtoH | 40.6 | 0.035 | 0.67 |
+| DtoH | 6.7 | 0.003 | 0.00 |
+| **total** | 221.0 | **0.221** | 1.77 |
+
+The UVM traffic is `DEAD_ENDS` 40's migration class, already priced and closed.
+So the core is **2.287 ms, not 2.517**, and it is **1.10x** the target rather
+than 1.21x.
+
+A frame is not only device work, though. The frame boundary is 0.94 ms of
+host time, of which **0.376 ms is the application's own record and decode** --
+the native driver pays it too, and it cannot overlap device work in the same
+frame. So the floor is:
+
+    core 2.287 + irreducible application boundary 0.376 = 2.663 ms
+    4x target                                             2.088 ms
+    over by                                               1.28x
+
+**The margin is 1.28x, not the 1.8x claimed above**, and it assumes zero
+overdraw, zero compaction, zero clears, zero writeback and zero launch gaps.
+It still does not reach 4x -- but it is close enough that the honest statement
+is "the floor exceeds the target", not "by a wide margin".
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
