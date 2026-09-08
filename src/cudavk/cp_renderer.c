@@ -8890,6 +8890,16 @@ cp_opaque_appendable(struct cp_context *cp,
        (cp->pass.nsegs >= CP_PASS_MAX_SEGS ||
         cp->pass.next_prim >= CP_PRIM_ID_LIMIT))
       return false;
+   /*
+    * Merging stage 3 across the episode needs every segment's queue set still
+    * live when the merged launch runs, and a stream owns exactly one set --
+    * so the episode may hold no more segments than there are streams. Without
+    * this the episode wraps a queue set and the merged launch reads queues a
+    * later segment has already rebuilt, which loses the device.
+    */
+   if (cp_debug->merge_stage3 && cp->pass.opaque &&
+       cp->pass.nsegs >= CP_PASS_STREAMS)
+      return false;
    if (!cp->pass_segs) {
       cp->pass_segs = calloc(CP_PASS_MAX_SEGS, sizeof(*cp->pass_segs));
       if (!cp->pass_segs)

@@ -416,7 +416,14 @@ struct cp_context {
     * queue set, since the queues are rebuilt per launch group and two
     * streams may be in one concurrently.
     */
-#define CP_PASS_STREAMS 8
+/* 16, not 8. Each stream owns a rasterizer queue set, so this also sets how
+ * many segments can have live queues at once -- and merging stage 3 across an
+ * episode (0.33 ms/frame, 100% per-launch fixed cost) needs one set per live
+ * segment. Episodes average 12.84 segments since the 2026-09-05 batching
+ * changes, so 16 covers the mean and 8 does not. DEAD_ENDS 38 measured the
+ * memory at +153 MB and declined it when the only prize was 0.084 ms; the
+ * prize here is four times that. */
+#define CP_PASS_STREAMS 16
 /* Arena generations cp_flush ping-pongs through; see the scratch struct. */
 #define CP_FLUSH_GENS 8
    CUstream seg_streams[CP_PASS_STREAMS];
