@@ -582,10 +582,19 @@ pools -- assume each vanishes completely, which no implementation can beat:
 | FS-merge of geometry across shade launches | 0.257 |
 | **absolute ceiling** | **2.161** |
 
-    frame now                       5.176 ms
-    minus every pool above          3.015 ms   <- nothing can do better
-    4x target                       2.088 ms
-    still over by                    1.44x
+**Stated self-consistently.** The pool sizes above were measured on the
+*pre-win* build, whose frame was 5.909; the two 2026-09-05 wins then removed
+0.733 ms, part of it from those same pools (fewer visibility clears, fewer
+compactions). Subtracting pre-win pools from the post-win frame would
+double-count that overlap, so the bound is a range:
+
+    pre-win, self-consistent:  5.909 - 2.161 = 3.748 ms  -> over by 1.80x
+    post-win, most generous:   5.176 - 2.161 = 3.015 ms  -> over by 1.44x
+
+The truth is between them, because the wins already banked some of the pools.
+**Both ends miss the 2.088 ms target**, so the conclusion does not depend on
+resolving the overlap -- and the self-consistent reading, 1.80x, is the
+honest one to quote.
 
 `clip_all + stage2 + stage3` (1.189 ms) is **excluded**, because the mechanism
 for removing it was built and measured **+1.8 ms worse**, twice.
