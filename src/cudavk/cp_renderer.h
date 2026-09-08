@@ -244,12 +244,19 @@ struct cp_run_geometry_member {
    uint32_t row_base;
 };
 
+struct cp_run_geometry_span {
+   CUdeviceptr output;
+   uint32_t num_verts;
+};
+
 struct cp_run_geometry_group {
    CUfunction kernel;
    uint32_t first_batch;  /* key owner in the collected batch array */
    uint32_t first_member;
    uint32_t num_members;
    uint32_t num_draws;
+   CUdeviceptr storage;
+   CUdeviceptr output;
 };
 
 struct cp_context {
@@ -321,8 +328,13 @@ struct cp_context {
       unsigned member_capacity, nmembers;
       struct cp_run_geometry_group *groups;
       unsigned group_capacity, ngroups;
+      struct cp_run_geometry_span *spans;
+      unsigned span_capacity;
+      CUdeviceptr active_output;
+      uint32_t active_num_verts;
       bool draining;
       uint64_t runs, batches_seen, draws_seen, groups_built;
+      uint64_t groups_launched, member_launches_saved;
       uint64_t refused_nonfused, refused_vs_side_effect;
       uint64_t alloc_fallbacks;
    } run_geometry;

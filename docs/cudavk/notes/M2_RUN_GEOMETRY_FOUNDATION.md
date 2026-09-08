@@ -6,7 +6,7 @@ M2 geometry change. It is behind the default-off value flag
 
 ## What is implemented
 
-- O run collection happens in `cp_batch_flush_defer_why()`. A deferrable batch
+- Opaque run collection happens in `cp_batch_flush_defer_why()`. A deferrable batch
   break appends an immutable `cp_draw_batch` snapshot. It does not end a run.
 - `cp_batch_flush_why()` is the authority for an ordering boundary. It drains
   the collected run before `cp_pass_finish()`. Refused draws drain the older
@@ -29,26 +29,32 @@ The focused gate runs the same three-triangle workload with
 `CUDAVK_BATCH_MAX=1`, observes a real 3-to-1-or-better group, and compares the
 full output hash against the flag-off renderer.
 
-## Exact continuation
+## CUDA execution in this slice
 
-This slice deliberately does **not** claim a launch reduction yet. The grouped
-plan is prepared, but draining still calls `cp_opaque_append()` once per saved
-batch. The next patch must extract the fused-fetch VS preparation/launch block
-from `cp_draw_execute_batch_inner()` into a helper which accepts the dynamic
-flattened member table and output per member. It must then feed those
-saved output spans into the current clip/raster/shade continuation.
+For each triangle-list group, one existing `CP_SHADER_EXEC_VS_FETCH` CUDA
+kernel is launched over the dynamic flattened slices and rows. Its output is a
+single device allocation with one saved span per source batch. The old
+per-batch VS launch is suppressed when that batch is replayed. The span then
+continues through the current clip, raster and shade code without changing
+its ordering.
 
-That extraction also must:
+The grouped launch does not seed a per-batch raster queue. Each downstream
+member takes the existing explicit-clear arm instead. The VS lane is also
+refused for these members because its two-slot lifetime is per batch. Group
+storage remains live until `cp_pass_finish()` has issued all consumers.
 
-1. disable the per-batch VS lane for grouped launches;
-2. give geometry its own counters instead of using fused-fetch seeding for a
-   single raster queue set;
-3. allocate all group outputs monotonically until every member downstream has
-   consumed them;
-4. launch each group once, then submit downstream members in original opaque
-   order; and
-5. retain the current whole-run classic fallback before any side-effecting FS
-   attempt.
+Unsupported topology, missing fused execution, VS memory side effects, an
+allocation error, or a CUDA launch error leaves that member/group on the
+existing renderer. A grouped VS is side-effect-free, so a partially prepared
+run can safely fall back before downstream fragment execution.
 
-Until that continuation lands, the flag is a correctness and grouping gate,
-not a performance option.
+## Known limits
+
+- Only `MESA_PRIM_TRIANGLES` uses the grouped launch. Topologies needing the
+  host-expanded vertex/instance id arrays use the old per-batch path.
+- Group storage currently uses `cuMemAlloc`/`cuMemFree`. This gives a simple
+  proven lifetime but makes the flag a correctness milestone, not yet a fair
+  performance arm. A run-owned reusable allocation is the next memory step.
+- The current clip/raster/shade path still runs once per saved batch. This
+  slice removes only fused VS launches; run-global clip/bin/walk/compaction is
+  later M2 work.

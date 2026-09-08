@@ -32,5 +32,8 @@ if not m:
 batches, groups, members = map(int, m.groups())
 if batches < 2 or groups >= batches or members != batches:
     raise SystemExit("expected a real many-to-one group, got %s\n%s" % (m.group(0), log))
-print("run geometry gate: %d batches -> %d group(s), pixels identical" %
+launches = re.findall(r"run-geometry-launch: members=(\d+)", log)
+if len(launches) != groups or sum(map(int, launches)) != members:
+    raise SystemExit("group launches did not replace every member VS launch\n" + log)
+print("run geometry gate: %d member VS launches -> %d, pixels identical" %
       (batches, groups))

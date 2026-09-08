@@ -960,12 +960,14 @@ cp_run_geometry_report(struct cp_context *cp)
       return;
    fprintf(stderr,
            "cudavk: run geometry: %llu runs, %llu batches, %llu draws, "
-           "%llu fused-launch groups; refusals non-fused=%llu "
-           "VS-side-effect=%llu allocation=%llu\n",
+           "%llu groups built, %llu launched, %llu member launches removed; "
+           "refusals non-fused=%llu VS-side-effect=%llu allocation=%llu\n",
            (unsigned long long)cp->run_geometry.runs,
            (unsigned long long)cp->run_geometry.batches_seen,
            (unsigned long long)cp->run_geometry.draws_seen,
            (unsigned long long)cp->run_geometry.groups_built,
+           (unsigned long long)cp->run_geometry.groups_launched,
+           (unsigned long long)cp->run_geometry.member_launches_saved,
            (unsigned long long)cp->run_geometry.refused_nonfused,
            (unsigned long long)cp->run_geometry.refused_vs_side_effect,
            (unsigned long long)cp->run_geometry.alloc_fallbacks);
@@ -1165,6 +1167,7 @@ cp_context_cleanup(struct cp_context *cp)
    free(cp->run_geometry.batches);
    free(cp->run_geometry.members);
    free(cp->run_geometry.groups);
+   free(cp->run_geometry.spans);
 }
 
 /* Per-stage timing for a draw, printed under CUDAVK_DEBUG_TIME. See
@@ -6236,7 +6239,12 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * A refusal here is silent and complete: everything below is what it
           * was, on the main stream, with the seeding folded as usual.
           */
-         bool vs_lane_out = fused_vfetch && cp->vslane.ready;
+         bool vs_lane_out = fused_vfetch && cp->vslane.ready &&
+                            !cp->run_geometry.active_output;
+         if (cp->run_geometry.active_output) {
+            assert(cp->run_geometry.active_num_verts == total_verts);
+            vs_output_buf = cp->run_geometry.active_output;
+         }
          if (vs_lane_out) {
             vs_output_buf =
                cp_vslane_output(cp, (size_t)total_verts * out_stride);
@@ -6522,6 +6530,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * is a cost and not a hazard.
           */
          fetch_fold = !cp_debug->no_fetch_fold && !vs_lane_out &&
+                      !cp->run_geometry.active_output &&
                       (fused_vfetch ? vs_runs : fetch_runs);
 
          /*
@@ -6909,7 +6918,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
 
          /* Which shader ran, and how often, so that the fused-fetch admission
           * share can be weighted by launches rather than by shader count. */
-         if (state->vs->vs_census) {
+         if (!cp->run_geometry.active_output && state->vs->vs_census) {
             p_atomic_inc(&state->vs->vs_census->launches);
             if (fused_vfetch)
                p_atomic_inc(&state->vs->vs_census->launches_fused);
@@ -6939,10 +6948,12 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             cp->vslane.slot_next ^= 1u;
          }
 
-         /* Compiled shaders grid-stride; see the fragment launch. */
-         CUresult vs_err = cp_launch(cp, vs_exec->kernel,
-            MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
-            0, cp->stream, vs_params, NULL);
+         /* A grouped launch already produced this member's span. */
+         CUresult vs_err = CUDA_SUCCESS;
+         if (!cp->run_geometry.active_output)
+            vs_err = cp_launch(cp, vs_exec->kernel,
+               MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
+               0, cp->stream, vs_params, NULL);
 
          /* Whatever the launch did, the main stream owns the rest of this
           * batch: the join is unconditional so that no path out of this
@@ -10920,8 +10931,13 @@ cp_run_geometry_plan(struct cp_context *cp)
                                 sizeof(cp->run_geometry.members[0])) ||
        !cp_run_geometry_reserve((void **)&cp->run_geometry.groups,
                                 &cp->run_geometry.group_capacity, n,
-                                sizeof(cp->run_geometry.groups[0])))
+                                sizeof(cp->run_geometry.groups[0])) ||
+       !cp_run_geometry_reserve((void **)&cp->run_geometry.spans,
+                                &cp->run_geometry.span_capacity, n,
+                                sizeof(cp->run_geometry.spans[0])))
       return false;
+   memset(cp->run_geometry.spans, 0,
+          (size_t)n * sizeof(cp->run_geometry.spans[0]));
 
    unsigned *which = malloc((size_t)n * sizeof(*which));
    if (!which)
@@ -10975,6 +10991,210 @@ cp_run_geometry_plan(struct cp_context *cp)
 }
 
 static bool
+cp_run_geometry_launch_group(struct cp_context *cp,
+                             struct cp_run_geometry_group *group)
+{
+   const struct cp_run_geometry_member *members =
+      cp->run_geometry.members + group->first_member;
+   const struct cp_draw_batch *first =
+      &cp->run_geometry.batches[group->first_batch];
+   const struct cp_draw_state *state = &first->state;
+   unsigned ndraws = group->num_draws;
+   unsigned total_verts = 0;
+
+   /* The existing fused lane derives triangle-list ids from slices. Other
+    * topologies need the host-expanded id arrays and stay on the old path. */
+   for (unsigned m = 0; m < group->num_members; m++) {
+      const struct cp_draw_batch *b =
+         &cp->run_geometry.batches[members[m].batch];
+      if (b->info.mode != MESA_PRIM_TRIANGLES)
+         return false;
+      for (unsigned d = 0; d < b->ndraws; d++) {
+         unsigned inst = b->compact_rows ? MAX2(b->instance_counts[d], 1u)
+                                         : MAX2(b->info.instance_count, 1u);
+         uint64_t add = (uint64_t)cp_triangles_for_draw(
+            b->info.mode, b->draws[d].count) * 3u * inst;
+         if (add > UINT32_MAX - total_verts)
+            return false;
+         total_verts += (unsigned)add;
+      }
+   }
+   if (!total_verts)
+      return false;
+
+   unsigned num_outputs = state->vs->nir_num_outputs ?
+                          state->vs->nir_num_outputs : 2;
+   unsigned out_stride = num_outputs * 16;
+   if (out_stride && total_verts > SIZE_MAX / out_stride)
+      return false;
+   size_t slices_bytes = (size_t)ndraws * sizeof(struct cp_draw_slice);
+   size_t bases_off = ALIGN_POT(slices_bytes, 16);
+   size_t bases_bytes = (size_t)ndraws * CP_VB_TABLE_STRIDE * sizeof(uint64_t);
+   size_t args_off = ALIGN_POT(bases_off + bases_bytes, 16);
+   size_t args_bytes = 64 * sizeof(void *);
+   size_t scal_off = args_off + args_bytes;
+   size_t tbl_off = scal_off + 32;
+   size_t tbl_bytes = (size_t)ndraws * CP_ARG_UBO_STRIDE * sizeof(uint64_t);
+   size_t dp_off = tbl_off + tbl_bytes;
+   size_t dp_bytes = (size_t)ndraws * CP_ARG_DRAW_PARAM_STRIDE * sizeof(uint32_t);
+   size_t vf_off = ALIGN_POT(dp_off + dp_bytes, 16);
+   size_t storage_bytes = vf_off + sizeof(struct cp_vertex_fetch_args);
+
+   void *host = calloc(1, storage_bytes);
+   if (!host)
+      return false;
+   CUdeviceptr storage = 0, output = 0;
+   if (cuMemAlloc(&storage, storage_bytes) != CUDA_SUCCESS ||
+       cuMemAlloc(&output, (size_t)total_verts * out_stride) != CUDA_SUCCESS) {
+      if (storage) cuMemFree(storage);
+      if (output) cuMemFree(output);
+      free(host);
+      return false;
+   }
+
+   struct cp_draw_slice *slices = host;
+   uint64_t *bases = (uint64_t *)((char *)host + bases_off);
+   uint64_t *tbl = (uint64_t *)((char *)host + tbl_off);
+   uint32_t *dp = (uint32_t *)((char *)host + dp_off);
+   unsigned row = 0, vbegin = 0;
+   uint64_t common_ib = first->compact_rows && first->index_ptrs[0] ?
+      first->index_ptrs[0] : (uint64_t)(uintptr_t)first->info.index_ptr;
+   for (unsigned m = 0; m < group->num_members; m++) {
+      unsigned bi = members[m].batch;
+      const struct cp_draw_batch *b = &cp->run_geometry.batches[bi];
+      unsigned batch_begin = vbegin;
+      for (unsigned d = 0; d < b->ndraws; d++, row++) {
+         unsigned inst = b->compact_rows ? MAX2(b->instance_counts[d], 1u)
+                                         : MAX2(b->info.instance_count, 1u);
+         unsigned verts_one = cp_triangles_for_draw(b->info.mode,
+                                                    b->draws[d].count) * 3;
+         uint64_t ib = b->compact_rows && b->index_ptrs[d] ?
+                       b->index_ptrs[d] : (uint64_t)(uintptr_t)b->info.index_ptr;
+         uint64_t slice_ib = ib != common_ib ? ib : 0;
+         slices[row] = (struct cp_draw_slice) {
+            .vert_begin = vbegin,
+            .index_bytes = b->info.index_size ?
+                           b->draws[d].start * b->info.index_size : 0,
+            .first_vertex = b->info.index_size ?
+                            (uint32_t)b->draws[d].index_bias : b->draws[d].start,
+            .ib_base_lo = (uint32_t)slice_ib,
+            .ib_base_hi = (uint32_t)(slice_ib >> 32),
+            .verts_per_instance = inst > 1 ? verts_one : 0,
+         };
+         vbegin += verts_one * inst;
+
+         for (unsigned e = 0; e < state->num_vertex_elements; e++) {
+            if (b->compact_rows)
+               bases[(size_t)row * CP_VB_TABLE_STRIDE + e] =
+                  b->vb_bases[(size_t)d * CP_VB_TABLE_STRIDE + e];
+            else {
+               unsigned vb = b->state.velem[e].vertex_buffer_index;
+               if (vb < b->state.num_vertex_buffers)
+                  bases[(size_t)row * CP_VB_TABLE_STRIDE + e] =
+                     b->state.vb_base[vb];
+            }
+         }
+         for (unsigned u = 0; u < state->num_vs_ubos &&
+                              u < CP_MAX_CONST_BUFFERS; u++)
+            tbl[(size_t)row * CP_ARG_UBO_STRIDE + u] = b->compact_rows ?
+               b->vs_ubos[(size_t)d * CP_ARG_UBO_STRIDE + u] :
+               b->state.vs_ubos[u];
+         dp[(size_t)row * CP_ARG_DRAW_PARAM_STRIDE + 0] =
+            b->info.index_size ? (uint32_t)b->draws[d].index_bias :
+                                 b->draws[d].start;
+         dp[(size_t)row * CP_ARG_DRAW_PARAM_STRIDE + 1] = b->info.start_instance;
+         dp[(size_t)row * CP_ARG_DRAW_PARAM_STRIDE + 2] = b->compact_rows ?
+            b->draw_ids[d] : b->drawid_offset;
+         dp[(size_t)row * CP_ARG_DRAW_PARAM_STRIDE + 3] =
+            b->info.index_size ? (uint32_t)b->draws[d].index_bias : 0;
+      }
+      cp->run_geometry.spans[bi] = (struct cp_run_geometry_span) {
+         .output = output + (size_t)batch_begin * out_stride,
+         .num_verts = vbegin - batch_begin,
+      };
+   }
+   assert(row == ndraws && vbegin == total_verts);
+
+   struct cp_vertex_fetch_args vf = {
+      .num_elements = state->num_vertex_elements,
+      .num_verts = total_verts,
+      .index_buffer = common_ib,
+      .index_size = first->info.index_size,
+      .start_instance = first->info.start_instance,
+      .draw_slices = storage,
+      .num_draw_slices = ndraws,
+      .elem_bases = storage + bases_off,
+   };
+   for (unsigned e = 0; e < state->num_vertex_elements; e++) {
+      const struct cp_vertex_elem *elem = &state->velem[e];
+      vf.elem_vb_idx[e] = elem->vertex_buffer_index;
+      vf.elem_src_offset[e] = elem->src_offset;
+      vf.elem_src_stride[e] = elem->src_stride;
+      vf.elem_attr_size[e] = elem->attr_size;
+      vf.elem_nr_chan[e] = elem->nr_chan;
+      vf.elem_chan_bytes[e] = elem->chan_bytes;
+      vf.elem_conv[e] = elem->conv;
+      vf.elem_swizzle[e] = elem->swizzle;
+      vf.elem_fill_w[e] = elem->fill_w;
+      vf.elem_instance_divisor[e] = elem->instance_divisor;
+   }
+   memcpy((char *)host + vf_off, &vf, sizeof(vf));
+
+   void **args = (void **)((char *)host + args_off);
+   args[0] = (void *)(uintptr_t)(storage + scal_off + 8);
+   args[2] = NULL;
+   args[3] = (void *)(uintptr_t)(storage + scal_off + 12);
+   args[4] = (void *)(uintptr_t)output;
+   args[7] = (void *)(uintptr_t)(storage + dp_off);
+   args[CP_ARG_SLOT_UBO_TABLE] = (void *)(uintptr_t)(storage + tbl_off);
+   args[CP_ARG_SLOT_BATCH_ROWS] = (void *)(uintptr_t)(storage + scal_off);
+   args[CP_ARG_SLOT_BATCH_MASK] =
+      (void *)(uintptr_t)(storage + scal_off + 4);
+   args[CP_ARG_SLOT_VS_FETCH] = (void *)(uintptr_t)(storage + vf_off);
+   uint32_t *scal = (uint32_t *)((char *)host + scal_off);
+   scal[0] = 0;
+   scal[1] = 0xffffffffu;
+   scal[2] = total_verts;
+   scal[3] = state->num_vertex_elements * 16;
+
+   if (cuMemcpyHtoDAsync(storage, host, storage_bytes, cp->stream) !=
+       CUDA_SUCCESS) {
+      cuMemFree(output); cuMemFree(storage); free(host);
+      for (unsigned m = 0; m < group->num_members; m++)
+         cp->run_geometry.spans[members[m].batch] =
+            (struct cp_run_geometry_span) { 0 };
+      return false;
+   }
+   free(host);
+   void *arg_ptr = (void *)(uintptr_t)(storage + args_off);
+   void *params[] = { &arg_ptr };
+   CUresult err = cp_launch(cp, group->kernel,
+      MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
+      0, cp->stream, params, NULL);
+   if (err != CUDA_SUCCESS) {
+      cuMemFree(output); cuMemFree(storage);
+      for (unsigned m = 0; m < group->num_members; m++)
+         cp->run_geometry.spans[members[m].batch] =
+            (struct cp_run_geometry_span) { 0 };
+      return false;
+   }
+   if (state->vs->vs_census) {
+      p_atomic_inc(&state->vs->vs_census->launches);
+      p_atomic_inc(&state->vs->vs_census->launches_fused);
+   }
+   group->storage = storage;
+   group->output = output;
+   cp->run_geometry.groups_launched++;
+   cp->run_geometry.member_launches_saved += group->num_members;
+   if (cp_debug->debug_episode)
+      fprintf(stderr,
+              "run-geometry-launch: members=%u draws=%u verts=%u kernel=%p\n",
+              group->num_members, group->num_draws, total_verts,
+              (void *)(uintptr_t)group->kernel);
+   return true;
+}
+
+static bool
 cp_run_geometry_collect(struct cp_context *cp)
 {
    if (!cp_run_geometry_fused(&cp->batch)) {
@@ -11022,14 +11242,36 @@ cp_run_geometry_drain(struct cp_context *cp)
       cp->run_geometry.alloc_fallbacks++;
       cp->run_geometry.nmembers = cp->run_geometry.ngroups = 0;
    }
+   for (unsigned g = 0; g < cp->run_geometry.ngroups; g++) {
+      if (!cp_run_geometry_launch_group(cp, &cp->run_geometry.groups[g]))
+         cp->run_geometry.alloc_fallbacks++;
+   }
    for (unsigned i = 0; i < n && !cp->device_fatal; i++) {
       cp->batch = cp->run_geometry.batches[i];
       cp->batch.pending = false;
       cp->batch_uploads_live = true;
+      cp->run_geometry.active_output = cp->run_geometry.spans[i].output;
+      cp->run_geometry.active_num_verts = cp->run_geometry.spans[i].num_verts;
       cp_opaque_append(cp, cp->batch.ndraws);
+      cp->run_geometry.active_output = 0;
+      cp->run_geometry.active_num_verts = 0;
    }
    cp->run_geometry.nbatches = 0;
    cp->run_geometry.draining = false;
+}
+
+static void
+cp_run_geometry_release(struct cp_context *cp)
+{
+   for (unsigned g = 0; g < cp->run_geometry.ngroups; g++) {
+      if (cp->run_geometry.groups[g].output)
+         cuMemFree(cp->run_geometry.groups[g].output);
+      if (cp->run_geometry.groups[g].storage)
+         cuMemFree(cp->run_geometry.groups[g].storage);
+      cp->run_geometry.groups[g].output = 0;
+      cp->run_geometry.groups[g].storage = 0;
+   }
+   cp->run_geometry.ngroups = cp->run_geometry.nmembers = 0;
 }
 
 void
@@ -11126,6 +11368,7 @@ cp_batch_flush_why(struct cp_context *cp, const char *why)
       fprintf(stderr, "episode-cut: flush_why=%s nsegs=%u\n", why,
               cp->pass.nsegs);
    cp_pass_finish(cp);
+   cp_run_geometry_release(cp);
 }
 
 /*
