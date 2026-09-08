@@ -610,6 +610,45 @@ withdrew, it does not depend on any model: only on (a) the measured
 union-exclusive size of every pool, and (b) the fact that a saving cannot
 exceed the pool it comes from.
 
+## The irreducible core, and the single question reachability turns on
+
+Strip the frame to the work that must happen to render it -- union-exclusive,
+with overdraw already removed from fragment shading:
+
+| core work | ms/frame |
+|---|---:|
+| VS (vertex shading) | 0.434 |
+| fragment shading, zero overdraw (0.729 / 2.29) | 0.318 |
+| `clip_all` | 0.520 |
+| `stage2 + stage3 + stage3_abuf` (rasterisation) | 0.669 |
+| `vertex_fetch` | 0.125 |
+| `memcpy` (uploads) | 0.451 |
+| **total** | **2.517** |
+
+Against a 2.088 ms target, **the core alone is 1.21x over with everything else
+at zero** -- no compaction, no writeback, no clears, no A-buffer support, no
+host time, no launch gaps, no frame boundary.
+
+**But 1.189 ms of that core is clip plus rasterisation, and probe 5 measured a
+bin+walk replacement at 0.150 ms in isolation.** If that held in the driver,
+the core would be **1.478 ms, under the target**, and 4x would be reachable.
+
+So the whole question reduces to one thing:
+
+> **Can the tile rasteriser be integrated at its microbenchmark cost?**
+
+The evidence is against it. Built, it measured **+1.57 to +1.80 ms/frame worse
+than doing nothing**, twice, on two baselines, once with coverage doubled. The
+gap between 0.150 ms in a benchmark and +1.8 ms in the driver is the bin pass
+running over a whole episode's triangles to accelerate a fraction of them,
+plus a walk that pays per-tile setup the classic stages avoid.
+
+**That is the honest terminus.** Not "the arithmetic forbids it" -- the
+arithmetic permits it if and only if that one integration works, and the one
+attempt failed by an order of magnitude. Anyone resuming should start there,
+with `redesign/runlevel` and `M2_PROGRESS_2026-09-05.md`, and should treat the
+microbenchmark figure as unproven in situ until a driver A/B says otherwise.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
