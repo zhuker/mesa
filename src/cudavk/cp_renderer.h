@@ -264,7 +264,6 @@ struct cp_run_geometry_group {
  * issued. positions is deliberately zero until that VS has produced its span.
  * Keeping the stable slot range explicit makes the future run-wide pass use
  * submission-order primitive IDs rather than an atomic append order. */
-#define CP_RUN_CLIP_BIN_MAX_SEGS 64
 struct cp_run_clip_bin_segment {
    uint32_t batch;
    uint32_t group;

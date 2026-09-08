@@ -20,12 +20,27 @@ Each descriptor records the geometry group/member, triangle count, output-slot
 count, and a stable `(prim_base, prim_slots)` range. `positions` stays zero
 until grouped geometry has completed. Any refusal is side-effect free.
 
-This slice then takes the exact legacy path. It intentionally suppresses the
-grouped VS launches as well: issuing grouped geometry and then the old
+`cp_run_clip_setup_tile_count` and its shared ABI now exist in the raster
+module. One grid accepts at most 64 device segment descriptors. It invokes the
+existing `cp_clip_one()` and `setup_triangle()` helpers, assigns stable IDs as
+`segment.prim_base + triangle * CP_CLIP_MAX_OUT + output`, atomically counts
+32-pixel bounding-box tile references, and compactly appends only
+`{stable_prim, segment}` for live setup results. Append order is immaterial;
+the stable ID is not an atomic allocation. The ABI has an explicit capacity
+and overflow word. It does not allocate or clear an eight-slot setup array.
+
+`cp_run_clip_bin_gate.cu` compares this run-wide kernel against the existing
+per-segment `cp_clip_triangles` entry point followed by the shared setup helper.
+It checks compact live records after sorting by stable ID, every tile count and
+the implied reference total. Cases cover fully inside, homogeneous clipping,
+fully clipped, face culled, multiple segments, and distinct viewport/scissor
+rectangles.
+
+The renderer still takes the exact legacy path. It intentionally suppresses
+the grouped VS launches as well: issuing grouped geometry and then the old
 per-member clip/raster chains would be additive work and would not validate a
-replacement. The focused gate checks identical pixels, the dependency, whole
-run preflight, stable nonzero slot ranges, and absence of an additive grouped
-launch.
+replacement. The CUDA entry point is registered but has no renderer launch
+site until the transaction below is complete.
 
 ## Exact continuation
 
@@ -33,14 +48,21 @@ launch.
    group and patch each descriptor's `positions` from its member span. If any
    group fails, discard the transaction and replay every member through the
    unchanged path.
-2. Add a run-wide CUDA clip/setup/tile-count kernel. Reuse the existing
-   seven-plane clip math and `CP_CLIP_PRIM_SHIFT` stable slots. It must consume
-   the descriptors in original batch order and produce 16-pixel tile counts.
-3. Prefix-scan the tile counts, capacity-check every sum, then run a fill/scatter
-   pass which emits dense `(stable primitive ID, segment/draw row)` references.
-   A failure before visibility writes must discard the transaction and replay
-   the whole run exactly.
-4. Feed those dense lists to the existing tile raster and grouped shade
+2. Patch and upload one `cp_run_clip_bin_device_segment` per host descriptor.
+   Its `clip` half points at the grouped position span plus per-segment clipped
+   output/ref storage. Its `rast` half copies the legacy viewport, scissor,
+   cull, and slot state. Clear only the tile counters, live counter and overflow
+   word, then launch `cp_run_clip_setup_tile_count` as `grid.y = num_segments`.
+3. Check overflow without allowing visibility writes. Prefix-scan all 32-pixel
+   tile counts with checked arithmetic and capacity-check the final sum. Launch
+   fill/scatter over the compact live array. For each record derive the local
+   stable ID from `stable_prim - segment.prim_base`, call the existing
+   `setup_triangle()` again, enumerate its recorded-equivalent tile bounds,
+   and scatter dense `(stable primitive ID, segment/draw row)` references using
+   the scanned offsets and per-tile cursors. Validate every cursor equals its
+   count. Any allocation, launch, overflow, sum or cursor failure discards the
+   whole transaction and replays the unchanged run before fragment effects.
+4. Feed those dense lists to the existing 32-pixel tile raster and grouped shade
    continuation. Only then remove each admitted member's old
    `cp_clip_rast_fused`/stage2/stage3 work. There must be no arm that performs
    both run-wide and old clip/raster work.

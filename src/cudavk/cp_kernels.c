@@ -403,6 +403,8 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
    cuModuleGetFunction(&k->rasterize_stage2, k->module, "cp_rasterize_stage2");
    cuModuleGetFunction(&k->rasterize_stage3, k->module, "cp_rasterize_stage3");
    cuModuleGetFunction(&k->clip_triangles, k->module, "cp_clip_triangles");
+   cuModuleGetFunction(&k->run_clip_setup_tile_count, k->module,
+                       "cp_run_clip_setup_tile_count");
    k->rasterize_triangles = k->rasterize_stage1;
    cuModuleGetFunction(&k->clear_visbuf, k->module, "cp_clear_visbuf");
    cuModuleGetFunction(&k->peel_advance, k->module, "cp_peel_advance");

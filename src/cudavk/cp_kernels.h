@@ -54,6 +54,7 @@ struct cp_kernels {
    CUfunction clip_rast_fused;
    CUfunction clip_rast_fused_abuf;
    CUfunction clip_triangles;
+   CUfunction run_clip_setup_tile_count;
    CUfunction clear_visbuf;
    CUfunction peel_advance;
    CUfunction resolve_samples;
