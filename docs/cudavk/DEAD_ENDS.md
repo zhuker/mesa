@@ -76,8 +76,19 @@ component of the measured frame has at least one entry that closed it:
 | submit / between-kernel residue | 0.813 | 1, 25 | CUDA graphs at three units: 318,454 candidate tails yield 65,905 exact keys; bounded LRU hits 69-76% |
 | **measured frame** | **5.198** | | |
 
-**45 entries, no open lead, and the frame closes exactly**: 4.009 device +
-0.376 application + 0.813 submit residue = 5.198 ms.
+**45 entries and no open lead.** One caveat on the arithmetic, because the
+first version of this table did not carry it: **the pool figures are from the
+pre-win trace, where the frame was 5.909 ms**, and only `memcpy` has been
+re-traced since (0.451 -> 0.221). Against that frame the accounting is
+
+    all_kernels 4.009 + application 0.376 + submit/gap 1.524 = 5.909
+
+The two wins then removed 0.733 ms. They cut launch *count* (episodes went
+6.21 -> 12.84 segments) rather than work, so the reduction should come out of
+the gap term, giving ~0.79 ms of gap against today's 5.198 ms frame with the
+device total roughly unchanged. **That is inference, not measurement** -- the
+post-win pools have not been re-traced, and `TODO` 15 (nsys dropping the
+kernel activity buffer) is why.
 
 Note the arithmetic trap this table exists to avoid. Summing the six largest
 pools gives 2.698 ms and implies a 1.200 ms gap; the union-exclusive device
