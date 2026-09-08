@@ -8850,10 +8850,21 @@ cp_opaque_appendable(struct cp_context *cp,
 {
    const struct cp_draw_state *state = &batch->state;
    const struct cp_fb_desc *fb = &batch->scope.fb;
+   /*
+    * A depth-only scope has no colour attachment, and the two tests below
+    * that ask for one are the same requirement that kept depth-only draws
+    * out of BATCHES until 2026-09-05. Batching them was worth -1.15 ms on
+    * favorite3's heavy band; this asks whether they may also form an opaque
+    * EPISODE, so that a shadow scope shares one visibility pass instead of
+    * one per batch. REDESIGN_PLAN 3.1 names this relaxation.
+    */
+   const bool depth_only = !fb->nr_cbufs && !fb->color &&
+                           !cp_debug->no_depth_only_episode;
    if (cp_debug->no_opaque_episode || !cp_batch_order_free(state) ||
        !state->fs || state->fs->writes_memory ||
-       MAX2(batch->scope.attachment_samples, 1u) != 1 || fb->nr_cbufs != 1 ||
-       !fb->color || fb->color_encoding < 0) {
+       MAX2(batch->scope.attachment_samples, 1u) != 1 ||
+       (!depth_only && (fb->nr_cbufs != 1 || !fb->color ||
+                        fb->color_encoding < 0))) {
       if (cp_debug->debug_episode)
          fprintf(stderr, "no-episode: noflag=%d orderfree=%d fs=%d "
                  "writes=%d samples=%u cbufs=%u color=%d enc=%d\n",

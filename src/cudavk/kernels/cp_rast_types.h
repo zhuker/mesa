@@ -1005,6 +1005,12 @@ struct cp_abuf_shade_count_args {
    uint64_t slots;
 };
 
+/* 32, and 16 was tried. The walk's work looks like references x tile_pixels,
+ * so 16 px should be ~2.7x cheaper (a quarter the pixels for ~1.5x the
+ * references). Measured, it is WORSE: +2.09 ms/frame whole against +1.57 at
+ * 32 px. Four times the tiles means four times the blocks and the bin
+ * references to feed them, and that outweighs the pixel work. The walk is
+ * bound by per-tile and per-block cost, not by pixel tests. */
 #define CP_OPAQUE_TILE_SIZE 32u
 
 /* The run-level walk (REDESIGN_PLAN_2026-09-05.md M2). A tile list longer

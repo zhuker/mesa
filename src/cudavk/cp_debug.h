@@ -172,6 +172,9 @@ struct cp_debug {
    bool plan_stats;
    bool run_census;
    bool no_tile_split;
+   bool wide_episode;
+   bool no_depth_only_batch;
+   bool no_depth_only_episode;
    bool debug_vfetch;
    bool debug_work;
    bool debug_discard;

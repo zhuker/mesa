@@ -2982,6 +2982,8 @@ cp_opaque_tile_raster_split(struct cp_opaque_tile_raster_args args,
     * depends on how large a triangle is.
     */
 #define CP_WALK_BATCH 32
+/* Pixels each of the 256 threads owns: 4 at a 32 px tile, 1 at 16 px. */
+#define CP_WALK_PX (CP_OPAQUE_TILE_SIZE * CP_OPAQUE_TILE_SIZE / 256u)
    __shared__ struct cp_tri_setup bset[CP_WALK_BATCH];
    __shared__ uint32_t bprim[CP_WALK_BATCH], blocal[CP_WALK_BATCH];
    __shared__ uint16_t bseg[CP_WALK_BATCH];
@@ -2995,8 +2997,10 @@ cp_opaque_tile_raster_split(struct cp_opaque_tile_raster_args args,
 
    /* Each thread owns four of the tile's 1,024 pixels, as the serial kernel
     * did, and keeps their winners in registers. */
-   uint64_t winner[4] = { VISBUF_EMPTY, VISBUF_EMPTY,
-                          VISBUF_EMPTY, VISBUF_EMPTY };
+   uint64_t winner[CP_WALK_PX];
+   #pragma unroll
+   for (uint32_t j = 0; j < CP_WALK_PX; j++)
+      winner[j] = VISBUF_EMPTY;
 
    for (uint32_t base = 0; base < n; base += CP_WALK_BATCH) {
       uint32_t m = min((uint32_t)CP_WALK_BATCH, n - base);
@@ -3021,9 +3025,9 @@ cp_opaque_tile_raster_split(struct cp_opaque_tile_raster_args args,
       __syncthreads();
 
       /* This thread's four pixels, hoisted out of the triangle loop. */
-      uint32_t mypx[4], mypy[4];
+      uint32_t mypx[CP_WALK_PX], mypy[CP_WALK_PX];
       #pragma unroll
-      for (uint32_t j = 0; j < 4; j++) {
+      for (uint32_t j = 0; j < CP_WALK_PX; j++) {
          uint32_t owned = threadIdx.x + j * blockDim.x;
          mypx[j] = x0 + owned % CP_OPAQUE_TILE_SIZE;
          mypy[j] = y0 + owned / CP_OPAQUE_TILE_SIZE;
@@ -3038,7 +3042,7 @@ cp_opaque_tile_raster_split(struct cp_opaque_tile_raster_args args,
          int32_t by0 = bbox[b][2], by1 = bbox[b][3];
          bool any = false;
          #pragma unroll
-         for (uint32_t j = 0; j < 4; j++)
+         for (uint32_t j = 0; j < CP_WALK_PX; j++)
             any |= ((int32_t)mypx[j] >= bx0 && (int32_t)mypx[j] <= bx1 &&
                     (int32_t)mypy[j] >= by0 && (int32_t)mypy[j] <= by1);
          if (!any)
@@ -3046,7 +3050,7 @@ cp_opaque_tile_raster_split(struct cp_opaque_tile_raster_args args,
          const struct cp_tri_setup setup = bset[b];
          struct cp_rasterize_args rast = rasts[bseg[b]];
          const uint32_t global_prim = bprim[b], local_prim = blocal[b];
-         for (uint32_t j = 0; j < 4; j++) {
+         for (uint32_t j = 0; j < CP_WALK_PX; j++) {
             uint32_t px = mypx[j], py = mypy[j];
             if (px >= args.width || py >= args.height ||
                 (int32_t)px < bx0 || (int32_t)px > bx1 ||
@@ -3092,7 +3096,7 @@ cp_opaque_tile_raster_split(struct cp_opaque_tile_raster_args args,
 
    /* Merge: atomicMin, because a split tile has several blocks here. */
    uint64_t *visbuf = (uint64_t *)(uintptr_t)rasts[0].framebuffer;
-   for (uint32_t j = 0; j < 4; j++) {
+   for (uint32_t j = 0; j < CP_WALK_PX; j++) {
       if (winner[j] == VISBUF_EMPTY)
          continue;
       uint32_t owned = threadIdx.x + j * blockDim.x;

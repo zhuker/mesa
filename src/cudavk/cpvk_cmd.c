@@ -2413,8 +2413,27 @@ cpvk_batch_structural(struct cpvk_device *dev, const struct cp_render_scope *sco
    if (!d->num_vb || !d->vb_base[0])
       return false;
 
-   if (!scope->fb.nr_cbufs || !scope->fb.color || !cp->visbuf || !cp->depthbuf)
+   if (!cp->visbuf || !cp->depthbuf)
       return false;
+   /*
+    * A depth-only scope has no colour attachment, and refusing it here is
+    * what makes the shadow scope run one chain and one full visibility clear
+    * per draw -- 18 draws a frame on favorite3, about 0.40 ms of
+    * batch-equivalent cost. The renderer already has a depth-only path
+    * (cp_draw_execute_batch's `depth_only`), so the question this probe asks
+    * is only whether such draws may BATCH.
+    *
+    * Gate: the sentinel comparison. If a depth-only batch renders anything
+    * other than what 18 single draws render, this comes straight back out.
+    */
+   if (!scope->fb.nr_cbufs || !scope->fb.color) {
+      if (cp_debug->no_depth_only_batch)
+         return false;
+      /* Nothing may be blended or side-effecting in a depth-only batch: the
+       * shade chain there exists only to let a fragment discard. */
+      if (!p->fs || p->fs->writes_memory || p->blend.enable)
+         return false;
+   }
 
    uint64_t tris = (uint64_t)cp_triangles_for_draw(d->call.mode,
                                                    d->range.count) *
@@ -2627,6 +2646,8 @@ cpvk_draws_mergeable(const struct cpvk_draw_cmd *a, const struct cpvk_draw_cmd *
 /* State the renderer reads once for a whole pass episode.  Shader,
  * descriptor, vertex-layout, vertex-buffer, push-constant, scissor and draw
  * changes are captured per segment; these are not. */
+static bool cpvk_pipeline_order_free(const struct cpvk_pipeline *p);
+
 static bool
 cpvk_draws_episode_compatible(const struct cp_render_scope *sa,
                               const struct cpvk_draw_cmd *a,
@@ -2637,12 +2658,38 @@ cpvk_draws_episode_compatible(const struct cp_render_scope *sa,
    if (!pa || !pb)
       return false;
 
-   return sa && sb && sa->serial == sb->serial &&
-          !memcmp(&a->viewport, &b->viewport, sizeof(a->viewport)) &&
+   if (sa != sb && !(sa && sb))
+      return false;
+   if (!sa || !sb || sa->serial != sb->serial || pa->samples != pb->samples)
+      return false;
+
+   /*
+    * The wide-episode probe (FOURX_DIAGNOSIS_2026-09-05.md).
+    *
+    * 80% of what ends an opaque episode is one of the four state groups
+    * below changing, which caps episodes at 6.21 segments where the run
+    * census says 74 draws are otherwise compatible. But the tiled opaque
+    * path reads its rasterize arguments PER SEGMENT -- depth scale and
+    * translate, the depth key inversion, the depth buffer, the cull state
+    * all come from rasts[ref.segment] inside cp_opaque_tile_raster_split --
+    * so the walk itself does not need any of this to be episode-wide.
+    *
+    * Two draws that are both order-free (no blend, no discard, depth test
+    * and write on) therefore may differ in viewport, rasterizer and depth
+    * state and still share an episode: each segment carries its own. Blend
+    * is still compared, because an order-free draw has blending off and a
+    * difference there means one of them is not opaque after all.
+    *
+    * Off by default. The gate is the sentinel comparison, not an argument.
+    */
+   if (cp_debug->wide_episode &&
+       cpvk_pipeline_order_free(pa) && cpvk_pipeline_order_free(pb))
+      return !memcmp(&pa->blend, &pb->blend, sizeof(pa->blend));
+
+   return !memcmp(&a->viewport, &b->viewport, sizeof(a->viewport)) &&
           !memcmp(&pa->raster, &pb->raster, sizeof(pa->raster)) &&
           !memcmp(&pa->depth, &pb->depth, sizeof(pa->depth)) &&
-          !memcmp(&pa->blend, &pb->blend, sizeof(pa->blend)) &&
-          pa->samples == pb->samples;
+          !memcmp(&pa->blend, &pb->blend, sizeof(pa->blend));
 }
 
 static bool

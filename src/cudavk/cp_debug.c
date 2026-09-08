@@ -113,6 +113,16 @@ static const struct cp_flag_def flags[] = {
      "trace every draw: geometry, attachments, and why a draw was skipped" },
    { "CUDAVK_DEBUG_TEX", CP_FLAG_BOOL_PRESENCE, F(debug_tex),
      "trace sampler and texture-handle setup" },
+   { "CUDAVK_NO_DEPTH_ONLY_EPISODE", CP_FLAG_BOOL_VALUE, F(no_depth_only_episode),
+     "keep depth-only batches out of opaque episodes, so a shadow scope runs "
+     "one visibility pass per batch instead of one per episode" },
+   { "CUDAVK_NO_DEPTH_ONLY_BATCH", CP_FLAG_BOOL_VALUE, F(no_depth_only_batch),
+     "refuse to batch draws in a scope with no colour attachment again, so a "
+     "shadow scope runs one chain and one visibility clear per draw" },
+   { "CUDAVK_WIDE_EPISODE", CP_FLAG_BOOL_VALUE, F(wide_episode),
+     "let an opaque episode span viewport, rasterizer and depth-state "
+     "changes, since the tiled walk reads those per segment; 80% of episode "
+     "cuts are one of them (FOURX_DIAGNOSIS_2026-09-05)" },
    { "CUDAVK_NO_TILE_SPLIT", CP_FLAG_BOOL_VALUE, F(no_tile_split),
      "walk a tiled-opaque tile with one block per tile again, serially over "
      "its references, instead of splitting long tile lists into chunks of "
