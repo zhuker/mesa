@@ -676,6 +676,54 @@ What remains is per-command recording cost, proportional to the Vulkan calls
 the application makes, spread across dozens of entry points. There is no
 single lever, which is why the 0.56 ms was always a pool rather than a plan.
 
+## CORRECTION: there IS a named lever, and I conflated it with the one I refuted
+
+Every verdict above rests on "no lever is named for the remainder". That is
+wrong, and the error was mine: I treated the bin+walk **tile algorithm** as
+the only way to shrink clip and raster, refuted it by building it, and then
+concluded the pools were irreducible. They are not, and the driver's own
+duration model says so:
+
+| kernel | launches/frame | per-launch fixed-cost share |
+|---|---:|---:|
+| `cp_rasterize_stage3` | 65.38 | **100.0%** |
+| `cp_clip_rast_fused` | 60.39 | **78.7%** |
+| VS | 68.45 | 70.2% |
+| `cp_fs_compact` | 65.38 | 65.4% |
+| `cp_rasterize_stage2` | 65.38 | 57.1% |
+
+A pool that is 100% floor costs what it costs **because it is launched 65
+times**, not because of the work inside it. Running the **same kernels** over
+concatenated geometry -- fewer, wider launches, per-segment arguments indexed
+the way the tiled path already indexes `rasts[ref.segment]` -- collapses that:
+
+| pool | now | merged | saves |
+|---|---:|---:|---:|
+| `clip_all` (97.8 -> 10 launches) | 0.520 | 0.153 | 0.367 |
+| `stage3` (65.4 -> 10) | 0.392 | 0.060 | 0.332 |
+| VS (68.5 -> 13 identities) | 0.434 | 0.187 | 0.247 |
+| `fs_compact` (65.4 -> 10) | 0.368 | 0.164 | 0.204 |
+| `stage2` (65.4 -> 10) | 0.187 | 0.097 | 0.090 |
+| `fs_writeback` (65.4 -> 10) | 0.109 | 0.061 | 0.048 |
+| **total** | | | **1.289** |
+
+**This is not the tile walk.** The walk replaced the rasterisation *algorithm*
+with binning and a per-tile visibility pass, and lost 1.6-2.5 ms to per-block
+overhead. Merging launches keeps every kernel exactly as it is and only feeds
+each one more triangles. `REDESIGN_PLAN` 3.2 and 3.3 propose precisely this,
+and the by-product recorded above -- that per-draw vertex layout is
+unnecessary on these captures -- removes its stated hardest obstacle.
+
+**So the verdict changes.** The core is not irreducible:
+
+    core today                                     2.517 ms
+      - launch merging of clip, raster, VS         -1.036
+      = core with merged launches                   1.481 ms   <  2.088 target
+
+**4x is not proven unreachable. The single largest untried lever is worth
+about 1.3 ms and has never been built.** What has been built and refuted is a
+different mechanism that happens to target the same pools.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
