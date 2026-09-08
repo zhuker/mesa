@@ -83,10 +83,28 @@ That removes the largest risk in the design and the only one that would have
 cost bandwidth on the hottest array in the frame.
 
 ## What else to measure before building
-1. **One episode-wide queue's capacity**: today's sets are sized per segment;
-   an episode of 12.84 segments needs the sum, and `CP_MAX_OPAQUE_TILE_REFS`
-   already bounds a comparable array.
-2. **The join cost**: merging requires all segments' vertex and clip work
+## Probe 2, answered: capacity is not a blocker either
+
+Today each queue set is sized to a **worst case**, not to observed use:
+
+    nontrivial  CP_MAX_NONTRIVIAL 1,000,000 x 4 B  =  4.0 MB
+    huge_tiles  CP_MAX_HUGE_TILES 2,000,000 x 8 B  = 16.0 MB
+    per set                                          20.0 MB
+    x CP_PASS_STREAMS (8)                           160.0 MB
+
+Observed use is far smaller: the M0 census measures **~412,000 tile references
+per frame**, across every episode and segment. An episode-wide queue sized
+from that is **3.3 MB -- 49x smaller than the eight worst-case sets it
+replaces**.
+
+And the shape is not novel: `CP_MAX_OPAQUE_TILE_REFS` (2,000,000) is already
+an episode-wide reference bound of exactly this kind, used by the tiled path.
+So the merged design **reduces** queue memory rather than adding to it, which
+is the opposite of the +307 MB that `DEAD_ENDS` 45 priced for the per-segment
+alternative.
+
+## What else to measure before building
+1. **The join cost**: merging requires all segments' vertex and clip work
    complete before stage 2. The episode joins already, but earlier in the
    pipeline than today.
 
