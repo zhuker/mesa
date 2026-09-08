@@ -301,6 +301,26 @@ if dep_vulkan_loader.found()
     endif
   endforeach
 
+  # Standalone device equivalence gate for the next default-off M2 slice. It
+  # compares the run kernel with the existing per-segment clip path and shared
+  # setup math; the renderer does not launch the new kernel yet.
+  cpvk_nvcc = find_program('nvcc', required : false)
+  if cpvk_nvcc.found()
+    cp_run_clip_bin_gate = custom_target(
+      'cp_run_clip_bin_gate',
+      input : files('tests/cp_run_clip_bin_gate.cu'),
+      output : 'cp_run_clip_bin_gate',
+      command : [cpvk_nvcc, '-arch=sm_75', '-std=c++17', '-O2',
+                 '-I' + meson.current_source_dir() + '/kernels',
+                 '@INPUT@', '-o', '@OUTPUT@'],
+      depend_files : files('kernels/cp_rasterize.cu',
+                           'kernels/cp_rast_types.h'),
+      build_by_default : false,
+    )
+    test('cp_run_clip_bin_gate', cp_run_clip_bin_gate,
+         suite : 'cudavk', timeout : 120, is_parallel : false)
+  endif
+
   # The vertex fetch, in the shapes neither replay capture contains: every
   # conversion class, a sparse set of attribute locations, a per-instance
   # attribute with a non-zero firstInstance, and one shader on the classic
