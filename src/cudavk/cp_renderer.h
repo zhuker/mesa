@@ -252,14 +252,28 @@ struct cp_run_geometry_span {
    /* Owned grow-only storage for exact per-batch preparation. */
    CUdeviceptr prepared_output;
    size_t prepared_capacity;
+   CUdeviceptr prepared_descriptors;
+   size_t prepared_descriptors_capacity;
    uint32_t out_stride;
+
+   /* Exact ordinary-path descriptors retained for the run continuation. */
+   CUdeviceptr draw_slices;
+   uint32_t num_draw_slices;
+   uint32_t prim_shift;
+   CUdeviceptr clip_rects;
+   struct cp_rasterize_args pre_clip_rast;
 };
 
-/* Exact output of one collected batch's ordinary fused VS preparation. */
+/* Exact output and continuation metadata of one ordinary fused VS prepare. */
 struct cp_prepared_geometry {
    CUdeviceptr output;
    uint32_t num_verts;
    uint32_t out_stride;
+   CUdeviceptr draw_slices;
+   uint32_t num_draw_slices;
+   uint32_t prim_shift;
+   CUdeviceptr clip_rects;
+   struct cp_rasterize_args pre_clip_rast;
 };
 
 struct cp_run_geometry_group {

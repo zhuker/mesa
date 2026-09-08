@@ -8,10 +8,17 @@ batches: their slice rows, index bases, vertex-buffer rows, UBO rows, draw
 parameters, instance counts, and output layout come from the same code as the
 legacy draw.
 
-The returned tuple is `{output, num_verts, out_stride}`. `output` is one
-collected batch's complete vertex stream, including all merged draws and
-instances in their legacy order. The helper only admits the existing
+The returned record carries `{output, num_verts, out_stride}` plus the exact
+device `draw_slices` pointer/count, pre-clip primitive shift, optional
+`clip_rects`, and the complete pre-clip `cp_rasterize_args` template. `output`
+is one collected batch's complete vertex stream, including all merged draws
+and instances in their legacy order. The helper only admits the existing
 side-effect-free fused-fetch lane. It does not broaden admission.
+
+Slice and rectangle bytes are built by the same helper used by ordinary
+execution. Prepare-only mode does not infer them again from the snapshot. The
+raster template is copied at the ordinary pre-clip boundary, after VS positions
+and varying count are known and before clipping can replace its geometry.
 
 ## Why this is a mode, not a second launcher
 
@@ -27,8 +34,9 @@ otherwise the mode must be replaced by an extracted VS helper.
 
 ## Ownership and ordering
 
-- Each collected batch slot owns a grow-only CUDA allocation. It survives all
-  clip, bin, raster, and shade consumers of the run. It is reused only after
+- Each collected batch slot owns grow-only CUDA allocations for VS output and
+  its slice/rectangle descriptor block. Both survive all clip, bin, raster,
+  and shade consumers of the run. They are reused only after
   the renderer's hard drain boundary has submitted those consumers. Context
   cleanup frees it. Growth can synchronize through `cuMemFree`; steady-state
   reuse does not allocate or free.
@@ -36,19 +44,20 @@ otherwise the mode must be replaced by an extracted VS helper.
   the main renderer stream may reuse them because launch order makes each VS
   consume its inputs before the next launch overwrites them.
 - Collection-time push uploads remain protected by `batch_uploads_live` while
-  `run_geometry.draining` is true. New slice and argument blocks use the normal
-  upload ring. `cp_upload_end()` closes them before `cp_launch()` flushes the
-  ordered copy and launch.
+  `run_geometry.draining` is true. New argument blocks use the normal upload
+  ring. Prepare-only slice/rectangle bytes are staged through that ring and
+  copied into span-owned device storage before the VS launch, so a later ring
+  wrap cannot invalidate the returned device pointers.
 - Prepare-only mode never takes the VS side stream. A run-wide continuation
   receives outputs produced in main-stream batch order.
 
 ## Work deliberately omitted
 
-Prepare-only mode does not clear the visibility or depth buffers. It does not
-upload per-draw raster rectangles, mutate fragment batch tables, allocate clip
-or shade scratch, or launch clip, raster, interpolation, fragment, or
-writeback work. The existing one-draw grouped launcher remains separate and
-may still share a launch under its current narrow launch key. The rejected
+Prepare-only mode does not clear the visibility or depth buffers. It uploads
+an optional per-draw raster rectangle only as retained descriptor data. It does
+not mutate fragment batch tables, allocate clip or shade scratch, or launch
+clip, raster, interpolation, fragment, or writeback work. The existing one-draw
+grouped launcher remains separate and may still share a launch under its current narrow launch key. The rejected
 broad `active_output` replay is unchanged and is not extended to multi-draw
 batches.
 

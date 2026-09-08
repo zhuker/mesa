@@ -1191,6 +1191,8 @@ cp_context_cleanup(struct cp_context *cp)
    for (unsigned i = 0; i < cp->run_geometry.span_capacity; i++) {
       if (cp->run_geometry.spans[i].prepared_output)
          cuMemFree(cp->run_geometry.spans[i].prepared_output);
+      if (cp->run_geometry.spans[i].prepared_descriptors)
+         cuMemFree(cp->run_geometry.spans[i].prepared_descriptors);
    }
    free(cp->run_geometry.spans);
 }
@@ -5652,9 +5654,16 @@ cp_vslane_join(struct cp_context *cp)
 struct cp_vs_prepare {
    CUdeviceptr *storage;
    size_t *storage_capacity;
+   CUdeviceptr *descriptor_storage;
+   size_t *descriptor_capacity;
    CUdeviceptr output;
    uint32_t num_verts;
    uint32_t out_stride;
+   CUdeviceptr draw_slices;
+   uint32_t num_draw_slices;
+   uint32_t prim_shift;
+   CUdeviceptr clip_rects;
+   struct cp_rasterize_args pre_clip_rast;
    bool ready;
 };
 
@@ -5663,6 +5672,131 @@ static bool cp_run_geometry_device_reserve(CUdeviceptr *ptr,
 static void cp_draw_execute_batch_inner(struct cp_context *cp,
                                         const struct cp_draw_batch *batch,
                                         struct cp_vs_prepare *prepare);
+
+/* The device descriptors shared by vertex fetch, raster clipping and fragment
+ * row lookup.  This is the one construction site for both ordinary execution
+ * and prepare-only handoff; the latter must retain what the former actually
+ * built rather than infer it again from the collected batch. */
+struct cp_draw_descriptors {
+   CUdeviceptr slices;
+   uint32_t num_slices;
+   CUdeviceptr clip_rects;
+   uint32_t prim_shift;
+};
+
+static bool
+cp_draw_descriptors_build(struct cp_context *cp,
+                          unsigned batch_draws,
+                          const struct cp_draw_call *info,
+                          const struct cp_draw_range *draws,
+                          bool indexed, const uint64_t *ib_ptrs,
+                          const uint32_t *instance_counts,
+                          unsigned instance_count, bool per_draw_rects,
+                          int clip_x0, int clip_y0, int clip_x1, int clip_y1,
+                          const struct cp_rect *scissors,
+                          struct cp_rasterize_args *rast_args,
+                          struct cp_vs_prepare *prepare,
+                          struct cp_draw_descriptors *desc)
+{
+   *desc = (struct cp_draw_descriptors) { 0 };
+   if (batch_draws <= 1)
+      return true;
+
+   struct cp_draw_slice slices[CP_MAX_BATCH_DRAWS];
+   uint32_t vbegin = 0;
+   for (unsigned d = 0; d < batch_draws; d++) {
+      unsigned inst = instance_counts
+         ? MAX2(instance_counts[d], 1u) : instance_count;
+      unsigned dverts = cp_triangles_for_draw(info->mode, draws[d].count) * 3;
+      slices[d].vert_begin = vbegin;
+      slices[d].index_bytes =
+         indexed ? (uint32_t)draws[d].start * info->index_size : 0;
+      slices[d].first_vertex =
+         indexed ? (uint32_t)draws[d].index_bias : draws[d].start;
+      /* This draw's own index buffer, when it is not the batch's.  The fold
+       * of draws[0].start into vf_args.index_buffer does not happen on the
+       * slice path, so the base goes in whole. */
+      uint64_t slice_ib = 0;
+      if (indexed && ib_ptrs && ib_ptrs[d] &&
+          ib_ptrs[d] != (uint64_t)(uintptr_t)info->index_ptr)
+         slice_ib = ib_ptrs[d];
+      slices[d].ib_base_lo = (uint32_t)slice_ib;
+      slices[d].ib_base_hi = (uint32_t)(slice_ib >> 32);
+      /* Zero for a plain draw, so the fetch skips the division; the span
+       * covers every instance either way. */
+      slices[d].verts_per_instance = inst > 1 ? dverts : 0;
+      vbegin += dverts * inst;
+   }
+   size_t slices_bytes = (size_t)batch_draws * sizeof(slices[0]);
+   size_t rects_off = ALIGN_POT(slices_bytes, 16);
+   size_t descriptor_bytes = rects_off +
+      (per_draw_rects ? (size_t)batch_draws * sizeof(int32_t[4]) : 0);
+   if (prepare) {
+      if (!prepare->descriptor_storage || !prepare->descriptor_capacity ||
+          !cp_run_geometry_device_reserve(prepare->descriptor_storage,
+                                          prepare->descriptor_capacity,
+                                          descriptor_bytes))
+         return false;
+      desc->slices = *prepare->descriptor_storage;
+   } else {
+      desc->slices = cp_upload(cp, slices, slices_bytes);
+      if (!desc->slices)
+         return false;
+   }
+   desc->num_slices = batch_draws;
+
+   if (cp_debug->debug_rows)
+      fprintf(stderr, "slices: n=%u set=%d verts=[%u %u %u]\n",
+              batch_draws, desc->slices ? 1 : 0, slices[0].vert_begin,
+              batch_draws > 1 ? slices[1].vert_begin : 0,
+              batch_draws > 2 ? slices[2].vert_begin : 0);
+
+   /* Each rectangle is the batch-wide framebuffer/viewport rectangle
+    * intersected with the draw's recorded scissor. */
+   int32_t rects[CP_MAX_BATCH_DRAWS][4];
+   if (per_draw_rects) {
+      for (unsigned d = 0; d < batch_draws; d++) {
+         rects[d][0] = MAX2(clip_x0, (int)scissors[d].minx);
+         rects[d][1] = MAX2(clip_y0, (int)scissors[d].miny);
+         rects[d][2] = MIN2(clip_x1, (int)scissors[d].maxx - 1);
+         rects[d][3] = MIN2(clip_y1, (int)scissors[d].maxy - 1);
+      }
+   }
+   if (prepare) {
+      void *host = NULL;
+      CUdeviceptr temporary = cp_upload_begin(cp, descriptor_bytes, &host);
+      if (!temporary)
+         return false;
+      memcpy(host, slices, slices_bytes);
+      if (rects_off > slices_bytes)
+         memset((char *)host + slices_bytes, 0, rects_off - slices_bytes);
+      if (per_draw_rects)
+         memcpy((char *)host + rects_off, rects,
+                (size_t)batch_draws * sizeof(rects[0]));
+      if (cp_upload_end(cp, temporary, host, descriptor_bytes) != CUDA_SUCCESS ||
+          cp_upload_flush(cp) != CUDA_SUCCESS ||
+          cuMemcpyDtoDAsync(*prepare->descriptor_storage, temporary,
+                            descriptor_bytes, cp->stream) != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return false;
+      }
+      if (per_draw_rects)
+         desc->clip_rects = desc->slices + rects_off;
+   } else if (per_draw_rects) {
+      desc->clip_rects = cp_upload(cp, rects,
+         (size_t)batch_draws * sizeof(rects[0]));
+      if (!desc->clip_rects)
+         return false;
+   }
+   if (per_draw_rects) {
+      rast_args->rect_draw_slices = desc->slices;
+      rast_args->clip_rects = desc->clip_rects;
+      rast_args->num_rect_slices = batch_draws;
+      rast_args->rect_prim_shift = 0;   /* CP_CLIP_PRIM_SHIFT after stable clip */
+   }
+   desc->prim_shift = rast_args->rect_prim_shift;
+   return true;
+}
 
 /*
  * The batch, with the vertex lane armed around it.
@@ -5701,11 +5835,18 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
                             struct cp_vs_prepare *prepare)
 {
    const bool prepare_only = prepare != NULL;
-   if (prepare)
+   if (prepare) {
+      CUdeviceptr *storage = prepare->storage;
+      size_t *storage_capacity = prepare->storage_capacity;
+      CUdeviceptr *descriptor_storage = prepare->descriptor_storage;
+      size_t *descriptor_capacity = prepare->descriptor_capacity;
       *prepare = (struct cp_vs_prepare) {
-         .storage = prepare->storage,
-         .storage_capacity = prepare->storage_capacity,
+         .storage = storage,
+         .storage_capacity = storage_capacity,
+         .descriptor_storage = descriptor_storage,
+         .descriptor_capacity = descriptor_capacity,
       };
+   }
    if (!prepare_only)
       cp->plan.flushes++;
    /* Where the main stream stood when this batch began; see the vertex lane
@@ -6420,39 +6561,25 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * value it has always had, which is what makes CUDAVK_BATCH_MAX=1
           * bit-identical rather than merely close.
           */
-         CUdeviceptr slices_dev = 0;
+         struct cp_draw_descriptors descriptors;
+         if (!cp_draw_descriptors_build(cp, batch_draws, info, draws, indexed,
+                                        ib_ptrs, instance_counts,
+                                        instance_count, per_draw_rects,
+                                        clip_x0, clip_y0, clip_x1, clip_y1,
+                                        scissors, &rast_args, prepare,
+                                        &descriptors)) {
+            FREE(refs);
+            return;
+         }
+         CUdeviceptr slices_dev = descriptors.slices;
+         if (cp_debug->debug_episode && cp->run_geometry.draining)
+            fprintf(stderr, "run-geometry-metadata: draws=%u slices=%u "
+                    "count=%u prim-shift=%u clip-rects=%u prepare=%u\n",
+                    batch_draws, descriptors.slices != 0,
+                    descriptors.num_slices, descriptors.prim_shift,
+                    descriptors.clip_rects != 0, prepare_only);
          CUdeviceptr batch_rows = 0;
          if (batch_draws > 1) {
-            struct cp_draw_slice slices[CP_MAX_BATCH_DRAWS];
-            uint32_t vbegin = 0;
-            for (unsigned d = 0; d < batch_draws; d++) {
-               unsigned inst = instance_counts
-                  ? MAX2(instance_counts[d], 1u) : instance_count;
-               unsigned dverts =
-                  cp_triangles_for_draw(info->mode, draws[d].count) * 3;
-               slices[d].vert_begin = vbegin;
-               slices[d].index_bytes =
-                  indexed ? (uint32_t)draws[d].start * info->index_size : 0;
-               slices[d].first_vertex =
-                  indexed ? (uint32_t)draws[d].index_bias : draws[d].start;
-               /* This draw's own index buffer, when it is not the batch's.
-                * The fold of draws[0].start into vf_args.index_buffer does
-                * not happen on the slice path, so the base goes in whole. */
-               uint64_t slice_ib = 0;
-               if (indexed && ib_ptrs && ib_ptrs[d] &&
-                   ib_ptrs[d] != (uint64_t)(uintptr_t)info->index_ptr)
-                  slice_ib = ib_ptrs[d];
-               slices[d].ib_base_lo = (uint32_t)slice_ib;
-               slices[d].ib_base_hi = (uint32_t)(slice_ib >> 32);
-               /* Zero for a plain draw, so the fetch skips the division; the
-                * span covers every instance either way. */
-               slices[d].verts_per_instance = inst > 1 ? dverts : 0;
-               vbegin += dverts * inst;
-            }
-            slices_dev = cp_upload(cp, slices,
-                                   (size_t)batch_draws * sizeof(slices[0]));
-            if (!slices_dev) { FREE(refs); return; }
-
             /* One row per assembled vertex, for the shader to pick its
              * uniform bindings and its draw parameters with. Only a shader
              * that reads either has any use for it — and a fused shader has
@@ -6468,36 +6595,6 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
              * rather than from the vertex; see cp_fs_interp_args. */
             if (!prepare_only && fs_ubo_table)
                cp->fs_batch.slices = slices_dev;
-
-            if (cp_debug->debug_rows)
-               fprintf(stderr, "slices: n=%u set=%d verts=[%u %u %u]\n",
-                       batch_draws, slices_dev ? 1 : 0, slices[0].vert_begin,
-                       batch_draws > 1 ? slices[1].vert_begin : 0,
-                       batch_draws > 2 ? slices[2].vert_begin : 0);
-
-            /*
-             * The per-draw clip rectangles, when the batch's draws may
-             * disagree on the scissor: each is the batch-wide rectangle —
-             * which then carries no scissor at all — intersected with that
-             * draw's recorded one. The rasterizer resolves a primitive to
-             * its rectangle through the slice table above.
-             */
-            if (!prepare_only && per_draw_rects) {
-               int32_t rects[CP_MAX_BATCH_DRAWS][4];
-               for (unsigned d = 0; d < batch_draws; d++) {
-                  rects[d][0] = MAX2(clip_x0, (int)scissors[d].minx);
-                  rects[d][1] = MAX2(clip_y0, (int)scissors[d].miny);
-                  rects[d][2] = MIN2(clip_x1, (int)scissors[d].maxx - 1);
-                  rects[d][3] = MIN2(clip_y1, (int)scissors[d].maxy - 1);
-               }
-               CUdeviceptr rects_dev = cp_upload(cp, rects,
-                  (size_t)batch_draws * sizeof(rects[0]));
-               if (!rects_dev) { FREE(refs); return; }
-               rast_args.rect_draw_slices = slices_dev;
-               rast_args.clip_rects = rects_dev;
-               rast_args.num_rect_slices = batch_draws;
-               rast_args.rect_prim_shift = 0;   /* 2 once stable clip runs */
-            }
          }
 
          /* The batch's per-draw vertex-buffer bases. Uploaded for a batch of
@@ -7027,9 +7124,18 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
 
          if (prepare_only) {
             if (vs_err == CUDA_SUCCESS) {
+               /* This is the exact ordinary template immediately before the
+                * clip block mutates positions/counts and the primitive shift. */
+               rast_args.positions = vs_output_buf;
+               rast_args.num_varyings = num_vs_outputs - 1;
                prepare->output = vs_output_buf;
                prepare->num_verts = total_verts;
                prepare->out_stride = out_stride;
+               prepare->draw_slices = descriptors.slices;
+               prepare->num_draw_slices = descriptors.num_slices;
+               prepare->prim_shift = descriptors.prim_shift;
+               prepare->clip_rects = descriptors.clip_rects;
+               prepare->pre_clip_rast = rast_args;
                prepare->ready = true;
             }
             FREE(refs);
@@ -11033,9 +11139,15 @@ cp_run_geometry_plan(struct cp_context *cp)
     * freeing or forgetting the pointer here would either synchronize every
     * run or leak it. */
    for (unsigned i = 0; i < n; i++) {
-      cp->run_geometry.spans[i].output = 0;
-      cp->run_geometry.spans[i].num_verts = 0;
-      cp->run_geometry.spans[i].out_stride = 0;
+      struct cp_run_geometry_span *span = &cp->run_geometry.spans[i];
+      span->output = 0;
+      span->num_verts = 0;
+      span->out_stride = 0;
+      span->draw_slices = 0;
+      span->num_draw_slices = 0;
+      span->prim_shift = 0;
+      span->clip_rects = 0;
+      span->pre_clip_rast = (struct cp_rasterize_args) { 0 };
    }
 
    unsigned *which = malloc((size_t)n * sizeof(*which));
@@ -11236,6 +11348,8 @@ cp_run_geometry_prepare_batch(struct cp_context *cp, unsigned batch,
    struct cp_vs_prepare prepare = {
       .storage = &span->prepared_output,
       .storage_capacity = &span->prepared_capacity,
+      .descriptor_storage = &span->prepared_descriptors,
+      .descriptor_capacity = &span->prepared_descriptors_capacity,
    };
 
    /* Collection-time push rows stay live through the drain. New VS argument
@@ -11246,12 +11360,23 @@ cp_run_geometry_prepare_batch(struct cp_context *cp, unsigned batch,
    if (!prepare.ready)
       return false;
 
+   span->output = prepare.output;
    span->num_verts = prepare.num_verts;
    span->out_stride = prepare.out_stride;
+   span->draw_slices = prepare.draw_slices;
+   span->num_draw_slices = prepare.num_draw_slices;
+   span->prim_shift = prepare.prim_shift;
+   span->clip_rects = prepare.clip_rects;
+   span->pre_clip_rast = prepare.pre_clip_rast;
    *result = (struct cp_prepared_geometry) {
       .output = prepare.output,
       .num_verts = prepare.num_verts,
       .out_stride = prepare.out_stride,
+      .draw_slices = prepare.draw_slices,
+      .num_draw_slices = prepare.num_draw_slices,
+      .prim_shift = prepare.prim_shift,
+      .clip_rects = prepare.clip_rects,
+      .pre_clip_rast = prepare.pre_clip_rast,
    };
    for (unsigned i = 0; i < cp->run_geometry.nclip_segments; i++) {
       if (cp->run_geometry.clip_segments[i].batch == batch) {
@@ -11379,10 +11504,10 @@ cp_run_geometry_launch_group(struct cp_context *cp,
          dp[(size_t)row * CP_ARG_DRAW_PARAM_STRIDE + 3] =
             b->info.index_size ? (uint32_t)b->draws[d].index_bias : 0;
       }
-      cp->run_geometry.spans[bi] = (struct cp_run_geometry_span) {
-         .output = output + (size_t)batch_begin * out_stride,
-         .num_verts = vbegin - batch_begin,
-      };
+      struct cp_run_geometry_span *span = &cp->run_geometry.spans[bi];
+      span->output = output + (size_t)batch_begin * out_stride;
+      span->num_verts = vbegin - batch_begin;
+      span->out_stride = out_stride;
    }
    assert(row == ndraws && vbegin == total_verts);
 
@@ -11448,9 +11573,13 @@ cp_run_geometry_launch_group(struct cp_context *cp,
       MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
       0, cp->stream, params, NULL);
    if (err != CUDA_SUCCESS) {
-      for (unsigned m = 0; m < group->num_members; m++)
-         cp->run_geometry.spans[members[m].batch] =
-            (struct cp_run_geometry_span) { 0 };
+      for (unsigned m = 0; m < group->num_members; m++) {
+         struct cp_run_geometry_span *span =
+            &cp->run_geometry.spans[members[m].batch];
+         span->output = 0;
+         span->num_verts = 0;
+         span->out_stride = 0;
+      }
       return false;
    }
    if (state->vs->vs_census) {
