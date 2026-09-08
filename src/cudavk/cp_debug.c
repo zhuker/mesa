@@ -113,6 +113,11 @@ static const struct cp_flag_def flags[] = {
      "trace every draw: geometry, attachments, and why a draw was skipped" },
    { "CUDAVK_DEBUG_TEX", CP_FLAG_BOOL_PRESENCE, F(debug_tex),
      "trace sampler and texture-handle setup" },
+   { "CUDAVK_NO_WIDE_EPISODE", CP_FLAG_BOOL_VALUE, F(no_wide_episode),
+     "compare viewport, rasterizer and depth state before letting two "
+     "order-free draws share an opaque episode again; every consumer of "
+     "those reads them per segment, and comparing them episode-wide held "
+     "episodes to 6.21 segments instead of 12.84" },
    { "CUDAVK_RUN_CENSUS", CP_FLAG_BOOL_VALUE, F(run_census),
      "count the runs the run-level redesign would render as one unit -- "
      "maximal sequences of consecutive same-class draws in one scope -- and "

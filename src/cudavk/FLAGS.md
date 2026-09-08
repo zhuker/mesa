@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-137 switches.
+138 switches.
 
 ## Tracing
 
@@ -24,6 +24,7 @@ deliberately: someone's script sets one of these to 0 today.
 |---|---|---|---|---|
 | `CUDAVK_DEBUG_DRAW` | bool (presence) | `off` | — | trace every draw: geometry, attachments, and why a draw was skipped |
 | `CUDAVK_DEBUG_TEX` | bool (presence) | `off` | — | trace sampler and texture-handle setup |
+| `CUDAVK_NO_WIDE_EPISODE` | bool (value) | `off` | — | compare viewport, rasterizer and depth state before letting two order-free draws share an opaque episode again; every consumer of those reads them per segment, and comparing them episode-wide held episodes to 6.21 segments instead of 12.84 |
 | `CUDAVK_RUN_CENSUS` | bool (value) | `off` | — | count the runs the run-level redesign would render as one unit -- maximal sequences of consecutive same-class draws in one scope -- and report at teardown what share of the frame's triangles they hold. Watches only; changes no rendering decision (REDESIGN_PLAN_2026-09-05) |
 | `CUDAVK_PLAN_STATS` | bool (value) | `off` | — | report at teardown what deciding one draw at a time costs: batch keys built, pairwise merge tests, flushes, pass episodes closed and every reactive reallocation, with per-scope averages |
 | `CUDAVK_SPEC_STATS` | bool (value) | `off` | — | report at teardown how many fragment launches used a sampler-specialised kernel, and which shaders sample textures the specialiser could not match; a silent drop to zero is a performance regression with no error |
