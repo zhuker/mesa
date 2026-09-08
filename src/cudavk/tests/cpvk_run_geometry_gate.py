@@ -108,6 +108,21 @@ if not cm or int(cm.group(1)) < 2 or int(cm.group(2)) == 0:
     raise SystemExit("whole-run clip+bin transaction was not reached\n" + clip_log)
 if "run-clip-bin-commit:" not in clip_log:
     raise SystemExit("run clip+bin did not report a committed continuation\n" + clip_log)
+pm = re.search(r"run-clip-bin-prepare: batches=(\d+) streams=(\d+) join=(\d+)",
+               clip_log)
+if not pm or int(pm.group(1)) != int(cm.group(1)) or int(pm.group(2)) < 2 or \
+        int(pm.group(3)) != 1:
+    raise SystemExit("exact VS preparation did not fan out and join once\n" + clip_log)
+
+# The revert keeps the same exact per-batch output and descriptors, but places
+# every prepare launch back on main.
+serial_hash, serial_log = arm(
+    True, clip_bin=True,
+    extra={"CPVK_TEST_DEPTH_LEQUAL": "1", "CUDAVK_NO_RUN_PREP_STREAMS": "1"})
+if serial_hash != clip_base or \
+        "run-clip-bin-prepare: batches=%s streams=1 join=0" % cm.group(1) not in serial_log:
+    raise SystemExit("serial prepare revert changed pixels or did not engage\n" +
+                     serial_log)
 
 # A tiny dense-list capacity makes the uint64 count check set the shared
 # predicate. The classic visibility arm must consume the same clipped geometry

@@ -122,3 +122,14 @@ count so holes are safe for the predicated classic arm.
 5. Gate with the full suite and native-driver image oracle before measurement.
    DEAD_ENDS 45 requires checking union-exclusive device time and the loss of
    stream fan-out; launch count alone is not a performance result.
+
+## Exact prepare fan-out
+
+The transaction now reserves every per-batch VS output and retained slice/scissor
+descriptor before its first geometry launch. It then gates the existing eight pass
+streams behind the main-stream upload tail, launches the ordinary prepare-only
+fused VS for each batch round-robin, and joins all used streams once before the
+run-wide count. Each batch keeps its own output. This does not restore the broad
+grouped multi-draw prototype. `CUDAVK_NO_RUN_PREP_STREAMS=1` is the exact serial
+revert. The schedule has no host wait or readback; launch/copy/event errors latch
+device loss, while an allocation OOM before launch remains an exact replay refusal.
