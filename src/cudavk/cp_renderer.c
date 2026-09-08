@@ -11764,12 +11764,16 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    }                                                                    \
 } while (0)
    unsigned nsegs = cp->run_geometry.nclip_segments;
+   bool direct = cp_debug->run_clip_direct;
    if (!nsegs || nsegs > CP_RUN_CLIP_BIN_MAX_SEGS ||
-       !screen->kernels.run_clip_setup_tile_count ||
-       !screen->kernels.run_clip_bin_check_counts ||
-       !screen->kernels.run_clip_bin_fill ||
-       !screen->kernels.run_clip_bin_validate_cursors ||
-       !screen->kernels.opaque_tile_raster)
+       !(direct ? screen->kernels.run_clip_setup_direct :
+                    screen->kernels.run_clip_setup_tile_count) ||
+       (direct && (!screen->kernels.run_clip_direct_raster ||
+                   !screen->kernels.run_clip_direct_raster_large)) ||
+       (!direct && !screen->kernels.run_clip_bin_check_counts) ||
+       (!direct && !screen->kernels.run_clip_bin_fill) ||
+       (!direct && !screen->kernels.run_clip_bin_validate_cursors) ||
+       (!direct && !screen->kernels.opaque_tile_raster))
       return false;
 
    const struct cp_fb_desc *fb = &cp->run_geometry.batches[0].scope.fb;
@@ -11783,9 +11787,9 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    uint32_t ref_capacity = cp_debug->run_clip_bin_capacity
       ? MIN2(cp_debug->run_clip_bin_capacity, CP_MAX_OPAQUE_TILE_REFS)
       : CP_MAX_OPAQUE_TILE_REFS;
-   if (!ref_capacity)
+   if (!direct && !ref_capacity)
       return false;
-   if (!cp_abuf_fuse_scan_ready(screen) || cp_debug->abuf_fuse_check)
+   if (!direct && (!cp_abuf_fuse_scan_ready(screen) || cp_debug->abuf_fuse_check))
       return false;
    unsigned scan_ept, scan_grid;
    cp_abuf_scan_tiling(ntiles, &scan_ept, &scan_grid);
@@ -11796,7 +11800,9 @@ cp_run_clip_bin_execute(struct cp_context *cp)
 #define RUN_ALLOC(name, bytes, align) \
    size_t name##_off = (off = cp_run_clip_bin_align(off, (align))); \
    off += (bytes)
-   RUN_ALLOC(live, (size_t)cp->run_geometry.clip_prim_slots * sizeof(struct cp_run_clip_bin_live), 16);
+   RUN_ALLOC(live, (size_t)cp->run_geometry.clip_prim_slots *
+                    (direct ? sizeof(struct cp_run_clip_direct_live) :
+                              sizeof(struct cp_run_clip_bin_live)), 16);
    RUN_ALLOC(primrefs, (size_t)cp->run_geometry.clip_prim_slots * sizeof(uint64_t), 16);
    size_t clipped_offs[CP_RUN_CLIP_BIN_MAX_SEGS];
    for (unsigned s = 0; s < nsegs; s++) {
@@ -11954,7 +11960,7 @@ cp_run_clip_bin_execute(struct cp_context *cp)
       cp_clear_depthbuf(cp, 1.0f);
    if (cp->device_fatal)
       return false;
-   if (err == CUDA_SUCCESS)
+   if (err == CUDA_SUCCESS && !direct)
       err = cuMemsetD32Async(counts, 0, ntiles, cp->stream);
    if (err == CUDA_SUCCESS)
       err = cuMemsetD32Async(live_count, 0, 4, cp->stream);
@@ -11971,11 +11977,13 @@ cp_run_clip_bin_execute(struct cp_context *cp)
       .tiles_x = tiles_x, .tiles_y = tiles_y,
    };
    void *count_params[] = { &count_args };
-   RUN_CLIP_LAUNCH(screen->kernels.run_clip_setup_tile_count,
+   RUN_CLIP_LAUNCH(direct ? screen->kernels.run_clip_setup_direct :
+                            screen->kernels.run_clip_setup_tile_count,
              MIN2(DIV_ROUND_UP(max_triangles, 64), 1024u), nsegs, 1,
              64, 1, 1, 0, cp->stream, count_params, NULL);
 
-   struct cp_run_clip_bin_check_counts_args check = {
+   if (!direct) {
+      struct cp_run_clip_bin_check_counts_args check = {
       .tile_counts = counts, .total_refs = total_refs, .errors = errors,
       .num_tiles = ntiles, .capacity = ref_capacity,
    };
@@ -12024,6 +12032,19 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    void *tile_params[] = { &tile };
    RUN_CLIP_LAUNCH(screen->kernels.opaque_tile_raster, ntiles, 1, 1,
              256, 1, 1, 0, cp->stream, tile_params, NULL);
+   } else {
+      struct cp_run_clip_direct_raster_args direct_args = {
+         .segments = segments_dev, .live = live, .live_count = live_count,
+         .errors = errors, .num_segments = nsegs,
+         .total_slots = cp->run_geometry.clip_prim_slots,
+         .live_capacity = cp->run_geometry.clip_prim_slots,
+      };
+      void *direct_params[] = { &direct_args };
+      RUN_CLIP_LAUNCH(screen->kernels.run_clip_direct_raster, 512, 1, 1,
+                      256, 1, 1, 0, cp->stream, direct_params, NULL);
+      RUN_CLIP_LAUNCH(screen->kernels.run_clip_direct_raster_large, 512, 1, 1,
+                      256, 1, 1, 0, cp->stream, direct_params, NULL);
+   }
 
    /* Inverse arm.  It consumes the already clipped stable buffers. */
    for (unsigned s = 0; s < nsegs; s++) {
@@ -12055,8 +12076,9 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    cp->pass.h = h;
    cp->run_geometry.clip_commits++;
    if (cp_debug->debug_episode)
-      fprintf(stderr, "run-clip-bin-commit: segments=%u prim-slots=%u\n",
-              nsegs, cp->run_geometry.clip_prim_slots);
+      fprintf(stderr, "run-clip-%s-commit: segments=%u prim-slots=%u\n",
+              direct ? "direct" : "bin", nsegs,
+              cp->run_geometry.clip_prim_slots);
    cp_opaque_finish_common(cp, true);
 #undef RUN_CLIP_LAUNCH
    return true;
@@ -12075,7 +12097,8 @@ cp_run_geometry_drain(struct cp_context *cp)
       cp->run_geometry.nmembers = cp->run_geometry.ngroups = 0;
    }
 
-   bool clip_bin_requested = cp_debug->run_clip_bin && cp_debug->run_geometry;
+   bool clip_bin_requested = (cp_debug->run_clip_bin || cp_debug->run_clip_direct) &&
+                              cp_debug->run_geometry;
    bool clip_bin_admitted = clip_bin_requested && cp_run_clip_bin_preflight(cp);
    bool clip_bin_committed = false;
    if (clip_bin_admitted)

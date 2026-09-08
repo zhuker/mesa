@@ -1395,6 +1395,25 @@ struct cp_run_clip_bin_live {
    uint32_t segment;
 };
 
+/* Compact setup consumed by the direct run raster.  Keeping the completed
+ * setup removes the bin path's second setup_triangle() and lets a fixed grid
+ * handle every bbox size without a dense tile-reference list. */
+struct cp_run_clip_direct_live {
+   struct cp_tri_setup setup;
+   uint32_t stable_prim;
+   uint32_t segment;
+};
+
+struct cp_run_clip_direct_raster_args {
+   uint64_t segments;
+   uint64_t live;
+   uint64_t live_count;
+   uint64_t errors;
+   uint32_t num_segments;
+   uint32_t total_slots;
+   uint32_t live_capacity;
+};
+
 #define CP_RUN_CLIP_BIN_ERR_LIVE_BOUNDS    (1u << 0)
 #define CP_RUN_CLIP_BIN_ERR_SEGMENT_BOUNDS (1u << 1)
 #define CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS    (1u << 2)
@@ -1418,11 +1437,13 @@ struct cp_run_clip_bin_args {
 static_assert(CP_RUN_CLIP_BIN_MAX_SEGS <= CP_PASS_MAX_SEGS,
               "run segments must fit pass storage");
 static_assert(sizeof(struct cp_run_clip_bin_live) == 8, "run live ABI");
+static_assert(sizeof(struct cp_run_clip_direct_live) == 88, "run direct live ABI");
 static_assert(sizeof(struct cp_run_clip_bin_args) == 64, "run bin args ABI");
 #else
 _Static_assert(CP_RUN_CLIP_BIN_MAX_SEGS <= CP_PASS_MAX_SEGS,
                "run segments must fit pass storage");
 _Static_assert(sizeof(struct cp_run_clip_bin_live) == 8, "run live ABI");
+_Static_assert(sizeof(struct cp_run_clip_direct_live) == 88, "run direct live ABI");
 _Static_assert(sizeof(struct cp_run_clip_bin_args) == 64, "run bin args ABI");
 #endif
 

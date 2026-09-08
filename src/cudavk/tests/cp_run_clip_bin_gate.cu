@@ -1,4 +1,4 @@
-/* Focused correctness gate for the default-off run clip/bin CUDA ABI. */
+/* Focused correctness gate for the default-off run clip/bin/direct CUDA ABI. */
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -51,6 +51,24 @@ reference_setup(struct cp_run_clip_bin_device_segment seg, uint32_t seg_idx,
       for (int ty = ty0; ty <= ty1; ty++)
          for (int tx = tx0; tx <= tx1; tx++)
             atomicAdd(counts + ty * args.tiles_x + tx, 1u);
+   }
+}
+
+
+__global__ static void
+reference_direct_setup(struct cp_run_clip_bin_device_segment seg,
+                       uint32_t seg_idx, cp_run_clip_direct_live *live,
+                       uint32_t *count)
+{
+   struct cp_rasterize_args rast = seg.rast;
+   rast.positions=seg.clip.out; rast.prim_refs=seg.clip.prim_refs;
+   rast.num_triangles=seg.clip.max_triangles;
+   rast.num_varyings=seg.clip.num_slots-1; rast.tri_count=0; rast.active_ids=0;
+   for (uint32_t id=threadIdx.x; id<seg.clip.max_triangles; id+=blockDim.x) {
+      cp_tri_setup setup={}; if (!setup_triangle(&rast,id,&setup)) continue;
+      uint32_t at=atomicAdd(count,1u);
+      live[at].setup=setup; live[at].stable_prim=seg.prim_base+id;
+      live[at].segment=seg_idx;
    }
 }
 
@@ -186,6 +204,33 @@ int main(void)
    std::sort(a.begin(),a.end(),less); std::sort(b.begin(),b.end(),less);
    CHECK(memcmp(a.data(),b.data(),an*sizeof(a[0])) == 0); CHECK(ac == bc);
 
+   /* Direct arm: fused clipping/setup must compact byte-identical setup to
+    * the legacy clip followed by the shared setup helper. */
+   cp_run_clip_direct_live *direct_live, *direct_ref;
+   uint32_t *direct_n, *direct_ref_n;
+   CK(cudaMalloc(&direct_live,SLOTS*sizeof(*direct_live)));
+   CK(cudaMalloc(&direct_ref,SLOTS*sizeof(*direct_ref)));
+   CK(cudaMalloc(&direct_n,4)); CK(cudaMalloc(&direct_ref_n,4));
+   CK(cudaMemset(direct_n,0,4)); CK(cudaMemset(direct_ref_n,0,4));
+   CK(cudaMemset(run_over,0,4));
+   cp_run_clip_bin_args direct=run; direct.live=(uint64_t)direct_live;
+   direct.live_count=(uint64_t)direct_n;
+   cp_run_clip_setup_direct<<<dim3(1,N),64>>>(direct);
+   for(uint32_t i=0;i<N;i++)
+      reference_direct_setup<<<1,32>>>(hs[i],i,direct_ref,direct_ref_n);
+   CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+   uint32_t dn=0,drn=0; CK(cudaMemcpy(&dn,direct_n,4,cudaMemcpyDeviceToHost));
+   CK(cudaMemcpy(&drn,direct_ref_n,4,cudaMemcpyDeviceToHost));
+   CHECK(dn==drn && dn==an);
+   std::vector<cp_run_clip_direct_live> dl(dn), dr(drn);
+   CK(cudaMemcpy(dl.data(),direct_live,dn*sizeof(dl[0]),cudaMemcpyDeviceToHost));
+   CK(cudaMemcpy(dr.data(),direct_ref,drn*sizeof(dr[0]),cudaMemcpyDeviceToHost));
+   auto dless=[](const cp_run_clip_direct_live&x,const cp_run_clip_direct_live&y){
+      return x.stable_prim<y.stable_prim;
+   };
+   std::sort(dl.begin(),dl.end(),dless); std::sort(dr.begin(),dr.end(),dless);
+   CHECK(memcmp(dl.data(),dr.data(),dn*sizeof(dl[0]))==0);
+
    /* The trusted path above supplies counts. Scan them on the CPU, as a
     * standalone gate may; the eventual renderer scan remains device-side. */
    std::vector<uint32_t> off(ac.size()); uint32_t total_refs=0;
@@ -227,6 +272,40 @@ int main(void)
       std::sort(qr.begin()+off[t],qr.begin()+off[t]+ac[t],rless);
       CHECK(memcmp(rr.data()+off[t],qr.data()+off[t],ac[t]*sizeof(rr[0]))==0);
    }
+   /* Compare the direct visibility result with the old exact tile arm. */
+   uint64_t *direct_vis, *tile_vis;
+   cp_rasterize_args *tile_rasts;
+   CK(cudaMalloc(&direct_vis,128*96*sizeof(uint64_t)));
+   CK(cudaMalloc(&tile_vis,128*96*sizeof(uint64_t)));
+   CK(cudaMalloc(&tile_rasts,N*sizeof(*tile_rasts)));
+   CK(cudaMemset(direct_vis,0xff,128*96*sizeof(uint64_t)));
+   CK(cudaMemset(tile_vis,0xff,128*96*sizeof(uint64_t)));
+   for(uint32_t i=0;i<N;i++) {
+      hs[i].rast.framebuffer=(uint64_t)direct_vis;
+      rs[i]=hs[i].rast;
+      rs[i].positions=hs[i].clip.out;
+      rs[i].prim_refs=hs[i].clip.prim_refs;
+      rs[i].num_triangles=hs[i].clip.max_triangles;
+      rs[i].num_varyings=hs[i].clip.num_slots-1;
+      rs[i].abuf_prim_base=hs[i].prim_base;
+      rs[i].framebuffer=(uint64_t)tile_vis;
+   }
+   CK(cudaMemcpy(ds,hs,sizeof(hs),cudaMemcpyHostToDevice));
+   CK(cudaMemcpy(tile_rasts,rs,sizeof(rs),cudaMemcpyHostToDevice));
+   CK(cudaMemset(errors,0,4));
+   cp_run_clip_direct_raster_args dra={(uint64_t)ds,(uint64_t)direct_live,
+      (uint64_t)direct_n,(uint64_t)errors,N,SLOTS,SLOTS};
+   cp_run_clip_direct_raster<<<8,256>>>(dra);
+   cp_run_clip_direct_raster_large<<<8,256>>>(dra);
+   cp_opaque_tile_raster_args ota={(uint64_t)tile_rasts,(uint64_t)run_counts,
+      (uint64_t)offsets,(uint64_t)run_refs,(uint64_t)errors,N,TX,TY,128,96};
+   cp_opaque_tile_raster<<<TX*TY,256>>>(ota);
+   CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+   std::vector<uint64_t> dv(128*96),tv(128*96);
+   CK(cudaMemcpy(dv.data(),direct_vis,dv.size()*8,cudaMemcpyDeviceToHost));
+   CK(cudaMemcpy(tv.data(),tile_vis,tv.size()*8,cudaMemcpyDeviceToHost));
+   CHECK(dv==tv);
+
    auto has=[&](uint32_t id){ for(auto &v:a) if(v.stable_prim==id) return true; return false; };
    CHECK(has(0)); CHECK(!has(2*CP_CLIP_MAX_OUT)); CHECK(!has(3*CP_CLIP_MAX_OUT));
    CHECK(has(4*CP_CLIP_MAX_OUT) && has(5*CP_CLIP_MAX_OUT));
@@ -306,7 +385,7 @@ int main(void)
    CK(cudaMemcpy(&ao,run_over,4,cudaMemcpyDeviceToHost));
    CHECK(ao == 1 && an > run.live_capacity);
 
-   printf("run clip/bin gate: %u segments, %u live, %u tile references; "
+   printf("run clip/bin/direct gate: %u segments, %u live, %u tile references; "
           "overflow fallback signalled -- PASS\n",N,bn,refs);
    return 0;
 }
