@@ -873,10 +873,20 @@ be priced before anyone builds it:
 3. **Five structural changes have been attempted in this driver during this
    investigation and all five measured slower.**
 
+**And it is not a bounded experiment.** The fused clip is followed immediately
+by stage 1, 2 and 3 for the *same* batch, and those write the shared
+visibility buffer. Merging the clip across an episode therefore means
+deferring it past every segment's raster stages -- deferring the entire raster
+pipeline, with all segments' vertex outputs and queue sets live simultaneously.
+That is the run-level redesign in full, not a contained change, and it carries
+the memory cost entry 45 already priced (one queue set per live segment,
++307 MB for the longest episode).
+
 Its ceiling is the clip pool's idle share, roughly **0.4 ms/frame**. Even
 collected in full, the floor becomes 2.67 ms against a 2.088 ms target --
 **still 1.28x over**, so it does not reach 4x on its own. It is the best
-remaining candidate for the ~5x ceiling, not for the objective.
+remaining candidate for the ~5x ceiling, not for the objective, and it costs
+weeks rather than an afternoon.
 
 ## Verdict: not achieved, and NOT proven unreachable
 
