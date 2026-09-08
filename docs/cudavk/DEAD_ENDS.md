@@ -2631,3 +2631,58 @@ before building the mechanism (40, 41, 42), and this is the fourth. In every
 case the instrument already existed: `CUDAVK_PLAN_STATS`, `CUDAVK_SHADER_STATS`,
 `CUDAVK_UPLOAD_STATS`, and here `CUDAVK_NVTX`. **The driver knows more about
 itself than the ledger does.**
+
+## 44. Everything between cudavk and 4x the native driver
+
+2026-09-05. Not a single mechanism but the closure of a whole search space, so
+that nobody re-runs it. Full evidence in `notes/FOURX_DIAGNOSIS_2026-09-05.md`.
+
+**The question.** Can cudavk render these captures within 4x of NVIDIA's own
+driver on the same GPU -- favorite3 heavy in 2.33 ms against its 0.582?
+
+**Refuted, each with a frame-time A/B on favorite3, three alternating rounds:**
+
+| lever | heavy | verdict |
+|---|---:|---|
+| register cap 64 | +0.52 | worse, spills exceed the warps bought |
+| register cap 96 | +0.06 | neutral |
+| register cap 160 | +0.04 | neutral |
+| no register cap (203 regs, **zero spill**) | -0.04 | **neutral, arms overlap** |
+| unfuse interpolation | +0.30 | worse |
+| alternate register allocator (`NO_REG_SSA`) | -0.03 | neutral |
+| fragment grid geometry (1 and 4 waves) | <= 0.05 | neutral |
+| tile-resident attribute staging | -- | the whole gather is 0.07 ms |
+| hardware-texture eligibility | -- | the 3 "ineligible" shaders have `sites=0` |
+| texture-cache budget | -- | peak 679 MB of 2048, zero fallbacks |
+
+**The invariant that closes the shader question.** At 203 registers there are
+**no spills at all** and occupancy is 15.6%; capped at 128 there are 168 B of
+spill and occupancy is 25%. **Both measure the same frame time.** No point on
+the register/spill curve escapes the memory-latency bound, so shader-level
+tuning is finished.
+
+**What is not refuted, and is the only remaining path**: structural work worth
+**2.08 ms of union-exclusive device time** (bin+walk for clip/stage2/stage3,
+frame-wide deferred shading, per-run compaction and clears, fused writeback)
+plus ~0.56 ms of frame-boundary host cost. That lands device work at 2.635 ms
+against a 2.088 ms target -- **1.26x over, so 4x is neither reached nor
+disproved**, and ~5x native is the realistic target.
+
+**Five errors were made and corrected while reaching this**, and they are the
+transferable part:
+
+1. The frame boundary was treated as the application's and therefore fixed. It
+   is 0.94 ms/frame, **larger than the native driver's entire frame**, so most
+   of it is cudavk's.
+2. Overdraw was guessed at 12x; measured, it is **2.29x**.
+3. Occupancy alone was used as a proof, but cycles-per-instruction is not a
+   constant, so the argument needed the zero-spill arm above instead.
+4. The fragment pool was quoted as 2.25 ms -- the **summed** duration of
+   kernels all named `main`, which contains the vertex shaders and
+   double-counts concurrency. Union-exclusive it is **0.729 ms**. This is the
+   merge rule (entry 22) being broken in a document that cites it.
+5. Savings were subtracted from 4 pools when the trace has **17**.
+
+**The rule.** Against an external reference, price the whole space in one
+metric before concluding anything. Four of the five errors above produced a
+confident wrong verdict that the next measurement overturned.
