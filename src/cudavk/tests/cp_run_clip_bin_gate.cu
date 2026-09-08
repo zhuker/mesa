@@ -78,6 +78,68 @@ reference_fill(struct cp_run_clip_bin_device_segment seg, uint32_t seg_idx,
    }
 }
 
+
+/* Serial, direct translation of the classic per-primitive raster order.  It
+ * is deliberately unlike cp_opaque_tile_raster's one-lane-per-reference
+ * schedule, so this gate catches coverage, setup, depth-direction, and tie
+ * regressions rather than comparing two copies of the parallel loop. */
+__global__ static void
+reference_raster(cp_opaque_tile_raster_args args)
+{
+   uint32_t tile = blockIdx.x;
+   if (threadIdx.x || tile >= args.tiles_x * args.tiles_y ||
+       *(const uint32_t *)(uintptr_t)args.overflow)
+      return;
+   const cp_rasterize_args *rasts =
+      (const cp_rasterize_args *)(uintptr_t)args.rast_args;
+   const cp_opaque_tile_ref *refs =
+      (const cp_opaque_tile_ref *)(uintptr_t)args.tile_refs;
+   uint64_t *vis = (uint64_t *)(uintptr_t)rasts[0].framebuffer;
+   uint32_t count = ((const uint32_t *)(uintptr_t)args.tile_counts)[tile];
+   uint32_t base = ((const uint32_t *)(uintptr_t)args.tile_offsets)[tile];
+   int x0 = (int)((tile % args.tiles_x) * CP_OPAQUE_TILE_SIZE);
+   int y0 = (int)((tile / args.tiles_x) * CP_OPAQUE_TILE_SIZE);
+   int x1 = min(x0 + (int)CP_OPAQUE_TILE_SIZE - 1, (int)args.width - 1);
+   int y1 = min(y0 + (int)CP_OPAQUE_TILE_SIZE - 1, (int)args.height - 1);
+   for (uint32_t i = 0; i < count; i++) {
+      cp_opaque_tile_ref ref = refs[base + i];
+      if (ref.segment >= args.num_segments) continue;
+      const cp_rasterize_args *rast = rasts + ref.segment;
+      if (ref.global_prim < rast->abuf_prim_base) continue;
+      uint32_t prim = ref.global_prim - rast->abuf_prim_base;
+      cp_tri_setup setup;
+      if (!setup_triangle(rast, prim, &setup)) continue;
+      int bx0=max(x0,setup.ix_min), by0=max(y0,setup.iy_min);
+      int bx1=min(x1,setup.ix_max), by1=min(y1,setup.iy_max);
+      for (int py=by0; py<=by1; py++) for (int px=bx0; px<=bx1; px++) {
+         if (cp_tri_rejected(rast,prim,px,py)) continue;
+         float sx=(float)px+0.5f, sy=(float)py+0.5f, z;
+         if (setup.is_point) {
+            if (sx<setup.pt_x0 || sx>=setup.pt_x1 ||
+                sy<setup.pt_y0 || sy>=setup.pt_y1) continue;
+            z=setup.ndc_z0;
+         } else {
+            float e0=edge_function(setup.sx1,setup.sy1,setup.sx2,setup.sy2,sx,sy);
+            float e1=edge_function(setup.sx2,setup.sy2,setup.sx0,setup.sy0,sx,sy);
+            float e2=edge_function(setup.sx0,setup.sy0,setup.sx1,setup.sy1,sx,sy);
+            if(!edge_inside(e0,setup.e0_top_left)||
+               !edge_inside(e1,setup.e1_top_left)||
+               !edge_inside(e2,setup.e2_top_left)) continue;
+            float w0=e0*setup.inv_area,w1=e1*setup.inv_area;
+            z=w0*setup.ndc_z0+w1*setup.ndc_z1+
+              (1.0f-w0-w1)*setup.ndc_z2;
+         }
+         uint32_t depth=float_to_sortable_uint(
+            CP_WINDOW_DEPTH(z,rast->depth_scale,rast->depth_translate));
+         uint32_t p=(uint32_t)py*args.width+(uint32_t)px;
+         if(!cp_opaque_depth_pass(rast,p,depth)) continue;
+         uint32_t key=rast->depth_key_invert?~depth:depth;
+         uint64_t packed=PACK_VISBUF(key,ref.global_prim);
+         if(packed<vis[p]) vis[p]=packed;
+      }
+   }
+}
+
 static cp_rasterize_args rast(unsigned cull, int x0, int y0, int x1, int y1,
                               float sx, float sy, float tx, float ty)
 {
@@ -235,6 +297,65 @@ int main(void)
    /* Counts define the exact number of future dense (stable ID, segment)
     * references. Different clip rectangles must occupy disjoint tile columns. */
    CHECK(ac[0]+ac[4] > 0); CHECK(ac[2]+ac[6]+ac[10] > 0);
+
+   /* Exercise the actual tile raster against the serial classic-order oracle.
+    * The geometry above includes clipped triangles, different viewport and
+    * scissor rectangles, and a rejected front face.  All live triangles have
+    * equal depth, so both passes also prove the latest-stable-primitive tie. */
+   uint64_t *parallel_vis, *classic_vis;
+   uint32_t *depthbuf;
+   cp_rasterize_args *parallel_rasts, *classic_rasts;
+   const size_t pixels = (size_t)128 * 96;
+   CK(cudaMalloc(&parallel_vis, pixels * sizeof(*parallel_vis)));
+   CK(cudaMalloc(&classic_vis, pixels * sizeof(*classic_vis)));
+   CK(cudaMalloc(&depthbuf, pixels * sizeof(*depthbuf)));
+   CK(cudaMalloc(&parallel_rasts, sizeof(rs)));
+   CK(cudaMalloc(&classic_rasts, sizeof(rs)));
+   std::vector<uint32_t> initial_depth(pixels);
+   std::vector<uint64_t> pv(pixels), cv(pixels);
+   auto raster_gate = [&](uint32_t func, uint32_t invert, float initial) {
+      cp_rasterize_args pr[N], cr[N];
+      union { float f; uint32_t u; } bits = {initial};
+      uint32_t mask = -((int32_t)bits.u >> 31) | 0x80000000u;
+      uint32_t initial_key = bits.u ^ mask;
+      std::fill(initial_depth.begin(), initial_depth.end(), initial_key);
+      CK(cudaMemcpy(depthbuf, initial_depth.data(), pixels * sizeof(uint32_t),
+                    cudaMemcpyHostToDevice));
+      CK(cudaMemset(parallel_vis, 0xff, pixels * sizeof(uint64_t)));
+      CK(cudaMemset(classic_vis, 0xff, pixels * sizeof(uint64_t)));
+      for (uint32_t i=0; i<N; i++) {
+         pr[i]=hs[i].rast;
+         pr[i].positions=(uint64_t)dout[i]; pr[i].prim_refs=(uint64_t)drefs[i];
+         pr[i].num_triangles=CP_CLIP_MAX_OUT; pr[i].num_varyings=0;
+         pr[i].tri_count=0; pr[i].active_ids=0;
+         pr[i].abuf_prim_base=i*CP_CLIP_MAX_OUT;
+         pr[i].depth_test=1; pr[i].depth_func=func;
+         pr[i].depth_key_invert=invert; pr[i].depthbuf=(uint64_t)depthbuf;
+         pr[i].depth_scale=1.0f; pr[i].depth_translate=0.0f;
+         cr[i]=pr[i];
+         pr[i].framebuffer=(uint64_t)parallel_vis;
+         cr[i].framebuffer=(uint64_t)classic_vis;
+      }
+      CK(cudaMemcpy(parallel_rasts,pr,sizeof(pr),cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(classic_rasts,cr,sizeof(cr),cudaMemcpyHostToDevice));
+      cp_opaque_tile_raster_args pa={(uint64_t)parallel_rasts,
+         (uint64_t)run_counts,(uint64_t)offsets,(uint64_t)run_refs,
+         (uint64_t)errors,N,TX,TY,128,96};
+      cp_opaque_tile_raster_args ca=pa; ca.rast_args=(uint64_t)classic_rasts;
+      cp_opaque_tile_raster<<<TX*TY,256>>>(pa);
+      reference_raster<<<TX*TY,1>>>(ca);
+      CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+      CK(cudaMemcpy(pv.data(),parallel_vis,pixels*sizeof(uint64_t),
+                    cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(cv.data(),classic_vis,pixels*sizeof(uint64_t),
+                    cudaMemcpyDeviceToHost));
+      CHECK(pv==cv);
+      CHECK(std::any_of(pv.begin(),pv.end(),[](uint64_t v){
+         return v!=VISBUF_EMPTY;
+      }));
+   };
+   raster_gate(CP_FUNC_LEQUAL,0,0.5f);
+   raster_gate(CP_FUNC_GEQUAL,1,0.5f);
 
    /* Capacity, record bounds, and cursor mismatch each have distinct bits. */
    CK(cudaMemset(errors,0,4)); fill.capacity=total_refs-1;

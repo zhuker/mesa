@@ -476,7 +476,7 @@ cp_queue_used(uint32_t count, uint32_t capacity)
 }
 
 static __device__ __forceinline__ bool
-setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
+setup_triangle(const struct cp_rasterize_args *args, uint32_t tri_id,
                struct cp_tri_setup *s)
 {
    uint32_t pos_stride = args->num_varyings + 1;
@@ -3052,84 +3052,85 @@ cp_opaque_tile_raster(struct cp_opaque_tile_raster_args args)
 
    uint32_t tx = tile % args.tiles_x;
    uint32_t ty = tile / args.tiles_x;
-   uint32_t x0 = tx * CP_OPAQUE_TILE_SIZE;
-   uint32_t y0 = ty * CP_OPAQUE_TILE_SIZE;
+   int tile_x0 = (int)(tx * CP_OPAQUE_TILE_SIZE);
+   int tile_y0 = (int)(ty * CP_OPAQUE_TILE_SIZE);
+   int tile_x1 = min(tile_x0 + (int)CP_OPAQUE_TILE_SIZE - 1,
+                     (int)args.width - 1);
+   int tile_y1 = min(tile_y0 + (int)CP_OPAQUE_TILE_SIZE - 1,
+                     (int)args.height - 1);
    const struct cp_rasterize_args *rasts =
       (const struct cp_rasterize_args *)(uintptr_t)args.rast_args;
    const struct cp_opaque_tile_ref *refs =
       (const struct cp_opaque_tile_ref *)(uintptr_t)args.tile_refs;
    uint32_t base = ((const uint32_t *)(uintptr_t)args.tile_offsets)[tile];
-   __shared__ struct cp_tri_setup setup;
-   __shared__ struct cp_rasterize_args rast;
-   __shared__ uint32_t global_prim, local_prim;
-   __shared__ int setup_valid;
-   uint64_t winner[4] = { VISBUF_EMPTY, VISBUF_EMPTY,
-                          VISBUF_EMPTY, VISBUF_EMPTY };
+   uint64_t *visbuf = (uint64_t *)(uintptr_t)rasts[0].framebuffer;
 
-   for (uint32_t i = 0; i < count; i++) {
-      if (threadIdx.x == 0) {
-         struct cp_opaque_tile_ref ref = refs[base + i];
-         setup_valid = 0;
-         if (ref.segment < args.num_segments) {
-            rast = rasts[ref.segment];
-            global_prim = ref.global_prim;
-            local_prim = global_prim - rast.abuf_prim_base;
-            setup_valid = setup_triangle(&rast, local_prim, &setup) ? 1 : 0;
+   /*
+    * A reference is independent once the visibility buffer is clear.  Give
+    * each lane references in a stride, keep its setup private, and merge all
+    * covered fragments with the same packed atomicMin as the classic path.
+    * The complemented primitive word makes the latest stable primitive win
+    * equal LEQUAL/GEQUAL depth, regardless of lane or atomic arrival order.
+    */
+   for (uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
+      struct cp_opaque_tile_ref ref = refs[base + i];
+      if (ref.segment >= args.num_segments)
+         continue;
+      const struct cp_rasterize_args *rast = &rasts[ref.segment];
+      uint32_t global_prim = ref.global_prim;
+      if (global_prim < rast->abuf_prim_base)
+         continue;
+      uint32_t local_prim = global_prim - rast->abuf_prim_base;
+      struct cp_tri_setup setup;
+      if (!setup_triangle(rast, local_prim, &setup))
+         continue;
+
+      int px0 = max(setup.ix_min, tile_x0);
+      int py0 = max(setup.iy_min, tile_y0);
+      int px1 = min(setup.ix_max, tile_x1);
+      int py1 = min(setup.iy_max, tile_y1);
+      for (int py = py0; py <= py1; py++) {
+         for (int px = px0; px <= px1; px++) {
+            if (cp_tri_rejected(rast, local_prim, px, py))
+               continue;
+            float sx = (float)px + 0.5f, sy = (float)py + 0.5f;
+            float ndc_z;
+            if (setup.is_point) {
+               if (sx < setup.pt_x0 || sx >= setup.pt_x1 ||
+                   sy < setup.pt_y0 || sy >= setup.pt_y1)
+                  continue;
+               ndc_z = setup.ndc_z0;
+            } else {
+               float e0 = edge_function(setup.sx1, setup.sy1, setup.sx2,
+                                        setup.sy2, sx, sy);
+               float e1 = edge_function(setup.sx2, setup.sy2, setup.sx0,
+                                        setup.sy0, sx, sy);
+               float e2 = edge_function(setup.sx0, setup.sy0, setup.sx1,
+                                        setup.sy1, sx, sy);
+               if (!edge_inside(e0, setup.e0_top_left) ||
+                   !edge_inside(e1, setup.e1_top_left) ||
+                   !edge_inside(e2, setup.e2_top_left))
+                  continue;
+               float w0 = e0 * setup.inv_area;
+               float w1 = e1 * setup.inv_area;
+               ndc_z = w0 * setup.ndc_z0 + w1 * setup.ndc_z1 +
+                       (1.0f - w0 - w1) * setup.ndc_z2;
+            }
+
+            uint32_t depth = float_to_sortable_uint(
+               CP_WINDOW_DEPTH(ndc_z, rast->depth_scale,
+                               rast->depth_translate));
+            uint32_t pixel = (uint32_t)py * args.width + (uint32_t)px;
+            /* Admission permits only inclusive depth tests.  Test the real
+             * attachment once, exactly as classic raster does, but leave it
+             * untouched: all references resolve against that same initial
+             * value and only the packed visibility buffer is reduced. */
+            if (!cp_opaque_depth_pass(rast, pixel, depth))
+               continue;
+            uint32_t key = rast->depth_key_invert ? ~depth : depth;
+            atomicMin((unsigned long long *)&visbuf[pixel],
+                      (unsigned long long)PACK_VISBUF(key, global_prim));
          }
       }
-      __syncthreads();
-      if (setup_valid) {
-         for (uint32_t j = 0; j < 4; j++) {
-            uint32_t owned = threadIdx.x + j * blockDim.x;
-            uint32_t px = x0 + owned % CP_OPAQUE_TILE_SIZE;
-            uint32_t py = y0 + owned / CP_OPAQUE_TILE_SIZE;
-            if (px >= args.width || py >= args.height ||
-                px < (uint32_t)setup.ix_min || px > (uint32_t)setup.ix_max ||
-                py < (uint32_t)setup.iy_min || py > (uint32_t)setup.iy_max ||
-                cp_tri_rejected(&rast, local_prim, px, py))
-               continue;
-         float sx = (float)px + 0.5f, sy = (float)py + 0.5f;
-         float ndc_z;
-         if (setup.is_point) {
-            if (sx < setup.pt_x0 || sx >= setup.pt_x1 ||
-                sy < setup.pt_y0 || sy >= setup.pt_y1)
-               continue;
-            ndc_z = setup.ndc_z0;
-         } else {
-            float e0 = edge_function(setup.sx1, setup.sy1, setup.sx2,
-                                     setup.sy2, sx, sy);
-            float e1 = edge_function(setup.sx2, setup.sy2, setup.sx0,
-                                     setup.sy0, sx, sy);
-            float e2 = edge_function(setup.sx0, setup.sy0, setup.sx1,
-                                     setup.sy1, sx, sy);
-            if (!edge_inside(e0, setup.e0_top_left) ||
-                !edge_inside(e1, setup.e1_top_left) ||
-                !edge_inside(e2, setup.e2_top_left))
-               continue;
-            float w0 = e0 * setup.inv_area;
-            float w1 = e1 * setup.inv_area;
-            ndc_z = w0 * setup.ndc_z0 + w1 * setup.ndc_z1 +
-                    (1.0f - w0 - w1) * setup.ndc_z2;
-         }
-         uint32_t depth = float_to_sortable_uint(
-            CP_WINDOW_DEPTH(ndc_z, rast.depth_scale, rast.depth_translate));
-         uint32_t pixel = py * args.width + px;
-         if (!cp_opaque_depth_pass(&rast, pixel, depth))
-            continue;
-         uint32_t key = rast.depth_key_invert ? ~depth : depth;
-            uint64_t packed = PACK_VISBUF(key, global_prim);
-            if (packed < winner[j])
-               winner[j] = packed;
-         }
-      }
-      __syncthreads();
-   }
-   for (uint32_t j = 0; j < 4; j++) {
-      uint32_t owned = threadIdx.x + j * blockDim.x;
-      uint32_t px = x0 + owned % CP_OPAQUE_TILE_SIZE;
-      uint32_t py = y0 + owned / CP_OPAQUE_TILE_SIZE;
-      if (px < args.width && py < args.height)
-         ((uint64_t *)(uintptr_t)rasts[0].framebuffer)
-            [py * args.width + px] = winner[j];
    }
 }
