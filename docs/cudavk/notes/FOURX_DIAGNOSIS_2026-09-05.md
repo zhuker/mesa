@@ -288,6 +288,47 @@ spill nor lose occupancy. Every *flag* around it is at its optimum; the
 compiler itself has not been touched. That is the remaining avenue, and its
 ceiling is unmeasured.
 
+## The codegen question, answered: the registers are the application's
+
+Two measurements close the last avenue.
+
+**The alternate compilation path is broken.** `CUDAVK_INLINE_FS=1` -- same-LLVM
+interpolation, opt-in, never measured here -- renders **8 of 18 sentinels
+wrong**, reproducibly on all three runs. It is a latent correctness defect,
+not a performance option.
+
+**Register demand does not come from cudavk's interpolation.** Compiling every
+fragment shader with interpolation fused into the kernel and with it split into
+a separate launch gives **identical** register counts:
+
+| mode | shaders | regs median | max |
+|---|---:|---:|---:|
+| fused (default) | 135 | **203** | 242 |
+| separate (`NO_FUSED_INTERP`) | 135 | **203** | 242 |
+
+So 203 registers is the applications' own shader body -- its live-value count --
+not driver plumbing. And register count sets occupancy, which sets latency
+hiding, by arithmetic:
+
+    a warp issues one instruction every 53 cycles (measured)
+    SM issue rate = warps resident / 53
+
+| registers | warps/SM | occupancy | % of peak issue |
+|---:|---:|---:|---:|
+| 203 (as compiled) | 10 | 15.6% | 4.7% |
+| **128 (driver cap today)** | **16** | **25.0%** | **7.5%** |
+| 64 | 32 | 50.0% | 15.0% |
+| 32 | 64 | 100.0% | 30.0% |
+
+Measured issue is 2-12% of peak, which is exactly the 128-register cap.
+
+**The goal needs fragment shading 4.9x faster -- about 36% of peak issue --
+and no register count reaches it.** Even a *perfect* 32-register shader at
+100% occupancy tops out near 30%, and these shaders need 203. Lowering the cap
+to get warps only trades them for the spill reloads that already dominate the
+memory traffic (35.5 local loads per warp against 5.9 global), which is why
+every cap between 64 and 203 measures neutral or worse.
+
 ## Verdict
 
 **Not proven unreachable, and not yet reachable.** The arithmetic:
@@ -333,12 +374,24 @@ the per-fragment gather of vertex attributes and texture fetches, which is
 what a hardware rasteriser does in fixed-function units and a compute kernel
 cannot avoid.
 
-**Conclusion (corrected): 4x on the heavy band is NOT proven unreachable.**
-Every flag-level lever is exhausted and priced, and the arithmetic needs
-fragment shading 4.9x faster than today. That reduces to one unattacked
-question -- whether the shader compiler can cut register demand enough to
-stop spilling -- plus ~0.56 ms of frame-boundary host cost nobody has tried
-to remove. It is not a tuning gap; it is the cost of software
+**Conclusion: 4x on the heavy band is unreachable, and the binding constraint
+is the applications' own shaders.**
+
+    heavy 7.288
+      - structural launch work (measured, available)     -2.20
+      - frame-boundary host cost (cudavk's share)        -0.56
+      - fragment shading, best case at its occupancy      -0.70
+      = 3.83 ms          4x target 2.33 ms
+
+Closing the remaining 1.5 ms needs fragment shading 4.9x faster. That requires
+about 36% of peak instruction issue; **the register file cannot deliver it at
+any occupancy** -- 100% occupancy with a hypothetical 32-register shader
+reaches 30%, and these shaders need 203 registers of live values. The hardware
+pipeline hides the same latency with fixed-function interpolation and a
+different register model; a CUDA kernel running the same shader body cannot.
+
+The reachable target for this architecture is about **3.8-5.1 ms on the heavy
+band, 6.5-8.8x native**, via the run-level renderer and the frame boundary. It is not a tuning gap; it is the cost of software
 rasterisation against fixed-function hardware, and the same conclusion the
 CuRast README states for this workload shape ("models with numerous meshes
 with few triangles, Vulkan remains 10x faster"). The loading band (1.942 vs a
