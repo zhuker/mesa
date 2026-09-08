@@ -56,3 +56,14 @@ RTX 5090 for both A/B arms. First-process wall times (and therefore not accepted
 frame benchmarks) were 62.92 s for the dense bin arm and 26.43 s for direct.
 They include shader compilation and teardown. A proper alternating steady-state
 submit benchmark remains required before accepting the prototype.
+
+
+## Side-stream classic control arm
+
+`CUDAVK_RUN_CLIP_CLASSIC=1` removes the compact list entirely. After the same
+whole-run admission and grow-only preparation reservation, each segment runs
+exact prepare-only VS, `cp_clip_rast_fused`, stage 2 and stage 3 on its existing
+round-robin stream. The legacy queue set is private to that stream. All stages
+write the one cleared visbuf with the segment's stable run-global primitive
+base. One join precedes grouped shade. There is no readback or device refusal;
+CUDA launch failures are fatal and restore main-stream context state.

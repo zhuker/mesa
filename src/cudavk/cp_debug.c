@@ -140,6 +140,10 @@ static const struct cp_flag_def flags[] = {
      "use compact clip/setup plus persistent-warp direct visibility for an "
      "opaque run; default off, requires CUDAVK_RUN_GEOMETRY, and keeps "
      "CUDAVK_RUN_CLIP_BIN selectable as the old dense-tile A/B arm" },
+   { "CUDAVK_RUN_CLIP_CLASSIC", CP_FLAG_BOOL_VALUE, F(run_clip_classic),
+     "pipeline exact prepare-only VS and the optimized classic fused clip/raster "
+     "chain per segment on the existing side streams; default off and requires "
+     "CUDAVK_RUN_GEOMETRY" },
    { "CUDAVK_RUN_CLIP_BIN_CAPACITY", CP_FLAG_UINT,
      F(run_clip_bin_capacity),
      "diagnostic dense-reference capacity for RUN_CLIP_BIN; 0 uses the "

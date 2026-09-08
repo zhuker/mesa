@@ -174,6 +174,7 @@ struct cp_debug {
    bool run_geometry;
    bool run_clip_bin;
    bool run_clip_direct;
+   bool run_clip_classic;
    unsigned run_clip_bin_capacity;
    bool no_run_prep_streams;
    unsigned run_geometry_fail_alloc;

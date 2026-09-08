@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-145 switches.
+147 switches.
 
 ## Tracing
 
@@ -30,6 +30,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_RUN_GEOMETRY` | bool (value) | `off` | — | collect each opaque run and launch compatible groups of one-draw triangle-list members through one fused vertex shader. Default-off M2 step; multi-draw members and downstream stages stay on the old path |
 | `CUDAVK_RUN_CLIP_BIN` | bool (value) | `off` | — | preflight at most 64 side-effect-free triangle-list batches and build stable run-global clip/bin descriptors before grouped geometry. Default-off transactional M2 renderer; requires CUDAVK_RUN_GEOMETRY, with exact pre-commit replay and device-predicated classic fallback |
 | `CUDAVK_RUN_CLIP_DIRECT` | bool (value) | `off` | — | use compact clip/setup plus persistent-warp direct visibility for an opaque run; default off, requires CUDAVK_RUN_GEOMETRY, and keeps CUDAVK_RUN_CLIP_BIN selectable as the old dense-tile A/B arm |
+| `CUDAVK_RUN_CLIP_CLASSIC` | bool (value) | `off` | — | pipeline exact prepare-only VS and the optimized classic fused clip/raster chain per segment on the existing side streams; default off and requires CUDAVK_RUN_GEOMETRY |
 | `CUDAVK_RUN_CLIP_BIN_CAPACITY` | uint | `0` | — | diagnostic dense-reference capacity for RUN_CLIP_BIN; 0 uses the normal maximum, while a small value forces the device-predicated classic visibility arm without a host readback |
 | `CUDAVK_NO_RUN_PREP_STREAMS` | bool (value) | `off` | — | keep exact RUN_CLIP_BIN vertex preparation serial on the main stream; reverts the round-robin side-stream launch schedule |
 | `CUDAVK_RUN_GEOMETRY_FAIL_ALLOC` | uint | `0` | — | fault gate for run geometry output growth: 1 injects soft OOM and 2 injects a fatal CUDA error before any geometry launch |

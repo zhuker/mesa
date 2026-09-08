@@ -319,6 +319,12 @@ if dep_vulkan_loader.found()
        suite : 'cudavk', env : cpvk_test_env, timeout : 300,
        is_parallel : false,
        depends : [libvulkan_cudavk, cpvk_devenv_icd])
+  test('cpvk_run_clip_classic_gate', prog_python,
+       args : [files('tests/cpvk_run_clip_classic_gate.py'), cpvk_batchbig_exe],
+       suite : 'cudavk', env : cpvk_test_env, timeout : 300,
+       is_parallel : false,
+       depends : [libvulkan_cudavk, cpvk_devenv_icd])
+
 
   # Standalone device equivalence gate for the next default-off M2 slice. It
   # compares the run kernel with the existing per-segment clip path and shared
