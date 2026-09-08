@@ -149,12 +149,15 @@ single item in the driver at 2.25 ms/frame.
 occupancy is the obvious move. The register cap sets it, and forcing the cap
 lower buys warps at the price of spills:
 
-| cap | theoretical occupancy | frame vs default |
+| cap | theoretical occupancy | heavy vs default |
 |---|---:|---:|
 | 64 | 50% | **+0.52 ms** (arms disjoint) |
-| 96 | 33% | +0.02 whole, +0.06 heavy |
-| 128 (default) | 25% | — |
+| 96 | 33% | +0.06 |
+| 128 | 25% | +0.00 |
+| 160 | 20% | +0.04 |
 | none (203 regs) | 15% | -0.04, overlap |
+
+The whole range is measured and the driver's tuned choice is the optimum.
 
 **The tuned 128 is already the optimum**, and the curve is flat on one side and
 sharply worse on the other. Spilling costs more than the extra warps buy.
@@ -183,6 +186,20 @@ latency that the application's own shaders contain.
 is worse. `CUDAVK_NO_FUSED_INTERP=1` restores the separate `cp_fs_interpolate`
 launch and lowers register demand: **+0.18 ms whole, +0.30 ms heavy, arms
 disjoint.** The fused path is already the optimum.
+
+## Two more hypotheses, tested and refuted
+
+**Silent software sampling.** `CUDAVK_TEXTURE_CACHE_BUDGET_MB` defaults to
+2048 and "an allocation past it falls back to software sampling silently" --
+and favorite3 maps 13.12 GB of data packs, so this looked like the cause of
+the memory stalls. It is not: peak hardware-texture-cache use is **679 MB**
+with **fallbacks=0, alloc_failures=0, purges=0**.
+
+**The 32% hardware-texture miss rate.** `CUDAVK_TEXTURE_CACHE_STATS` reports
+94,581 of 139,369 fragment launches on the hardware texture path (67.9%), with
+44,788 "ineligible" across 3 binaries. Those three report **`sites=0`**: they
+sample no textures at all, so there is nothing to sample in software. The
+counter is benign, not a lost win.
 
 ## Verdict
 
