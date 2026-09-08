@@ -243,13 +243,33 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
     43.5% at the bottom). Same geometry and same UI, so this is shading, not
     rasterisation precision.
 
-    **The lesson this entry now carries.** The sampled comparison that produced
-    it steps every 200 frames; a 26-frame event is invisible to it 87% of the
-    time, and it was found only because one sample landed inside. Any future
-    claim that cudavk matches the native driver must state its sampling
-    interval, because this defect is 26 frames wide and the standing comparison
-    would miss the next one. It is also invisible to the test suite by
-    construction: sentinels compare cudavk against cudavk.
+    **A second burst exists, found by re-scanning at 10-frame steps:**
+
+        2976        0.48%          clean
+        2977-2981   1.37 - 4.91%   burst 2
+        2982+       0.34%          clean
+
+    It differs in character. Burst 2 sits in the **top quarter** of the image
+    (22% of rows in the first eighth, 16% in the second, ~0% below) and cudavk
+    is darker by only **5.3**; burst 1 sits in the lower two-thirds and cudavk
+    is darker by **41.6**. Both are cudavk-darker, so they are plausibly one
+    defect with two exposures, but that is a guess and not measured.
+
+    **favorite2 is clean at the same 10-frame resolution** (348 samples, none
+    above 2%).
+
+    **Totals: 30 of 3,473 favorite3 frames differ, 0.86%.**
+
+    **The lesson this entry now carries.** The comparison that produced the
+    original entry steps every 200 frames; a 26-frame event is invisible to it
+    87% of the time and was found only because one sample landed inside. The
+    re-scan at 10 frames then found a **5-frame** burst that the 200-frame scan
+    had missed entirely -- and a 5-frame event is invisible to a 10-frame scan
+    half the time, so **the current sweep is still not conclusive**. Any claim
+    that cudavk matches the native driver must state its sampling interval and
+    the smallest event that interval can detect. This defect class is also
+    invisible to the test suite by construction: sentinels compare cudavk
+    against cudavk.
 
 
 15. **nsys CUDA traces lose the kernel activity buffer -- RESOLVED 2026-09-05,
