@@ -1042,6 +1042,51 @@ cp_spec_report(struct cp_context *cp)
            cp->spec.shaders_unmatchable);
 }
 
+/* Release the pass side-stream bundle as one ownership unit.  The same
+ * routine handles an interrupted construction and final context teardown.
+ * Clear a handle only after attempting its matching CUDA release so a partial
+ * initializer cannot hide an owned object from cleanup. */
+static void
+cp_pass_streams_cleanup(struct cp_context *cp)
+{
+   bool failed = false;
+
+   for (unsigned i = 0; i < CP_PASS_STREAMS; i++) {
+      CUdeviceptr *allocs[] = {
+         &cp->seg_qsets[i].setup_cache,
+         &cp->seg_qsets[i].counts,
+         &cp->seg_qsets[i].huge_tiles,
+         &cp->seg_qsets[i].nontrivial,
+      };
+      for (unsigned j = 0; j < ARRAY_SIZE(allocs); j++) {
+         if (*allocs[j]) {
+            if (cuMemFree(*allocs[j]) != CUDA_SUCCESS)
+               failed = true;
+            *allocs[j] = 0;
+         }
+      }
+      if (cp->seg_ev[i]) {
+         if (cuEventDestroy(cp->seg_ev[i]) != CUDA_SUCCESS)
+            failed = true;
+         cp->seg_ev[i] = NULL;
+      }
+      if (cp->seg_streams[i]) {
+         if (cuStreamDestroy(cp->seg_streams[i]) != CUDA_SUCCESS)
+            failed = true;
+         cp->seg_streams[i] = NULL;
+      }
+      cp->seg_stream_serial[i] = 0;
+   }
+   if (cp->pass_gate) {
+      if (cuEventDestroy(cp->pass_gate) != CUDA_SUCCESS)
+         failed = true;
+      cp->pass_gate = NULL;
+   }
+
+   if (failed)
+      cp_renderer_texture_fatal(cp);
+}
+
 void
 cp_context_cleanup(struct cp_context *cp)
 {
@@ -1088,16 +1133,7 @@ cp_context_cleanup(struct cp_context *cp)
    for (unsigned i = 0; i < CP_FLUSH_GENS; i++)
       if (cp->flush_retire[i])
          cuEventDestroy(cp->flush_retire[i]);
-   for (unsigned i = 0; i < CP_PASS_STREAMS; i++) {
-      if (cp->seg_qsets[i].setup_cache)
-         cuMemFree(cp->seg_qsets[i].setup_cache);
-      if (cp->seg_ev[i])
-         cuEventDestroy(cp->seg_ev[i]);
-      if (cp->seg_streams[i])
-         cuStreamDestroy(cp->seg_streams[i]);
-   }
-   if (cp->pass_gate)
-      cuEventDestroy(cp->pass_gate);
+   cp_pass_streams_cleanup(cp);
    /* The vertex lane's marks and its two output buffers. The context was
     * synchronised at the top of this function, so nothing is under them. */
    for (unsigned i = 0; i < 2; i++) {
@@ -5373,7 +5409,7 @@ cp_restore_preclip(const struct cp_pending_clip *clip,
  * stream, and the main stream waits for the lane before the clip.
  */
 
-static void cp_pass_streams_init(struct cp_context *cp);
+static bool cp_pass_streams_init(struct cp_context *cp);
 
 /* What the main stream had enqueued at some point of a batch. */
 struct cp_devop_mark {
@@ -5460,8 +5496,7 @@ cp_vslane_arm(struct cp_context *cp, const struct cp_draw_batch *batch)
        cp->stream != cp->main_stream)
       return;
 
-   cp_pass_streams_init(cp);
-   if (!cp_vslane_stream(cp))
+   if (!cp_pass_streams_init(cp) || !cp_vslane_stream(cp))
       return;
 
    if (!cp->vslane.done &&
@@ -5616,6 +5651,8 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
       return;
    }
    cp_vslane_arm(cp, batch);
+   if (cp->device_fatal)
+      return;
    cp_draw_execute_batch_inner(cp, batch);
    cp_vslane_disarm(cp, batch);
 }
@@ -8627,7 +8664,7 @@ cp_batch_record_packet(struct cp_context *cp,
  * vertex-shader, fragment-shader and vertex-elements binds.
  */
 
-static void cp_pass_streams_init(struct cp_context *cp);
+static bool cp_pass_streams_init(struct cp_context *cp);
 
 static bool
 cp_pass_appendable(struct cp_context *cp,
@@ -8724,8 +8761,7 @@ cp_pass_appendable(struct cp_context *cp,
          return false;
    }
 
-   cp_pass_streams_init(cp);
-   return true;
+   return cp_pass_streams_init(cp);
 }
 
 /*
@@ -8737,44 +8773,60 @@ cp_pass_appendable(struct cp_context *cp,
  * rasterizer queue sets and the same gate event, and it never goes through the
  * blended admission test that used to be the only place they were built.
  */
-static void
+static bool
 cp_pass_streams_init(struct cp_context *cp)
 {
-   if (!cp->pass_streams_ready) {
-      cp->pass_streams_ready = true;
-      bool ok = cuEventCreate(&cp->pass_gate,
-                              CU_EVENT_DISABLE_TIMING) == CUDA_SUCCESS;
-      for (unsigned k = 0; ok && k < CP_PASS_STREAMS; k++) {
-         ok = cuStreamCreate(&cp->seg_streams[k],
-                             CU_STREAM_NON_BLOCKING) == CUDA_SUCCESS &&
-              cuEventCreate(&cp->seg_ev[k],
-                            CU_EVENT_DISABLE_TIMING) == CUDA_SUCCESS &&
-              cuMemAlloc(&cp->seg_qsets[k].nontrivial,
-                         (size_t)CP_MAX_NONTRIVIAL * sizeof(uint32_t)) ==
-                 CUDA_SUCCESS &&
-              cuMemAlloc(&cp->seg_qsets[k].huge_tiles,
-                         (size_t)CP_MAX_HUGE_TILES *
-                         sizeof(struct cp_tile_pair)) == CUDA_SUCCESS &&
-              cuMemAlloc(&cp->seg_qsets[k].counts, 256) == CUDA_SUCCESS;
-         if (cp->seg_streams[k])
-            cp->seg_stream_serial[k] =
-               cp_texture_stream_serial_alloc(cp->dev);
-      }
-      /* A cache refusal must not disable the side stream or its classic
-       * queues. Each stream owns the same 84-KiB evidence-sized capacity. */
-      if (ok && !cp_debug->no_setup_cache) {
-         for (unsigned k = 0; k < CP_PASS_STREAMS; k++)
-            if (cuMemAlloc(&cp->seg_qsets[k].setup_cache,
-                           (size_t)CP_SETUP_CACHE_CAPACITY *
-                           sizeof(struct cp_setup_cache_entry)) != CUDA_SUCCESS)
-               cp->seg_qsets[k].setup_cache = 0;
-      }
-      if (!ok) {
-         fprintf(stderr, "cudavk: pass-episode streams unavailable; "
-                 "episodes run on the main stream\n");
-         memset(cp->seg_streams, 0, sizeof(cp->seg_streams));
+   if (cp->pass_streams_ready)
+      return !cp->device_fatal;
+
+   cp->pass_streams_ready = true;
+   CUresult err = cuEventCreate(&cp->pass_gate, CU_EVENT_DISABLE_TIMING);
+   for (unsigned k = 0; err == CUDA_SUCCESS && k < CP_PASS_STREAMS; k++) {
+      err = cuStreamCreate(&cp->seg_streams[k], CU_STREAM_NON_BLOCKING);
+      if (err == CUDA_SUCCESS)
+         err = cuEventCreate(&cp->seg_ev[k], CU_EVENT_DISABLE_TIMING);
+      if (err == CUDA_SUCCESS)
+         err = cuMemAlloc(&cp->seg_qsets[k].nontrivial,
+                          (size_t)CP_MAX_NONTRIVIAL * sizeof(uint32_t));
+      if (err == CUDA_SUCCESS)
+         err = cuMemAlloc(&cp->seg_qsets[k].huge_tiles,
+                          (size_t)CP_MAX_HUGE_TILES *
+                          sizeof(struct cp_tile_pair));
+      if (err == CUDA_SUCCESS)
+         err = cuMemAlloc(&cp->seg_qsets[k].counts, 256);
+      if (cp->seg_streams[k])
+         cp->seg_stream_serial[k] =
+            cp_texture_stream_serial_alloc(cp->dev);
+   }
+
+   /* A cache OOM must not disable the side stream or its classic queues.
+    * Each stream owns the same 84-KiB evidence-sized capacity.  Other CUDA
+    * failures are device failures, not optional-cache refusals. */
+   if (err == CUDA_SUCCESS && !cp_debug->no_setup_cache) {
+      for (unsigned k = 0; k < CP_PASS_STREAMS; k++) {
+         err = cuMemAlloc(&cp->seg_qsets[k].setup_cache,
+                          (size_t)CP_SETUP_CACHE_CAPACITY *
+                          sizeof(struct cp_setup_cache_entry));
+         if (err == CUDA_ERROR_OUT_OF_MEMORY) {
+            cp->seg_qsets[k].setup_cache = 0;
+            err = CUDA_SUCCESS;
+         } else if (err != CUDA_SUCCESS) {
+            break;
+         }
       }
    }
+
+   if (err == CUDA_SUCCESS)
+      return true;
+
+   bool oom = err == CUDA_ERROR_OUT_OF_MEMORY;
+   if (!oom)
+      cp_renderer_texture_fatal(cp);
+   cp_pass_streams_cleanup(cp);
+   if (oom && !cp->device_fatal)
+      fprintf(stderr, "cudavk: pass-episode streams unavailable; "
+                      "episodes run on the main stream\n");
+   return !cp->device_fatal;
 }
 
 /*
@@ -8839,8 +8891,8 @@ cp_opaque_appendable(struct cp_context *cp,
    }
    /* An opaque episode that is going to fan out needs the same eight streams
     * a blended one uses, and blended admission may never have run. */
-   if (!cp_debug->no_opaque_streams)
-      cp_pass_streams_init(cp);
+   if (!cp_debug->no_opaque_streams && !cp_pass_streams_init(cp))
+      return false;
    return true;
 }
 
@@ -10883,6 +10935,10 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
       cp_opaque_append(cp, ndraws);
       return;
    }
+   /* Admission may have found a fatal CUDA failure while constructing its
+    * optional side-stream set.  Do not turn that into a classic draw. */
+   if (cp->device_fatal)
+      return;
 
    /* Whatever the episode holds was submitted before these draws. */
    cp_pass_finish(cp);
