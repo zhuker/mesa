@@ -143,6 +143,23 @@ This is the same pool the plan's 3.5 addresses (fuse the writeback into the
 shade) and `DEAD_ENDS` 15 parked. It is now measured, and it is the largest
 single item in the driver at 2.25 ms/frame.
 
+## Occupancy is not the lever either -- measured, and it goes the wrong way
+
+`main` stalls 64-77% on memory with 8-16% achieved occupancy, so raising
+occupancy is the obvious move. The register cap sets it, and forcing the cap
+lower buys warps at the price of spills:
+
+| cap | theoretical occupancy | frame vs default |
+|---|---:|---:|
+| 64 | 50% | **+0.52 ms** (arms disjoint) |
+| 96 | 33% | +0.02 whole, +0.06 heavy |
+| 128 (default) | 25% | — |
+| none (203 regs) | 15% | -0.04, overlap |
+
+**The tuned 128 is already the optimum**, and the curve is flat on one side and
+sharply worse on the other. Spilling costs more than the extra warps buy.
+There is no occupancy knob left.
+
 ## Verdict
 
 **Not proven unreachable, and not yet reachable.** The arithmetic:
@@ -158,7 +175,39 @@ which is a round-trip problem, not a bandwidth or arithmetic one. The round
 trips are `fs_in` (interpolated varyings) and `fs_out` (shaded colour read
 back by a separate writeback launch).
 
-**Still not proven unreachable.** The remaining question is how much of that
-2.25 ms survives if the varyings stay in registers and the writeback fuses --
-which is exactly `DEAD_ENDS` 15 and plan 3.5, now with a measured reason to
-retry rather than a modelled one.
+### The accounting, with every lever measured
+
+| lever | heavy ms | state |
+|---|---:|---|
+| bin+walk replaces clip+stage2+stage3 | 1.17 | available (probe 5) |
+| identity grouping of shade launches | 0.40 | available (probe 2 bounds it) |
+| `cp_fs_compact` reduction | 0.33 | available |
+| launch-count collapse, per-launch floor | 0.25 | available |
+| register / occupancy tuning | 0.00 | **refuted**: 64 regs +0.52, 96 neutral, none neutral |
+| fragment grid geometry | 0.00 | **refuted**: <= 0.05 ms |
+| host wait removal | 0.00 | **refuted**: absorbed (`DEAD_ENDS` 41) |
+| spill elimination | 0.00 | **refuted**: -0.04, overlap |
+| **sum** | **2.15** | |
+
+    heavy 7.288 - 2.15 (everything) = 5.14 ms
+    4x target                       = 2.33 ms
+    short by                          2.21x
+
+Of the 5.14 ms that would remain, **fragment shading is ~2.77 ms**. Reaching
+2.33 requires `main` under 1.0 ms -- a **2.8x** efficiency gain on a kernel
+that runs at 0.31% compute throughput, 0.14% DRAM, 64-77% memory-latency
+stalls, and whose occupancy is already at its measured optimum.
+
+**No measured lever produces that, and four candidate levers have been
+refuted rather than left untested.** Interpolation is already fused into the
+shader, so the `fs_in` round trip does not exist to remove; what remains is
+the per-fragment gather of vertex attributes and texture fetches, which is
+what a hardware rasteriser does in fixed-function units and a compute kernel
+cannot avoid.
+
+**Conclusion: 4x on the heavy band is not reachable within this
+architecture.** It is not a tuning gap; it is the cost of software
+rasterisation against fixed-function hardware, and the same conclusion the
+CuRast README states for this workload shape ("models with numerous meshes
+with few triangles, Vulkan remains 10x faster"). The loading band (1.942 vs a
+1.40 target) is the only one within reach of the levers above.
