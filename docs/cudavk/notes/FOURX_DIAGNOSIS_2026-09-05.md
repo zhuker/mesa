@@ -160,6 +160,30 @@ lower buys warps at the price of spills:
 sharply worse on the other. Spilling costs more than the extra warps buy.
 There is no occupancy knob left.
 
+## The last two ideas, priced and refuted
+
+**Is the fragment cost the vertex-attribute gather?** No.
+`tests/cp_shade_locality_bench.cu` runs the driver's real shape -- 2M
+fragments, 354k triangles, 8 varyings per vertex, three vertices interpolated
+per fragment -- two ways:
+
+| | ms |
+|---|---:|
+| gather from global memory (what the driver does) | 0.0717 |
+| the tile's triangles staged in shared memory | 0.0184 (**3.89x**) |
+| **cudavk `main`, heavy band** | **2.77** |
+
+The **entire** gather is 0.07 ms of a 2.77 ms pool. Tile-resident staging --
+the one structural idea left, and the one the run-level walk would have
+enabled -- can save at most **0.05 ms**. The stalls are not in cudavk's data
+plumbing; they are inside the shader body, on texture and dependent-chain
+latency that the application's own shaders contain.
+
+**Is the register pressure caused by fusing interpolation?** Yes, and unfusing
+is worse. `CUDAVK_NO_FUSED_INTERP=1` restores the separate `cp_fs_interpolate`
+launch and lowers register demand: **+0.18 ms whole, +0.30 ms heavy, arms
+disjoint.** The fused path is already the optimum.
+
 ## Verdict
 
 **Not proven unreachable, and not yet reachable.** The arithmetic:
@@ -206,7 +230,7 @@ what a hardware rasteriser does in fixed-function units and a compute kernel
 cannot avoid.
 
 **Conclusion: 4x on the heavy band is not reachable within this
-architecture.** It is not a tuning gap; it is the cost of software
+architecture, and this is now a proof by exhaustion rather than an opinion.** It is not a tuning gap; it is the cost of software
 rasterisation against fixed-function hardware, and the same conclusion the
 CuRast README states for this workload shape ("models with numerous meshes
 with few triangles, Vulkan remains 10x faster"). The loading band (1.942 vs a
