@@ -257,6 +257,8 @@ struct cp_run_geometry_group {
    uint32_t num_draws;
    CUdeviceptr storage;
    CUdeviceptr output;
+   size_t storage_capacity;
+   size_t output_capacity;
 };
 
 struct cp_context {

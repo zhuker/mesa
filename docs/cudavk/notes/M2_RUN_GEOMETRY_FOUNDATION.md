@@ -52,9 +52,11 @@ run can safely fall back before downstream fragment execution.
 
 - Only `MESA_PRIM_TRIANGLES` uses the grouped launch. Topologies needing the
   host-expanded vertex/instance id arrays use the old per-batch path.
-- Group storage currently uses `cuMemAlloc`/`cuMemFree`. This gives a simple
-  proven lifetime but makes the flag a correctness milestone, not yet a fair
-  performance arm. A run-owned reusable allocation is the next memory step.
+- Group argument and output storage is context-owned and grow-only. Group
+  slots are reused after the hard boundary has issued all old consumers; main
+  stream order plus the opaque side-stream join prevents overwrite races.
+  `cuMemAlloc`/`cuMemFree` occurs only when a slot grows and at cleanup, not
+  once per group or run.
 - The current clip/raster/shade path still runs once per saved batch. This
   slice removes only fused VS launches; run-global clip/bin/walk/compaction is
   later M2 work.

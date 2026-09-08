@@ -1166,6 +1166,12 @@ cp_context_cleanup(struct cp_context *cp)
    free(cp->pass_group_ubos);
    free(cp->run_geometry.batches);
    free(cp->run_geometry.members);
+   for (unsigned g = 0; g < cp->run_geometry.group_capacity; g++) {
+      if (cp->run_geometry.groups[g].output)
+         cuMemFree(cp->run_geometry.groups[g].output);
+      if (cp->run_geometry.groups[g].storage)
+         cuMemFree(cp->run_geometry.groups[g].storage);
+   }
    free(cp->run_geometry.groups);
    free(cp->run_geometry.spans);
 }
@@ -10928,11 +10934,18 @@ cp_run_geometry_plan(struct cp_context *cp)
 
    if (!cp_run_geometry_reserve((void **)&cp->run_geometry.members,
                                 &cp->run_geometry.member_capacity, n,
-                                sizeof(cp->run_geometry.members[0])) ||
-       !cp_run_geometry_reserve((void **)&cp->run_geometry.groups,
+                                sizeof(cp->run_geometry.members[0])))
+      return false;
+   unsigned old_group_capacity = cp->run_geometry.group_capacity;
+   if (!cp_run_geometry_reserve((void **)&cp->run_geometry.groups,
                                 &cp->run_geometry.group_capacity, n,
-                                sizeof(cp->run_geometry.groups[0])) ||
-       !cp_run_geometry_reserve((void **)&cp->run_geometry.spans,
+                                sizeof(cp->run_geometry.groups[0])))
+      return false;
+   if (cp->run_geometry.group_capacity > old_group_capacity)
+      memset(cp->run_geometry.groups + old_group_capacity, 0,
+             (size_t)(cp->run_geometry.group_capacity - old_group_capacity) *
+                sizeof(cp->run_geometry.groups[0]));
+   if (!cp_run_geometry_reserve((void **)&cp->run_geometry.spans,
                                 &cp->run_geometry.span_capacity, n,
                                 sizeof(cp->run_geometry.spans[0])))
       return false;
@@ -10953,11 +10966,19 @@ cp_run_geometry_plan(struct cp_context *cp)
       if (g == cp->run_geometry.ngroups) {
          struct cp_run_geometry_group *group =
             &cp->run_geometry.groups[cp->run_geometry.ngroups++];
+         CUdeviceptr storage = group->storage;
+         CUdeviceptr output = group->output;
+         size_t storage_capacity = group->storage_capacity;
+         size_t output_capacity = group->output_capacity;
          *group = (struct cp_run_geometry_group) {
             .kernel = cp->run_geometry.batches[i].state.vs->
                          exec[CP_SHADER_EXEC_VS_FETCH].kernel,
             .first_batch = i,
             .first_member = i, /* fixed after the count pass below */
+            .storage = storage,
+            .output = output,
+            .storage_capacity = storage_capacity,
+            .output_capacity = output_capacity,
          };
       }
       which[i] = g;
@@ -10987,6 +11008,31 @@ cp_run_geometry_plan(struct cp_context *cp)
       fprintf(stderr, "run-geometry-plan: batches=%u groups=%u members=%u\n",
               n, cp->run_geometry.ngroups, cursor);
    free(which);
+   return true;
+}
+
+/* Grow-only run resources. Reuse is safe because a new run cannot be
+ * collected until the hard boundary which issued all consumers of the old
+ * one. A rare growth uses legacy cuMemFree and may synchronize; steady state
+ * performs neither an allocation nor a free. */
+static bool
+cp_run_geometry_device_reserve(CUdeviceptr *ptr, size_t *capacity, size_t need)
+{
+   if (*capacity >= need)
+      return true;
+   size_t cap = MAX2(*capacity, (size_t)4096);
+   while (cap < need) {
+      if (cap > SIZE_MAX / 2)
+         return false;
+      cap *= 2;
+   }
+   CUdeviceptr fresh = 0;
+   if (cuMemAlloc(&fresh, cap) != CUDA_SUCCESS)
+      return false;
+   if (*ptr)
+      cuMemFree(*ptr);
+   *ptr = fresh;
+   *capacity = cap;
    return true;
 }
 
@@ -11043,14 +11089,18 @@ cp_run_geometry_launch_group(struct cp_context *cp,
    void *host = calloc(1, storage_bytes);
    if (!host)
       return false;
-   CUdeviceptr storage = 0, output = 0;
-   if (cuMemAlloc(&storage, storage_bytes) != CUDA_SUCCESS ||
-       cuMemAlloc(&output, (size_t)total_verts * out_stride) != CUDA_SUCCESS) {
-      if (storage) cuMemFree(storage);
-      if (output) cuMemFree(output);
+   size_t output_bytes = (size_t)total_verts * out_stride;
+   if (!cp_run_geometry_device_reserve(&group->storage,
+                                       &group->storage_capacity,
+                                       storage_bytes) ||
+       !cp_run_geometry_device_reserve(&group->output,
+                                       &group->output_capacity,
+                                       output_bytes)) {
       free(host);
       return false;
    }
+   CUdeviceptr storage = group->storage;
+   CUdeviceptr output = group->output;
 
    struct cp_draw_slice *slices = host;
    uint64_t *bases = (uint64_t *)((char *)host + bases_off);
@@ -11159,7 +11209,7 @@ cp_run_geometry_launch_group(struct cp_context *cp,
 
    if (cuMemcpyHtoDAsync(storage, host, storage_bytes, cp->stream) !=
        CUDA_SUCCESS) {
-      cuMemFree(output); cuMemFree(storage); free(host);
+      free(host);
       for (unsigned m = 0; m < group->num_members; m++)
          cp->run_geometry.spans[members[m].batch] =
             (struct cp_run_geometry_span) { 0 };
@@ -11172,7 +11222,6 @@ cp_run_geometry_launch_group(struct cp_context *cp,
       MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
       0, cp->stream, params, NULL);
    if (err != CUDA_SUCCESS) {
-      cuMemFree(output); cuMemFree(storage);
       for (unsigned m = 0; m < group->num_members; m++)
          cp->run_geometry.spans[members[m].batch] =
             (struct cp_run_geometry_span) { 0 };
@@ -11263,14 +11312,9 @@ cp_run_geometry_drain(struct cp_context *cp)
 static void
 cp_run_geometry_release(struct cp_context *cp)
 {
-   for (unsigned g = 0; g < cp->run_geometry.ngroups; g++) {
-      if (cp->run_geometry.groups[g].output)
-         cuMemFree(cp->run_geometry.groups[g].output);
-      if (cp->run_geometry.groups[g].storage)
-         cuMemFree(cp->run_geometry.groups[g].storage);
-      cp->run_geometry.groups[g].output = 0;
-      cp->run_geometry.groups[g].storage = 0;
-   }
+   /* Buffers are grow-only context storage. The next run reuses slots from
+    * zero; their contents may be overwritten only after this hard boundary
+    * has submitted every old consumer on the ordered renderer streams. */
    cp->run_geometry.ngroups = cp->run_geometry.nmembers = 0;
 }
 
