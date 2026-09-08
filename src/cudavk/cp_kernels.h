@@ -49,6 +49,7 @@ struct cp_kernels {
    CUfunction run_chunk_count, run_chunk_build;
    CUfunction run_tile_walk, run_compact;
    CUfunction opaque_tile_raster_split;
+   CUfunction rasterize_stage3_merged;
    CUfunction rasterize_stage2;
    CUfunction rasterize_stage3;
    /* The same three with the A-buffer's count/fill branch compiled in. Only

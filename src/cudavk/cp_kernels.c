@@ -399,6 +399,8 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
 
    if (!build_module(&k->module, cp_rasterize_src, "cp_rasterize.cu", sm_major, sm_minor))
       goto fail;
+   cuModuleGetFunction(&k->rasterize_stage3_merged, k->module,
+                       "cp_rasterize_stage3_merged");
    cuModuleGetFunction(&k->opaque_tile_raster_split, k->module,
                        "cp_opaque_tile_raster_split");
    cuModuleGetFunction(&k->run_bin_count, k->module, "cp_run_bin_count");

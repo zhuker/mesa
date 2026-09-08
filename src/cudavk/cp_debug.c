@@ -113,6 +113,11 @@ static const struct cp_flag_def flags[] = {
      "trace every draw: geometry, attachments, and why a draw was skipped" },
    { "CUDAVK_DEBUG_TEX", CP_FLAG_BOOL_PRESENCE, F(debug_tex),
      "trace sampler and texture-handle setup" },
+   { "CUDAVK_MERGE_STAGE3", CP_FLAG_BOOL_VALUE, F(merge_stage3),
+     "EXPERIMENTAL, hangs: drain every segment's stage-3 queue in one launch "
+     "per opaque episode instead of one per segment. Stage 3 is 100% "
+     "per-launch fixed cost so the prize is 0.33 ms/frame, but the first "
+     "implementation loses the device (see M2_PROGRESS_2026-09-05)" },
    { "CUDAVK_NO_DEPTH_ONLY_EPISODE", CP_FLAG_BOOL_VALUE, F(no_depth_only_episode),
      "keep depth-only batches out of opaque episodes, so a shadow scope runs "
      "one visibility pass per batch instead of one per episode" },

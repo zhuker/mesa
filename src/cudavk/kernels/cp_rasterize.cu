@@ -1414,6 +1414,34 @@ cp_rasterize_stage3(struct cp_rasterize_args args, struct cp_rast_queues queues)
    cp_rasterize_stage3_body<false>(args, queues);
 }
 
+/*
+ * Stage 3 for a whole opaque episode in ONE launch.
+ *
+ * Stage 3 is 100% per-launch fixed cost in the duration model: 65.4 launches
+ * a frame for 0.392 ms of union-exclusive time, and its grid is a fixed 2,048
+ * blocks because tile counts are only known on the device. It costs what it
+ * costs because it is launched once per segment.
+ *
+ * Both later stages grid-stride their queue, so any grid is correct -- which
+ * means one launch can drain every segment's queue in turn. The segments'
+ * arguments and queue sets are already recorded (cp_pass_seg), and the
+ * episode already joins its side streams before shading, so all of stage 2 is
+ * complete before this runs. Visibility writes are atomicMin on globally
+ * numbered primitives, so draining the queues in one launch instead of N
+ * changes no result.
+ */
+extern "C" __global__ void
+cp_rasterize_stage3_merged(uint64_t args_array, uint64_t queues_array,
+                           uint32_t nseg)
+{
+   const struct cp_rasterize_args *aa =
+      (const struct cp_rasterize_args *)(uintptr_t)args_array;
+   const struct cp_rast_queues *qq =
+      (const struct cp_rast_queues *)(uintptr_t)queues_array;
+   for (uint32_t s = 0; s < nseg; s++)
+      cp_rasterize_stage3_body<false>(aa[s], qq[s]);
+}
+
 extern "C" __global__ void
 cp_rasterize_stage1_abuf(struct cp_rasterize_args args,
                          struct cp_rast_queues queues)

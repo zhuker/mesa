@@ -7975,12 +7975,23 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          s2_blocks, 1, 1, 256, 1, 1,
          0, cp->stream, s2_params, NULL);
 
-      /* Stage 3: block per tile, grid-strided over the huge-tile queue */
-      void *s3_params[] = { &rast_args, &rast_queues };
-      CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2,
-         CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage3,
-         s3_blocks, 1, 1, 64, 1, 1,
-         0, cp->stream, s3_params, NULL);
+      /*
+       * Stage 3: block per tile, grid-strided over the huge-tile queue.
+       *
+       * Deferred for an opaque episode's segments: stage 3 is 100% per-launch
+       * fixed cost, and one launch at cp_opaque_finish() drains every
+       * segment's queue instead of one launch each. The stages stride their
+       * queues, so the merged form is the same work in one grid.
+       */
+      bool defer_s3 = cp_debug->merge_stage3 && cp->pass.appending &&
+                      cp->pass.opaque && screen->kernels.rasterize_stage3_merged;
+      if (!defer_s3) {
+         void *s3_params[] = { &rast_args, &rast_queues };
+         CP_LAUNCH_AFTER(screen->kernels.rasterize_stage2,
+            CP_PDL_TIER_RASTER, screen->kernels.rasterize_stage3,
+            s3_blocks, 1, 1, 64, 1, 1,
+            0, cp->stream, s3_params, NULL);
+      }
 
       if (rast_err != CUDA_SUCCESS && cp_debug->debug_draw)
          fprintf(stderr, "  rasterize launch failed: %d\n", rast_err);
@@ -9249,6 +9260,30 @@ cp_opaque_finish(struct cp_context *cp)
     * price of the fan-out and none of its benefit. */
    if (cp_opaque_side_streams(cp) && !cp_pass_join(cp, nsegs - 1))
       return;
+
+   /*
+    * The deferred stage 3 for every segment, in one launch. Ordered behind
+    * the join above, so all of stage 2 is complete.
+    */
+   struct cp_device *mscreen = cp->dev;
+   if (cp_debug->merge_stage3 && mscreen->kernels.rasterize_stage3_merged) {
+      struct cp_rasterize_args ra[CP_PASS_MAX_SEGS];
+      struct cp_rast_queues rq[CP_PASS_MAX_SEGS];
+      for (unsigned s = 0; s < nsegs; s++) {
+         ra[s] = segs[s].rast;
+         rq[s] = segs[s].queues;
+      }
+      CUdeviceptr ra_dev = cp_upload(cp, ra, (size_t)nsegs * sizeof(ra[0]));
+      CUdeviceptr rq_dev = cp_upload(cp, rq, (size_t)nsegs * sizeof(rq[0]));
+      if (ra_dev && rq_dev) {
+         void *mp[] = { &ra_dev, &rq_dev, &nsegs };
+         CP_LAUNCH(mscreen->kernels.rasterize_stage3_merged, 2048, 1, 1,
+                   64, 1, 1, 0, cp->stream, mp, NULL);
+      } else {
+         cp_pass_fallback(cp, segs, nsegs);
+         return;
+      }
+   }
 
    if (cp_debug->tiled_opaque &&
        !cp_opaque_tile_visibility(cp, segs, nsegs, w, h)) {

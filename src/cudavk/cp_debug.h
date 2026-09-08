@@ -175,6 +175,7 @@ struct cp_debug {
    bool wide_episode;
    bool no_depth_only_batch;
    bool no_depth_only_episode;
+   bool merge_stage3;
    bool debug_vfetch;
    bool debug_work;
    bool debug_discard;
