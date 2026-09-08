@@ -322,12 +322,28 @@ hiding, by arithmetic:
 
 Measured issue is 2-12% of peak, which is exactly the 128-register cap.
 
-**The goal needs fragment shading 4.9x faster -- about 36% of peak issue --
-and no register count reaches it.** Even a *perfect* 32-register shader at
-100% occupancy tops out near 30%, and these shaders need 203. Lowering the cap
-to get warps only trades them for the spill reloads that already dominate the
-memory traffic (35.5 local loads per warp against 5.9 global), which is why
-every cap between 64 and 203 measures neutral or worse.
+**The goal needs fragment shading 4.9x faster -- about 36% of peak issue.**
+The occupancy table above is a necessary but not sufficient argument, because
+cycles-per-instruction is not a constant: fewer memory operations would raise
+the issue rate at unchanged occupancy. So the honest test is whether removing
+the memory operations helps. **It was already run, and it does not.**
+
+The driver's own shader census gives the two endpoints:
+
+    fragment fused  regs 203  spill    0  blocks/sm 1   (10 warps, 15.6% occupancy)
+             capped regs 126  spill  168  blocks/sm 2   (16 warps, 25.0% occupancy)
+
+At 203 registers there are **no spills at all** -- the 35.5 local loads per
+warp vanish -- and `CUDAVK_NO_REGCAP=1` measures **-0.04 ms, arms
+overlapping.** More warps while spilling, or fewer warps without spilling:
+**identical frame time.** The product of occupancy and issue efficiency is
+invariant across the whole register range, which is what a pure memory-latency
+bound looks like when no configuration on the curve can hide it.
+
+That is the empirical form of the argument, and it does not depend on treating
+cycles-per-instruction as fixed. Every cap from 64 to 203 -- including the
+zero-spill end -- lands within 0.06 ms of the same frame, except 64 which is
+0.52 ms worse.
 
 ## Verdict
 
