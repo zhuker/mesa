@@ -488,7 +488,15 @@ permuted, since the driver already asserts order-independence for them, so
 A,B,A,B could be grouped into A,A,B,B. Probe 2's identity counts bound it at
 about **0.34 ms/frame**.
 
-**But summing it with everything else still does not reach the target:**
+**Corrected before building it.** The 0.34 ms figure assumed whole batches
+collapse. They do not: an opaque episode **already** shares its visibility
+pass and groups its segments by shader identity for shading
+(`cp_opaque_finish`'s `seg_group`). Only the *vertex* launch is per segment,
+and it is one launch of about eight. At 18 segments/frame and ~2.8 us per
+launch, merging vertex launches by identity is worth **0.02-0.04 ms**, not
+0.34. Reordering is struck from the list.
+
+**Summing what is left still does not reach the target:**
 
     favorite3 whole now                     5.176 ms
       - frame-wide deferred shading         -0.411
@@ -496,9 +504,9 @@ about **0.34 ms/frame**.
       - fs_writeback fused                  -0.109
       - abuf_support from sorted lists      -0.098
       - frame-boundary host cost            -0.560
-      - reorder order-free draws            -0.340
-      = every identified lever built         3.390 ms
-        4x target                            2.088 ms   over by 1.62x
+      - reorder order-free draws            -0.030   (corrected from 0.340)
+      = every identified lever built         3.700 ms
+        4x target                            2.088 ms   over by 1.77x
 
 **3.09 ms is needed and 1.79 ms is identified.** The 1.30 ms shortfall has no
 lever named for it, and the one large structural idea that was supposed to
