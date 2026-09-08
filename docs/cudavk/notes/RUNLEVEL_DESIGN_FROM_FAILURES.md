@@ -60,15 +60,33 @@ window near **2.0-2.6 ms**, i.e. **3.8-5x native** -- the first configuration
 in this investigation whose ceiling reaches the objective rather than falling
 short of it.
 
-## What to measure first, before building
+## Probe 1, answered: no tagging is needed at all
 
-1. **Segment-tagged queue entries**: does `cp_rast_queues` have room for a
-   segment index, or does the entry format need widening? Widening costs
-   bandwidth on the hottest array in the frame.
-2. **One episode-wide queue's capacity**: today's sets are sized per segment;
+The queue entries do not need a segment index, because **they already carry
+one implicitly**. A `cp_tile_pair` holds `tri_id`, and inside an episode that
+id is **episode-global** (`abuf_prim_base` offsets each segment's primitives
+into a shared numbering, `CP_PRIM_ID_LIMIT` = 2^30). The driver already
+resolves a segment from a global id:
+
+    cp_resolve_seg_range(args, gprim)          cp_fs_interp.h:267
+      binary-searches struct cp_seg_range[]    sorted by prim_base
+      and rewrites positions, prim_refs, draw_slices, prim_shift,
+      abuf_prim_base and row_base for that segment
+
+`struct cp_seg_range` (`cp_rast_types.h:898`) carries exactly the per-segment
+state stages 2 and 3 would need, and `cp_fs_compact` already calls this per
+primitive on the blended path. So an episode-wide queue needs **no format
+change, no widening, and no extra bandwidth** -- only that stages 2 and 3
+resolve their segment the same way the fragment path already does.
+
+That removes the largest risk in the design and the only one that would have
+cost bandwidth on the hottest array in the frame.
+
+## What else to measure before building
+1. **One episode-wide queue's capacity**: today's sets are sized per segment;
    an episode of 12.84 segments needs the sum, and `CP_MAX_OPAQUE_TILE_REFS`
    already bounds a comparable array.
-3. **The join cost**: merging requires all segments' vertex and clip work
+2. **The join cost**: merging requires all segments' vertex and clip work
    complete before stage 2. The episode joins already, but earlier in the
    pipeline than today.
 
