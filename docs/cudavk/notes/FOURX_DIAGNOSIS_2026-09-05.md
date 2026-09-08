@@ -658,6 +658,24 @@ attempt failed by an order of magnitude. Anyone resuming should start there,
 with `redesign/runlevel` and `M2_PROGRESS_2026-09-05.md`, and should treat the
 microbenchmark figure as unproven in situ until a driver A/B says otherwise.
 
+## The frame boundary, checked: no lever there either
+
+The last unattacked pool was the 0.94 ms/frame of host time between frames,
+of which ~0.56 is cudavk's. It resolves the same way as the others:
+
+- the completion worker blocks on `cuEventSynchronize` on its own thread --
+  no spinning, no polling;
+- the batch planner is **fully cached**: "batch plan answered 490,448 of
+  490,448 merge decisions (100.0%)", so nothing is recomputed per submission;
+- `RESIDUAL_AUDITS_2026-08-31.md`, a DWARF host profile taken without CUPTI,
+  already concluded that **no exclusive host subtree reaches 0.500 ms/frame in
+  steady state**, and that steady-state planning is "about 0.33 ms/frame
+  across dozens of functions".
+
+What remains is per-command recording cost, proportional to the Vulkan calls
+the application makes, spread across dozens of entry points. There is no
+single lever, which is why the 0.56 ms was always a pool rather than a plan.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
