@@ -438,6 +438,38 @@ With all of them, and the run-level design applied to each:
 used an incomplete pool list), and not the "below the floor" of the section
 before that (which treated the frame boundary as fixed).
 
+## Two wins, and one estimate refuted -- the position after building
+
+**Landed, both default-on, both bit-identical, both A/B'd on two captures:**
+
+| change | favorite3 whole | favorite3 heavy | favorite2 heavy |
+|---|---:|---:|---:|
+| opaque episodes span viewport/raster/depth changes | -0.076 | -0.075 | -0.265 |
+| depth-only scopes batch | -0.657 | -1.151 | -0.279 |
+| **combined, measured together** | **-0.733** | **-1.226** | **-0.544** |
+
+favorite3 is **5.176 whole / 6.023 heavy**, down from 5.909 / 7.249; favorite2
+**4.867 / 5.054**. Against native that is **9.92x whole and 10.35x heavy**,
+from 11.32x and 12.46x.
+
+Both came from the same move, and it is the transferable lesson of this
+document: **a measurement that says "the workload does this" may be a driver
+policy nobody re-examined.** The episode-wide state comparison and the
+colour-attachment test were each one predicate, and each was asking for
+something no consumer needed.
+
+**And the largest estimated lever is refuted.** "bin+walk replaces clip +
+stage2 + stage3" was priced at **-1.039 ms** of device time. Built and measured
+twice, on two baselines and with coverage doubled by the wins above, the tiled
+path is **+1.57 whole / +1.80 heavy -- worse**. The bin pass costs more than
+the stages it displaces at every coverage tested. It is removed from the
+accounting.
+
+    favorite3 whole 5.176 - 1.446 (everything still standing) = 3.730
+    4x target                                                   2.088   over by 1.79x
+    favorite3 heavy 6.023 - 1.735                             = 4.288
+    4x target                                                   2.328   over by 1.84x
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
