@@ -470,6 +470,43 @@ accounting.
     favorite3 heavy 6.023 - 1.735                             = 4.288
     4x target                                                   2.328   over by 1.84x
 
+## The position after two wins and one refutation
+
+Batches are down 17.8% (179,976 -> 148,007) and the merge rate is up from
+74.2% to 80.1%. What still breaks a batch:
+
+| cause | count | share |
+|---|---:|---:|
+| vertex shader | 95,448 | 68% |
+| fragment shader | 38,263 | 27% |
+| draw not batchable | 2,894 | 2% |
+| triangle cap / rasterizer | 412 | — |
+
+A batch is one vertex-shader launch, so a shader change genuinely ends it.
+The one idea left there is **reordering**: consecutive order-free draws may be
+permuted, since the driver already asserts order-independence for them, so
+A,B,A,B could be grouped into A,A,B,B. Probe 2's identity counts bound it at
+about **0.34 ms/frame**.
+
+**But summing it with everything else still does not reach the target:**
+
+    favorite3 whole now                     5.176 ms
+      - frame-wide deferred shading         -0.411
+      - fs_compact once per run             -0.268
+      - fs_writeback fused                  -0.109
+      - abuf_support from sorted lists      -0.098
+      - frame-boundary host cost            -0.560
+      - reorder order-free draws            -0.340
+      = every identified lever built         3.390 ms
+        4x target                            2.088 ms   over by 1.62x
+
+**3.09 ms is needed and 1.79 ms is identified.** The 1.30 ms shortfall has no
+lever named for it, and the one large structural idea that was supposed to
+supply it -- bin+walk -- measured 1.8 ms worse than doing nothing.
+
+That is the state: not a proof of impossibility, but an accounting in which
+every known item is priced and the total falls short by a factor of 1.6.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
