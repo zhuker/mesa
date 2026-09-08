@@ -2702,3 +2702,40 @@ confident wrong verdict that the next measurement overturned -- and the sixth,
 which called a driver policy a property of the workload, was worth 0.15 ms
 once questioned. **When a measurement says "the workload does this", check
 whether the driver had to care.**
+
+## 45. Reducing launch count by merging kernels: five attempts, all slower
+
+2026-09-05, and the counterpart to entry 44. Every attempt to shrink a pool by
+issuing fewer, wider launches was built and measured **worse**:
+
+| attempt | result |
+|---|---:|
+| bin+walk replacing clip/stage2/stage3, 32 px tiles | **+1.57 whole / +1.80 heavy** |
+| the same at 16 px tiles | **+2.09 / +2.51** |
+| depth-only batches forming their own episodes | +0.089 / +0.179 |
+| merged stage 3 across an episode | **device lost**, then +0.147 / +0.208 once fixed |
+
+**The estimate that motivated them was wrong in a specific, repeatable way.**
+The duration model reports each kernel's per-launch "floor" as a share of
+**summed** duration. Stage 3 sums to 0.778 ms/frame and is **0.392
+union-exclusive**: half its launch time is already overlapped with other work.
+Multiplying a floor share by a launch count therefore prices something the
+fan-out has already hidden. That is `DEAD_ENDS` 22's merge rule -- a
+launch-removal credit is collectable only where launches were serial -- and it
+was violated twice in one investigation, first by quoting the fragment pool at
+its summed 2.25 ms instead of its union-exclusive 0.729.
+
+**Two structural facts came out of the failures and are worth keeping:**
+
+1. **`CP_PASS_STREAMS` queue sets bound how late any per-segment work can
+   run.** A stream owns one rasterizer queue set, so with 8 sets and 12.84
+   segments an episode wraps: segment 8 rebuilds the queues segment 0 has not
+   drained. Deferring stage 3 past that loses the device; capping the episode
+   at `CP_PASS_STREAMS` segments fixes it and renders bit-identically.
+2. **The tile walk is bound by per-tile and per-block cost, not pixel tests.**
+   16 px tiles quarter the pixels for ~1.5x the references and measure
+   *worse*, which a microbenchmark over a synthetic tile list cannot show.
+
+**The rule.** Before pricing a merge, check whether the launches being merged
+already overlap. If a pool's union-exclusive time is well below its summed
+time, the fan-out is already collecting most of what the merge would.
