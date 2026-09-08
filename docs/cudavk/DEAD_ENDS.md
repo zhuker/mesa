@@ -65,13 +65,26 @@ component of the measured frame has at least one entry that closed it:
 | vertex shading | 0.434 | 7, 14, 35 | 70% per-launch floor; exact post-transform reuse refuted at a 0.438 ceiling |
 | memcpy / uploads | 0.221 | 8, 37, 40, 42 | HtoD is 0.104 ms/frame; UM fault stall 0.374, 90% of it one application allocation |
 | vertex fetch | 0.125 | 14 | fused as a device link, landed, then superseded |
-| between-kernel gaps | ~1.200 | 1, 25 | CUDA graphs at three units: 318,454 candidate tails yield 65,905 exact keys; bounded LRU hits 69-76% |
+| fs_compact | 0.368 | 26, 44 | |
+| memset / clears | 0.258 | 7, 19 | |
+| abuf_support | 0.198 | 6, 11, 21 | |
+| fs_writeback | 0.109 | 15 (parked) | |
+| stage 1, small ops | 0.378 | 19, 44 | |
+| **all kernels, union-exclusive** | **4.009** | | |
 | host waits | ~0 | 16, 17, 34, 41 | not host-bound; injecting 0.449 ms/frame before the largest wait does not move the frame |
 | application boundary | 0.376 | -- | record and decode in the harness, outside the driver |
+| submit / between-kernel residue | 0.813 | 1, 25 | CUDA graphs at three units: 318,454 candidate tails yield 65,905 exact keys; bounded LRU hits 69-76% |
+| **measured frame** | **5.198** | | |
 
-**45 entries, no open lead, 82% of the frame accounted for by name.** The
-remaining ~18% is launch ramp and tail distributed across the pools above,
-which entry 45 shows is not separately collectible.
+**45 entries, no open lead, and the frame closes exactly**: 4.009 device +
+0.376 application + 0.813 submit residue = 5.198 ms.
+
+Note the arithmetic trap this table exists to avoid. Summing the six largest
+pools gives 2.698 ms and implies a 1.200 ms gap; the union-exclusive device
+total is 4.009 and the real gap is **0.813**. Summing named pools instead of
+taking the union overstated the most attackable component by 48%, which is the
+same double-counting error that `DEAD_ENDS` 22 records and that drove four of
+the five failed rewrites.
 
 The target is 2.088 ms. The largest single component is 0.729 ms and is
 physically bounded; the largest *addressable* one is the between-kernel gap,
