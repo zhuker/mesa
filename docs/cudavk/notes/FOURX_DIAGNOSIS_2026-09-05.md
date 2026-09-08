@@ -818,6 +818,30 @@ is 1.47x, and it grew rather than shrank as the analysis got more careful --
 which is the opposite of what happened every other time this document was
 corrected.
 
+## The floor's largest term, checked from first principles
+
+Fragment shading is 0.729 ms, 27% of the floor, so it is worth verifying
+rather than trusting:
+
+    0.729 ms x 2.87 GHz x 170 SMs x 128 lanes = 45.5 billion lane-cycles
+    2,110,375 fragments shaded (CUDAVK_DEBUG_DISCARD)
+    at the measured 2% issue efficiency -> ~431 instructions per fragment
+
+**431 instructions is an entirely ordinary game pixel shader.** So neither the
+fragment count nor the shader length is anomalous: the 0.729 ms is 431
+instructions each waiting the measured **53 cycles** per issued instruction,
+and 53 cycles is hidden only by ~53 resident warps. The register file gives
+16.
+
+    431 instructions x 53 cycles = 22,843 lane-cycles per fragment
+
+That is the whole story of this driver's fragment cost, and it is consistent
+with every other measurement: 0.31% compute throughput, 0.14% DRAM, 64-77%
+long-scoreboard stalls, and a frame time invariant across the entire
+register/spill curve. The work is ordinary, the latency is real, and the warps
+needed to hide it do not fit in the register file at these shaders' live-value
+count.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
