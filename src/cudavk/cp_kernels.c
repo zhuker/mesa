@@ -411,6 +411,8 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
                        "cp_run_clip_bin_fill");
    cuModuleGetFunction(&k->run_clip_bin_validate_cursors, k->module,
                        "cp_run_clip_bin_validate_cursors");
+   cuModuleGetFunction(&k->run_clip_bin_fallback_raster, k->module,
+                       "cp_run_clip_bin_fallback_raster");
    k->rasterize_triangles = k->rasterize_stage1;
    cuModuleGetFunction(&k->clear_visbuf, k->module, "cp_clear_visbuf");
    cuModuleGetFunction(&k->peel_advance, k->module, "cp_peel_advance");

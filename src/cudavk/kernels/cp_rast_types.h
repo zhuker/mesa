@@ -1414,16 +1414,30 @@ struct cp_run_clip_bin_args {
    uint32_t tiles_y;
 };
 
+/* One launch covers every stable primitive in the run.  The kernel reads
+ * each cp_rasterize_args verbatim and is the inverse of the tiled visibility
+ * arm: zero errors return before geometry is touched; any error selects exact
+ * ordinary depth-tested visbuf rasterization. */
+struct cp_run_clip_bin_fallback_args {
+   uint64_t rast_args; /* const cp_rasterize_args[num_segments] */
+   uint64_t errors;    /* shared uint32 transaction predicate */
+   uint32_t num_segments;
+};
+
 #ifdef __CUDACC__
 static_assert(CP_RUN_CLIP_BIN_MAX_SEGS <= CP_PASS_MAX_SEGS,
               "run segments must fit pass storage");
 static_assert(sizeof(struct cp_run_clip_bin_live) == 8, "run live ABI");
 static_assert(sizeof(struct cp_run_clip_bin_args) == 64, "run bin args ABI");
+static_assert(sizeof(struct cp_run_clip_bin_fallback_args) == 24,
+              "run fallback args ABI");
 #else
 _Static_assert(CP_RUN_CLIP_BIN_MAX_SEGS <= CP_PASS_MAX_SEGS,
                "run segments must fit pass storage");
 _Static_assert(sizeof(struct cp_run_clip_bin_live) == 8, "run live ABI");
 _Static_assert(sizeof(struct cp_run_clip_bin_args) == 64, "run bin args ABI");
+_Static_assert(sizeof(struct cp_run_clip_bin_fallback_args) == 24,
+               "run fallback args ABI");
 #endif
 
 struct cp_run_clip_bin_check_counts_args {

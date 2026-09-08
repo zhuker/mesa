@@ -108,6 +108,9 @@ if not cm or int(cm.group(1)) < 2 or int(cm.group(2)) == 0:
     raise SystemExit("whole-run clip+bin transaction was not reached\n" + clip_log)
 if "run-clip-bin-commit:" not in clip_log:
     raise SystemExit("run clip+bin did not report a committed continuation\n" + clip_log)
+if clip_log.count("run-clip-bin-fallback-launch:") != 1:
+    raise SystemExit("success did not enqueue exactly one run-wide inverse grid\n" +
+                     clip_log)
 
 # A tiny dense-list capacity makes the uint64 count check set the shared
 # predicate. The classic visibility arm must consume the same clipped geometry
@@ -118,6 +121,9 @@ overflow_hash, overflow_log = arm(
            "CUDAVK_RUN_CLIP_BIN_CAPACITY": "1"})
 if overflow_hash != clip_base or "run-clip-bin-commit:" not in overflow_log:
     raise SystemExit("device-predicated classic fallback changed pixels\n" +
+                     overflow_log)
+if overflow_log.count("run-clip-bin-fallback-launch:") != 1:
+    raise SystemExit("overflow did not enqueue exactly one run-wide inverse grid\n" +
                      overflow_log)
 
 # Strict LESS is deliberately refused before geometry because equal-depth ties

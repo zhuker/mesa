@@ -58,6 +58,7 @@ struct cp_kernels {
    CUfunction run_clip_bin_check_counts;
    CUfunction run_clip_bin_fill;
    CUfunction run_clip_bin_validate_cursors;
+   CUfunction run_clip_bin_fallback_raster;
    CUfunction clear_visbuf;
    CUfunction peel_advance;
    CUfunction resolve_samples;

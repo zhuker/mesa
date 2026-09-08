@@ -11769,6 +11769,7 @@ cp_run_clip_bin_execute(struct cp_context *cp)
        !screen->kernels.run_clip_bin_check_counts ||
        !screen->kernels.run_clip_bin_fill ||
        !screen->kernels.run_clip_bin_validate_cursors ||
+       !screen->kernels.run_clip_bin_fallback_raster ||
        !screen->kernels.opaque_tile_raster)
       return false;
 
@@ -11790,8 +11791,11 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    unsigned scan_ept, scan_grid;
    cp_abuf_scan_tiling(ntiles, &scan_ept, &scan_grid);
 
-   /* One grow-only transaction block.  Reserve it, and every segment's clip
-    * output/ref array, before the first VS launch. */
+   /* One grow-only transaction block.  Reserve it, and every segment's full
+    * worst-case stable clip output/ref array, before the first VS launch. This
+    * is also the inverse-arm completeness invariant: an admitted descriptor
+    * cannot run out of clipped slots, and the reachable device predicate is a
+    * post-clip dense-reference/cursor refusal, never partial geometry. */
    size_t off = 0;
 #define RUN_ALLOC(name, bytes, align) \
    size_t name##_off = (off = cp_run_clip_bin_align(off, (align))); \
@@ -11957,7 +11961,8 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    if (err == CUDA_SUCCESS)
       err = cuMemsetD32Async(counts, 0, ntiles, cp->stream);
    if (err == CUDA_SUCCESS)
-      err = cuMemsetD32Async(live_count, 0, 4, cp->stream);
+      /* live_count and the adjacent shared error predicate. */
+      err = cuMemsetD32Async(live_count, 0, 2, cp->stream);
    if (err != CUDA_SUCCESS) {
       cp_renderer_texture_fatal(cp);
       return false;
@@ -12025,27 +12030,19 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    RUN_CLIP_LAUNCH(screen->kernels.opaque_tile_raster, ntiles, 1, 1,
              256, 1, 1, 0, cp->stream, tile_params, NULL);
 
-   /* Inverse arm.  It consumes the already clipped stable buffers. */
-   for (unsigned s = 0; s < nsegs; s++) {
-      struct cp_rasterize_args aa = rasts[s];
-      struct cp_rast_queues queues = cp->pass_segs[s].queues;
-      aa.path_flag = errors;
-      aa.path_value = 1;
-      if (cuMemsetD32Async(queues.nontrivial_count, 0, 3, cp->stream) !=
-          CUDA_SUCCESS) {
-         cp_renderer_texture_fatal(cp);
-         return false;
-      }
-      void *params[] = { &aa, &queues };
-      RUN_CLIP_LAUNCH(screen->kernels.rasterize_stage1,
-                DIV_ROUND_UP(aa.num_triangles, 256), 1, 1,
-                256, 1, 1, 0, cp->stream, params, NULL);
-      RUN_CLIP_LAUNCH(screen->kernels.rasterize_stage2,
-                CLAMP(DIV_ROUND_UP(aa.num_triangles, 8), 1u, 512u), 1, 1,
-                256, 1, 1, 0, cp->stream, params, NULL);
-      RUN_CLIP_LAUNCH(screen->kernels.rasterize_stage3, 2048, 1, 1,
-                64, 1, 1, 0, cp->stream, params, NULL);
-   }
+   /* The complete inverse arm is one launch for the run.  Its first load is
+    * the finalized device error word: success returns without touching any
+    * geometry, while failure walks these exact stable per-segment descriptors
+    * and performs ordinary depth-tested atomicMin visibility rasterization. */
+   struct cp_run_clip_bin_fallback_args fallback = {
+      .rast_args = rasts_dev, .errors = errors, .num_segments = nsegs,
+   };
+   void *fallback_params[] = { &fallback };
+   RUN_CLIP_LAUNCH(screen->kernels.run_clip_bin_fallback_raster,
+             1, 1, 1, 256, 1, 1, 0, cp->stream, fallback_params, NULL);
+   if (cp_debug->debug_episode)
+      fprintf(stderr, "run-clip-bin-fallback-launch: one block, segments=%u\n",
+              nsegs);
 
    cp->pass.hw_attempt_start = cp->hardware_texture.fs_attempts;
    cp->pass.nsegs = nsegs;

@@ -79,9 +79,12 @@ exact-replays the legacy member path. An admitted run intentionally suppresses
 all legacy per-member clip/raster chains. Proven one-draw groups use the grouped
 VS and then harvest exact ordinary-path metadata without a second VS; other
 batches use prepare-only fused VS. The run count/check/scan/fill/validate chain
-feeds `cp_opaque_tile_raster`, while the same error word predicates a classic
-stage1/2/3 arm over the already clipped geometry. Thus clipping never repeats
-and exactly one visibility arm runs.
+feeds `cp_opaque_tile_raster`, while the same error word predicates one
+run-wide queue-free ordinary visibility grid over the exact per-segment raster
+arguments and already clipped stable geometry. It is exactly one 256-thread
+block, so a successful transaction schedules one no-op CTA rather than up to
+64K predicate-only CTAs or three launches per segment. Thus clipping
+never repeats and exactly one visibility arm writes.
 
 Admission is intentionally narrower than the kernel ABI. It requires one
 sample, one color attachment, a real depth attachment, depth test+write, no
@@ -90,8 +93,12 @@ inclusive LEQUAL or GEQUAL function. Strict LESS/GREATER and mixed depth
 ordering refuse before CUDA work because the current tile winner tie rule is
 not equivalent. Grouped shading uses the complete batch key plus exact FS UBO
 rows. Run clipped geometry, stable primitive refs, dense lists, scan scratch,
-and predicates live in grow-only storage. Primitive refs are cleared before
-count so holes are safe for the predicated classic arm.
+and predicates live in grow-only storage. Every segment reserves its complete
+`input triangles * CP_CLIP_MAX_OUT` stable range before clipping starts, and
+live capacity is the sum of those ranges. Therefore an admitted run cannot set
+the predicate with partial clipped output: reachable overflow/cursor refusals
+happen only after the exact stable geometry is complete. Primitive refs are
+cleared before count so holes are safe for the predicated inverse arm.
 
 ## Exact continuation
 

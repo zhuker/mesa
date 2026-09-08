@@ -1125,6 +1125,65 @@ cp_rast_small_or_defer(struct cp_rasterize_args *args,
 }
 
 /*
+ * Slow, queue-free ordinary rasterization for the transactional inverse arm.
+ * It deliberately walks the complete bounding box in one lane. Overflow is
+ * exceptional, while keeping this path in one run-wide launch is essential.
+ * Coverage, depth testing, the fill rule, primitive IDs and atomicMin tie
+ * resolution all go through the same helpers as the ordinary three stages.
+ */
+static __device__ __forceinline__ void
+cp_rast_direct_one(struct cp_rasterize_args *args, uint32_t tri_id)
+{
+   struct cp_tri_setup s;
+   if (!setup_triangle(args, tri_id, &s))
+      return;
+
+   if (s.is_point) {
+      rasterize_point<false>(args, &s, tri_id, 0, 1);
+      return;
+   }
+
+   for (int py = s.iy_min; py <= s.iy_max; py++) {
+      for (int px = s.ix_min; px <= s.ix_max; px++) {
+         for (int sm = 0; sm < (int)args->num_samples; sm++) {
+            float ox, oy;
+            cp_sample_pos(args->num_samples, sm, &ox, &oy);
+            float cx = (float)px + ox, cy = (float)py + oy;
+            float e0 = edge_function(s.sx1, s.sy1, s.sx2, s.sy2, cx, cy);
+            float e1 = edge_function(s.sx2, s.sy2, s.sx0, s.sy0, cx, cy);
+            float e2 = edge_function(s.sx0, s.sy0, s.sx1, s.sy1, cx, cy);
+            if (edge_inside(e0, s.e0_top_left) &&
+                edge_inside(e1, s.e1_top_left) &&
+                edge_inside(e2, s.e2_top_left)) {
+               float w0 = e0 * s.inv_area;
+               float w1 = e1 * s.inv_area;
+               emit_fragment<false>(args, tri_id, px, py, sm,
+                  w0 * s.ndc_z0 + w1 * s.ndc_z1 +
+                  (1.0f - w0 - w1) * s.ndc_z2);
+            }
+         }
+      }
+   }
+}
+
+extern "C" __global__ void
+cp_run_clip_bin_fallback_raster(struct cp_run_clip_bin_fallback_args args)
+{
+   if (!*(const volatile uint32_t *)(uintptr_t)args.errors)
+      return;
+   const struct cp_rasterize_args *all =
+      (const struct cp_rasterize_args *)(uintptr_t)args.rast_args;
+   /* Deliberately one block: success schedules only one CTA. Overflow cost is
+    * irrelevant, so its lanes may walk every segment and stable slot. */
+   for (uint32_t segment = 0; segment < args.num_segments; segment++) {
+      struct cp_rasterize_args rast = all[segment];
+      for (uint32_t tri = threadIdx.x; tri < rast.num_triangles;
+           tri += blockDim.x)
+         cp_rast_direct_one(&rast, tri);
+   }
+}
+
+/*
  * Stage 1: 1 thread per triangle.
  * Small triangles are rasterized with incremental edge stepping.
  * Large triangles are pushed to the nontrivial queue for stage 2.
