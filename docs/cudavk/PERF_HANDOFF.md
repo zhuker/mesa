@@ -22,6 +22,11 @@ window (WORKFLOW.md 4.0), all defaults, clean environment:
 | favorite3 | **5.854** | 9.883 (pre-wide-episode) |
 | favorite2 | **4.875** | 8.283 (pre-wide-episode) |
 
+Both were validated on the 18-sample sweep (label `batching-wins`): 16 ok, no
+verdict changed, `gltfscenerendering` unchanged at its standing exception
+(137,028 -> 137,029 of a 27,480 budget, `TODO` 8) and `multithreading` inside
+its non-deterministic band.
+
 The RTX figures include the wide-episode relaxation (2026-09-05): an opaque
 episode may span viewport, rasterizer and depth-state changes, because every
 consumer of those reads them per segment. Episodes went 6.21 -> 12.84 segments
