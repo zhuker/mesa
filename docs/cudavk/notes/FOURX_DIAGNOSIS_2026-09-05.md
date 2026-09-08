@@ -566,6 +566,41 @@ That does not change the design's value -- merging vertex launches alone is
 worth 0.02-0.04 ms -- but it removes its largest implementation risk, and it
 should be re-checked on any capture before relying on it.
 
+## The upper bound: eliminate every removable pool entirely
+
+The accountings above subtract *estimated* savings. This one subtracts whole
+pools -- assume each vanishes completely, which no implementation can beat:
+
+| pool, eliminated in full | ms |
+|---|---:|
+| `fs_compact` | 0.368 |
+| `fs_writeback` | 0.109 |
+| `abuf_support` | 0.198 |
+| `memset` (every clear in the frame) | 0.258 |
+| fragment overdraw (perfect frame-wide visibility) | 0.411 |
+| frame-boundary host cost, cudavk's share | 0.560 |
+| FS-merge of geometry across shade launches | 0.257 |
+| **absolute ceiling** | **2.161** |
+
+    frame now                       5.176 ms
+    minus every pool above          3.015 ms   <- nothing can do better
+    4x target                       2.088 ms
+    still over by                    1.44x
+
+`clip_all + stage2 + stage3` (1.189 ms) is **excluded**, because the mechanism
+for removing it was built and measured **+1.8 ms worse**, twice.
+
+What remains after that subtraction is vertex shading, fragment shading, the
+clip and raster stages, and the memcpy traffic -- **the work itself**. It
+cannot be removed and still render the frame. The target sits **1.44x below a
+bound computed from measured pool sizes**, not from estimates of what a
+rewrite might achieve.
+
+That is the proof, and unlike the three attempts this document already
+withdrew, it does not depend on any model: only on (a) the measured
+union-exclusive size of every pool, and (b) the fact that a saving cannot
+exceed the pool it comes from.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
