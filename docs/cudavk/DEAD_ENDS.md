@@ -2661,12 +2661,33 @@ spill and occupancy is 25%. **Both measure the same frame time.** No point on
 the register/spill curve escapes the memory-latency bound, so shader-level
 tuning is finished.
 
-**What is not refuted, and is the only remaining path**: structural work worth
-**2.08 ms of union-exclusive device time** (bin+walk for clip/stage2/stage3,
-frame-wide deferred shading, per-run compaction and clears, fused writeback)
-plus ~0.56 ms of frame-boundary host cost. That lands device work at 2.635 ms
-against a 2.088 ms target -- **1.26x over, so 4x is neither reached nor
-disproved**, and ~5x native is the realistic target.
+**Closed, 2026-09-05, after building the remaining candidates.** Two predicate
+relaxations landed (entry 45 lists them and the five rewrites that failed),
+taking favorite3 to **5.198 whole / 6.043 heavy = 9.96x / 10.38x native** and
+favorite2 to 4.863 / 5.054 = 9.69x / 9.74x. Tagged `cudavk-0.0.3`.
+
+The floor, with `memcpy` re-measured on the final build (0.221 ms/frame, not
+the 0.451 an earlier trace showed):
+
+    core work: VS 0.434 + FS 0.318 (zero overdraw) + clip 0.520
+             + raster 0.669 + vertex_fetch 0.125 + memcpy 0.221 = 2.287 ms
+    plus the application's own record/decode, which the native
+      driver also pays and which cannot overlap device work         0.376
+    = frame floor                                                   2.663 ms
+    4x target                                                       2.088 ms
+    over by                                                         1.28x
+
+**Everything tunable was tested**: 17 flag levers including a post-change
+re-tune of the raster thresholds, `TILE_BOUND` and `POINT_THRESHOLD` (defaults
+optimal, 0.09-0.10 ms worse either side); 20 batch-break tests, of which 17
+never fire; 3 predicate relaxations; 5 structural rewrites, all slower.
+
+**The margin is 1.28x, not a wide one**, and this document corrected itself
+eleven times reaching it -- three of those reversals of a stated verdict. The
+firm claims are narrower than "impossible": every mechanism identifiable from
+the driver's own instrumentation has been built and measured, and they fail
+for one shared reason -- the eight-stream fan-out already collects the overlap
+that fewer, wider launches would buy.
 
 **Five errors were made and corrected while reaching this**, and they are the
 transferable part:
