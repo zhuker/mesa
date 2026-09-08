@@ -226,8 +226,16 @@ struct cp_run_census {
    uint64_t id_hist[CP_RUN_CLASSES][CP_RUN_ID_MAX + 1];
    uint64_t id_overflows;
 
+   /* episode-wide state the run must not span */
+   struct cp_viewport_state ep_viewport;
+   struct cp_raster_state ep_raster;
+   struct cp_depth_state ep_depth;
+   struct cp_blend_desc ep_blend;
+   uint32_t ep_samples;
+   bool have_ep;
+
    /* why runs ended */
-   uint64_t break_scope, break_class, break_flush;
+   uint64_t break_scope, break_class, break_state, break_flush;
 
    /* denominators */
    uint64_t total_draws, total_tris, scopes;

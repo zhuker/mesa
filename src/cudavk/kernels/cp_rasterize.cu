@@ -2963,41 +2963,95 @@ cp_opaque_tile_raster_split(struct cp_opaque_tile_raster_args args,
    const struct cp_opaque_tile_ref *refs =
       (const struct cp_opaque_tile_ref *)(uintptr_t)args.tile_refs;
 
-   /* 32x32 pixels, one packed visibility word each: 8 KB of shared. */
-   __shared__ unsigned long long vis[CP_OPAQUE_TILE_SIZE * CP_OPAQUE_TILE_SIZE];
-   for (uint32_t p = threadIdx.x;
-        p < CP_OPAQUE_TILE_SIZE * CP_OPAQUE_TILE_SIZE; p += blockDim.x)
-      vis[p] = VISBUF_EMPTY;
-   __syncthreads();
+   /*
+    * The mapping, and it is the whole point of this kernel.
+    *
+    * cp_opaque_tile_raster sets one triangle up in thread 0 and syncs, so
+    * setup is serial in the tile's reference count -- dead end 24.
+    *
+    * The first version of this kernel inverted that to one thread per
+    * reference, which parallelises setup but makes ONE thread walk all of
+    * that triangle's pixels in the tile. Measured on favorite3 that cost
+    * 318 us per launch, because a game frame has triangles that cover a
+    * whole 32x32 tile and 1024 pixel tests then land in one lane. Probe 4
+    * missed it: its pool is tile-local, so no triangle was ever large.
+    *
+    * So: batch the references. CP_WALK_BATCH of them are set up in parallel
+    * into shared memory, then every thread tests ITS OWN pixels against the
+    * whole batch. Setup is parallel and pixels are parallel, and neither
+    * depends on how large a triangle is.
+    */
+#define CP_WALK_BATCH 32
+   __shared__ struct cp_tri_setup bset[CP_WALK_BATCH];
+   __shared__ uint32_t bprim[CP_WALK_BATCH], blocal[CP_WALK_BATCH];
+   __shared__ uint16_t bseg[CP_WALK_BATCH];
+   __shared__ uint8_t bok[CP_WALK_BATCH];
+   /* The bounding box alone, so a thread can reject a triangle without
+    * pulling all 80 bytes of its setup out of shared memory. Reading the
+    * whole setup per thread per triangle -- even when the box rejects it --
+    * was 2.5 KB of shared traffic per thread per batch, and it was the
+    * kernel's cost: 217 us a launch. */
+   __shared__ int32_t bbox[CP_WALK_BATCH][4];
 
-   for (uint32_t base = 0; base < n; base += blockDim.x) {
-      const uint32_t k = base + threadIdx.x;
-      if (k >= n)
-         break;
-      const struct cp_opaque_tile_ref ref = refs[off + k];
-      if (ref.segment >= args.num_segments)
-         continue;
-      struct cp_rasterize_args rast = rasts[ref.segment];   /* setup_triangle
-                                                             * takes it by
-                                                             * non-const ptr */
-      const uint32_t global_prim = ref.global_prim;
-      const uint32_t local_prim = global_prim - rast.abuf_prim_base;
-      struct cp_tri_setup setup;
-      if (!setup_triangle(&rast, local_prim, &setup))
-         continue;
+   /* Each thread owns four of the tile's 1,024 pixels, as the serial kernel
+    * did, and keeps their winners in registers. */
+   uint64_t winner[4] = { VISBUF_EMPTY, VISBUF_EMPTY,
+                          VISBUF_EMPTY, VISBUF_EMPTY };
 
-      /* Only this tile's share of the triangle. */
-      int px0 = max((int)x0, setup.ix_min);
-      int px1 = min((int)(x0 + CP_OPAQUE_TILE_SIZE - 1), setup.ix_max);
-      int py0 = max((int)y0, setup.iy_min);
-      int py1 = min((int)(y0 + CP_OPAQUE_TILE_SIZE - 1), setup.iy_max);
-      for (int py = py0; py <= py1; py++) {
-         if ((uint32_t)py >= args.height)
-            break;
-         for (int px = px0; px <= px1; px++) {
-            if ((uint32_t)px >= args.width)
-               break;
-            if (cp_tri_rejected(&rast, local_prim, px, py))
+   for (uint32_t base = 0; base < n; base += CP_WALK_BATCH) {
+      uint32_t m = min((uint32_t)CP_WALK_BATCH, n - base);
+      if (threadIdx.x < m) {
+         struct cp_opaque_tile_ref ref = refs[off + base + threadIdx.x];
+         bok[threadIdx.x] = 0;
+         if (ref.segment < args.num_segments) {
+            struct cp_rasterize_args ra = rasts[ref.segment];
+            uint32_t lp = ref.global_prim - ra.abuf_prim_base;
+            if (setup_triangle(&ra, lp, &bset[threadIdx.x])) {
+               bbox[threadIdx.x][0] = bset[threadIdx.x].ix_min;
+               bbox[threadIdx.x][1] = bset[threadIdx.x].ix_max;
+               bbox[threadIdx.x][2] = bset[threadIdx.x].iy_min;
+               bbox[threadIdx.x][3] = bset[threadIdx.x].iy_max;
+               bprim[threadIdx.x] = ref.global_prim;
+               blocal[threadIdx.x] = lp;
+               bseg[threadIdx.x] = ref.segment;
+               bok[threadIdx.x] = 1;
+            }
+         }
+      }
+      __syncthreads();
+
+      /* This thread's four pixels, hoisted out of the triangle loop. */
+      uint32_t mypx[4], mypy[4];
+      #pragma unroll
+      for (uint32_t j = 0; j < 4; j++) {
+         uint32_t owned = threadIdx.x + j * blockDim.x;
+         mypx[j] = x0 + owned % CP_OPAQUE_TILE_SIZE;
+         mypy[j] = y0 + owned / CP_OPAQUE_TILE_SIZE;
+      }
+
+      for (uint32_t b = 0; b < m; b++) {
+         if (!bok[b])
+            continue;
+         /* Box first, out of a 16 byte shared row. Only a thread that can be
+          * covered pays for the full setup. */
+         int32_t bx0 = bbox[b][0], bx1 = bbox[b][1];
+         int32_t by0 = bbox[b][2], by1 = bbox[b][3];
+         bool any = false;
+         #pragma unroll
+         for (uint32_t j = 0; j < 4; j++)
+            any |= ((int32_t)mypx[j] >= bx0 && (int32_t)mypx[j] <= bx1 &&
+                    (int32_t)mypy[j] >= by0 && (int32_t)mypy[j] <= by1);
+         if (!any)
+            continue;
+         const struct cp_tri_setup setup = bset[b];
+         struct cp_rasterize_args rast = rasts[bseg[b]];
+         const uint32_t global_prim = bprim[b], local_prim = blocal[b];
+         for (uint32_t j = 0; j < 4; j++) {
+            uint32_t px = mypx[j], py = mypy[j];
+            if (px >= args.width || py >= args.height ||
+                (int32_t)px < bx0 || (int32_t)px > bx1 ||
+                (int32_t)py < by0 || (int32_t)py > by1 ||
+                cp_tri_rejected(&rast, local_prim, px, py))
                continue;
             float sx = (float)px + 0.5f, sy = (float)py + 0.5f;
             float ndc_z;
@@ -3024,30 +3078,29 @@ cp_opaque_tile_raster_split(struct cp_opaque_tile_raster_args args,
             }
             uint32_t depth = float_to_sortable_uint(
                CP_WINDOW_DEPTH(ndc_z, rast.depth_scale, rast.depth_translate));
-            uint32_t pixel = (uint32_t)py * args.width + (uint32_t)px;
+            uint32_t pixel = py * args.width + px;
             if (!cp_opaque_depth_pass(&rast, pixel, depth))
                continue;
             uint32_t key = rast.depth_key_invert ? ~depth : depth;
-            atomicMin(&vis[((uint32_t)py - y0) * CP_OPAQUE_TILE_SIZE +
-                           ((uint32_t)px - x0)],
-                      (unsigned long long)PACK_VISBUF(key, global_prim));
+            uint64_t packed = PACK_VISBUF(key, global_prim);
+            if (packed < winner[j])
+               winner[j] = packed;
          }
       }
+      __syncthreads();
    }
-   __syncthreads();
 
-   /* Merge. atomicMin because a split tile has several blocks here, and
-    * because the unsplit case then behaves identically. */
+   /* Merge: atomicMin, because a split tile has several blocks here. */
    uint64_t *visbuf = (uint64_t *)(uintptr_t)rasts[0].framebuffer;
-   for (uint32_t p = threadIdx.x;
-        p < CP_OPAQUE_TILE_SIZE * CP_OPAQUE_TILE_SIZE; p += blockDim.x) {
-      if (vis[p] == VISBUF_EMPTY)
+   for (uint32_t j = 0; j < 4; j++) {
+      if (winner[j] == VISBUF_EMPTY)
          continue;
-      uint32_t px = x0 + p % CP_OPAQUE_TILE_SIZE;
-      uint32_t py = y0 + p / CP_OPAQUE_TILE_SIZE;
+      uint32_t owned = threadIdx.x + j * blockDim.x;
+      uint32_t px = x0 + owned % CP_OPAQUE_TILE_SIZE;
+      uint32_t py = y0 + owned / CP_OPAQUE_TILE_SIZE;
       if (px < args.width && py < args.height)
          atomicMin((unsigned long long *)&visbuf[(size_t)py * args.width + px],
-                   (unsigned long long)vis[p]);
+                   (unsigned long long)winner[j]);
    }
 }
 

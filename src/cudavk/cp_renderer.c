@@ -8461,13 +8461,32 @@ cp_run_census_draw(struct cp_context *cp, const struct cp_draw_packet *packet,
    if (!cp_debug->run_census)
       return;
    struct cp_run_census *rc = &cp->run_census;
+   const struct cp_draw_state *st = &packet->state;
    enum cp_run_class cls = cp_run_classify(packet);
 
    rc->total_draws++;
    rc->total_tris += tris;
 
+   /*
+    * The plan's run predicate includes cpvk_draws_episode_compatible(): a run
+    * cannot span a change to viewport, rasterizer, depth, blend or sample
+    * count, because the renderer reads those once for a whole episode. The
+    * first version of this census omitted that and counted runs of 181 draws;
+    * the driver's own opaque episodes are 6.21 segments. Carrying the same
+    * fields here is what makes the census answer the question the plan asks.
+    */
+   bool episode_break = rc->have_ep &&
+      (memcmp(&rc->ep_viewport, &st->viewport, sizeof(rc->ep_viewport)) ||
+       memcmp(&rc->ep_raster, &st->raster, sizeof(rc->ep_raster)) ||
+       memcmp(&rc->ep_depth, &st->depth, sizeof(rc->ep_depth)) ||
+       memcmp(&rc->ep_blend, &st->blend, sizeof(rc->ep_blend)) ||
+       rc->ep_samples != st->pipeline_samples);
+   if (rc->cls != CP_RUN_NONE && episode_break)
+      rc->break_state++;
+
    if (rc->cls != CP_RUN_NONE &&
-       (cls != rc->cls || packet->scope->serial != rc->scope_serial)) {
+       (cls != rc->cls || packet->scope->serial != rc->scope_serial ||
+        episode_break)) {
       if (cls != rc->cls)
          rc->break_class++;
       else
@@ -8476,6 +8495,12 @@ cp_run_census_draw(struct cp_context *cp, const struct cp_draw_packet *packet,
    }
    rc->cls = cls;
    rc->scope_serial = packet->scope->serial;
+   rc->ep_viewport = st->viewport;
+   rc->ep_raster = st->raster;
+   rc->ep_depth = st->depth;
+   rc->ep_blend = st->blend;
+   rc->ep_samples = st->pipeline_samples;
+   rc->have_ep = true;
    rc->cur_draws++;
    rc->cur_tris += tris;
 }
@@ -8520,8 +8545,8 @@ cp_run_census_report(struct cp_context *cp)
            admitted_runs, admitted_draws, admitted_tris,
            100.0 * (double)admitted_tris / (double)rc->total_tris);
    fprintf(stderr, "cudavk:   run ends: %" PRIu64 " scope, %" PRIu64
-           " class change, %" PRIu64 " flush\n",
-           rc->break_scope, rc->break_class, rc->break_flush);
+           " class change, %" PRIu64 " episode state, %" PRIu64 " flush\n",
+           rc->break_scope, rc->break_class, rc->break_state, rc->break_flush);
    for (unsigned k = CP_RUN_OPAQUE; k < CP_RUN_CLASSES; k++) {
       if (!rc->runs[k])
          continue;
