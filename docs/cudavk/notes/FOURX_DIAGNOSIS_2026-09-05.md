@@ -842,6 +842,42 @@ register/spill curve. The work is ordinary, the latency is real, and the warps
 needed to hide it do not fit in the register file at these shaders' live-value
 count.
 
+## One mechanism left untried, and why it is different
+
+The same first-principles check applied to clip and raster is less comfortable
+than the fragment one:
+
+    clip   0.520 ms -> 32.5 G lane-cycles for 250,000 triangles
+             at 2% issue that implies ~2,598 instructions per triangle
+    a 7-plane homogeneous clip plus triangle setup is ~100-300
+
+So roughly **90% of the clip pool is launch ramp, tail and idle lanes**, not
+clipping. Same limiter as everywhere else -- the launches cannot fill the
+machine -- but it points at one mechanism this investigation has **not** tried:
+
+| | work shape | merged form |
+|---|---|---|
+| stage 3 (tried, slower) | queue-based | one launch must drain each segment's queue **in turn** -- serialises what the fan-out overlapped |
+| **clip (untried)** | **per-triangle over contiguous vertex output** | **one grid over all segments' triangles is data-parallel -- it fills the machine rather than serialising it** |
+
+That difference is real and it is why the stage-3 result does not settle the
+clip case. Three things make it a risk rather than a free win, and they should
+be priced before anyone builds it:
+
+1. `cp_clip_rast_fused` also writes the **per-segment rasterizer queues**, so
+   it meets the same 8-queue-set wrap that lost the device for merged stage 3;
+   capping the episode at `CP_PASS_STREAMS` segments is the known fix and it
+   costs episode length.
+2. It needs a per-triangle to segment map (a prefix sum over segment triangle
+   counts) and per-segment argument indexing.
+3. **Five structural changes have been attempted in this driver during this
+   investigation and all five measured slower.**
+
+Its ceiling is the clip pool's idle share, roughly **0.4 ms/frame**. Even
+collected in full, the floor becomes 2.67 ms against a 2.088 ms target --
+**still 1.28x over**, so it does not reach 4x on its own. It is the best
+remaining candidate for the ~5x ceiling, not for the objective.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
