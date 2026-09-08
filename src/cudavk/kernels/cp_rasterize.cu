@@ -760,10 +760,77 @@ cp_run_clip_setup_direct(struct cp_run_clip_bin_args args)
    }
 }
 
-/* One warp claims one compact setup at a time.  Its lanes stride the complete
- * bbox, so fullscreen and other large triangles are safe without a threshold,
- * queue capacity, or cooperative-launch requirement.  This is visibility
- * only: cp_opaque_finish_common shades and performs the first real depth write. */
+/* Small setups use one thread each; larger setups use one warp each.  Both
+ * mappings share one launch, so a side-stream segment still has exactly two
+ * visibility kernels: clip/setup compact, then this raster. */
+static __device__ void
+cp_run_clip_direct_record(const struct cp_run_clip_direct_live &rec,
+                          const struct cp_run_clip_bin_device_segment *segments,
+                          const struct cp_run_clip_direct_raster_args &args,
+                          uint32_t first, uint32_t stride, uint32_t *errors)
+{
+   if (rec.segment >= args.num_segments ||
+       rec.segment >= CP_RUN_CLIP_BIN_MAX_SEGS ||
+       rec.stable_prim >= args.total_slots) {
+      if (first == 0)
+         atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS);
+      return;
+   }
+   struct cp_rasterize_args rast = segments[rec.segment].rast;
+   uint32_t base = segments[rec.segment].prim_base;
+   if (rec.stable_prim < base ||
+       rec.stable_prim - base >= segments[rec.segment].clip.max_triangles) {
+      if (first == 0)
+         atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS);
+      return;
+   }
+   uint32_t local = rec.stable_prim - base;
+   struct cp_tri_setup setup = rec.setup;
+   int64_t bw = (int64_t)setup.ix_max - setup.ix_min + 1;
+   int64_t bh = (int64_t)setup.iy_max - setup.iy_min + 1;
+   uint64_t area = bw > 0 && bh > 0 ? (uint64_t)bw * (uint64_t)bh : 0;
+   for (uint64_t p = first; p < area; p += stride) {
+      int px = setup.ix_min + (int)(p % (uint64_t)bw);
+      int py = setup.iy_min + (int)(p / (uint64_t)bw);
+      uint32_t pixel = (uint32_t)py * rast.width + (uint32_t)px;
+      if (rast.reject && rast.reject_passes) {
+         const uint32_t *rej = (const uint32_t *)(uintptr_t)rast.reject +
+                               (size_t)pixel * rast.reject_layers;
+         bool rejected = false;
+         for (uint32_t q = 0; q < rast.reject_passes; q++)
+            if (rej[q] == local) rejected = true;
+         if (rejected) continue;
+      }
+      float sx = (float)px + 0.5f, sy = (float)py + 0.5f, z;
+      if (setup.is_point) {
+         if (sx < setup.pt_x0 || sx >= setup.pt_x1 ||
+             sy < setup.pt_y0 || sy >= setup.pt_y1) continue;
+         z = setup.ndc_z0;
+      } else {
+         float e0 = edge_function(setup.sx1, setup.sy1, setup.sx2, setup.sy2, sx, sy);
+         float e1 = edge_function(setup.sx2, setup.sy2, setup.sx0, setup.sy0, sx, sy);
+         float e2 = edge_function(setup.sx0, setup.sy0, setup.sx1, setup.sy1, sx, sy);
+         if (!edge_inside(e0, setup.e0_top_left) ||
+             !edge_inside(e1, setup.e1_top_left) ||
+             !edge_inside(e2, setup.e2_top_left)) continue;
+         float w0 = e0 * setup.inv_area, w1 = e1 * setup.inv_area;
+         z = w0 * setup.ndc_z0 + w1 * setup.ndc_z1 +
+             (1.0f - w0 - w1) * setup.ndc_z2;
+      }
+      uint32_t depth = float_to_sortable_uint(
+         CP_WINDOW_DEPTH(z, rast.depth_scale, rast.depth_translate));
+      if (rast.depth_test && rast.depthbuf) {
+         uint32_t prev = ((const uint32_t *)(uintptr_t)rast.depthbuf)[pixel];
+         bool pass = rast.depth_func == CP_FUNC_LEQUAL ? depth <= prev :
+                     rast.depth_func == CP_FUNC_GEQUAL ? depth >= prev : false;
+         if (!pass) continue;
+      }
+      uint32_t key = rast.depth_key_invert ? ~depth : depth;
+      atomicMin((unsigned long long *)(uintptr_t)rast.framebuffer + pixel,
+                (unsigned long long)PACK_VISBUF(key, rec.stable_prim));
+   }
+}
+
 extern "C" __global__ void
 cp_run_clip_direct_raster(struct cp_run_clip_direct_raster_args args)
 {
@@ -775,73 +842,34 @@ cp_run_clip_direct_raster(struct cp_run_clip_direct_raster_args args)
       atomicOr(errors, CP_RUN_CLIP_BIN_ERR_LIVE_BOUNDS);
       n = args.live_capacity;
    }
-   uint32_t lane = threadIdx.x & 31u;
-   uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-   uint32_t warps = (gridDim.x * blockDim.x) >> 5;
    const struct cp_run_clip_direct_live *live =
       (const struct cp_run_clip_direct_live *)(uintptr_t)args.live;
    const struct cp_run_clip_bin_device_segment *segments =
       (const struct cp_run_clip_bin_device_segment *)(uintptr_t)args.segments;
+   uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t threads = gridDim.x * blockDim.x;
+
+   /* A thread owns a complete small record. */
+   for (uint32_t i = tid; i < n; i += threads) {
+      struct cp_run_clip_direct_live rec = live[i];
+      int64_t bw = (int64_t)rec.setup.ix_max - rec.setup.ix_min + 1;
+      int64_t bh = (int64_t)rec.setup.iy_max - rec.setup.iy_min + 1;
+      uint64_t area = bw > 0 && bh > 0 ? (uint64_t)bw * (uint64_t)bh : 0;
+      if (area <= CP_SMALL_THRESHOLD)
+         cp_run_clip_direct_record(rec, segments, args, 0, 1, errors);
+   }
+
+   /* A warp owns a complete larger record. */
+   uint32_t lane = threadIdx.x & 31u;
+   uint32_t warp = tid >> 5;
+   uint32_t warps = threads >> 5;
    for (uint32_t i = warp; i < n; i += warps) {
       struct cp_run_clip_direct_live rec = live[i];
-      if (rec.segment >= args.num_segments || rec.segment >= CP_RUN_CLIP_BIN_MAX_SEGS ||
-          rec.stable_prim >= args.total_slots) {
-         if (lane == 0) atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS);
-         continue;
-      }
-      struct cp_rasterize_args rast = segments[rec.segment].rast;
-      uint32_t base = segments[rec.segment].prim_base;
-      if (rec.stable_prim < base ||
-          rec.stable_prim - base >= segments[rec.segment].clip.max_triangles) {
-         if (lane == 0) atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS);
-         continue;
-      }
-      uint32_t local = rec.stable_prim - base;
-      struct cp_tri_setup setup = rec.setup;
-      int64_t bw = (int64_t)setup.ix_max - setup.ix_min + 1;
-      int64_t bh = (int64_t)setup.iy_max - setup.iy_min + 1;
+      int64_t bw = (int64_t)rec.setup.ix_max - rec.setup.ix_min + 1;
+      int64_t bh = (int64_t)rec.setup.iy_max - rec.setup.iy_min + 1;
       uint64_t area = bw > 0 && bh > 0 ? (uint64_t)bw * (uint64_t)bh : 0;
-      for (uint64_t p = lane; p < area; p += 32) {
-         int px = setup.ix_min + (int)(p % (uint64_t)bw);
-         int py = setup.iy_min + (int)(p / (uint64_t)bw);
-         uint32_t pixel = (uint32_t)py * rast.width + (uint32_t)px;
-         if (rast.reject && rast.reject_passes) {
-            const uint32_t *rej=(const uint32_t *)(uintptr_t)rast.reject +
-               (size_t)pixel * rast.reject_layers;
-            bool rejected = false;
-            for (uint32_t q=0;q<rast.reject_passes;q++)
-               if (rej[q] == local) rejected=true;
-            if (rejected) continue;
-         }
-         float sx = (float)px + 0.5f, sy = (float)py + 0.5f, z;
-         if (setup.is_point) {
-            if (sx < setup.pt_x0 || sx >= setup.pt_x1 ||
-                sy < setup.pt_y0 || sy >= setup.pt_y1) continue;
-            z = setup.ndc_z0;
-         } else {
-            float e0 = edge_function(setup.sx1,setup.sy1,setup.sx2,setup.sy2,sx,sy);
-            float e1 = edge_function(setup.sx2,setup.sy2,setup.sx0,setup.sy0,sx,sy);
-            float e2 = edge_function(setup.sx0,setup.sy0,setup.sx1,setup.sy1,sx,sy);
-            if (!edge_inside(e0,setup.e0_top_left) ||
-                !edge_inside(e1,setup.e1_top_left) ||
-                !edge_inside(e2,setup.e2_top_left)) continue;
-            float w0 = e0 * setup.inv_area, w1 = e1 * setup.inv_area;
-            z = w0 * setup.ndc_z0 + w1 * setup.ndc_z1 +
-                (1.0f - w0 - w1) * setup.ndc_z2;
-         }
-         uint32_t depth = float_to_sortable_uint(
-            CP_WINDOW_DEPTH(z,rast.depth_scale,rast.depth_translate));
-         if (rast.depth_test && rast.depthbuf) {
-            uint32_t prev =
-               ((const uint32_t *)(uintptr_t)rast.depthbuf)[pixel];
-            bool pass = rast.depth_func == CP_FUNC_LEQUAL ? depth <= prev :
-                        rast.depth_func == CP_FUNC_GEQUAL ? depth >= prev : false;
-            if (!pass) continue;
-         }
-         uint32_t key = rast.depth_key_invert ? ~depth : depth;
-         atomicMin((unsigned long long *)(uintptr_t)rast.framebuffer + pixel,
-                   (unsigned long long)PACK_VISBUF(key,rec.stable_prim));
-      }
+      if (area > CP_SMALL_THRESHOLD)
+         cp_run_clip_direct_record(rec, segments, args, lane, 32, errors);
    }
 }
 

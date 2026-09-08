@@ -24,6 +24,26 @@ writes if a bad compact record is found concurrently; the predicated classic
 arm rasterizes the complete clipped superset on top. No host readback is used.
 CUDA API failures use the existing fatal-device classification.
 
+## Side-stream transaction prototype
+
+The successor keeps the eight-stream overlap instead of collecting clip and
+visibility on main. After whole-run preflight, grow-only prepared-output
+reservation, and an upload-ring no-wrap proof, each segment uses its existing
+round-robin pass stream. Its ordered chain is exact prepare-only fused VS,
+direct clip/setup compaction into a private compact range, then direct
+visibility into the shared cleared visbuf. Small bounding boxes use one thread;
+larger boxes use one warp, within the same visibility launch. Stable run-global
+primitive IDs make all `atomicMin` winners independent of stream order.
+
+The main stream owns the visbuf/depth clears and uploaded segment tables. A
+post-clear broadcast orders those shared inputs before every side continuation.
+Per-segment live counters avoid append/consume races. One join orders all
+partial visbuf writes and the shared error word before the complete
+run-predicated classic fallback and grouped shade. Therefore a device refusal
+can leave disposable partial visibility, but cannot reach depth or color.
+CUDA launch/event failures after fan-out remain fatal; there is no host
+readback or partial host replay.
+
 ## Validation
 
 `cp_run_clip_bin_gate` now compares the direct fused clip/setup records,

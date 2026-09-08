@@ -11843,7 +11843,8 @@ cp_run_clip_bin_reserve_prepared(struct cp_context *cp)
  * and retained descriptor visible to the run-wide count stage. */
 static bool
 cp_run_clip_bin_prepare(struct cp_context *cp,
-                        struct cp_prepared_geometry *prepared)
+                        struct cp_prepared_geometry *prepared,
+                        bool defer_join, bool *side_out)
 {
    unsigned nsegs = cp->run_geometry.nclip_segments;
    bool side = !cp_debug->no_run_prep_streams && cp->seg_streams[0];
@@ -11868,18 +11869,20 @@ cp_run_clip_bin_prepare(struct cp_context *cp,
 
    if (side) {
       cp_stream_set(cp, main);
-      if (!cp_pass_join(cp, nsegs))
+      if ((!ok || !defer_join) && !cp_pass_join(cp, nsegs))
          ok = false;
-      else
+      else if (!defer_join)
          cp->run_geometry.clip_prepare_side_joins++;
       cp->run_geometry.clip_prepare_side_runs++;
    } else {
       cp->run_geometry.clip_prepare_side_refused++;
    }
+   if (side_out)
+      *side_out = side && ok;
    if (cp_debug->debug_episode)
       fprintf(stderr, "run-clip-bin-prepare: batches=%u streams=%u join=%u\n",
               nsegs, side ? MIN2(nsegs, (unsigned)CP_PASS_STREAMS) : 1u,
-              side ? 1u : 0u);
+              side && !defer_join ? 1u : 0u);
    return ok;
 }
 
@@ -11952,7 +11955,8 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    RUN_ALLOC(refs, (size_t)ref_capacity * sizeof(struct cp_opaque_tile_ref), 16);
    RUN_ALLOC(s1, (size_t)MAX2(scan_grid, 1u) * 4, 16);
    RUN_ALLOC(s3, 4, 16);
-   RUN_ALLOC(scalars, 16, 16); /* live count, errors, uint64 total */
+   RUN_ALLOC(scalars, direct ? ((size_t)nsegs + 3u) * 4u : 16u, 16);
+   /* Direct owns one compact counter per stream; errors stay shared. */
 #undef RUN_ALLOC
    if (off < refs_off ||
        !cp_run_geometry_device_reserve(cp, &cp->run_geometry.clip_bin_storage,
@@ -11977,8 +11981,9 @@ cp_run_clip_bin_execute(struct cp_context *cp)
       return false;
 
    struct cp_prepared_geometry prepared[CP_RUN_CLIP_BIN_MAX_SEGS];
+   bool direct_side = false;
    memset(prepared, 0, sizeof(prepared));
-   if (!cp_run_clip_bin_prepare(cp, prepared))
+   if (!cp_run_clip_bin_prepare(cp, prepared, direct, &direct_side))
       return false;
    for (unsigned s = 0; s < nsegs; s++)
       if (!cp->run_geometry.clip_segments[s].positions)
@@ -11992,9 +11997,10 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    CUdeviceptr offsets = base + offsets_off;
    CUdeviceptr cursors = base + cursors_off;
    CUdeviceptr refs = base + refs_off;
-   CUdeviceptr errors = base + scalars_off + 4;
-   CUdeviceptr total_refs = base + scalars_off + 8;
    CUdeviceptr live_count = base + scalars_off;
+   CUdeviceptr errors = direct ? live_count + (size_t)nsegs * 4u
+                               : live_count + 4u;
+   CUdeviceptr total_refs = direct ? errors + 4u : live_count + 8u;
 
    struct cp_run_clip_bin_device_segment devsegs[CP_RUN_CLIP_BIN_MAX_SEGS];
    struct cp_rasterize_args rasts[CP_RUN_CLIP_BIN_MAX_SEGS];
@@ -12023,7 +12029,8 @@ cp_run_clip_bin_execute(struct cp_context *cp)
          .clip = {
             .vs_out = prepared[s].output,
             .out = clipped,
-            .out_count = live_count, /* stable/no-active-ids does not use it */
+            .out_count = direct ? live_count + (size_t)s * 4u : live_count,
+            /* stable/no-active-ids does not use this clip count */
             .active_ids = 0,
             .prim_refs = prim_refs,
             .num_triangles = seg->num_triangles,
@@ -12084,24 +12091,27 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    if (err == CUDA_SUCCESS && !direct)
       err = cuMemsetD32Async(counts, 0, ntiles, cp->stream);
    if (err == CUDA_SUCCESS)
-      err = cuMemsetD32Async(live_count, 0, 4, cp->stream);
+      err = cuMemsetD32Async(live_count, 0, direct ? nsegs + 1u : 4u,
+                            cp->stream);
    if (err != CUDA_SUCCESS) {
       cp_renderer_texture_fatal(cp);
       return false;
    }
 
-   struct cp_run_clip_bin_args count_args = {
-      .segments = segments_dev, .live = live, .live_count = live_count,
-      .overflow = errors, .tile_counts = counts, .num_segments = nsegs,
-      .total_slots = cp->run_geometry.clip_prim_slots,
-      .live_capacity = cp->run_geometry.clip_prim_slots,
-      .tiles_x = tiles_x, .tiles_y = tiles_y,
-   };
-   void *count_params[] = { &count_args };
-   RUN_CLIP_LAUNCH(direct ? screen->kernels.run_clip_setup_direct :
-                            screen->kernels.run_clip_setup_tile_count,
-             MIN2(DIV_ROUND_UP(max_triangles, 64), 1024u), nsegs, 1,
-             64, 1, 1, 0, cp->stream, count_params, NULL);
+   if (!direct_side) {
+      struct cp_run_clip_bin_args count_args = {
+         .segments = segments_dev, .live = live, .live_count = live_count,
+         .overflow = errors, .tile_counts = counts, .num_segments = nsegs,
+         .total_slots = cp->run_geometry.clip_prim_slots,
+         .live_capacity = cp->run_geometry.clip_prim_slots,
+         .tiles_x = tiles_x, .tiles_y = tiles_y,
+      };
+      void *count_params[] = { &count_args };
+      RUN_CLIP_LAUNCH(direct ? screen->kernels.run_clip_setup_direct :
+                               screen->kernels.run_clip_setup_tile_count,
+                MIN2(DIV_ROUND_UP(max_triangles, 64), 1024u), nsegs, 1,
+                64, 1, 1, 0, cp->stream, count_params, NULL);
+   }
 
    if (!direct) {
       struct cp_run_clip_bin_check_counts_args check = {
@@ -12153,6 +12163,67 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    void *tile_params[] = { &tile };
    RUN_CLIP_LAUNCH(screen->kernels.opaque_tile_raster, ntiles, 1, 1,
              256, 1, 1, 0, cp->stream, tile_params, NULL);
+   } else if (direct_side) {
+      /* Main owns all shared clears and uploaded descriptors.  This broadcast
+       * is deliberately after them.  On each side stream it is ordered after
+       * that segment's prepare-only VS, so the resulting chain is
+       * prepare -> wait-for-shared-admission -> compact -> visibility. */
+      if (!cp_pass_broadcast(cp, nsegs))
+         return false;
+      for (unsigned s = 0; s < nsegs; s++) {
+         const struct cp_run_clip_bin_segment *seg =
+            &cp->run_geometry.clip_segments[s];
+         CUdeviceptr seg_dev = segments_dev +
+            (size_t)s * sizeof(struct cp_run_clip_bin_device_segment);
+         CUdeviceptr seg_live = live + (size_t)seg->prim_base *
+            sizeof(struct cp_run_clip_direct_live);
+         CUdeviceptr seg_count = live_count + (size_t)s * 4u;
+         cp_stream_set(cp, cp_pass_seg_stream(cp, s));
+         struct cp_run_clip_bin_args setup_args = {
+            .segments = seg_dev, .live = seg_live, .live_count = seg_count,
+            .overflow = errors, .tile_counts = 0, .num_segments = 1,
+            .total_slots = cp->run_geometry.clip_prim_slots,
+            .live_capacity = seg->prim_slots,
+            .tiles_x = tiles_x, .tiles_y = tiles_y,
+         };
+         void *setup_params[] = { &setup_args };
+         CUresult side_err = cp_launch(
+            cp, screen->kernels.run_clip_setup_direct,
+            MIN2(DIV_ROUND_UP(seg->num_triangles, 64), 1024u),
+            1, 1, 64, 1, 1, 0, cp->stream, setup_params, NULL);
+         if (side_err != CUDA_SUCCESS) {
+            /* The fatal path must not strand context state on a side stream.
+             * Join anything issued earlier before teardown can reuse storage. */
+            cp->stream = cp->main_stream;
+            if (!cp->device_fatal)
+               cp_renderer_texture_fatal(cp);
+            cp_pass_join(cp, nsegs);
+            return false;
+         }
+         struct cp_run_clip_direct_raster_args direct_args = {
+            .segments = seg_dev, .live = seg_live, .live_count = seg_count,
+            .errors = errors, .num_segments = 1,
+            .total_slots = cp->run_geometry.clip_prim_slots,
+            .live_capacity = seg->prim_slots,
+         };
+         void *direct_params[] = { &direct_args };
+         unsigned direct_grid = CLAMP(DIV_ROUND_UP(seg->prim_slots, 256),
+                                      1u, 512u);
+         side_err = cp_launch(cp, screen->kernels.run_clip_direct_raster,
+                              direct_grid, 1, 1, 256, 1, 1, 0, cp->stream,
+                              direct_params, NULL);
+         if (side_err != CUDA_SUCCESS) {
+            cp->stream = cp->main_stream;
+            if (!cp->device_fatal)
+               cp_renderer_texture_fatal(cp);
+            cp_pass_join(cp, nsegs);
+            return false;
+         }
+      }
+      cp_stream_set(cp, cp->main_stream);
+      if (!cp_pass_join(cp, nsegs))
+         return false;
+      cp->run_geometry.clip_prepare_side_joins++;
    } else {
       struct cp_run_clip_direct_raster_args direct_args = {
          .segments = segments_dev, .live = live, .live_count = live_count,
@@ -12165,7 +12236,8 @@ cp_run_clip_bin_execute(struct cp_context *cp)
                       256, 1, 1, 0, cp->stream, direct_params, NULL);
    }
 
-   /* Inverse arm.  It consumes the already clipped stable buffers. */
+   /* Inverse arm. It runs only after the side-stream join, so any shared
+    * error and any partial visbuf are ordered before the complete fallback. */
    for (unsigned s = 0; s < nsegs; s++) {
       struct cp_rasterize_args aa = rasts[s];
       struct cp_rast_queues queues = cp->pass_segs[s].queues;
