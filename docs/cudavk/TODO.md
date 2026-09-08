@@ -232,6 +232,22 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
     and 3250 are clean, so whatever it is switches on for a small number of
     frames.
 
+
+15. **nsys CUDA traces now lose the kernel activity buffer.** Two captures of
+    the current build (`-t cuda`, once with `--delay=14` and once with
+    `--delay=20 --duration=12`) exported a sqlite with
+    `CUPTI_ACTIVITY_KIND_MEMCPY`, `..._MEMSET` and `..._RUNTIME` present and
+    **`CUPTI_ACTIVITY_KIND_KERNEL` entirely absent**, so no per-kernel
+    analysis is possible. Traces taken earlier the same day
+    (`/tmp/rtx-head.sqlite`, same flags plus the UM page-fault options) have
+    the table. `DEAD_ENDS` 37 records the related failure -- a dropped CUPTI
+    buffer that looks like an absent activity class -- and its rule applies:
+    **a trace missing an activity class is invalid until a positive control
+    reproduces the workload's exit behaviour.** Until this is diagnosed, the
+    per-pool numbers in `notes/FOURX_DIAGNOSIS_2026-09-05.md` are the ones
+    from before the 2026-09-05 batching changes, and they are stale by
+    -0.733 ms/frame of removed launches.
+
 ## Vulkan surface not implemented
 
 The driver advertises Vulkan 1.1. The Gallium driver that was removed advertised
