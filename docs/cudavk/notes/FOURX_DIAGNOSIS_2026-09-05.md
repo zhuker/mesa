@@ -676,7 +676,9 @@ What remains is per-command recording cost, proportional to the Vulkan calls
 the application makes, spread across dozens of entry points. There is no
 single lever, which is why the 0.56 ms was always a pool rather than a plan.
 
-## CORRECTION: there IS a named lever, and I conflated it with the one I refuted
+## RETRACTED: the launch-merging lever below was mis-computed. See the measurement after it.
+
+## (Retracted) CORRECTION: there IS a named lever
 
 Every verdict above rests on "no lever is named for the remainder". That is
 wrong, and the error was mine: I treated the bin+walk **tile algorithm** as
@@ -728,6 +730,40 @@ cannot be deferred past the reuse. Merging needs **one queue set per live
 segment: +307 MB** for the longest episode. That is a memory trade to price,
 not a free win (`M2_PROGRESS_2026-09-05.md`). What has been built and refuted is a
 different mechanism that happens to target the same pools.
+
+## The launch-merging lever, built and refuted
+
+The section above claimed 1.29 ms from merging launches, on the strength of
+the duration model's per-launch "floor" shares. **It was built and measured,
+and it is a loss: +0.147 ms/frame whole, +0.208 heavy, arms disjoint**, with
+output bit-identical (18/18 sentinels, exact hash) so the comparison is sound.
+
+Getting there took three iterations, each of which taught something:
+
+1. Merged stage 3 across the whole episode -- **device lost**. There are 8
+   rasterizer queue sets and 12.84 segments per episode, so segment 8 rebuilds
+   the queues segment 0 has not drained.
+2. `CP_PASS_STREAMS` 8 -> 16 -- crash moves from row 2,657 to 4,332. The
+   diagnosis is confirmed, but the longest episode is 24 segments.
+3. Cap the episode at `CP_PASS_STREAMS` segments so the sets cannot wrap --
+   **correct**, and **slower**.
+
+**Why the estimate was wrong, and it is the merge rule again.** The floor
+percentages are shares of **summed** duration. Stage 3 sums to 0.778 ms/frame
+and is 0.392 union-exclusive, so **half of its launch time is already
+overlapped with other work** -- which is precisely what the 8-stream fan-out
+exists to do (`DEAD_ENDS` 36 prices surrendering it at 0.66-0.84 ms). A merged
+kernel that loops the segments sequentially inside one grid removes launch
+count and **adds serialisation**, and the serialisation costs more than the
+launches saved.
+
+Applying summed-duration floors to pools whose cost is already union-exclusive
+is `DEAD_ENDS` 22 in a new disguise, and it is the second time this document
+made that error -- the first was quoting the fragment pool at 2.25 ms.
+
+**So the verdict returns to where it was**: no lever is named for the
+remainder, and this one is now refuted by construction rather than by
+argument.
 
 ## Verdict: not achieved, and NOT proven unreachable
 
