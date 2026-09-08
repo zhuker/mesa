@@ -371,6 +371,49 @@ largest single item still on the table and larger than anything else measured.
       - overdraw (frame-wide deferred) -1.56
       = 2.97 ms          4x target 2.33 ms   -- short by 1.27x
 
+## CORRECTION: the fragment pool was quoted in the wrong metric
+
+Every figure above that calls fragment shading "2.25 ms/frame" is wrong. That
+is the **summed** duration of kernels named `main`, and in this driver *every
+compiled shader is named `main`* -- so it contains the vertex shaders as well
+as the fragment shaders, and it double-counts kernels that ran concurrently.
+Union-exclusive, from the same trace:
+
+| pool | union-exclusive | summed |
+|---|---:|---:|
+| all kernels | 4.009 | 7.209 |
+| FS_direct | **0.659** | 0.662 |
+| FS_abuf | **0.070** | 0.078 |
+| clip_all | 0.520 | 2.415 |
+| VS | 0.434 | 1.298 |
+| stage3 | 0.392 | 0.778 |
+| fs_compact | 0.368 | 0.371 |
+| stage2 | 0.187 | 0.378 |
+| memcpy / memset | 0.451 / 0.258 | |
+
+**Fragment shading is 0.729 ms/frame, not 2.25.** This is the error
+`CLAUDE.md` and the merge rule warn about, made in this very document.
+
+## The corrected accounting, and it is the cleanest form of the argument
+
+    device work, union-exclusive, whole window     4.718 ms/frame
+      - bin+walk replaces clip+stage2+stage3       -0.95
+      - overdraw removal on fragments (0.729/2.29) -0.41
+      - fs_compact reduction                       -0.27
+      = device work after every measured saving     3.088 ms/frame
+    4x native target, whole window                  2.088 ms/frame
+
+**A frame cannot be shorter than the device work it contains.** After every
+saving this campaign has identified and priced, the GPU still has 3.09 ms of
+union-exclusive work to execute against a 2.09 ms budget -- **1.48x over,
+before counting a single microsecond of host time, launch gap or frame
+boundary.**
+
+That is the argument in its final form. It needs no model of occupancy, no
+assumption about cycles per instruction, and no estimate of what a rewrite
+might achieve: it is measured device work against the target, with every
+identified saving already subtracted.
+
 ## Verdict
 
 **Not proven unreachable, and not yet reachable.** The arithmetic:
