@@ -11,6 +11,8 @@ nobody was looking for is bigger than either: **unified-memory fault stall is
 1.83 ms/frame there against 0.38 here, 4.8x**.
 
 Standing when this was written: favorite3 **9.883**, favorite2 **8.283**
+(both **pre-2026-09-05**: the wide-episode and depth-only-batching wins landed
+after this and have never been measured on the B200)
 (3 alternating rounds, gates passed, `PERF_HANDOFF.md`).
 
 ---
