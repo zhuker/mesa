@@ -206,6 +206,16 @@ cpvk_devenv_icd = custom_target(
 )
 
 
+# Pure host gate for visibility-complete opaque shade grouping.  It proves
+# both the retained shading boundaries and the visibility-only exclusions.
+cp_shade_equiv_test = executable(
+  'cp_shade_equiv_test', files('tests/cp_shade_equiv_test.c'),
+  include_directories : [inc_include, inc_src, inc_util,
+                         include_directories('.')],
+  dependencies : [dep_cuda_vk, idep_mesautil, idep_nir],
+  build_by_default : false)
+test('cp_shade_equiv_test', cp_shade_equiv_test, suite : 'cudavk')
+
 # Focused external-API regression suite. These link the Vulkan loader rather
 # than driver internals and select the generated development ICD, so they test
 # the same dispatch and object-lifetime boundary as applications do.

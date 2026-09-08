@@ -8,6 +8,7 @@
  */
 
 #include "cp_renderer.h"
+#include "cp_shade_equiv.h"
 #include "cp_nvtx.h"
 #include "compiler/glsl_types.h"
 
@@ -4329,9 +4330,10 @@ cp_shade_prepare(struct cp_context *cp, const struct cp_draw_state *state,
     * instead, which is rare and still has to be right. */
    CUdeviceptr batch_rows = 0;
    if (cp->fs_batch.ndraws > 1 && fs->reads_const_bufs) {
-      if (!cp->fs_batch.slices) {
-         fprintf(stderr, "cudavk: a batch of %u has no slice table; refusing "
-                 "to shade it\n", cp->fs_batch.ndraws);
+      if (!cp->fs_batch.slices && !seg_ranges) {
+         fprintf(stderr, "cudavk: a batch of %u has neither a slice nor "
+                 "segment-range table; refusing to shade it\n",
+                 cp->fs_batch.ndraws);
          return false;
       }
       batch_rows = cp_scratch_alloc_device(cp, (size_t)max_pixels * 4);
@@ -9433,8 +9435,7 @@ cp_opaque_finish_common(struct cp_context *cp, bool visibility_ready)
          for (unsigned g = 0; g < ngroups; g++) {
             struct cp_pass_seg *first = &segs[group_first[g]];
             bool same = visibility_ready
-               ? !memcmp(&first->batch.key, &segs[s].batch.key,
-                         sizeof(first->batch.key))
+               ? cp_opaque_shade_equivalent(first, &segs[s])
                : first->batch.state.vs == segs[s].batch.state.vs &&
                  first->batch.state.fs == segs[s].batch.state.fs &&
                  first->batch.state.num_fs_ubos ==
@@ -9504,6 +9505,8 @@ cp_opaque_finish_common(struct cp_context *cp, bool visibility_ready)
    }
 
    struct cp_fs_batch saved_fs_batch = cp->fs_batch;
+   CUdeviceptr saved_sampler_table = cp->sampler_table;
+   unsigned saved_num_samplers = cp->num_samplers;
    size_t shade_mark = cp->scratch.used;
    size_t shade_dmark = cp->dscratch.used;
    for (unsigned g = 0; g < ngroups; g++) {
@@ -9526,11 +9529,17 @@ cp_opaque_finish_common(struct cp_context *cp, bool visibility_ready)
       cp->fs_batch.ndraws = group_rows;
       cp->fs_batch.slices = seg->slices_dev;
       cp->fs_batch.prim_shift = seg->prim_shift;
+      /* The finish is deferred past later descriptor binds.  Restore the
+       * snapshot belonging to this shade group before the FS specializer and
+       * its module globals inspect it. */
+      cp->sampler_table = seg->batch.key.sampler_table;
+      cp->num_samplers = seg->batch.key.num_samplers;
       cp_shade_fragments(cp, &seg->batch.state, &seg->batch.scope,
                          &seg->batch.info, cp->visbuf, seg->rast.positions,
                          seg->rast.positions, seg->rast.prim_refs,
                          seg->num_triangles, w, h,
-                         color_data, seg->rast.vp_scale_x,
+                         seg->batch.scope.fb.color,
+                         seg->rast.vp_scale_x,
                          seg->rast.vp_scale_y, seg->rast.vp_trans_x,
                          seg->rast.vp_trans_y, seg->rast.depth_scale,
                          seg->rast.depth_translate, 0, 0, 0,
@@ -9541,6 +9550,8 @@ cp_opaque_finish_common(struct cp_context *cp, bool visibility_ready)
                           * visibility buffer is keyed on depth. */
                          false);
    }
+   cp->sampler_table = saved_sampler_table;
+   cp->num_samplers = saved_num_samplers;
    cp->fs_batch = saved_fs_batch;
 }
 
