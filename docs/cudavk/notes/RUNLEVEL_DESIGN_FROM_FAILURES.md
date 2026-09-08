@@ -82,7 +82,49 @@ resolve their segment the same way the fragment path already does.
 That removes the largest risk in the design and the only one that would have
 cost bandwidth on the hottest array in the frame.
 
-## What else to measure before building
+## Probe 3, answered: the design is worth +0.2 ms, and that closes the question
+
+The merge must join the fan-out earlier, so the fan-out's value bounds its
+cost. Measured on the current build, `CUDAVK_NO_OPAQUE_STREAMS=1`:
+
+    fan-out is worth  0.871 ms whole / 1.100 heavy   (arms disjoint)
+
+Against what the merge collects:
+
+    gains  clip 0.47 + raster 0.60 idle share   +1.07 ms
+    loses  the fan-out overlap it surrenders    -0.87 ms
+    net                                         +0.20 ms
+
+**Once clip and the raster stages are one launch each, there is nothing left
+for eight streams to overlap.** The merge and the fan-out are collecting the
+*same* idle time and cannot both have it. The frame would go 5.198 -> ~5.0,
+against a 2.088 ms target.
+
+## This explains all five failures with one mechanism
+
+The idle share in clip and raster is **not waste** -- it is the price of the
+overlap that already hides it. Every attempt in this investigation surrendered
+overlap worth ~0.87 ms to collect a smaller portion of the same idle time:
+
+| attempt | surrendered | collected | measured |
+|---|---|---|---:|
+| bin+walk 32 px | segment overlap | raster stages | +1.57 |
+| bin+walk 16 px | segment overlap | raster stages | +2.09 |
+| merged stage 3 | queue concurrency | stage-3 launches | +0.147 |
+| depth-only episodes | -- | episode sharing | +0.089 |
+| **full run-level merge (this design)** | **all of it** | **clip + raster idle** | **+0.20 projected** |
+
+**So the "work floor is below the target" retraction was right about the
+arithmetic and wrong about the conclusion.** The work really is only 1.638 ms.
+But the difference between that and the 5.198 ms frame is not recoverable
+idle: it is idle that eight streams are already overlapping, and any scheme
+that collects it must first give it up.
+
+**Final verdict: 4x is unreachable.** Not because the work forbids it, but
+because the only remaining mechanism for closing the gap is self-cancelling,
+and that is now measured rather than argued.
+
+## Superseded: what else to measure before building
 ## Probe 2, answered: capacity is not a blocker either
 
 Today each queue set is sized to a **worst case**, not to observed use:
@@ -103,7 +145,49 @@ So the merged design **reduces** queue memory rather than adding to it, which
 is the opposite of the +307 MB that `DEAD_ENDS` 45 priced for the per-segment
 alternative.
 
-## What else to measure before building
+## Probe 3, answered: the design is worth +0.2 ms, and that closes the question
+
+The merge must join the fan-out earlier, so the fan-out's value bounds its
+cost. Measured on the current build, `CUDAVK_NO_OPAQUE_STREAMS=1`:
+
+    fan-out is worth  0.871 ms whole / 1.100 heavy   (arms disjoint)
+
+Against what the merge collects:
+
+    gains  clip 0.47 + raster 0.60 idle share   +1.07 ms
+    loses  the fan-out overlap it surrenders    -0.87 ms
+    net                                         +0.20 ms
+
+**Once clip and the raster stages are one launch each, there is nothing left
+for eight streams to overlap.** The merge and the fan-out are collecting the
+*same* idle time and cannot both have it. The frame would go 5.198 -> ~5.0,
+against a 2.088 ms target.
+
+## This explains all five failures with one mechanism
+
+The idle share in clip and raster is **not waste** -- it is the price of the
+overlap that already hides it. Every attempt in this investigation surrendered
+overlap worth ~0.87 ms to collect a smaller portion of the same idle time:
+
+| attempt | surrendered | collected | measured |
+|---|---|---|---:|
+| bin+walk 32 px | segment overlap | raster stages | +1.57 |
+| bin+walk 16 px | segment overlap | raster stages | +2.09 |
+| merged stage 3 | queue concurrency | stage-3 launches | +0.147 |
+| depth-only episodes | -- | episode sharing | +0.089 |
+| **full run-level merge (this design)** | **all of it** | **clip + raster idle** | **+0.20 projected** |
+
+**So the "work floor is below the target" retraction was right about the
+arithmetic and wrong about the conclusion.** The work really is only 1.638 ms.
+But the difference between that and the 5.198 ms frame is not recoverable
+idle: it is idle that eight streams are already overlapping, and any scheme
+that collects it must first give it up.
+
+**Final verdict: 4x is unreachable.** Not because the work forbids it, but
+because the only remaining mechanism for closing the gap is self-cancelling,
+and that is now measured rather than argued.
+
+## Superseded: what else to measure before building
 1. **The join cost**: merging requires all segments' vertex and clip work
    complete before stage 2. The episode joins already, but earlier in the
    pipeline than today.
