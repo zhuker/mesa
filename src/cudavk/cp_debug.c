@@ -136,6 +136,14 @@ static const struct cp_flag_def flags[] = {
      "stable run-global clip/bin descriptors before grouped geometry. "
      "Default-off structural M2 step; requires CUDAVK_RUN_GEOMETRY and uses "
      "the exact old path until the run-wide CUDA pass lands" },
+   { "CUDAVK_RUN_GEOMETRY_FAIL_ALLOC", CP_FLAG_UINT,
+     F(run_geometry_fail_alloc),
+     "fault gate for run geometry output growth: 1 injects soft OOM and 2 "
+     "injects a fatal CUDA error before any geometry launch" },
+   { "CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH", CP_FLAG_BOOL_VALUE,
+     F(run_geometry_fail_launch),
+     "fault gate that replaces each admitted run geometry group launch with "
+     "a fatal CUDA error; verifies device loss rather than exact replay" },
    { "CUDAVK_PLAN_STATS", CP_FLAG_BOOL_VALUE, F(plan_stats),
      "report at teardown what deciding one draw at a time costs: batch keys "
      "built, pairwise merge tests, flushes, pass episodes closed and every "

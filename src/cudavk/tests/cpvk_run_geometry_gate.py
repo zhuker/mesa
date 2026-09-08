@@ -10,8 +10,10 @@ from pathlib import Path
 exe = sys.argv[1]
 out = Path("/tmp/lat/native_batchtex.ppm")
 
-def arm(enabled, split=True, clip_bin=False):
+def arm(enabled, split=True, clip_bin=False, extra=None):
     env = os.environ.copy()
+    env.pop("CUDAVK_RUN_GEOMETRY_FAIL_ALLOC", None)
+    env.pop("CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH", None)
     if split:
         env["CUDAVK_BATCH_MAX"] = "1"
     else:
@@ -20,6 +22,8 @@ def arm(enabled, split=True, clip_bin=False):
     env["CUDAVK_RUN_CLIP_BIN"] = "1" if clip_bin else "0"
     if enabled or clip_bin:
         env["CUDAVK_DEBUG_EPISODE"] = "1"
+    if extra:
+        env.update(extra)
     p = subprocess.run([exe], env=env, text=True, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, timeout=120)
     if p.returncode:
@@ -50,6 +54,32 @@ if multi_base != multi_on:
                      (multi_base, multi_on))
 print("run geometry gate: %d member VS launches -> %d, pixels identical; "
       "multi-draw fallback identical" % (batches, groups))
+
+# Allocation OOM happens before any grouped launch and is a legal exact-path
+# refusal. A CUDA/context error at the same allocation site, or at the launch,
+# must instead reach the ICD's existing VK_ERROR_DEVICE_LOST latch.
+oom_hash, oom_log = arm(True, extra={"CUDAVK_RUN_GEOMETRY_FAIL_ALLOC": "1"})
+if oom_hash != base or "run-geometry-launch:" in oom_log:
+    raise SystemExit("run geometry OOM did not soft-refuse before launch\n" + oom_log)
+
+def fatal_fault(extra, label):
+    env = os.environ.copy()
+    env.pop("CUDAVK_RUN_GEOMETRY_FAIL_ALLOC", None)
+    env.pop("CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH", None)
+    env["CUDAVK_BATCH_MAX"] = "1"
+    env["CUDAVK_RUN_GEOMETRY"] = "1"
+    env.update(extra)
+    proc = subprocess.run([exe], env=env, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, timeout=120)
+    if proc.returncode == 0 or "failed: -4" not in proc.stdout:
+        raise SystemExit("%s did not latch VK_ERROR_DEVICE_LOST\n%s" %
+                         (label, proc.stdout))
+
+fatal_fault({"CUDAVK_RUN_GEOMETRY_FAIL_ALLOC": "2"},
+            "run geometry allocation CUDA fault")
+fatal_fault({"CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH": "1"},
+            "run geometry group launch CUDA fault")
+print("run geometry fault gate: OOM replayed; CUDA allocation/launch faults lost device")
 
 # The clip+bin structural slice preflights the whole run before any grouped VS.
 # Until its count/scan/fill/scatter continuation exists it must issue no

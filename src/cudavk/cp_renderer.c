@@ -5658,7 +5658,8 @@ struct cp_vs_prepare {
    bool ready;
 };
 
-static bool cp_run_geometry_device_reserve(CUdeviceptr *ptr,
+static bool cp_run_geometry_device_reserve(struct cp_context *cp,
+                                            CUdeviceptr *ptr,
                                             size_t *capacity, size_t need);
 static void cp_draw_execute_batch_inner(struct cp_context *cp,
                                         const struct cp_draw_batch *batch,
@@ -6305,7 +6306,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          } else if (prepare_only) {
             size_t output_bytes = (size_t)total_verts * out_stride;
             if (!prepare->storage || !prepare->storage_capacity ||
-                !cp_run_geometry_device_reserve(prepare->storage,
+                !cp_run_geometry_device_reserve(cp, prepare->storage,
                                                 prepare->storage_capacity,
                                                 output_bytes)) {
                FREE(refs);
@@ -6771,8 +6772,12 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             vs_blk_bytes = vs_vf_off + sizeof(struct cp_vertex_fetch_args);
 
          void *vs_blk = NULL;
-         CUdeviceptr vs_args_dev = cp_upload_begin(cp, vs_blk_bytes, &vs_blk);
+         CUresult vs_begin_err = CUDA_SUCCESS;
+         CUdeviceptr vs_args_dev =
+            cp_upload_begin_checked(cp, vs_blk_bytes, &vs_blk, &vs_begin_err);
          if (!vs_args_dev) {
+            if (vs_begin_err != CUDA_SUCCESS && !cp->device_fatal)
+               cp_renderer_texture_fatal(cp);
             FREE(refs);
             return;
          }
@@ -6853,7 +6858,14 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             vs_args_host[CP_ARG_UBO_BASE + i] =
                (void *)(uintptr_t)state->vs_ubos[i];
 
-         cp_upload_end(cp, vs_args_dev, vs_blk, vs_blk_bytes);
+         CUresult vs_upload_err =
+            cp_upload_end(cp, vs_args_dev, vs_blk, vs_blk_bytes);
+         if (vs_upload_err != CUDA_SUCCESS) {
+            if (!cp->device_fatal)
+               cp_renderer_texture_fatal(cp);
+            FREE(refs);
+            return;
+         }
 
          /*
           * The clip's scratch, and the shade chain's two argument blocks,
@@ -7034,6 +7046,12 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
                prepare->num_verts = total_verts;
                prepare->out_stride = out_stride;
                prepare->ready = true;
+            } else {
+               /* Preparation has enqueued or attempted CUDA work. A launch or
+                * upload fault is not a pre-commit admission refusal: replaying
+                * the batch exactly would submit it onto a poisoned context. */
+               if (!cp->device_fatal)
+                  cp_renderer_texture_fatal(cp);
             }
             FREE(refs);
             return;
@@ -11195,7 +11213,8 @@ cp_run_clip_bin_preflight(struct cp_context *cp)
  * one. A rare growth uses legacy cuMemFree and may synchronize; steady state
  * performs neither an allocation nor a free. */
 static bool
-cp_run_geometry_device_reserve(CUdeviceptr *ptr, size_t *capacity, size_t need)
+cp_run_geometry_device_reserve(struct cp_context *cp, CUdeviceptr *ptr,
+                               size_t *capacity, size_t need)
 {
    if (*capacity >= need)
       return true;
@@ -11205,11 +11224,31 @@ cp_run_geometry_device_reserve(CUdeviceptr *ptr, size_t *capacity, size_t need)
          return false;
       cap *= 2;
    }
+
    CUdeviceptr fresh = 0;
-   if (cuMemAlloc(&fresh, cap) != CUDA_SUCCESS)
+   CUresult err = cp_debug->run_geometry_fail_alloc == 1
+      ? CUDA_ERROR_OUT_OF_MEMORY
+      : cp_debug->run_geometry_fail_alloc == 2
+      ? CUDA_ERROR_UNKNOWN
+      : cp_mem_alloc_retry(cp, &fresh, cap);
+   if (err != CUDA_SUCCESS) {
+      /* Capacity and OOM are pre-commit admission refusals. Every other CUDA
+       * error may report an earlier launch/context/device fault and cannot be
+       * converted into exact replay on the same poisoned context. */
+      if (err != CUDA_ERROR_OUT_OF_MEMORY && !cp->device_fatal)
+         cp_renderer_texture_fatal(cp);
       return false;
-   if (*ptr)
-      cuMemFree(*ptr);
+   }
+
+   if (*ptr) {
+      err = cuMemFree(*ptr);
+      if (err != CUDA_SUCCESS) {
+         (void)cuMemFree(fresh);
+         if (!cp->device_fatal)
+            cp_renderer_texture_fatal(cp);
+         return false;
+      }
+   }
    *ptr = fresh;
    *capacity = cap;
    return true;
@@ -11319,14 +11358,19 @@ cp_run_geometry_launch_group(struct cp_context *cp,
    size_t storage_bytes = vf_off + sizeof(struct cp_vertex_fetch_args);
 
    size_t output_bytes = (size_t)total_verts * out_stride;
-   if (!cp_run_geometry_device_reserve(&group->output,
+   if (!cp_run_geometry_device_reserve(cp, &group->output,
                                        &group->output_capacity,
                                        output_bytes))
       return false;
    void *host = NULL;
-   CUdeviceptr storage = cp_upload_begin(cp, storage_bytes, &host);
-   if (!storage)
+   CUresult begin_err = CUDA_SUCCESS;
+   CUdeviceptr storage =
+      cp_upload_begin_checked(cp, storage_bytes, &host, &begin_err);
+   if (!storage) {
+      if (begin_err != CUDA_SUCCESS && !cp->device_fatal)
+         cp_renderer_texture_fatal(cp);
       return false;
+   }
    memset(host, 0, storage_bytes);
    CUdeviceptr output = group->output;
 
@@ -11447,13 +11491,19 @@ cp_run_geometry_launch_group(struct cp_context *cp,
    /* Use the ordinary upload ring rather than handing an async copy a temporary
     * calloc block. The ring owns the staging lifetime until the ordered DMA has
     * consumed it and coalesces this block with adjacent launch arguments. */
-   cp_upload_end(cp, storage, host, storage_bytes);
-   void *arg_ptr = (void *)(uintptr_t)(storage + args_off);
-   void *params[] = { &arg_ptr };
-   CUresult err = cp_launch(cp, group->kernel,
-      MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
-      0, cp->stream, params, NULL);
+   CUresult err = cp_upload_end(cp, storage, host, storage_bytes);
+   if (err == CUDA_SUCCESS) {
+      void *arg_ptr = (void *)(uintptr_t)(storage + args_off);
+      void *params[] = { &arg_ptr };
+      err = cp_debug->run_geometry_fail_launch
+         ? CUDA_ERROR_UNKNOWN
+         : cp_launch(cp, group->kernel,
+                     MIN2((total_verts + 255) / 256, 4096u), 1, 1,
+                     256, 1, 1, 0, cp->stream, params, NULL);
+   }
    if (err != CUDA_SUCCESS) {
+      if (!cp->device_fatal)
+         cp_renderer_texture_fatal(cp);
       for (unsigned m = 0; m < group->num_members; m++) {
          struct cp_run_geometry_span *span =
             &cp->run_geometry.spans[members[m].batch];
@@ -11537,7 +11587,7 @@ cp_run_geometry_drain(struct cp_context *cp)
       (void)cp_run_clip_bin_preflight(cp);
       cp->run_geometry.clip_continuation_fallbacks++;
    }
-   for (unsigned g = 0; !clip_bin_stage &&
+   for (unsigned g = 0; !clip_bin_stage && !cp->device_fatal &&
                             g < cp->run_geometry.ngroups; g++) {
       struct cp_run_geometry_group *group = &cp->run_geometry.groups[g];
       const struct cp_run_geometry_member *members =

@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-141 switches.
+143 switches.
 
 ## Tracing
 
@@ -29,6 +29,8 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_RUN_CENSUS` | bool (value) | `off` | — | count the runs the run-level redesign would render as one unit -- maximal sequences of consecutive same-class draws in one scope -- and report at teardown what share of the frame's triangles they hold. Watches only; changes no rendering decision (REDESIGN_PLAN_2026-09-05) |
 | `CUDAVK_RUN_GEOMETRY` | bool (value) | `off` | — | collect each opaque run and launch compatible groups of one-draw triangle-list members through one fused vertex shader. Default-off M2 step; multi-draw members and downstream stages stay on the old path |
 | `CUDAVK_RUN_CLIP_BIN` | bool (value) | `off` | — | preflight at most 64 side-effect-free triangle-list batches and build stable run-global clip/bin descriptors before grouped geometry. Default-off structural M2 step; requires CUDAVK_RUN_GEOMETRY and uses the exact old path until the run-wide CUDA pass lands |
+| `CUDAVK_RUN_GEOMETRY_FAIL_ALLOC` | uint | `0` | — | fault gate for run geometry output growth: 1 injects soft OOM and 2 injects a fatal CUDA error before any geometry launch |
+| `CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH` | bool (value) | `off` | — | fault gate that replaces each admitted run geometry group launch with a fatal CUDA error; verifies device loss rather than exact replay |
 | `CUDAVK_PLAN_STATS` | bool (value) | `off` | — | report at teardown what deciding one draw at a time costs: batch keys built, pairwise merge tests, flushes, pass episodes closed and every reactive reallocation, with per-scope averages |
 | `CUDAVK_SPEC_STATS` | bool (value) | `off` | — | report at teardown how many fragment launches used a sampler-specialised kernel, and which shaders sample textures the specialiser could not match; a silent drop to zero is a performance regression with no error |
 | `CUDAVK_TEXTURE_CACHE_BUDGET_MB` | uint | `2048` | — | hardware texture cache byte budget in MiB; an allocation past it falls back to software sampling silently, which cost 1.76 ms/frame on the occlusion capture at the old default of 384 |

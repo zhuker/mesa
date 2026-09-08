@@ -173,6 +173,8 @@ struct cp_debug {
    bool run_census;
    bool run_geometry;
    bool run_clip_bin;
+   unsigned run_geometry_fail_alloc;
+   bool run_geometry_fail_launch;
    bool no_wide_episode;
    bool no_depth_only_batch;
    bool debug_vfetch;

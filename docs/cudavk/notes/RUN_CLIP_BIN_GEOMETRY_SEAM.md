@@ -62,12 +62,21 @@ the continuation must initialize its own counters once, in its own order.
 
 Run-wide descriptor and resource preflight must finish before the first call.
 Every prepared VS is side-effect-free, writes only private run storage, and
-seeds no downstream counter. Therefore an allocation or preparation refusal,
-even after earlier batches were prepared, may replay the whole run through the
-exact legacy path. That duplicates exceptional VS work but has no rendering or
-ordering effect. A CUDA execution fault remains a device failure. Once the
-future clip/bin path writes shared visibility or runs a fragment shader, legacy
-replay is no longer a valid fallback.
+seeds no downstream counter. Therefore a host-capacity refusal or
+`CUDA_ERROR_OUT_OF_MEMORY`, even after earlier batches were prepared, may replay
+the whole run through the exact legacy path. That duplicates exceptional VS
+work but has no rendering or ordering effect.
+
+That rule is deliberately narrow. A non-OOM CUDA allocation result, an upload
+ring wrap whose context synchronization fails, an upload failure, a failed
+`cuMemFree`, or a kernel launch failure latches `cp->device_fatal` through the
+renderer's existing fatal callback. The drain then stops before exact replay,
+and the native ICD reports its existing `VK_ERROR_DEVICE_LOST`; this layer does
+not invent a Vulkan status. `CUDAVK_RUN_GEOMETRY_FAIL_ALLOC=1` gates the soft
+OOM arm, `=2` gates a fatal allocation result, and
+`CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH=1` gates the fatal group-launch arm. Once the
+future clip/bin path writes shared visibility or runs a fragment shader, even
+OOM is no longer a valid legacy fallback.
 
 This commit adds the seam but does not call it from the current
 `RUN_CLIP_BIN` preflight. That path still has no run-wide continuation and
