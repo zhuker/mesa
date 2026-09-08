@@ -2682,6 +2682,17 @@ re-tune of the raster thresholds, `TILE_BOUND` and `POINT_THRESHOLD` (defaults
 optimal, 0.09-0.10 ms worse either side); 20 batch-break tests, of which 17
 never fire; 3 predicate relaxations; 5 structural rewrites, all slower.
 
+**Frame-wide deferred shading: already done where it is legal.** The 0.411 ms
+carried for it throughout this investigation was never available. An opaque
+episode already defers -- every segment rasterises into one visibility buffer
+and shading runs per identity group afterwards -- so a pixel is shaded once
+per episode. Frame-wide deferral would require all opaque work in a single
+episode, and opaque groups are separated by **15.3 blended runs a frame**. A
+blended draw reads the colour underneath it, so the opaque work before it must
+already have shaded. Merging across it changes the result. The 2.29x overdraw
+is the cost of that interleaving, and it is the application's structure, not
+the driver's.
+
 **The last hardware-assisted path, priced and refused.** CUDA cannot invoke
 the rasteriser, but this GPU has RT cores that do hardware triangle
 intersection, and using them for visibility is a known technique. It needs a
