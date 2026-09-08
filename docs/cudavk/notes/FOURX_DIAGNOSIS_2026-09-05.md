@@ -96,6 +96,53 @@ band's ~1.54 M launches takes **6.2 hours** and exceeds any sane timeout. A
 different instrument is required -- profiling a representative shader in
 isolation, or a synthetic harness that reproduces the launch geometry.
 
+## The fragment pool, priced at last
+
+`ncu` cannot reach the heavy band, but it reaches the **first** launches
+cheaply: `--kernel-name main --launch-count 24` completes in minutes where
+`--launch-skip 240000` needed 6.2 hours. Same shaders, same driver path.
+
+| | median | max |
+|---|---:|---:|
+| Compute (SM) throughput | **0.31%** | 2.33% |
+| Memory throughput | 5.12% | 6.35% |
+| DRAM throughput | 0.14% | 0.86% |
+| L1/TEX throughput | 12.35% | 19.55% |
+| L2 throughput | 0.45% | 4.10% |
+| **Achieved occupancy** | **8.74%** | 16.61% |
+| **Warp cycles per issued instruction** | **53.27** | 77.36 |
+
+Each warp issues one instruction every 53 cycles. The stall breakdown says why:
+
+| stall reason | warps stalled | share |
+|---|---:|---:|
+| **long_scoreboard** (waiting on memory) | 24.97 | **76.6%** |
+| no_instruction | 2.65 | 8.1% |
+| wait | 2.23 | 6.8% |
+| short_scoreboard | 1.23 | 3.8% |
+| everything else | — | 4.7% |
+
+**`main` is memory-latency bound with too little occupancy to hide the
+latency.** Not bandwidth -- DRAM is 0.14% and L2 0.45%; the traffic is L1/TEX
+at 12%. So it is *latency on small, cache-resident accesses*, waited on by
+5.6 resident warps per SM out of 64.
+
+Two things follow, and both are architectural rather than tuning:
+
+- **Grid shape is not it.** `CUDAVK_FS_GRID_WAVES=1` and `=4` move the frame
+  by <= 0.05 ms. The grids are already 1,266 blocks x 255 threads, 7x the
+  machine, with a 0.86 us minimum duration -- there is no launch floor.
+- **The fragment path is a memory pipeline where hardware has none.** cudavk
+  materialises interpolated varyings into `fs_in`, the shader loads them,
+  writes `fs_out`, and a **separate** `cp_fs_writeback` launch reads that back
+  to blend. Every varying is a memory round trip; a hardware rasteriser
+  delivers them without one. That is what 76.6% long_scoreboard at 0.14% DRAM
+  looks like.
+
+This is the same pool the plan's 3.5 addresses (fuse the writeback into the
+shade) and `DEAD_ENDS` 15 parked. It is now measured, and it is the largest
+single item in the driver at 2.25 ms/frame.
+
 ## Verdict
 
 **Not proven unreachable, and not yet reachable.** The arithmetic:
@@ -105,6 +152,13 @@ isolation, or a synthetic harness that reproduces the launch geometry.
       - fragment efficiency        ??             (2.25 ms pool, 2% issue, unmeasured)
       = 2.33 target
 
-Closing it needs the fragment pool to give up roughly 3 ms, and nothing yet
-says whether it can. **That measurement is the next step**, and it is the last
-large unpriced quantity in this driver.
+Closing it needs the fragment pool to give up roughly 3 ms. It is now priced:
+**76.6% of its stalls are memory latency at 8.7% occupancy and 0.14% DRAM**,
+which is a round-trip problem, not a bandwidth or arithmetic one. The round
+trips are `fs_in` (interpolated varyings) and `fs_out` (shaded colour read
+back by a separate writeback launch).
+
+**Still not proven unreachable.** The remaining question is how much of that
+2.25 ms survives if the varyings stay in registers and the writeback fuses --
+which is exactly `DEAD_ENDS` 15 and plan 3.5, now with a measured reason to
+retry rather than a modelled one.
