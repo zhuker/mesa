@@ -2682,6 +2682,22 @@ re-tune of the raster thresholds, `TILE_BOUND` and `POINT_THRESHOLD` (defaults
 optimal, 0.09-0.10 ms worse either side); 20 batch-break tests, of which 17
 never fire; 3 predicate relaxations; 5 structural rewrites, all slower.
 
+**The last hardware-assisted path, priced and refused.** CUDA cannot invoke
+the rasteriser, but this GPU has RT cores that do hardware triangle
+intersection, and using them for visibility is a known technique. It needs a
+BVH over the frame's geometry, and the geometry here is dynamic (skinned
+characters, animated scene) so no BVH survives a frame:
+
+| build kind | throughput | 250k triangles |
+|---|---:|---:|
+| full | 10 Mtri/s | 25.00 ms |
+| fast full | 50 Mtri/s | 5.00 ms |
+| LBVH | 100 Mtri/s | 2.50 ms |
+
+**The fastest build alone exceeds the entire 2.088 ms frame budget**, before a
+single ray is cast -- and rays would give visibility only, leaving shading,
+blending and the A-buffer exactly as they are. Refused on build cost.
+
 **The margin is 1.28x, not a wide one**, and this document corrected itself
 eleven times reaching it -- three of those reversals of a stated verdict. The
 firm claims are narrower than "impossible": every mechanism identifiable from
