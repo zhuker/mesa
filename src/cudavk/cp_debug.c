@@ -127,6 +127,28 @@ static const struct cp_flag_def flags[] = {
      "maximal sequences of consecutive same-class draws in one scope -- and "
      "report at teardown what share of the frame's triangles they hold. "
      "Watches only; changes no rendering decision (REDESIGN_PLAN_2026-09-05)" },
+   { "CUDAVK_RUN_GEOMETRY", CP_FLAG_BOOL_VALUE, F(run_geometry),
+     "collect each opaque run and launch compatible groups of one-draw "
+     "triangle-list members through one fused vertex shader. Default-off M2 "
+     "step; multi-draw members and downstream stages stay on the old path" },
+   { "CUDAVK_RUN_CLIP_BIN", CP_FLAG_BOOL_VALUE, F(run_clip_bin),
+     "preflight at most 64 side-effect-free triangle-list batches and build "
+     "stable run-global clip/bin descriptors before grouped geometry. "
+     "Default-off transactional M2 renderer; requires CUDAVK_RUN_GEOMETRY, "
+     "with exact pre-commit replay and device-predicated classic fallback" },
+   { "CUDAVK_RUN_CLIP_BIN_CAPACITY", CP_FLAG_UINT,
+     F(run_clip_bin_capacity),
+     "diagnostic dense-reference capacity for RUN_CLIP_BIN; 0 uses the "
+     "normal maximum, while a small value forces the device-predicated "
+     "classic visibility arm without a host readback" },
+   { "CUDAVK_RUN_GEOMETRY_FAIL_ALLOC", CP_FLAG_UINT,
+     F(run_geometry_fail_alloc),
+     "fault gate for run geometry output growth: 1 injects soft OOM and 2 "
+     "injects a fatal CUDA error before any geometry launch" },
+   { "CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH", CP_FLAG_BOOL_VALUE,
+     F(run_geometry_fail_launch),
+     "fault gate that replaces each admitted run geometry group launch with "
+     "a fatal CUDA error; verifies device loss rather than exact replay" },
    { "CUDAVK_PLAN_STATS", CP_FLAG_BOOL_VALUE, F(plan_stats),
      "report at teardown what deciding one draw at a time costs: batch keys "
      "built, pairwise merge tests, flushes, pass episodes closed and every "

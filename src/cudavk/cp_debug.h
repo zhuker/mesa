@@ -171,6 +171,11 @@ struct cp_debug {
    bool texture_cache_stats;
    bool plan_stats;
    bool run_census;
+   bool run_geometry;
+   bool run_clip_bin;
+   unsigned run_clip_bin_capacity;
+   unsigned run_geometry_fail_alloc;
+   bool run_geometry_fail_launch;
    bool no_wide_episode;
    bool no_depth_only_batch;
    bool debug_vfetch;

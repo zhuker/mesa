@@ -373,7 +373,7 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
             ids[emitted] = id;
          emitted++;
       }
-      if (args->stable && !args->active_ids)
+      if (args->stable && !args->active_ids && !ids)
          clip_retire(args, out, slots, tri, 1);
       return emitted;
    }
@@ -388,7 +388,7 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
       float4 *dst = (p & 1) ? poly_b : poly_a;
       n = clip_poly(dst, src, n, slots, p);
       if (n < 3) {
-         if (args->stable && !args->active_ids)
+         if (args->stable && !args->active_ids && !ids)
             clip_retire(args, out, slots, tri, 0);
          return 0;
       }
@@ -413,7 +413,9 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
          ids[emitted] = id;
       emitted++;
    }
-   if (args->stable && !args->active_ids)
+   /* A caller consuming emitted IDs directly never visits unused stable
+    * slots, so do not pay eight retirement writes per input triangle. */
+   if (args->stable && !args->active_ids && !ids)
       clip_retire(args, out, slots, tri, (uint32_t)k);
    return emitted;
 }
@@ -606,6 +608,222 @@ setup_triangle(struct cp_rasterize_args *args, uint32_t tri_id,
 }
 
 /*
+ * One grid for an ordered run. blockIdx.y names a segment and x grid-strides
+ * its input triangles. cp_clip_one() and setup_triangle() are the same helpers
+ * used by the legacy path; this entry point only adds the run-global stable ID
+ * and the 32-pixel bounding-box tile count.
+ *
+ * live_count, overflow and tile_counts must be cleared before launch. The
+ * kernel publishes a compact live record only after clip output and setup are
+ * complete. It has no rendering side effects and is not launched by the
+ * renderer until scan/fill can replace the
+ * old path transactionally.
+ */
+extern "C" __global__ void
+cp_run_clip_setup_tile_count(struct cp_run_clip_bin_args args)
+{
+   uint32_t seg_idx = blockIdx.y;
+   if (seg_idx >= args.num_segments)
+      return;
+   uint32_t *overflow = (uint32_t *)(uintptr_t)args.overflow;
+   if (seg_idx >= CP_RUN_CLIP_BIN_MAX_SEGS || !args.tiles_x || !args.tiles_y) {
+      if (blockIdx.x == 0 && threadIdx.x == 0)
+         atomicOr(overflow, CP_RUN_CLIP_BIN_ERR_SEGMENT_BOUNDS);
+      return;
+   }
+
+   const struct cp_run_clip_bin_device_segment *segments =
+      (const struct cp_run_clip_bin_device_segment *)(uintptr_t)args.segments;
+   struct cp_run_clip_bin_device_segment seg = segments[seg_idx];
+   struct cp_clip_args clip = seg.clip;
+   struct cp_rasterize_args rast = seg.rast;
+   if (!clip.stable || clip.num_slots == 0 ||
+       clip.num_slots > CP_MAX_CLIP_SLOTS) {
+      if (blockIdx.x == 0 && threadIdx.x == 0)
+         atomicOr(overflow, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS);
+      return;
+   }
+
+   /* These fields follow directly from the clip ABI. Keeping them here avoids
+    * a descriptor whose two halves silently disagree about the same buffer. */
+   clip.active_ids = 0;
+   rast.positions = clip.out;
+   rast.prim_refs = clip.prim_refs;
+   rast.num_triangles = clip.max_triangles;
+   rast.num_varyings = clip.num_slots - 1u;
+   rast.tri_count = 0;
+   rast.active_ids = 0;
+
+   struct cp_run_clip_bin_live *live =
+      (struct cp_run_clip_bin_live *)(uintptr_t)args.live;
+   uint32_t *live_count = (uint32_t *)(uintptr_t)args.live_count;
+   uint32_t *counts = (uint32_t *)(uintptr_t)args.tile_counts;
+
+   for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x;
+        tri < clip.num_triangles; tri += blockDim.x * gridDim.x) {
+      uint32_t emitted[CP_CLIP_MAX_OUT];
+      int n = cp_clip_one(&clip, tri, emitted);
+      for (int i = 0; i < n; i++) {
+         uint32_t local_id = emitted[i];
+         uint32_t stable_id = seg.prim_base + local_id;
+         if (stable_id < seg.prim_base || stable_id >= args.total_slots) {
+            atomicOr(overflow, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS);
+            continue;
+         }
+         struct cp_tri_setup setup = {};
+         if (!setup_triangle(&rast, local_id, &setup))
+            continue;
+
+         int tx0 = max(setup.ix_min, 0) / (int)CP_RUN_CLIP_BIN_TILE_SIZE;
+         int ty0 = max(setup.iy_min, 0) / (int)CP_RUN_CLIP_BIN_TILE_SIZE;
+         int tx1 = min(setup.ix_max,
+                       (int)(args.tiles_x * CP_RUN_CLIP_BIN_TILE_SIZE - 1u)) /
+                   (int)CP_RUN_CLIP_BIN_TILE_SIZE;
+         int ty1 = min(setup.iy_max,
+                       (int)(args.tiles_y * CP_RUN_CLIP_BIN_TILE_SIZE - 1u)) /
+                   (int)CP_RUN_CLIP_BIN_TILE_SIZE;
+         if (tx0 > tx1 || ty0 > ty1)
+            continue;
+
+         uint32_t at = atomicAdd(live_count, 1u);
+         if (at >= args.live_capacity) {
+            atomicOr(overflow, CP_RUN_CLIP_BIN_ERR_LIVE_BOUNDS);
+            continue;
+         }
+         struct cp_run_clip_bin_live rec;
+         rec.stable_prim = stable_id;
+         rec.segment = seg_idx;
+         live[at] = rec;
+
+         for (int ty = ty0; ty <= ty1; ty++)
+            for (int tx = tx0; tx <= tx1; tx++)
+               atomicAdd(counts + (uint32_t)ty * args.tiles_x + (uint32_t)tx,
+                         1u);
+      }
+   }
+}
+
+/* Check the uint32 tile-count sum in uint64 before the existing uint32
+ * exclusive scan. If it exceeds dense-list capacity, later fill and visibility
+ * kernels observe errors and return without consuming wrapped offsets. Launch
+ * exactly one 256-thread block. */
+extern "C" __global__ void
+cp_run_clip_bin_check_counts(struct cp_run_clip_bin_check_counts_args args)
+{
+   if (blockDim.x != 256) {
+      if (threadIdx.x == 0)
+         atomicOr((uint32_t *)(uintptr_t)args.errors,
+                  CP_RUN_CLIP_BIN_ERR_REF_OVERFLOW);
+      return;
+   }
+   __shared__ uint64_t sums[256];
+   uint64_t sum = 0;
+   for (uint32_t tile = threadIdx.x; tile < args.num_tiles;
+        tile += blockDim.x)
+      sum += ((const uint32_t *)(uintptr_t)args.tile_counts)[tile];
+   sums[threadIdx.x] = sum;
+   __syncthreads();
+   for (uint32_t step = blockDim.x >> 1; step; step >>= 1) {
+      if (threadIdx.x < step)
+         sums[threadIdx.x] += sums[threadIdx.x + step];
+      __syncthreads();
+   }
+   if (threadIdx.x == 0) {
+      *(uint64_t *)(uintptr_t)args.total_refs = sums[0];
+      if (sums[0] > args.capacity || sums[0] > 0xffffffffull)
+         atomicOr((uint32_t *)(uintptr_t)args.errors,
+                  CP_RUN_CLIP_BIN_ERR_REF_OVERFLOW);
+   }
+}
+
+/* Scatter one dense reference per counted tile. The scan itself stays a
+ * separate primitive so the eventual renderer can keep the whole transaction
+ * on-device. No host readback or visibility write occurs here. */
+extern "C" __global__ void
+cp_run_clip_bin_fill(struct cp_run_clip_bin_fill_args args)
+{
+   uint32_t *errors = (uint32_t *)(uintptr_t)args.errors;
+   if (*errors)
+      return;
+   uint32_t n = *(const uint32_t *)(uintptr_t)args.live_count;
+   if (n > args.live_capacity) {
+      atomicOr(errors, CP_RUN_CLIP_BIN_ERR_LIVE_BOUNDS);
+      n = args.live_capacity;
+   }
+   const struct cp_run_clip_bin_live *live =
+      (const struct cp_run_clip_bin_live *)(uintptr_t)args.live;
+   const struct cp_run_clip_bin_device_segment *segments =
+      (const struct cp_run_clip_bin_device_segment *)(uintptr_t)args.segments;
+   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+        i += gridDim.x * blockDim.x) {
+      struct cp_run_clip_bin_live rec = live[i];
+      if (rec.segment >= args.num_segments ||
+          rec.segment >= CP_RUN_CLIP_BIN_MAX_SEGS) {
+         atomicOr(errors, CP_RUN_CLIP_BIN_ERR_SEGMENT_BOUNDS); continue;
+      }
+      struct cp_run_clip_bin_device_segment seg = segments[rec.segment];
+      if (rec.stable_prim < seg.prim_base ||
+          rec.stable_prim >= args.total_slots) {
+         atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS); continue;
+      }
+      uint32_t local = rec.stable_prim - seg.prim_base;
+      if (local >= seg.clip.max_triangles) {
+         atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS); continue;
+      }
+      struct cp_rasterize_args rast = seg.rast;
+      rast.positions = seg.clip.out; rast.prim_refs = seg.clip.prim_refs;
+      rast.num_triangles = seg.clip.max_triangles;
+      rast.num_varyings = seg.clip.num_slots - 1u;
+      rast.tri_count = 0; rast.active_ids = 0;
+      struct cp_tri_setup setup = {};
+      if (!setup_triangle(&rast, local, &setup)) {
+         atomicOr(errors, CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS); continue;
+      }
+      int tx0 = max(setup.ix_min, 0) / (int)CP_RUN_CLIP_BIN_TILE_SIZE;
+      int ty0 = max(setup.iy_min, 0) / (int)CP_RUN_CLIP_BIN_TILE_SIZE;
+      int tx1 = min(setup.ix_max,
+         (int)(args.tiles_x * CP_RUN_CLIP_BIN_TILE_SIZE - 1u)) /
+         (int)CP_RUN_CLIP_BIN_TILE_SIZE;
+      int ty1 = min(setup.iy_max,
+         (int)(args.tiles_y * CP_RUN_CLIP_BIN_TILE_SIZE - 1u)) /
+         (int)CP_RUN_CLIP_BIN_TILE_SIZE;
+      for (int ty = ty0; ty <= ty1; ty++) for (int tx = tx0; tx <= tx1; tx++) {
+         uint32_t tile = (uint32_t)ty * args.tiles_x + (uint32_t)tx;
+         uint32_t pos = atomicAdd((uint32_t *)(uintptr_t)args.tile_cursors + tile, 1u);
+         uint32_t count = ((const uint32_t *)(uintptr_t)args.tile_counts)[tile];
+         uint64_t at = (uint64_t)((const uint32_t *)(uintptr_t)args.tile_offsets)[tile] + pos;
+         if (pos >= count || at >= args.capacity) {
+            atomicOr(errors, CP_RUN_CLIP_BIN_ERR_REF_OVERFLOW); continue;
+         }
+         struct cp_opaque_tile_ref *refs =
+            (struct cp_opaque_tile_ref *)(uintptr_t)args.tile_refs;
+         refs[at].global_prim = rec.stable_prim;
+         refs[at].segment = (uint16_t)rec.segment;
+         refs[at].flags = 0;
+      }
+   }
+}
+
+extern "C" __global__ void
+cp_run_clip_bin_validate_cursors(struct cp_run_clip_bin_fill_args args)
+{
+   if (*(const uint32_t *)(uintptr_t)args.errors)
+      return;
+   uint32_t tile = blockIdx.x * blockDim.x + threadIdx.x;
+   uint32_t nt = args.tiles_x * args.tiles_y;
+   if (tile >= nt) return;
+   uint32_t count = ((const uint32_t *)(uintptr_t)args.tile_counts)[tile];
+   uint32_t cursor = ((const uint32_t *)(uintptr_t)args.tile_cursors)[tile];
+   uint64_t end = (uint64_t)((const uint32_t *)(uintptr_t)args.tile_offsets)[tile] + count;
+   if (cursor != count)
+      atomicOr((uint32_t *)(uintptr_t)args.errors,
+               CP_RUN_CLIP_BIN_ERR_CURSOR_MISMATCH);
+   if (end > args.capacity)
+      atomicOr((uint32_t *)(uintptr_t)args.errors,
+               CP_RUN_CLIP_BIN_ERR_REF_OVERFLOW);
+}
+
+/*
  * Whether this triangle already discarded at this pixel on an earlier pass of
  * an alpha-tested draw. Visibility is resolved before shading, so without this
  * the pixel would keep choosing the same transparent fragment and whatever is
@@ -751,7 +969,8 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
       const uint32_t *next = (const uint32_t *)(uintptr_t)args->peel_next;
       if (tri_id < next[(uint32_t)py * args->width + (uint32_t)px])
          return;
-      atomicMin(&visbuf[at], PACK_VISBUF(tri_id, tri_id));
+      atomicMin((unsigned long long *)&visbuf[at],
+                (unsigned long long)PACK_VISBUF(tri_id, tri_id));
       /* Tells the host another pass is worth running. Racing writers all store
        * the same value, so the read first is only there to spare the traffic. */
       uint32_t *any = (uint32_t *)(uintptr_t)args->peel_any;
@@ -761,8 +980,8 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
    }
 
    uint32_t key = args->depth_key_invert ? ~depth_uint : depth_uint;
-   atomicMin(&visbuf[at],
-             PACK_VISBUF(key, args->abuf_prim_base + tri_id));
+   atomicMin((unsigned long long *)&visbuf[at],
+             (unsigned long long)PACK_VISBUF(key, args->abuf_prim_base + tri_id));
 }
 
 /*

@@ -794,7 +794,7 @@ cp_scratch_reset(struct cp_context *cp)
     * kernels have not been issued yet. Rewinding then lets this draw's own
     * uploads land on them.
     */
-   if (!cp->batch_uploads_live) {
+   if (!cp->batch_uploads_live && !cp->run_geometry.draining) {
       /* The rewind hands these bytes out again, so anything still owed on
        * them has to go first. The callers have already drained the device,
        * so the copy this issues is the last reader of the old contents. */
@@ -954,6 +954,44 @@ cp_plan_report(struct cp_context *cp)
 }
 
 static void
+cp_run_geometry_report(struct cp_context *cp)
+{
+   if (!cp_debug->run_geometry && !cp_debug->run_clip_bin)
+      return;
+   if (cp_debug->run_geometry)
+      fprintf(stderr,
+           "cudavk: run geometry: %llu runs, %llu batches, %llu draws, "
+           "%llu groups built, %llu launched, %llu member launches removed; "
+           "refusals non-fused=%llu VS-side-effect=%llu allocation=%llu\n",
+           (unsigned long long)cp->run_geometry.runs,
+           (unsigned long long)cp->run_geometry.batches_seen,
+           (unsigned long long)cp->run_geometry.draws_seen,
+           (unsigned long long)cp->run_geometry.groups_built,
+           (unsigned long long)cp->run_geometry.groups_launched,
+           (unsigned long long)cp->run_geometry.member_launches_saved,
+           (unsigned long long)cp->run_geometry.refused_nonfused,
+           (unsigned long long)cp->run_geometry.refused_vs_side_effect,
+           (unsigned long long)cp->run_geometry.alloc_fallbacks);
+   if (cp_debug->run_clip_bin) {
+      fprintf(stderr,
+              "cudavk: run clip+bin: dependency=%s; %llu preflights, "
+              "%llu prepared, %llu committed, %llu exact pre-commit fallbacks; "
+              "refusals segments=%llu shape=%llu side-effect=%llu slots=%llu "
+              "primitive-range=%llu\n",
+              cp_debug->run_geometry ? "met" : "missing RUN_GEOMETRY",
+              (unsigned long long)cp->run_geometry.clip_preflights,
+              (unsigned long long)cp->run_geometry.clip_prepared,
+              (unsigned long long)cp->run_geometry.clip_commits,
+              (unsigned long long)cp->run_geometry.clip_continuation_fallbacks,
+              (unsigned long long)cp->run_geometry.clip_refused_segments,
+              (unsigned long long)cp->run_geometry.clip_refused_shape,
+              (unsigned long long)cp->run_geometry.clip_refused_side_effect,
+              (unsigned long long)cp->run_geometry.clip_refused_slots,
+              (unsigned long long)cp->run_geometry.clip_refused_primitive_range);
+   }
+}
+
+static void
 cp_hardware_texture_report(struct cp_context *cp)
 {
    if (!cp_debug->texture_cache_stats || !cp->hardware_texture.launches)
@@ -1062,6 +1100,7 @@ cp_context_cleanup(struct cp_context *cp)
               (double)cp->fs_blocks / (double)cp->fs_launches, cp->sm_count,
               cp_debug->fs_grid_waves);
    cp_plan_report(cp);
+   cp_run_geometry_report(cp);
    cp_run_census_report(cp);
    if (cp_debug->upload_stats)
       fprintf(stderr, "cudavk: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
@@ -1143,6 +1182,22 @@ cp_context_cleanup(struct cp_context *cp)
    cp->hardware_texture.resolve_workspace = NULL;
    free(cp->pass_segs);
    free(cp->pass_group_ubos);
+   free(cp->run_geometry.batches);
+   free(cp->run_geometry.members);
+   for (unsigned g = 0; g < cp->run_geometry.group_capacity; g++) {
+      if (cp->run_geometry.groups[g].output)
+         cuMemFree(cp->run_geometry.groups[g].output);
+   }
+   free(cp->run_geometry.groups);
+   for (unsigned i = 0; i < cp->run_geometry.span_capacity; i++) {
+      if (cp->run_geometry.spans[i].prepared_output)
+         cuMemFree(cp->run_geometry.spans[i].prepared_output);
+      if (cp->run_geometry.spans[i].prepared_descriptors)
+         cuMemFree(cp->run_geometry.spans[i].prepared_descriptors);
+   }
+   if (cp->run_geometry.clip_bin_storage)
+      cuMemFree(cp->run_geometry.clip_bin_storage);
+   free(cp->run_geometry.spans);
 }
 
 /* Per-stage timing for a draw, printed under CUDAVK_DEBUG_TIME. See
@@ -5596,8 +5651,161 @@ cp_vslane_join(struct cp_context *cp)
    cp->vslane.taken++;
 }
 
+/* A non-NULL preparation request stops immediately after the ordinary VS
+ * launch.  storage is grow-only device memory owned by the run; all other
+ * allocations remain per-batch scratch. */
+struct cp_vs_prepare {
+   CUdeviceptr *storage;
+   size_t *storage_capacity;
+   CUdeviceptr *descriptor_storage;
+   size_t *descriptor_capacity;
+   CUdeviceptr output;
+   uint32_t num_verts;
+   uint32_t out_stride;
+   CUdeviceptr draw_slices;
+   uint32_t num_draw_slices;
+   uint32_t prim_shift;
+   CUdeviceptr clip_rects;
+   struct cp_rasterize_args pre_clip_rast;
+   bool ready;
+};
+
+static bool cp_run_geometry_device_reserve(struct cp_context *cp,
+                                            CUdeviceptr *ptr,
+                                            size_t *capacity, size_t need);
 static void cp_draw_execute_batch_inner(struct cp_context *cp,
-                                        const struct cp_draw_batch *batch);
+                                        const struct cp_draw_batch *batch,
+                                        struct cp_vs_prepare *prepare);
+
+/* The device descriptors shared by vertex fetch, raster clipping and fragment
+ * row lookup.  This is the one construction site for both ordinary execution
+ * and prepare-only handoff; the latter must retain what the former actually
+ * built rather than infer it again from the collected batch. */
+struct cp_draw_descriptors {
+   CUdeviceptr slices;
+   uint32_t num_slices;
+   CUdeviceptr clip_rects;
+   uint32_t prim_shift;
+};
+
+static bool
+cp_draw_descriptors_build(struct cp_context *cp,
+                          unsigned batch_draws,
+                          const struct cp_draw_call *info,
+                          const struct cp_draw_range *draws,
+                          bool indexed, const uint64_t *ib_ptrs,
+                          const uint32_t *instance_counts,
+                          unsigned instance_count, bool per_draw_rects,
+                          int clip_x0, int clip_y0, int clip_x1, int clip_y1,
+                          const struct cp_rect *scissors,
+                          struct cp_rasterize_args *rast_args,
+                          struct cp_vs_prepare *prepare,
+                          struct cp_draw_descriptors *desc)
+{
+   *desc = (struct cp_draw_descriptors) { 0 };
+   if (batch_draws <= 1)
+      return true;
+
+   struct cp_draw_slice slices[CP_MAX_BATCH_DRAWS];
+   uint32_t vbegin = 0;
+   for (unsigned d = 0; d < batch_draws; d++) {
+      unsigned inst = instance_counts
+         ? MAX2(instance_counts[d], 1u) : instance_count;
+      unsigned dverts = cp_triangles_for_draw(info->mode, draws[d].count) * 3;
+      slices[d].vert_begin = vbegin;
+      slices[d].index_bytes =
+         indexed ? (uint32_t)draws[d].start * info->index_size : 0;
+      slices[d].first_vertex =
+         indexed ? (uint32_t)draws[d].index_bias : draws[d].start;
+      /* This draw's own index buffer, when it is not the batch's.  The fold
+       * of draws[0].start into vf_args.index_buffer does not happen on the
+       * slice path, so the base goes in whole. */
+      uint64_t slice_ib = 0;
+      if (indexed && ib_ptrs && ib_ptrs[d] &&
+          ib_ptrs[d] != (uint64_t)(uintptr_t)info->index_ptr)
+         slice_ib = ib_ptrs[d];
+      slices[d].ib_base_lo = (uint32_t)slice_ib;
+      slices[d].ib_base_hi = (uint32_t)(slice_ib >> 32);
+      /* Zero for a plain draw, so the fetch skips the division; the span
+       * covers every instance either way. */
+      slices[d].verts_per_instance = inst > 1 ? dverts : 0;
+      vbegin += dverts * inst;
+   }
+   size_t slices_bytes = (size_t)batch_draws * sizeof(slices[0]);
+   size_t rects_off = ALIGN_POT(slices_bytes, 16);
+   size_t descriptor_bytes = rects_off +
+      (per_draw_rects ? (size_t)batch_draws * sizeof(int32_t[4]) : 0);
+   if (prepare) {
+      if (!prepare->descriptor_storage || !prepare->descriptor_capacity ||
+          !cp_run_geometry_device_reserve(cp, prepare->descriptor_storage,
+                                          prepare->descriptor_capacity,
+                                          descriptor_bytes))
+         return false;
+      desc->slices = *prepare->descriptor_storage;
+   } else {
+      desc->slices = cp_upload(cp, slices, slices_bytes);
+      if (!desc->slices)
+         return false;
+   }
+   desc->num_slices = batch_draws;
+
+   if (cp_debug->debug_rows)
+      fprintf(stderr, "slices: n=%u set=%d verts=[%u %u %u]\n",
+              batch_draws, desc->slices ? 1 : 0, slices[0].vert_begin,
+              batch_draws > 1 ? slices[1].vert_begin : 0,
+              batch_draws > 2 ? slices[2].vert_begin : 0);
+
+   /* Each rectangle is the batch-wide framebuffer/viewport rectangle
+    * intersected with the draw's recorded scissor. */
+   int32_t rects[CP_MAX_BATCH_DRAWS][4];
+   if (per_draw_rects) {
+      for (unsigned d = 0; d < batch_draws; d++) {
+         rects[d][0] = MAX2(clip_x0, (int)scissors[d].minx);
+         rects[d][1] = MAX2(clip_y0, (int)scissors[d].miny);
+         rects[d][2] = MIN2(clip_x1, (int)scissors[d].maxx - 1);
+         rects[d][3] = MIN2(clip_y1, (int)scissors[d].maxy - 1);
+      }
+   }
+   if (prepare) {
+      void *host = NULL;
+      CUresult begin_err = CUDA_SUCCESS;
+      CUdeviceptr temporary = cp_upload_begin_checked(
+         cp, descriptor_bytes, &host, &begin_err);
+      if (!temporary) {
+         if (begin_err != CUDA_SUCCESS && !cp->device_fatal)
+            cp_renderer_texture_fatal(cp);
+         return false;
+      }
+      memcpy(host, slices, slices_bytes);
+      if (rects_off > slices_bytes)
+         memset((char *)host + slices_bytes, 0, rects_off - slices_bytes);
+      if (per_draw_rects)
+         memcpy((char *)host + rects_off, rects,
+                (size_t)batch_draws * sizeof(rects[0]));
+      if (cp_upload_end(cp, temporary, host, descriptor_bytes) != CUDA_SUCCESS ||
+          cp_upload_flush(cp) != CUDA_SUCCESS ||
+          cuMemcpyDtoDAsync(*prepare->descriptor_storage, temporary,
+                            descriptor_bytes, cp->stream) != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return false;
+      }
+      if (per_draw_rects)
+         desc->clip_rects = desc->slices + rects_off;
+   } else if (per_draw_rects) {
+      desc->clip_rects = cp_upload(cp, rects,
+         (size_t)batch_draws * sizeof(rects[0]));
+      if (!desc->clip_rects)
+         return false;
+   }
+   if (per_draw_rects) {
+      rast_args->rect_draw_slices = desc->slices;
+      rast_args->clip_rects = desc->clip_rects;
+      rast_args->num_rect_slices = batch_draws;
+      rast_args->rect_prim_shift = 0;   /* CP_CLIP_PRIM_SHIFT after stable clip */
+   }
+   desc->prim_shift = rast_args->rect_prim_shift;
+   return true;
+}
 
 /*
  * The batch, with the vertex lane armed around it.
@@ -5612,11 +5820,11 @@ void
 cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 {
    if (!!cp_debug->no_vs_lane) {
-      cp_draw_execute_batch_inner(cp, batch);
+      cp_draw_execute_batch_inner(cp, batch, NULL);
       return;
    }
    cp_vslane_arm(cp, batch);
-   cp_draw_execute_batch_inner(cp, batch);
+   cp_draw_execute_batch_inner(cp, batch, NULL);
    cp_vslane_disarm(cp, batch);
 }
 
@@ -5632,9 +5840,24 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
  */
 static void
 cp_draw_execute_batch_inner(struct cp_context *cp,
-                            const struct cp_draw_batch *batch)
+                            const struct cp_draw_batch *batch,
+                            struct cp_vs_prepare *prepare)
 {
-   cp->plan.flushes++;
+   const bool prepare_only = prepare != NULL;
+   if (prepare) {
+      CUdeviceptr *storage = prepare->storage;
+      size_t *storage_capacity = prepare->storage_capacity;
+      CUdeviceptr *descriptor_storage = prepare->descriptor_storage;
+      size_t *descriptor_capacity = prepare->descriptor_capacity;
+      *prepare = (struct cp_vs_prepare) {
+         .storage = storage,
+         .storage_capacity = storage_capacity,
+         .descriptor_storage = descriptor_storage,
+         .descriptor_capacity = descriptor_capacity,
+      };
+   }
+   if (!prepare_only)
+      cp->plan.flushes++;
    /* Where the main stream stood when this batch began; see the vertex lane
     * above. Nothing between here and the two clears below may enqueue
     * anything, and the check after them says so. */
@@ -5681,17 +5904,20 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * this one. `slices` stays null until the batch actually has more than one
     * draw to tell apart; with one draw every fragment takes row zero.
     */
-   cp->fs_batch.ubos = fs_ubo_table;
-   cp->fs_batch.ndraws = fs_ubo_table ? batch_draws : 0;
-   cp->fs_batch.slices = 0;
-   cp->fs_batch.prim_shift = 0;
+   if (!prepare_only) {
+      cp->fs_batch.ubos = fs_ubo_table;
+      cp->fs_batch.ndraws = fs_ubo_table ? batch_draws : 0;
+      cp->fs_batch.slices = 0;
+      cp->fs_batch.prim_shift = 0;
+   }
 
-   if (cp_debug->debug_rows)
+   if (!prepare_only && cp_debug->debug_rows)
       fprintf(stderr, "exec: batch_draws=%u num_draws=%u fs_tbl=%d "
               "fs_ndraws=%u\n", batch_draws, num_draws, fs_ubo_table ? 1 : 0,
               cp->fs_batch.ndraws);
 
-   if (!screen->kernels.initialized || !screen->kernels.rasterize_triangles)
+   if (!screen->kernels.initialized ||
+       (!prepare_only && !screen->kernels.rasterize_triangles))
       return;
    /*
     * A draw with nowhere to put a colour and nowhere to put a depth normally
@@ -5703,7 +5929,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * further down, which carries the same condition through the rest of the
     * function.
     */
-   if (!fb->nr_cbufs && !fb->has_zs &&
+   if (!prepare_only && !fb->nr_cbufs && !fb->has_zs &&
        !(state->fs && state->fs->writes_memory))
       do { if (cp_debug->debug_draw)
             fprintf(stderr, "  skipped: no colour or depth attachment\n");
@@ -5802,7 +6028,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * across draws would shade one draw's pixels with another's geometry.
     * Occlusion between draws is carried by the depth buffer instead. */
    CUdeviceptr visbuf = cp->visbuf;
-   if (!visbuf)
+   if (!prepare_only && !visbuf)
       do { if (cp_debug->debug_draw)
             fprintf(stderr, "  skipped: no visibility buffer\n");
          return; } while (0);
@@ -5812,11 +6038,11 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * skips it: the A-buffer passes never touch the visibility buffer, and at
     * a segment per blended batch this was most of the frame's memset traffic.
     * The fallback path re-executes classically and clears its own. */
-   if (!cp->pass.appending)
+   if (!prepare_only && !cp->pass.appending)
       cuMemsetD32Async(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples,
                        cp->stream);
 
-   if (!cp->depthbuf_cleared)
+   if (!prepare_only && !cp->depthbuf_cleared)
       cp_clear_depthbuf(cp, 1.0f);
 
    /*
@@ -5827,7 +6053,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * allowance is exactly two and the mark for the launch site is taken
     * here, behind them.
     */
-   if (cp->vslane.ready && !cp_devop_quiet_since(cp, vsl_top, 2)) {
+   if (!prepare_only && cp->vslane.ready &&
+       !cp_devop_quiet_since(cp, vsl_top, 2)) {
       cp->vslane.ready = false;
       cp->vslane.refused++;
    }
@@ -6024,7 +6251,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
 
    /* Marks the start of the draw; the interval it opens is
     * attributed to nothing. */
-   cp_stage_end(cp, -1);
+   if (!prepare_only)
+      cp_stage_end(cp, -1);
 
    /* Reclaim last draw's scratch and size the arena for this one. A pass
     * episode owns the epoch instead: every segment's clipped stream has to
@@ -6039,7 +6267,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * The batch's uploads have survived the reclaim above; everything this
     * draw uploads from here is its own, and the next draw may rewind freely.
     */
-   cp->batch_uploads_live = false;
+   if (!cp->run_geometry.draining)
+      cp->batch_uploads_live = false;
 
    /* A shader with no declared inputs needs no vertex buffer: it builds its
     * positions from gl_VertexIndex, which is how a fullscreen pass is drawn.
@@ -6151,7 +6380,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          return;
       }
    }
-   cp_stage_end(cp, CP_STAGE_ASSEMBLE);
+   if (!prepare_only)
+      cp_stage_end(cp, CP_STAGE_ASSEMBLE);
 
    /* If we have a compiled VS, run it to transform vertices.
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
@@ -6214,7 +6444,22 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * A refusal here is silent and complete: everything below is what it
           * was, on the main stream, with the seeding folded as usual.
           */
-         bool vs_lane_out = fused_vfetch && cp->vslane.ready;
+         bool vs_lane_out = !prepare_only && !cp->run_geometry.active_output &&
+                            fused_vfetch && cp->vslane.ready;
+         if (cp->run_geometry.active_output) {
+            assert(cp->run_geometry.active_num_verts == total_verts);
+            vs_output_buf = cp->run_geometry.active_output;
+         } else if (prepare_only) {
+            size_t output_bytes = (size_t)total_verts * out_stride;
+            if (!prepare->storage || !prepare->storage_capacity ||
+                !cp_run_geometry_device_reserve(cp, prepare->storage,
+                                                prepare->storage_capacity,
+                                                output_bytes)) {
+               FREE(refs);
+               return;
+            }
+            vs_output_buf = *prepare->storage;
+         }
          if (vs_lane_out) {
             vs_output_buf =
                cp_vslane_output(cp, (size_t)total_verts * out_stride);
@@ -6325,39 +6570,25 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * value it has always had, which is what makes CUDAVK_BATCH_MAX=1
           * bit-identical rather than merely close.
           */
-         CUdeviceptr slices_dev = 0;
+         struct cp_draw_descriptors descriptors;
+         if (!cp_draw_descriptors_build(cp, batch_draws, info, draws, indexed,
+                                        ib_ptrs, instance_counts,
+                                        instance_count, per_draw_rects,
+                                        clip_x0, clip_y0, clip_x1, clip_y1,
+                                        scissors, &rast_args, prepare,
+                                        &descriptors)) {
+            FREE(refs);
+            return;
+         }
+         CUdeviceptr slices_dev = descriptors.slices;
+         if (cp_debug->debug_episode && cp->run_geometry.draining)
+            fprintf(stderr, "run-geometry-metadata: draws=%u slices=%u "
+                    "count=%u prim-shift=%u clip-rects=%u prepare=%u\n",
+                    batch_draws, descriptors.slices != 0,
+                    descriptors.num_slices, descriptors.prim_shift,
+                    descriptors.clip_rects != 0, prepare_only);
          CUdeviceptr batch_rows = 0;
          if (batch_draws > 1) {
-            struct cp_draw_slice slices[CP_MAX_BATCH_DRAWS];
-            uint32_t vbegin = 0;
-            for (unsigned d = 0; d < batch_draws; d++) {
-               unsigned inst = instance_counts
-                  ? MAX2(instance_counts[d], 1u) : instance_count;
-               unsigned dverts =
-                  cp_triangles_for_draw(info->mode, draws[d].count) * 3;
-               slices[d].vert_begin = vbegin;
-               slices[d].index_bytes =
-                  indexed ? (uint32_t)draws[d].start * info->index_size : 0;
-               slices[d].first_vertex =
-                  indexed ? (uint32_t)draws[d].index_bias : draws[d].start;
-               /* This draw's own index buffer, when it is not the batch's.
-                * The fold of draws[0].start into vf_args.index_buffer does
-                * not happen on the slice path, so the base goes in whole. */
-               uint64_t slice_ib = 0;
-               if (indexed && ib_ptrs && ib_ptrs[d] &&
-                   ib_ptrs[d] != (uint64_t)(uintptr_t)info->index_ptr)
-                  slice_ib = ib_ptrs[d];
-               slices[d].ib_base_lo = (uint32_t)slice_ib;
-               slices[d].ib_base_hi = (uint32_t)(slice_ib >> 32);
-               /* Zero for a plain draw, so the fetch skips the division; the
-                * span covers every instance either way. */
-               slices[d].verts_per_instance = inst > 1 ? dverts : 0;
-               vbegin += dverts * inst;
-            }
-            slices_dev = cp_upload(cp, slices,
-                                   (size_t)batch_draws * sizeof(slices[0]));
-            if (!slices_dev) { FREE(refs); return; }
-
             /* One row per assembled vertex, for the shader to pick its
              * uniform bindings and its draw parameters with. Only a shader
              * that reads either has any use for it — and a fused shader has
@@ -6371,38 +6602,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
 
             /* The fragment stage searches the same table, from the primitive
              * rather than from the vertex; see cp_fs_interp_args. */
-            if (fs_ubo_table)
+            if (!prepare_only && fs_ubo_table)
                cp->fs_batch.slices = slices_dev;
-
-            if (cp_debug->debug_rows)
-               fprintf(stderr, "slices: n=%u set=%d verts=[%u %u %u]\n",
-                       batch_draws, slices_dev ? 1 : 0, slices[0].vert_begin,
-                       batch_draws > 1 ? slices[1].vert_begin : 0,
-                       batch_draws > 2 ? slices[2].vert_begin : 0);
-
-            /*
-             * The per-draw clip rectangles, when the batch's draws may
-             * disagree on the scissor: each is the batch-wide rectangle —
-             * which then carries no scissor at all — intersected with that
-             * draw's recorded one. The rasterizer resolves a primitive to
-             * its rectangle through the slice table above.
-             */
-            if (per_draw_rects) {
-               int32_t rects[CP_MAX_BATCH_DRAWS][4];
-               for (unsigned d = 0; d < batch_draws; d++) {
-                  rects[d][0] = MAX2(clip_x0, (int)scissors[d].minx);
-                  rects[d][1] = MAX2(clip_y0, (int)scissors[d].miny);
-                  rects[d][2] = MIN2(clip_x1, (int)scissors[d].maxx - 1);
-                  rects[d][3] = MIN2(clip_y1, (int)scissors[d].maxy - 1);
-               }
-               CUdeviceptr rects_dev = cp_upload(cp, rects,
-                  (size_t)batch_draws * sizeof(rects[0]));
-               if (!rects_dev) { FREE(refs); return; }
-               rast_args.rect_draw_slices = slices_dev;
-               rast_args.clip_rects = rects_dev;
-               rast_args.num_rect_slices = batch_draws;
-               rast_args.rect_prim_shift = 0;   /* 2 once stable clip runs */
-            }
          }
 
          /* The batch's per-draw vertex-buffer bases. Uploaded for a batch of
@@ -6499,7 +6700,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * then stays on the main stream pays a clear it did not need, which
           * is a cost and not a hazard.
           */
-         fetch_fold = !cp_debug->no_fetch_fold && !vs_lane_out &&
+         fetch_fold = !prepare_only && !cp_debug->no_fetch_fold &&
+                      !vs_lane_out && !cp->run_geometry.active_output &&
                       (fused_vfetch ? vs_runs : fetch_runs);
 
          /*
@@ -6672,8 +6874,12 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             vs_blk_bytes = vs_vf_off + sizeof(struct cp_vertex_fetch_args);
 
          void *vs_blk = NULL;
-         CUdeviceptr vs_args_dev = cp_upload_begin(cp, vs_blk_bytes, &vs_blk);
+         CUresult vs_begin_err = CUDA_SUCCESS;
+         CUdeviceptr vs_args_dev =
+            cp_upload_begin_checked(cp, vs_blk_bytes, &vs_blk, &vs_begin_err);
          if (!vs_args_dev) {
+            if (vs_begin_err != CUDA_SUCCESS && !cp->device_fatal)
+               cp_renderer_texture_fatal(cp);
             FREE(refs);
             return;
          }
@@ -6754,7 +6960,14 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             vs_args_host[CP_ARG_UBO_BASE + i] =
                (void *)(uintptr_t)state->vs_ubos[i];
 
-         cp_upload_end(cp, vs_args_dev, vs_blk, vs_blk_bytes);
+         CUresult vs_upload_err =
+            cp_upload_end(cp, vs_args_dev, vs_blk, vs_blk_bytes);
+         if (vs_upload_err != CUDA_SUCCESS) {
+            if (!cp->device_fatal)
+               cp_renderer_texture_fatal(cp);
+            FREE(refs);
+            return;
+         }
 
          /*
           * The clip's scratch, and the shade chain's two argument blocks,
@@ -6795,7 +7008,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * with it.
           */
          struct cp_clip_alloc clip_alloc = { 0 };
-         if (!cp_debug->no_clip_alloc_hoist) {
+         if (!prepare_only && !cp_debug->no_clip_alloc_hoist) {
             clip_alloc.taken = true;
             clip_alloc.stable = stable_clip_early;
             clip_alloc.max_clipped = max_clipped_early;
@@ -6887,7 +7100,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
 
          /* Which shader ran, and how often, so that the fused-fetch admission
           * share can be weighted by launches rather than by shader count. */
-         if (state->vs->vs_census) {
+         if (!cp->run_geometry.active_output && state->vs->vs_census) {
             p_atomic_inc(&state->vs->vs_census->launches);
             if (fused_vfetch)
                p_atomic_inc(&state->vs->vs_census->launches_fused);
@@ -6917,16 +7130,42 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             cp->vslane.slot_next ^= 1u;
          }
 
-         /* Compiled shaders grid-stride; see the fragment launch. */
-         CUresult vs_err = cp_launch(cp, vs_exec->kernel,
-            MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
-            0, cp->stream, vs_params, NULL);
+         CUresult vs_err = CUDA_SUCCESS;
+         if (!cp->run_geometry.active_output)
+            vs_err = cp_launch(cp, vs_exec->kernel,
+               MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
+               0, cp->stream, vs_params, NULL);
 
          /* Whatever the launch did, the main stream owns the rest of this
           * batch: the join is unconditional so that no path out of this
           * function can leave work on the lane unordered. */
          if (vs_lane)
             cp_vslane_join(cp);
+
+         if (prepare_only) {
+            if (vs_err == CUDA_SUCCESS) {
+               /* Exact ordinary template at the pre-clip boundary. */
+               rast_args.positions = vs_output_buf;
+               rast_args.num_varyings = num_vs_outputs - 1;
+               prepare->output = vs_output_buf;
+               prepare->num_verts = total_verts;
+               prepare->out_stride = out_stride;
+               prepare->draw_slices = descriptors.slices;
+               prepare->num_draw_slices = descriptors.num_slices;
+               prepare->prim_shift = descriptors.prim_shift;
+               prepare->clip_rects = descriptors.clip_rects;
+               prepare->pre_clip_rast = rast_args;
+               prepare->ready = true;
+            } else {
+               /* Preparation has enqueued or attempted CUDA work. A launch or
+                * upload fault is not a pre-commit admission refusal: replaying
+                * the batch exactly would submit it onto a poisoned context. */
+               if (!cp->device_fatal)
+                  cp_renderer_texture_fatal(cp);
+            }
+            FREE(refs);
+            return;
+         }
 
          if (vs_err == CUDA_SUCCESS) {
             /* The rasterizer reads positions directly from VS output */
@@ -8456,7 +8695,7 @@ cp_run_census_break(struct cp_context *cp, bool scope_change)
 
 void
 cp_run_census_draw(struct cp_context *cp, const struct cp_draw_packet *packet,
-                   unsigned tris)
+                   unsigned tris, bool compatible_with_previous)
 {
    if (!cp_debug->run_census)
       return;
@@ -8466,12 +8705,18 @@ cp_run_census_draw(struct cp_context *cp, const struct cp_draw_packet *packet,
    rc->total_draws++;
    rc->total_tris += tris;
 
+   /* Use the Vulkan front end's real episode predicate instead of copying
+    * fields here.  That predicate is the rendering contract and changes when
+    * state is proven per-segment (for example CUDAVK_NO_WIDE_EPISODE). */
    if (rc->cls != CP_RUN_NONE &&
-       (cls != rc->cls || packet->scope->serial != rc->scope_serial)) {
+       (cls != rc->cls || packet->scope->serial != rc->scope_serial ||
+        !compatible_with_previous)) {
       if (cls != rc->cls)
          rc->break_class++;
-      else
+      else if (packet->scope->serial != rc->scope_serial)
          rc->break_scope++;
+      else
+         rc->break_flush++;
       cp_run_census_close(cp);
    }
    rc->cls = cls;
@@ -9124,7 +9369,7 @@ static void cp_tile_census_quads(struct cp_context *cp,
                                  unsigned w, unsigned h);
 
 static void
-cp_opaque_finish(struct cp_context *cp)
+cp_opaque_finish_common(struct cp_context *cp, bool visibility_ready)
 {
    unsigned nsegs = cp->pass.nsegs;
    if (!nsegs)
@@ -9155,7 +9400,7 @@ cp_opaque_finish(struct cp_context *cp)
     * so counting it as fanned out would report a fan-out that did not
     * happen — and this counter is what says whether a sample's regression or
     * win came from the streams at all. */
-   if (cp_opaque_side_streams(cp) && nsegs > 1)
+   if (!visibility_ready && cp_opaque_side_streams(cp) && nsegs > 1)
       cp->plan.opaque_fanned++;
 
    /* The segments rasterized visibility on the side streams; everything below
@@ -9167,10 +9412,11 @@ cp_opaque_finish(struct cp_context *cp)
     * work is not merely wasted: it is the same event record and cross-stream
     * wait a real join costs, which for a one-segment episode is the whole
     * price of the fan-out and none of its benefit. */
-   if (cp_opaque_side_streams(cp) && !cp_pass_join(cp, nsegs - 1))
+   if (!visibility_ready && cp_opaque_side_streams(cp) &&
+       !cp_pass_join(cp, nsegs - 1))
       return;
 
-   if (cp_debug->tiled_opaque &&
+   if (!visibility_ready && cp_debug->tiled_opaque &&
        !cp_opaque_tile_visibility(cp, segs, nsegs, w, h)) {
       cp_pass_fallback(cp, segs, nsegs);
       return;
@@ -9186,11 +9432,15 @@ cp_opaque_finish(struct cp_context *cp)
       if (!cp_debug->no_seg_merge) {
          for (unsigned g = 0; g < ngroups; g++) {
             struct cp_pass_seg *first = &segs[group_first[g]];
-            if (first->batch.state.vs == segs[s].batch.state.vs &&
-                first->batch.state.fs == segs[s].batch.state.fs &&
-                first->batch.state.num_fs_ubos == segs[s].batch.state.num_fs_ubos &&
-                first->batch.info.mode == segs[s].batch.info.mode &&
-                first->batch.ndraws == segs[s].batch.ndraws &&
+            bool same = visibility_ready
+               ? !memcmp(&first->batch.key, &segs[s].batch.key,
+                         sizeof(first->batch.key))
+               : first->batch.state.vs == segs[s].batch.state.vs &&
+                 first->batch.state.fs == segs[s].batch.state.fs &&
+                 first->batch.state.num_fs_ubos ==
+                    segs[s].batch.state.num_fs_ubos &&
+                 first->batch.info.mode == segs[s].batch.info.mode;
+            if (same && first->batch.ndraws == segs[s].batch.ndraws &&
                 !memcmp(first->batch.fs_ubos, segs[s].batch.fs_ubos,
                         (size_t)first->batch.ndraws * CP_ARG_UBO_STRIDE *
                            sizeof(uint64_t))) {
@@ -9292,6 +9542,12 @@ cp_opaque_finish(struct cp_context *cp)
                          false);
    }
    cp->fs_batch = saved_fs_batch;
+}
+
+static void
+cp_opaque_finish(struct cp_context *cp)
+{
+   cp_opaque_finish_common(cp, false);
 }
 
 /*
@@ -10824,6 +11080,1063 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    }
 }
 
+/*
+ * Whether two collected batches can use one existing fused-fetch VS launch.
+ * This deliberately keeps the fields which are launch-wide in
+ * cp_vertex_fetch_args in the key.  VB/IB addresses, ranges, instance counts,
+ * UBOs and draw parameters already have rows/slices; layout, index width and
+ * firstInstance do not.  Equality is the fallback for that missing ABI.
+ */
+static bool
+cp_run_geometry_same_launch(const struct cp_draw_batch *a,
+                            const struct cp_draw_batch *b)
+{
+   const struct cp_draw_state *sa = &a->state;
+   const struct cp_draw_state *sb = &b->state;
+   if (sa->vs != sb->vs || !sa->vs ||
+       sa->vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel !=
+          sb->vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel ||
+       a->info.index_size != b->info.index_size ||
+       a->info.start_instance != b->info.start_instance ||
+       sa->num_vertex_elements != sb->num_vertex_elements)
+      return false;
+
+   return !memcmp(sa->velem, sb->velem,
+                  (size_t)sa->num_vertex_elements * sizeof(sa->velem[0]));
+}
+
+static bool
+cp_run_geometry_fused(const struct cp_draw_batch *batch)
+{
+   const struct cp_draw_state *s = &batch->state;
+   return cp_debug->fused_vfetch && !cp_debug->no_fused_vfetch &&
+          !cp_debug->debug_vfetch && s->vs && !s->vs->writes_memory &&
+          s->vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel &&
+          s->num_vertex_elements <= CP_MAX_VERTEX_ELEMENTS_VF;
+}
+
+static bool
+cp_run_geometry_reserve(void **ptr, unsigned *capacity, unsigned need,
+                        size_t elem_size)
+{
+   if (*capacity >= need)
+      return true;
+   unsigned cap = MAX2(*capacity, 16u);
+   while (cap < need) {
+      if (cap > UINT32_MAX / 2u)
+         return false;
+      cap *= 2u;
+   }
+   void *p = realloc(*ptr, (size_t)cap * elem_size);
+   if (!p)
+      return false;
+   *ptr = p;
+   *capacity = cap;
+   return true;
+}
+
+/* Build the dynamic flattened table before any member is submitted.  Group
+ * order is first occurrence; member order is draw order.  The table is the
+ * hand-off an extracted geometry launcher will consume, while each member's
+ * copied batch remains the prepared input to today's clip/raster/shade path.
+ */
+static bool
+cp_run_geometry_plan(struct cp_context *cp)
+{
+   unsigned n = cp->run_geometry.nbatches;
+   cp->run_geometry.nmembers = 0;
+   cp->run_geometry.ngroups = 0;
+   if (!n)
+      return true;
+
+   if (!cp_run_geometry_reserve((void **)&cp->run_geometry.members,
+                                &cp->run_geometry.member_capacity, n,
+                                sizeof(cp->run_geometry.members[0])))
+      return false;
+   unsigned old_group_capacity = cp->run_geometry.group_capacity;
+   if (!cp_run_geometry_reserve((void **)&cp->run_geometry.groups,
+                                &cp->run_geometry.group_capacity, n,
+                                sizeof(cp->run_geometry.groups[0])))
+      return false;
+   if (cp->run_geometry.group_capacity > old_group_capacity)
+      memset(cp->run_geometry.groups + old_group_capacity, 0,
+             (size_t)(cp->run_geometry.group_capacity - old_group_capacity) *
+                sizeof(cp->run_geometry.groups[0]));
+   unsigned old_span_capacity = cp->run_geometry.span_capacity;
+   if (!cp_run_geometry_reserve((void **)&cp->run_geometry.spans,
+                                &cp->run_geometry.span_capacity, n,
+                                sizeof(cp->run_geometry.spans[0])))
+      return false;
+   if (cp->run_geometry.span_capacity > old_span_capacity)
+      memset(cp->run_geometry.spans + old_span_capacity, 0,
+             (size_t)(cp->run_geometry.span_capacity - old_span_capacity) *
+                sizeof(cp->run_geometry.spans[0]));
+   /* Each slot owns grow-only output storage. Reset only the returned shape;
+    * freeing or forgetting the pointer here would either synchronize every
+    * run or leak it. */
+   for (unsigned i = 0; i < n; i++) {
+      struct cp_run_geometry_span *span = &cp->run_geometry.spans[i];
+      span->output = 0;
+      span->num_verts = 0;
+      span->out_stride = 0;
+      span->draw_slices = 0;
+      span->num_draw_slices = 0;
+      span->prim_shift = 0;
+      span->clip_rects = 0;
+      span->pre_clip_rast = (struct cp_rasterize_args) { 0 };
+   }
+
+   unsigned *which = malloc((size_t)n * sizeof(*which));
+   if (!which)
+      return false;
+   for (unsigned i = 0; i < n; i++) {
+      unsigned g;
+      for (g = 0; g < cp->run_geometry.ngroups; g++) {
+         unsigned first = cp->run_geometry.groups[g].first_batch;
+         if (cp_run_geometry_same_launch(&cp->run_geometry.batches[first],
+                                         &cp->run_geometry.batches[i]))
+            break;
+      }
+      if (g == cp->run_geometry.ngroups) {
+         struct cp_run_geometry_group *group =
+            &cp->run_geometry.groups[cp->run_geometry.ngroups++];
+         CUdeviceptr output = group->output;
+         size_t output_capacity = group->output_capacity;
+         *group = (struct cp_run_geometry_group) {
+            .kernel = cp->run_geometry.batches[i].state.vs->
+                         exec[CP_SHADER_EXEC_VS_FETCH].kernel,
+            .first_batch = i,
+            .first_member = i, /* fixed after the count pass below */
+            .output = output,
+            .output_capacity = output_capacity,
+         };
+      }
+      which[i] = g;
+   }
+
+   unsigned cursor = 0;
+   for (unsigned g = 0; g < cp->run_geometry.ngroups; g++) {
+      struct cp_run_geometry_group *group = &cp->run_geometry.groups[g];
+      group->first_member = cursor;
+      group->num_members = 0;
+      group->num_draws = 0;
+      for (unsigned i = 0; i < n; i++) {
+         if (which[i] != g)
+            continue;
+         cp->run_geometry.members[cursor++] =
+            (struct cp_run_geometry_member) {
+               .batch = i,
+               .row_base = group->num_draws,
+            };
+         group->num_members++;
+         group->num_draws += cp->run_geometry.batches[i].ndraws;
+      }
+   }
+   cp->run_geometry.nmembers = cursor;
+   cp->run_geometry.groups_built += cp->run_geometry.ngroups;
+   if (cp_debug->debug_episode)
+      fprintf(stderr, "run-geometry-plan: batches=%u groups=%u members=%u\n",
+              n, cp->run_geometry.ngroups, cursor);
+   free(which);
+   return true;
+}
+
+/*
+ * Build the host half of the future run-wide clip/setup/bin ABI. This is a
+ * whole-run transaction: no grouped VS has been launched when it runs, and a
+ * refusal leaves no CUDA work to undo. The current slice deliberately stops
+ * here and uses the exact legacy path. The next slice can patch positions from
+ * spans after the grouped launches, upload this table, then replace each
+ * member's clip/stage1/stage2/stage3 only after count, scan and fill/scatter
+ * all succeed as one run-wide path.
+ */
+static bool
+cp_run_clip_bin_preflight(struct cp_context *cp)
+{
+   unsigned n = cp->run_geometry.nbatches;
+   cp->run_geometry.nclip_segments = 0;
+   cp->run_geometry.clip_prim_slots = 0;
+   cp->run_geometry.clip_preflights++;
+
+   if (!n || n > CP_RUN_CLIP_BIN_MAX_SEGS) {
+      cp->run_geometry.clip_refused_segments++;
+      return false;
+   }
+
+   const struct cp_draw_batch *first = &cp->run_geometry.batches[0];
+   const enum cp_compare_func depth_func = first->state.depth.depth_func;
+   uint64_t next_prim = 0;
+   for (unsigned i = 0; i < n; i++) {
+      const struct cp_draw_batch *b = &cp->run_geometry.batches[i];
+      const struct cp_draw_state *s = &b->state;
+      /* cp_opaque_tile_raster currently has one inclusive depth-order rule.
+       * Fail closed on strict tests, mixed directions, discard, multisample,
+       * and framebuffer changes. unsafe_force_opaque must not relax this. */
+      if (s->blend.enable || !s->fs || s->fs->uses_discard ||
+          !s->depth.depth_enabled || !s->depth.depth_writemask ||
+          (depth_func != CP_FUNC_LEQUAL && depth_func != CP_FUNC_GEQUAL) ||
+          s->depth.depth_func != depth_func || !b->scope.fb.has_zs ||
+          b->scope.fb.nr_cbufs != 1 || !b->scope.fb.color ||
+          MAX2(b->scope.attachment_samples, 1u) != 1 ||
+          memcmp(&b->scope.fb, &first->scope.fb, sizeof(b->scope.fb)) != 0) {
+         cp->run_geometry.clip_refused_shape++;
+         return false;
+      }
+      unsigned outputs = s->vs && s->vs->nir_num_outputs ?
+                         s->vs->nir_num_outputs : 2;
+      if (!b->ndraws || b->info.mode != MESA_PRIM_TRIANGLES || !b->tris) {
+         cp->run_geometry.clip_refused_shape++;
+         return false;
+      }
+      if (!s->vs || s->vs->writes_memory ||
+          (s->fs && s->fs->writes_memory)) {
+         cp->run_geometry.clip_refused_side_effect++;
+         return false;
+      }
+      if (outputs > CP_MAX_CLIP_SLOTS) {
+         cp->run_geometry.clip_refused_slots++;
+         return false;
+      }
+      uint64_t slots = (uint64_t)b->tris * CP_CLIP_MAX_OUT;
+      if (slots > CP_PRIM_ID_LIMIT ||
+          next_prim + slots > CP_PRIM_ID_LIMIT) {
+         cp->run_geometry.clip_refused_primitive_range++;
+         return false;
+      }
+
+      unsigned found_group = UINT32_MAX, found_member = UINT32_MAX;
+      for (unsigned g = 0; g < cp->run_geometry.ngroups; g++) {
+         const struct cp_run_geometry_group *group =
+            &cp->run_geometry.groups[g];
+         for (unsigned m = 0; m < group->num_members; m++) {
+            const struct cp_run_geometry_member *member =
+               &cp->run_geometry.members[group->first_member + m];
+            if (member->batch == i) {
+               found_group = g;
+               found_member = m;
+               break;
+            }
+         }
+         if (found_group != UINT32_MAX)
+            break;
+      }
+      if (found_group == UINT32_MAX) {
+         cp->run_geometry.clip_refused_shape++;
+         return false;
+      }
+
+      cp->run_geometry.clip_segments[i] =
+         (struct cp_run_clip_bin_segment) {
+            .batch = i,
+            .group = found_group,
+            .group_member = found_member,
+            .num_draws = b->ndraws,
+            .num_triangles = b->tris,
+            .num_outputs = outputs,
+            .prim_base = (uint32_t)next_prim,
+            .prim_slots = (uint32_t)slots,
+            .positions = 0,
+         };
+      next_prim += slots;
+   }
+
+   cp->run_geometry.nclip_segments = n;
+   cp->run_geometry.clip_prim_slots = (uint32_t)next_prim;
+   cp->run_geometry.clip_prepared++;
+   if (cp_debug->debug_episode)
+      fprintf(stderr,
+              "run-clip-bin-preflight: segments=%u prim-slots=%u "
+              "continuation=transaction\n", n, (uint32_t)next_prim);
+   return true;
+}
+
+/* Grow-only run resources. Reuse is safe because a new run cannot be
+ * collected until the hard boundary which issued all consumers of the old
+ * one. A rare growth uses legacy cuMemFree and may synchronize; steady state
+ * performs neither an allocation nor a free. */
+static bool
+cp_run_geometry_device_reserve(struct cp_context *cp, CUdeviceptr *ptr,
+                               size_t *capacity, size_t need)
+{
+   if (*capacity >= need)
+      return true;
+   size_t cap = MAX2(*capacity, (size_t)4096);
+   while (cap < need) {
+      if (cap > SIZE_MAX / 2)
+         return false;
+      cap *= 2;
+   }
+
+   CUdeviceptr fresh = 0;
+   CUresult err = cp_debug->run_geometry_fail_alloc == 1
+      ? CUDA_ERROR_OUT_OF_MEMORY
+      : cp_debug->run_geometry_fail_alloc == 2
+      ? CUDA_ERROR_UNKNOWN
+      : cp_mem_alloc_retry(cp, &fresh, cap);
+   if (err != CUDA_SUCCESS) {
+      /* Capacity and OOM are pre-commit admission refusals. Every other CUDA
+       * error may report an earlier launch/context/device fault and cannot be
+       * converted into exact replay on the same poisoned context. */
+      if (err != CUDA_ERROR_OUT_OF_MEMORY && !cp->device_fatal)
+         cp_renderer_texture_fatal(cp);
+      return false;
+   }
+
+   if (*ptr) {
+      err = cuMemFree(*ptr);
+      if (err != CUDA_SUCCESS) {
+         (void)cuMemFree(fresh);
+         if (!cp->device_fatal)
+            cp_renderer_texture_fatal(cp);
+         return false;
+      }
+   }
+   *ptr = fresh;
+   *capacity = cap;
+   return true;
+}
+
+/*
+ * Prepare one immutable collected batch with the VS setup in
+ * cp_draw_execute_batch_inner(), not a reconstructed launch ABI.
+ *
+ * The caller must have admitted a replacement continuation for the whole run
+ * before the first call. Preparation launches a side-effect-free VS into
+ * private storage and seeds no downstream counter, so a later preparation or
+ * allocation refusal may still replay the whole run through the exact old
+ * path; the duplicated VS work is exceptional cost, not a semantic effect.
+ * A CUDA execution fault remains a device failure.
+ */
+bool
+cp_run_geometry_prepare_batch(struct cp_context *cp, unsigned batch,
+                              struct cp_prepared_geometry *result)
+{
+   if (result)
+      *result = (struct cp_prepared_geometry) { 0 };
+   if (!result || !cp->run_geometry.draining ||
+       cp->stream != cp->main_stream ||
+       batch >= cp->run_geometry.nbatches ||
+       !cp_run_geometry_fused(&cp->run_geometry.batches[batch]))
+      return false;
+
+   struct cp_run_geometry_span *span = &cp->run_geometry.spans[batch];
+   struct cp_vs_prepare prepare = {
+      .storage = &span->prepared_output,
+      .storage_capacity = &span->prepared_capacity,
+      .descriptor_storage = &span->prepared_descriptors,
+      .descriptor_capacity = &span->prepared_descriptors_capacity,
+   };
+
+   /* Collection-time push rows stay live through the drain. New VS argument
+    * uploads use the ordinary ring and are consumed by the ordered main-stream
+    * launch before a later batch may reuse its temporary scratch. */
+   cp->batch_uploads_live = true;
+   cp_draw_execute_batch_inner(cp, &cp->run_geometry.batches[batch], &prepare);
+   if (!prepare.ready)
+      return false;
+
+   span->output = prepare.output;
+   span->num_verts = prepare.num_verts;
+   span->out_stride = prepare.out_stride;
+   span->draw_slices = prepare.draw_slices;
+   span->num_draw_slices = prepare.num_draw_slices;
+   span->prim_shift = prepare.prim_shift;
+   span->clip_rects = prepare.clip_rects;
+   span->pre_clip_rast = prepare.pre_clip_rast;
+   *result = (struct cp_prepared_geometry) {
+      .output = prepare.output,
+      .num_verts = prepare.num_verts,
+      .out_stride = prepare.out_stride,
+      .draw_slices = prepare.draw_slices,
+      .num_draw_slices = prepare.num_draw_slices,
+      .prim_shift = prepare.prim_shift,
+      .clip_rects = prepare.clip_rects,
+      .pre_clip_rast = prepare.pre_clip_rast,
+   };
+   for (unsigned i = 0; i < cp->run_geometry.nclip_segments; i++) {
+      if (cp->run_geometry.clip_segments[i].batch == batch) {
+         cp->run_geometry.clip_segments[i].positions = prepare.output;
+         break;
+      }
+   }
+   return true;
+}
+
+/* Retain the ordinary path's exact slice/rectangle/raster metadata for an
+ * output span already produced by a proven grouped one-draw VS launch.  The
+ * prepare-only lane observes active_output and therefore does not launch VS. */
+static bool
+cp_run_geometry_prepare_grouped_metadata(struct cp_context *cp, unsigned batch,
+                                         struct cp_prepared_geometry *result)
+{
+   struct cp_run_geometry_span *span = &cp->run_geometry.spans[batch];
+   if (result)
+      *result = (struct cp_prepared_geometry) { 0 };
+   if (!result || !span->output || !span->num_verts ||
+       cp->run_geometry.active_output)
+      return false;
+
+   cp->run_geometry.active_output = span->output;
+   cp->run_geometry.active_num_verts = span->num_verts;
+   bool ok = cp_run_geometry_prepare_batch(cp, batch, result);
+   cp->run_geometry.active_output = 0;
+   cp->run_geometry.active_num_verts = 0;
+   return ok;
+}
+
+static bool
+cp_run_geometry_launch_group(struct cp_context *cp,
+                             struct cp_run_geometry_group *group)
+{
+   const struct cp_run_geometry_member *members =
+      cp->run_geometry.members + group->first_member;
+   const struct cp_draw_batch *first =
+      &cp->run_geometry.batches[group->first_batch];
+   const struct cp_draw_state *state = &first->state;
+   unsigned ndraws = group->num_draws;
+   unsigned total_verts = 0;
+
+   /* The existing fused lane derives triangle-list ids from slices. Other
+    * topologies need the host-expanded id arrays and stay on the old path. */
+   for (unsigned m = 0; m < group->num_members; m++) {
+      const struct cp_draw_batch *b =
+         &cp->run_geometry.batches[members[m].batch];
+      if (b->info.mode != MESA_PRIM_TRIANGLES)
+         return false;
+      for (unsigned d = 0; d < b->ndraws; d++) {
+         unsigned inst = b->compact_rows ? MAX2(b->instance_counts[d], 1u)
+                                         : MAX2(b->info.instance_count, 1u);
+         uint64_t add = (uint64_t)cp_triangles_for_draw(
+            b->info.mode, b->draws[d].count) * 3u * inst;
+         if (add > UINT32_MAX - total_verts)
+            return false;
+         total_verts += (unsigned)add;
+      }
+   }
+   if (!total_verts)
+      return false;
+
+   unsigned num_outputs = state->vs->nir_num_outputs ?
+                          state->vs->nir_num_outputs : 2;
+   unsigned out_stride = num_outputs * 16;
+   if (out_stride && total_verts > SIZE_MAX / out_stride)
+      return false;
+   size_t slices_bytes = (size_t)ndraws * sizeof(struct cp_draw_slice);
+   size_t bases_off = ALIGN_POT(slices_bytes, 16);
+   size_t bases_bytes = (size_t)ndraws * CP_VB_TABLE_STRIDE * sizeof(uint64_t);
+   size_t args_off = ALIGN_POT(bases_off + bases_bytes, 16);
+   size_t args_bytes = 64 * sizeof(void *);
+   size_t scal_off = args_off + args_bytes;
+   size_t tbl_off = scal_off + 32;
+   size_t tbl_bytes = (size_t)ndraws * CP_ARG_UBO_STRIDE * sizeof(uint64_t);
+   size_t dp_off = tbl_off + tbl_bytes;
+   size_t dp_bytes = (size_t)ndraws * CP_ARG_DRAW_PARAM_STRIDE * sizeof(uint32_t);
+   size_t vf_off = ALIGN_POT(dp_off + dp_bytes, 16);
+   size_t storage_bytes = vf_off + sizeof(struct cp_vertex_fetch_args);
+
+   size_t output_bytes = (size_t)total_verts * out_stride;
+   if (!cp_run_geometry_device_reserve(cp, &group->output,
+                                       &group->output_capacity,
+                                       output_bytes))
+      return false;
+   void *host = NULL;
+   CUresult begin_err = CUDA_SUCCESS;
+   CUdeviceptr storage =
+      cp_upload_begin_checked(cp, storage_bytes, &host, &begin_err);
+   if (!storage) {
+      if (begin_err != CUDA_SUCCESS && !cp->device_fatal)
+         cp_renderer_texture_fatal(cp);
+      return false;
+   }
+   memset(host, 0, storage_bytes);
+   CUdeviceptr output = group->output;
+
+   struct cp_draw_slice *slices = host;
+   uint64_t *bases = (uint64_t *)((char *)host + bases_off);
+   uint64_t *tbl = (uint64_t *)((char *)host + tbl_off);
+   uint32_t *dp = (uint32_t *)((char *)host + dp_off);
+   unsigned row = 0, vbegin = 0;
+   uint64_t common_ib = (uint64_t)(uintptr_t)first->info.index_ptr;
+   for (unsigned m = 0; m < group->num_members; m++) {
+      unsigned bi = members[m].batch;
+      const struct cp_draw_batch *b = &cp->run_geometry.batches[bi];
+      unsigned batch_begin = vbegin;
+      for (unsigned d = 0; d < b->ndraws; d++, row++) {
+         unsigned inst = b->compact_rows ? MAX2(b->instance_counts[d], 1u)
+                                         : MAX2(b->info.instance_count, 1u);
+         unsigned verts_one = cp_triangles_for_draw(b->info.mode,
+                                                    b->draws[d].count) * 3;
+         uint64_t ib = b->compact_rows && b->index_ptrs[d] ?
+                       b->index_ptrs[d] : (uint64_t)(uintptr_t)b->info.index_ptr;
+         uint64_t slice_ib = ib != common_ib ? ib : 0;
+         slices[row] = (struct cp_draw_slice) {
+            .vert_begin = vbegin,
+            .index_bytes = b->info.index_size ?
+                           b->draws[d].start * b->info.index_size : 0,
+            .first_vertex = b->info.index_size ?
+                            (uint32_t)b->draws[d].index_bias : b->draws[d].start,
+            .ib_base_lo = (uint32_t)slice_ib,
+            .ib_base_hi = (uint32_t)(slice_ib >> 32),
+            .verts_per_instance = inst > 1 ? verts_one : 0,
+         };
+         vbegin += verts_one * inst;
+
+         for (unsigned e = 0; e < state->num_vertex_elements; e++) {
+            if (b->compact_rows)
+               bases[(size_t)row * CP_VB_TABLE_STRIDE + e] =
+                  b->vb_bases[(size_t)d * CP_VB_TABLE_STRIDE + e];
+            else {
+               unsigned vb = b->state.velem[e].vertex_buffer_index;
+               if (vb < b->state.num_vertex_buffers)
+                  bases[(size_t)row * CP_VB_TABLE_STRIDE + e] =
+                     b->state.vb_base[vb];
+            }
+         }
+         for (unsigned u = 0; u < b->state.num_vs_ubos &&
+                              u < CP_MAX_CONST_BUFFERS; u++)
+            tbl[(size_t)row * CP_ARG_UBO_STRIDE + u] = b->compact_rows ?
+               b->vs_ubos[(size_t)d * CP_ARG_UBO_STRIDE + u] :
+               b->state.vs_ubos[u];
+         dp[(size_t)row * CP_ARG_DRAW_PARAM_STRIDE + 0] =
+            b->info.index_size ? (uint32_t)b->draws[d].index_bias :
+                                 b->draws[d].start;
+         dp[(size_t)row * CP_ARG_DRAW_PARAM_STRIDE + 1] = b->info.start_instance;
+         dp[(size_t)row * CP_ARG_DRAW_PARAM_STRIDE + 2] = b->compact_rows ?
+            b->draw_ids[d] : b->drawid_offset;
+         dp[(size_t)row * CP_ARG_DRAW_PARAM_STRIDE + 3] =
+            b->info.index_size ? (uint32_t)b->draws[d].index_bias : 0;
+      }
+      struct cp_run_geometry_span *span = &cp->run_geometry.spans[bi];
+      span->output = output + (size_t)batch_begin * out_stride;
+      span->num_verts = vbegin - batch_begin;
+      span->out_stride = out_stride;
+   }
+   assert(row == ndraws && vbegin == total_verts);
+
+   struct cp_vertex_fetch_args vf = {
+      .num_elements = state->num_vertex_elements,
+      .num_verts = total_verts,
+      .vs_in_stride = state->num_vertex_elements * 16,
+      .index_buffer = common_ib,
+      .index_size = first->info.index_size,
+      .first_vertex = first->info.index_size ?
+                      (uint32_t)first->draws[0].index_bias :
+                      first->draws[0].start,
+      .start_instance = first->info.start_instance,
+      .verts_per_instance = 0,
+      .draw_slices = storage,
+      .num_draw_slices = ndraws,
+      .elem_bases = storage + bases_off,
+   };
+   for (unsigned e = 0; e < state->num_vertex_elements; e++) {
+      const struct cp_vertex_elem *elem = &state->velem[e];
+      vf.elem_vb_idx[e] = elem->vertex_buffer_index;
+      if (elem->vertex_buffer_index < state->num_vertex_buffers)
+         vf.vb_bases[elem->vertex_buffer_index] =
+            state->vb_base[elem->vertex_buffer_index];
+      vf.elem_src_offset[e] = elem->src_offset;
+      vf.elem_src_stride[e] = elem->src_stride;
+      vf.elem_attr_size[e] = elem->attr_size;
+      vf.elem_nr_chan[e] = elem->nr_chan;
+      vf.elem_chan_bytes[e] = elem->chan_bytes;
+      vf.elem_conv[e] = elem->conv;
+      vf.elem_swizzle[e] = elem->swizzle;
+      vf.elem_fill_w[e] = elem->fill_w;
+      vf.elem_instance_divisor[e] = elem->instance_divisor;
+   }
+   memcpy((char *)host + vf_off, &vf, sizeof(vf));
+
+   void **args = (void **)((char *)host + args_off);
+   args[0] = (void *)(uintptr_t)(storage + scal_off + 8);
+   args[2] = NULL;
+   args[3] = (void *)(uintptr_t)(storage + scal_off + 12);
+   args[4] = (void *)(uintptr_t)output;
+   args[7] = (void *)(uintptr_t)(storage + dp_off);
+   args[CP_ARG_SLOT_UBO_TABLE] = (void *)(uintptr_t)(storage + tbl_off);
+   args[CP_ARG_SLOT_BATCH_ROWS] = (void *)(uintptr_t)(storage + scal_off);
+   args[CP_ARG_SLOT_BATCH_MASK] =
+      (void *)(uintptr_t)(storage + scal_off + 4);
+   args[CP_ARG_SLOT_VS_FETCH] = (void *)(uintptr_t)(storage + vf_off);
+   for (unsigned u = 0; u < state->num_vs_ubos && u < CP_MAX_CONST_BUFFERS; u++)
+      args[CP_ARG_UBO_BASE + u] = (void *)(uintptr_t)state->vs_ubos[u];
+   uint32_t *scal = (uint32_t *)((char *)host + scal_off);
+   scal[0] = 0;
+   scal[1] = 0xffffffffu;
+   scal[2] = total_verts;
+   scal[3] = state->num_vertex_elements * 16;
+
+   /* Use the ordinary upload ring rather than handing an async copy a temporary
+    * calloc block. The ring owns the staging lifetime until the ordered DMA has
+    * consumed it and coalesces this block with adjacent launch arguments. */
+   CUresult err = cp_upload_end(cp, storage, host, storage_bytes);
+   if (err == CUDA_SUCCESS) {
+      void *arg_ptr = (void *)(uintptr_t)(storage + args_off);
+      void *params[] = { &arg_ptr };
+      err = cp_debug->run_geometry_fail_launch
+         ? CUDA_ERROR_UNKNOWN
+         : cp_launch(cp, group->kernel,
+                     MIN2((total_verts + 255) / 256, 4096u), 1, 1,
+                     256, 1, 1, 0, cp->stream, params, NULL);
+   }
+   if (err != CUDA_SUCCESS) {
+      if (!cp->device_fatal)
+         cp_renderer_texture_fatal(cp);
+      for (unsigned m = 0; m < group->num_members; m++) {
+         struct cp_run_geometry_span *span =
+            &cp->run_geometry.spans[members[m].batch];
+         span->output = 0;
+         span->num_verts = 0;
+         span->out_stride = 0;
+      }
+      return false;
+   }
+   if (state->vs->vs_census) {
+      p_atomic_inc(&state->vs->vs_census->launches);
+      p_atomic_inc(&state->vs->vs_census->launches_fused);
+   }
+   group->output = output;
+   cp->run_geometry.groups_launched++;
+   cp->run_geometry.member_launches_saved += group->num_members - 1;
+   if (cp_debug->debug_episode)
+      fprintf(stderr,
+              "run-geometry-launch: members=%u draws=%u verts=%u kernel=%p\n",
+              group->num_members, group->num_draws, total_verts,
+              (void *)(uintptr_t)group->kernel);
+   return true;
+}
+
+static bool
+cp_run_geometry_collect(struct cp_context *cp)
+{
+   if (!cp_run_geometry_fused(&cp->batch)) {
+      if (cp_debug->debug_episode)
+         fprintf(stderr, "run-geometry-refuse: vs=%d side=%d fused-kernel=%d elems=%u\n",
+                 (int)!!cp->batch.state.vs,
+                 cp->batch.state.vs ? (int)cp->batch.state.vs->writes_memory : -1,
+                 cp->batch.state.vs ?
+                    (int)!!cp->batch.state.vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel : 0,
+                 cp->batch.state.num_vertex_elements);
+      if (cp->batch.state.vs && cp->batch.state.vs->writes_memory)
+         cp->run_geometry.refused_vs_side_effect++;
+      else
+         cp->run_geometry.refused_nonfused++;
+      return false;
+   }
+   unsigned n = cp->run_geometry.nbatches;
+   if (!cp_run_geometry_reserve((void **)&cp->run_geometry.batches,
+                                &cp->run_geometry.batch_capacity, n + 1,
+                                sizeof(cp->run_geometry.batches[0]))) {
+      cp->run_geometry.alloc_fallbacks++;
+      return false;
+   }
+   cp->run_geometry.batches[n] = cp->batch;
+   cp->run_geometry.nbatches++;
+   cp->run_geometry.batches_seen++;
+   cp->run_geometry.draws_seen += cp->batch.ndraws;
+   return true;
+}
+
+/* Drain only at cp_batch_flush_why(), the renderer's authoritative ordering
+ * boundary.  Submission remains in original batch order.  Setting the upload
+ * lifetime latch before every member prevents the first execution's reclaim
+ * from invalidating push rows belonging to later collected members.
+ */
+static size_t
+cp_run_clip_bin_align(size_t value, size_t alignment)
+{
+   return (value + alignment - 1) & ~(alignment - 1);
+}
+
+/* Execute the first run-wide clip/bin transaction.  Everything before the
+ * visibility pair writes private run storage, so a host refusal may replay
+ * the immutable batches.  Once the pair is enqueued the shared device error
+ * word selects either the tile raster or the classic stage chain; neither arm
+ * needs a host decision and clipping is never repeated. */
+static bool
+cp_run_clip_bin_execute(struct cp_context *cp)
+{
+   struct cp_device *screen = cp->dev;
+#define RUN_CLIP_LAUNCH(...) do {                                      \
+   CUresult _run_err = cp_launch(cp, __VA_ARGS__);                     \
+   if (_run_err != CUDA_SUCCESS) {                                     \
+      if (!cp->device_fatal) cp_renderer_texture_fatal(cp);            \
+      return false;                                                     \
+   }                                                                    \
+} while (0)
+   unsigned nsegs = cp->run_geometry.nclip_segments;
+   if (!nsegs || nsegs > CP_RUN_CLIP_BIN_MAX_SEGS ||
+       !screen->kernels.run_clip_setup_tile_count ||
+       !screen->kernels.run_clip_bin_check_counts ||
+       !screen->kernels.run_clip_bin_fill ||
+       !screen->kernels.run_clip_bin_validate_cursors ||
+       !screen->kernels.opaque_tile_raster)
+      return false;
+
+   const struct cp_fb_desc *fb = &cp->run_geometry.batches[0].scope.fb;
+   unsigned w = fb->width, h = fb->height;
+   uint32_t tiles_x = DIV_ROUND_UP(w, CP_RUN_CLIP_BIN_TILE_SIZE);
+   uint32_t tiles_y = DIV_ROUND_UP(h, CP_RUN_CLIP_BIN_TILE_SIZE);
+   if (!w || !h || !tiles_x || !tiles_y ||
+       tiles_x > UINT32_MAX / tiles_y)
+      return false;
+   uint32_t ntiles = tiles_x * tiles_y;
+   uint32_t ref_capacity = cp_debug->run_clip_bin_capacity
+      ? MIN2(cp_debug->run_clip_bin_capacity, CP_MAX_OPAQUE_TILE_REFS)
+      : CP_MAX_OPAQUE_TILE_REFS;
+   if (!ref_capacity)
+      return false;
+   if (!cp_abuf_fuse_scan_ready(screen) || cp_debug->abuf_fuse_check)
+      return false;
+   unsigned scan_ept, scan_grid;
+   cp_abuf_scan_tiling(ntiles, &scan_ept, &scan_grid);
+
+   /* One grow-only transaction block.  Reserve it, and every segment's clip
+    * output/ref array, before the first VS launch. */
+   size_t off = 0;
+#define RUN_ALLOC(name, bytes, align) \
+   size_t name##_off = (off = cp_run_clip_bin_align(off, (align))); \
+   off += (bytes)
+   RUN_ALLOC(live, (size_t)cp->run_geometry.clip_prim_slots * sizeof(struct cp_run_clip_bin_live), 16);
+   RUN_ALLOC(primrefs, (size_t)cp->run_geometry.clip_prim_slots * sizeof(uint64_t), 16);
+   size_t clipped_offs[CP_RUN_CLIP_BIN_MAX_SEGS];
+   for (unsigned s = 0; s < nsegs; s++) {
+      const struct cp_run_clip_bin_segment *seg = &cp->run_geometry.clip_segments[s];
+      off = cp_run_clip_bin_align(off, 16);
+      clipped_offs[s] = off;
+      off += (size_t)seg->prim_slots * 3u * seg->num_outputs * 16u;
+   }
+   RUN_ALLOC(counts, (size_t)ntiles * 4, 16);
+   RUN_ALLOC(offsets, (size_t)ntiles * 4, 16);
+   RUN_ALLOC(cursors, (size_t)ntiles * 4, 16);
+   RUN_ALLOC(refs, (size_t)ref_capacity * sizeof(struct cp_opaque_tile_ref), 16);
+   RUN_ALLOC(s1, (size_t)MAX2(scan_grid, 1u) * 4, 16);
+   RUN_ALLOC(s3, 4, 16);
+   RUN_ALLOC(scalars, 16, 16); /* live count, errors, uint64 total */
+#undef RUN_ALLOC
+   if (off < refs_off ||
+       !cp_run_geometry_device_reserve(cp, &cp->run_geometry.clip_bin_storage,
+                                       &cp->run_geometry.clip_bin_storage_capacity,
+                                       off))
+      return false;
+
+
+   /* Finish older episode work before taking over pass_segs. */
+   cp_pass_finish(cp);
+   if (cp->device_fatal)
+      return false;
+
+   struct cp_prepared_geometry prepared[CP_RUN_CLIP_BIN_MAX_SEGS];
+   bool grouped[CP_RUN_CLIP_BIN_MAX_SEGS] = { false };
+   memset(prepared, 0, sizeof(prepared));
+   for (unsigned g = 0; g < cp->run_geometry.ngroups; g++) {
+      struct cp_run_geometry_group *group = &cp->run_geometry.groups[g];
+      const struct cp_run_geometry_member *members =
+         cp->run_geometry.members + group->first_member;
+      bool launchable = group->num_members > 1;
+      for (unsigned m = 0; launchable && m < group->num_members; m++) {
+         const struct cp_draw_batch *b =
+            &cp->run_geometry.batches[members[m].batch];
+         launchable = b->info.mode == MESA_PRIM_TRIANGLES && b->ndraws == 1;
+      }
+      if (!launchable)
+         continue;
+      if (!cp_run_geometry_launch_group(cp, group))
+         return false;
+      for (unsigned m = 0; m < group->num_members; m++)
+         grouped[members[m].batch] = true;
+   }
+   for (unsigned s = 0; s < nsegs; s++) {
+      unsigned batch = cp->run_geometry.clip_segments[s].batch;
+      bool ok = grouped[batch]
+         ? cp_run_geometry_prepare_grouped_metadata(cp, batch, &prepared[s])
+         : cp_run_geometry_prepare_batch(cp, batch, &prepared[s]);
+      if (!ok)
+         return false;
+   }
+   for (unsigned s = 0; s < nsegs; s++)
+      if (!cp->run_geometry.clip_segments[s].positions)
+         return false;
+
+   CUdeviceptr base = cp->run_geometry.clip_bin_storage;
+   CUdeviceptr segments_dev = 0;
+   CUdeviceptr rasts_dev = 0;
+   CUdeviceptr live = base + live_off;
+   CUdeviceptr counts = base + counts_off;
+   CUdeviceptr offsets = base + offsets_off;
+   CUdeviceptr cursors = base + cursors_off;
+   CUdeviceptr refs = base + refs_off;
+   CUdeviceptr errors = base + scalars_off + 4;
+   CUdeviceptr total_refs = base + scalars_off + 8;
+   CUdeviceptr live_count = base + scalars_off;
+
+   struct cp_run_clip_bin_device_segment devsegs[CP_RUN_CLIP_BIN_MAX_SEGS];
+   struct cp_rasterize_args rasts[CP_RUN_CLIP_BIN_MAX_SEGS];
+   uint32_t max_triangles = 0;
+   for (unsigned s = 0; s < nsegs; s++) {
+      const struct cp_run_clip_bin_segment *seg = &cp->run_geometry.clip_segments[s];
+      CUdeviceptr clipped = base + clipped_offs[s];
+      CUdeviceptr prim_refs = base + primrefs_off + (size_t)seg->prim_base * 8u;
+      struct cp_rasterize_args rast = prepared[s].pre_clip_rast;
+      uint32_t expected_invert =
+         cp->run_geometry.batches[0].state.depth.depth_func == CP_FUNC_GEQUAL;
+      if (rast.framebuffer != cp->visbuf || rast.depthbuf != cp->depthbuf ||
+          rast.width != w || rast.height != h || !rast.depth_test ||
+          rast.depth_func != cp->run_geometry.batches[0].state.depth.depth_func ||
+          rast.depth_key_invert != expected_invert)
+         return false;
+      rast.positions = clipped;
+      rast.prim_refs = prim_refs;
+      rast.tri_count = 0;
+      rast.active_ids = 0;
+      rast.num_triangles = seg->prim_slots;
+      rast.num_varyings = seg->num_outputs - 1;
+      rast.rect_prim_shift = CP_CLIP_PRIM_SHIFT;
+      rast.abuf_prim_base = seg->prim_base;
+      devsegs[s] = (struct cp_run_clip_bin_device_segment) {
+         .clip = {
+            .vs_out = prepared[s].output,
+            .out = clipped,
+            .out_count = live_count, /* stable/no-active-ids does not use it */
+            .active_ids = 0,
+            .prim_refs = prim_refs,
+            .num_triangles = seg->num_triangles,
+            .num_slots = seg->num_outputs,
+            .max_triangles = seg->prim_slots,
+            .stable = true,
+         },
+         .rast = rast,
+         .prim_base = seg->prim_base,
+      };
+      rasts[s] = rast;
+      max_triangles = MAX2(max_triangles, seg->num_triangles);
+
+      struct cp_pass_seg *ps = &cp->pass_segs[s];
+      memset(ps, 0, sizeof(*ps));
+      ps->rast = rast;
+      ps->queues = (struct cp_rast_queues) {
+         .nontrivial = cp->cur_qset.nontrivial,
+         .nontrivial_count = cp->cur_qset.counts,
+         .huge_tiles = cp->cur_qset.huge_tiles,
+         .huge_count = cp->cur_qset.counts + sizeof(uint32_t),
+         .setup_cache = cp->cur_qset.setup_cache,
+         .setup_count = cp->cur_qset.counts + 2 * sizeof(uint32_t),
+         .setup_capacity = cp->cur_qset.setup_cache ? CP_SETUP_CACHE_CAPACITY : 0,
+         .mode = CP_QUEUE_FILL,
+      };
+      ps->rast_num_triangles = seg->prim_slots;
+      ps->num_triangles = seg->num_triangles;
+      ps->prim_base = seg->prim_base;
+      ps->prim_slots = seg->prim_slots;
+      ps->prim_shift = CP_CLIP_PRIM_SHIFT;
+      ps->batch = cp->run_geometry.batches[seg->batch];
+      ps->slices_dev = prepared[s].draw_slices;
+   }
+
+   segments_dev = cp_upload(cp, devsegs,
+                            (size_t)nsegs * sizeof(devsegs[0]));
+   rasts_dev = cp_upload(cp, rasts, (size_t)nsegs * sizeof(rasts[0]));
+   if (!segments_dev || !rasts_dev)
+      return false;
+   CUresult err = cuMemsetD32Async(base + primrefs_off, 0,
+                                     (size_t)cp->run_geometry.clip_prim_slots * 2u,
+                                     cp->stream);
+   if (err != CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return false;
+   }
+
+   /* From this point policy forbids host replay: CUDA faults are fatal and the
+    * shared predicate handles capacity errors. The externally visible commit
+    * remains the first fragment/writeback; visbuf is disposable before it. */
+   err = cuMemsetD32Async(cp->visbuf, 0xFFFFFFFF,
+                            (size_t)w * h * 2, cp->stream);
+   if (err == CUDA_SUCCESS && !cp->depthbuf_cleared)
+      cp_clear_depthbuf(cp, 1.0f);
+   if (cp->device_fatal)
+      return false;
+   if (err == CUDA_SUCCESS)
+      err = cuMemsetD32Async(counts, 0, ntiles, cp->stream);
+   if (err == CUDA_SUCCESS)
+      err = cuMemsetD32Async(live_count, 0, 4, cp->stream);
+   if (err != CUDA_SUCCESS) {
+      cp_renderer_texture_fatal(cp);
+      return false;
+   }
+
+   struct cp_run_clip_bin_args count_args = {
+      .segments = segments_dev, .live = live, .live_count = live_count,
+      .overflow = errors, .tile_counts = counts, .num_segments = nsegs,
+      .total_slots = cp->run_geometry.clip_prim_slots,
+      .live_capacity = cp->run_geometry.clip_prim_slots,
+      .tiles_x = tiles_x, .tiles_y = tiles_y,
+   };
+   void *count_params[] = { &count_args };
+   RUN_CLIP_LAUNCH(screen->kernels.run_clip_setup_tile_count,
+             MIN2(DIV_ROUND_UP(max_triangles, 64), 1024u), nsegs, 1,
+             64, 1, 1, 0, cp->stream, count_params, NULL);
+
+   struct cp_run_clip_bin_check_counts_args check = {
+      .tile_counts = counts, .total_refs = total_refs, .errors = errors,
+      .num_tiles = ntiles, .capacity = ref_capacity,
+   };
+   void *check_params[] = { &check };
+   RUN_CLIP_LAUNCH(screen->kernels.run_clip_bin_check_counts, 1, 1, 1,
+             256, 1, 1, 0, cp->stream, check_params, NULL);
+   {
+      CUdeviceptr scan_s1 = base + s1_off;
+      CUdeviceptr scan_s3 = base + s3_off;
+      void *reduce_params[] = { &counts, &scan_s1, &ntiles, &scan_ept };
+      RUN_CLIP_LAUNCH(screen->kernels.abuf_scan_reduce,
+                      scan_grid, 1, 1, CP_ABUF_SCAN_BLOCK, 1, 1, 0,
+                      cp->stream, reduce_params, NULL);
+      unsigned brk = cp_debug->abuf_fuse_break;
+      uint32_t capacity = ref_capacity;
+      void *finish_params[] = { &counts, &offsets, &scan_s1, &scan_grid,
+         &ntiles, &scan_ept, &scan_s3, &cursors, &counts, &capacity,
+         &errors, &brk };
+      RUN_CLIP_LAUNCH(screen->kernels.abuf_scan_finish,
+                      scan_grid, 1, 1, CP_ABUF_SCAN_BLOCK, 1, 1, 0,
+                      cp->stream, finish_params, NULL);
+   }
+
+   struct cp_run_clip_bin_fill_args fill = {
+      .segments = segments_dev, .live = live, .live_count = live_count,
+      .tile_counts = counts, .tile_offsets = offsets,
+      .tile_cursors = cursors, .tile_refs = refs, .errors = errors,
+      .num_segments = nsegs, .total_slots = cp->run_geometry.clip_prim_slots,
+      .live_capacity = cp->run_geometry.clip_prim_slots,
+      .tiles_x = tiles_x, .tiles_y = tiles_y,
+      .capacity = ref_capacity,
+   };
+   void *fill_params[] = { &fill };
+   RUN_CLIP_LAUNCH(screen->kernels.run_clip_bin_fill,
+             MIN2(DIV_ROUND_UP(cp->run_geometry.clip_prim_slots, 256), 1024u),
+             1, 1, 256, 1, 1, 0, cp->stream, fill_params, NULL);
+   RUN_CLIP_LAUNCH(screen->kernels.run_clip_bin_validate_cursors,
+             MIN2(DIV_ROUND_UP(ntiles, 256), 1024u), 1, 1,
+             256, 1, 1, 0, cp->stream, fill_params, NULL);
+
+   struct cp_opaque_tile_raster_args tile = {
+      .rast_args = rasts_dev, .tile_counts = counts, .tile_offsets = offsets,
+      .tile_refs = refs, .overflow = errors, .num_segments = nsegs,
+      .tiles_x = tiles_x, .tiles_y = tiles_y, .width = w, .height = h,
+   };
+   void *tile_params[] = { &tile };
+   RUN_CLIP_LAUNCH(screen->kernels.opaque_tile_raster, ntiles, 1, 1,
+             256, 1, 1, 0, cp->stream, tile_params, NULL);
+
+   /* Inverse arm.  It consumes the already clipped stable buffers. */
+   for (unsigned s = 0; s < nsegs; s++) {
+      struct cp_rasterize_args aa = rasts[s];
+      struct cp_rast_queues queues = cp->pass_segs[s].queues;
+      aa.path_flag = errors;
+      aa.path_value = 1;
+      if (cuMemsetD32Async(queues.nontrivial_count, 0, 3, cp->stream) !=
+          CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
+         return false;
+      }
+      void *params[] = { &aa, &queues };
+      RUN_CLIP_LAUNCH(screen->kernels.rasterize_stage1,
+                DIV_ROUND_UP(aa.num_triangles, 256), 1, 1,
+                256, 1, 1, 0, cp->stream, params, NULL);
+      RUN_CLIP_LAUNCH(screen->kernels.rasterize_stage2,
+                CLAMP(DIV_ROUND_UP(aa.num_triangles, 8), 1u, 512u), 1, 1,
+                256, 1, 1, 0, cp->stream, params, NULL);
+      RUN_CLIP_LAUNCH(screen->kernels.rasterize_stage3, 2048, 1, 1,
+                64, 1, 1, 0, cp->stream, params, NULL);
+   }
+
+   cp->pass.hw_attempt_start = cp->hardware_texture.fs_attempts;
+   cp->pass.nsegs = nsegs;
+   cp->pass.next_prim = cp->run_geometry.clip_prim_slots;
+   cp->pass.opaque = true;
+   cp->pass.w = w;
+   cp->pass.h = h;
+   cp->run_geometry.clip_commits++;
+   if (cp_debug->debug_episode)
+      fprintf(stderr, "run-clip-bin-commit: segments=%u prim-slots=%u\n",
+              nsegs, cp->run_geometry.clip_prim_slots);
+   cp_opaque_finish_common(cp, true);
+#undef RUN_CLIP_LAUNCH
+   return true;
+}
+
+static void
+cp_run_geometry_drain(struct cp_context *cp)
+{
+   unsigned n = cp->run_geometry.nbatches;
+   if (!n || cp->run_geometry.draining)
+      return;
+   cp->run_geometry.draining = true;
+   cp->run_geometry.runs++;
+   if (!cp_run_geometry_plan(cp)) {
+      cp->run_geometry.alloc_fallbacks++;
+      cp->run_geometry.nmembers = cp->run_geometry.ngroups = 0;
+   }
+
+   bool clip_bin_requested = cp_debug->run_clip_bin && cp_debug->run_geometry;
+   bool clip_bin_admitted = clip_bin_requested && cp_run_clip_bin_preflight(cp);
+   bool clip_bin_committed = false;
+   if (clip_bin_admitted)
+      clip_bin_committed = cp_run_clip_bin_execute(cp);
+   if (clip_bin_requested && !clip_bin_committed && !cp->device_fatal) {
+      /* Private grouped/prepared VS work may have run, but exact refusal means
+       * the unchanged member path must issue its own VS/clip/raster chain. */
+      cp->run_geometry.clip_continuation_fallbacks++;
+      for (unsigned i = 0; i < n; i++) {
+         cp->run_geometry.spans[i].output = 0;
+         cp->run_geometry.spans[i].num_verts = 0;
+         cp->run_geometry.spans[i].out_stride = 0;
+      }
+   }
+   if (clip_bin_committed)
+      goto run_done;
+
+   for (unsigned g = 0; !clip_bin_requested && !cp->device_fatal &&
+                            g < cp->run_geometry.ngroups; g++) {
+      struct cp_run_geometry_group *group = &cp->run_geometry.groups[g];
+      const struct cp_run_geometry_member *members =
+         cp->run_geometry.members + group->first_member;
+      bool launchable = group->num_members > 1;
+      for (unsigned m = 0; launchable && m < group->num_members; m++) {
+         const struct cp_draw_batch *b =
+            &cp->run_geometry.batches[members[m].batch];
+         launchable = b->info.mode == MESA_PRIM_TRIANGLES && b->ndraws == 1;
+      }
+      /* The dynamic helper is proven only for one-draw member snapshots.
+       * Existing multi-draw batches already own one fused launch, and replay
+       * needs their exact local preparation path. A singleton cannot save a
+       * launch, so neither case pays speculative geometry work. */
+      if (launchable && !cp_run_geometry_launch_group(cp, group))
+         cp->run_geometry.alloc_fallbacks++;
+   }
+   for (unsigned i = 0; i < n && !cp->device_fatal; i++) {
+      cp->batch = cp->run_geometry.batches[i];
+      cp->batch.pending = false;
+      cp->batch_uploads_live = true;
+      cp->run_geometry.active_output = cp->run_geometry.spans[i].output;
+      cp->run_geometry.active_num_verts = cp->run_geometry.spans[i].num_verts;
+      cp_opaque_append(cp, cp->batch.ndraws);
+      cp->run_geometry.active_output = 0;
+      cp->run_geometry.active_num_verts = 0;
+   }
+run_done:
+   cp->run_geometry.nbatches = 0;
+   cp->run_geometry.draining = false;
+}
+
+static void
+cp_run_geometry_release(struct cp_context *cp)
+{
+   /* Buffers are grow-only context storage. The next run reuses slots from
+    * zero; their contents may be overwritten only after this hard boundary
+    * has submitted every old consumer on the ordered renderer streams. */
+   cp->run_geometry.ngroups = cp->run_geometry.nmembers = 0;
+   cp->run_geometry.nclip_segments = 0;
+   cp->run_geometry.clip_prim_slots = 0;
+}
+
 void
 cp_batch_flush(struct cp_context *cp)
 {
@@ -10875,6 +12188,25 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
       }
    }
 
+   /* The M2 collector sees the same already-proven opaque episode
+    * admission as the shipping append path.  A defer boundary ends a batch,
+    * not the run. */
+   if (cp_debug->run_geometry && !blended &&
+       cp_opaque_appendable(cp, &cp->batch) &&
+       cp_run_geometry_collect(cp))
+      return;
+
+   /* A refused candidate follows the collected run in Vulkan order.  Drain
+    * the saved members first, then restore the candidate snapshot before the
+    * unchanged blended/direct/fallback decision below. */
+   if (cp_debug->run_geometry && cp->run_geometry.nbatches) {
+      struct cp_draw_batch candidate = cp->batch;
+      cp_run_geometry_drain(cp);
+      cp->batch = candidate;
+      if (cp->device_fatal)
+         return;
+   }
+
    if (blended && cp_pass_appendable(cp, &cp->batch)) {
       cp_pass_append(cp, ndraws);
       return;
@@ -10894,10 +12226,12 @@ void
 cp_batch_flush_why(struct cp_context *cp, const char *why)
 {
    cp_batch_flush_defer_why(cp, why);
+   cp_run_geometry_drain(cp);
    if (cp_debug->debug_episode && cp->pass.nsegs)
       fprintf(stderr, "episode-cut: flush_why=%s nsegs=%u\n", why,
               cp->pass.nsegs);
    cp_pass_finish(cp);
+   cp_run_geometry_release(cp);
 }
 
 /*

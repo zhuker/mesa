@@ -6,7 +6,7 @@
 #ifndef CP_RAST_TYPES_H
 #define CP_RAST_TYPES_H
 
-#ifndef __CUDACC__
+#if !defined(__CUDACC__) || !defined(__CUDACC_RTC__)
 #include <stdint.h>
 #else
 /* NVRTC doesn't have stdint.h — define what we need */
@@ -387,6 +387,11 @@ struct cp_clip_args {
 #endif
 
 #define CP_MAX_CLIP_SLOTS 16
+
+/* Run-wide clip/bin ABI limits.  Tile size 32 is load-bearing: DEAD_ENDS 45
+ * rejected the otherwise identical 16-pixel arm. */
+#define CP_RUN_CLIP_BIN_TILE_SIZE CP_OPAQUE_TILE_SIZE
+#define CP_RUN_CLIP_BIN_MAX_SEGS 64u
 
 /* Shader kernel argument slots. 0..7 are the fixed stage inputs and 18.. are
  * the uniform/descriptor buffers; the gap in between is free. */
@@ -1369,6 +1374,95 @@ _Static_assert(sizeof(struct cp_setup_cache_entry) == 84, "setup-cache ABI");
 _Static_assert(CP_PRIM_ID_LIMIT <= CP_TILE_SETUP_TAG, "primitive/tag range collision");
 _Static_assert(CP_SETUP_CACHE_CAPACITY <= CP_TILE_SETUP_INDEX_MASK,
                "setup-cache index does not fit tile tag");
+#endif
+
+/*
+ * Run-wide clip/setup/tile-count ABI. Each ordered segment retains the exact
+ * clip and raster arguments used by the legacy per-segment path. The kernel
+ * changes scheduling only: local stable slots remain triangle *
+ * CP_CLIP_MAX_OUT, while prim_base turns them into one run-global ordered ID.
+ * Counts are bounding-box references. A later fill pass reads the compact
+ * live records and recomputes setup from the descriptor and local stable ID.
+ */
+struct cp_run_clip_bin_device_segment {
+   struct cp_clip_args clip;
+   struct cp_rasterize_args rast;
+   uint32_t prim_base;
+};
+
+struct cp_run_clip_bin_live {
+   uint32_t stable_prim;
+   uint32_t segment;
+};
+
+#define CP_RUN_CLIP_BIN_ERR_LIVE_BOUNDS    (1u << 0)
+#define CP_RUN_CLIP_BIN_ERR_SEGMENT_BOUNDS (1u << 1)
+#define CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS    (1u << 2)
+#define CP_RUN_CLIP_BIN_ERR_REF_OVERFLOW   (1u << 3)
+#define CP_RUN_CLIP_BIN_ERR_CURSOR_MISMATCH (1u << 4)
+
+struct cp_run_clip_bin_args {
+   uint64_t segments;    /* const cp_run_clip_bin_device_segment[num_segments] */
+   uint64_t live;        /* compact cp_run_clip_bin_live[live_capacity] */
+   uint64_t live_count;  /* atomic uint32; caller clears */
+   uint64_t overflow;    /* uint32; caller clears, makes transaction refuse */
+   uint64_t tile_counts; /* uint32[tiles_x * tiles_y], caller clears */
+   uint32_t num_segments;
+   uint32_t total_slots;
+   uint32_t live_capacity;
+   uint32_t tiles_x;
+   uint32_t tiles_y;
+};
+
+#ifdef __CUDACC__
+static_assert(CP_RUN_CLIP_BIN_MAX_SEGS <= CP_PASS_MAX_SEGS,
+              "run segments must fit pass storage");
+static_assert(sizeof(struct cp_run_clip_bin_live) == 8, "run live ABI");
+static_assert(sizeof(struct cp_run_clip_bin_args) == 64, "run bin args ABI");
+#else
+_Static_assert(CP_RUN_CLIP_BIN_MAX_SEGS <= CP_PASS_MAX_SEGS,
+               "run segments must fit pass storage");
+_Static_assert(sizeof(struct cp_run_clip_bin_live) == 8, "run live ABI");
+_Static_assert(sizeof(struct cp_run_clip_bin_args) == 64, "run bin args ABI");
+#endif
+
+struct cp_run_clip_bin_check_counts_args {
+   uint64_t tile_counts;
+   uint64_t total_refs; /* uint64_t[1], written by the kernel */
+   uint64_t errors;
+   uint32_t num_tiles;
+   uint32_t capacity;
+};
+
+struct cp_run_clip_bin_fill_args {
+   uint64_t segments;
+   uint64_t live;
+   uint64_t live_count;
+   uint64_t tile_counts;
+   uint64_t tile_offsets;
+   uint64_t tile_cursors;
+   uint64_t tile_refs; /* cp_opaque_tile_ref[capacity] */
+   uint64_t errors;
+   uint32_t num_segments;
+   uint32_t total_slots;
+   uint32_t live_capacity;
+   uint32_t tiles_x;
+   uint32_t tiles_y;
+   uint32_t capacity;
+};
+
+#ifdef __CUDACC__
+static_assert(sizeof(struct cp_run_clip_bin_check_counts_args) == 32,
+              "run count-check args ABI");
+static_assert(sizeof(struct cp_run_clip_bin_fill_args) == 88,
+              "run fill args ABI");
+static_assert(sizeof(struct cp_opaque_tile_ref) == 8, "tile ref ABI");
+#else
+_Static_assert(sizeof(struct cp_run_clip_bin_check_counts_args) == 32,
+               "run count-check args ABI");
+_Static_assert(sizeof(struct cp_run_clip_bin_fill_args) == 88,
+               "run fill args ABI");
+_Static_assert(sizeof(struct cp_opaque_tile_ref) == 8, "tile ref ABI");
 #endif
 
 /*

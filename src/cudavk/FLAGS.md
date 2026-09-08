@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-139 switches.
+144 switches.
 
 ## Tracing
 
@@ -27,6 +27,11 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_NO_DEPTH_ONLY_BATCH` | bool (value) | `off` | — | refuse to batch draws in a scope with no colour attachment again, so a shadow scope runs one chain and one full visibility clear per draw instead of batching them |
 | `CUDAVK_NO_WIDE_EPISODE` | bool (value) | `off` | — | compare viewport, rasterizer and depth state before letting two order-free draws share an opaque episode again; every consumer of those reads them per segment, and comparing them episode-wide held episodes to 6.21 segments instead of 12.84 |
 | `CUDAVK_RUN_CENSUS` | bool (value) | `off` | — | count the runs the run-level redesign would render as one unit -- maximal sequences of consecutive same-class draws in one scope -- and report at teardown what share of the frame's triangles they hold. Watches only; changes no rendering decision (REDESIGN_PLAN_2026-09-05) |
+| `CUDAVK_RUN_GEOMETRY` | bool (value) | `off` | — | collect each opaque run and launch compatible groups of one-draw triangle-list members through one fused vertex shader. Default-off M2 step; multi-draw members and downstream stages stay on the old path |
+| `CUDAVK_RUN_CLIP_BIN` | bool (value) | `off` | — | preflight at most 64 side-effect-free triangle-list batches and build stable run-global clip/bin descriptors before grouped geometry. Default-off transactional M2 renderer; requires CUDAVK_RUN_GEOMETRY, with exact pre-commit replay and device-predicated classic fallback |
+| `CUDAVK_RUN_CLIP_BIN_CAPACITY` | uint | `0` | — | diagnostic dense-reference capacity for RUN_CLIP_BIN; 0 uses the normal maximum, while a small value forces the device-predicated classic visibility arm without a host readback |
+| `CUDAVK_RUN_GEOMETRY_FAIL_ALLOC` | uint | `0` | — | fault gate for run geometry output growth: 1 injects soft OOM and 2 injects a fatal CUDA error before any geometry launch |
+| `CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH` | bool (value) | `off` | — | fault gate that replaces each admitted run geometry group launch with a fatal CUDA error; verifies device loss rather than exact replay |
 | `CUDAVK_PLAN_STATS` | bool (value) | `off` | — | report at teardown what deciding one draw at a time costs: batch keys built, pairwise merge tests, flushes, pass episodes closed and every reactive reallocation, with per-scope averages |
 | `CUDAVK_SPEC_STATS` | bool (value) | `off` | — | report at teardown how many fragment launches used a sampler-specialised kernel, and which shaders sample textures the specialiser could not match; a silent drop to zero is a performance regression with no error |
 | `CUDAVK_TEXTURE_CACHE_BUDGET_MB` | uint | `2048` | — | hardware texture cache byte budget in MiB; an allocation past it falls back to software sampling silently, which cost 1.76 ms/frame on the occlusion capture at the old default of 384 |
