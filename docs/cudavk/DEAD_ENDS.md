@@ -2669,13 +2669,19 @@ favorite2 to 4.863 / 5.054 = 9.69x / 9.74x. Tagged `cudavk-0.0.3`.
 The floor, with `memcpy` re-measured on the final build (0.221 ms/frame, not
 the 0.451 an earlier trace showed):
 
-    core work: VS 0.434 + FS 0.318 (zero overdraw) + clip 0.520
-             + raster 0.669 + vertex_fetch 0.125 + memcpy 0.221 = 2.287 ms
+    core work: VS 0.434 + FS 0.729 + clip 0.520
+             + raster 0.669 + vertex_fetch 0.125 + memcpy 0.221 = 2.698 ms
     plus the application's own record/decode, which the native
       driver also pays and which cannot overlap device work         0.376
-    = frame floor                                                   2.663 ms
+    = frame floor                                                   3.074 ms
     4x target                                                       2.088 ms
-    over by                                                         1.28x
+    over by                                                         1.47x
+
+Fragment shading enters at **0.729 ms, its measured cost**, not the 0.318 an
+earlier draft used. That 0.318 assumed overdraw removed, and the section below
+shows the 2.29x overdraw is the application's opaque/blended interleaving --
+deferral is already applied everywhere it is legal. Every term in this floor
+is now measured work with nothing assumed away.
 
 **Everything tunable was tested**: 17 flag levers including a post-change
 re-tune of the raster thresholds, `TILE_BOUND` and `POINT_THRESHOLD` (defaults

@@ -797,6 +797,27 @@ overdraw, zero compaction, zero clears, zero writeback and zero launch gaps.
 It still does not reach 4x -- but it is close enough that the honest statement
 is "the floor exceeds the target", not "by a wide margin".
 
+## The floor, final
+
+Every earlier version of this number subtracted something that turned out not
+to be subtractable. The last of those was overdraw: fragment shading was
+carried at 0.318 ms (2.29x removed) until it became clear that an opaque
+episode already defers, and that frame-wide deferral is blocked by the
+application interleaving 15.3 blended runs a frame between opaque groups.
+
+    VS 0.434 + FS 0.729 + clip 0.520 + raster 0.669
+      + vertex_fetch 0.125 + memcpy 0.221            = 2.698 ms  device
+    + application record/decode (native pays it too)   0.376
+    = frame floor                                      3.074 ms
+      4x target                                        2.088 ms
+      over by                                          1.47x
+
+**Nothing in this is assumed away.** It is measured union-exclusive work plus
+one host term the native driver also carries, against the target. The margin
+is 1.47x, and it grew rather than shrank as the analysis got more careful --
+which is the opposite of what happened every other time this document was
+corrected.
+
 ## Verdict: not achieved, and NOT proven unreachable
 
 A 1.26x margin cannot be settled by this arithmetic, and it would be the fifth
