@@ -52,6 +52,31 @@ iteration-by-iteration context is in
 `docs/cudavk/history/PERF16_ITERATIONS.md`; the measured shape of the frame is
 in `docs/cudavk/PERFORMANCE.md`.
 
+## Coverage: every part of the frame maps to a closed entry
+
+The exhaustion claim for the 4x objective is structural, not rhetorical. Each
+component of the measured frame has at least one entry that closed it:
+
+| component | ms | entries | why it is closed |
+|---|---:|---|---|
+| fragment shading | 0.729 | 9, 10, 12, 15, 26, 28, 44 | register-bound: 431 instr/fragment at 53-cycle latency needs ~53 warps; the register file gives 16 |
+| rasterisation (stage 2+3) | 0.669 | 2, 10, 18, 19, 20, 24, 36, 45 | its idle **is** the 8-stream overlap; every merge measured +0.147 to +2.51 |
+| clip | 0.520 | 3, 45 | same mechanism; a clip-only merge nets +0.30, leaving 9.38x |
+| vertex shading | 0.434 | 7, 14, 35 | 70% per-launch floor; exact post-transform reuse refuted at a 0.438 ceiling |
+| memcpy / uploads | 0.221 | 8, 37, 40, 42 | HtoD is 0.104 ms/frame; UM fault stall 0.374, 90% of it one application allocation |
+| vertex fetch | 0.125 | 14 | fused as a device link, landed, then superseded |
+| between-kernel gaps | ~1.200 | 1, 25 | CUDA graphs at three units: 318,454 candidate tails yield 65,905 exact keys; bounded LRU hits 69-76% |
+| host waits | ~0 | 16, 17, 34, 41 | not host-bound; injecting 0.449 ms/frame before the largest wait does not move the frame |
+| application boundary | 0.376 | -- | record and decode in the harness, outside the driver |
+
+**45 entries, no open lead, 82% of the frame accounted for by name.** The
+remaining ~18% is launch ramp and tail distributed across the pools above,
+which entry 45 shows is not separately collectible.
+
+The target is 2.088 ms. The largest single component is 0.729 ms and is
+physically bounded; the largest *addressable* one is the between-kernel gap,
+and entry 1 measured why it does not capture.
+
 ## Index
 
 | # | dead end | iteration | verdict | headline |
