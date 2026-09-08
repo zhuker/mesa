@@ -218,19 +218,38 @@ default — `CUDAVK_NO_OPAQUE_STREAMS=1` still measures 15.89, and
    Appended for the same reason items 10, 11 and 12 were.
 
 
-14. **favorite3 frame 3225 is shaded wrong against the native driver.** The
-    first frame-by-frame comparison with NVIDIA's own driver (580.173.02, same
-    GPU, same command stream -- `notes/NATIVE_DRIVER_REFERENCE.md`) agrees to
-    within +-2 on 99.89% of bytes across the sampled frames, except this one:
-    **20% of its pixels differ by more than 8**, a large snow surface in the
-    lower left is shaded differently, and the whole frame is darker (mean 158.1
-    against 166.8). Same geometry and same UI, so this is shading, not
-    rasterisation precision. It is invisible to the suite by construction --
-    the sentinel controls compare cudavk against cudavk, so a defect present in
-    every cudavk run cannot fail them. The reference render
-    (`~/timelines/native-nvidia/`) is the oracle; the neighbouring frames 3200
-    and 3250 are clean, so whatever it is switches on for a small number of
-    frames.
+14. **favorite3 frames 3204-3229 are shaded wrong against the native driver --
+    a 26-frame burst, not one frame.** The first frame-by-frame comparison with
+    NVIDIA's own driver (580.173.02, same GPU, same command stream --
+    `notes/NATIVE_DRIVER_REFERENCE.md`) agrees to within +-2 on 99.89% of bytes
+    on every *sampled* frame, and the original version of this entry concluded
+    from that sampling that frame 3225 was isolated and its neighbours clean.
+    **Both halves of that were wrong.** A dense scan (2026-09-05) gives:
+
+        3195-3201   0.11 - 0.20%   clean
+        3202        0.45%          onset
+        3203-3204   1.76 - 2.77%   ramp
+        3205-3228   18 - 25%       the burst
+        3229        3.62%          decay
+        3230+       0.31 - 0.46%   clean
+
+    So it is a **contiguous 26-frame event**, it ramps in and out rather than
+    switching, and 3225 is merely the frame that happened to be sampled. Every
+    other sampled frame in the replay (every 200th, 0 to 3400) is under 0.44%.
+
+    Where they differ, native means 192.4 and cudavk 150.8 -- **cudavk is
+    darker by 41.6 on average**, p5/p95 -52/-16, and the difference covers the
+    whole lower two-thirds of the image (4.5% of rows at the top, rising to
+    43.5% at the bottom). Same geometry and same UI, so this is shading, not
+    rasterisation precision.
+
+    **The lesson this entry now carries.** The sampled comparison that produced
+    it steps every 200 frames; a 26-frame event is invisible to it 87% of the
+    time, and it was found only because one sample landed inside. Any future
+    claim that cudavk matches the native driver must state its sampling
+    interval, because this defect is 26 frames wide and the standing comparison
+    would miss the next one. It is also invisible to the test suite by
+    construction: sentinels compare cudavk against cudavk.
 
 
 15. **nsys CUDA traces lose the kernel activity buffer -- RESOLVED 2026-09-05,
