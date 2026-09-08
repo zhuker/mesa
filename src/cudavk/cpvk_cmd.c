@@ -3011,6 +3011,9 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
     * what that flag is for.
     */
    bool batch_blended = false;
+   bool run_compatible = dev->prev_draw_valid && dev->prev_draw &&
+      cpvk_draws_episode_compatible(scope, d, dev->prev_scope,
+                                    dev->prev_draw);
    cp->plan.merge_tests++;
    bool batch_ok = cpvk_batch_can_join(dev, scope, d, &batch_blended);
    if (batch_ok)
@@ -3060,7 +3063,7 @@ cpvk_execute_draw_cmd(struct cpvk_device *dev, const struct cp_render_scope *sco
     */
    cp_run_census_draw(cp, &packet,
                       cp_triangles_for_draw(d->call.mode, d->range.count) *
-                      MAX2(d->call.instance_count, 1u));
+                      MAX2(d->call.instance_count, 1u), run_compatible);
 
    /* The renderer takes draw state through explicit launch arguments and
     * immutable batch snapshots; no device-global mutable state is published. */
@@ -4378,6 +4381,10 @@ cpvk_execute_order_point(struct cpvk_device *dev)
 {
    cp_batch_flush_why(&dev->renderer, "Vulkan order point");
    cp_pass_finish(&dev->renderer);
+   /* Shading above resolves the current run's launch identities.  Close the
+    * census only afterwards, while still making this non-draw command a run
+    * boundary for the next draw. */
+   cp_run_census_break(&dev->renderer, false);
 }
 
 struct cpvk_event_callback {
