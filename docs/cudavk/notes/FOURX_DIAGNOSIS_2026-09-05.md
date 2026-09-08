@@ -721,7 +721,12 @@ unnecessary on these captures -- removes its stated hardest obstacle.
       = core with merged launches                   1.481 ms   <  2.088 target
 
 **4x is not proven unreachable. The single largest untried lever is worth
-about 1.3 ms and has never been built.** What has been built and refuted is a
+about 1.3 ms.** It has now been prototyped: a merged stage 3 builds, renders
+nothing, and loses the device, because there are **8 rasterizer queue sets and
+12.84 segments per episode** -- segment 0 and segment 8 share one, so stage 3
+cannot be deferred past the reuse. Merging needs **one queue set per live
+segment: +307 MB** for the longest episode. That is a memory trade to price,
+not a free win (`M2_PROGRESS_2026-09-05.md`). What has been built and refuted is a
 different mechanism that happens to target the same pools.
 
 ## Verdict: not achieved, and NOT proven unreachable
