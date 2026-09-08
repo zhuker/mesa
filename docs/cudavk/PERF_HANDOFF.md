@@ -19,8 +19,15 @@ window (WORKFLOW.md 4.0), all defaults, clean environment:
 
 | capture | RTX 5090 (sm_120) | B200 (sm_100) |
 |---|---:|---:|
-| favorite3 | **5.940** | **9.883** |
-| favorite2 | **5.022** | **8.283** |
+| favorite3 | **5.854** | 9.883 (pre-wide-episode) |
+| favorite2 | **4.875** | 8.283 (pre-wide-episode) |
+
+The RTX figures include the wide-episode relaxation (2026-09-05): an opaque
+episode may span viewport, rasterizer and depth-state changes, because every
+consumer of those reads them per segment. Episodes went 6.21 -> 12.84 segments
+and the frame fell 0.076 on favorite3 and 0.150 on favorite2 (whole window,
+arms disjoint, output bit-identical). **favorite2 is now under the 5.0 goal.**
+The B200 has not been re-measured since.
 
 ## How far this can go, and what it would take
 

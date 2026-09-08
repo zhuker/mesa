@@ -2683,6 +2683,22 @@ transferable part:
    merge rule (entry 22) being broken in a document that cites it.
 5. Savings were subtracted from 4 pools when the trace has **17**.
 
+**A sixth correction, and the only one that produced a shipping change.** This
+entry originally recorded the coverage gate as the workload's fault: "80% of
+what ends an opaque episode is the workload changing viewport, rasterizer,
+depth or blend state." That was measured correctly and interpreted wrongly.
+Every consumer of those three groups reads them **per segment** --
+`cp_rasterize_args` carries depth scale, translate, key inversion, the depth
+buffer and the cull state, and each segment is launched with its own -- so
+comparing them episode-wide was driver conservatism, not a workload
+constraint. Relaxed for order-free draws, episodes run **12.84 segments
+instead of 6.21** and the frame falls 0.076/0.150 ms (favorite3/favorite2,
+whole window, arms disjoint, bit-identical). Landed default-on,
+`CUDAVK_NO_WIDE_EPISODE` reverts.
+
 **The rule.** Against an external reference, price the whole space in one
-metric before concluding anything. Four of the five errors above produced a
-confident wrong verdict that the next measurement overturned.
+metric before concluding anything. Five of the six errors above produced a
+confident wrong verdict that the next measurement overturned -- and the sixth,
+which called a driver policy a property of the workload, was worth 0.15 ms
+once questioned. **When a measurement says "the workload does this", check
+whether the driver had to care.**
