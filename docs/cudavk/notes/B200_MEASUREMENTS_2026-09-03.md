@@ -15,7 +15,7 @@ Standing when this was written: favorite3 **9.883**, favorite2 **8.283**
 
 ---
 
-## 0. Environment — one finding, and it is worth 0.5 ms
+## 0. Environment — nothing wrong, and one apparent 0.5 ms finding that did not replicate
 
 Sampled during an untraced favorite3 replay.
 
