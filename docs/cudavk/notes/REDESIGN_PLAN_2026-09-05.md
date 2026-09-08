@@ -1,5 +1,22 @@
 # Redesign plan: the run-level renderer
 
+> **Current status (updated after implementation attempts): stopped before
+> full M2.** P0 passes on both RTX captures; the P1 RTX gates pass, while the
+> required B200 P1 measurements remain pending. A partial, bit-identical M2 on
+> `redesign/runlevel` made the integrated renderer slower: +1.57/+1.80 ms at
+> 32 px and +2.09/+2.51 ms at 16 px. Merged stage 3 was also +0.147/+0.208 ms.
+> `DEAD_ENDS.md` 44-45 explains the common cause: these wider launches give up
+> overlap already collected by the eight-stream fan-out. The branch stays as
+> evidence; do not merge it as a performance change. A later default-off M2
+> foundation now collects runs and safely groups only one-draw VS members. It
+> removes 208/118 launches over the two full RTX replays and measured neutral
+> (+0.0206/-0.0156 ms whole-frame); broad multi-draw replay failed an image
+> sentinel and remains refused. `M2_RUN_GEOMETRY_FOUNDATION.md` records it.
+> `M2_RUN_CLIP_BIN_STAGE.md` adds whole-run descriptor preflight but still
+> executes exact fallback, not run-wide CUDA work. The shipped pieces remain
+> the run census, wide opaque episodes and depth-only batching. This document
+> remains the original charter, not a claim that M2-M5 landed.
+
 Written 2026-09-05, after the 2026-09-02/03 leads landed (favorite3 **5.940**
 ms, favorite2 **5.022** on the RTX 5090; **9.883 / 8.283** on the B200) and
 after the first measurement of the floor: NVIDIA's own driver executes the

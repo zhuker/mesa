@@ -290,6 +290,9 @@ if dep_vulkan_loader.found()
     if test_name == 'cpvk_sampler_two_bindings'
       cpvk_texture_cache_test_exe = test_exe
     endif
+    if test_name == 'cpvk_batchbig'
+      cpvk_batchbig_exe = test_exe
+    endif
     if test_name == 'cpvk_texture_cache_no_replay'
       cpvk_texture_cache_no_replay_exe = test_exe
     endif
@@ -300,6 +303,12 @@ if dep_vulkan_loader.found()
       cpvk_texgrad_exe = test_exe
     endif
   endforeach
+
+  test('cpvk_run_geometry_gate', prog_python,
+       args : [files('tests/cpvk_run_geometry_gate.py'), cpvk_batchbig_exe],
+       suite : 'cudavk', env : cpvk_test_env, timeout : 300,
+       is_parallel : false,
+       depends : [libvulkan_cudavk, cpvk_devenv_icd])
 
   # The vertex fetch, in the shapes neither replay capture contains: every
   # conversion class, a sparse set of attribute locations, a per-instance

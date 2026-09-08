@@ -844,6 +844,7 @@ int main(int argc, char **argv)
    const bool want_homog = !strcmp(mode, "all");
    const bool want_iso   = !strcmp(mode, "all") || !strcmp(mode, "iso");
    const bool want_mixed = !strcmp(mode, "all") || !strcmp(mode, "mixed");
+   bool gate_ok = true;
    int dev = 0;
    if (const char *e = getenv("CP_BENCH_DEV")) dev = atoi(e);   /* a test
       program, not the ICD: tests/ is on cp_no_getenv.py's allowlist */
@@ -1053,7 +1054,7 @@ int main(int argc, char **argv)
 
       upload(lens, 0);
       printf("  HARNESS CHECK\n");
-      verify(d, NBLOCKS, h_refs, h_tiles, pool, 64);
+      gate_ok &= verify(d, NBLOCKS, h_refs, h_tiles, pool, 64);
       struct arm_result off = run_walk<false>(d, NBLOCKS, lens, 20);
       struct arm_result on  = run_walk<true>(d, NBLOCKS, lens, 20);
       print_arm("early-out OFF", off, NBLOCKS);
@@ -1075,14 +1076,17 @@ int main(int argc, char **argv)
          for (unsigned ch : { 512u, 1024u, 2048u }) {
             struct split_result nm = run_split(d, offs, lens, ch, 20, false);
             struct split_result mg = run_split(d, offs, lens, ch, 20, true);
+            double merge_cost = (mg.wall_ms - nm.wall_ms) / nm.wall_ms;
+            bool pass = nm.p99_us <= 30.0 && merge_cost <= 0.10;
             printf("  chunk %4u  no-merge chunks %6d  p50 %7.2f  p99 %7.2f  "
                    "max %7.2f  wall %.4f ms\n",
                    ch, nm.nchunks, nm.p50_us, nm.p99_us, nm.max_us, nm.wall_ms);
             printf("  chunk %4u  +atomicMin merge     "
                    "                                        wall %.4f ms  "
-                   "merge cost %+.1f%%\n",
-                   ch, mg.wall_ms,
-                   100.0 * (mg.wall_ms - nm.wall_ms) / nm.wall_ms);
+                   "merge cost %+.1f%%  [%s]\n",
+                   ch, mg.wall_ms, 100.0 * merge_cost,
+                   pass ? "PASS" : "FAIL");
+            gate_ok &= pass;
          }
       }
 
@@ -1099,5 +1103,7 @@ int main(int argc, char **argv)
    printf("\nGATE (M1 section 4.5): <= 28 cycles of block time per reference "
           "at the p99 tile (12,823 refs).\n"
           "Entry 24's prototype: 3,409 cycles/reference.\n");
-   return 0;
+   if (!gate_ok)
+      fprintf(stderr, "cp_tilewalk_bench: correctness or split-walk gate failed\n");
+   return gate_ok ? 0 : 1;
 }

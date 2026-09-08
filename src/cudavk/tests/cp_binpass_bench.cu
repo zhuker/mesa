@@ -122,7 +122,8 @@ int main(int argc, char **argv)
     * than a tile, a tail spans several.
     */
    std::mt19937 rng(1234u);
-   std::lognormal_distribution<double> ln(1.1, 1.05);   /* px extent */
+   std::lognormal_distribution<double> ln(-0.6, 1.05);  /* px extent;
+      including tile-boundary crossings this is about 1.16 refs/triangle */
    std::uniform_int_distribution<int> px(0, SCR_W - 1), py(0, SCR_H - 1);
    std::vector<struct tri_box> h(n);
    size_t refs_expected = 0;
@@ -203,5 +204,8 @@ int main(int argc, char **argv)
           "TOTAL", per, per <= 0.15 ? "PASS" : "FAIL");
    printf("\nfor scale, what it replaces on the RTX (union-exclusive, heavy):\n"
           "  clip_all 0.520 + stage2 0.187 + stage3 0.392 = 1.099 ms/frame\n");
-   return 0;
+   bool gate_ok = total == refs_expected && per <= 0.15;
+   if (!gate_ok)
+      fprintf(stderr, "cp_binpass_bench: count verification or timing gate failed\n");
+   return gate_ok ? 0 : 1;
 }
