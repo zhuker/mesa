@@ -5674,6 +5674,10 @@ struct cp_vs_prepare {
    uint32_t prim_shift;
    CUdeviceptr clip_rects;
    struct cp_rasterize_args pre_clip_rast;
+   CUfunction deferred_vs_kernel;
+   CUdeviceptr deferred_vs_args;
+   uint32_t deferred_vs_grid;
+   bool defer_launch;
    bool ready;
 };
 
@@ -5856,11 +5860,13 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
       size_t *storage_capacity = prepare->storage_capacity;
       CUdeviceptr *descriptor_storage = prepare->descriptor_storage;
       size_t *descriptor_capacity = prepare->descriptor_capacity;
+      bool defer_launch = prepare->defer_launch;
       *prepare = (struct cp_vs_prepare) {
          .storage = storage,
          .storage_capacity = storage_capacity,
          .descriptor_storage = descriptor_storage,
          .descriptor_capacity = descriptor_capacity,
+         .defer_launch = defer_launch,
       };
    }
    if (!prepare_only)
@@ -7138,12 +7144,19 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          }
 
          CUresult vs_err = CUDA_SUCCESS;
-         if (!cp->run_geometry.active_output)
-            vs_err = prepare_only && cp_debug->run_geometry_fail_launch
-               ? CUDA_ERROR_UNKNOWN
-               : cp_launch(cp, vs_exec->kernel,
-                    MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
-                    0, cp->stream, vs_params, NULL);
+         if (!cp->run_geometry.active_output) {
+            unsigned vs_grid = MIN2((total_verts + 255) / 256, 4096u);
+            if (prepare_only && prepare->defer_launch) {
+               prepare->deferred_vs_kernel = vs_exec->kernel;
+               prepare->deferred_vs_args = vs_args_dev;
+               prepare->deferred_vs_grid = vs_grid;
+            } else {
+               vs_err = prepare_only && cp_debug->run_geometry_fail_launch
+                  ? CUDA_ERROR_UNKNOWN
+                  : cp_launch(cp, vs_exec->kernel, vs_grid, 1, 1,
+                              256, 1, 1, 0, cp->stream, vs_params, NULL);
+            }
+         }
 
          /* Whatever the launch did, the main stream owns the rest of this
           * batch: the join is unconditional so that no path out of this
@@ -11428,7 +11441,7 @@ cp_run_geometry_device_reserve(struct cp_context *cp, CUdeviceptr *ptr,
 static bool
 cp_run_geometry_prepare_batch_stream(struct cp_context *cp, unsigned batch,
                                      struct cp_prepared_geometry *result,
-                                     bool side_stream)
+                                     bool side_stream, bool defer_launch)
 {
    if (result)
       *result = (struct cp_prepared_geometry) { 0 };
@@ -11445,6 +11458,7 @@ cp_run_geometry_prepare_batch_stream(struct cp_context *cp, unsigned batch,
       .storage_capacity = &span->prepared_capacity,
       .descriptor_storage = &span->prepared_descriptors,
       .descriptor_capacity = &span->prepared_descriptors_capacity,
+      .defer_launch = defer_launch,
    };
 
    /* Collection-time push rows stay live through the drain. New VS argument
@@ -11472,6 +11486,9 @@ cp_run_geometry_prepare_batch_stream(struct cp_context *cp, unsigned batch,
       .prim_shift = prepare.prim_shift,
       .clip_rects = prepare.clip_rects,
       .pre_clip_rast = prepare.pre_clip_rast,
+      .deferred_vs_kernel = prepare.deferred_vs_kernel,
+      .deferred_vs_args = prepare.deferred_vs_args,
+      .deferred_vs_grid = prepare.deferred_vs_grid,
    };
    for (unsigned i = 0; i < cp->run_geometry.nclip_segments; i++) {
       if (cp->run_geometry.clip_segments[i].batch == batch) {
@@ -11486,7 +11503,7 @@ bool
 cp_run_geometry_prepare_batch(struct cp_context *cp, unsigned batch,
                               struct cp_prepared_geometry *result)
 {
-   return cp_run_geometry_prepare_batch_stream(cp, batch, result, false);
+   return cp_run_geometry_prepare_batch_stream(cp, batch, result, false, false);
 }
 
 static bool
@@ -11844,26 +11861,29 @@ cp_run_clip_bin_reserve_prepared(struct cp_context *cp)
 static bool
 cp_run_clip_bin_prepare(struct cp_context *cp,
                         struct cp_prepared_geometry *prepared,
-                        bool defer_join, bool *side_out)
+                        bool defer_join, bool defer_vs, bool *side_out)
 {
    unsigned nsegs = cp->run_geometry.nclip_segments;
    bool side = !cp_debug->no_run_prep_streams && cp->seg_streams[0];
    CUstream main = cp->main_stream;
    bool ok = true;
 
-   if (side && !cp_pass_broadcast(cp, nsegs))
+   if (side && !defer_vs && !cp_pass_broadcast(cp, nsegs))
       return false;
 
    for (unsigned s = 0; s < nsegs; s++) {
       unsigned batch = cp->run_geometry.clip_segments[s].batch;
-      if (side)
+      if (side && !defer_vs)
          cp_stream_set(cp, cp_pass_seg_stream(cp, s));
-      ok = side ? cp_run_geometry_prepare_batch_stream(
-                     cp, batch, &prepared[s], true)
+      ok = defer_vs
+         ? cp_run_geometry_prepare_batch_stream(
+              cp, batch, &prepared[s], false, true)
+         : side ? cp_run_geometry_prepare_batch_stream(
+                     cp, batch, &prepared[s], true, false)
                 : cp_run_geometry_prepare_batch(cp, batch, &prepared[s]);
       if (!ok)
          break;
-      if (side)
+      if (side && !defer_vs)
          cp->run_geometry.clip_prepare_side_launches++;
    }
 
@@ -11992,7 +12012,8 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    struct cp_prepared_geometry prepared[CP_RUN_CLIP_BIN_MAX_SEGS];
    bool direct_side = false;
    memset(prepared, 0, sizeof(prepared));
-   if (!cp_run_clip_bin_prepare(cp, prepared, direct || classic, &direct_side))
+   if (!cp_run_clip_bin_prepare(cp, prepared, direct || classic, classic,
+                                &direct_side))
       return false;
    for (unsigned s = 0; s < nsegs; s++)
       if (!cp->run_geometry.clip_segments[s].positions)
@@ -12111,9 +12132,15 @@ cp_run_clip_bin_execute(struct cp_context *cp)
       /* The clear and uploaded metadata are main-owned.  Put every segment's
        * complete legacy visibility chain behind them, while retaining stream
        * order after that segment's exact prepare-only VS. */
-      if (direct_side && !cp_pass_broadcast(cp, nsegs))
+      if (direct_side) {
+         if (!cp_pass_broadcast(cp, nsegs))
+            return false;
+      } else if (cp_upload_flush(cp) != CUDA_SUCCESS) {
+         cp_renderer_texture_fatal(cp);
          return false;
+      }
       CUresult classic_err = CUDA_SUCCESS;
+      unsigned classic_vs_clip_pdl = 0;
       for (unsigned s = 0; s < nsegs && classic_err == CUDA_SUCCESS; s++) {
          const struct cp_run_clip_bin_segment *seg =
             &cp->run_geometry.clip_segments[s];
@@ -12133,14 +12160,36 @@ cp_run_clip_bin_execute(struct cp_context *cp)
          };
          classic_err = cuMemsetD32Async(queues.nontrivial_count, 0, 3,
                                          cp->stream);
+         CUfunction vs_kernel = prepared[s].deferred_vs_kernel;
+         void *vs_arg_ptr = (void *)(uintptr_t)prepared[s].deferred_vs_args;
+         void *vs_params[] = { &vs_arg_ptr };
+         if (classic_err == CUDA_SUCCESS &&
+             (!vs_kernel || !prepared[s].deferred_vs_args ||
+              !prepared[s].deferred_vs_grid))
+            classic_err = CUDA_ERROR_INVALID_VALUE;
+         if (classic_err == CUDA_SUCCESS)
+            classic_err = cp_debug->run_geometry_fail_launch
+               ? CUDA_ERROR_UNKNOWN
+               : cp_launch(cp, vs_kernel, prepared[s].deferred_vs_grid,
+                           1, 1, 256, 1, 1, 0, cp->stream, vs_params, NULL);
+         if (classic_err == CUDA_SUCCESS && direct_side)
+            cp->run_geometry.clip_prepare_side_launches++;
+
          struct cp_clip_args clip = devsegs[s].clip;
          struct cp_rasterize_args rast = rasts[s];
          void *fused_params[] = { &clip, &rast, &queues };
-         if (classic_err == CUDA_SUCCESS)
-            classic_err = cp_launch(
+         if (classic_err == CUDA_SUCCESS) {
+            /* This experiment needs the link at the default PDL level 3.
+             * RASTER (tier 2), not diagnostic STAGE1 (tier 4), retains the
+             * CUDAVK_NO_PDL escape while making VS -> fused clip active. */
+            uint64_t pdl_before = cp->pdl_taken;
+            classic_err = cp_launch_after(
                cp, screen->kernels.clip_rast_fused,
                DIV_ROUND_UP(seg->num_triangles, 64), 1, 1, 64, 1, 1, 0,
-               cp->stream, fused_params, NULL);
+               cp->stream, fused_params, NULL,
+               vs_kernel, CP_PDL_TIER_RASTER);
+            classic_vs_clip_pdl += cp->pdl_taken != pdl_before;
+         }
          void *rast_params[] = { &rast, &queues };
          if (classic_err == CUDA_SUCCESS)
             classic_err = cp_launch_after(
@@ -12175,8 +12224,9 @@ cp_run_clip_bin_execute(struct cp_context *cp)
       cp->run_geometry.clip_commits++;
       if (cp_debug->debug_episode)
          fprintf(stderr,
-                 "run-clip-classic-commit: segments=%u prim-slots=%u\n",
-                 nsegs, cp->run_geometry.clip_prim_slots);
+                 "run-clip-classic-commit: segments=%u prim-slots=%u "
+                 "vs-clip-pdl=%u\n", nsegs,
+                 cp->run_geometry.clip_prim_slots, classic_vs_clip_pdl);
       cp_opaque_finish_common(cp, true);
       return true;
    }

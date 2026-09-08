@@ -67,3 +67,11 @@ round-robin stream. The legacy queue set is private to that stream. All stages
 write the one cleared visbuf with the segment's stable run-global primitive
 base. One join precedes grouped shade. There is no readback or device refusal;
 CUDA launch failures are fatal and restore main-stream context state.
+
+The classic arm defers the exact VS launch description until after the shared
+clear/upload broadcast. It then launches VS and offers the immediately following
+fused clip/raster launch as a PDL secondary. This link uses
+`CP_PDL_TIER_RASTER` (tier 2), not diagnostic `CP_PDL_TIER_STAGE1` (tier 4), so
+it is active at the shipping `CUDAVK_PDL=3` default while still respecting
+`CUDAVK_NO_PDL`. The focused gate requires all nine VS-to-clip offers to take
+the attribute.

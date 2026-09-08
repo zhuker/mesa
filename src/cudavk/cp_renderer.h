@@ -275,6 +275,9 @@ struct cp_prepared_geometry {
    uint32_t prim_shift;
    CUdeviceptr clip_rects;
    struct cp_rasterize_args pre_clip_rast;
+   CUfunction deferred_vs_kernel;
+   CUdeviceptr deferred_vs_args;
+   uint32_t deferred_vs_grid;
 
    /* Private stable clipped geometry. It survives through grouped shading. */
    CUdeviceptr clipped;

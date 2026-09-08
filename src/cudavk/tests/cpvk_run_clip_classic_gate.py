@@ -34,7 +34,8 @@ if side != base or serial != base:
     raise SystemExit("classic run visibility changed pixels: %s %s %s\n%s" %
                      (base, side, serial, log))
 if ("run-clip-classic-commit:" not in log or
-        "run-clip-bin-prepare: batches=9 streams=8 join=0" not in log):
+        "run-clip-bin-prepare: batches=9 streams=8 join=0" not in log or
+        "vs-clip-pdl=9" not in log):
     raise SystemExit("side-stream classic transaction did not engage\n" + log)
 if ("run-clip-classic-commit:" not in serial_log or
         "run-clip-bin-prepare: batches=9 streams=1 join=0" not in serial_log):
