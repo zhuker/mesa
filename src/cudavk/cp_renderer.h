@@ -245,8 +245,21 @@ struct cp_run_geometry_member {
 };
 
 struct cp_run_geometry_span {
+   /* Borrowed from a shared one-draw group for legacy replay. */
    CUdeviceptr output;
    uint32_t num_verts;
+
+   /* Owned grow-only storage for exact per-batch preparation. */
+   CUdeviceptr prepared_output;
+   size_t prepared_capacity;
+   uint32_t out_stride;
+};
+
+/* Exact output of one collected batch's ordinary fused VS preparation. */
+struct cp_prepared_geometry {
+   CUdeviceptr output;
+   uint32_t num_verts;
+   uint32_t out_stride;
 };
 
 struct cp_run_geometry_group {
@@ -1342,6 +1355,9 @@ void cp_scratch_reset(struct cp_context *cp);
 void cp_scratch_destroy(struct cp_context *cp);
 bool cp_timing_enabled(void);
 void cp_stage_end(struct cp_context *cp, int stage);
+
+bool cp_run_geometry_prepare_batch(struct cp_context *cp, unsigned batch,
+                                   struct cp_prepared_geometry *result);
 
 void cp_run_census_draw(struct cp_context *cp,
                         const struct cp_draw_packet *packet, unsigned tris,

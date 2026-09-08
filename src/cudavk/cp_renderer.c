@@ -1188,6 +1188,10 @@ cp_context_cleanup(struct cp_context *cp)
          cuMemFree(cp->run_geometry.groups[g].output);
    }
    free(cp->run_geometry.groups);
+   for (unsigned i = 0; i < cp->run_geometry.span_capacity; i++) {
+      if (cp->run_geometry.spans[i].prepared_output)
+         cuMemFree(cp->run_geometry.spans[i].prepared_output);
+   }
    free(cp->run_geometry.spans);
 }
 
@@ -5642,8 +5646,23 @@ cp_vslane_join(struct cp_context *cp)
    cp->vslane.taken++;
 }
 
+/* A non-NULL preparation request stops immediately after the ordinary VS
+ * launch.  storage is grow-only device memory owned by the run; all other
+ * allocations remain per-batch scratch. */
+struct cp_vs_prepare {
+   CUdeviceptr *storage;
+   size_t *storage_capacity;
+   CUdeviceptr output;
+   uint32_t num_verts;
+   uint32_t out_stride;
+   bool ready;
+};
+
+static bool cp_run_geometry_device_reserve(CUdeviceptr *ptr,
+                                            size_t *capacity, size_t need);
 static void cp_draw_execute_batch_inner(struct cp_context *cp,
-                                        const struct cp_draw_batch *batch);
+                                        const struct cp_draw_batch *batch,
+                                        struct cp_vs_prepare *prepare);
 
 /*
  * The batch, with the vertex lane armed around it.
@@ -5658,11 +5677,11 @@ void
 cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
 {
    if (!!cp_debug->no_vs_lane) {
-      cp_draw_execute_batch_inner(cp, batch);
+      cp_draw_execute_batch_inner(cp, batch, NULL);
       return;
    }
    cp_vslane_arm(cp, batch);
-   cp_draw_execute_batch_inner(cp, batch);
+   cp_draw_execute_batch_inner(cp, batch, NULL);
    cp_vslane_disarm(cp, batch);
 }
 
@@ -5678,9 +5697,17 @@ cp_draw_execute_batch(struct cp_context *cp, const struct cp_draw_batch *batch)
  */
 static void
 cp_draw_execute_batch_inner(struct cp_context *cp,
-                            const struct cp_draw_batch *batch)
+                            const struct cp_draw_batch *batch,
+                            struct cp_vs_prepare *prepare)
 {
-   cp->plan.flushes++;
+   const bool prepare_only = prepare != NULL;
+   if (prepare)
+      *prepare = (struct cp_vs_prepare) {
+         .storage = prepare->storage,
+         .storage_capacity = prepare->storage_capacity,
+      };
+   if (!prepare_only)
+      cp->plan.flushes++;
    /* Where the main stream stood when this batch began; see the vertex lane
     * above. Nothing between here and the two clears below may enqueue
     * anything, and the check after them says so. */
@@ -5727,17 +5754,20 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * this one. `slices` stays null until the batch actually has more than one
     * draw to tell apart; with one draw every fragment takes row zero.
     */
-   cp->fs_batch.ubos = fs_ubo_table;
-   cp->fs_batch.ndraws = fs_ubo_table ? batch_draws : 0;
-   cp->fs_batch.slices = 0;
-   cp->fs_batch.prim_shift = 0;
+   if (!prepare_only) {
+      cp->fs_batch.ubos = fs_ubo_table;
+      cp->fs_batch.ndraws = fs_ubo_table ? batch_draws : 0;
+      cp->fs_batch.slices = 0;
+      cp->fs_batch.prim_shift = 0;
+   }
 
-   if (cp_debug->debug_rows)
+   if (!prepare_only && cp_debug->debug_rows)
       fprintf(stderr, "exec: batch_draws=%u num_draws=%u fs_tbl=%d "
               "fs_ndraws=%u\n", batch_draws, num_draws, fs_ubo_table ? 1 : 0,
               cp->fs_batch.ndraws);
 
-   if (!screen->kernels.initialized || !screen->kernels.rasterize_triangles)
+   if (!screen->kernels.initialized ||
+       (!prepare_only && !screen->kernels.rasterize_triangles))
       return;
    /*
     * A draw with nowhere to put a colour and nowhere to put a depth normally
@@ -5749,7 +5779,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * further down, which carries the same condition through the rest of the
     * function.
     */
-   if (!fb->nr_cbufs && !fb->has_zs &&
+   if (!prepare_only && !fb->nr_cbufs && !fb->has_zs &&
        !(state->fs && state->fs->writes_memory))
       do { if (cp_debug->debug_draw)
             fprintf(stderr, "  skipped: no colour or depth attachment\n");
@@ -5848,7 +5878,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * across draws would shade one draw's pixels with another's geometry.
     * Occlusion between draws is carried by the depth buffer instead. */
    CUdeviceptr visbuf = cp->visbuf;
-   if (!visbuf)
+   if (!prepare_only && !visbuf)
       do { if (cp_debug->debug_draw)
             fprintf(stderr, "  skipped: no visibility buffer\n");
          return; } while (0);
@@ -5858,11 +5888,11 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * skips it: the A-buffer passes never touch the visibility buffer, and at
     * a segment per blended batch this was most of the frame's memset traffic.
     * The fallback path re-executes classically and clears its own. */
-   if (!cp->pass.appending)
+   if (!prepare_only && !cp->pass.appending)
       cuMemsetD32Async(visbuf, 0xFFFFFFFF, (size_t)w * h * 2 * fb_samples,
                        cp->stream);
 
-   if (!cp->depthbuf_cleared)
+   if (!prepare_only && !cp->depthbuf_cleared)
       cp_clear_depthbuf(cp, 1.0f);
 
    /*
@@ -5873,7 +5903,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * allowance is exactly two and the mark for the launch site is taken
     * here, behind them.
     */
-   if (cp->vslane.ready && !cp_devop_quiet_since(cp, vsl_top, 2)) {
+   if (!prepare_only && cp->vslane.ready &&
+       !cp_devop_quiet_since(cp, vsl_top, 2)) {
       cp->vslane.ready = false;
       cp->vslane.refused++;
    }
@@ -6070,7 +6101,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
 
    /* Marks the start of the draw; the interval it opens is
     * attributed to nothing. */
-   cp_stage_end(cp, -1);
+   if (!prepare_only)
+      cp_stage_end(cp, -1);
 
    /* Reclaim last draw's scratch and size the arena for this one. A pass
     * episode owns the epoch instead: every segment's clipped stream has to
@@ -6198,7 +6230,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          return;
       }
    }
-   cp_stage_end(cp, CP_STAGE_ASSEMBLE);
+   if (!prepare_only)
+      cp_stage_end(cp, CP_STAGE_ASSEMBLE);
 
    /* If we have a compiled VS, run it to transform vertices.
     * The VS kernel reads from VB (args[2]) and writes positions+varyings (args[4]).
@@ -6261,11 +6294,21 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * A refusal here is silent and complete: everything below is what it
           * was, on the main stream, with the seeding folded as usual.
           */
-         bool vs_lane_out = fused_vfetch && cp->vslane.ready &&
-                            !cp->run_geometry.active_output;
+         bool vs_lane_out = !prepare_only && !cp->run_geometry.active_output &&
+                            fused_vfetch && cp->vslane.ready;
          if (cp->run_geometry.active_output) {
             assert(cp->run_geometry.active_num_verts == total_verts);
             vs_output_buf = cp->run_geometry.active_output;
+         } else if (prepare_only) {
+            size_t output_bytes = (size_t)total_verts * out_stride;
+            if (!prepare->storage || !prepare->storage_capacity ||
+                !cp_run_geometry_device_reserve(prepare->storage,
+                                                prepare->storage_capacity,
+                                                output_bytes)) {
+               FREE(refs);
+               return;
+            }
+            vs_output_buf = *prepare->storage;
          }
          if (vs_lane_out) {
             vs_output_buf =
@@ -6423,7 +6466,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
 
             /* The fragment stage searches the same table, from the primitive
              * rather than from the vertex; see cp_fs_interp_args. */
-            if (fs_ubo_table)
+            if (!prepare_only && fs_ubo_table)
                cp->fs_batch.slices = slices_dev;
 
             if (cp_debug->debug_rows)
@@ -6439,7 +6482,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
              * draw's recorded one. The rasterizer resolves a primitive to
              * its rectangle through the slice table above.
              */
-            if (per_draw_rects) {
+            if (!prepare_only && per_draw_rects) {
                int32_t rects[CP_MAX_BATCH_DRAWS][4];
                for (unsigned d = 0; d < batch_draws; d++) {
                   rects[d][0] = MAX2(clip_x0, (int)scissors[d].minx);
@@ -6551,8 +6594,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * then stays on the main stream pays a clear it did not need, which
           * is a cost and not a hazard.
           */
-         fetch_fold = !cp_debug->no_fetch_fold && !vs_lane_out &&
-                      !cp->run_geometry.active_output &&
+         fetch_fold = !prepare_only && !cp_debug->no_fetch_fold &&
+                      !vs_lane_out && !cp->run_geometry.active_output &&
                       (fused_vfetch ? vs_runs : fetch_runs);
 
          /*
@@ -6848,7 +6891,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * with it.
           */
          struct cp_clip_alloc clip_alloc = { 0 };
-         if (!cp_debug->no_clip_alloc_hoist) {
+         if (!prepare_only && !cp_debug->no_clip_alloc_hoist) {
             clip_alloc.taken = true;
             clip_alloc.stable = stable_clip_early;
             clip_alloc.max_clipped = max_clipped_early;
@@ -6970,7 +7013,6 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             cp->vslane.slot_next ^= 1u;
          }
 
-         /* A grouped launch already produced this member's span. */
          CUresult vs_err = CUDA_SUCCESS;
          if (!cp->run_geometry.active_output)
             vs_err = cp_launch(cp, vs_exec->kernel,
@@ -6982,6 +7024,17 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * function can leave work on the lane unordered. */
          if (vs_lane)
             cp_vslane_join(cp);
+
+         if (prepare_only) {
+            if (vs_err == CUDA_SUCCESS) {
+               prepare->output = vs_output_buf;
+               prepare->num_verts = total_verts;
+               prepare->out_stride = out_stride;
+               prepare->ready = true;
+            }
+            FREE(refs);
+            return;
+         }
 
          if (vs_err == CUDA_SUCCESS) {
             /* The rasterizer reads positions directly from VS output */
@@ -10967,12 +11020,23 @@ cp_run_geometry_plan(struct cp_context *cp)
       memset(cp->run_geometry.groups + old_group_capacity, 0,
              (size_t)(cp->run_geometry.group_capacity - old_group_capacity) *
                 sizeof(cp->run_geometry.groups[0]));
+   unsigned old_span_capacity = cp->run_geometry.span_capacity;
    if (!cp_run_geometry_reserve((void **)&cp->run_geometry.spans,
                                 &cp->run_geometry.span_capacity, n,
                                 sizeof(cp->run_geometry.spans[0])))
       return false;
-   memset(cp->run_geometry.spans, 0,
-          (size_t)n * sizeof(cp->run_geometry.spans[0]));
+   if (cp->run_geometry.span_capacity > old_span_capacity)
+      memset(cp->run_geometry.spans + old_span_capacity, 0,
+             (size_t)(cp->run_geometry.span_capacity - old_span_capacity) *
+                sizeof(cp->run_geometry.spans[0]));
+   /* Each slot owns grow-only output storage. Reset only the returned shape;
+    * freeing or forgetting the pointer here would either synchronize every
+    * run or leak it. */
+   for (unsigned i = 0; i < n; i++) {
+      cp->run_geometry.spans[i].output = 0;
+      cp->run_geometry.spans[i].num_verts = 0;
+      cp->run_geometry.spans[i].out_stride = 0;
+   }
 
    unsigned *which = malloc((size_t)n * sizeof(*which));
    if (!which)
@@ -11144,6 +11208,57 @@ cp_run_geometry_device_reserve(CUdeviceptr *ptr, size_t *capacity, size_t need)
       cuMemFree(*ptr);
    *ptr = fresh;
    *capacity = cap;
+   return true;
+}
+
+/*
+ * Prepare one immutable collected batch with the VS setup in
+ * cp_draw_execute_batch_inner(), not a reconstructed launch ABI.
+ *
+ * The caller must have admitted a replacement continuation for the whole run
+ * before the first call. A false result before cp_launch() permits the old
+ * path; a CUDA launch failure is a device failure, not permission to append a
+ * duplicate legacy pipeline behind already prepared work.
+ */
+bool
+cp_run_geometry_prepare_batch(struct cp_context *cp, unsigned batch,
+                              struct cp_prepared_geometry *result)
+{
+   if (result)
+      *result = (struct cp_prepared_geometry) { 0 };
+   if (!result || !cp->run_geometry.draining ||
+       cp->stream != cp->main_stream || cp->run_geometry.active_output ||
+       batch >= cp->run_geometry.nbatches ||
+       !cp_run_geometry_fused(&cp->run_geometry.batches[batch]))
+      return false;
+
+   struct cp_run_geometry_span *span = &cp->run_geometry.spans[batch];
+   struct cp_vs_prepare prepare = {
+      .storage = &span->prepared_output,
+      .storage_capacity = &span->prepared_capacity,
+   };
+
+   /* Collection-time push rows stay live through the drain. New VS argument
+    * uploads use the ordinary ring and are consumed by the ordered main-stream
+    * launch before a later batch may reuse its temporary scratch. */
+   cp->batch_uploads_live = true;
+   cp_draw_execute_batch_inner(cp, &cp->run_geometry.batches[batch], &prepare);
+   if (!prepare.ready)
+      return false;
+
+   span->num_verts = prepare.num_verts;
+   span->out_stride = prepare.out_stride;
+   *result = (struct cp_prepared_geometry) {
+      .output = prepare.output,
+      .num_verts = prepare.num_verts,
+      .out_stride = prepare.out_stride,
+   };
+   for (unsigned i = 0; i < cp->run_geometry.nclip_segments; i++) {
+      if (cp->run_geometry.clip_segments[i].batch == batch) {
+         cp->run_geometry.clip_segments[i].positions = prepare.output;
+         break;
+      }
+   }
    return true;
 }
 
