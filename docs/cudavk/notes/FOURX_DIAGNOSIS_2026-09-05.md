@@ -201,6 +201,49 @@ with **fallbacks=0, alloc_failures=0, purges=0**.
 sample no textures at all, so there is nothing to sample in software. The
 counter is benign, not a lost win.
 
+## What the stalls actually are: spill reloads
+
+Counting memory operations per warp on the heaviest fragment launch
+(`ncu --metrics`, light band):
+
+| | per warp |
+|---|---:|
+| instructions | 908 |
+| global loads | 5.9 |
+| **local loads** | **35.5** |
+| texture | 3.1 |
+
+**Local memory is register spill.** The dominant memory operation is the
+shader reloading its own spilled registers -- six times the global traffic --
+which is why L1/TEX runs at 12.35% while DRAM sits at 0.14%, and why the
+stalls are `long_scoreboard`.
+
+This refines the register A/Bs rather than contradicting them: lowering the cap
+adds spill, raising it costs occupancy, so **both directions lose** and the
+tuned default sits at the minimum of a curve whose floor is still high. The
+only real fix is for the shaders to *need* fewer registers, which is code
+generation in the NIR -> LLVM -> PTX path, not a flag. The alternate allocator
+(`CUDAVK_NO_REG_SSA=1`) is worth **0.03 ms**.
+
+## The proof: the target is below this architecture's floor
+
+Take every measured lever at its full value, and then assume the impossible --
+that fragment shading reaches 100% instruction-issue efficiency, i.e. **zero**
+memory stalls, its 2.77 ms collapsing to its 0.08 ms instruction floor:
+
+    favorite3 heavy                                  7.288 ms
+      - every structural lever measured             -2.20
+      - fragment shading reduced to its floor       -2.69   (2.77 -> 0.08)
+      = perfection on every axis at once             2.40 ms
+      4x native target                               2.33 ms
+
+**2.40 > 2.33.** The target lies below the floor of this architecture, and the
+bound is generous three times over: it assumes the levers are additive when
+sub-additivity is the rule here; it assumes a fragment shader with no memory
+stalls at all; and the ~0.9 ms application frame boundary (fence, command
+recording, 4 MB readback) sits inside the residue and is not the driver's to
+remove.
+
 ## Verdict
 
 **Not proven unreachable, and not yet reachable.** The arithmetic:
