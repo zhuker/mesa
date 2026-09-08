@@ -233,6 +233,25 @@ struct cp_run_census {
    uint64_t total_draws, total_tris, scopes;
 };
 
+/*
+ * Default-off M2 run-geometry foundation.  A run owns immutable copies of the
+ * batches which the reactive renderer would otherwise execute at each
+ * deferrable key break.  The flattened member table has no draw-count cap;
+ * CP_MAX_BATCH_DRAWS only bounds each source snapshot.
+ */
+struct cp_run_geometry_member {
+   uint32_t batch;
+   uint32_t row_base;
+};
+
+struct cp_run_geometry_group {
+   CUfunction kernel;
+   uint32_t first_batch;  /* key owner in the collected batch array */
+   uint32_t first_member;
+   uint32_t num_members;
+   uint32_t num_draws;
+};
+
 struct cp_context {
 
    /* Per-renderer A-buffer storage: every CUDA pointer belongs to this
@@ -294,6 +313,19 @@ struct cp_context {
     * cp_batch_flush() before it looks.
     */
    struct cp_draw_batch batch;
+
+   struct {
+      struct cp_draw_batch *batches;
+      unsigned nbatches, batch_capacity;
+      struct cp_run_geometry_member *members;
+      unsigned member_capacity, nmembers;
+      struct cp_run_geometry_group *groups;
+      unsigned group_capacity, ngroups;
+      bool draining;
+      uint64_t runs, batches_seen, draws_seen, groups_built;
+      uint64_t refused_nonfused, refused_vs_side_effect;
+      uint64_t alloc_fallbacks;
+   } run_geometry;
 
    /*
     * A pass episode: consecutive blended batches sharing one A-buffer build,

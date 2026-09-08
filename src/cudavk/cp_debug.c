@@ -127,6 +127,10 @@ static const struct cp_flag_def flags[] = {
      "maximal sequences of consecutive same-class draws in one scope -- and "
      "report at teardown what share of the frame's triangles they hold. "
      "Watches only; changes no rendering decision (REDESIGN_PLAN_2026-09-05)" },
+   { "CUDAVK_RUN_GEOMETRY", CP_FLAG_BOOL_VALUE, F(run_geometry),
+     "collect each opaque run at its proven episode flush boundary and group "
+     "its segments by fused vertex-shader launch identity. Default-off M2 "
+     "foundation; current downstream execution remains the existing path" },
    { "CUDAVK_PLAN_STATS", CP_FLAG_BOOL_VALUE, F(plan_stats),
      "report at teardown what deciding one draw at a time costs: batch keys "
      "built, pairwise merge tests, flushes, pass episodes closed and every "

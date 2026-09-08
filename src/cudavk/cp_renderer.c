@@ -954,6 +954,24 @@ cp_plan_report(struct cp_context *cp)
 }
 
 static void
+cp_run_geometry_report(struct cp_context *cp)
+{
+   if (!cp_debug->run_geometry)
+      return;
+   fprintf(stderr,
+           "cudavk: run geometry: %llu runs, %llu batches, %llu draws, "
+           "%llu fused-launch groups; refusals non-fused=%llu "
+           "VS-side-effect=%llu allocation=%llu\n",
+           (unsigned long long)cp->run_geometry.runs,
+           (unsigned long long)cp->run_geometry.batches_seen,
+           (unsigned long long)cp->run_geometry.draws_seen,
+           (unsigned long long)cp->run_geometry.groups_built,
+           (unsigned long long)cp->run_geometry.refused_nonfused,
+           (unsigned long long)cp->run_geometry.refused_vs_side_effect,
+           (unsigned long long)cp->run_geometry.alloc_fallbacks);
+}
+
+static void
 cp_hardware_texture_report(struct cp_context *cp)
 {
    if (!cp_debug->texture_cache_stats || !cp->hardware_texture.launches)
@@ -1062,6 +1080,7 @@ cp_context_cleanup(struct cp_context *cp)
               (double)cp->fs_blocks / (double)cp->fs_launches, cp->sm_count,
               cp_debug->fs_grid_waves);
    cp_plan_report(cp);
+   cp_run_geometry_report(cp);
    cp_run_census_report(cp);
    if (cp_debug->upload_stats)
       fprintf(stderr, "cudavk: uploads: blocks=%" PRIu64 " flushes=%" PRIu64
@@ -1143,6 +1162,9 @@ cp_context_cleanup(struct cp_context *cp)
    cp->hardware_texture.resolve_workspace = NULL;
    free(cp->pass_segs);
    free(cp->pass_group_ubos);
+   free(cp->run_geometry.batches);
+   free(cp->run_geometry.members);
+   free(cp->run_geometry.groups);
 }
 
 /* Per-stage timing for a draw, printed under CUDAVK_DEBUG_TIME. See
@@ -10824,6 +10846,192 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    }
 }
 
+/*
+ * Whether two collected batches can use one existing fused-fetch VS launch.
+ * This deliberately keeps the fields which are launch-wide in
+ * cp_vertex_fetch_args in the key.  VB/IB addresses, ranges, instance counts,
+ * UBOs and draw parameters already have rows/slices; layout, index width and
+ * firstInstance do not.  Equality is the fallback for that missing ABI.
+ */
+static bool
+cp_run_geometry_same_launch(const struct cp_draw_batch *a,
+                            const struct cp_draw_batch *b)
+{
+   const struct cp_draw_state *sa = &a->state;
+   const struct cp_draw_state *sb = &b->state;
+   if (sa->vs != sb->vs || !sa->vs ||
+       sa->vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel !=
+          sb->vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel ||
+       a->info.index_size != b->info.index_size ||
+       a->info.start_instance != b->info.start_instance ||
+       sa->num_vertex_elements != sb->num_vertex_elements)
+      return false;
+
+   return !memcmp(sa->velem, sb->velem,
+                  (size_t)sa->num_vertex_elements * sizeof(sa->velem[0]));
+}
+
+static bool
+cp_run_geometry_fused(const struct cp_draw_batch *batch)
+{
+   const struct cp_draw_state *s = &batch->state;
+   return cp_debug->fused_vfetch && !cp_debug->no_fused_vfetch &&
+          !cp_debug->debug_vfetch && s->vs && !s->vs->writes_memory &&
+          s->vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel &&
+          s->num_vertex_elements <= CP_MAX_VERTEX_ELEMENTS_VF;
+}
+
+static bool
+cp_run_geometry_reserve(void **ptr, unsigned *capacity, unsigned need,
+                        size_t elem_size)
+{
+   if (*capacity >= need)
+      return true;
+   unsigned cap = MAX2(*capacity, 16u);
+   while (cap < need) {
+      if (cap > UINT32_MAX / 2u)
+         return false;
+      cap *= 2u;
+   }
+   void *p = realloc(*ptr, (size_t)cap * elem_size);
+   if (!p)
+      return false;
+   *ptr = p;
+   *capacity = cap;
+   return true;
+}
+
+/* Build the dynamic flattened table before any member is submitted.  Group
+ * order is first occurrence; member order is draw order.  The table is the
+ * hand-off an extracted geometry launcher will consume, while each member's
+ * copied batch remains the prepared input to today's clip/raster/shade path.
+ */
+static bool
+cp_run_geometry_plan(struct cp_context *cp)
+{
+   unsigned n = cp->run_geometry.nbatches;
+   cp->run_geometry.nmembers = 0;
+   cp->run_geometry.ngroups = 0;
+   if (!n)
+      return true;
+
+   if (!cp_run_geometry_reserve((void **)&cp->run_geometry.members,
+                                &cp->run_geometry.member_capacity, n,
+                                sizeof(cp->run_geometry.members[0])) ||
+       !cp_run_geometry_reserve((void **)&cp->run_geometry.groups,
+                                &cp->run_geometry.group_capacity, n,
+                                sizeof(cp->run_geometry.groups[0])))
+      return false;
+
+   unsigned *which = malloc((size_t)n * sizeof(*which));
+   if (!which)
+      return false;
+   for (unsigned i = 0; i < n; i++) {
+      unsigned g;
+      for (g = 0; g < cp->run_geometry.ngroups; g++) {
+         unsigned first = cp->run_geometry.groups[g].first_batch;
+         if (cp_run_geometry_same_launch(&cp->run_geometry.batches[first],
+                                         &cp->run_geometry.batches[i]))
+            break;
+      }
+      if (g == cp->run_geometry.ngroups) {
+         struct cp_run_geometry_group *group =
+            &cp->run_geometry.groups[cp->run_geometry.ngroups++];
+         *group = (struct cp_run_geometry_group) {
+            .kernel = cp->run_geometry.batches[i].state.vs->
+                         exec[CP_SHADER_EXEC_VS_FETCH].kernel,
+            .first_batch = i,
+            .first_member = i, /* fixed after the count pass below */
+         };
+      }
+      which[i] = g;
+   }
+
+   unsigned cursor = 0;
+   for (unsigned g = 0; g < cp->run_geometry.ngroups; g++) {
+      struct cp_run_geometry_group *group = &cp->run_geometry.groups[g];
+      group->first_member = cursor;
+      group->num_members = 0;
+      group->num_draws = 0;
+      for (unsigned i = 0; i < n; i++) {
+         if (which[i] != g)
+            continue;
+         cp->run_geometry.members[cursor++] =
+            (struct cp_run_geometry_member) {
+               .batch = i,
+               .row_base = group->num_draws,
+            };
+         group->num_members++;
+         group->num_draws += cp->run_geometry.batches[i].ndraws;
+      }
+   }
+   cp->run_geometry.nmembers = cursor;
+   cp->run_geometry.groups_built += cp->run_geometry.ngroups;
+   if (cp_debug->debug_episode)
+      fprintf(stderr, "run-geometry-plan: batches=%u groups=%u members=%u\n",
+              n, cp->run_geometry.ngroups, cursor);
+   free(which);
+   return true;
+}
+
+static bool
+cp_run_geometry_collect(struct cp_context *cp)
+{
+   if (!cp_run_geometry_fused(&cp->batch)) {
+      if (cp_debug->debug_episode)
+         fprintf(stderr, "run-geometry-refuse: vs=%d side=%d fused-kernel=%d elems=%u\n",
+                 (int)!!cp->batch.state.vs,
+                 cp->batch.state.vs ? (int)cp->batch.state.vs->writes_memory : -1,
+                 cp->batch.state.vs ?
+                    (int)!!cp->batch.state.vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel : 0,
+                 cp->batch.state.num_vertex_elements);
+      if (cp->batch.state.vs && cp->batch.state.vs->writes_memory)
+         cp->run_geometry.refused_vs_side_effect++;
+      else
+         cp->run_geometry.refused_nonfused++;
+      return false;
+   }
+   unsigned n = cp->run_geometry.nbatches;
+   if (!cp_run_geometry_reserve((void **)&cp->run_geometry.batches,
+                                &cp->run_geometry.batch_capacity, n + 1,
+                                sizeof(cp->run_geometry.batches[0]))) {
+      cp->run_geometry.alloc_fallbacks++;
+      return false;
+   }
+   cp->run_geometry.batches[n] = cp->batch;
+   cp->run_geometry.nbatches++;
+   cp->run_geometry.batches_seen++;
+   cp->run_geometry.draws_seen += cp->batch.ndraws;
+   return true;
+}
+
+/* Drain only at cp_batch_flush_why(), the renderer's authoritative ordering
+ * boundary.  Submission remains in original batch order.  Setting the upload
+ * lifetime latch before every member prevents the first execution's reclaim
+ * from invalidating push rows belonging to later collected members.
+ */
+static void
+cp_run_geometry_drain(struct cp_context *cp)
+{
+   unsigned n = cp->run_geometry.nbatches;
+   if (!n || cp->run_geometry.draining)
+      return;
+   cp->run_geometry.draining = true;
+   cp->run_geometry.runs++;
+   if (!cp_run_geometry_plan(cp)) {
+      cp->run_geometry.alloc_fallbacks++;
+      cp->run_geometry.nmembers = cp->run_geometry.ngroups = 0;
+   }
+   for (unsigned i = 0; i < n && !cp->device_fatal; i++) {
+      cp->batch = cp->run_geometry.batches[i];
+      cp->batch.pending = false;
+      cp->batch_uploads_live = true;
+      cp_opaque_append(cp, cp->batch.ndraws);
+   }
+   cp->run_geometry.nbatches = 0;
+   cp->run_geometry.draining = false;
+}
+
 void
 cp_batch_flush(struct cp_context *cp)
 {
@@ -10875,6 +11083,25 @@ cp_batch_flush_defer_why(struct cp_context *cp, const char *why)
       }
    }
 
+   /* The M2 collector sees the same already-proven opaque episode
+    * admission as the shipping append path.  A defer boundary ends a batch,
+    * not the run. */
+   if (cp_debug->run_geometry && !blended &&
+       cp_opaque_appendable(cp, &cp->batch) &&
+       cp_run_geometry_collect(cp))
+      return;
+
+   /* A refused candidate follows the collected run in Vulkan order.  Drain
+    * the saved members first, then restore the candidate snapshot before the
+    * unchanged blended/direct/fallback decision below. */
+   if (cp_debug->run_geometry && cp->run_geometry.nbatches) {
+      struct cp_draw_batch candidate = cp->batch;
+      cp_run_geometry_drain(cp);
+      cp->batch = candidate;
+      if (cp->device_fatal)
+         return;
+   }
+
    if (blended && cp_pass_appendable(cp, &cp->batch)) {
       cp_pass_append(cp, ndraws);
       return;
@@ -10894,6 +11121,7 @@ void
 cp_batch_flush_why(struct cp_context *cp, const char *why)
 {
    cp_batch_flush_defer_why(cp, why);
+   cp_run_geometry_drain(cp);
    if (cp_debug->debug_episode && cp->pass.nsegs)
       fprintf(stderr, "episode-cut: flush_why=%s nsegs=%u\n", why,
               cp->pass.nsegs);
