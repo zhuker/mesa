@@ -22,6 +22,51 @@ window (WORKFLOW.md 4.0), all defaults, clean environment:
 | favorite3 | **5.940** | **9.883** |
 | favorite2 | **5.022** | **8.283** |
 
+## How far this can go, and what it would take
+
+`notes/FOURX_DIAGNOSIS_2026-09-05.md` prices the whole remaining space against
+the native driver. Per band, cudavk against NVIDIA's own driver on the same
+GPU and capture:
+
+| band | cudavk | native | ratio |
+|---|---:|---:|---:|
+| loading | 1.942 | 0.351 | 5.53x |
+| light | 4.171 | 0.478 | 8.73x |
+| heavy | 7.288 | 0.582 | **12.52x** |
+
+**Every flag-level lever is exhausted**: 14 tested, 10 refuted, including the
+whole register/spill curve (64 to 203 registers, all within 0.06 ms except 64
+which is 0.52 worse), fragment grid geometry, interpolation fusion, both
+register allocators, the texture-cache budget and hardware-texture
+eligibility. Frame time is **invariant across the register curve**, which is
+what a memory-latency bound looks like when no configuration escapes it.
+
+**What is left is structural, unbuilt, and priced** -- device work,
+union-exclusive:
+
+| work | saves |
+|---|---:|
+| bin+walk replacing clip + stage2 + stage3 (+abuf) | 1.039 |
+| frame-wide deferred shading (overdraw is 2.29x) | 0.411 |
+| one compaction per run | 0.268 |
+| writeback fused into the shade | 0.109 |
+| one visibility clear per run | 0.158 |
+| A-buffer support from the walk's sorted lists | 0.098 |
+| **device total** | **2.083** |
+| frame-boundary host cost (cudavk's share of 0.94) | ~0.56 |
+
+That lands device work at **2.635 ms/frame against a 2.088 ms 4x target --
+1.26x over**, so 4x is not obviously reachable and not proven unreachable. The
+realistic target is **~5x native**, which is still a 2.3x improvement on today.
+
+**The gating problem is coverage, not the kernels.** The split tile walk is
+built, bit-identical and 3.6x its predecessor (`notes/M2_PROGRESS_2026-09-05.md`,
+branch `redesign/runlevel`), but opaque episodes hold only 21% of batches, and
+**80% of what ends an episode is the workload changing viewport, rasterizer,
+depth or blend state** -- which the plan assumes is episode-wide. Carrying that
+state per segment is the prerequisite for everything in the table above.
+
+
 **Against the previous release**, measured 2026-09-05 with both drivers
 alternating run-by-run in one session (`CTRL_ICD`/`CAND_ICD`), same harness
 binary, all twelve runs passing their gates and every arm disjoint:
