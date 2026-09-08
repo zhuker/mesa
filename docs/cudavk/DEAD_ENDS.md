@@ -2819,6 +2819,29 @@ target. What forbids it is that the 3.5 ms separating work from frame is idle
 the fan-out is already hiding, and no scheme can collect it without first
 surrendering it.
 
+## The other direction, also measured: the fan-out is saturated
+
+If the fan-out hides 0.871 ms of idle, more streams should hide more. Episodes
+now run 12.84 segments against `CP_PASS_STREAMS` = 8, so segments share
+streams and the case looked stronger than when `DEAD_ENDS` 38 tested it.
+
+Measured on the post-2026-09-05 baseline, 16 streams against 8, bit-identical:
+**-0.051 ms whole (disjoint), -0.043 heavy (overlapping)** for +160 MB of
+worst-case-sized queue sets. Entry 38 declined the same trade at 0.084 ms; at
+0.051 it is declined again.
+
+So both directions from the current configuration are now bounded:
+
+| change | measured |
+|---|---:|
+| more overlap (16 streams, +160 MB) | **-0.051** (saturated) |
+| less overlap (merge to one launch) | +0.147 to +2.51 |
+| no overlap (`NO_OPAQUE_STREAMS=1`) | +0.871 |
+
+**The fan-out at eight streams is at its optimum**, and the idle it cannot
+hide is irreducible by any scheduling change. That is the last degree of
+freedom in this driver, and it is spent.
+
 **The rule.** Before pricing a merge, check whether the launches being merged
 already overlap. If a pool's union-exclusive time is well below its summed
 time, the fan-out is already collecting most of what the merge would -- and
