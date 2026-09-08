@@ -145,14 +145,18 @@ static const struct cp_flag_def flags[] = {
      "diagnostic dense-reference capacity for RUN_CLIP_BIN; 0 uses the "
      "normal maximum, while a small value forces the device-predicated "
      "classic visibility arm without a host readback" },
+   { "CUDAVK_NO_RUN_PREP_STREAMS", CP_FLAG_BOOL_VALUE,
+     F(no_run_prep_streams),
+     "keep exact RUN_CLIP_BIN vertex preparation serial on the main stream; "
+     "reverts the round-robin side-stream launch schedule" },
    { "CUDAVK_RUN_GEOMETRY_FAIL_ALLOC", CP_FLAG_UINT,
      F(run_geometry_fail_alloc),
      "fault gate for run geometry output growth: 1 injects soft OOM and 2 "
      "injects a fatal CUDA error before any geometry launch" },
    { "CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH", CP_FLAG_BOOL_VALUE,
      F(run_geometry_fail_launch),
-     "fault gate that replaces each admitted run geometry group launch with "
-     "a fatal CUDA error; verifies device loss rather than exact replay" },
+     "fault gate that replaces each admitted run geometry launch with a "
+     "fatal CUDA error; verifies device loss rather than exact replay" },
    { "CUDAVK_PLAN_STATS", CP_FLAG_BOOL_VALUE, F(plan_stats),
      "report at teardown what deciding one draw at a time costs: batch keys "
      "built, pairwise merge tests, flushes, pass episodes closed and every "

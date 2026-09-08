@@ -394,6 +394,8 @@ struct cp_context {
       uint32_t clip_prim_slots;
       uint64_t clip_preflights, clip_prepared, clip_continuation_fallbacks;
       uint64_t clip_commits;
+      uint64_t clip_prepare_side_runs, clip_prepare_side_launches;
+      uint64_t clip_prepare_side_joins, clip_prepare_side_refused;
       uint64_t clip_refused_segments, clip_refused_shape;
 
       /* Grow-only storage for the transactional run clip/bin continuation. */
