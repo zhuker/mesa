@@ -212,8 +212,20 @@ Entry 1's premise was **3.29 ms/frame of sub-20 µs device-idle gaps**
 (iteration 12). Re-measured on the post-wins build from a full-run CUDA trace
 (`/tmp/kb.sqlite`, 1,163,280 kernels, whole replay):
 
-    total device idle        3.242 ms/frame
+    total device idle        3.242 ms/frame  -- but see the correction below
     of which sub-20 us       0.660 ms/frame   (773,220 gaps)
+
+The 3.242 figure is wrong as a per-frame cost. It includes **112 gaps larger
+than 2 ms**, which are one-off shader-compilation and teardown stalls spread
+over the whole run, not per-frame work; amortising them across 3,473 frames
+manufactured 1.508 ms/frame that no frame pays. Excluding them:
+
+    per-frame device idle    1.734 ms/frame (traced, CUPTI-inflated)
+      sub-20 us launch/handoff  0.660
+      20 us - 0.5 ms            0.410
+      0.5 - 2 ms                0.663   -- 0.68 gaps/frame: the frame boundary
+                                           itself, i.e. the application's
+                                           readback fence, outside the driver
 
 **0.66 against 3.29 -- an 80% reduction in exactly the pool graphs were built
 to capture**, and the trace still carries CUPTI's per-launch inflation, so the
