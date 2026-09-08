@@ -225,7 +225,9 @@ only real fix is for the shaders to *need* fewer registers, which is code
 generation in the NIR -> LLVM -> PTX path, not a flag. The alternate allocator
 (`CUDAVK_NO_REG_SSA=1`) is worth **0.03 ms**.
 
-## The proof: the target is below this architecture's floor
+## RETRACTED: the "proof" below is wrong -- see the correction after it
+
+## The (wrong) proof: the target is below this architecture's floor
 
 Take every measured lever at its full value, and then assume the impossible --
 that fragment shading reaches 100% instruction-issue efficiency, i.e. **zero**
@@ -243,6 +245,48 @@ sub-additivity is the rule here; it assumes a fragment shader with no memory
 stalls at all; and the ~0.9 ms application frame boundary (fence, command
 recording, 4 MB readback) sits inside the residue and is not the driver's to
 remove.
+
+## The correction, and why the proof fails
+
+The proof treated the ~0.9 ms frame boundary as untouchable. It is not, and
+the giveaway was in plain sight: **the native driver renders an entire frame
+in 0.522 ms, which is less than that boundary alone.** Nothing inherent to the
+application can cost more than the whole native frame.
+
+Measured from the trace: device idle is **2.456 ms/frame** of a 5.94 ms frame,
+of which **0.940 ms/frame** sits in 1,968 gaps over 100 us -- 2.1 per frame,
+i.e. the two submits. `RESIDUAL_AUDITS_2026-08-31.md` decomposes that host
+time:
+
+| | ms/frame |
+|---|---:|
+| application record/decode | 0.376 |
+| unattributed | 0.371 |
+| other CUDA APIs | 0.190 |
+
+**Only the first is the application's**, and the native driver pays it too --
+so its 0.522 ms frame is roughly 0.376 of application plus ~0.15 of driver.
+The remaining **~0.56 ms/frame is cudavk's own host cost at the frame
+boundary**, and I counted it as irreducible without checking.
+
+    the claimed floor        2.40 ms
+    minus that boundary     -0.56
+    corrected floor          1.84 ms   <  2.33 target
+
+**So the target is not below the floor, and the goal is not proven
+unreachable.** What it actually requires is all three of:
+
+1. the structural launch work (2.20 ms, measured and available),
+2. the frame-boundary host cost (~0.56 ms, unattacked), and
+3. **fragment shading 4.9x faster** -- 2.77 -> 0.57 ms, against an instruction
+   floor of 0.08, by removing the spill reloads that dominate its memory
+   traffic (35.5 local loads per warp against 5.9 global).
+
+Item 3 is the crux and it is a **code-generation problem** in the
+NIR -> LLVM -> PTX path: the shaders must need fewer registers so they neither
+spill nor lose occupancy. Every *flag* around it is at its optimum; the
+compiler itself has not been touched. That is the remaining avenue, and its
+ceiling is unmeasured.
 
 ## Verdict
 
@@ -289,8 +333,12 @@ the per-fragment gather of vertex attributes and texture fetches, which is
 what a hardware rasteriser does in fixed-function units and a compute kernel
 cannot avoid.
 
-**Conclusion: 4x on the heavy band is not reachable within this
-architecture, and this is now a proof by exhaustion rather than an opinion.** It is not a tuning gap; it is the cost of software
+**Conclusion (corrected): 4x on the heavy band is NOT proven unreachable.**
+Every flag-level lever is exhausted and priced, and the arithmetic needs
+fragment shading 4.9x faster than today. That reduces to one unattacked
+question -- whether the shader compiler can cut register demand enough to
+stop spilling -- plus ~0.56 ms of frame-boundary host cost nobody has tried
+to remove. It is not a tuning gap; it is the cost of software
 rasterisation against fixed-function hardware, and the same conclusion the
 CuRast README states for this workload shape ("models with numerous meshes
 with few triangles, Vulkan remains 10x faster"). The loading band (1.942 vs a
