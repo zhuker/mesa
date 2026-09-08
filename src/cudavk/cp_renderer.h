@@ -233,6 +233,49 @@ struct cp_run_census {
    uint64_t total_draws, total_tris, scopes;
 };
 
+/*
+ * Default-off M2 run-geometry foundation.  A run owns immutable copies of the
+ * batches which the reactive renderer would otherwise execute at each
+ * deferrable key break.  The flattened member table has no draw-count cap;
+ * CP_MAX_BATCH_DRAWS only bounds each source snapshot.
+ */
+struct cp_run_geometry_member {
+   uint32_t batch;
+   uint32_t row_base;
+};
+
+struct cp_run_geometry_span {
+   CUdeviceptr output;
+   uint32_t num_verts;
+};
+
+struct cp_run_geometry_group {
+   CUfunction kernel;
+   uint32_t first_batch;  /* key owner in the collected batch array */
+   uint32_t first_member;
+   uint32_t num_members;
+   uint32_t num_draws;
+   CUdeviceptr output;
+   size_t output_capacity;
+};
+
+/* First CUDA-only clip/bin slice. A segment is one immutable legacy batch.
+ * The preflight fills this table for the whole run before any grouped VS is
+ * issued. positions is deliberately zero until that VS has produced its span.
+ * Keeping the stable slot range explicit makes the future run-wide pass use
+ * submission-order primitive IDs rather than an atomic append order. */
+#define CP_RUN_CLIP_BIN_MAX_SEGS 64
+struct cp_run_clip_bin_segment {
+   uint32_t batch;
+   uint32_t group;
+   uint32_t group_member;
+   uint32_t num_triangles;
+   uint32_t num_outputs;
+   uint32_t prim_base;
+   uint32_t prim_slots;
+   CUdeviceptr positions;
+};
+
 struct cp_context {
 
    /* Per-renderer A-buffer storage: every CUDA pointer belongs to this
@@ -294,6 +337,32 @@ struct cp_context {
     * cp_batch_flush() before it looks.
     */
    struct cp_draw_batch batch;
+
+   struct {
+      struct cp_draw_batch *batches;
+      unsigned nbatches, batch_capacity;
+      struct cp_run_geometry_member *members;
+      unsigned member_capacity, nmembers;
+      struct cp_run_geometry_group *groups;
+      unsigned group_capacity, ngroups;
+      struct cp_run_geometry_span *spans;
+      unsigned span_capacity;
+      CUdeviceptr active_output;
+      uint32_t active_num_verts;
+      bool draining;
+      uint64_t runs, batches_seen, draws_seen, groups_built;
+      uint64_t groups_launched, member_launches_saved;
+      uint64_t refused_nonfused, refused_vs_side_effect;
+      uint64_t alloc_fallbacks;
+
+      struct cp_run_clip_bin_segment clip_segments[CP_RUN_CLIP_BIN_MAX_SEGS];
+      unsigned nclip_segments;
+      uint32_t clip_prim_slots;
+      uint64_t clip_preflights, clip_prepared, clip_continuation_fallbacks;
+      uint64_t clip_refused_segments, clip_refused_shape;
+      uint64_t clip_refused_side_effect, clip_refused_slots;
+      uint64_t clip_refused_primitive_range;
+   } run_geometry;
 
    /*
     * A pass episode: consecutive blended batches sharing one A-buffer build,
@@ -1274,7 +1343,8 @@ bool cp_timing_enabled(void);
 void cp_stage_end(struct cp_context *cp, int stage);
 
 void cp_run_census_draw(struct cp_context *cp,
-                        const struct cp_draw_packet *packet, unsigned tris);
+                        const struct cp_draw_packet *packet, unsigned tris,
+                        bool compatible_with_previous);
 void cp_run_census_break(struct cp_context *cp, bool scope_change);
 void cp_run_census_identity(struct cp_context *cp, const void *fs,
                             const void *exec);
