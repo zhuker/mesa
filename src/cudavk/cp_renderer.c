@@ -9,6 +9,7 @@
 
 #include "cp_renderer.h"
 #include "cp_shade_equiv.h"
+#include "kernels/cp_vfetch_eq.h"
 #include "cp_nvtx.h"
 #include "compiler/glsl_types.h"
 
@@ -35,6 +36,32 @@
 /* Which caller site produced a descriptor fallback; printed with the
  * hardware-texture stats. Attribution before ranking, rule 14. */
 static uint64_t cp_hwtex_desc_fallback_site[10];
+
+/* Private rows are not draw scratch: that arena rewinds while the VS lane can
+ * still read it. Two reusable slots have explicit consumer-completion events.
+ * Allocation happens before lane admission; waits/oracle happen on its selected
+ * stream. The report is initialized synchronously before any stream uses it.
+ * Growth may wait for the old consumer and can make the existing quiet-mark
+ * guard refuse lane admission. Steady-state validation enqueues nothing before
+ * that guard: it does not force the lane or grouped geometry off. */
+struct cp_vfetch_eq_state {
+   CUdeviceptr report;
+   struct {
+      CUdeviceptr rows;
+      size_t capacity;
+      CUevent done;
+      bool recorded;
+   } slot[2];
+   uint64_t next_dispatch;
+   uint64_t expected_invocations, expected_slots, expected_words;
+   uint64_t specialized_launches, generic_launches;
+   uint64_t layout_fallback_launches, standalone_launches;
+   uint64_t lane_launches, group_launches, reused_outputs, errors;
+};
+
+static bool cp_vfetch_eq_init(struct cp_context *cp);
+static void cp_vfetch_eq_finish(struct cp_context *cp);
+
 
 /*
  * Bring a renderer up on a device.
@@ -64,6 +91,8 @@ bool
 cp_context_init(struct cp_context *cp, struct cp_device *dev)
 {
    cp->dev = dev;
+   if (!cp_vfetch_eq_init(cp))
+      goto fail;
    cp_smallop_enabled = cp_debug->upload_stats;
 
    /*
@@ -194,6 +223,213 @@ cp_renderer_texture_fatal(struct cp_context *cp)
    cp->device_fatal = true;
    if (cp->dev->texture_cache_fatal)
       cp->dev->texture_cache_fatal(cp->dev->texture_cache_private);
+}
+
+
+static void
+cp_vfetch_eq_cleanup_result(struct cp_context *cp, CUresult err)
+{
+   if (cp->vfetch_eq && err != CUDA_SUCCESS) {
+      cp->vfetch_eq->errors++;
+      cp_renderer_texture_fatal(cp);
+   }
+}
+
+static bool
+cp_vfetch_eq_init(struct cp_context *cp)
+{
+   if (!cp_debug->vfetch_eq_check)
+      return true;
+   cp->vfetch_eq = calloc(1, sizeof(*cp->vfetch_eq));
+   if (!cp->vfetch_eq) {
+      fprintf(stderr, "VFETCH_EQ {\"complete\":0,\"errors\":1,\"error\":\"host allocation\"}\n");
+      return false;
+   }
+   struct cp_vfetch_eq_state *s = cp->vfetch_eq;
+   if (cuMemAlloc(&s->report, sizeof(struct cp_vfetch_eq_report)) != CUDA_SUCCESS ||
+       cuMemsetD8(s->report, 0, sizeof(struct cp_vfetch_eq_report)) != CUDA_SUCCESS)
+      goto fail;
+   for (unsigned i = 0; i < 2; i++)
+      if (cuEventCreate(&s->slot[i].done, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS)
+         goto fail;
+   return true;
+fail:
+   s->errors++;
+   cp_renderer_texture_fatal(cp);
+   return false;
+}
+
+static bool
+cp_vfetch_eq_prepare(struct cp_context *cp, struct cp_vertex_fetch_args *vf,
+                     const struct cp_shader_binary *vs)
+{
+   struct cp_vfetch_eq_state *s = cp->vfetch_eq;
+   if (!s || !vs->vs_layout_static)
+      return true;
+   if (vs->vs_num_slots > 32 ||
+       (vs->vs_num_slots < 32 &&
+        (vs->vs_live_slots >> vs->vs_num_slots)))
+      goto fail;
+   uint64_t dispatch = ++s->next_dispatch;
+   unsigned k = (dispatch - 1) & 1u;
+   size_t bytes = (size_t)vf->num_verts * sizeof(struct cp_vfetch_eq_row);
+   if (!bytes || bytes > CP_SCRATCH_MAX_BYTES)
+      goto fail;
+   if (s->slot[k].capacity < bytes) {
+      /* Growth is rare. Never free a slot until its previous real VS ends. */
+      if (s->slot[k].recorded &&
+          cuEventSynchronize(s->slot[k].done) != CUDA_SUCCESS)
+         goto fail;
+      if (s->slot[k].rows && cuMemFree(s->slot[k].rows) != CUDA_SUCCESS)
+         goto fail;
+      s->slot[k].rows = 0;
+      s->slot[k].capacity = 0;
+      if (cuMemAlloc(&s->slot[k].rows, bytes) != CUDA_SUCCESS)
+         goto fail;
+      s->slot[k].capacity = bytes;
+   }
+   vf->eq_rows = s->slot[k].rows;
+   vf->eq_report = s->report;
+   vf->eq_dispatch = dispatch;
+   vf->eq_mask = vs->vs_live_slots;
+   vf->eq_slots = util_bitcount(vf->eq_mask);
+   vf->eq_break = cp_debug->vfetch_eq_break;
+   return true;
+fail:
+   s->errors++;
+   cp_renderer_texture_fatal(cp);
+   return false;
+}
+
+static CUresult
+cp_vfetch_eq_before(struct cp_context *cp, const struct cp_vertex_fetch_args *vf,
+                    const struct cp_shader_binary *vs, bool fused,
+                    bool layout_match, bool lane, bool group)
+{
+   struct cp_vfetch_eq_state *s = cp->vfetch_eq;
+   if (!s)
+      return CUDA_SUCCESS;
+   if (vs->vs_eq_failed) {
+      s->errors++;
+      cp_renderer_texture_fatal(cp);
+      return CUDA_ERROR_INVALID_PTX;
+   }
+   if (!fused) {
+      if (vs->vs_layout_static && !layout_match)
+         s->layout_fallback_launches++;
+      else
+         s->standalone_launches++;
+      return CUDA_SUCCESS;
+   }
+   if (!vs->vs_layout_static) {
+      s->generic_launches++;
+      return CUDA_SUCCESS;
+   }
+   s->specialized_launches++;
+   s->lane_launches += lane;
+   s->group_launches += group;
+   s->expected_invocations += vf->num_verts;
+   s->expected_slots += (uint64_t)vf->num_verts * vf->eq_slots;
+   s->expected_words += (uint64_t)vf->num_verts * vf->eq_slots * 4;
+   unsigned k = (vf->eq_dispatch - 1) & 1u;
+   CUresult err = CUDA_SUCCESS;
+   if (s->slot[k].recorded)
+      err = cuStreamWaitEvent(cp->stream, s->slot[k].done, 0);
+   struct cp_vertex_fetch_args oracle = *vf;
+   /* The oracle writes only eq_rows. Even accidental calls of the original
+    * gather cannot write live shader inputs, IDs, rows or raster counters. */
+   oracle.output = 0;
+   oracle.out_vertex_ids = 0;
+   oracle.out_instance_ids = 0;
+   oracle.out_batch_rows = 0;
+   oracle.seed_counts = 0;
+   oracle.seed_clip_count = 0;
+   oracle.eq_break = 0;
+   void *params[] = { &oracle };
+   if (err == CUDA_SUCCESS) {
+      if (!cp->dev->kernels.vfetch_eq_oracle)
+         err = CUDA_ERROR_INVALID_HANDLE;
+      else
+         err = cp_launch(cp, cp->dev->kernels.vfetch_eq_oracle,
+                         MIN2((vf->num_verts + 255) / 256, 4096u), 1, 1,
+                         256, 1, 1, 0, cp->stream, params, NULL);
+   }
+   if (err != CUDA_SUCCESS) {
+      s->errors++;
+      cp_renderer_texture_fatal(cp);
+   }
+   return err;
+}
+
+static void
+cp_vfetch_eq_after(struct cp_context *cp, const struct cp_vertex_fetch_args *vf,
+                   CUresult launch_error)
+{
+   struct cp_vfetch_eq_state *s = cp->vfetch_eq;
+   if (!s)
+      return;
+   if (launch_error != CUDA_SUCCESS) {
+      s->errors++;
+      cp_renderer_texture_fatal(cp);
+      return;
+   }
+   if (!vf->eq_rows)
+      return;
+   unsigned k = (vf->eq_dispatch - 1) & 1u;
+   if (cuEventRecord(s->slot[k].done, cp->stream) != CUDA_SUCCESS) {
+      s->errors++;
+      cp_renderer_texture_fatal(cp);
+   } else {
+      s->slot[k].recorded = true;
+   }
+}
+
+static void
+cp_vfetch_eq_finish(struct cp_context *cp)
+{
+   struct cp_vfetch_eq_state *s = cp->vfetch_eq;
+   if (!s)
+      return;
+   /* Called only after cleanup's existing all-stream context drain. */
+   struct cp_vfetch_eq_report report = {0};
+   if (cp->device_fatal || !s->report)
+      s->errors++;
+   else if (cuMemcpyDtoH(&report, s->report, sizeof(report)) != CUDA_SUCCESS)
+      s->errors++;
+   for (unsigned i = 0; i < 2; i++) {
+      if (s->slot[i].rows && cuMemFree(s->slot[i].rows) != CUDA_SUCCESS)
+         s->errors++;
+      if (s->slot[i].done && cuEventDestroy(s->slot[i].done) != CUDA_SUCCESS)
+         s->errors++;
+   }
+   if (s->report && cuMemFree(s->report) != CUDA_SUCCESS)
+      s->errors++;
+   char line[4096];
+   size_t used = snprintf(line, sizeof(line), "VFETCH_EQ {\"complete\":%u",
+                          s->errors == 0);
+#define EQ_APPEND(field, value) \
+   used += snprintf(line + used, sizeof(line) - used, \
+                    ",\"" #field "\":%" PRIu64, (uint64_t)(value))
+#define EQ_DEVICE(field) EQ_APPEND(field, report.field)
+#define EQ_HOST(field) EQ_APPEND(field, s->field)
+   EQ_APPEND(context_id, (uintptr_t)cp);
+   EQ_DEVICE(invocations); EQ_DEVICE(valid); EQ_DEVICE(slots); EQ_DEVICE(words);
+   EQ_DEVICE(diff_validity); EQ_DEVICE(diff_ids); EQ_DEVICE(diff_slots);
+   EQ_DEVICE(diff_words); EQ_DEVICE(differing_invocations); EQ_DEVICE(injections);
+   EQ_DEVICE(first_claim); EQ_DEVICE(first_dispatch); EQ_DEVICE(first_invocation);
+   EQ_DEVICE(first_slot); EQ_DEVICE(first_word); EQ_DEVICE(first_expected);
+   EQ_DEVICE(first_actual);
+   EQ_HOST(expected_invocations); EQ_HOST(expected_slots); EQ_HOST(expected_words);
+   EQ_HOST(specialized_launches); EQ_HOST(generic_launches);
+   EQ_HOST(layout_fallback_launches); EQ_HOST(standalone_launches);
+   EQ_HOST(lane_launches); EQ_HOST(group_launches); EQ_HOST(reused_outputs);
+   EQ_HOST(errors);
+#undef EQ_DEVICE
+#undef EQ_HOST
+#undef EQ_APPEND
+   fprintf(stderr, "%s}\n", line);
+   free(s);
+   cp->vfetch_eq = NULL;
 }
 
 static CUresult
@@ -705,8 +941,13 @@ cp_launch(struct cp_context *cp, CUfunction f,
           unsigned bx, unsigned by, unsigned bz,
           unsigned shmem, CUstream stream, void **params, void **extra)
 {
-   return cp_launch_after(cp, f, gx, gy, gz, bx, by, bz, shmem, stream,
-                          params, extra, NULL, 0);
+   CUresult err = cp_launch_after(cp, f, gx, gy, gz, bx, by, bz, shmem, stream,
+                                  params, extra, NULL, 0);
+   if (err != CUDA_SUCCESS && cp->vfetch_eq) {
+      cp->vfetch_eq->errors++;
+      cp_renderer_texture_fatal(cp);
+   }
+   return err;
 }
 
 /*
@@ -897,7 +1138,7 @@ cp_scratch_reset(struct cp_context *cp)
 void
 cp_scratch_destroy(struct cp_context *cp)
 {
-   cuCtxSynchronize();
+   cp_vfetch_eq_cleanup_result(cp, cuCtxSynchronize());
    for (unsigned i = 0; i < cp->scratch.num_overflow; i++)
       cp_scratch_free_host_visible(cp, cp->scratch.overflow[i],
                                    cp->scratch.overflow_pinned[i]);
@@ -907,13 +1148,13 @@ cp_scratch_destroy(struct cp_context *cp)
    memset(&cp->scratch, 0, sizeof(cp->scratch));
 
    for (unsigned i = 0; i < cp->dscratch.num_overflow; i++)
-      cuMemFree(cp->dscratch.overflow[i]);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->dscratch.overflow[i]));
    if (cp->dscratch.base)
-      cuMemFree(cp->dscratch.base);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->dscratch.base));
    memset(&cp->dscratch, 0, sizeof(cp->dscratch));
 
    if (cp->shade_ctr.base)
-      cuMemFree(cp->shade_ctr.base);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->shade_ctr.base));
    memset(&cp->shade_ctr, 0, sizeof(cp->shade_ctr));
 }
 
@@ -1269,54 +1510,55 @@ cp_context_cleanup(struct cp_context *cp)
    cp_smallop_report();
    cp_abuf_fuse_report();
    if (cp->fuse_check) {
-      cuMemFree(cp->fuse_check);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->fuse_check));
       cp->fuse_check = 0;
    }
-   cp_abuf_cleanup(cp->abuf);
+   cp_vfetch_eq_cleanup_result(cp, cp_abuf_cleanup(cp->abuf)
+      ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN);
    free(cp->abuf);
    cp->abuf = NULL;
    cp_scratch_destroy(cp);
 
    for (unsigned i = 0; i < cp->timer.cap; i++)
       if (cp->timer.events && cp->timer.events[i])
-         cuEventDestroy(cp->timer.events[i]);
+         cp_vfetch_eq_cleanup_result(cp, cuEventDestroy(cp->timer.events[i]));
    free(cp->timer.events);
    free(cp->timer.stages);
 
    for (unsigned i = 0; i < CP_FLUSH_GENS; i++)
       if (cp->flush_retire[i])
-         cuEventDestroy(cp->flush_retire[i]);
+         cp_vfetch_eq_cleanup_result(cp, cuEventDestroy(cp->flush_retire[i]));
    cp_pass_streams_cleanup(cp);
    /* The vertex lane's marks and its two output buffers. The context was
     * synchronised at the top of this function, so nothing is under them. */
    for (unsigned i = 0; i < 2; i++) {
       if (cp->vslane.gate[i])
-         cuEventDestroy(cp->vslane.gate[i]);
+         cp_vfetch_eq_cleanup_result(cp, cuEventDestroy(cp->vslane.gate[i]));
       if (cp->vslane.slot[i])
-         cuMemFree(cp->vslane.slot[i]);
+         cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->vslane.slot[i]));
    }
    if (cp->vslane.done)
-      cuEventDestroy(cp->vslane.done);
+      cp_vfetch_eq_cleanup_result(cp, cuEventDestroy(cp->vslane.done));
    memset(&cp->vslane, 0, sizeof(cp->vslane));
    if (cp->stream)
-      cuStreamDestroy(cp->stream);
+      cp_vfetch_eq_cleanup_result(cp, cuStreamDestroy(cp->stream));
    if (cp->upload_host)
-      cuMemFreeHost(cp->upload_host);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFreeHost(cp->upload_host));
    if (cp->arena_base)
-      cuMemFree(cp->arena_base);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->arena_base));
    if (cp->rast_nontrivial)
-      cuMemFree(cp->rast_nontrivial);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->rast_nontrivial));
    if (cp->rast_counts)
-      cuMemFree(cp->rast_counts);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->rast_counts));
    if (cp->rast_huge_tiles)
-      cuMemFree(cp->rast_huge_tiles);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->rast_huge_tiles));
    if (cp->rast_setup_cache)
-      cuMemFree(cp->rast_setup_cache);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->rast_setup_cache));
 
    /* The optional host mirror has its own allocation. peel_any itself is
     * device-local in that mode and remains in the generic device list below. */
    if (cp->peel_any_host) {
-      cuMemFreeHost(cp->peel_any_host);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFreeHost(cp->peel_any_host));
       cp->peel_any_host = NULL;
    }
 
@@ -1331,7 +1573,7 @@ cp_context_cleanup(struct cp_context *cp)
    };
    for (unsigned i = 0; i < ARRAY_SIZE(owned); i++) {
       if (*owned[i])
-         cuMemFree(*owned[i]);
+         cp_vfetch_eq_cleanup_result(cp, cuMemFree(*owned[i]));
       *owned[i] = 0;
    }
 
@@ -1343,18 +1585,19 @@ cp_context_cleanup(struct cp_context *cp)
    free(cp->run_geometry.members);
    for (unsigned g = 0; g < cp->run_geometry.group_capacity; g++) {
       if (cp->run_geometry.groups[g].output)
-         cuMemFree(cp->run_geometry.groups[g].output);
+         cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->run_geometry.groups[g].output));
    }
    free(cp->run_geometry.groups);
    for (unsigned i = 0; i < cp->run_geometry.span_capacity; i++) {
       if (cp->run_geometry.spans[i].prepared_output)
-         cuMemFree(cp->run_geometry.spans[i].prepared_output);
+         cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->run_geometry.spans[i].prepared_output));
       if (cp->run_geometry.spans[i].prepared_descriptors)
-         cuMemFree(cp->run_geometry.spans[i].prepared_descriptors);
+         cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->run_geometry.spans[i].prepared_descriptors));
    }
    if (cp->run_geometry.clip_bin_storage)
-      cuMemFree(cp->run_geometry.clip_bin_storage);
+      cp_vfetch_eq_cleanup_result(cp, cuMemFree(cp->run_geometry.clip_bin_storage));
    free(cp->run_geometry.spans);
+   cp_vfetch_eq_finish(cp);
 }
 
 /* Per-stage timing for a draw, printed under CUDAVK_DEBUG_TIME. See
@@ -1918,11 +2161,12 @@ cp_abuf_report(struct cp_abuf *ab)
            ab->growths, ab->growths == 1 ? "" : "s");
 }
 
-void
+bool
 cp_abuf_cleanup(struct cp_abuf *ab)
 {
    if (!ab)
-      return;
+      return true;
+   bool ok = true;
 
    cp_abuf_report(ab);
 
@@ -1939,11 +2183,14 @@ cp_abuf_cleanup(struct cp_abuf *ab)
       &ab->colors_abuf, &ab->writes_abuf,
       &ab->colors_peel, &ab->writes_peel,
    };
-   for (unsigned i = 0; i < ARRAY_SIZE(device_allocs); i++)
-      cp_abuf_free(device_allocs[i]);
+   for (unsigned i = 0; i < ARRAY_SIZE(device_allocs); i++) {
+      if (*device_allocs[i] && cuMemFree(*device_allocs[i]) != CUDA_SUCCESS)
+         ok = false;
+      *device_allocs[i] = 0;
+   }
    for (unsigned i = 0; i < ARRAY_SIZE(ab->ev); i++)
-      if (ab->ev[i])
-         cuEventDestroy(ab->ev[i]);
+      if (ab->ev[i] && cuEventDestroy(ab->ev[i]) != CUDA_SUCCESS)
+         ok = false;
 
    free(ab->h_counts);
    free(ab->h_offsets);
@@ -1964,6 +2211,7 @@ cp_abuf_cleanup(struct cp_abuf *ab)
 
    memset(ab, 0, sizeof(*ab));
    ab->enabled = -1;
+   return ok;
 }
 
 /*
@@ -7062,6 +7310,12 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * batched and unbatched form of the generated code and nothing to get
           * out of step.
           */
+         if (!cp->run_geometry.active_output && fused_vfetch &&
+             !cp_vfetch_eq_prepare(cp, &vf_args, state->vs)) {
+            FREE(refs);
+            return;
+         }
+
          const size_t vs_args_bytes = 64 * sizeof(void *);
          const size_t vs_scal_off = vs_args_bytes;   /* row 0, then the mask,
                                                       * then vcount and stride
@@ -7344,12 +7598,20 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          }
 
          CUresult vs_err = CUDA_SUCCESS;
-         if (!cp->run_geometry.active_output)
-            vs_err = prepare_only && cp_debug->run_geometry_fail_launch
-               ? CUDA_ERROR_UNKNOWN
-               : cp_launch(cp, vs_exec->kernel,
-                    MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
-                    0, cp->stream, vs_params, NULL);
+         if (!cp->run_geometry.active_output) {
+            vs_err = cp_vfetch_eq_before(cp, &vf_args, state->vs, fused_vfetch,
+               cp_vs_fetch_layout_matches(state->vs,
+                  state->num_vertex_elements, state->velem), vs_lane, false);
+            if (vs_err == CUDA_SUCCESS)
+               vs_err = prepare_only && cp_debug->run_geometry_fail_launch
+                  ? CUDA_ERROR_UNKNOWN
+                  : cp_launch(cp, vs_exec->kernel,
+                       MIN2((total_verts + 255) / 256, 4096u), 1, 1, 256, 1, 1,
+                       0, cp->stream, vs_params, NULL);
+            cp_vfetch_eq_after(cp, &vf_args, vs_err);
+         } else if (cp->vfetch_eq) {
+            cp->vfetch_eq->reused_outputs++;
+         }
 
          /* Whatever the launch did, the main stream owns the rest of this
           * batch: the join is unconditional so that no path out of this
@@ -12003,6 +12265,7 @@ cp_run_geometry_launch_group(struct cp_context *cp,
       vf.elem_fill_w[e] = elem->fill_w;
       vf.elem_instance_divisor[e] = elem->instance_divisor;
    }
+   bool eq_ready = cp_vfetch_eq_prepare(cp, &vf, state->vs);
    memcpy((char *)host + vf_off, &vf, sizeof(vf));
 
    void **args = (void **)((char *)host + args_off);
@@ -12028,6 +12291,10 @@ cp_run_geometry_launch_group(struct cp_context *cp,
     * calloc block. The ring owns the staging lifetime until the ordered DMA has
     * consumed it and coalesces this block with adjacent launch arguments. */
    CUresult err = cp_upload_end(cp, storage, host, storage_bytes);
+   if (!eq_ready)
+      err = CUDA_ERROR_UNKNOWN;
+   if (err == CUDA_SUCCESS)
+      err = cp_vfetch_eq_before(cp, &vf, state->vs, true, true, false, true);
    if (err == CUDA_SUCCESS) {
       void *arg_ptr = (void *)(uintptr_t)(storage + args_off);
       void *params[] = { &arg_ptr };
@@ -12037,6 +12304,7 @@ cp_run_geometry_launch_group(struct cp_context *cp,
                      MIN2((total_verts + 255) / 256, 4096u), 1, 1,
                      256, 1, 1, 0, cp->stream, params, NULL);
    }
+   cp_vfetch_eq_after(cp, &vf, err);
    if (err != CUDA_SUCCESS) {
       if (!cp->device_fatal)
          cp_renderer_texture_fatal(cp);

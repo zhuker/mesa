@@ -290,6 +290,7 @@ struct cp_shader_binary {
    /* Which VARYING_SLOT_* each I/O slot carries. */
    unsigned in_location[CP_MAX_IO_SLOTS];
    unsigned out_location[CP_MAX_IO_SLOTS];
+   bool vs_eq_failed; /* Check compile failed after ordinary admission. */
 };
 
 static inline struct cp_shader_exec *

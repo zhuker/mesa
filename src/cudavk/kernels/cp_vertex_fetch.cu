@@ -66,3 +66,28 @@ cp_vertex_fetch(struct cp_vertex_fetch_args args)
    if (args.out_instance_ids)
       ((uint32_t *)(uintptr_t)args.out_instance_ids)[v] = instance_id;
 }
+
+#ifdef CP_VFETCH_EQ_CHECK
+#include "cp_vfetch_eq.h"
+#include "cp_vfetch_eq_oracle.h"
+extern "C" __global__ void
+cp_vfetch_eq_oracle(struct cp_vertex_fetch_args args)
+{
+   for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x;
+        v < args.num_verts; v += blockDim.x * gridDim.x) {
+      struct cp_vfetch_eq_row *q =
+         (struct cp_vfetch_eq_row *)(uintptr_t)args.eq_rows + v;
+      /* Full rows are initialized, including absent and unused shader slots.
+       * No production scratch or output/counter is touched by this kernel. */
+      uint32_t *words = (uint32_t *)q;
+      for (unsigned w = 0; w < sizeof(*q) / sizeof(uint32_t); w++) words[w] = 0;
+      q->valid = cp_vfetch_eq_oracle_ids(&args, v, &q->vertex_id,
+                                         &q->instance_id, &q->row);
+      if (!q->valid) continue;
+      for (unsigned e = 0; e < 32; e++)
+         if (args.eq_mask & (1u << e))
+            cp_vfetch_eq_oracle_element(&args, e, q->vertex_id,
+               q->instance_id, q->row, (unsigned char *)q->slots[e]);
+   }
+}
+#endif

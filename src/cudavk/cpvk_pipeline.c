@@ -1079,6 +1079,10 @@ cpvk_compile_stage(struct cpvk_device *dev,
       _mesa_blake3_update(&ctx, hash, sizeof(hash));
       static const char tag[] = "cudavk-static-vfetch-v1";
       _mesa_blake3_update(&ctx, tag, sizeof(tag));
+      if (cp_debug->vfetch_eq_check) {
+         static const char eq_tag[] = "vfetch-device-equivalence-v1-abi944";
+         _mesa_blake3_update(&ctx, eq_tag, sizeof(eq_tag));
+      }
       _mesa_blake3_update(&ctx, &vs_layout->count, sizeof(vs_layout->count));
       for (unsigned e = 0; e < vs_layout->count; e++) {
          _mesa_blake3_update(&ctx, &vs_layout->elem[e].vertex_buffer_index,

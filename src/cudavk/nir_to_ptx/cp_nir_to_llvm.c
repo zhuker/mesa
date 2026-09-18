@@ -168,6 +168,7 @@ cp_vs_census_report(void)
 
 struct ntl_context {
    const struct cp_vs_fetch_layout *vs_layout;
+   bool vs_eq_check;
    LLVMContextRef llvm_ctx;
    LLVMModuleRef module;
    LLVMBuilderRef builder;
@@ -3736,6 +3737,20 @@ emit_function(struct ntl_context *ctx)
          };
          LLVMValueRef ok = LLVMBuildCall2(ctx->builder, id_type, id_fn,
                                           id_args, 5, "vs_fetch_ok");
+         /* Gate observes the real validity and IDs before the early return.
+          * No checker calls are emitted into flag-off or generic modules. */
+         const bool eq = ctx->vs_layout && ctx->vs_eq_check;
+         LLVMValueRef eq_diff = NULL;
+         if (eq) {
+            LLVMTypeRef pt[] = {i8_ptr, i32_t, i32_t, i32_t, i32_t, i32_t};
+            LLVMTypeRef ft = LLVMFunctionType(i32_t, pt, 6, false);
+            LLVMValueRef fn = LLVMAddFunction(ctx->module, "cp_vs_fetch_eq_ids", ft);
+            LLVMValueRef av[] = {fetch_args, vid, ok,
+               LLVMBuildLoad2(ctx->builder, i32_t, ctx->vs_fetch_vid, ""),
+               LLVMBuildLoad2(ctx->builder, i32_t, ctx->vs_fetch_iid, ""),
+               LLVMBuildLoad2(ctx->builder, i32_t, ctx->vs_fetch_row, "")};
+            eq_diff = LLVMBuildCall2(ctx->builder, ft, fn, av, 6, "eq_ids");
+         }
          /* Zero only for a lane the fetch declines; today the bounds check
           * above already excluded those, so this folds away. It is kept
           * because it is the seam a robust-access fetch needs. */
@@ -3803,6 +3818,22 @@ emit_function(struct ntl_context *ctx)
                el_args[16] = LLVMConstInt(i32_t, ve->fill_w, false);
             }
             LLVMBuildCall2(ctx->builder, el_type, el_fn, el_args, el_count, "");
+            if (eq) {
+               LLVMTypeRef pt[] = {i8_ptr, i32_t, i32_t, i8_ptr};
+               LLVMTypeRef ft = LLVMFunctionType(i32_t, pt, 4, false);
+               LLVMValueRef fn = LLVMGetNamedFunction(ctx->module, "cp_vs_fetch_eq_slot");
+               if (!fn) fn = LLVMAddFunction(ctx->module, "cp_vs_fetch_eq_slot", ft);
+               LLVMValueRef av[] = {fetch_args, vid, el_args[1], slot};
+               LLVMValueRef d = LLVMBuildCall2(ctx->builder, ft, fn, av, 4, "eq_slot");
+               eq_diff = LLVMBuildOr(ctx->builder, eq_diff, d, "eq_diff");
+            }
+         }
+         if (eq) {
+            LLVMTypeRef pt[] = {i8_ptr, i32_t};
+            LLVMTypeRef ft = LLVMFunctionType(LLVMVoidTypeInContext(ctx->llvm_ctx), pt, 2, false);
+            LLVMValueRef fn = LLVMAddFunction(ctx->module, "cp_vs_fetch_eq_finish", ft);
+            LLVMValueRef av[] = {fetch_args, eq_diff};
+            LLVMBuildCall2(ctx->builder, ft, fn, av, 2, "");
          }
       }
 
@@ -4127,7 +4158,10 @@ link_and_inline_vs_fetch(LLVMModuleRef module, LLVMContextRef llvm_ctx,
    static const char *const symbols[] = { "cp_vs_fetch_ids",
                                           "cp_vs_fetch_element",
                                           "cp_vs_fetch_element_layout",
-                                          "cp_vs_fetch_seed" };
+                                          "cp_vs_fetch_seed",
+                                          "cp_vs_fetch_eq_ids",
+                                          "cp_vs_fetch_eq_slot",
+                                          "cp_vs_fetch_eq_finish" };
    return link_and_inline_bitcode(module, llvm_ctx, sm_major, sm_minor,
                                   cp_vs_inline_bc, sizeof(cp_vs_inline_bc),
                                   symbols, ARRAY_SIZE(symbols), "VS fetch");
@@ -4873,11 +4907,12 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
                    const char *sampler_ptx, const char *fs_helper_ptx,
                    bool fused_interp, bool inline_interp,
                    bool hardware_texture, bool vs_fetch,
-                   bool fused_writeback, const struct cp_vs_fetch_layout *vs_layout)
+                   bool fused_writeback, const struct cp_vs_fetch_layout *vs_layout, bool vs_eq_check)
 {
    struct ntl_context ctx = {0};
    ctx.nir = nir;
    ctx.vs_layout = vs_layout;
+   ctx.vs_eq_check = vs_eq_check;
    ctx.sm_major = sm_major;
    ctx.sm_minor = sm_minor;
    ctx.fused_interp = fused_interp;
@@ -5233,7 +5268,8 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
     */
    if (ctx.vs_fetch && (strstr(ptx, "cp_vs_fetch_ids") ||
                         strstr(ptx, "cp_vs_fetch_element") ||
-                        strstr(ptx, "cp_vs_fetch_seed"))) {
+                        strstr(ptx, "cp_vs_fetch_seed") ||
+                        strstr(ptx, "cp_vs_fetch_eq_"))) {
       fprintf(stderr, "cudavk: fused vertex fetch rejected: the lane helper "
               "survived into the PTX\n");
       free(ptx);
@@ -5421,15 +5457,20 @@ cp_vs_attach_fused_fetch(struct cp_shader_binary *bin,
    if (!fused_nir || !classic->kernel)
       return;
 
+   /* Keep production admission independent of debug register/local-memory
+    * pressure. The second compile does not execute a second vertex shader. */
+   nir_shader *eq_nir = vs_layout && cp_debug->vfetch_eq_check
+      ? nir_shader_clone(NULL, fused_nir) : NULL;
    struct cp_shader_binary *fused =
       cp_compile_nir_one(fused_nir, sm_major, sm_minor, sampler_ptx, NULL,
-                         false, false, false, true, false, vs_layout);
+                         false, false, false, true, false, vs_layout, false);
    struct cp_shader_exec *fx = fused ? &fused->exec[CP_SHADER_EXEC_VS_FETCH]
                                      : NULL;
    if (!fx || !fx->kernel) {
       if (census)
          census->verdict = CP_VS_FETCH_COMPILE_FAILED;
       cp_shader_binary_destroy(fused);
+      ralloc_free(eq_nir);
       return;
    }
 
@@ -5473,7 +5514,24 @@ cp_vs_attach_fused_fetch(struct cp_shader_binary *bin,
               classic_local, fx->num_regs, fx->spill_bytes, fx->blocks_per_sm,
               fused_local);
 
+   if (verdict == CP_VS_FETCH_ADMITTED && vs_layout && cp_debug->vfetch_eq_check) {
+      struct cp_shader_binary *checked = eq_nir
+         ? cp_compile_nir_one(eq_nir, sm_major, sm_minor, sampler_ptx, NULL,
+                              false, false, false, true, false, vs_layout, true)
+         : NULL;
+      cp_shader_binary_destroy(fused);
+      fused = checked;
+      fx = fused ? &fused->exec[CP_SHADER_EXEC_VS_FETCH] : NULL;
+      if (!fx || !fx->kernel) {
+         bin->vs_eq_failed = true;
+         fprintf(stderr, "cudavk: VFETCH_EQ instrumented compile failed\n");
+         verdict = CP_VS_FETCH_COMPILE_FAILED;
+      }
+   }
+   ralloc_free(eq_nir);
    if (verdict == CP_VS_FETCH_ADMITTED) {
+      bin->vs_num_slots = fused->vs_num_slots;
+      bin->vs_live_slots = fused->vs_live_slots;
       bin->vs_layout_static = vs_layout != NULL;
       if (vs_layout)
          bin->vs_layout = *vs_layout;
@@ -5542,7 +5600,7 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
 #endif
       struct cp_shader_binary *bin =
          cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx, NULL,
-                            false, false, false, false, false, NULL);
+                            false, false, false, false, false, NULL, false);
       if (nir->info.stage == MESA_SHADER_VERTEX)
          cp_vs_attach_fused_fetch(bin, fused_nir, sm_major, sm_minor,
                                   sampler_ptx, vs_layout);
@@ -5557,7 +5615,7 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
          ? NULL : nir_shader_clone(NULL, nir);
       struct cp_shader_binary *fused =
          cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
-                            fs_helper_ptx, true, false, false, false, false, NULL);
+                            fs_helper_ptx, true, false, false, false, false, NULL, false);
       if (fused && fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
          ralloc_free(classic_nir);
          return fused;
@@ -5567,7 +5625,7 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
        * correctness if its fused JIT is unavailable. */
       struct cp_shader_binary *classic = classic_nir
          ? cp_compile_nir_one(classic_nir, sm_major, sm_minor, sampler_ptx,
-                              NULL, false, false, false, false, false, NULL)
+                              NULL, false, false, false, false, false, NULL, false)
          : NULL;
       ralloc_free(classic_nir);
       return classic;
@@ -5589,22 +5647,22 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
 #endif
    struct cp_shader_binary *fused =
       cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
-                         fs_helper_ptx, true, false, false, false, false, NULL);
+                         fs_helper_ptx, true, false, false, false, false, NULL, false);
    if (fused && !fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
       cp_shader_binary_destroy(fused);
       fused = NULL;
    }
    struct cp_shader_binary *classic = !fused && standalone_nir
       ? cp_compile_nir_one(standalone_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, false, false, false, false, NULL)
+                           NULL, false, false, false, false, false, NULL, false)
       : NULL;
    struct cp_shader_binary *inlined = inline_nir
       ? cp_compile_nir_one(inline_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, true, false, false, false, NULL)
+                           NULL, false, true, false, false, false, NULL, false)
       : NULL;
    struct cp_shader_binary *inlined_wb = inline_wb_nir
       ? cp_compile_nir_one(inline_wb_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, true, false, false, true, NULL)
+                           NULL, false, true, false, false, true, NULL, false)
       : NULL;
    ralloc_free(standalone_nir);
    ralloc_free(inline_nir);
@@ -5664,13 +5722,13 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
 #ifdef CP_HAVE_FS_INLINE_BC
    struct cp_shader_binary *hardware = hardware_nir
       ? cp_compile_nir_one(hardware_nir, sm_major, sm_minor, math_ptx, NULL,
-                           false, true, true, false, false, NULL)
+                           false, true, true, false, false, NULL, false)
       : NULL;
    struct cp_shader_binary *hardware_fused =
       hardware_fused_nir &&
       (!hardware || !hardware->exec[CP_SHADER_EXEC_HW_INLINE].kernel)
       ? cp_compile_nir_one(hardware_fused_nir, sm_major, sm_minor,
-                           math_ptx, fs_helper_ptx, true, false, true, false, false, NULL)
+                           math_ptx, fs_helper_ptx, true, false, true, false, false, NULL, false)
       : NULL;
    if (bin && hardware) {
       bin->hw_compile_failure = hardware->hw_compile_failure;
@@ -5712,7 +5770,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    struct cp_shader_binary *hardware_wb =
       hardware_wb_nir && bin && bin->exec[CP_SHADER_EXEC_HW_INLINE].kernel
       ? cp_compile_nir_one(hardware_wb_nir, sm_major, sm_minor, math_ptx, NULL,
-                           false, true, true, false, true, NULL)
+                           false, true, true, false, true, NULL, false)
       : NULL;
    if (bin && bin->exec[CP_SHADER_EXEC_HW_INLINE].kernel)
       cp_fs_attach_writeback(bin, CP_SHADER_EXEC_HW_INLINE, hardware_wb);

@@ -1662,6 +1662,9 @@ struct cp_vertex_fetch_args {
    uint64_t seed_clip_count;  /* uint32_t, or 0 */
    uint32_t clip_seed;
    uint32_t pad_seed;
+   /* Appended validation trailer. Unread by uninstrumented shader modules. */
+   uint64_t eq_rows, eq_report, eq_dispatch;
+   uint32_t eq_slots, eq_mask, eq_break, eq_pad;
 };
 
 /* uint64 entries per draw in the per-draw vertex-buffer base table. */

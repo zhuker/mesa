@@ -128,6 +128,8 @@ struct cp_kernels {
    char *fs_helper_ptx;
 
    bool initialized;
+   /* Appended validation handle; absent when the check is disabled. */
+   CUfunction vfetch_eq_oracle;
 };
 
 /* Whether the kernels were compiled with the census and A-buffer verification

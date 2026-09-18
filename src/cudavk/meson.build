@@ -103,6 +103,7 @@ if dep_llvm.version().version_compare('>=18.0.0')
     cpvk_vs_inline_bc = custom_target(
       'cpvk_vs_inline.bc',
       input : ['kernels/cp_vs_inline.c', 'kernels/cp_vf_lane.h',
+               'kernels/cp_vfetch_eq.h',
                'kernels/cp_rast_types.h'],
       output : 'cp_vs_inline.bc',
       command : [cpvk_clang,
@@ -133,7 +134,8 @@ endif
 cpvk_kernel_incs = []
 foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_math.cu', 'cp_fs.cu',
                   'cp_vertex_fetch.cu', 'cp_rast_types.h', 'cp_fs_interp.h',
-                  'cp_vf_lane.h', 'cp_fs_write.h']
+                  'cp_vf_lane.h', 'cp_fs_write.h', 'cp_vfetch_eq.h',
+                  'cp_vfetch_eq_oracle.h']
   cpvk_kernel_incs += custom_target(
     'cpvk_' + kernel + '.inc',
     input : ['kernels/' + kernel],
@@ -466,3 +468,10 @@ cp_vfetch_layout_cpu = executable(
   c_args : ['-Wno-error=missing-prototypes', '-Wno-attributes'],
   build_by_default : false)
 test('cp_vfetch_layout_cpu', cp_vfetch_layout_cpu, suite : 'cudavk-cpu')
+
+# Independent pre-specialization oracle and live comparator, CPU only.
+cp_vfetch_eq_oracle_cpu = executable(
+  'cp_vfetch_eq_oracle_cpu', files('tests/cp_vfetch_eq_oracle_cpu.c'),
+  c_args : ['-Wno-error=missing-prototypes', '-Wno-attributes'],
+  build_by_default : false)
+test('cp_vfetch_eq_oracle_cpu', cp_vfetch_eq_oracle_cpu, suite : 'cudavk-cpu')

@@ -945,6 +945,9 @@ struct cp_context {
     * Set when a draw joins a batch, cleared when cp_draw_execute_batch() returns.
     */
    bool batch_uploads_live;
+
+   /* Validation-only ownership; appended to preserve existing field offsets. */
+   struct cp_vfetch_eq_state *vfetch_eq;
 };
 
 
@@ -1227,7 +1230,7 @@ bool cp_abuf_batch_enabled(void);
 bool cp_abuf_enabled(struct cp_abuf *ab);
 void cp_abuf_mark(struct cp_abuf *ab, CUevent ev, CUstream stream);
 void cp_abuf_report(struct cp_abuf *ab);
-void cp_abuf_cleanup(struct cp_abuf *ab);
+bool cp_abuf_cleanup(struct cp_abuf *ab);
 void cp_abuf_scan(struct cp_context *cp, struct cp_device *screen, struct cp_abuf *ab, unsigned n, CUdeviceptr zero);
 void cp_abuf_scan_n(struct cp_context *cp, struct cp_device *screen, CUdeviceptr in, CUdeviceptr out, CUdeviceptr s1, CUdeviceptr s1x, CUdeviceptr s2, CUdeviceptr s2x, CUdeviceptr s3, unsigned n, unsigned nb1, unsigned nb2, unsigned nb3, CUdeviceptr clamp_counts, uint32_t clamp_capacity, CUdeviceptr clamp_overflow, CUdeviceptr zero);
 void cp_abuf_scan_tiling(unsigned n, unsigned *ept, unsigned *grid);

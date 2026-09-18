@@ -16,7 +16,7 @@
  * cannot be left for runtime to discover. Sentinel offsets across the element
  * tables, the batch tables and the iteration-26 counter seeds.
  */
-_Static_assert(sizeof(struct cp_vertex_fetch_args) == 904,
+_Static_assert(sizeof(struct cp_vertex_fetch_args) == 944,
                "cp_vertex_fetch_args ABI size");
 _Static_assert(_Alignof(struct cp_vertex_fetch_args) == 8,
                "cp_vertex_fetch_args ABI alignment");
@@ -137,4 +137,101 @@ cp_vs_fetch_element_layout(const struct cp_vertex_fetch_args *source, uint32_t e
 {
    cp_vf_lane_element_layout(source, e, vertex_id, instance_id, row, slot,
       num_elements, vertex_buffer_index, src_offset, src_stride, instance_divisor, attr_size, nr_chan, chan_bytes, swizzle, conv, fill_w);
+}
+
+/* These entry points are emitted only for the instrumented module. They never
+ * run the shader or recompute its gather; slot points at its actual alloca. */
+#include "cp_vfetch_eq.h"
+_Static_assert(offsetof(struct cp_vertex_fetch_args, eq_rows) == 904,
+               "fetch validation trailer ABI");
+_Static_assert(sizeof(struct cp_vfetch_eq_row) == 528, "oracle row ABI");
+_Static_assert(sizeof(struct cp_vfetch_eq_report) == 136, "report ABI");
+#define EQ_INLINE static inline __attribute__((always_inline))
+EQ_INLINE void cp_eq_add(uint64_t *p, uint64_t n)
+{
+   __atomic_fetch_add(p, n, __ATOMIC_RELAXED);
+}
+EQ_INLINE void cp_eq_first(const struct cp_vertex_fetch_args *a, uint32_t v,
+                           uint32_t e, uint32_t w, uint32_t ref, uint32_t got)
+{
+   struct cp_vfetch_eq_report *r = (void *)(uintptr_t)a->eq_report;
+   uint64_t zero = 0;
+   if (__atomic_compare_exchange_n(&r->first_claim, &zero, 1, false,
+                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+      r->first_dispatch = a->eq_dispatch;
+      r->first_invocation = v;
+      r->first_slot = e;
+      r->first_word = w;
+      r->first_expected = ref;
+      r->first_actual = got;
+   }
+}
+__attribute__((always_inline)) uint32_t
+cp_vs_fetch_eq_ids(const struct cp_vertex_fetch_args *a, uint32_t v,
+                   uint32_t valid, uint32_t vertex, uint32_t instance,
+                   uint32_t row)
+{
+   struct cp_vfetch_eq_report *r = (void *)(uintptr_t)a->eq_report;
+   const struct cp_vfetch_eq_row *q =
+      (const void *)(uintptr_t)a->eq_rows;
+   q += v;
+   cp_eq_add(&r->invocations, 1);
+   if (valid) cp_eq_add(&r->valid, 1);
+   uint32_t dv = !!valid != !!q->valid;
+   uint32_t di = valid && q->valid &&
+      (vertex != q->vertex_id || instance != q->instance_id || row != q->row);
+   if (dv) {
+      cp_eq_add(&r->diff_validity, 1);
+      cp_eq_first(a, v, UINT32_MAX, 0, q->valid, valid);
+   }
+   if (di) {
+      cp_eq_add(&r->diff_ids, 1);
+      if (vertex != q->vertex_id)
+         cp_eq_first(a, v, UINT32_MAX, 1, q->vertex_id, vertex);
+      else if (instance != q->instance_id)
+         cp_eq_first(a, v, UINT32_MAX, 2, q->instance_id, instance);
+      else cp_eq_first(a, v, UINT32_MAX, 3, q->row, row);
+   }
+   /* A rejected candidate never reaches the slot or final hook. */
+   if (!valid && (dv || di)) cp_eq_add(&r->differing_invocations, 1);
+   return dv || di;
+}
+__attribute__((always_inline)) uint32_t
+cp_vs_fetch_eq_slot(const struct cp_vertex_fetch_args *a, uint32_t v,
+                    uint32_t e, unsigned char *slot)
+{
+   struct cp_vfetch_eq_report *r = (void *)(uintptr_t)a->eq_report;
+   const struct cp_vfetch_eq_row *q =
+      (const void *)(uintptr_t)a->eq_rows;
+   /* Fault the LIVE result, not an oracle or a mismatch counter. Restore it
+    * after comparison so the detector control can finish a complete replay.
+    * Character accesses alias the float/int slot representation legally. */
+   volatile unsigned char *live = slot;
+   if (a->eq_break) {
+      live[0] ^= 1;
+      cp_eq_add(&r->injections, 1);
+   }
+   uint32_t bits[4];
+   __builtin_memcpy(bits, slot, sizeof(bits));
+   uint32_t n = 0;
+   for (unsigned w = 0; w < 4; w++) {
+      if (bits[w] != q[v].slots[e][w]) {
+         n++;
+         cp_eq_first(a, v, e, w, q[v].slots[e][w], bits[w]);
+      }
+   }
+   if (a->eq_break) live[0] ^= 1;
+   cp_eq_add(&r->slots, 1);
+   cp_eq_add(&r->words, 4);
+   if (n) {
+      cp_eq_add(&r->diff_slots, 1);
+      cp_eq_add(&r->diff_words, n);
+   }
+   return n != 0;
+}
+__attribute__((always_inline)) void
+cp_vs_fetch_eq_finish(const struct cp_vertex_fetch_args *a, uint32_t different)
+{
+   struct cp_vfetch_eq_report *r = (void *)(uintptr_t)a->eq_report;
+   if (different) cp_eq_add(&r->differing_invocations, 1);
 }

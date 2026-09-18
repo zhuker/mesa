@@ -176,6 +176,10 @@ static const struct cp_flag_def flags[] = {
      "on the occlusion capture at the old default of 384", .dflt = 2048 },
    { "CUDAVK_TEXTURE_CACHE_STATS", CP_FLAG_BOOL_VALUE, F(texture_cache_stats),
      "report hardware-texture fragment execution hits and software fallbacks" },
+   { "CUDAVK_VFETCH_EQ_CHECK", CP_FLAG_BOOL_VALUE, F(vfetch_eq_check),
+     "validate every specialized fused fetch against a private original gather" },
+   { "CUDAVK_VFETCH_EQ_BREAK", CP_FLAG_BOOL_VALUE, F(vfetch_eq_break),
+     "inject one live specialized fetch bit error; requires VFETCH_EQ_CHECK" },
    { "CUDAVK_DEBUG_VFETCH", CP_FLAG_BOOL_PRESENCE, F(debug_vfetch),
      "dump what the GPU vertex fetch gathered; syncs, so debug-only" },
    { "CUDAVK_DEBUG_WORK", CP_FLAG_BOOL_PRESENCE, F(debug_work),
@@ -1029,6 +1033,11 @@ cp_debug_init(void)
       parse_one(&flags[i], i);
 
    apply_couplings();
+
+   if (cp_debug->vfetch_eq_break && !cp_debug->vfetch_eq_check) {
+      fprintf(stderr, "cudavk: CUDAVK_VFETCH_EQ_BREAK requires CUDAVK_VFETCH_EQ_CHECK\n");
+      abort();
+   }
 
    report_retired();
    report_pdl_level();
