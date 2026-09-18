@@ -144,6 +144,10 @@ static const struct cp_flag_def flags[] = {
      "pipeline exact prepare-only VS and the optimized classic fused clip/raster "
      "chain per segment on the existing side streams; default off and requires "
      "CUDAVK_RUN_GEOMETRY" },
+   { "CUDAVK_RUN_ORDER_LARGEST", CP_FLAG_BOOL_VALUE, F(run_order_largest),
+     "issue side-stream run segments largest triangle count first; default off, "
+     "requires RUN_GEOMETRY and RUN_CLIP_CLASSIC; keeps original stream owners, "
+     "primitive IDs and shade order" },
    { "CUDAVK_RUN_CLIP_BIN_CAPACITY", CP_FLAG_UINT,
      F(run_clip_bin_capacity),
      "diagnostic dense-reference capacity for RUN_CLIP_BIN; 0 uses the "

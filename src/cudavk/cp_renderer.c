@@ -9,6 +9,7 @@
 
 #include "cp_renderer.h"
 #include "cp_shade_equiv.h"
+#include "cp_run_order.h"
 #include "cp_nvtx.h"
 #include "compiler/glsl_types.h"
 
@@ -12104,7 +12105,7 @@ cp_run_clip_bin_align(size_t value, size_t alignment)
 }
 
 static bool
-cp_run_clip_bin_upload_fits(struct cp_context *cp)
+cp_run_clip_bin_upload_fits(struct cp_context *cp, const unsigned *order)
 {
    size_t host = cp->upload_offset;
    size_t dev = cp->arena_offset;
@@ -12120,7 +12121,8 @@ cp_run_clip_bin_upload_fits(struct cp_context *cp)
        dev > dev_limit || _n > dev_limit - dev) return false;            \
    host += _n; dev += _n;                                                \
 } while (0)
-   for (unsigned s = 0; s < cp->run_geometry.nclip_segments; s++) {
+   for (unsigned i = 0; i < cp->run_geometry.nclip_segments; i++) {
+      unsigned s = order[i];
       const struct cp_draw_batch *b = &cp->run_geometry.batches[
          cp->run_geometry.clip_segments[s].batch];
       if (b->ndraws > 1) {
@@ -12195,7 +12197,8 @@ cp_run_clip_bin_reserve_prepared(struct cp_context *cp)
 static bool
 cp_run_clip_bin_prepare(struct cp_context *cp,
                         struct cp_prepared_geometry *prepared,
-                        bool defer_join, bool *side_out)
+                        bool defer_join, bool *side_out,
+                        const unsigned *order)
 {
    unsigned nsegs = cp->run_geometry.nclip_segments;
    /* Dense continuation remains serial: its side-prepared synthetic gate was
@@ -12208,7 +12211,8 @@ cp_run_clip_bin_prepare(struct cp_context *cp,
    if (side && !cp_pass_broadcast(cp, nsegs))
       return false;
 
-   for (unsigned s = 0; s < nsegs; s++) {
+   for (unsigned i = 0; i < nsegs; i++) {
+      unsigned s = order[i];
       unsigned batch = cp->run_geometry.clip_segments[s].batch;
       if (side)
          cp_stream_set(cp, cp_pass_seg_stream(cp, s));
@@ -12345,13 +12349,30 @@ cp_run_clip_bin_execute(struct cp_context *cp)
 
    /* The older episode may itself have consumed upload-ring space. Prove the
     * no-wrap budget at the last possible point before prepare fan-out. */
-   if (!cp_run_clip_bin_upload_fits(cp))
+   unsigned order[CP_RUN_CLIP_BIN_MAX_SEGS];
+   uint32_t triangles[CP_RUN_CLIP_BIN_MAX_SEGS];
+   bool largest = classic && cp_debug->run_order_largest &&
+                  !cp_debug->no_run_prep_streams && cp->seg_streams[0];
+   for (unsigned s = 0; s < nsegs; s++)
+      triangles[s] = cp->run_geometry.clip_segments[s].num_triangles;
+   /* Storage is now immutable and indexed by original segment. Only issue
+    * order changes: both phases retain s % CP_PASS_STREAMS ownership. */
+   cp_run_order(order, triangles, nsegs, largest);
+   if (largest && cp_debug->debug_episode) {
+      fprintf(stderr, "run-order-largest:");
+      for (unsigned i = 0; i < nsegs; i++)
+         fprintf(stderr, " %u:%u@%u", order[i], triangles[order[i]],
+                 order[i] % CP_PASS_STREAMS);
+      fprintf(stderr, "\n");
+   }
+   if (!cp_run_clip_bin_upload_fits(cp, order))
       return false;
 
    struct cp_prepared_geometry prepared[CP_RUN_CLIP_BIN_MAX_SEGS];
    bool direct_side = false;
    memset(prepared, 0, sizeof(prepared));
-   if (!cp_run_clip_bin_prepare(cp, prepared, direct || classic, &direct_side))
+   if (!cp_run_clip_bin_prepare(cp, prepared, direct || classic, &direct_side,
+                                order))
       return false;
    for (unsigned s = 0; s < nsegs; s++)
       if (!cp->run_geometry.clip_segments[s].positions)
@@ -12474,7 +12495,10 @@ cp_run_clip_bin_execute(struct cp_context *cp)
       if (direct_side && !cp_pass_broadcast(cp, nsegs))
          return false;
       CUresult classic_err = CUDA_SUCCESS;
-      for (unsigned s = 0; s < nsegs && classic_err == CUDA_SUCCESS; s++) {
+      for (unsigned i = 0; i < nsegs && classic_err == CUDA_SUCCESS; i++) {
+         unsigned s = order[i];
+         /* Never split a queue-producing chain across issue turns: the next
+          * owner of this stream's queue must follow stage3, including wrap. */
          const struct cp_run_clip_bin_segment *seg =
             &cp->run_geometry.clip_segments[s];
          if (direct_side)
