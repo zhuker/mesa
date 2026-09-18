@@ -369,6 +369,9 @@ if dep_vulkan_loader.found()
     dependencies : dep_vulkan_loader,
     c_args : ['-Wno-error=missing-prototypes'],
     build_by_default : false)
+  test('cp_clip_copy_bypass', prog_python,
+       args : [files('tests/cp_clip_copy_bypass.py')],
+       suite : 'cudavk', timeout : 120)
   test('cp_launch_audit', prog_python,
        args : [files('tests/cp_launch_audit.py')],
        suite : 'cudavk')
