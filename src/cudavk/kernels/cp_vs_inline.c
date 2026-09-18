@@ -125,3 +125,16 @@ cp_vs_fetch_seed(const struct cp_vertex_fetch_args *source, uint32_t gtid)
    if (source->seed_clip_count)
       *(uint32_t *)(uintptr_t)source->seed_clip_count = source->clip_seed;
 }
+
+/* Static layout is scalar: no aggregate alloca or pointer ABI. */
+__attribute__((always_inline)) void
+cp_vs_fetch_element_layout(const struct cp_vertex_fetch_args *source, uint32_t e,
+   uint32_t vertex_id, uint32_t instance_id, uint32_t row, unsigned char *slot,
+   uint32_t num_elements, uint32_t vertex_buffer_index, uint32_t src_offset, uint32_t src_stride,
+                   uint32_t instance_divisor, uint32_t attr_size, uint32_t nr_chan,
+                   uint32_t chan_bytes, uint32_t swizzle, uint32_t conv,
+                   uint32_t fill_w)
+{
+   cp_vf_lane_element_layout(source, e, vertex_id, instance_id, row, slot,
+      num_elements, vertex_buffer_index, src_offset, src_stride, instance_divisor, attr_size, nr_chan, chan_bytes, swizzle, conv, fill_w);
+}

@@ -6636,7 +6636,9 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             cp_debug->fused_vfetch && !cp_debug->no_fused_vfetch &&
             !cp_debug->debug_vfetch &&
             state->vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel &&
-            state->num_vertex_elements <= CP_MAX_VERTEX_ELEMENTS_VF;
+            state->num_vertex_elements <= CP_MAX_VERTEX_ELEMENTS_VF &&
+            cp_vs_fetch_layout_matches(state->vs, state->num_vertex_elements,
+                                        state->velem);
 
          /*
           * CUDAVK_VS_LANE, decided here because the shader's output buffer
@@ -11481,7 +11483,8 @@ cp_run_geometry_fused(const struct cp_draw_batch *batch)
    return cp_debug->fused_vfetch && !cp_debug->no_fused_vfetch &&
           !cp_debug->debug_vfetch && s->vs && !s->vs->writes_memory &&
           s->vs->exec[CP_SHADER_EXEC_VS_FETCH].kernel &&
-          s->num_vertex_elements <= CP_MAX_VERTEX_ELEMENTS_VF;
+          s->num_vertex_elements <= CP_MAX_VERTEX_ELEMENTS_VF &&
+          cp_vs_fetch_layout_matches(s->vs, s->num_vertex_elements, s->velem);
 }
 
 static bool

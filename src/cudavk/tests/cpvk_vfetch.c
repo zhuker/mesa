@@ -38,8 +38,8 @@
  *             VK_VERTEX_INPUT_RATE_INSTANCE to divisor 1 and does not
  *             implement VK_EXT_vertex_attribute_divisor, so a divisor above
  *             one is not reachable through the API; what is exercised here is
- *             the runtime divisor read out of the argument block, which is
- *             the operand the fused build must not fold away.
+ *             the divisor from the pipeline layout, with firstInstance and
+ *             instance identity kept dynamic even in specialized fetch.
  *
  *   decline   the divisor draw into the left half of the frame and the sparse
  *             draw into the right half, in one render pass and one submit,

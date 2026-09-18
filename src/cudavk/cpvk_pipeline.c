@@ -894,7 +894,7 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       pipeline->bin = cp_compile_nir_to_ptx(
          nir, dev->pdev->sm_major, dev->pdev->sm_minor,
          uses_tex ? sampler_ptx : NULL, NULL, NULL,
-         false, false, false, false);
+         false, false, false, false, NULL);
       if (pipeline->bin) {
          pipeline->bin->uses_tex_3d = (sampler_opts & CP_SAMPLER_3D) != 0;
          pipeline->bin->uses_tex_gather =
@@ -992,6 +992,7 @@ cpvk_compile_stage(struct cpvk_device *dev,
                    VkPipelineCreateFlags2KHR flags,
                    const VkPipelineShaderStageCreateInfo *stage,
                    const struct cpvk_pipeline_layout *layout,
+                   const struct cp_vs_fetch_layout *vs_layout,
                    VkResult *result)
 {
    /* Robustness is not implemented here, so the state that feeds the hash is
@@ -1070,6 +1071,38 @@ cpvk_compile_stage(struct cpvk_device *dev,
       _mesa_blake3_final(&ctx, hash);
       for (unsigned s = 0; s < layout->vk.set_count; s++)
          free(used[s]);
+   }
+
+   if (vs_layout) {
+      struct mesa_blake3 ctx;
+      _mesa_blake3_init(&ctx);
+      _mesa_blake3_update(&ctx, hash, sizeof(hash));
+      static const char tag[] = "cudavk-static-vfetch-v1";
+      _mesa_blake3_update(&ctx, tag, sizeof(tag));
+      _mesa_blake3_update(&ctx, &vs_layout->count, sizeof(vs_layout->count));
+      for (unsigned e = 0; e < vs_layout->count; e++) {
+         _mesa_blake3_update(&ctx, &vs_layout->elem[e].vertex_buffer_index,
+                             sizeof(vs_layout->elem[e].vertex_buffer_index));
+         _mesa_blake3_update(&ctx, &vs_layout->elem[e].src_offset,
+                             sizeof(vs_layout->elem[e].src_offset));
+         _mesa_blake3_update(&ctx, &vs_layout->elem[e].src_stride,
+                             sizeof(vs_layout->elem[e].src_stride));
+         _mesa_blake3_update(&ctx, &vs_layout->elem[e].instance_divisor,
+                             sizeof(vs_layout->elem[e].instance_divisor));
+         _mesa_blake3_update(&ctx, &vs_layout->elem[e].attr_size,
+                             sizeof(vs_layout->elem[e].attr_size));
+         _mesa_blake3_update(&ctx, &vs_layout->elem[e].nr_chan,
+                             sizeof(vs_layout->elem[e].nr_chan));
+         _mesa_blake3_update(&ctx, &vs_layout->elem[e].chan_bytes,
+                             sizeof(vs_layout->elem[e].chan_bytes));
+         _mesa_blake3_update(&ctx, &vs_layout->elem[e].swizzle,
+                             sizeof(vs_layout->elem[e].swizzle));
+         _mesa_blake3_update(&ctx, &vs_layout->elem[e].conv,
+                             sizeof(vs_layout->elem[e].conv));
+         _mesa_blake3_update(&ctx, &vs_layout->elem[e].fill_w,
+                             sizeof(vs_layout->elem[e].fill_w));
+      }
+      _mesa_blake3_final(&ctx, hash);
    }
 
    simple_mtx_lock(&dev->shader_cache_lock);
@@ -1190,7 +1223,7 @@ cpvk_compile_stage(struct cpvk_device *dev,
                             frag ? dev->cp_dev.kernels.fs_helper_ptx : NULL,
                              cp_debug->no_inline_fs, cp_debug->inline_fs,
                              cp_debug->force_fused_fs,
-                             cp_debug->texture_cache);
+                             cp_debug->texture_cache, vs_layout);
    if (bin) {
       bin->uses_tex_3d = (sampler_opts & CP_SAMPLER_3D) != 0;
       bin->uses_tex_gather = (sampler_opts & CP_SAMPLER_GATHER) != 0;
@@ -1325,6 +1358,59 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
       cpvk_pipeline_init_ref(dev, pipeline, pAllocator);
       pipeline->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
 
+      const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
+      if (vi) {
+         for (uint32_t a = 0; a < vi->vertexAttributeDescriptionCount && a < 16; a++) {
+            const VkVertexInputAttributeDescription *ad =
+               &vi->pVertexAttributeDescriptions[a];
+            unsigned stride = 0, divisor = 0;
+            for (uint32_t b = 0; b < vi->vertexBindingDescriptionCount; b++)
+               if (vi->pVertexBindingDescriptions[b].binding == ad->binding) {
+                  stride = vi->pVertexBindingDescriptions[b].stride;
+                  /* Per-instance attributes step once per instance. */
+                  divisor = vi->pVertexBindingDescriptions[b].inputRate ==
+                            VK_VERTEX_INPUT_RATE_INSTANCE ? 1 : 0;
+               }
+            /* The format's consequences, worked out by the same function
+             * the Gallium front end calls: every component arrives in its own
+             * 32-bit slot however narrow it is in memory, so anything that is
+             * not already 32 bits per component has to be widened. The
+             * hardcoded four-float attribute this replaces read an R8G8B8A8
+             * as one number up to 2^32. */
+            enum pipe_format pfmt = vk_format_to_pipe_format(ad->format);
+            uint32_t nr_chan, chan_bytes, swizzle;
+            enum cp_vf_conv conv =
+               cp_vertex_format(pfmt, &nr_chan, &chan_bytes, &swizzle);
+            pipeline->velem[ad->location] = (struct cp_vertex_elem) {
+               .vertex_buffer_index = ad->binding,
+               .src_offset = ad->offset,
+               .src_stride = stride,
+               .instance_divisor = divisor,
+               .attr_size = util_format_get_blocksize(pfmt),
+               .nr_chan = nr_chan,
+               .chan_bytes = chan_bytes,
+               .swizzle = swizzle,
+               .conv = conv,
+               .fill_w = cp_vertex_fill_w(pfmt, conv),
+            };
+            if (ad->location + 1 > pipeline->num_velem)
+               pipeline->num_velem = ad->location + 1;
+            pipeline->vertex_stride = stride;
+         }
+      }
+
+      struct cp_vs_fetch_layout fetch_layout = {0};
+      fetch_layout.count = pipeline->num_velem;
+      memcpy(fetch_layout.elem, pipeline->velem, sizeof(fetch_layout.elem));
+      bool static_fetch = cp_debug->specialize_vfetch;
+      /* Unknown extension state and dynamic input/stride use the generic path. */
+      static_fetch &= !vi || !vi->pNext;
+      const VkPipelineDynamicStateCreateInfo *fetch_dyn = info->pDynamicState;
+      for (unsigned d = 0; fetch_dyn && d < fetch_dyn->dynamicStateCount; d++)
+         if (fetch_dyn->pDynamicStates[d] == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT ||
+             fetch_dyn->pDynamicStates[d] == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE)
+            static_fetch = false;
+
       /* Both stages through the cache, so identical SPIR-V compiles once and
        * two pipelines built from it share one binary -- which is what lets
        * their draws batch. */
@@ -1335,7 +1421,9 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
       for (uint32_t s = 0; s < info->stageCount; s++) {
          const VkPipelineShaderStageCreateInfo *stage = &info->pStages[s];
          struct cp_shader_binary *bin =
-            cpvk_compile_stage(dev, info->flags, stage, layout, &result);
+            cpvk_compile_stage(dev, info->flags, stage, layout,
+                               static_fetch && stage->stage == VK_SHADER_STAGE_VERTEX_BIT
+                                  ? &fetch_layout : NULL, &result);
          if (!bin)
             break;
          if (stage->stage == VK_SHADER_STAGE_FRAGMENT_BIT)
@@ -1486,46 +1574,6 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
 
       const VkPipelineInputAssemblyStateCreateInfo *ia = info->pInputAssemblyState;
       pipeline->topology = ia ? cpvk_prim(ia->topology) : MESA_PRIM_TRIANGLES;
-      const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
-      if (vi) {
-         for (uint32_t a = 0; a < vi->vertexAttributeDescriptionCount && a < 16; a++) {
-            const VkVertexInputAttributeDescription *ad =
-               &vi->pVertexAttributeDescriptions[a];
-            unsigned stride = 0, divisor = 0;
-            for (uint32_t b = 0; b < vi->vertexBindingDescriptionCount; b++)
-               if (vi->pVertexBindingDescriptions[b].binding == ad->binding) {
-                  stride = vi->pVertexBindingDescriptions[b].stride;
-                  /* Per-instance attributes step once per instance. */
-                  divisor = vi->pVertexBindingDescriptions[b].inputRate ==
-                            VK_VERTEX_INPUT_RATE_INSTANCE ? 1 : 0;
-               }
-            /* The format's consequences, worked out by the same function
-             * the Gallium front end calls: every component arrives in its own
-             * 32-bit slot however narrow it is in memory, so anything that is
-             * not already 32 bits per component has to be widened. The
-             * hardcoded four-float attribute this replaces read an R8G8B8A8
-             * as one number up to 2^32. */
-            enum pipe_format pfmt = vk_format_to_pipe_format(ad->format);
-            uint32_t nr_chan, chan_bytes, swizzle;
-            enum cp_vf_conv conv =
-               cp_vertex_format(pfmt, &nr_chan, &chan_bytes, &swizzle);
-            pipeline->velem[ad->location] = (struct cp_vertex_elem) {
-               .vertex_buffer_index = ad->binding,
-               .src_offset = ad->offset,
-               .src_stride = stride,
-               .instance_divisor = divisor,
-               .attr_size = util_format_get_blocksize(pfmt),
-               .nr_chan = nr_chan,
-               .chan_bytes = chan_bytes,
-               .swizzle = swizzle,
-               .conv = conv,
-               .fill_w = cp_vertex_fill_w(pfmt, conv),
-            };
-            if (ad->location + 1 > pipeline->num_velem)
-               pipeline->num_velem = ad->location + 1;
-            pipeline->vertex_stride = stride;
-         }
-      }
 
       pPipelines[i] = cpvk_pipeline_to_handle(pipeline);
    }

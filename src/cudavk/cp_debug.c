@@ -272,6 +272,8 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_FUSED_VFETCH", CP_FLAG_BOOL_VALUE, F(fused_vfetch),
      "gather vertex attributes inside the vertex shader, from bitcode inlined "
      "into it, instead of launching cp_vertex_fetch before it", .dflt = 1 },
+   { "CUDAVK_SPECIALIZE_VFETCH", CP_FLAG_BOOL_VALUE, F(specialize_vfetch),
+     "Bake static pipeline vertex layouts into fused vertex fetch" },
    { "CUDAVK_NO_FUSED_VFETCH", CP_FLAG_BOOL_VALUE, F(no_fused_vfetch),
      "do not even build the fused vertex execution: the resource-isolated "
      "control, and the revert once the fusion is the default" },

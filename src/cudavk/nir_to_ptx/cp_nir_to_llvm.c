@@ -167,6 +167,7 @@ cp_vs_census_report(void)
 #define CP_MAX_ARG_SLOTS 64
 
 struct ntl_context {
+   const struct cp_vs_fetch_layout *vs_layout;
    LLVMContextRef llvm_ctx;
    LLVMModuleRef module;
    LLVMBuilderRef builder;
@@ -3759,14 +3760,19 @@ emit_function(struct ntl_context *ctx)
                                                     ctx->vs_fetch_iid, "");
          LLVMValueRef gathered_row = LLVMBuildLoad2(ctx->builder, i32_t,
                                                     ctx->vs_fetch_row, "");
-         LLVMTypeRef el_params[] = { i8_ptr, i32_t, i32_t, i32_t, i32_t,
-                                     i8_ptr };
+         LLVMTypeRef el_params[17] = { i8_ptr, i32_t, i32_t, i32_t, i32_t,
+                                      i8_ptr };
+         for (unsigned i = 6; i < 17; i++)
+            el_params[i] = i32_t;
+         unsigned el_count = ctx->vs_layout ? 17 : 6;
+         const char *el_name = ctx->vs_layout ? "cp_vs_fetch_element_layout"
+                                               : "cp_vs_fetch_element";
          LLVMTypeRef el_type = LLVMFunctionType(
-            LLVMVoidTypeInContext(ctx->llvm_ctx), el_params, 6, false);
+            LLVMVoidTypeInContext(ctx->llvm_ctx), el_params, el_count, false);
          LLVMValueRef el_fn = LLVMGetNamedFunction(ctx->module,
-                                                   "cp_vs_fetch_element");
+                                                   el_name);
          if (!el_fn)
-            el_fn = LLVMAddFunction(ctx->module, "cp_vs_fetch_element",
+            el_fn = LLVMAddFunction(ctx->module, el_name,
                                     el_type);
          LLVMValueRef slots_base = LLVMBuildBitCast(
             ctx->builder, ctx->vs_fetch_slots, i8_ptr, "");
@@ -3776,11 +3782,27 @@ emit_function(struct ntl_context *ctx)
             LLVMValueRef off = LLVMConstInt(i32_t, e * 16, false);
             LLVMValueRef slot = LLVMBuildGEP2(ctx->builder,
                LLVMInt8TypeInContext(ctx->llvm_ctx), slots_base, &off, 1, "");
-            LLVMValueRef el_args[] = {
+            LLVMValueRef el_args[17] = {
                fetch_args, LLVMConstInt(i32_t, e, false),
                gathered_vid, gathered_iid, gathered_row, slot,
             };
-            LLVMBuildCall2(ctx->builder, el_type, el_fn, el_args, 6, "");
+            if (ctx->vs_layout) {
+               const struct cp_vertex_elem zero = {0};
+               const struct cp_vertex_elem *ve = e < 16
+                  ? &ctx->vs_layout->elem[e] : &zero;
+               el_args[6] = LLVMConstInt(i32_t, ctx->vs_layout->count, false);
+               el_args[7] = LLVMConstInt(i32_t, ve->vertex_buffer_index, false);
+               el_args[8] = LLVMConstInt(i32_t, ve->src_offset, false);
+               el_args[9] = LLVMConstInt(i32_t, ve->src_stride, false);
+               el_args[10] = LLVMConstInt(i32_t, ve->instance_divisor, false);
+               el_args[11] = LLVMConstInt(i32_t, ve->attr_size, false);
+               el_args[12] = LLVMConstInt(i32_t, ve->nr_chan, false);
+               el_args[13] = LLVMConstInt(i32_t, ve->chan_bytes, false);
+               el_args[14] = LLVMConstInt(i32_t, ve->swizzle, false);
+               el_args[15] = LLVMConstInt(i32_t, ve->conv, false);
+               el_args[16] = LLVMConstInt(i32_t, ve->fill_w, false);
+            }
+            LLVMBuildCall2(ctx->builder, el_type, el_fn, el_args, el_count, "");
          }
       }
 
@@ -4104,6 +4126,7 @@ link_and_inline_vs_fetch(LLVMModuleRef module, LLVMContextRef llvm_ctx,
 {
    static const char *const symbols[] = { "cp_vs_fetch_ids",
                                           "cp_vs_fetch_element",
+                                          "cp_vs_fetch_element_layout",
                                           "cp_vs_fetch_seed" };
    return link_and_inline_bitcode(module, llvm_ctx, sm_major, sm_minor,
                                   cp_vs_inline_bc, sizeof(cp_vs_inline_bc),
@@ -4850,10 +4873,11 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
                    const char *sampler_ptx, const char *fs_helper_ptx,
                    bool fused_interp, bool inline_interp,
                    bool hardware_texture, bool vs_fetch,
-                   bool fused_writeback)
+                   bool fused_writeback, const struct cp_vs_fetch_layout *vs_layout)
 {
    struct ntl_context ctx = {0};
    ctx.nir = nir;
+   ctx.vs_layout = vs_layout;
    ctx.sm_major = sm_major;
    ctx.sm_minor = sm_minor;
    ctx.fused_interp = fused_interp;
@@ -5369,7 +5393,8 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
 static void
 cp_vs_attach_fused_fetch(struct cp_shader_binary *bin,
                          struct nir_shader *fused_nir, int sm_major,
-                         int sm_minor, const char *sampler_ptx)
+                         int sm_minor, const char *sampler_ptx,
+                         const struct cp_vs_fetch_layout *vs_layout)
 {
    if (!bin)
       return;
@@ -5398,7 +5423,7 @@ cp_vs_attach_fused_fetch(struct cp_shader_binary *bin,
 
    struct cp_shader_binary *fused =
       cp_compile_nir_one(fused_nir, sm_major, sm_minor, sampler_ptx, NULL,
-                         false, false, false, true, false);
+                         false, false, false, true, false, vs_layout);
    struct cp_shader_exec *fx = fused ? &fused->exec[CP_SHADER_EXEC_VS_FETCH]
                                      : NULL;
    if (!fx || !fx->kernel) {
@@ -5449,6 +5474,9 @@ cp_vs_attach_fused_fetch(struct cp_shader_binary *bin,
               fused_local);
 
    if (verdict == CP_VS_FETCH_ADMITTED) {
+      bin->vs_layout_static = vs_layout != NULL;
+      if (vs_layout)
+         bin->vs_layout = *vs_layout;
       bin->exec[CP_SHADER_EXEC_VS_FETCH] = *fx;
       memset(fx, 0, sizeof(*fx));
    }
@@ -5500,7 +5528,7 @@ static struct cp_shader_binary *
 cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
                         const char *sampler_ptx, const char *fs_helper_ptx,
                         bool no_inline_fs, bool inline_fs,
-                        bool force_fused_fs)
+                        bool force_fused_fs, const struct cp_vs_fetch_layout *vs_layout)
 {
    if (!nir)
       return NULL;
@@ -5514,10 +5542,10 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
 #endif
       struct cp_shader_binary *bin =
          cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx, NULL,
-                            false, false, false, false, false);
+                            false, false, false, false, false, NULL);
       if (nir->info.stage == MESA_SHADER_VERTEX)
          cp_vs_attach_fused_fetch(bin, fused_nir, sm_major, sm_minor,
-                                  sampler_ptx);
+                                  sampler_ptx, vs_layout);
       ralloc_free(fused_nir);
       return bin;
    }
@@ -5529,7 +5557,7 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
          ? NULL : nir_shader_clone(NULL, nir);
       struct cp_shader_binary *fused =
          cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
-                            fs_helper_ptx, true, false, false, false, false);
+                            fs_helper_ptx, true, false, false, false, false, NULL);
       if (fused && fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
          ralloc_free(classic_nir);
          return fused;
@@ -5539,7 +5567,7 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
        * correctness if its fused JIT is unavailable. */
       struct cp_shader_binary *classic = classic_nir
          ? cp_compile_nir_one(classic_nir, sm_major, sm_minor, sampler_ptx,
-                              NULL, false, false, false, false, false)
+                              NULL, false, false, false, false, false, NULL)
          : NULL;
       ralloc_free(classic_nir);
       return classic;
@@ -5561,22 +5589,22 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
 #endif
    struct cp_shader_binary *fused =
       cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
-                         fs_helper_ptx, true, false, false, false, false);
+                         fs_helper_ptx, true, false, false, false, false, NULL);
    if (fused && !fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
       cp_shader_binary_destroy(fused);
       fused = NULL;
    }
    struct cp_shader_binary *classic = !fused && standalone_nir
       ? cp_compile_nir_one(standalone_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, false, false, false, false)
+                           NULL, false, false, false, false, false, NULL)
       : NULL;
    struct cp_shader_binary *inlined = inline_nir
       ? cp_compile_nir_one(inline_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, true, false, false, false)
+                           NULL, false, true, false, false, false, NULL)
       : NULL;
    struct cp_shader_binary *inlined_wb = inline_wb_nir
       ? cp_compile_nir_one(inline_wb_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, true, false, false, true)
+                           NULL, false, true, false, false, true, NULL)
       : NULL;
    ralloc_free(standalone_nir);
    ralloc_free(inline_nir);
@@ -5607,7 +5635,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
                       const char *sampler_ptx, const char *math_ptx,
                       const char *fs_helper_ptx,
                       bool no_inline_fs, bool inline_fs, bool force_fused_fs,
-                      bool hw_texture)
+                      bool hw_texture, const struct cp_vs_fetch_layout *vs_layout)
 {
    if (!nir)
       return NULL;
@@ -5631,18 +5659,18 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
 
    struct cp_shader_binary *bin = cp_compile_nir_software(
       nir, sm_major, sm_minor, sampler_ptx, fs_helper_ptx,
-      no_inline_fs, inline_fs, force_fused_fs);
+      no_inline_fs, inline_fs, force_fused_fs, vs_layout);
 
 #ifdef CP_HAVE_FS_INLINE_BC
    struct cp_shader_binary *hardware = hardware_nir
       ? cp_compile_nir_one(hardware_nir, sm_major, sm_minor, math_ptx, NULL,
-                           false, true, true, false, false)
+                           false, true, true, false, false, NULL)
       : NULL;
    struct cp_shader_binary *hardware_fused =
       hardware_fused_nir &&
       (!hardware || !hardware->exec[CP_SHADER_EXEC_HW_INLINE].kernel)
       ? cp_compile_nir_one(hardware_fused_nir, sm_major, sm_minor,
-                           math_ptx, fs_helper_ptx, true, false, true, false, false)
+                           math_ptx, fs_helper_ptx, true, false, true, false, false, NULL)
       : NULL;
    if (bin && hardware) {
       bin->hw_compile_failure = hardware->hw_compile_failure;
@@ -5684,7 +5712,7 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    struct cp_shader_binary *hardware_wb =
       hardware_wb_nir && bin && bin->exec[CP_SHADER_EXEC_HW_INLINE].kernel
       ? cp_compile_nir_one(hardware_wb_nir, sm_major, sm_minor, math_ptx, NULL,
-                           false, true, true, false, true)
+                           false, true, true, false, true, NULL)
       : NULL;
    if (bin && bin->exec[CP_SHADER_EXEC_HW_INLINE].kernel)
       cp_fs_attach_writeback(bin, CP_SHADER_EXEC_HW_INLINE, hardware_wb);
