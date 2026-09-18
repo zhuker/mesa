@@ -354,6 +354,8 @@ struct cp_debug {
    bool no_layered_copy3d;
    bool no_clip_alloc_hoist;
    bool clip_common_reject;
+   bool clip_eq_check;
+   unsigned clip_eq_break;
 };
 
 /*

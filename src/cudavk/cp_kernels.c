@@ -163,10 +163,17 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
     * reproduce. Unset means the header's default.
     */
    char small_opt[64], medium_opt[64], point_opt[64], tilebound_opt[64];
-   const char *opts[11];
+   const char *opts[13];
    unsigned num_opts = 0;
    opts[num_opts++] = arch_opt;
    opts[num_opts++] = "--std=c++14";
+   if (cp_debug->clip_eq_check && !strcmp(name, "cp_rasterize.cu")) {
+      opts[num_opts++] = "-DCP_CLIP_EQ_CHECK=1";
+      if (cp_debug->clip_eq_break == 1)
+         opts[num_opts++] = "-DCP_CLIP_EQ_BREAK=1";
+      if (cp_debug->clip_eq_break == 2)
+         opts[num_opts++] = "-DCP_CLIP_EQ_BREAK=2";
+   }
    if (cp_debug->clip_common_reject && !strcmp(name, "cp_rasterize.cu"))
       opts[num_opts++] = "-DCP_CLIP_COMMON_REJECT=1";
    if (relocatable)

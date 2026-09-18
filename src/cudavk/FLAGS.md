@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-155 switches.
+158 switches.
 
 ## Tracing
 
@@ -53,6 +53,8 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_FRAG_CENSUS` | bool (presence) | `off` | — | count fragments per draw; also compiles the instrumented kernels in |
 | `CUDAVK_NVTX` | bool (presence) | `off` | — | push an NVTX range around each draw and stage, for nsys |
 | `CUDAVK_DEBUG_ROWS` | bool (presence) | `off` | — | trace the per-draw tables a batch builds: fragment UBO slots and the vertex slice table the fragment stage searches |
+| `CUDAVK_CLIP_EQ_CHECK` | bool (value) | `off` | — | Validation-only exact full-replay clipping oracle |
+| `CUDAVK_CLIP_EQ_BREAK` | uint | `0` | — | Clip oracle negative control: 0 off, 1 copy, 2 common reject; requires CHECK and feature |
 | `CUDAVK_CLIP_COPY_BYPASS` | bool (value) | `off` | — | skip polygon copies for clip planes accepting every current vertex; experimental, default off |
 | `CUDAVK_DEBUG_CLIP` | bool (presence) | `off` | — | report what each batch hands the clip stage: triangles, draws, whether the stable slot mode is on |
 | `CUDAVK_DEBUG_PASS` | bool (presence) | `off` | — | report, for the first three batches only, every condition that decides whether a blended batch may join the open pass episode |

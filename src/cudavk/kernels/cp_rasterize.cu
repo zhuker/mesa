@@ -308,8 +308,13 @@ clip_alloc(struct cp_clip_args *args, uint32_t tri, uint32_t k,
       ? tri * CP_CLIP_MAX_OUT + k
       : atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
    *id_out = o;
-   if (o >= args->max_triangles)
+   if (o >= args->max_triangles) {
+#if CP_CLIP_EQ_CHECK
+      if (args->eq_report)
+         atomicAdd((unsigned long long *)(uintptr_t)args->eq_report + 30, 1ull);
+#endif
       return false;
+   }
 
    /* In stable mode o is the primitive's ordered fixed-slot ID. Append that
     * ID to a compact worklist instead of making the rasterizer visit holes. */
@@ -370,8 +375,103 @@ clip_retire(struct cp_clip_args *args, float4 *out, uint32_t slots,
  * rasterize what it just clipped without re-deriving the ID assignment.
  * Returns how many triangles were emitted (and recorded in ids[]).
  */
+/* Validation oracle: pre-optimization cp_clip_one plane loop from
+ * ded250960ee62c^ (unchanged clip_dist/clip_poly/clip_lerp). No allocation,
+ * retirement, queue writes or publication. Its local arrays stay live through
+ * the comparison. Compile-time removal includes all counters and fault stores. */
+#ifndef CP_CLIP_EQ_CHECK
+#define CP_CLIP_EQ_CHECK 0
+#endif
+#ifndef CP_CLIP_EQ_BREAK
+#define CP_CLIP_EQ_BREAK 0
+#endif
+#if CP_CLIP_EQ_CHECK
+static __device__ void
+clip_eq_terminal(struct cp_clip_args *args, uint32_t tri, uint32_t slots,
+                 const float4 *v, int n, const float4 *candidate,
+                 unsigned terminal, unsigned bypass, bool after, bool ids, unsigned path)
+{
+   unsigned long long *r = (unsigned long long *)(uintptr_t)args->eq_report;
+   if (!r) return; /* Host treats missing comparisons as a hard coverage error. */
+   atomicAdd(r + 0, 1ull);
+   if (path >= 26 && path <= 29) atomicAdd(r + path, 1ull);
+   else atomicAdd(r + 14, 1ull);
+   atomicAdd(r + 1, 1ull);
+   atomicAdd(r + terminal, 1ull);
+   atomicAdd(r + 10, (unsigned long long)bypass);
+   atomicAdd(r + 11, (unsigned long long)(bypass != 0));
+   atomicAdd(r + 12, (unsigned long long)after);
+   atomicAdd(r + 15, (unsigned long long)(args->stable != 0));
+   atomicAdd(r + 16, (unsigned long long)(args->prim_refs != 0));
+   atomicAdd(r + 17, (unsigned long long)(args->active_ids != 0));
+   atomicAdd(r + 18, (unsigned long long)ids);
+   if (args->num_slots > CP_MAX_CLIP_SLOTS) atomicAdd(r + 14, 1ull);
+   if (!slots) { atomicAdd(r + 14, 1ull); return; }
+   float4 a[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
+   float4 b[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
+   const float4 *ref = v;
+   int rn = 3;
+   bool inside = true;
+   for (int i = 0; i < 3; i++)
+      for (int p = 0; p < CP_CLIP_NUM_PLANES; p++)
+         inside = inside && clip_dist(v + (size_t)i * slots, p) >= 0.0f;
+   if (!inside) {
+      for (int p = 0; p < CP_CLIP_NUM_PLANES; p++) {
+         float4 *dst = (p & 1) ? b : a;
+         rn = clip_poly(dst, ref, rn, slots, p);
+         if (rn < 3) { rn = 0; break; }
+         ref = dst;
+      }
+   }
+   if (n < 3) n = 0;
+   /* Faults affect the real terminal candidate, never the oracle or counters.
+    * Restore after comparison so negative controls can finish a full replay. */
+   unsigned *fault = NULL, saved = 0;
+#if CP_CLIP_EQ_BREAK == 1
+   if (bypass && n) {
+      fault = (unsigned *)(uintptr_t)candidate;
+      saved = *fault;
+      *fault ^= 1u;
+      atomicAdd(r + 13, 1ull);
+   }
+#elif CP_CLIP_EQ_BREAK == 2
+   if (terminal == 7) {
+      n = 3;
+      candidate = v;
+      atomicAdd(r + 13, 1ull);
+   }
+#endif
+   unsigned long long dw = 0;
+   unsigned cb = 0, rb = 0;
+   if (n == rn) {
+      const unsigned *c = (const unsigned *)candidate;
+      const unsigned *o = (const unsigned *)ref;
+      unsigned words = n * slots * 4;
+      for (unsigned i = 0; i < words; i++) {
+         if (c[i] != o[i]) { dw++; cb = c[i]; rb = o[i]; }
+      }
+      atomicAdd(r + 2, (unsigned long long)words);
+   }
+   if (n != rn) atomicAdd(r + 5, 1ull);
+   if (dw) atomicAdd(r + 4, dw);
+   if (dw || n != rn) {
+      atomicAdd(r + 3, 1ull);
+      if (atomicCAS(r + 19, 0ull, 1ull) == 0) {
+         r[20] = args->eq_dispatch; r[21] = tri;
+         r[22] = n; r[23] = rn; r[24] = cb; r[25] = rb;
+      }
+   }
+   if (fault) *fault = saved;
+}
+#define CLIP_EQ(n, src, terminal) \
+   clip_eq_terminal(args, tri, slots, v, n, src, terminal, eq_bypass, eq_after, ids != NULL, eq_path)
+#else
+#define CLIP_EQ(n, src, terminal) ((void)0)
+#endif
+
 static __device__ int
-cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
+cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids,
+            unsigned eq_path = 26)
 {
    uint32_t slots = args->num_slots;
    if (slots > CP_MAX_CLIP_SLOTS)
@@ -382,6 +482,11 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
    const float4 *v = in + (size_t)tri * 3 * slots;
    uint32_t id;
    int emitted = 0;
+#if CP_CLIP_EQ_CHECK
+   unsigned eq_bypass = 0;
+   bool eq_after = false;
+   if (!slots) { CLIP_EQ(0, v, 8); return 0; }
+#endif
 
    /* The overwhelming majority of triangles are wholly inside, so check that
     * first and copy straight through — the polygon buffers below live in local
@@ -397,6 +502,7 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
    }
 
    if (inside == 3) {
+      CLIP_EQ(3, v, 6);
       if (clip_alloc(args, tri, 0, &id)) {
          if (args->prim_refs) {
             /* Immutable VS output stays live through every consumer of the
@@ -417,6 +523,7 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
 
 #if CP_CLIP_COMMON_REJECT
    if (clip_common_reject(v, slots)) {
+      CLIP_EQ(0, v, 7);
       if (args->stable && !args->active_ids && !ids)
          clip_retire(args, out, slots, tri, 0);
       return 0;
@@ -443,8 +550,20 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
             break;
          }
       }
-      if (unchanged)
+      if (unchanged) {
+#if CP_CLIP_EQ_CHECK
+         eq_bypass++;
+#endif
          continue;
+      }
+#if CP_CLIP_EQ_CHECK
+      if (eq_bypass) {
+         int accepted = 0;
+         for (int i = 0; i < n; i++)
+            accepted += clip_dist(src + (size_t)i * slots, p) >= 0.0f;
+         if (accepted && accepted < n) eq_after = true;
+      }
+#endif
       /* Plane parity is no longer buffer parity after a bypass. */
       float4 *dst = src == poly_a ? poly_b : poly_a;
 #else
@@ -452,12 +571,15 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
 #endif
       n = clip_poly(dst, src, n, slots, p);
       if (n < 3) {
+         CLIP_EQ(0, v, 8);
          if (args->stable && !args->active_ids && !ids)
             clip_retire(args, out, slots, tri, 0);
          return 0;
       }
       src = dst;
    }
+
+   CLIP_EQ(n, src, 9);
 
    /* Fan-triangulate the clipped polygon, which keeps the original winding. */
    int k = 0;
@@ -726,7 +848,7 @@ cp_run_clip_setup_tile_count(struct cp_run_clip_bin_args args)
    for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x;
         tri < clip.num_triangles; tri += blockDim.x * gridDim.x) {
       uint32_t emitted[CP_CLIP_MAX_OUT];
-      int n = cp_clip_one(&clip, tri, emitted);
+      int n = cp_clip_one(&clip, tri, emitted, 28);
       for (int i = 0; i < n; i++) {
          uint32_t local_id = emitted[i];
          uint32_t stable_id = seg.prim_base + local_id;
@@ -804,7 +926,7 @@ cp_run_clip_setup_direct(struct cp_run_clip_bin_args args)
    for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x;
         tri < clip.num_triangles; tri += blockDim.x * gridDim.x) {
       uint32_t emitted[CP_CLIP_MAX_OUT];
-      int n = cp_clip_one(&clip, tri, emitted);
+      int n = cp_clip_one(&clip, tri, emitted, 29);
       for (int i = 0; i < n; i++) {
          uint32_t local = emitted[i], stable = seg.prim_base + local;
          if (stable < seg.prim_base || stable >= args.total_slots) {
@@ -1677,7 +1799,7 @@ cp_clip_rast_fused_body(struct cp_clip_args cargs,
       return;
 
    uint32_t emitted[CP_CLIP_MAX_OUT];
-   int n = cp_clip_one(&cargs, tri, emitted);
+   int n = cp_clip_one(&cargs, tri, emitted, 27);
    for (int i = 0; i < n; i++) {
       cp_rast_small_or_defer<ABUF>(&args, &queues, emitted[i],
                                    queues.mode != CP_QUEUE_REUSE);

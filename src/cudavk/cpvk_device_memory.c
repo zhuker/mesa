@@ -509,6 +509,10 @@ cpvk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->cp_dev.sm_major = pdev->sm_major;
    dev->cp_dev.sm_minor = pdev->sm_minor;
    atomic_init(&dev->cp_dev.next_texture_stream_serial, 0);
+   if (!cp_clip_eq_init(&dev->cp_dev)) {
+      result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
+      goto fail_stream;
+   }
    if (!cp_kernels_init(&dev->cp_dev.kernels, pdev->sm_major, pdev->sm_minor,
                          pdev->vk.disk_cache)) {
       result = vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
@@ -581,6 +585,7 @@ fail_queue:
 fail_stream:
    if (renderer_initialized)
       cp_context_cleanup(&dev->renderer);
+   cp_clip_eq_finish(&dev->cp_dev, false);
    if (shader_lock_initialized) {
       simple_mtx_destroy(&dev->shader_cache_lock);
       simple_mtx_destroy(&dev->view_lock);
@@ -613,14 +618,24 @@ cpvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* Not CPVK_CTX_SCOPE: the scope's pop would run after cuCtxDestroy below
     * has freed the very context it would pop. Push here, pop by hand at the
     * one point the context is still alive. */
-   cuCtxPushCurrent(dev->cu_ctx);
-   cuCtxSynchronize();
+   CUresult clip_eq_push = cuCtxPushCurrent(dev->cu_ctx);
+   CUresult clip_eq_drain = cuCtxSynchronize();
    cpvk_submit_wait_pending(dev);
    cpvk_submit_worker_finish(dev);
    vk_queue_finish(&dev->queue);
 
    cpvk_batch_break_report();
    cp_context_cleanup(&dev->renderer);
+   /* The verification footer follows the worker and every renderer stream.
+    * Capture this final drain directly, even if cleanup already saw a fault. */
+   CUresult clip_eq_final = cp_debug->clip_eq_check
+      ? cuCtxSynchronize() : CUDA_SUCCESS;
+   cp_clip_eq_finish(&dev->cp_dev,
+                     clip_eq_push == CUDA_SUCCESS &&
+                     clip_eq_drain == CUDA_SUCCESS &&
+                     clip_eq_final == CUDA_SUCCESS &&
+                     !dev->renderer.device_fatal &&
+                     !atomic_load_explicit(&dev->device_lost, memory_order_acquire));
    cpvk_texture_cache_report(dev);
    for (unsigned i = 0; i < dev->num_shaders; i++)
       cp_shader_binary_destroy(dev->shader_cache[i].bin);

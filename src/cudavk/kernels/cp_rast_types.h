@@ -379,7 +379,12 @@ struct cp_clip_args {
     * on a zero area instead.
     */
    uint32_t stable;
+   /* Optional device-lifetime equivalence report; zero in production. */
+   uint64_t eq_report;
+   uint64_t eq_dispatch;
 };
+
+#define CP_CLIP_EQ_REPORT_WORDS 32u
 
 #define CP_CLIP_MAX_OUT 8
 #define CP_CLIP_PRIM_SHIFT 3

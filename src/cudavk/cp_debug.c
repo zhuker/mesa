@@ -206,6 +206,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_DEBUG_ROWS", CP_FLAG_BOOL_PRESENCE, F(debug_rows),
      "trace the per-draw tables a batch builds: fragment UBO slots and the "
      "vertex slice table the fragment stage searches" },
+   { "CUDAVK_CLIP_EQ_CHECK", CP_FLAG_BOOL_VALUE, F(clip_eq_check),
+     "Validation-only exact full-replay clipping oracle" },
+   { "CUDAVK_CLIP_EQ_BREAK", CP_FLAG_UINT, F(clip_eq_break),
+     "Clip oracle negative control: 0 off, 1 copy, 2 common reject; requires CHECK and feature" },
    { "CUDAVK_CLIP_COPY_BYPASS", CP_FLAG_BOOL_VALUE, F(clip_copy_bypass),
      "skip polygon copies for clip planes accepting every current vertex; "
      "experimental, default off" },

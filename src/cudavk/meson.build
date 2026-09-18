@@ -372,6 +372,12 @@ if dep_vulkan_loader.found()
     dependencies : dep_vulkan_loader,
     c_args : ['-Wno-error=missing-prototypes'],
     build_by_default : false)
+  test('cpvk_clip_eq_gate', prog_python,
+       args : [files('tests/cpvk_clip_eq_gate.py'), 'self-test'],
+       suite : 'cudavk', timeout : 120)
+  test('cp_clip_eq', prog_python,
+       args : [files('tests/cp_clip_eq.py')],
+       suite : 'cudavk', timeout : 120)
   test('cp_clip_copy_bypass', prog_python,
        args : [files('tests/cp_clip_copy_bypass.py')],
        suite : 'cudavk', timeout : 120)
