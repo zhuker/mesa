@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-154 switches.
+155 switches.
 
 ## Tracing
 
@@ -78,6 +78,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_NO_FETCH_FOLD` | bool (value) | `off` | — | clear the clip and raster queue counters with their own device clears again instead of seeding them inside cp_vertex_fetch |
 | `CUDAVK_NO_VS_LANE` | bool (value) | `off` | — | run a direct batch's fused vertex shader on a side stream, joined before its clip, so it overlaps the previous batch's shading; the batch's queue-counter seeding falls back to its own clears |
 | `CUDAVK_FUSED_VFETCH` | bool (value) | `on` | — | gather vertex attributes inside the vertex shader, from bitcode inlined into it, instead of launching cp_vertex_fetch before it |
+| `CUDAVK_SPECIALIZE_VFETCH` | bool (value) | `off` | — | Bake static pipeline vertex layouts into fused vertex fetch |
 | `CUDAVK_NO_FUSED_VFETCH` | bool (value) | `off` | — | do not even build the fused vertex execution: the resource-isolated control, and the revert once the fusion is the default |
 | `CUDAVK_FUSED_WRITEBACK` | bool (value) | `off` | — | blend direct-path colour inside the fragment shader instead of launching cp_fs_writeback |
 | `CUDAVK_PEEL_ANY_PINNED` | bool (value) | `on` | — | keep the depth-peel convergence word device-local and copy its four bytes to a pinned host mirror before each existing convergence wait |

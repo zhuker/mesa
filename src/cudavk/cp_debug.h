@@ -212,6 +212,7 @@ struct cp_debug {
    bool no_fetch_fold;
    bool fused_vfetch;
    bool no_fused_vfetch;
+   bool specialize_vfetch;
    bool fused_writeback;
    bool peel_any_pinned;
    bool no_peel_any_pinned;

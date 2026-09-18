@@ -212,9 +212,13 @@ cp_vf_lane_ids(const struct cp_vertex_fetch_args *ap, uint32_t v,
  * a register.
  */
 CP_VF_INLINE void
-cp_vf_lane_element(const struct cp_vertex_fetch_args *ap, uint32_t e,
+cp_vf_lane_element_layout(const struct cp_vertex_fetch_args *ap, uint32_t e,
                    uint32_t vertex_id, uint32_t instance_id, uint32_t row,
-                   unsigned char *dst_slot)
+                   unsigned char *dst_slot, uint32_t num_elements,
+                   uint32_t vertex_buffer_index, uint32_t src_offset, uint32_t src_stride,
+                   uint32_t instance_divisor, uint32_t attr_size, uint32_t nr_chan,
+                   uint32_t chan_bytes, uint32_t swizzle, uint32_t conv,
+                   uint32_t fill_w)
 {
    char *dst = (char *)dst_slot;
 #ifdef CP_VF_FIXED_SLOTS
@@ -223,7 +227,7 @@ cp_vf_lane_element(const struct cp_vertex_fetch_args *ap, uint32_t e,
    ((uint32_t *)dst)[1] = 0;
    ((uint32_t *)dst)[2] = 0;
    ((uint32_t *)dst)[3] = 0;
-   if (e >= ap->num_elements)
+   if (e >= num_elements)
       return;
 #endif
 
@@ -233,21 +237,21 @@ cp_vf_lane_element(const struct cp_vertex_fetch_args *ap, uint32_t e,
    uint64_t vb_base = ap->elem_bases
       ? ((const uint64_t *)(uintptr_t)ap->elem_bases)
            [row * CP_VB_TABLE_STRIDE + e]
-      : ap->vb_bases[ap->elem_vb_idx[e]];
+      : ap->vb_bases[vertex_buffer_index];
    if (!vb_base)
       return;
 
-   uint32_t index = ap->elem_instance_divisor[e]
-      ? ap->start_instance + instance_id / ap->elem_instance_divisor[e]
+   uint32_t index = instance_divisor
+      ? ap->start_instance + instance_id / instance_divisor
       : vertex_id;
 
    const char *src = (const char *)(uintptr_t)vb_base +
-                     (uint64_t)index * ap->elem_src_stride[e] +
-                     ap->elem_src_offset[e];
+                     (uint64_t)index * src_stride +
+                     src_offset;
 
    /* Copy attribute bytes into the 16-byte slot. The output was zero-filled
     * by the caller (scratch arena is zeroed on grow). */
-   uint32_t size = ap->elem_attr_size[e];
+   uint32_t size = attr_size;
    if (size > 16)
       size = 16;
 
@@ -258,17 +262,17 @@ cp_vf_lane_element(const struct cp_vertex_fetch_args *ap, uint32_t e,
     * CUDA_ERROR_MISALIGNED_ADDRESS, so use the widest unit the source
     * address actually allows. dst is always 16 byte aligned.
     */
-   if (ap->elem_conv[e] != CP_VF_CONV_COPY32) {
+   if (conv != CP_VF_CONV_COPY32) {
       /*
        * Narrower than 32 bits per component. The shader addresses component
        * c of attribute e at e * 16 + c * 4 whatever the format, so each
        * component has to be widened into its own slot — copying the bytes
        * would leave them packed in the first one.
        */
-      uint32_t nch = ap->elem_nr_chan[e];
-      uint32_t cb = ap->elem_chan_bytes[e];
-      uint32_t conv = ap->elem_conv[e];
-      uint32_t swz = ap->elem_swizzle[e];
+      uint32_t nch = nr_chan;
+      uint32_t cb = chan_bytes;
+
+      uint32_t swz = swizzle;
       uint32_t *d32 = (uint32_t *)dst;
 
       /*
@@ -341,9 +345,28 @@ cp_vf_lane_element(const struct cp_vertex_fetch_args *ap, uint32_t e,
     * slot was zero-filled, so only the one has to be written — and it
     * matters: a shader taking a vec3 position as vec4 otherwise gets w = 0
     * and loses the translation column of its matrix. */
-   uint32_t fill_w = ap->elem_fill_w[e];
+
    if (fill_w)
       ((uint32_t *)dst)[3] = fill_w;
+}
+
+CP_VF_INLINE void
+cp_vf_lane_element(const struct cp_vertex_fetch_args *ap, uint32_t e,
+                   uint32_t vertex_id, uint32_t instance_id, uint32_t row,
+                   unsigned char *dst_slot)
+{
+#ifdef CP_VF_FIXED_SLOTS
+   /* Do not read an element table for an unbound shader slot (e may be >=16). */
+   if (e >= ap->num_elements) {
+      ((uint32_t *)dst_slot)[0] = 0;
+      ((uint32_t *)dst_slot)[1] = 0;
+      ((uint32_t *)dst_slot)[2] = 0;
+      ((uint32_t *)dst_slot)[3] = 0;
+      return;
+   }
+#endif
+   cp_vf_lane_element_layout(ap, e, vertex_id, instance_id, row, dst_slot,
+      ap->num_elements, ap->elem_vb_idx[e], ap->elem_src_offset[e], ap->elem_src_stride[e], ap->elem_instance_divisor[e], ap->elem_attr_size[e], ap->elem_nr_chan[e], ap->elem_chan_bytes[e], ap->elem_swizzle[e], ap->elem_conv[e], ap->elem_fill_w[e]);
 }
 
 #endif /* CP_VF_LANE_H */

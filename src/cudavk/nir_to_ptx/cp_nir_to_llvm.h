@@ -4,6 +4,13 @@
 #include <cuda.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include "cp_draw_types.h"
+#include <string.h>
+
+struct cp_vs_fetch_layout {
+   unsigned count;
+   struct cp_vertex_elem elem[16];
+};
 
 struct nir_shader;
 struct nir_tex_instr;
@@ -203,6 +210,8 @@ enum cp_hw_compile_failure {
 };
 
 struct cp_shader_binary {
+   bool vs_layout_static;
+   struct cp_vs_fetch_layout vs_layout;
    struct cp_shader_exec exec[CP_SHADER_EXEC_COUNT];
    int sm_major;
    int sm_minor;
@@ -325,7 +334,17 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
                       const char *sampler_ptx, const char *math_ptx,
                       const char *fs_helper_ptx,
                       bool no_inline_fs, bool inline_fs, bool force_fused_fs,
-                      bool hw_texture);
+                      bool hw_texture, const struct cp_vs_fetch_layout *vs_layout);
+
+/* A mismatch selects the independent classic execution, never stale constants. */
+static inline bool
+cp_vs_fetch_layout_matches(const struct cp_shader_binary *bin, unsigned count,
+                            const struct cp_vertex_elem *elem)
+{
+   return !bin->vs_layout_static ||
+      (count == bin->vs_layout.count && count <= 16 &&
+       !memcmp(elem, bin->vs_layout.elem, count * sizeof(*elem)));
+}
 
 void
 cp_shader_binary_destroy(struct cp_shader_binary *bin);

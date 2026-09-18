@@ -459,3 +459,10 @@ if dep_vulkan_loader.found()
        is_parallel : false,
        depends : [libvulkan_cudavk, cpvk_devenv_icd])
 endif
+
+# No device or CUDA runtime: scalar-layout decode and missing-slot safety.
+cp_vfetch_layout_cpu = executable(
+  'cp_vfetch_layout_cpu', files('tests/cp_vfetch_layout_cpu.c'),
+  c_args : ['-Wno-error=missing-prototypes', '-Wno-attributes'],
+  build_by_default : false)
+test('cp_vfetch_layout_cpu', cp_vfetch_layout_cpu, suite : 'cudavk-cpu')

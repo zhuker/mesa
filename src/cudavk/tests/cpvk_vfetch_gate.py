@@ -15,7 +15,7 @@ every state the driver can be in --
                                 admission gate creates in every real frame
   CUDAVK_NO_FUSED_VFETCH=1    the second binary is not even built
 
--- and the frames must be byte-identical across all five, not merely all
+-- and the frames must be byte-identical across all states, not merely all
 passing. A fetch that is wrong in the same way in both forms would pass the
 test and fail this comparison only if it also differed; that is why the test
 carries the format expectations and this carries the agreement.
@@ -29,6 +29,9 @@ import tempfile
 MODES = ["formats", "sparse", "divisor", "decline"]
 STATES = [
     ("default", {}),
+    ("specialized", {"CUDAVK_SPECIALIZE_VFETCH": "1"}),
+    ("specialized-decline", {"CUDAVK_SPECIALIZE_VFETCH": "1",
+                             "CUDAVK_VFETCH_DECLINE_NTH": "1"}),
     ("fused", {"CUDAVK_FUSED_VFETCH": "1"}),
     ("fused+decline1", {"CUDAVK_FUSED_VFETCH": "1",
                         "CUDAVK_VFETCH_DECLINE_NTH": "1"}),
@@ -52,6 +55,7 @@ def main():
                 # under CUDAVK_NO_FUSED_VFETCH=1 would otherwise compare
                 # five copies of the classic path and prove nothing.
                 env = dict(os.environ)
+                env.pop("CUDAVK_SPECIALIZE_VFETCH", None)
                 env.pop("CUDAVK_FUSED_VFETCH", None)
                 env.pop("CUDAVK_NO_FUSED_VFETCH", None)
                 env.pop("CUDAVK_VFETCH_DECLINE_NTH", None)
@@ -75,7 +79,7 @@ def main():
             print("%-8s %s" % (mode, " ".join(
                 "%s=%s" % (n, d[:12]) for n, d in digests.items())))
             if len(uniq) > 1:
-                failures.append("%s: the five states do not agree" % mode)
+                failures.append("%s: the states do not agree" % mode)
     for f in failures:
         print("FAIL: %s" % f)
     return 1 if failures else 0
