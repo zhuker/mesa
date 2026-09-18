@@ -216,6 +216,43 @@ clip_dist(const float4 *v, int plane)
                      : v[0].w - v[0].y;
 }
 
+#if CP_CLIP_COMMON_REJECT
+/* A common negative outcode is a geometric reject, but not necessarily an
+ * exact floating-point reject: clipping an earlier plane can round an
+ * interpolated vertex across a later plane. Only take the shortcut if every
+ * preceding plane accepts all original vertices. The legacy clipper then
+ * copies those vertices unchanged before dropping all of them at this plane.
+ * Non-finite positions fail closed, including NaNs in unrelated components.
+ * No epsilon is needed: no arithmetic beyond the original clip_dist occurs.
+ */
+static __device__ __forceinline__ bool
+clip_common_reject(const float4 *v, uint32_t slots)
+{
+   unsigned common = (1u << CP_CLIP_NUM_PLANES) - 1u;
+   unsigned any = 0;
+   for (int i = 0; i < 3; i++) {
+      const float4 *vi = v + (size_t)i * slots;
+      if (!isfinite(vi->x) || !isfinite(vi->y) ||
+          !isfinite(vi->z) || !isfinite(vi->w))
+         return false;
+      unsigned code = 0;
+      for (int p = 0; p < CP_CLIP_NUM_PLANES; p++) {
+         float d = clip_dist(vi, p);
+         if (!isfinite(d))
+            return false;
+         if (d < 0.0f)
+            code |= 1u << p;
+      }
+      common &= code;
+      any |= code;
+   }
+   /* The earliest plane with any outside vertex must be a common plane.
+    * Otherwise earlier interpolation makes an original-vertex outcode alone
+    * insufficient evidence; use the original polygon clipper. */
+   return (common & (any & (0u - any))) != 0;
+}
+#endif
+
 static __device__ __forceinline__ void
 clip_lerp(float4 *dst, const float4 *a, const float4 *b, float t, uint32_t slots)
 {
@@ -377,6 +414,14 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
          clip_retire(args, out, slots, tri, 1);
       return emitted;
    }
+
+#if CP_CLIP_COMMON_REJECT
+   if (clip_common_reject(v, slots)) {
+      if (args->stable && !args->active_ids && !ids)
+         clip_retire(args, out, slots, tri, 0);
+      return 0;
+   }
+#endif
 
    float4 poly_a[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
    float4 poly_b[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
