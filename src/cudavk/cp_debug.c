@@ -222,6 +222,9 @@ static const struct cp_flag_def flags[] = {
      "its six faces from where the sampler will look; syncs" },
 
    /* ---- subsystem switches ---- */
+   { "CUDAVK_CLIP_COMMON_REJECT", CP_FLAG_BOOL_VALUE, F(clip_common_reject),
+     "reject common-plane outside triangles in the existing clip thread when "
+     "earlier planes need no interpolation (default off)" },
    { "CUDAVK_NO_CLIP_ALLOC_HOIST", CP_FLAG_BOOL_VALUE, F(no_clip_alloc_hoist),
      "allocate the clip stage's scratch below the vertex shader's launch and "
      "reserve the direct shade chain's interpolation and fragment argument "

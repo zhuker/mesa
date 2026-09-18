@@ -215,6 +215,9 @@ cp_shade_equiv_test = executable(
   dependencies : [dep_cuda_vk, idep_mesautil, idep_nir],
   build_by_default : false)
 test('cp_shade_equiv_test', cp_shade_equiv_test, suite : 'cudavk')
+# CPU-only source-equivalence gate; safe while another process uses the GPU.
+test('cp_clip_common_reject', prog_python,
+     args : [files('tests/cp_clip_common_reject.py')], suite : 'cudavk')
 
 # Focused external-API regression suite. These link the Vulkan loader rather
 # than driver internals and select the generated development ICD, so they test
