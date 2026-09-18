@@ -14,6 +14,8 @@ def arm(enabled, split=True, clip_bin=False, direct=False, extra=None):
     env = os.environ.copy()
     env.pop("CUDAVK_RUN_GEOMETRY_FAIL_ALLOC", None)
     env.pop("CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH", None)
+    # This gate selects grouped, dense or direct modes, never classic.
+    env["CUDAVK_RUN_CLIP_CLASSIC"] = "0"
     if split:
         env["CUDAVK_BATCH_MAX"] = "1"
     else:
@@ -80,6 +82,7 @@ def fatal_fault(extra, label):
     env = os.environ.copy()
     env.pop("CUDAVK_RUN_GEOMETRY_FAIL_ALLOC", None)
     env.pop("CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH", None)
+    env["CUDAVK_RUN_CLIP_CLASSIC"] = "0"
     env["CUDAVK_BATCH_MAX"] = "1"
     env["CUDAVK_RUN_GEOMETRY"] = "1"
     env.update(extra)
