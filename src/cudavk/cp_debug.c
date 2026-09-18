@@ -305,6 +305,15 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_OPAQUE_EPISODE", CP_FLAG_BOOL_VALUE,
      F(no_opaque_episode),
      "disable consecutive opaque-run visibility deferral" },
+   { "CUDAVK_BALANCE_PASS_STREAMS", CP_FLAG_BOOL_VALUE,
+     F(balance_pass_streams),
+     "assign wrapped opaque and blended geometry segments to the side stream "
+     "with least estimated work; keep the first eight side assignments unchanged" },
+   { "CUDAVK_BALANCE_TRIANGLE_WEIGHT", CP_FLAG_UINT,
+     F(balance_triangle_weight),
+     "triangle weight in the pass stream score: vertices plus weighted "
+     "pre-clip triangles, including instances; only with BALANCE_PASS_STREAMS",
+     .dflt = 1, .has_range = true, .lo = 0, .hi = 16 },
    { "CUDAVK_NO_OPAQUE_STREAMS", CP_FLAG_BOOL_VALUE, F(no_opaque_streams),
      "issue an opaque episode's segments back to back on the main stream "
      "instead of fanning them over the pass side streams" },

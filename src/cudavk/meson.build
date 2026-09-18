@@ -216,6 +216,12 @@ cp_shade_equiv_test = executable(
   build_by_default : false)
 test('cp_shade_equiv_test', cp_shade_equiv_test, suite : 'cudavk')
 
+# Pure host gate: initial prefix, wrapped least-load choice, ties and saturation.
+cp_pass_schedule_test = executable(
+  'cp_pass_schedule_test', files('tests/cp_pass_schedule.c'),
+  build_by_default : false)
+test('cp_pass_schedule_test', cp_pass_schedule_test, suite : 'cudavk')
+
 # Focused external-API regression suite. These link the Vulkan loader rather
 # than driver internals and select the generated development ICD, so they test
 # the same dispatch and object-lifetime boundary as applications do.

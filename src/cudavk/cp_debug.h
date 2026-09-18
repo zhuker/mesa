@@ -225,6 +225,8 @@ struct cp_debug {
    unsigned upload_flush_fail_at;
    bool no_opaque_episode;
    bool no_opaque_streams;
+   bool balance_pass_streams;
+   unsigned balance_triangle_weight;
    bool no_episode_gate_once;
    /* Opt-in, unlike the reverts around it: the vertex-shader side lane is off
     * until it has been measured on both captures. See cp_vslane_arm(). */

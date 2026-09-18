@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-154 switches.
+156 switches.
 
 ## Tracing
 
@@ -88,6 +88,8 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_VFETCH_DECLINE_NTH` | uint | `0` | — | fault injection: refuse the fused execution for the Nth vertex shader compiled, or for every one at 4294967295, after building it either way |
 | `CUDAVK_VFETCH_SKIP_SEED` | bool (value) | `off` | — | fault injection: a fused draw does not seed the clip and raster counters, and the host still skips their clears -- the negative control for the seeding moving into the fused vertex shader |
 | `CUDAVK_NO_OPAQUE_EPISODE` | bool (value) | `off` | — | disable consecutive opaque-run visibility deferral |
+| `CUDAVK_BALANCE_PASS_STREAMS` | bool (value) | `off` | — | assign wrapped opaque and blended geometry segments to the side stream with least estimated work; keep the first eight side assignments unchanged |
+| `CUDAVK_BALANCE_TRIANGLE_WEIGHT` | uint | `1` | 0&ndash;16 | triangle weight in the pass stream score: vertices plus weighted pre-clip triangles, including instances; only with BALANCE_PASS_STREAMS |
 | `CUDAVK_NO_OPAQUE_STREAMS` | bool (value) | `off` | — | issue an opaque episode's segments back to back on the main stream instead of fanning them over the pass side streams |
 | `CUDAVK_NO_EPISODE_GATE_ONCE` | bool (value) | `off` | — | record an opaque episode's stream gate once per segment on the main stream again, behind segment 0's launches, so no side segment starts until segment 0 has finished, instead of recording it once after the episode's clears and sending each segment's owed uniform rows on its own stream; implied by CUDAVK_NO_UPLOAD_COALESCE, which leaves no owed span to send |
 | `CUDAVK_NO_PDL` | bool (value) | `off` | — | issue every kernel with an ordinary launch again, so that no dependent kernel starts before its predecessor in the same stream has drained; the revert for the programmatic dependent launch default |

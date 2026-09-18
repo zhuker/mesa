@@ -434,6 +434,7 @@ struct cp_context {
        * A-buffer fields and relaunches the fill stages from it. */
       struct cp_rasterize_args rast;
       struct cp_rast_queues queues;
+      CUstream geometry_stream;    /* owns queues, including fill replay */
       unsigned rast_num_triangles;
       unsigned num_triangles;
       uint32_t prim_base;           /* first episode-global primitive slot */
@@ -529,6 +530,7 @@ struct cp_context {
    CUevent seg_ev[CP_PASS_STREAMS];
    CUevent pass_gate;
    bool pass_streams_ready;
+   uint64_t pass_stream_load[CP_PASS_STREAMS]; /* append phase only */
    struct cp_queue_set {
       CUdeviceptr nontrivial, huge_tiles, setup_cache, counts;
    } seg_qsets[CP_PASS_STREAMS];

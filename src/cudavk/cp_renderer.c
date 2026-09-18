@@ -9,6 +9,7 @@
 
 #include "cp_renderer.h"
 #include "cp_shade_equiv.h"
+#include "cp_pass_schedule.h"
 #include "cp_nvtx.h"
 #include "compiler/glsl_types.h"
 
@@ -9457,7 +9458,9 @@ cp_pass_seg_stream(struct cp_context *cp, unsigned s)
    return st ? st : cp->stream;
 }
 
-/* Join every side stream a finished phase used back into the main stream. */
+/* Join every side stream a finished phase used back into the main stream.
+ * Balanced appends fill the first eight slots before choosing freely, so the
+ * same contiguous-prefix contract also covers non-modulo placement. */
 static bool
 cp_pass_join(struct cp_context *cp, unsigned nsegs)
 {
@@ -9744,6 +9747,7 @@ cp_opaque_finish_common(struct cp_context *cp, bool visibility_ready)
    unsigned w = cp->pass.w, h = cp->pass.h;
    cp->pass.nsegs = 0;
    cp->pass.next_prim = 0;
+   memset(cp->pass_stream_load, 0, sizeof(cp->pass_stream_load));
    cp->pass.opaque = false;
 
    /* Counted in both arms: how much concurrency this episode had to offer. */
@@ -10610,6 +10614,7 @@ cp_pass_finish(struct cp_context *cp)
       return;
    }
 
+   memset(cp->pass_stream_load, 0, sizeof(cp->pass_stream_load));
    /* Cleared first: nothing below may see the episode as still open. */
    cp->pass.nsegs = 0;
    cp->pass.next_prim = 0;
@@ -10667,8 +10672,10 @@ cp_pass_finish(struct cp_context *cp)
          return;
       for (unsigned s = 0; s < nsegs; s++) {
          struct cp_pass_seg *sg = &segs[s];
+         /* Queue ownership follows the original assignment, not s % 8.
+          * The count join and scan broadcast above order this replay. */
          if (cp->seg_streams[0])
-            cp_stream_set(cp, cp_pass_seg_stream(cp, s));
+            cp_stream_set(cp, sg->geometry_stream);
          struct cp_rasterize_args aa = sg->rast;
          aa.abuf_frags = ab->frags;
          aa.abuf_capacity = ab->capacity;
@@ -11079,6 +11086,7 @@ cp_pass_record_segment(struct cp_context *cp,
 
    sg->rast = *aa;
    sg->queues = *queues;
+   sg->geometry_stream = cp->stream;
    sg->rast_num_triangles = rast_num_triangles;
    sg->num_triangles = num_triangles;
    sg->prim_base = cp->pass.next_prim;
@@ -11125,6 +11133,32 @@ cp_batch_total_triangles(const struct cp_draw_call *info,
    return total;
 }
 
+/* Only append geometry is balanced. Fill replays retain its saved stream;
+ * shading and run-geometry have independent, unchanged phase scheduling. */
+static unsigned
+cp_pass_append_slot(struct cp_context *cp, unsigned ordinal, unsigned ndraws)
+{
+   if (!cp_debug->balance_pass_streams)
+      return ordinal % CP_PASS_STREAMS;
+
+   uint64_t cost = 0;
+   for (unsigned d = 0; d < ndraws; d++) {
+      uint64_t instances = ndraws > 1
+         ? MAX2(cp->batch.instance_counts[d], 1u)
+         : MAX2(cp->batch.info.instance_count, 1u);
+      uint64_t work = (uint64_t)cp->batch.draws[d].count +
+         (uint64_t)cp_debug->balance_triangle_weight *
+         cp_triangles_for_draw(cp->batch.info.mode, cp->batch.draws[d].count);
+      if (work > (UINT64_MAX - cost) / instances) {
+         cost = UINT64_MAX;
+         break;
+      }
+      cost += work * instances;
+   }
+   return cp_pass_schedule(cp->pass_stream_load, CP_PASS_STREAMS,
+                           ordinal, MAX2(cost, UINT64_C(1)));
+}
+
 /* Append the pending batch to the episode as a segment; on a refusal deep
  * enough that only cp_draw_execute could see it, finish the episode and
  * render the batch the classic way — its draws came after every segment's. */
@@ -11161,6 +11195,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
     * behind them — every segment stream waits on it before its first work.
     */
    if (cp->pass.nsegs == 0) {
+      memset(cp->pass_stream_load, 0, sizeof(cp->pass_stream_load));
       unsigned w = fb->width, h = fb->height;
       if (!w || !h || !cp_abuf_setup(cp, ab, w, h)) {
          /* A refusal falls back; a latched device loss must not. */
@@ -11200,7 +11235,7 @@ cp_pass_append(struct cp_context *cp, unsigned ndraws)
    CUstream saved_stream = cp->stream;
    struct cp_queue_set saved_qset = cp->cur_qset;
    if (cp->seg_streams[0]) {
-      unsigned k = cp->pass.nsegs % CP_PASS_STREAMS;
+      unsigned k = cp_pass_append_slot(cp, cp->pass.nsegs, ndraws);
       /* The gate is what orders this segment behind the clears above. */
       if (cuStreamWaitEvent(cp->seg_streams[k], cp->pass_gate, 0) !=
           CUDA_SUCCESS) {
@@ -11253,6 +11288,7 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    bool side = cp_opaque_side_streams(cp);
 
    if (!cp->pass.nsegs) {
+      memset(cp->pass_stream_load, 0, sizeof(cp->pass_stream_load));
       const struct cp_fb_desc *fb = &cp->batch.scope.fb;
       cp->pass.opaque = true;
       cp->pass.w = fb->width;
@@ -11327,8 +11363,9 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
    struct cp_queue_set saved_qset = cp->cur_qset;
    /*
     * The first segment stays on the main stream, and only segment s > 0 goes
-    * to a side stream — stream s-1, so eight streams still carry the eight
-    * segments that can overlap.
+    * to a side stream — initially stream s-1, so eight streams still carry
+    * the eight segments that can overlap. Wrapped assignments may use the
+    * default-off static load estimate instead of modulo placement.
     *
     * Segment 0 has nothing to overlap: it is the only work the episode has in
     * flight, and everything the episode did before it is on the main stream
@@ -11349,7 +11386,7 @@ cp_opaque_append(struct cp_context *cp, unsigned ndraws)
     */
    bool seg_side = side && cp->pass.nsegs > 0;
    if (seg_side) {
-      unsigned k = (cp->pass.nsegs - 1) % CP_PASS_STREAMS;
+      unsigned k = cp_pass_append_slot(cp, cp->pass.nsegs - 1, ndraws);
       if (!cp->pass.gate_once) {
          /*
           * The gate is what orders this segment behind the episode's clears
