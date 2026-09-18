@@ -1,7 +1,7 @@
-# cudavk 0.0.1 — build, install and use
+# cudavk 0.0.3 — build, install and use
 
 This is the quickstart for a fresh machine or a fresh session. It describes
-the driver exactly as tagged `cudavk-0.0.1`. The deeper documents are indexed
+the driver exactly as tagged `cudavk-0.0.3`. The deeper documents are indexed
 in `../../CUDAVK.md`; this page only gets you from a clone to a rendering
 Vulkan application.
 
@@ -37,7 +37,7 @@ sudo pip3 install "meson>=1.4"
 ## Build
 
 ```bash
-git clone https://github.com/zhuker/mesa.git -b cudavk-0.0.1
+git clone https://github.com/zhuker/mesa.git -b cudavk-0.0.3
 cd mesa
 meson setup build -Dcudavk=true \
   -Dgallium-drivers=llvmpipe -Dvulkan-drivers=swrast \
@@ -111,10 +111,17 @@ frame time over real frames, all defaults, clean environment:
 
 | capture | RTX 5090 (sm_120, CUDA 12.8) | B200 (sm_100, CUDA 13.0) |
 |---|---:|---:|
-| favorite3 | 6.68 ms | 10.79 ms |
-| favorite2 | 5.48 ms | 8.97 ms |
+| favorite3 | **5.176 ms** | **8.529 ms** |
+| favorite2 | **4.867 ms** | not re-measured for 0.0.3 (0.0.2: 8.283 ms) |
 
-Rendering output is bit-identical across the two architectures on both
+The RTX results come from strict alternating measurements against 0.0.2:
+favorite3 improved from 5.909 to 5.176 ms (-12.4%), and favorite2 improved
+from 5.043 to 4.867 ms (-3.5%). Their heavy-band medians improved from 7.249
+to 6.023 ms (-16.9%) and from 5.598 to 5.054 ms (-9.7%), respectively. The
+B200 favorite3 result is a three-round, six-arm identical-control measurement;
+favorite2 has not been re-measured on B200 since 0.0.2.
+
+Rendering output is bit-identical across the two architectures on the measured
 captures. The B200 gap is clock-bound arithmetic on small kernels, not a
 defect; `docs/cudavk/PERFORMANCE.md` carries the measured cost of every
 default and `docs/cudavk/DEAD_ENDS.md` the measured cost of everything that
