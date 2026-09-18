@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-139 switches.
+154 switches.
 
 ## Tracing
 
@@ -27,6 +27,14 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_NO_DEPTH_ONLY_BATCH` | bool (value) | `off` | — | refuse to batch draws in a scope with no colour attachment again, so a shadow scope runs one chain and one full visibility clear per draw instead of batching them |
 | `CUDAVK_NO_WIDE_EPISODE` | bool (value) | `off` | — | compare viewport, rasterizer and depth state before letting two order-free draws share an opaque episode again; every consumer of those reads them per segment, and comparing them episode-wide held episodes to 6.21 segments instead of 12.84 |
 | `CUDAVK_RUN_CENSUS` | bool (value) | `off` | — | count the runs the run-level redesign would render as one unit -- maximal sequences of consecutive same-class draws in one scope -- and report at teardown what share of the frame's triangles they hold. Watches only; changes no rendering decision (REDESIGN_PLAN_2026-09-05) |
+| `CUDAVK_RUN_GEOMETRY` | bool (value) | `off` | — | collect each opaque run and launch compatible groups of one-draw triangle-list members through one fused vertex shader. Default-off M2 step; multi-draw members and downstream stages stay on the old path |
+| `CUDAVK_RUN_CLIP_BIN` | bool (value) | `off` | — | preflight at most 64 side-effect-free triangle-list batches and build stable run-global clip/bin descriptors before grouped geometry. Default-off transactional M2 renderer; requires CUDAVK_RUN_GEOMETRY, with exact pre-commit replay and device-predicated classic fallback |
+| `CUDAVK_RUN_CLIP_DIRECT` | bool (value) | `off` | — | use compact clip/setup plus persistent-warp direct visibility for an opaque run; default off, requires CUDAVK_RUN_GEOMETRY, and keeps CUDAVK_RUN_CLIP_BIN selectable as the old dense-tile A/B arm |
+| `CUDAVK_RUN_CLIP_CLASSIC` | bool (value) | `off` | — | pipeline exact prepare-only VS and the optimized classic fused clip/raster chain per segment on the existing side streams; default off and requires CUDAVK_RUN_GEOMETRY |
+| `CUDAVK_RUN_CLIP_BIN_CAPACITY` | uint | `0` | — | diagnostic dense-reference capacity for RUN_CLIP_BIN; 0 uses the normal maximum, while a small value forces the device-predicated classic visibility arm without a host readback |
+| `CUDAVK_NO_RUN_PREP_STREAMS` | bool (value) | `off` | — | keep exact run-transaction vertex preparation serial on the main stream; reverts the round-robin side-stream launch schedule |
+| `CUDAVK_RUN_GEOMETRY_FAIL_ALLOC` | uint | `0` | — | fault gate for run geometry output growth: 1 injects soft OOM and 2 injects a fatal CUDA error before any geometry launch |
+| `CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH` | bool (value) | `off` | — | fault gate that replaces each admitted run geometry launch with a fatal CUDA error; verifies device loss rather than exact replay |
 | `CUDAVK_PLAN_STATS` | bool (value) | `off` | — | report at teardown what deciding one draw at a time costs: batch keys built, pairwise merge tests, flushes, pass episodes closed and every reactive reallocation, with per-scope averages |
 | `CUDAVK_SPEC_STATS` | bool (value) | `off` | — | report at teardown how many fragment launches used a sampler-specialised kernel, and which shaders sample textures the specialiser could not match; a silent drop to zero is a performance regression with no error |
 | `CUDAVK_TEXTURE_CACHE_BUDGET_MB` | uint | `2048` | — | hardware texture cache byte budget in MiB; an allocation past it falls back to software sampling silently, which cost 1.76 ms/frame on the occlusion capture at the old default of 384 |
@@ -71,6 +79,11 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_NO_VS_LANE` | bool (value) | `off` | — | run a direct batch's fused vertex shader on a side stream, joined before its clip, so it overlaps the previous batch's shading; the batch's queue-counter seeding falls back to its own clears |
 | `CUDAVK_FUSED_VFETCH` | bool (value) | `on` | — | gather vertex attributes inside the vertex shader, from bitcode inlined into it, instead of launching cp_vertex_fetch before it |
 | `CUDAVK_NO_FUSED_VFETCH` | bool (value) | `off` | — | do not even build the fused vertex execution: the resource-isolated control, and the revert once the fusion is the default |
+| `CUDAVK_FUSED_WRITEBACK` | bool (value) | `off` | — | blend direct-path colour inside the fragment shader instead of launching cp_fs_writeback |
+| `CUDAVK_PEEL_ANY_PINNED` | bool (value) | `on` | — | keep the depth-peel convergence word device-local and copy its four bytes to a pinned host mirror before each existing convergence wait |
+| `CUDAVK_NO_PEEL_ANY_PINNED` | bool (value) | `off` | — | revert depth-peel convergence to the managed word |
+| `CUDAVK_SCRATCH_PINNED` | bool (value) | `on` | — | allocate host-written/GPU-read renderer scratch as mapped pinned memory instead of migration-prone managed memory |
+| `CUDAVK_NO_SCRATCH_PINNED` | bool (value) | `off` | — | revert renderer scratch to managed memory |
 | `CUDAVK_FS_GRID_WAVES` | uint | `0` | — | size the fragment grid to fill the machine this many times over and let it grid-stride, instead of covering the framebuffer's worst case; 0 keeps the 4096-block cap, which is the only bound either way |
 | `CUDAVK_VFETCH_DECLINE_NTH` | uint | `0` | — | fault injection: refuse the fused execution for the Nth vertex shader compiled, or for every one at 4294967295, after building it either way |
 | `CUDAVK_VFETCH_SKIP_SEED` | bool (value) | `off` | — | fault injection: a fused draw does not seed the clip and raster counters, and the host still skips their clears -- the negative control for the seeding moving into the fused vertex shader |
@@ -103,6 +116,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_ABUF_FUSE_BREAK` | uint | `0` | 0&ndash;2 | negative control for the fusion check: 1 drops the block base in the fused scan, 2 stops the fused quad count writing an uncovered zero |
 | `CUDAVK_FLUSH_DRAIN` | bool (value) | `off` | — | restore the draining flush: cp_flush waits for the whole device and rewinds the arenas in place instead of ping-ponging generations |
 | `CUDAVK_NO_SEG_MERGE` | bool (value) | `off` | — | disable merged shading groups: every episode segment shades in its own launch group, as before |
+| `CUDAVK_OPAQUE_UBO_CONCAT` | bool (value) | `off` | — | merge opaque shade groups with different FS argument rows by concatenating the rows and applying each segment's row base |
 | `CUDAVK_NO_ABUF_APPEND` | bool (value) | `off` | — | disable the single-pass A-buffer build: the count pass stops appending (pixel, prim) records and the fill rasterizes a second time |
 | `CUDAVK_NO_FUSED_ABUF_INTERP` | bool (value) | `off` | — | launch A-buffer interpolation separately instead of calling it from the generated fragment shader; performance experiment only |
 | `CUDAVK_NO_FUSED_INTERP` | bool (value) | `off` | — | restore the direct shade path's separate cp_fs_interpolate launch instead of the slim compaction plus in-shader interpolation |
@@ -169,6 +183,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_SMALL_ALLOC_MAX` | uint64 | `128` | 0&ndash;1024 | allocations up to this many bytes come from the arena |
 | `CUDAVK_SMALL_ALLOC_WARMUP` | uint64 | `64` | — | allocations to let past before the arena opens |
 | `CUDAVK_SMALL_ALLOC_STATS` | bool (presence) | `off` | — | dump the allocation mix and arena hit rates at exit |
+| `CUDAVK_MEMORY_ALLOC_STATS` | bool (presence) | `off` | — | print every Vulkan memory allocation's CUDA address, size, type and host visibility, plus renderer scratch/peel allocation backends, for profiler-address correlation |
 
 ## Shader compilation
 

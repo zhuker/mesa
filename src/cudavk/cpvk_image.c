@@ -439,6 +439,16 @@ cpvk_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount,
          image->cache_alias = true;
       cpvk_memory_note_bind(dev, mem, image->offset, image->size,
                             image, image);
+      if (cp_debug->memory_alloc_stats)
+         fprintf(stderr, "cudavk: memory bind-image addr=0x%llx "
+                 "bind-addr=0x%llx offset=%llu size=%llu usage=0x%x "
+                 "format=%u extent=%ux%ux%u type=%u\n",
+                 (unsigned long long)mem->dev_ptr,
+                 (unsigned long long)(mem->dev_ptr + image->offset),
+                 (unsigned long long)image->offset,
+                 (unsigned long long)image->size, image->vk.usage,
+                 image->vk.format, image->vk.extent.width,
+                 image->vk.extent.height, image->vk.extent.depth, mem->kind);
       simple_mtx_lock(&dev->view_lock);
       for (struct cpvk_image_view *view = image->views; view;
            view = view->image_next)

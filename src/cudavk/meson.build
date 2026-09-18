@@ -83,7 +83,7 @@ if dep_llvm.version().version_compare('>=18.0.0')
     cpvk_fs_inline_bc = custom_target(
       'cpvk_fs_inline.bc',
       input : ['kernels/cp_fs_inline.c', 'kernels/cp_fs_interp.h',
-               'kernels/cp_rast_types.h'],
+               'kernels/cp_rast_types.h', 'kernels/cp_fs_write.h'],
       output : 'cp_fs_inline.bc',
       command : [cpvk_clang,
         '-target', 'nvptx64-nvidia-cuda', '-march=sm_86', '--cuda-feature=+ptx75',
@@ -133,7 +133,7 @@ endif
 cpvk_kernel_incs = []
 foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_math.cu', 'cp_fs.cu',
                   'cp_vertex_fetch.cu', 'cp_rast_types.h', 'cp_fs_interp.h',
-                  'cp_vf_lane.h']
+                  'cp_vf_lane.h', 'cp_fs_write.h']
   cpvk_kernel_incs += custom_target(
     'cpvk_' + kernel + '.inc',
     input : ['kernels/' + kernel],
@@ -205,6 +205,16 @@ cpvk_devenv_icd = custom_target(
   build_by_default : true,
 )
 
+
+# Pure host gate for visibility-complete opaque shade grouping.  It proves
+# both the retained shading boundaries and the visibility-only exclusions.
+cp_shade_equiv_test = executable(
+  'cp_shade_equiv_test', files('tests/cp_shade_equiv_test.c'),
+  include_directories : [inc_include, inc_src, inc_util,
+                         include_directories('.')],
+  dependencies : [dep_cuda_vk, idep_mesautil, idep_nir],
+  build_by_default : false)
+test('cp_shade_equiv_test', cp_shade_equiv_test, suite : 'cudavk')
 
 # Focused external-API regression suite. These link the Vulkan loader rather
 # than driver internals and select the generated development ICD, so they test
@@ -290,6 +300,9 @@ if dep_vulkan_loader.found()
     if test_name == 'cpvk_sampler_two_bindings'
       cpvk_texture_cache_test_exe = test_exe
     endif
+    if test_name == 'cpvk_batchbig'
+      cpvk_batchbig_exe = test_exe
+    endif
     if test_name == 'cpvk_texture_cache_no_replay'
       cpvk_texture_cache_no_replay_exe = test_exe
     endif
@@ -300,6 +313,39 @@ if dep_vulkan_loader.found()
       cpvk_texgrad_exe = test_exe
     endif
   endforeach
+
+  test('cpvk_run_geometry_gate', prog_python,
+       args : [files('tests/cpvk_run_geometry_gate.py'), cpvk_batchbig_exe],
+       suite : 'cudavk', env : cpvk_test_env, timeout : 300,
+       is_parallel : false,
+       depends : [libvulkan_cudavk, cpvk_devenv_icd])
+  test('cpvk_run_clip_classic_gate', prog_python,
+       args : [files('tests/cpvk_run_clip_classic_gate.py'), cpvk_batchbig_exe],
+       suite : 'cudavk', env : cpvk_test_env, timeout : 300,
+       is_parallel : false,
+       depends : [libvulkan_cudavk, cpvk_devenv_icd])
+
+
+  # Standalone device equivalence gate for the next default-off M2 slice. It
+  # compares the run kernel with the existing per-segment clip path and shared
+  # setup math; the renderer does not launch the new kernel yet.
+  cpvk_nvcc = find_program('nvcc', required : false)
+  if cpvk_nvcc.found()
+    cp_run_clip_bin_gate = custom_target(
+      'cp_run_clip_bin_gate',
+      input : files('tests/cp_run_clip_bin_gate.cu'),
+      output : 'cp_run_clip_bin_gate',
+      command : [cpvk_nvcc, '-arch=sm_75', '-std=c++17', '-O2',
+                 '-diag-suppress=177',
+                 '-I' + meson.current_source_dir() + '/kernels',
+                 '@INPUT@', '-o', '@OUTPUT@'],
+      depend_files : files('kernels/cp_rasterize.cu',
+                           'kernels/cp_rast_types.h'),
+      build_by_default : false,
+    )
+    test('cp_run_clip_bin_gate', cp_run_clip_bin_gate,
+         suite : 'cudavk', timeout : 120, is_parallel : false)
+  endif
 
   # The vertex fetch, in the shapes neither replay capture contains: every
   # conversion class, a sparse set of attribute locations, a per-instance

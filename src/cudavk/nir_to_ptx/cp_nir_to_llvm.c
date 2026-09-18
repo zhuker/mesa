@@ -217,6 +217,10 @@ struct ntl_context {
    bool writes_memory;
    bool fused_interp;
    bool inline_interp;
+   bool fused_writeback;
+   /* Four raw colour words. Entry allocas let mem2reg form exact CFG phis;
+    * they are re-seeded for every virtual slot in the grid-stride loop. */
+   LLVMValueRef fused_color[4];
    LLVMValueRef inline_fs_inputs;
    uint32_t inline_live_slots;
    int32_t inline_pntc_input;
@@ -948,25 +952,38 @@ emit_intrinsic(struct ntl_context *ctx, nir_intrinsic_instr *instr)
       break;
    }
    case nir_intrinsic_store_output: {
-      /* VS output: write to output buffer at (base + component) * 4 bytes per vertex */
+      /* Output buffer at (base + component) * 4 bytes per invocation. */
       LLVMValueRef data = get_src(ctx, &instr->src[0]);
       unsigned base = nir_intrinsic_base(instr);
       unsigned comp = nir_intrinsic_component(instr);
       LLVMValueRef offset_val = get_src(ctx, &instr->src[1]);
 
-      /* Output ptr is at args[4] */
-      LLVMValueRef output_ptr = cp_arg_slot(ctx, 4);
+      /* The WB clone keeps storage slot zero in four promotable words. Mirror
+       * the existing contiguous LLVM store exactly, including its treatment of
+       * write-mask holes; changing that only in this clone would change output. */
+      bool local_color = ctx->fused_writeback &&
+                         nir_src_is_const(instr->src[1]) &&
+                         base + nir_src_as_uint(instr->src[1]) == 0;
+      if (local_color) {
+         unsigned nc = instr->num_components;
+         for (unsigned c = 0; c < nc; c++) {
+            LLVMValueRef scalar = nc == 1 ? data :
+               LLVMBuildExtractElement(ctx->builder, data,
+                  LLVMConstInt(i32, c, false), "wb_color_extract");
+            LLVMValueRef bits = LLVMGetTypeKind(LLVMTypeOf(scalar)) == LLVMIntegerTypeKind
+               ? scalar : LLVMBuildBitCast(ctx->builder, scalar, i32, "wb_color_bits");
+            LLVMBuildStore(ctx->builder, bits, ctx->fused_color[comp + c]);
+         }
+         break;
+      }
 
-      /* vertex_id */
+      LLVMValueRef output_ptr = cp_arg_slot(ctx, 4);
       LLVMValueRef bid2 = emit_workgroup_id(ctx, 0);
       LLVMValueRef tid2 = emit_local_invocation_id(ctx, 0);
       LLVMValueRef vid = LLVMBuildAdd(ctx->builder,
          LLVMBuildMul(ctx->builder, bid2, LLVMConstInt(i32, 256, false), ""), tid2, "");
 
-      /* Output stride = num_output_slots * 16 (packed vec4s) */
-      unsigned num_outputs = ctx->nir->num_outputs;
-      unsigned out_stride = num_outputs * 16;
-
+      unsigned out_stride = ctx->nir->num_outputs * 16;
       LLVMValueRef byte_off = LLVMBuildAdd(ctx->builder,
          LLVMBuildAdd(ctx->builder,
             LLVMBuildMul(ctx->builder, vid, LLVMConstInt(i32, out_stride, false), ""),
@@ -3143,6 +3160,25 @@ capture_tex_desc_ref(nir_tex_instr *tex, struct cp_tex_desc_ref *ref)
    return true;
 }
 
+static unsigned
+cp_nir_vm_ops(const struct nir_shader *nir)
+{
+   unsigned count = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            /* Constants and dereferences are bytecode operands, not executed
+             * VM instructions. Everything else needs either an opcode or a
+             * control-flow action in a general interpreter. */
+            if (instr->type != nir_instr_type_load_const &&
+                instr->type != nir_instr_type_deref)
+               count++;
+         }
+      }
+   }
+   return count;
+}
+
 static void
 capture_tex_desc_refs(struct nir_shader *nir, struct cp_shader_binary *bin)
 {
@@ -3539,6 +3575,15 @@ emit_function(struct ntl_context *ctx)
       LLVMGetMDKindIDInContext(ctx->llvm_ctx, "invariant.load",
                                strlen("invariant.load"));
 
+   if (ctx->fused_writeback) {
+      LLVMTypeRef i32_t = LLVMInt32TypeInContext(ctx->llvm_ctx);
+      for (unsigned c = 0; c < 4; c++) {
+         ctx->fused_color[c] = LLVMBuildAlloca(ctx->builder, i32_t,
+                                               "fused_color");
+         LLVMSetAlignment(ctx->fused_color[c], 4);
+      }
+   }
+
    if (ctx->inline_interp) {
       LLVMTypeRef i8_t = LLVMInt8TypeInContext(ctx->llvm_ctx);
       LLVMTypeRef input_array = LLVMArrayType(i8_t, CP_MAX_FS_INPUTS * 16);
@@ -3836,7 +3881,69 @@ emit_function(struct ntl_context *ctx)
       }
    }
 
+   if (ctx->fused_writeback) {
+      /* Seed from the exact bytes standalone writeback would load. A component
+       * overwritten on every path makes its seed dead after mem2reg/DSE; a
+       * dynamically unwritten component retains the old scratch bits. This is
+       * per virtual slot because one physical lane can run several iterations. */
+      LLVMTypeRef i32_t = LLVMInt32TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef i8_t = LLVMInt8TypeInContext(ctx->llvm_ctx);
+      LLVMValueRef slot = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, emit_workgroup_id(ctx, 0),
+                      LLVMConstInt(i32_t, 256, false), ""),
+         emit_local_invocation_id(ctx, 0), "wb_seed_slot");
+      unsigned stride = MAX2(ctx->nir->num_outputs, 1u) * 16;
+      LLVMValueRef row_off = LLVMBuildMul(ctx->builder, slot,
+         LLVMConstInt(i32_t, stride, false), "wb_seed_row");
+      LLVMValueRef row = LLVMBuildGEP2(ctx->builder, i8_t,
+         cp_arg_slot(ctx, 4), &row_off, 1, "wb_seed_ptr");
+      LLVMValueRef words = LLVMBuildBitCast(ctx->builder, row,
+                                            LLVMPointerType(i32_t, 0), "");
+      for (unsigned c = 0; c < 4; c++) {
+         LLVMValueRef at = LLVMBuildGEP2(ctx->builder, i32_t, words,
+            &(LLVMValueRef){ LLVMConstInt(i32_t, c, false) }, 1, "");
+         LLVMValueRef old = LLVMBuildLoad2(ctx->builder, i32_t, at,
+                                           "wb_color_seed");
+         LLVMSetAlignment(old, 4);
+         LLVMBuildStore(ctx->builder, old, ctx->fused_color[c]);
+      }
+   }
+
    emit_cf_list(ctx, &impl->body);
+
+   /* A distinct same-LLVM execution writes its own direct-path colour after
+    * all shader output stores. `vid` is this grid-stride iteration's virtual
+    * slot, not the physical block's first iteration. */
+   if (ctx->fused_writeback) {
+      LLVMBasicBlockRef body_end = LLVMGetInsertBlock(ctx->builder);
+      LLVMValueRef body_term = LLVMGetBasicBlockTerminator(body_end);
+      if (body_term)
+         LLVMPositionBuilderBefore(ctx->builder, body_term);
+      LLVMTypeRef i32_t = LLVMInt32TypeInContext(ctx->llvm_ctx);
+      LLVMTypeRef i8_ptr = LLVMPointerType(
+         LLVMInt8TypeInContext(ctx->llvm_ctx), 0);
+      LLVMTypeRef params[] = { i8_ptr, i32_t, i32_t, i32_t, i32_t, i32_t };
+      LLVMTypeRef helper_type = LLVMFunctionType(
+         LLVMVoidTypeInContext(ctx->llvm_ctx), params, 6, false);
+      LLVMValueRef helper = LLVMGetNamedFunction(ctx->module,
+                                                 "cp_fs_write_lane");
+      if (!helper)
+         helper = LLVMAddFunction(ctx->module, "cp_fs_write_lane", helper_type);
+      LLVMValueRef slot = LLVMBuildAdd(ctx->builder,
+         LLVMBuildMul(ctx->builder, emit_workgroup_id(ctx, 0),
+                      LLVMConstInt(i32_t, 256, false), ""),
+         emit_local_invocation_id(ctx, 0), "wb_slot");
+      LLVMValueRef args[] = {
+         cp_arg_slot(ctx, CP_ARG_SLOT_FS_WRITEBACK), slot,
+         LLVMBuildLoad2(ctx->builder, i32_t, ctx->fused_color[0], "wb_r"),
+         LLVMBuildLoad2(ctx->builder, i32_t, ctx->fused_color[1], "wb_g"),
+         LLVMBuildLoad2(ctx->builder, i32_t, ctx->fused_color[2], "wb_b"),
+         LLVMBuildLoad2(ctx->builder, i32_t, ctx->fused_color[3], "wb_a"),
+      };
+      LLVMBuildCall2(ctx->builder, helper_type, helper, args, 6, "");
+      if (body_term)
+         LLVMPositionBuilderAtEnd(ctx->builder, body_end);
+   }
 
    /* Close the body: back to the stride loop's latch for a drawing stage,
     * a plain return for compute. */
@@ -3982,7 +4089,8 @@ static bool
 link_and_inline_fs_interp(LLVMModuleRef module, LLVMContextRef llvm_ctx,
                           int sm_major, int sm_minor)
 {
-   static const char *const symbols[] = { "cp_fs_inline_lane" };
+   static const char *const symbols[] = { "cp_fs_inline_lane",
+                                          "cp_fs_write_lane" };
    return link_and_inline_bitcode(module, llvm_ctx, sm_major, sm_minor,
                                   cp_fs_inline_bc, sizeof(cp_fs_inline_bc),
                                   symbols, ARRAY_SIZE(symbols), "FS");
@@ -4684,6 +4792,38 @@ cp_nir_writes_memory(struct nir_shader *nir)
    return false;
 }
 
+/* The scalar handoff is deliberately narrower than generic output storage.
+ * Anything that could address colour slot zero in a shape we cannot reproduce
+ * exactly leaves the independently compiled base execution in charge. */
+static bool
+cp_nir_fused_writeback_eligible(struct nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_output)
+               continue;
+
+            unsigned base = nir_intrinsic_base(intr);
+            if (!nir_src_is_const(intr->src[1])) {
+               if (base == 0)
+                  return false;
+               continue;
+            }
+            if (base + nir_src_as_uint(intr->src[1]) != 0)
+               continue;
+            if (nir_src_bit_size(intr->src[0]) != 32 ||
+                nir_intrinsic_component(intr) + intr->num_components > 4)
+               return false;
+         }
+      }
+   }
+   return true;
+}
+
 static unsigned
 cp_count_substring(const char *text, const char *needle)
 {
@@ -4709,7 +4849,8 @@ static struct cp_shader_binary *
 cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
                    const char *sampler_ptx, const char *fs_helper_ptx,
                    bool fused_interp, bool inline_interp,
-                   bool hardware_texture, bool vs_fetch)
+                   bool hardware_texture, bool vs_fetch,
+                   bool fused_writeback)
 {
    struct ntl_context ctx = {0};
    ctx.nir = nir;
@@ -4719,8 +4860,12 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    ctx.inline_interp = inline_interp;
    ctx.hardware_texture = hardware_texture;
    ctx.vs_fetch = vs_fetch && nir->info.stage == MESA_SHADER_VERTEX;
+   bool want_fused_writeback = fused_writeback && inline_interp &&
+                               nir->info.stage == MESA_SHADER_FRAGMENT;
 
    cp_lower_nir(nir);
+   ctx.fused_writeback = want_fused_writeback &&
+                         cp_nir_fused_writeback_eligible(nir);
    if (hardware_texture && !cp_hardware_texture_shader_eligible(nir))
       return cp_hardware_failure_stub(CP_HW_COMPILE_INELIGIBLE);
 
@@ -4855,6 +5000,7 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    ctx.writes_memory = cp_nir_writes_memory(nir);
    struct cp_shader_binary tex_meta = {0};
    capture_tex_desc_refs(nir, &tex_meta);
+   unsigned vm_ops = cp_debug->shader_stats ? cp_nir_vm_ops(nir) : 0;
    if (hardware_texture) {
       capture_hw_tex_sites(nir, &tex_meta);
       ctx.hardware_texture_site_count = tex_meta.num_hw_tex_sites;
@@ -5047,7 +5193,8 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
                          grad_count != tex_meta.num_hw_tex_sites - expected_level ||
                          dim_count != tex_meta.num_hw_tex_sites;
    }
-   bool surviving_inline_helper = strstr(ptx, "cp_fs_inline_lane");
+   bool surviving_inline_helper = strstr(ptx, "cp_fs_inline_lane") ||
+                                  strstr(ptx, "cp_fs_write_lane");
    bool local_memory = strstr(ptx, ".local") || strstr(ptx, "ld.local") ||
                        strstr(ptx, "st.local");
 
@@ -5103,11 +5250,14 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
       return NULL;
    }
    enum cp_shader_exec_mode mode = hardware_texture
-      ? (inline_interp ? CP_SHADER_EXEC_HW_INLINE : CP_SHADER_EXEC_HW_FUSED)
+      ? (inline_interp ? (ctx.fused_writeback ? CP_SHADER_EXEC_HW_INLINE_WB
+                                              : CP_SHADER_EXEC_HW_INLINE)
+                       : CP_SHADER_EXEC_HW_FUSED)
+      : (ctx.fused_writeback ? CP_SHADER_EXEC_INLINE_WB
       : (ctx.vs_fetch ? CP_SHADER_EXEC_VS_FETCH
                       : (inline_interp ? CP_SHADER_EXEC_INLINE
                        : (fused_interp ? CP_SHADER_EXEC_FUSED
-                                       : CP_SHADER_EXEC_CLASSIC)));
+                                       : CP_SHADER_EXEC_CLASSIC))));
    struct cp_shader_exec *exec = &bin->exec[mode];
    exec->ptx_text = ptx;
    exec->ptx_size = ptx_size;
@@ -5121,7 +5271,10 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
    bin->vs_live_slots = ctx.vs_live_slots;
    bin->reads_const_bufs = ctx.reads_const_bufs;
    bin->writes_memory = ctx.writes_memory;
+   bin->uses_tex = ctx.uses_tex;
+   bin->vm_ops = vm_ops;
 
+   bin->num_tex_instrs = tex_meta.num_tex_instrs;
    bin->num_tex_descs = tex_meta.num_tex_descs;
    memcpy(bin->tex_descs, tex_meta.tex_descs, sizeof(bin->tex_descs));
    bin->tex_descs_dynamic = tex_meta.tex_descs_dynamic;
@@ -5172,8 +5325,11 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
       stage_name = "vertex fused-fetch";
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       stage_name = hardware_texture
-         ? (inline_interp ? "fragment hardware inline" : "fragment hardware fused")
-         : (inline_interp ? "fragment inline" :
+         ? (inline_interp ? (ctx.fused_writeback ? "fragment hw inline+wb"
+                                                 : "fragment hardware inline")
+                          : "fragment hardware fused")
+         : (inline_interp ? (ctx.fused_writeback ? "fragment inline+wb"
+                                                 : "fragment inline") :
           (fused_interp ? "fragment fused" : "fragment classic"));
    CUresult err = load_shader_module_tuned(exec, ptx,
                                            needs_sampler ? sampler_ptx : NULL,
@@ -5242,7 +5398,7 @@ cp_vs_attach_fused_fetch(struct cp_shader_binary *bin,
 
    struct cp_shader_binary *fused =
       cp_compile_nir_one(fused_nir, sm_major, sm_minor, sampler_ptx, NULL,
-                         false, false, false, true);
+                         false, false, false, true, false);
    struct cp_shader_exec *fx = fused ? &fused->exec[CP_SHADER_EXEC_VS_FETCH]
                                      : NULL;
    if (!fx || !fx->kernel) {
@@ -5305,6 +5461,41 @@ cp_vs_attach_fused_fetch(struct cp_shader_binary *bin,
 #endif
 }
 
+#ifdef CP_HAVE_FS_INLINE_BC
+/* Attach an independently built writeback execution only when it preserves
+ * the base execution's local-memory, spill, and occupancy class. */
+static void
+cp_fs_attach_writeback(struct cp_shader_binary *bin,
+                       enum cp_shader_exec_mode base_mode,
+                       struct cp_shader_binary *wb_bin)
+{
+   if (!bin || !wb_bin)
+      return;
+   enum cp_shader_exec_mode wb_mode = cp_shader_exec_wb_of(base_mode);
+   struct cp_shader_exec *base = &bin->exec[base_mode];
+   struct cp_shader_exec *wb = &wb_bin->exec[wb_mode];
+   if (!base->kernel || !wb->kernel)
+      return;
+
+   unsigned base_local = base->ptx_text
+      ? cp_count_substring(base->ptx_text, ".local") : 0;
+   unsigned wb_local = wb->ptx_text
+      ? cp_count_substring(wb->ptx_text, ".local") : 0;
+   if (wb_local > base_local || wb->spill_bytes > base->spill_bytes ||
+       wb->blocks_per_sm < base->blocks_per_sm) {
+      if (cp_debug->shader_stats)
+         fprintf(stderr, "cudavk: declined fused writeback: local %u->%u "
+                 "spill %d->%d blocks/sm %d->%d\n", base_local, wb_local,
+                 base->spill_bytes, wb->spill_bytes, base->blocks_per_sm,
+                 wb->blocks_per_sm);
+      return;
+   }
+
+   bin->exec[wb_mode] = *wb;
+   memset(wb, 0, sizeof(*wb));
+}
+#endif
+
 static struct cp_shader_binary *
 cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
                         const char *sampler_ptx, const char *fs_helper_ptx,
@@ -5323,7 +5514,7 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
 #endif
       struct cp_shader_binary *bin =
          cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx, NULL,
-                            false, false, false, false);
+                            false, false, false, false, false);
       if (nir->info.stage == MESA_SHADER_VERTEX)
          cp_vs_attach_fused_fetch(bin, fused_nir, sm_major, sm_minor,
                                   sampler_ptx);
@@ -5338,7 +5529,7 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
          ? NULL : nir_shader_clone(NULL, nir);
       struct cp_shader_binary *fused =
          cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
-                            fs_helper_ptx, true, false, false, false);
+                            fs_helper_ptx, true, false, false, false, false);
       if (fused && fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
          ralloc_free(classic_nir);
          return fused;
@@ -5348,7 +5539,7 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
        * correctness if its fused JIT is unavailable. */
       struct cp_shader_binary *classic = classic_nir
          ? cp_compile_nir_one(classic_nir, sm_major, sm_minor, sampler_ptx,
-                              NULL, false, false, false, false)
+                              NULL, false, false, false, false, false)
          : NULL;
       ralloc_free(classic_nir);
       return classic;
@@ -5361,31 +5552,40 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
    nir_shader *standalone_nir = nir_shader_clone(NULL, nir);
 #ifdef CP_HAVE_FS_INLINE_BC
    nir_shader *inline_nir = nir_shader_clone(NULL, nir);
+   nir_shader *inline_wb_nir = cp_debug->fused_writeback
+      ? nir_shader_clone(NULL, nir) : NULL;
 #else
+   nir_shader *inline_wb_nir = NULL;
    nir_shader *inline_nir = NULL;
    call_once(&cp_inline_missing_once, cp_warn_inline_missing);
 #endif
    struct cp_shader_binary *fused =
       cp_compile_nir_one(nir, sm_major, sm_minor, sampler_ptx,
-                         fs_helper_ptx, true, false, false, false);
+                         fs_helper_ptx, true, false, false, false, false);
    if (fused && !fused->exec[CP_SHADER_EXEC_FUSED].kernel) {
       cp_shader_binary_destroy(fused);
       fused = NULL;
    }
    struct cp_shader_binary *classic = !fused && standalone_nir
       ? cp_compile_nir_one(standalone_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, false, false, false)
+                           NULL, false, false, false, false, false)
       : NULL;
    struct cp_shader_binary *inlined = inline_nir
       ? cp_compile_nir_one(inline_nir, sm_major, sm_minor, sampler_ptx,
-                           NULL, false, true, false, false)
+                           NULL, false, true, false, false, false)
+      : NULL;
+   struct cp_shader_binary *inlined_wb = inline_wb_nir
+      ? cp_compile_nir_one(inline_wb_nir, sm_major, sm_minor, sampler_ptx,
+                           NULL, false, true, false, false, true)
       : NULL;
    ralloc_free(standalone_nir);
    ralloc_free(inline_nir);
+   ralloc_free(inline_wb_nir);
 
    struct cp_shader_binary *bin = fused ? fused : classic;
    if (!bin) {
       cp_shader_binary_destroy(inlined);
+      cp_shader_binary_destroy(inlined_wb);
       return NULL;
    }
    if (inlined && inlined != bin) {
@@ -5394,6 +5594,10 @@ cp_compile_nir_software(struct nir_shader *nir, int sm_major, int sm_minor,
              sizeof(inlined->exec[CP_SHADER_EXEC_INLINE]));
       cp_shader_binary_destroy(inlined);
    }
+#ifdef CP_HAVE_FS_INLINE_BC
+   cp_fs_attach_writeback(bin, CP_SHADER_EXEC_INLINE, inlined_wb);
+#endif
+   cp_shader_binary_destroy(inlined_wb);
    return bin;
 }
 
@@ -5413,10 +5617,13 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
     * NIR. A build without matching inline bitcode quietly skips this clone. */
    nir_shader *hardware_nir = NULL;
    nir_shader *hardware_fused_nir = NULL;
+   nir_shader *hardware_wb_nir = NULL;
 #ifdef CP_HAVE_FS_INLINE_BC
    if (hw_texture && nir->info.stage == MESA_SHADER_FRAGMENT) {
       hardware_nir = nir_shader_clone(NULL, nir);
       hardware_fused_nir = nir_shader_clone(NULL, nir);
+      if (cp_debug->fused_writeback)
+         hardware_wb_nir = nir_shader_clone(NULL, nir);
    }
 #else
    (void)hw_texture;
@@ -5429,13 +5636,13 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
 #ifdef CP_HAVE_FS_INLINE_BC
    struct cp_shader_binary *hardware = hardware_nir
       ? cp_compile_nir_one(hardware_nir, sm_major, sm_minor, math_ptx, NULL,
-                           false, true, true, false)
+                           false, true, true, false, false)
       : NULL;
    struct cp_shader_binary *hardware_fused =
       hardware_fused_nir &&
       (!hardware || !hardware->exec[CP_SHADER_EXEC_HW_INLINE].kernel)
       ? cp_compile_nir_one(hardware_fused_nir, sm_major, sm_minor,
-                           math_ptx, fs_helper_ptx, true, false, true, false)
+                           math_ptx, fs_helper_ptx, true, false, true, false, false)
       : NULL;
    if (bin && hardware) {
       bin->hw_compile_failure = hardware->hw_compile_failure;
@@ -5474,11 +5681,20 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
             ? hardware_fused->hw_compile_failure : CP_HW_COMPILE_OTHER;
       }
    }
+   struct cp_shader_binary *hardware_wb =
+      hardware_wb_nir && bin && bin->exec[CP_SHADER_EXEC_HW_INLINE].kernel
+      ? cp_compile_nir_one(hardware_wb_nir, sm_major, sm_minor, math_ptx, NULL,
+                           false, true, true, false, true)
+      : NULL;
+   if (bin && bin->exec[CP_SHADER_EXEC_HW_INLINE].kernel)
+      cp_fs_attach_writeback(bin, CP_SHADER_EXEC_HW_INLINE, hardware_wb);
+   cp_shader_binary_destroy(hardware_wb);
    cp_shader_binary_destroy(hardware);
    cp_shader_binary_destroy(hardware_fused);
 #endif
    ralloc_free(hardware_nir);
    ralloc_free(hardware_fused_nir);
+   ralloc_free(hardware_wb_nir);
    return bin;
 }
 

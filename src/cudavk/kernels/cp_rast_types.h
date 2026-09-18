@@ -6,7 +6,7 @@
 #ifndef CP_RAST_TYPES_H
 #define CP_RAST_TYPES_H
 
-#ifndef __CUDACC__
+#if !defined(__CUDACC__) || !defined(__CUDACC_RTC__)
 #include <stdint.h>
 #else
 /* NVRTC doesn't have stdint.h — define what we need */
@@ -212,7 +212,8 @@ struct cp_rasterize_args {
     * nothing is left.
     */
    uint64_t peel_next;      /* uint32 per pixel: first primitive not yet blended */
-   uint64_t peel_any;       /* uint32: set when any pixel still had a layer */
+   uint64_t peel_any;       /* uint32: set to peel_epoch when work remains */
+   uint32_t peel_epoch;     /* generation for this convergence interval */
    uint32_t blend_peel;
    /* Samples per pixel, 1 or CP_MAX_SAMPLES. Coverage and depth are resolved
     * per sample; shading stays per pixel. */
@@ -388,6 +389,11 @@ struct cp_clip_args {
 
 #define CP_MAX_CLIP_SLOTS 16
 
+/* Run-wide clip/bin ABI limits.  Tile size 32 is load-bearing: DEAD_ENDS 45
+ * rejected the otherwise identical 16-pixel arm. */
+#define CP_RUN_CLIP_BIN_TILE_SIZE CP_OPAQUE_TILE_SIZE
+#define CP_RUN_CLIP_BIN_MAX_SEGS 64u
+
 /* Shader kernel argument slots. 0..7 are the fixed stage inputs and 18.. are
  * the uniform/descriptor buffers; the gap in between is free. */
 #define CP_ARG_SLOT_DISCARD 8
@@ -469,6 +475,11 @@ struct cp_clip_args {
  * a fused vertex kernel with it null is an internal error, not a soft path.
  */
 #define CP_ARG_SLOT_VS_FETCH 16
+
+/* Optional device address of cp_fs_writeback_args for a fragment execution
+ * that writes its direct-path colour itself. Null for every non-fused and
+ * A-buffer execution. */
+#define CP_ARG_SLOT_FS_WRITEBACK 17
 
 /*
  * One merged draw's slice of the assembled vertex stream.
@@ -1369,6 +1380,132 @@ _Static_assert(sizeof(struct cp_setup_cache_entry) == 84, "setup-cache ABI");
 _Static_assert(CP_PRIM_ID_LIMIT <= CP_TILE_SETUP_TAG, "primitive/tag range collision");
 _Static_assert(CP_SETUP_CACHE_CAPACITY <= CP_TILE_SETUP_INDEX_MASK,
                "setup-cache index does not fit tile tag");
+#endif
+
+/*
+ * Run-wide clip/setup/tile-count ABI. Each ordered segment retains the exact
+ * clip and raster arguments used by the legacy per-segment path. The kernel
+ * changes scheduling only: local stable slots remain triangle *
+ * CP_CLIP_MAX_OUT, while prim_base turns them into one run-global ordered ID.
+ * Counts are bounding-box references. A later fill pass reads the compact
+ * live records and recomputes setup from the descriptor and local stable ID.
+ */
+struct cp_run_clip_bin_device_segment {
+   struct cp_clip_args clip;
+   struct cp_rasterize_args rast;
+   uint32_t prim_base;
+};
+
+struct cp_run_clip_bin_live {
+   uint32_t stable_prim;
+   uint32_t segment;
+};
+
+/* Compact setup consumed by the direct run raster. Keeping the completed
+ * setup removes the bin path's second setup_triangle() and lets a fixed grid
+ * handle every bbox size without a dense tile-reference list. */
+struct cp_run_clip_direct_live {
+   struct cp_tri_setup setup;
+   uint32_t stable_prim;
+   uint32_t segment;
+};
+
+struct cp_run_clip_direct_raster_args {
+   uint64_t segments;
+   uint64_t live;
+   uint64_t live_count;
+   uint64_t errors;
+   uint32_t num_segments;
+   uint32_t total_slots;
+   uint32_t live_capacity;
+};
+
+#define CP_RUN_CLIP_BIN_ERR_LIVE_BOUNDS    (1u << 0)
+#define CP_RUN_CLIP_BIN_ERR_SEGMENT_BOUNDS (1u << 1)
+#define CP_RUN_CLIP_BIN_ERR_PRIM_BOUNDS    (1u << 2)
+#define CP_RUN_CLIP_BIN_ERR_REF_OVERFLOW   (1u << 3)
+#define CP_RUN_CLIP_BIN_ERR_CURSOR_MISMATCH (1u << 4)
+
+struct cp_run_clip_bin_args {
+   uint64_t segments;    /* const cp_run_clip_bin_device_segment[num_segments] */
+   uint64_t live;        /* compact cp_run_clip_bin_live[live_capacity] */
+   uint64_t live_count;  /* atomic uint32; caller clears */
+   uint64_t overflow;    /* uint32; caller clears, makes transaction refuse */
+   uint64_t tile_counts; /* uint32[tiles_x * tiles_y], caller clears */
+   uint32_t num_segments;
+   uint32_t total_slots;
+   uint32_t live_capacity;
+   uint32_t tiles_x;
+   uint32_t tiles_y;
+};
+
+/* One launch covers every stable primitive in the run.  The kernel reads
+ * each cp_rasterize_args verbatim and is the inverse of the tiled visibility
+ * arm: zero errors return before geometry is touched; any error selects exact
+ * ordinary depth-tested visbuf rasterization. */
+struct cp_run_clip_bin_fallback_args {
+   uint64_t rast_args; /* const cp_rasterize_args[num_segments] */
+   uint64_t errors;    /* shared uint32 transaction predicate */
+   uint32_t num_segments;
+};
+
+#ifdef __CUDACC__
+static_assert(CP_RUN_CLIP_BIN_MAX_SEGS <= CP_PASS_MAX_SEGS,
+              "run segments must fit pass storage");
+static_assert(sizeof(struct cp_run_clip_bin_live) == 8, "run live ABI");
+static_assert(sizeof(struct cp_run_clip_direct_live) == 88,
+              "run direct live ABI");
+static_assert(sizeof(struct cp_run_clip_bin_args) == 64, "run bin args ABI");
+static_assert(sizeof(struct cp_run_clip_bin_fallback_args) == 24,
+              "run fallback args ABI");
+#else
+_Static_assert(CP_RUN_CLIP_BIN_MAX_SEGS <= CP_PASS_MAX_SEGS,
+               "run segments must fit pass storage");
+_Static_assert(sizeof(struct cp_run_clip_bin_live) == 8, "run live ABI");
+_Static_assert(sizeof(struct cp_run_clip_direct_live) == 88,
+              "run direct live ABI");
+_Static_assert(sizeof(struct cp_run_clip_bin_args) == 64, "run bin args ABI");
+_Static_assert(sizeof(struct cp_run_clip_bin_fallback_args) == 24,
+               "run fallback args ABI");
+#endif
+
+struct cp_run_clip_bin_check_counts_args {
+   uint64_t tile_counts;
+   uint64_t total_refs; /* uint64_t[1], written by the kernel */
+   uint64_t errors;
+   uint32_t num_tiles;
+   uint32_t capacity;
+};
+
+struct cp_run_clip_bin_fill_args {
+   uint64_t segments;
+   uint64_t live;
+   uint64_t live_count;
+   uint64_t tile_counts;
+   uint64_t tile_offsets;
+   uint64_t tile_cursors;
+   uint64_t tile_refs; /* cp_opaque_tile_ref[capacity] */
+   uint64_t errors;
+   uint32_t num_segments;
+   uint32_t total_slots;
+   uint32_t live_capacity;
+   uint32_t tiles_x;
+   uint32_t tiles_y;
+   uint32_t capacity;
+};
+
+#ifdef __CUDACC__
+static_assert(sizeof(struct cp_run_clip_bin_check_counts_args) == 32,
+              "run count-check args ABI");
+static_assert(sizeof(struct cp_run_clip_bin_fill_args) == 88,
+              "run fill args ABI");
+static_assert(sizeof(struct cp_opaque_tile_ref) == 8, "tile ref ABI");
+#else
+_Static_assert(sizeof(struct cp_run_clip_bin_check_counts_args) == 32,
+               "run count-check args ABI");
+_Static_assert(sizeof(struct cp_run_clip_bin_fill_args) == 88,
+               "run fill args ABI");
+_Static_assert(sizeof(struct cp_opaque_tile_ref) == 8, "tile ref ABI");
 #endif
 
 /*

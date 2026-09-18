@@ -100,3 +100,22 @@ are, and they covered favorite3 only.
 **A sentinel sample is a smoke test, not an image comparison.** When the claim
 is "these render the same", the population is every frame, and it is now cheap
 to check because both renders exist.
+
+
+## Current denominator recheck after pinned residency (2026-09-09)
+
+The explicit NVIDIA ICD was rerun three times per capture with the same submit
+shim and two-submit frame convention. Every run exited zero with 6,947/6,965
+rows. Medians (per-run values in parentheses):
+
+| capture | native whole | native heavy | 4x whole / heavy | current cudavk whole / heavy | ratio whole / heavy |
+|---|---:|---:|---:|---:|---:|
+| favorite3 | 0.5193 (0.5193, 0.5193, 0.5392) | 0.5682 (0.5676, 0.5682, 0.5848) | 2.0773 / 2.2727 | 4.9813 / 5.7643 | **9.59x / 10.15x** |
+| favorite2 | 0.5062 (0.5042, 0.5062, 0.5070) | 0.5244 (0.5244, 0.5265, 0.5244) | 2.0248 / 2.0977 | 4.7093 / 4.8643 | **9.30x / 9.28x** |
+
+The denominator therefore has not drifted into a different conclusion. The
+shipped CUDA-only renderer misses every exact 4x limit by 2.68-3.49 ms and is
+still roughly 9.3-10.2x native. An attempted run with no explicit ICD is not
+evidence: it selected an incompatible device/memory-type mapping and died
+before the first submit. Always name
+`/usr/share/vulkan/icd.d/nvidia_icd.json` for this check.

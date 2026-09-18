@@ -36,6 +36,15 @@ _Static_assert(offsetof(struct cp_fs_interp_args, fused_direct) == 400,
 _Static_assert(offsetof(struct cp_fs_interp_args, depth_scale) == 404,
                "cp_fs_interp_args.depth_scale ABI");
 
+_Static_assert(sizeof(struct cp_fs_writeback_args) == 176,
+               "cp_fs_writeback_args ABI size");
+_Static_assert(_Alignof(struct cp_fs_writeback_args) == 8,
+               "cp_fs_writeback_args ABI alignment");
+_Static_assert(offsetof(struct cp_fs_writeback_args, frag_coord) == 32,
+               "cp_fs_writeback_args.frag_coord ABI");
+_Static_assert(offsetof(struct cp_fs_writeback_args, blend) == 128,
+               "cp_fs_writeback_args.blend ABI");
+
 _Static_assert(sizeof(struct cp_seg_range) == 48, "cp_seg_range ABI size");
 _Static_assert(_Alignof(struct cp_seg_range) == 8,
                "cp_seg_range ABI alignment");
@@ -75,6 +84,69 @@ cp_make_float4(float x, float y, float z, float w)
 #undef CP_FMUL_RN
 #undef CP_INTERP_FIXED_SLOTS
 #undef CP_INTERP_INLINE
+
+/* The same writeback body as the standalone NVRTC kernel, with clang/NVVM
+ * spellings for the CUDA builtins. */
+extern float cp_nvvm_ex2_approx_f(float) __asm("llvm.nvvm.ex2.approx.f");
+extern float cp_nvvm_lg2_approx_f(float) __asm("llvm.nvvm.lg2.approx.f");
+
+static inline __attribute__((always_inline)) float
+cp_fsw_powf(float a, float b)
+{
+   return cp_nvvm_ex2_approx_f(b * cp_nvvm_lg2_approx_f(a));
+}
+
+static inline __attribute__((always_inline)) int
+cp_fsw_float_as_int(float f)
+{
+   union { float f; int i; } bits = { .f = f };
+   return bits.i;
+}
+
+static inline __attribute__((always_inline)) float
+cp_fsw_int_as_float(int i)
+{
+   union { float f; int i; } bits = { .i = i };
+   return bits.f;
+}
+
+static inline __attribute__((always_inline)) float
+cp_fsw_uint_as_float(uint32_t i)
+{
+   union { float f; uint32_t i; } bits = { .i = i };
+   return bits.f;
+}
+
+static inline __attribute__((always_inline)) uint32_t
+cp_fsw_float_as_uint(float f)
+{
+   union { float f; uint32_t i; } bits = { .f = f };
+   return bits.i;
+}
+
+#define CP_FSW_INLINE static inline __attribute__((always_inline))
+#define CP_FSW_FMINF(a, b) __builtin_fminf((a), (b))
+#define CP_FSW_FMAXF(a, b) __builtin_fmaxf((a), (b))
+#define CP_FSW_POWF(a, b) cp_fsw_powf((a), (b))
+#define CP_FSW_FFS(a) __builtin_ffs(a)
+#define CP_FSW_FLOAT_AS_INT(f) cp_fsw_float_as_int(f)
+#define CP_FSW_INT_AS_FLOAT(i) cp_fsw_int_as_float(i)
+#define CP_FSW_UINT_AS_FLOAT(i) cp_fsw_uint_as_float(i)
+#define CP_FSW_FLOAT_AS_UINT(f) cp_fsw_float_as_uint(f)
+#define CP_FSW_MAKE_FLOAT4(x, y, z, w) cp_make_float4((x), (y), (z), (w))
+#define CP_FSW_UNROLL _Pragma("clang loop unroll(full)")
+#include "cp_fs_write.h"
+#undef CP_FSW_UNROLL
+#undef CP_FSW_MAKE_FLOAT4
+#undef CP_FSW_FLOAT_AS_UINT
+#undef CP_FSW_UINT_AS_FLOAT
+#undef CP_FSW_INT_AS_FLOAT
+#undef CP_FSW_FLOAT_AS_INT
+#undef CP_FSW_FFS
+#undef CP_FSW_POWF
+#undef CP_FSW_FMAXF
+#undef CP_FSW_FMINF
+#undef CP_FSW_INLINE
 
 extern uint32_t cp_nvvm_tid_x(void)
    __asm("llvm.nvvm.read.ptx.sreg.tid.x");
@@ -207,4 +279,19 @@ cp_fs_inline_lane(const struct cp_fs_interp_args *source, uint32_t slot,
       ((unsigned char *)(uintptr_t)args.coverage)[slot] =
          (ok && in_fb && (mask & (1u << lane))) ? 1u : 0u;
    return ok ? 1 : 0;
+}
+
+
+/* Linked into the generated fragment execution and inlined away. */
+__attribute__((always_inline)) void
+cp_fs_write_lane(const struct cp_fs_writeback_args *source, uint32_t slot,
+                 uint32_t x, uint32_t y, uint32_t z, uint32_t w)
+{
+   if (source) {
+      float4 color = cp_make_float4(cp_fsw_uint_as_float(x),
+                                    cp_fsw_uint_as_float(y),
+                                    cp_fsw_uint_as_float(z),
+                                    cp_fsw_uint_as_float(w));
+      cp_fs_writeback_one_color(source, slot, color, 1u);
+   }
 }

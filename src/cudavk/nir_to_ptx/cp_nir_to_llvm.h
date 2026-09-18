@@ -79,8 +79,25 @@ enum cp_shader_exec_mode {
     * so the packed input buffer and its own launch do not exist. Independently
     * linked, which is what makes selecting the classic binary a real revert. */
    CP_SHADER_EXEC_VS_FETCH = 5,
-   CP_SHADER_EXEC_COUNT = 6,
+   /* Same-LLVM fragment executions with direct-path writeback inlined. */
+   CP_SHADER_EXEC_INLINE_WB = 6,
+   CP_SHADER_EXEC_HW_INLINE_WB = 7,
+   CP_SHADER_EXEC_COUNT = 8,
 };
+
+static inline enum cp_shader_exec_mode
+cp_shader_exec_wb_of(enum cp_shader_exec_mode mode)
+{
+   return mode == CP_SHADER_EXEC_HW_INLINE ? CP_SHADER_EXEC_HW_INLINE_WB
+        : (mode == CP_SHADER_EXEC_INLINE ? CP_SHADER_EXEC_INLINE_WB : mode);
+}
+
+static inline bool
+cp_shader_exec_is_wb(enum cp_shader_exec_mode mode)
+{
+   return mode == CP_SHADER_EXEC_INLINE_WB ||
+          mode == CP_SHADER_EXEC_HW_INLINE_WB;
+}
 
 /*
  * Why a vertex shader did or did not get a fused-fetch execution. The census
@@ -198,6 +215,11 @@ struct cp_shader_binary {
    bool inline_fallback_reported;
    bool hw_inline_fallback_reported;
 
+   /* Static instruction count for the shader-VM feasibility census. */
+   unsigned vm_ops;
+
+   /* Whether emitted code calls any software-sampler entry point. */
+   bool uses_tex;
    bool uses_tex_3d;
    /* Whether any textureGather() in the shader is one the sampler serves, and
     * therefore whether the sampler module linked in has cp_tex_gather() in
@@ -279,6 +301,8 @@ cp_shader_has_any_exec(const struct cp_shader_binary *bin)
 {
    return bin && (bin->exec[CP_SHADER_EXEC_CLASSIC].kernel ||
                   bin->exec[CP_SHADER_EXEC_VS_FETCH].kernel ||
+                  bin->exec[CP_SHADER_EXEC_INLINE_WB].kernel ||
+                  bin->exec[CP_SHADER_EXEC_HW_INLINE_WB].kernel ||
                   bin->exec[CP_SHADER_EXEC_FUSED].kernel ||
                   bin->exec[CP_SHADER_EXEC_INLINE].kernel ||
                   bin->exec[CP_SHADER_EXEC_HW_INLINE].kernel ||

@@ -1,0 +1,93 @@
+main tid 308125468474637 worker tid 308125468474653
+worker cuEventSynchronize rows (submits) 2051
+window (18629876, 8598737501) frames 1024 wall 8580.108 ms -> 8.3790 ms/frame mean
+frame wall median 8.1432 p10 3.8933 p90 10.4393
+device ops in window 1159025 kernels 736846
+device union 5.1517 ms/frame  summed 7.8995  idle 3.2273  overlap 1.533x
+== ops per class on main stream 13 vs side streams (per frame):
+   memcpy1                  main  191.30 side   70.69
+   memset                   main  102.58 side   11.51
+   VS                       main   46.18 side   62.81
+   cp_rasterize_stage2      main   49.14 side   16.57
+   cp_rasterize_stage3      main   49.14 side   16.57
+   cp_fs_compact            main   65.71 side    0.00
+   FS_direct                main   65.71 side    0.00
+   cp_fs_writeback          main   65.71 side    0.00
+   cp_clip_rast_fused       main   44.21 side   16.57
+   cp_clip_rast_fused_abuf  main    1.96 side   37.05
+   cp_rasterize_stage2_abuf main    1.96 side   37.05
+   cp_rasterize_stage3_abuf main    1.96 side   37.05
+   memcpy8                  main   23.30 side    0.00
+   cp_abuf_scan_finish      main   13.13 side    0.00
+   cp_clip_triangles        main    0.00 side    9.20
+   cp_abuf_scan_reduce      main    6.57 side    0.00
+   cp_abuf_fill_recs        main    6.57 side    0.00
+   cp_abuf_sort             main    6.57 side    0.00
+   cp_abuf_quad_count_all   main    6.57 side    0.00
+   cp_abuf_quad_fill_all    main    6.57 side    0.00
+
+== union-exclusive per pool (ms/frame): exclusive, summed, launches/frame
+  all_kernels          4.3083   7.0536   719.58  self-overlap 1.64x
+  clip_all             0.7254   2.3181   108.99  self-overlap 3.20x
+  VS                   0.6815   1.4825   108.99  self-overlap 2.18x
+  FS_direct            0.6646   0.6646    65.71  self-overlap 1.00x
+  clip_rast_fused      0.5854   1.9142    60.78  self-overlap 3.27x
+  memcpy               0.4848   0.5191   298.20  self-overlap 1.07x
+  stage3               0.4196   0.7642    65.71  self-overlap 1.82x
+  fs_compact           0.3683   0.3683    65.71  self-overlap 1.00x
+  memset               0.3220   0.3268   114.09  self-overlap 1.01x
+  stage2               0.2114   0.3692    65.71  self-overlap 1.75x
+  memcpy_HtoD          0.1954   0.2296   261.99  self-overlap 1.18x
+  abuf_support         0.1921   0.1921    66.23  self-overlap 1.00x
+  vertex_fetch         0.1244   0.1491     5.83  self-overlap 1.20x
+  fs_writeback         0.1086   0.1086    65.71  self-overlap 1.00x
+  stage3_abuf          0.0915   0.3110    39.02  self-overlap 3.40x
+  FS_abuf              0.0748   0.0748     2.28  self-overlap 1.00x
+  main_other           0.0355   0.0386     3.92  self-overlap 1.09x
+main-thread runtime rows 1608024
+host blocked in sync APIs 3.9374 ms/frame; all main-thread CUDA API residency 6.2415; blocking calls/frame 17.19 {'cuMemcpyHtoD_v2': 1013, 'cuCtxSynchronize': 1444, 'cuStreamSynchronize': 8419, 'cuMemcpyDtoH_v2': 6722}
+blocking syncs in window 17598 -> 17.19/frame
+event records 221367 stream waits 199306
+host timeline events 1589593
+site census (count/frame, blocked ms/frame, CUPTI-inflated):
+   S1                4.60    0.5938
+   S1copy            4.60    0.0322
+   S2                1.96    0.2860
+   S2copy            1.96    0.0191
+   S3                1.67    0.1542
+   S4                1.41    2.8407
+   S6                0.99    0.0115
+   Sother:cuMemcpyDtoH_v2    0.01    0.0000
+   Sother:cuMemcpyHtoD_v2    0.00    0.0000
+readback fences in window 1013 (0.99/frame); app gap fence-return->first CUDA call: median 790 us p10 581 p90 1158; negative 0
+E0 unchanged: median 8.1549 mean 8.3253 (orig median 8.1432 mean 8.3790)
+E0 + fence dep (must equal E0): median 8.1549 mean 8.3253
+  free syncs, NO fence dep (closure-audit)                   median 6.7827 (d -1.3723)  mean 6.4991 (d -1.8262)
+  free syncs, fence kept                                     median 7.6475 (d -0.5074)  mean 7.8055 (d -0.5198)
+  free syncs, fence kept, host x0.5                          median 7.2191 (d -0.9359)  mean 7.1097 (d -1.2155)
+  free syncs, fence kept, gaps zero                          median 5.9113 (d -2.2436)  mean 6.2235 (d -2.1018)
+  host infinitely fast, fence kept                           median 7.6684 (d -0.4865)  mean 7.8198 (d -0.5055)
+  free S1, fence kept                                        median 7.9628 (d -0.1922)  mean 8.1460 (d -0.1793)
+  free S1, NO fence dep                                      median 7.6732 (d -0.4818)  mean 7.8623 (d -0.4630)
+  free S2, fence kept                                        median 8.0542 (d -0.1008)  mean 8.2150 (d -0.1103)
+  free S2, NO fence dep                                      median 8.0542 (d -0.1008)  mean 8.2150 (d -0.1103)
+  free S3, fence kept                                        median 8.1294 (d -0.0256)  mean 8.2990 (d -0.0263)
+  free S3, NO fence dep                                      median 8.1294 (d -0.0256)  mean 8.2990 (d -0.0263)
+  free S4, fence kept                                        median 8.1379 (d -0.0170)  mean 8.3026 (d -0.0226)
+  free S4, NO fence dep                                      median 8.1379 (d -0.0170)  mean 8.3026 (d -0.0226)
+  free S6, fence kept                                        median 8.1525 (d -0.0024)  mean 8.3186 (d -0.0067)
+  free S6, NO fence dep                                      median 8.1525 (d -0.0024)  mean 8.3186 (d -0.0067)
+  free S1+S2, fence kept                                     median 7.8157 (d -0.3393)  mean 8.0206 (d -0.3047)
+  free S1+S2, NO fence dep                                   median 7.5333 (d -0.6217)  mean 7.7212 (d -0.6041)
+  free S1+S2+S4, fence kept                                  median 7.7899 (d -0.3650)  mean 7.9492 (d -0.3761)
+  free S1+S2+S4, NO fence dep                                median 7.4918 (d -0.6632)  mean 7.5705 (d -0.7547)
+  free S1+S2+S3, fence kept                                  median 7.6812 (d -0.4737)  mean 7.8975 (d -0.4278)
+  free S1+S2+S3, NO fence dep                                median 7.0257 (d -1.1292)  mean 7.3477 (d -0.9776)
+  free S1+S2+S3+S4, fence kept                               median 7.6535 (d -0.5014)  mean 7.8123 (d -0.5130)
+  free S1+S2+S3+S4, NO fence dep                             median 6.7827 (d -1.3723)  mean 6.4992 (d -1.8261)
+  free S1+S2+S3+S4+S6, fence kept                            median 7.6475 (d -0.5074)  mean 7.8056 (d -0.5197)
+  free S1+S2+S3+S4+S6, NO fence dep                          median 6.7827 (d -1.3723)  mean 6.4991 (d -1.8261)
+  free S1+S2+S3+S4, fence kept, +2.0 us device per freed S1/S2/S3 median 7.6725 (d -0.4824)  mean 7.8287 (d -0.4966)
+  free S1+S2+S3+S4, fence kept, +7.3 us device per freed S1/S2/S3 median 7.7162 (d -0.4387)  mean 7.8723 (d -0.4530)
+  free S1+S2+S3+S4, fence kept, +10.3 us device per freed S1/S2/S3 median 7.7430 (d -0.4120)  mean 7.8969 (d -0.4284)
+done in 40s

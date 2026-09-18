@@ -1,28 +1,39 @@
 # The redesign probes (P0 and P1)
 
-All six pre-build gates of `REDESIGN_PLAN_2026-09-05.md` §7. **All pass.**
+Status after re-running the host probes with the exact shipped episode
+predicate: **P0 passes on both RTX captures. P1 passes on the RTX 5090; its
+required B200 run is still pending.** The benchmark programs now return a
+non-zero exit status when a correctness or timing gate fails.
 
-| probe | gate | favorite3 | favorite2 | |
+| probe | gate | favorite3 | favorite2 | status |
 |---|---|---|---|---|
-| 1 run census | admitted >= 60% of references | **99.1%** | **99.2%** | pass |
+| 1 run census | admitted >= 60% of references | **99.1%** | **99.2%** | pass (triangle proxy) |
 | 2 identities/run | p99 <= 64 | **18** | **13** | pass |
-| 3 stencil | none in candidate runs | **0** | **0** | pass |
-| 4 split walk | p99 chunk <= 30 us, merge <= 10% | **10.0 us, 1.3%** | — | pass |
-| 5 bin pass | <= 0.15 ms/heavy frame | **0.055 ms** | — | pass |
+| 3 stencil | none in candidate runs | **0** | **0** | pass for these captures |
+| 4 split walk | p99 chunk <= 30 us, merge <= 10% | **10.10 us, 2.8%** | — | RTX pass; B200 pending |
+| 5 bin pass | <= 0.15 ms/heavy frame | **0.0391 ms** | — | RTX pass; B200 pending |
 | 6 `.local` baseline | recorded | `DEAD_ENDS` 42 | | done |
 
 ## Probe 1: the run census
 
-Run at HEAD on both captures with
-`CUDAVK_RUN_CENSUS=1`. Host-side only: it classifies every draw the way the
-run-level renderer would and counts the runs it would form. It changes no
-rendering decision.
+Run at HEAD on both captures with `CUDAVK_RUN_CENSUS=1`. Host-side only: it
+classifies every draw the way the run-level renderer would and counts the runs
+it would form. It changes no rendering decision. Both runs completed with the
+expected stdout hashes and 6,947 / 6,965 submit rows.
+
+The first implementation compared only class and scope serial. The corrected
+implementation asks `cpvk_draws_episode_compatible()` directly and ends a run
+at every ordered non-draw operation. Using the front end's real predicate is
+important: the shipped wide-episode change proved viewport, rasterizer and
+depth state are per-segment and therefore must not be copied into a second,
+stricter census predicate.
 
 **The gate was: stop if admitted runs hold under 60% of a frame's references.
 They hold 99.1% and 99.2%. The probe passes, and not marginally.**
 
-Triangles stand in for tile references (M0 measured 1.16 references per
-triangle); the gate tests a share, so the factor cancels.
+Triangles remain a proxy for tile references. M0 measured 1.16 references per
+triangle with no strong per-draw skew, so this is enough to keep the 60% gate
+far from its boundary, but it is not an exact per-run reference census.
 
 ## favorite3 (2,083 real frames)
 
@@ -30,9 +41,9 @@ triangle); the gate tests a share, so the factor cancels.
 |---|---:|---:|---:|---:|---:|
 | opaque | 2,153 | 1.03 | 181.3 | 244 | **90.8%** |
 | depth-only | 2,876 | 1.38 | 13.0 | 34 | 6.0% |
-| blended | 31,786 | 15.3 | 4.2 | 128 | 2.2% |
-| fallthrough | 4,406 | 2.1 | 1.5 | 4 | 0.9% |
-| **admitted** | **36,815** | **17.7** | | | **99.1%** |
+| blended | 45,802 | 22.0 | 2.9 | 121 | 2.2% |
+| fallthrough | 4,449 | 2.1 | 1.5 | 4 | 0.9% |
+| **admitted** | **50,831** | **24.4** | | | **99.1%** |
 
 ## favorite2 (2,078 real frames)
 
@@ -40,40 +51,39 @@ triangle); the gate tests a share, so the factor cancels.
 |---|---:|---:|---:|---:|---:|
 | opaque | 2,098 | 1.01 | 164.0 | 216 | **95.2%** |
 | depth-only | 755 | 0.36 | 10.4 | 23 | 1.7% |
-| blended | 31,438 | 15.1 | 3.1 | 19 | 2.3% |
+| blended | 45,205 | 21.8 | 2.2 | 15 | 2.3% |
 | fallthrough | 3,591 | 1.7 | 1.6 | 3 | 0.8% |
-| **admitted** | **34,291** | **16.5** | | | **99.2%** |
+| **admitted** | **48,058** | **23.1** | | | **99.2%** |
 
 ## What this says about the plan
 
-- **One opaque run per frame carries ~91-95% of the triangles**, at 164-181
-  draws each, and 2,084 of favorite3's 2,153 opaque runs are in the 128+
-  bucket. Today that run is rendered as ~110 separate per-batch chains. This
-  is the redesign's central claim, and it is now measured rather than assumed.
-- **The depth-only relaxation is real and it is not large.** favorite3 has
-  1.38 depth-only runs per frame holding 18.0 draws -- the shadow scope the
-  plan describes, at 6.0% of triangles. Collapsing 18 single-draw chains and
-  their 18 visibility clears into one run is worth doing, but it is a tail
-  item, and on favorite2 it is 1.7%.
-- **Blended is where the runs are short**: 15 runs per frame of 3-4 draws, and
-  23,000 of ~31,500 blended runs are a single draw. The plan's M3 stage
-  should expect little from run-level batching here; its win must come from
-  the walk emitting sorted lists directly, not from longer runs.
-- **~18 runs per frame** against ~700 launches today. At the plan's 8-30
-  launches per run that is 140-530, bracketing its 100-250 estimate but not
-  confirming it.
+- **One opaque run per frame still carries ~91-95% of the triangles**, at
+  164-181 draws each. The exact shipped compatibility predicate leaves this
+  central premise intact.
+- **The depth-only relaxation is real but is a tail item.** favorite3 has 1.38
+  depth-only runs per frame at 6.0% of triangles; favorite2 has 0.36 at 1.7%.
+- **Blended runs are shorter than the original report said.** Ordered non-draw
+  boundaries raise them from about 15 to about 22 runs/frame and reduce them
+  to 2.2-2.9 draws/run. M3 cannot rely on batching for its win; it must remove
+  the scan/fill/sort/list work.
+- **There are 23-24 admitted runs/frame**, not the original 16-18 estimate.
+  At 8-30 launches/run this implies 184-720 launches before fallbacks. The
+  plan's 100-250 launch estimate is therefore not established.
 
-## A correction made while running it
+## Corrections made while running it
 
 The first version hooked `cp_batch_record_packet`, which sees only draws the
-batcher accepted. It reported 251 draws/frame against the plan's ~300 and
-**zero depth-only runs** -- because a depth-only draw fails
-`cpvk_batch_structural` and takes the direct path, so the census was blind to
-exactly the draws the relaxation targets. The hook moved to
-`cpvk_prepare_draw`'s caller, before the batching decision. Draws/frame went
-251 -> 273 and the depth-only class appeared.
+batcher accepted. It reported zero depth-only runs. The hook moved upstream of
+the batching decision, where all draws are visible.
 
-**A census of a decision must be taken upstream of that decision.**
+The next version joined draws using only class and scope serial, so it missed
+ordered non-draw boundaries and did not call the renderer's compatibility
+predicate. The fixed probe uses the predicate directly and closes after the
+pending renderer work has resolved its shader identities. This keeps the
+identity histogram attached to the run that generated it.
+
+**A census of a decision must be taken upstream of that decision and must use
+the same predicate as the decision.**
 
 ## Probe 2: fragment-shader identities per run
 
@@ -86,10 +96,13 @@ launch would cover. **Gate: stop if p99 exceeds 64.**
 |---|---|---|
 | opaque | 12.75 / 13 / 17 / **18** / 18 | 11.00 / 11 / 13 / **13** / 13 |
 | depth-only | 1.00 / 1 / 1 / 1 / 2 | 1.00 / 1 / 1 / 1 / 1 |
-| blended | 1.41 / 1 / 3 / 4 / 5 | 1.41 / 1 / 3 / 3 / 4 |
+| blended | 0.98 / 1 / 1 / 2 / 3 | 0.98 / 1 / 1 / 2 / 3 |
 | fallthrough | 1.00 / 1 / 1 / 1 / 1 | 1.00 / 1 / 1 / 1 / 1 |
 
-No run exceeded the 128 tracked identities. **Passes with a 3.5x margin.**
+No run exceeded the 128 tracked identities. The opaque gate passes with a
+3.5x margin. A small number of blended runs record zero identities because
+they produce no shade launch; that is a launch census result, not an identity
+collision.
 
 The number that matters for the design: **an opaque run of 181 draws needs
 13-18 shade launches**. Add one geometry launch per VS identity, one clip+bin,
@@ -116,13 +129,12 @@ hot tile pinned to M0's p99 of 12,823 references).
 
 | arrangement | chunks | p50 | p99 | max | walk wall |
 |---|---:|---:|---:|---:|---:|
-| unsplit, one block per tile | 3,600 | 0.22 us | 23.88 us | 34.61 us | 0.0435 ms |
-| **chunk 512** | 3,968 | 2.18 | **10.03** | 11.28 | **0.0221 ms** |
-| chunk 1024 | 3,737 | 1.27 | 16.32 | 19.15 | 0.0281 ms |
-| chunk 2048 | 3,644 | 0.24 | 26.12 | 31.47 | 0.0395 ms |
+| unsplit, one block per tile | 3,600 | 0.21 us | 23.11 us | 35.94 us | 0.0440 ms |
+| **chunk 512** | 3,968 | 2.22 | **10.10** | 11.96 | **0.0221 ms** |
+| chunk 1024 | 3,737 | 1.30 | 16.33 | 19.40 | 0.0281 ms |
+| chunk 2048 | 3,644 | 0.24 | 26.40 | 32.01 | 0.0398 ms |
 
-The `atomicMin` merge costs **0.8-1.3%**, an order of magnitude inside its 10%
-gate. Splitting is order-independent, so it changes no result.
+The `atomicMin` merge costs **2.8%** at chunk 512, inside its 10% gate. Splitting is order-independent, so it changes no result.
 
 **Splitting does not merely fix the tail; it halves the walk.** 0.0435 ->
 0.0221 ms at chunk 512, because 3,968 evenly sized blocks fill 170 SMs where
@@ -138,24 +150,24 @@ a device count (sizing from a worst-case bound is dead end 11).
 
 | phase | ms |
 |---|---:|
-| count | 0.0144 |
+| count | 0.0103 |
 | scan | 0.0061 |
-| scatter | 0.0346 |
-| **total** | **0.0551** |
+| scatter | 0.0228 |
+| **total** | **0.0391** |
 
-Gate 0.15 ms/heavy frame: **passes with 2.7x margin**, and the generator emits
-**1.685 references per triangle** against M0's measured 1.16, so the real
-input is lighter than the one measured. The device's reference count matches
-the host's expectation exactly (596,415), which is the correctness check on
-the scan and the cursors.
+Gate 0.15 ms/heavy frame: **passes with 3.8x margin**. The generator was fixed
+to include tile-boundary crossings when matching M0; it now emits **1.161
+references per triangle**, not the old synthetic 1.685. The device's reference
+count matches the host's expectation exactly (411,096), which checks the scan
+and cursors.
 
 For scale, this replaces `clip_all` 0.520 + `stage2` 0.187 + `stage3` 0.392 =
 **1.099 ms/frame** of union-exclusive device time.
 
 ## Where that leaves the plan's arithmetic
 
-Walk 0.0221 ms/scope at 2.02 drawing scopes = 0.045 ms/frame, plus bin 0.055 =
-**0.10 ms/frame** for walk + bin, against the plan's ESTIMATED 0.25-0.5 for
+Walk 0.0221 ms/scope at 2.02 drawing scopes = 0.045 ms/frame, plus bin 0.039 =
+**0.084 ms/frame** for walk + bin, against the plan's ESTIMATED 0.25-0.5 for
 walk + bin + compaction. The two new kernels are cheaper than the plan
 budgeted, and they displace 1.099 ms/frame. Compaction is not yet measured.
 
@@ -163,9 +175,62 @@ This does **not** validate the frame-time estimate. Device time is not frame
 time (`PERFORMANCE.md` §5.1), the M2 A/B is the only thing that settles it,
 and the plan's own gate stands: **>= 1.0 ms/frame on the heavy band or stop.**
 
-## Next gates
+## Remaining pre-build gates
 
-Probe 2 (four-axis identity census per run, stop if p99 > 64), probe 3
-(stencil and alpha-to-coverage inside candidate runs), probes 4-5 (the
-split-walk and bin-pass microbenchmarks). Probe 6, the `.local` baseline of
-every fused VS, is already recorded in `DEAD_ENDS.md` 42.
+Run the split-walk and bin benchmarks on the B200 and require the plan's 1.6x
+cross-device bound. An exact tile-reference-per-run census would replace the
+triangle proxy, although the measured 99% share is too far above 60% for the
+proxy error to change the current gate. Probe 6's `.local` baseline remains in
+`DEAD_ENDS.md` 42.
+
+These probe results do not overturn the later integrated results. The partial
+M2 implementation on `redesign/runlevel` was bit-identical but slower than the
+default renderer; `DEAD_ENDS.md` 45 records +1.57/+1.80 ms at 32 px and
++2.09/+2.51 ms at 16 px. Do not merge that prototype as a performance change.
+
+## Code-set recurrence probe (2026-09-08)
+
+A weaker key than the previously rejected exact CUDA-graph recipe was added to
+`CUDAVK_RUN_CENSUS`: the order-independent set of resolved FS executions and
+VS binaries needed by a run. Mutable arguments and segment order are data, not
+code. This asks whether a runtime-generated worker could reuse one linked code
+image in the same process.
+
+| capture | all unique / runs | recurring coverage | opaque unique / runs | opaque recurring coverage | max opaque reuse |
+|---|---:|---:|---:|---:|---:|
+| favorite3 | 182 / 55,280 | 100.0% | 122 / 2,153 | 99.1% | 148 |
+| favorite2 | 88 / 51,649 | 100.0% | 38 / 2,098 | 99.7% | 753 |
+
+Both stdout hashes and row counts remained exact. Thus compilation reuse is
+not the blocker for a code-set-specialized worker. This does **not** overturn
+the exact-graph result: it proves only code reuse, not recurring arguments,
+queue lifetimes, or a profitable static schedule.
+
+The matching PTX device-call probe is
+`src/cudavk/tests/cp_ptx_call_probe.py`. On real kernels from `cpvk_tex`, two
+bodies that separately use 34/44 registers and admit 6/5 blocks per SM produce
+a 100-register, 2-block/SM selector. Adding a 96-register body produces 212
+registers and 1 block/SM. The code-set gate passes; the first combined-resource
+gate fails.
+
+### Real favorite3 PTX resource gate
+
+A full `CUDAVK_DUMP_PTX=1 CUDAVK_SHADER_STATS=1` capture produced 232 real
+shader images. Linking two common hardware-inline FS bodies through the probe
+made this comparison on the local RTX:
+
+| image | registers | local bytes/thread | blocks/SM |
+|---|---:|---:|---:|
+| FS A alone | 96 | 0 | 2 |
+| FS B alone | 104 | 0 | 2 |
+| A/B block-uniform selector | **222** | 0 | **1** |
+| A/B plus a third 106-register FS | 230 | 0 | 1 |
+| two 158-register FS bodies | **254** | **184** | 1 |
+
+Direct branch-separated calls, `.calltargets`, and ABI `.callprototype`
+indirect calls produce the same resource result. Adding `.maxnreg 128`, 96, or
+64 to the two-body entry makes `cuLinkComplete` fail with CUDA error 300 rather
+than producing a viable capped image. Thus PTX linkability and run-code reuse
+both pass, but the combined image freezes the whole cooperative grid at worse
+than the component occupancy and adds local call state for the large pair.
+This fails the predeclared resource gate before any renderer integration.

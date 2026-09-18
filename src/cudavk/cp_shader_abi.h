@@ -139,5 +139,9 @@ static_assert(CP_ARG_SLOT_VS_FETCH < CP_ARG_UBO_BASE,
               "the fetch block is fixed state, below the buffer slots");
 static_assert(CP_ARG_SLOT_VS_FETCH != CP_ARG_SLOT_HW_TEX_TABLE,
               "every fixed argument slot is used by exactly one thing");
+static_assert(CP_ARG_SLOT_FS_WRITEBACK < CP_ARG_UBO_BASE,
+              "the writeback block is fixed state, below the buffer slots");
+static_assert(CP_ARG_SLOT_FS_WRITEBACK != CP_ARG_SLOT_VS_FETCH,
+              "every fixed argument slot is used by exactly one thing");
 
 #endif /* CP_SHADER_ABI_H */

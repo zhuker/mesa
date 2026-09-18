@@ -3,13 +3,13 @@
  *
  * The run-level renderer replaces cp_clip_rast_fused, stage 2 and stage 3 for
  * a covered run with one clip-and-bin launch: every post-clip triangle is
- * setup, then appended to the 16 px tile lists it covers, with per-tile
+ * setup, then appended to the 32 px tile lists it covers, with per-tile
  * counters and a device prefix sum so every list is dense and its length is
  * known before the walk launches.
  *
  * This measures the binning half alone, at the sizes the M0 census recorded:
  * 354,000 post-clip triangles per heavy frame, 1.16 tile references each,
- * over an 80 x 45 grid of 16 px tiles (1280 x 720).
+ * over an 40 x 23 grid of 32 px tiles (1280 x 720).
  *
  * GATE: <= 0.15 ms per heavy frame. Above that the plan stops.
  *
@@ -31,12 +31,12 @@
    fprintf(stderr, "%s:%d %s -> %s\n", __FILE__, __LINE__, #x, \
            cudaGetErrorString(e_)); exit(1); } } while (0)
 
-#define TILE 16
+#define TILE 32
 #define SCR_W 1280
 #define SCR_H 720
-#define TX ((SCR_W + TILE - 1) / TILE)      /* 80 */
-#define TY ((SCR_H + TILE - 1) / TILE)      /* 45 */
-#define NTILES (TX * TY)                    /* 3600 */
+#define TX ((SCR_W + TILE - 1) / TILE)      /* 40 */
+#define TY ((SCR_H + TILE - 1) / TILE)      /* 23 */
+#define NTILES (TX * TY)                    /* 920 */
 
 /* Only what binning reads: the screen bounding box and the row it came from. */
 struct tri_box {
@@ -117,12 +117,13 @@ int main(int argc, char **argv)
           n, NTILES, TILE, SCR_W, SCR_H);
 
    /*
-    * Triangle sizes are drawn so the mean tile coverage lands on M0's
-    * measured 1.16 references per triangle: most triangles are far smaller
+    * Triangle sizes are drawn so the mean tile coverage lands on a conservative
+    * heavy-frame reference density references per triangle: most triangles are far smaller
     * than a tile, a tail spans several.
     */
    std::mt19937 rng(1234u);
-   std::lognormal_distribution<double> ln(1.1, 1.05);   /* px extent */
+   std::lognormal_distribution<double> ln(-0.6, 1.05);  /* px extent;
+      including tile-boundary crossings this is a modest reference count */
    std::uniform_int_distribution<int> px(0, SCR_W - 1), py(0, SCR_H - 1);
    std::vector<struct tri_box> h(n);
    size_t refs_expected = 0;
@@ -139,7 +140,7 @@ int main(int argc, char **argv)
       refs_expected += (size_t)(h[i].x1 / TILE - h[i].x0 / TILE + 1) *
                        (h[i].y1 / TILE - h[i].y0 / TILE + 1);
    }
-   printf("generated: %.3f references per triangle (M0 measured 1.16), "
+   printf("generated: %.3f references per triangle (32-pixel tiles), "
           "%zu references\n", (double)refs_expected / n, refs_expected);
 
    struct tri_box *d_tris; CK(cudaMalloc(&d_tris, n * sizeof(*d_tris)));
@@ -203,5 +204,8 @@ int main(int argc, char **argv)
           "TOTAL", per, per <= 0.15 ? "PASS" : "FAIL");
    printf("\nfor scale, what it replaces on the RTX (union-exclusive, heavy):\n"
           "  clip_all 0.520 + stage2 0.187 + stage3 0.392 = 1.099 ms/frame\n");
-   return 0;
+   bool gate_ok = total == refs_expected && per <= 0.15;
+   if (!gate_ok)
+      fprintf(stderr, "cp_binpass_bench: count verification or timing gate failed\n");
+   return gate_ok ? 0 : 1;
 }

@@ -636,6 +636,16 @@ driver.
 
 ## Performance leads that are open, not closed
 
+**4x status after the 2026-09-09 default trace:** no item in this historical
+list now has enough measured scope to reach 2 ms. The shipped frame is 4.9813
+ms and needs 2.9813 ms of credit. The six-stage renderer sums to only 3.247 ms,
+so a joint replacement must recover 91.8% and cost at most 0.265 ms before
+overlap. CUDA clusters/Launch Control, green contexts, TMA, graphs, PDL, CDP,
+linked shader calls and interpretation all fail that representation gate; see
+`DEAD_ENDS.md` 52. Keep the smaller items below for maintenance/per-capture
+wins, not as 4x candidates. The objective now needs a constraint change or a
+new CUDA capability.
+
 Ranked by the evidence behind them, not by size. `PERFORMANCE.md` has the
 measurements these come from.
 
@@ -770,9 +780,11 @@ measurements these come from.
    - **Honest framing:** this is not "a 0.387 ms opportunity". Nothing here has
      resolved above the run spread yet.
 
-2. **Fuse the fragment writeback into the fragment shader.** Parked with a
-   working mechanism and a wrong result; about 0.04 ms and a known next step.
-   See `DEAD_ENDS.md`.
+2. **Fuse the fragment writeback into the fragment shader — measured and
+   closed.** The stale-cache defect was fixed with attachment notification and
+   an SSA colour handoff removed the output store/reload. Both captures are
+   exact, but strict alternating results are neutral on favorite3 and
+   favorite2. It remains default-off; see `DEAD_ENDS.md` item 15.
 3. **`CUDA_CACHE_MAXSIZE` is unset, and the cubin cache is at its cap and
    evicting.** Free, one line, and it is no longer speculative: measured
    2026-08-27, `~/.nv/ComputeCache` holds **1,074,252,980 bytes = 1024.49 MiB**
@@ -800,18 +812,18 @@ measurements these come from.
 5. **`pbribl` regresses by about 0.03 ms** with vertex-fetch fusion enabled and
    nobody knows why. Bounded and deliberately accepted; the cost is in fused
    execution on that workload, not in the machinery around it.
-6. **Where the 2.453 ms median inter-submit stall lives.** `PERFORMANCE.md`
-   §5.2 attributes the frame-boundary gap to it, and the census now shows
-   `vkDeviceWaitIdle` blocks only 0.514 ms/frame, so most of that stall is
-   somewhere the driver does not currently instrument. Open — but note the
-   2026-08-27 reading of it: the driver issues device work **only from inside
-   `vkQueueSubmit`**, and recording touches CUDA not at all, so while the
-   replayer decodes the next frame the driver has nothing queued *by
-   construction*. Width cannot touch that; only letting the host run past the
-   drain can (`history/perf-2026-08-27/wide_bench.md`).
+6. **Where the old 2.453 ms inter-submit stall lived — measured and closed as
+   an independent host-side lead.** Fully threaded Mesa runtime submission was
+   tested with completion timestamps, not misleading enqueue timestamps. It
+   recovered only **0.126184 ms/frame**, with queue depth p95 1 and max 2, and
+   missed the 0.500-ms admission gate. See `DEAD_ENDS.md` item 34. The latest
+   joint floor audit also shows that adding this gain to impossible deletion of
+   every non-shader kernel still leaves 2.3085 ms/frame in the traced window;
+   any retry must be a joint execution/scheduling redesign, not another submit
+   wrapper.
 
-7. **Port the blended path's fs-UBO row concatenation to the opaque path — the
-   only never-measured lead left in the programme.** `FS main (direct)` runs
+7. **Port the blended path's fs-UBO row concatenation to the opaque path —
+   measured and closed.** `FS main (direct)` runs
    **74.5 launches/frame against 74.5 direct raster triples — exactly 1:1, no
    merging at all**, because the opaque group key demands a byte-identical
    `memcmp` of the fs-UBO rows. The blended path already solved that problem
@@ -830,8 +842,15 @@ measurements these come from.
      `DEAD_ENDS.md` §22 applies directly: if they are already concurrent, this
      merge inverts like the other two did, and the wide merge cost 0.410 ms for
      removing five times as many launches.
-   It is on this list *because* it has never been run. Every other lead here has
-   a number against it; the cheap thing to do with this one is to measure it.
+   It was measured on 2026-09-08 behind default-off
+   `CUDAVK_OPAQUE_UBO_CONCAT`. Both hashes and row counts are exact, but the
+   current renderer has already collected almost all of the old opportunity:
+   favorite3 FS launches fall only 107,400 -> 105,628 over 3,473 frames and
+   favorite2 only 95,461 -> 93,712. That is about **0.5 launch/frame**, worth
+   roughly **0.0004 ms/frame** at the measured 0.78--0.81 us removal price.
+   It fails the zero-code gate by two orders of magnitude; no timing run or
+   production enable is justified. The flag remains default-off as the exact
+   reproducer.
 
 **Removed from this list since it was last revised, so that nobody re-opens
 them:**
@@ -839,6 +858,12 @@ them:**
 - **The opaque sort-middle tiling prototype** — refused with a number on
   2026-08-27: best case 2.1–2.6 ms/frame against the +2.73 ms/frame fan-out it
   must surrender. `DEAD_ENDS.md` §24.
+- **Renderer scratch / peel managed-memory migration** — resolved on
+  2026-09-09. Device-local peel convergence plus mapped pinned renderer
+  scratch is exact and default-on. It saves 0.170-0.289 ms on RTX and
+  1.034-1.055 ms on B200 across both captures; see `PERFORMANCE.md` and
+  `notes/B200_MEASUREMENTS_2026-09-03.md`. Broad read-mostly and Vulkan
+  host-memory pinning variants are closed in `DEAD_ENDS.md` 50-51.
 - **`CUDAVK_PDL`** — it is **landed** and on by default at level 3
   (`6e6e00968ca`, with level 4 offered as a diagnostic in `b9766f720a4`). Its
   revert row in `PERFORMANCE.md` §1 is re-measured on the binary that landed:

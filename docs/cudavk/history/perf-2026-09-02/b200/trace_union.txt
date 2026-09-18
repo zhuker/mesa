@@ -1,0 +1,3 @@
+union of kernel+memcpy+memset in window: 4.509 ms/frame ; idle 2.921 ms/frame of 7.430 traced frame
+kernels starting with device fully idle (all streams): 143701 of 176208 = 81.6%  -> 348.4/frame; idle gap before them: p50 1.89 us p90 11.78 us; sum 26.581 ms/frame
+  gaps <20us: n/frame 341.8 sum 1.203 ms/frame; gaps>=20us: n/frame 6.5 sum 25.378 ms/frame

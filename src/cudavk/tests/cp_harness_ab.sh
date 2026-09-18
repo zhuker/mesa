@@ -31,9 +31,10 @@ CAND_WRAP=${CAND_WRAP:-}      # ... and for the candidate arm
 # A per-arm ICD, for a change that is NOT behind a flag -- a build constant, or
 # a branch with no revert switch. Without this, measuring two builds means two
 # sessions, and between-session drift is exactly what a 3-round A/B cannot see.
+MESA=${MESA:-$HOME/mesa}
+ICD=${ICD:-$MESA/build-cudavk/src/cudavk/cudavk_devenv_icd.x86_64.json}
 CTRL_ICD=${CTRL_ICD:-$ICD}
 CAND_ICD=${CAND_ICD:-$ICD}
-MESA=${MESA:-$HOME/mesa}
 # The venv python only exists on the workstation; the B200 workspace has none.
 # Nothing here needs numpy, so fall back to whatever python3 is on PATH rather
 # than failing every sentinel check and reporting a gate failure that is really
@@ -41,7 +42,6 @@ MESA=${MESA:-$HOME/mesa}
 PY=${PY:-$MESA/venv/bin/python3}
 [ -x "$PY" ] || PY=$(command -v python3)
 [ -x "$PY" ] || { echo "no python3" >&2; exit 2; }
-ICD=${ICD:-$MESA/build-cudavk/src/cudavk/cudavk_devenv_icd.x86_64.json}
 SHIM=${SHIM:-$HOME/favorite-cpp/submit_shim.so}
 OUT=${OUT:-/tmp/harness-ab/$LABEL}
 

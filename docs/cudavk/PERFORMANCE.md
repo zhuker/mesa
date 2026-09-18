@@ -1288,3 +1288,46 @@ started.
   has to surrender, and the note's recorded explanation is dead in both halves
   (compute throughput 2.53%, branch efficiency 94.32%, triangles 1.7 px across).
   `DEAD_ENDS.md` §24.
+
+
+## Host-to-device residency correction (2026-09-09)
+
+The renderer's tiny depth-peel convergence word and its host-built scratch
+arena used managed allocations. Nsight Systems 2026.4.1 on B200 attributed the
+dominant recurring two-page GPU-fault region to that scratch arena. Summed
+fault-event duration was useful for finding the address, not for predicting
+frame credit: fault events overlap other work.
+
+The accepted implementation keeps peel atomics in four bytes of device-local
+memory and copies the generation to a pinned host mirror immediately before
+the existing convergence wait. Renderer scratch uses mapped, cacheable pinned
+host allocations, with the existing multi-generation lifetime discipline. It
+falls back transactionally to managed memory when pinning is unavailable or
+out of memory, records the allocator for every grown/overflow arena, and frees
+it with the matching API. Both paths are now on by default;
+`CUDAVK_NO_PEEL_ANY_PINNED=1` and `CUDAVK_NO_SCRATCH_PINNED=1` are the exact
+reverts.
+
+Three alternating exact rounds measured:
+
+| device / capture | managed whole | pinned whole | delta | managed heavy | pinned heavy | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| RTX 5090 favorite3 | 5.2868 | 4.9976 | **-0.2892** | 6.0361 | 5.7675 | **-0.2686** |
+| RTX 5090 favorite2 | 4.8791 | 4.7093 | **-0.1697** | 5.0768 | 4.8643 | **-0.2124** |
+| B200 favorite3 | 8.8291 | 7.7948 | **-1.0342** | 9.9927 | 8.8979 | **-1.0948** |
+| B200 favorite2 | 8.4519 | 7.3965 | **-1.0554** | 8.7408 | 7.6035 | **-1.1373** |
+
+Every arm retained the capture hash, 6,947/6,965 submit rows and 18/18 image
+sentinels, and every timing interval was disjoint in the winning direction.
+Default and explicit-revert suites pass 83/83. Broadly pinning Vulkan host-only
+memory and `SET_READ_MOSTLY` on application buffers both lost on RTX and were
+removed (`DEAD_ENDS.md` 50-51); the win is specific to small renderer-owned,
+host-produced state.
+
+A final shipped-default-versus-explicit-revert session independently confirms
+favorite3 at 5.2802 -> **4.9813 ms whole** and 6.0350 -> **5.7643 ms heavy**
+(-0.2989/-0.2706); it too is exact and disjoint in all three rounds.
+
+This is a material B200 correction, not completion of the 4x objective. The
+best corresponding RTX favorite3 result remains about 5.0 ms rather than the
+roughly 2.0-ms target.

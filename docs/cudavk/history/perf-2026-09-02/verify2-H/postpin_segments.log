@@ -1,0 +1,34 @@
+frames 1024 wall/frame 8.3790 ms
+segments 16586 -> 16.20/frame
+
+== kernel-name-only signature (closure-audit definition), incl. empty: segments 16586 distinct 424; seen-in-previous-frame 95.3%; same-position 90.0%; top-50 cover 93.1%
+   signatures needed to cover 90% of device ops: 215 of 424; total ops 1124.3/frame
+   signatures seen exactly once in window: 161 (0.97% of segments); ops in them 94.21/frame
+
+== kernel-name-only signature, non-empty segments: segments 9657 distinct 423; seen-in-previous-frame 91.9%; same-position 88.9%; top-50 cover 88.3%
+   signatures needed to cover 90% of device ops: 215 of 424; total ops 1124.3/frame
+   signatures seen exactly once in window: 161 (1.67% of segments); ops in them 94.21/frame
+
+== FULL node signature: ordered (kind,name,stream) for kernels/memcpy/memset/hostfn + event record/wait streams, non-empty: segments 9657 distinct 534; seen-in-previous-frame 90.5%; same-position 87.6%; top-50 cover 86.3%
+   signatures needed to cover 90% of device ops: 287 of 535; total ops 1124.3/frame
+   signatures seen exactly once in window: 243 (2.52% of segments); ops in them 138.11/frame
+
+non-empty segments/frame 9.43; ops/segment p50 38 p90 335 ; kernels/segment p50 21
+per frame: kernels 719.6 htod-copies 261.0 memsets 114.1 2D/3D copies 29.3 hostfn 3.0 event rec+wait 411.1
+segments/frame containing a 2D/3D copy (not ExecUpdate-able): 2.36; containing a host-func node: 1.01; ops in 2D-bearing segments 814.4/frame
+segments with <=3 device ops: 0.00/frame carrying 0.0 ops/frame
+
+host issue API time/frame (CUPTI-inflated): issue 2.170 ms, event traffic 0.109 ms; /1.28 -> 1.696 / 0.085
+device idle INSIDE segment device spans: host-late (next op API not yet returned) 1.584 ms/frame; launch-latency-only 1.441 ms/frame
+host issue after first device op start (s_k - d0): median 96.8 us, sum 4.307 ms/frame
+device end minus host-reaches-sync (d1 - s_k): median 93.0 us; segments where host arrived first (device-bound) 100.0%
+
+MODEL deferral: per-node update+launch cost u, graph launch cost, first-node latency, inter-node gap scale
+   u=0.4us launch=3us first=5us gaps=1.0 (lead's assumptions, gaps unchanged): frame delta median +1.493 ms  mean +1.484
+   u=0.4us launch=3us first=5us gaps=0.5 (lead's optimistic device half): frame delta median +0.727 ms  mean +0.755
+   u=0.4us launch=3us first=5us gaps=0   (impossible best): frame delta median +0.001 ms  mean +0.027
+   u=1.0us launch=5us first=8us gaps=1.0 (pessimistic host): frame delta median +2.227 ms  mean +2.213
+   u=0.4 no launch/first-node cost, gaps=1.0 (no deferral penalty beyond serialisation): frame delta median +1.423 ms  mean +1.407
+MODEL no-deferral upper bound (host-late idle shrinks with API time; device start unchanged):
+   u=0.4us: frame delta median -0.728 ms  mean -1.208
+   u=0 (host issue free inside segments): frame delta median -0.979 ms  mean -1.601

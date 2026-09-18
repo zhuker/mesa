@@ -1,0 +1,110 @@
+{
+ "idle_classes": {
+  "submit": {
+   "n": 5231,
+   "per_frame": 12.681212121212122,
+   "ms_fr": 1.4892432533333335
+  },
+  "launch-gap": {
+   "n": 231515,
+   "per_frame": 561.2484848484848,
+   "ms_fr": 1.1464409187878788
+  },
+  "hostfunc": {
+   "n": 12133,
+   "per_frame": 29.413333333333334,
+   "ms_fr": 0.05778642181818182
+  },
+  "sync": {
+   "n": 5383,
+   "per_frame": 13.049696969696969,
+   "ms_fr": 0.14756189333333333
+  },
+  "submit+hostfunc": {
+   "n": 8012,
+   "per_frame": 19.423030303030302,
+   "ms_fr": 0.1749736581818182
+  },
+  "submit+sync+hostfunc": {
+   "n": 29,
+   "per_frame": 0.0703030303030303,
+   "ms_fr": 0.023941624242424246
+  }
+ },
+ "submit_parity": {
+  "0": {
+   "n": 413,
+   "med_us": 2028.681,
+   "mean_us": 2492.260699757869,
+   "ms_fr": 2.4952816218181817,
+   "pre_med_us": 65.595,
+   "post_med_us": 1944.592
+  },
+  "1": {
+   "n": 413,
+   "med_us": 2029.065,
+   "mean_us": 2495.353506053269,
+   "ms_fr": 2.498378176969697,
+   "pre_med_us": 1826.92,
+   "post_med_us": 200.692
+  }
+ },
+ "ctx_by_next": {
+  "cuMemcpyHtoDAsync_v2": {
+   "n": 549,
+   "per_frame": 1.3309090909090908,
+   "spin_ms_fr": 1.3709845284848485,
+   "gap_ms_fr": 0.011812649696969697
+  },
+  "cuCtxSynchronize [crosses submit]": {
+   "n": 81,
+   "per_frame": 0.19636363636363635,
+   "spin_ms_fr": 0.002992242424242424,
+   "gap_ms_fr": 0.5291127127272728
+  },
+  "cuTexObjectDestroy [crosses submit]": {
+   "n": 39,
+   "per_frame": 0.09454545454545454,
+   "spin_ms_fr": 4.704727272727273e-05,
+   "gap_ms_fr": 0.2573814545454545
+  },
+  "cuSurfObjectDestroy [crosses submit]": {
+   "n": 39,
+   "per_frame": 0.09454545454545454,
+   "spin_ms_fr": 3.431515151515151e-05,
+   "gap_ms_fr": 0.2573814545454545
+  },
+  "cuMemFree_v2 [crosses submit]": {
+   "n": 2,
+   "per_frame": 0.0048484848484848485,
+   "spin_ms_fr": 2.210909090909091e-06,
+   "gap_ms_fr": 0.009566535757575758
+  },
+  "cuMemcpy2DAsync_v2 [crosses submit]": {
+   "n": 1,
+   "per_frame": 0.0024242424242424242,
+   "spin_ms_fr": 7.781818181818182e-07,
+   "gap_ms_fr": 0.004783267878787879
+  },
+  "cuMemsetD8Async": {
+   "n": 129,
+   "per_frame": 0.31272727272727274,
+   "spin_ms_fr": 0.2193987296969697,
+   "gap_ms_fr": 0.003785968484848485
+  },
+  "cuMemFree_v2": {
+   "n": 1,
+   "per_frame": 0.0024242424242424242,
+   "spin_ms_fr": 0.0021450715151515153,
+   "gap_ms_fr": 0.0017325575757575758
+  }
+ },
+ "hostfunc": {
+  "n": 1238,
+  "per_frame": 3.001212121212121,
+  "cross": 38,
+  "gap_med_us": 77.535,
+  "gap_mean_us": 90.39297833333333,
+  "gap_ms_fr": 0.2629613915151515
+ }
+}

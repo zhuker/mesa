@@ -1,0 +1,106 @@
+# pass_census.py outputs (harness ~/favorite3-cpp/out/src, read-only)
+
+== files 700 800
+frames 98
+passes             median      7.0 mean      7.0 min 7 max 7
+draws              median    226.0 mean    228.9 min 202 max 258
+onedraw            median      4.0 mean      4.0 min 4 max 4
+binds              median     46.0 mean     45.6 min 43 max 48
+runs               median     46.0 mean     45.4 min 43 max 47
+distinct           median     34.0 mean     33.0 min 31 max 34
+maxpass_draws      median    198.0 mean    200.9 min 174 max 230
+maxpass_binds      median     24.0 mean     23.6 min 21 max 26
+maxpass_runs       median     24.0 mean     23.4 min 21 max 25
+maxpass_distinct   median     24.0 mean     23.0 min 21 max 24
+ds                 median    226.0 mean    228.6 min 200 max 258
+vb                 median    162.0 mean    163.3 min 135 max 195
+
+== files 1123 1400
+frames 215
+passes             median     10.0 mean      9.5 min 7 max 10
+draws              median    304.0 mean    293.0 min 188 max 384
+onedraw            median      6.0 mean      5.7 min 4 max 6
+binds              median     81.0 mean     86.2 min 45 max 136
+runs               median     69.0 mean     75.4 min 45 max 131
+distinct           median     46.0 mean     44.0 min 32 max 51
+maxpass_draws      median    249.0 mean    241.4 min 160 max 327
+maxpass_binds      median     51.0 mean     57.6 min 23 max 106
+maxpass_runs       median     39.0 mean     46.9 min 23 max 101
+maxpass_distinct   median     28.0 mean     27.4 min 22 max 33
+ds                 median    302.0 mean    291.5 min 186 max 384
+vb                 median    175.0 mean    174.9 min 148 max 208
+
+== files 1400 1700
+frames 189
+passes             median     10.0 mean     10.4 min 10 max 11
+draws              median    363.0 mean    358.9 min 279 max 422
+onedraw            median      6.0 mean      6.0 min 6 max 6
+binds              median    116.0 mean    119.4 min 58 max 186
+runs               median     93.0 mean    101.9 min 58 max 167
+distinct           median     48.0 mean     47.6 min 37 max 52
+maxpass_draws      median    296.0 mean    292.6 min 219 max 359
+maxpass_binds      median     87.0 mean     88.9 min 28 max 156
+maxpass_runs       median     67.0 mean     71.4 min 28 max 137
+maxpass_distinct   median     30.0 mean     29.1 min 23 max 33
+ds                 median    363.0 mean    358.9 min 279 max 422
+vb                 median    177.0 mean    179.4 min 161 max 204
+
+== files 1700 2000
+frames 218
+passes             median     11.0 mean     11.0 min 11 max 11
+draws              median    288.5 mean    315.4 min 246 max 426
+onedraw            median      6.0 mean      6.0 min 6 max 6
+binds              median     71.0 mean     93.7 min 53 max 168
+runs               median     69.0 mean     85.4 min 51 max 150
+distinct           median     50.0 mean     49.3 min 38 max 57
+maxpass_draws      median    212.0 mean    242.6 min 175 max 357
+maxpass_binds      median     38.0 mean     61.4 min 24 max 135
+maxpass_runs       median     36.0 mean     53.1 min 22 max 117
+maxpass_distinct   median     29.0 mean     29.0 min 21 max 36
+ds                 median    288.5 mean    315.0 min 246 max 424
+vb                 median    166.0 mean    171.4 min 139 max 227
+
+== files 2000 2300
+frames 200
+passes             median     11.0 mean     11.0 min 11 max 11
+draws              median    329.0 mean    334.4 min 280 max 404
+onedraw            median      6.0 mean      6.0 min 6 max 6
+binds              median    108.0 mean    111.7 min 75 max 146
+runs               median     96.5 mean     96.7 min 70 max 129
+distinct           median     54.0 mean     53.1 min 49 max 56
+maxpass_draws      median    262.0 mean    269.4 min 213 max 340
+maxpass_binds      median     75.0 mean     79.4 min 42 max 113
+maxpass_runs       median     63.5 mean     64.5 min 39 max 96
+maxpass_distinct   median     33.0 mean     32.8 min 30 max 35
+ds                 median    327.0 mean    332.7 min 280 max 402
+vb                 median    170.0 mean    170.7 min 144 max 196
+
+== files 2300 2548
+frames 172
+passes             median     11.0 mean     11.0 min 11 max 11
+draws              median    299.0 mean    326.9 min 280 max 409
+onedraw            median      6.0 mean      6.1 min 6 max 7
+binds              median     77.0 mean    102.0 min 72 max 178
+runs               median     68.0 mean     92.2 min 63 max 160
+distinct           median     46.0 mean     47.1 min 45 max 50
+maxpass_draws      median    230.0 mean    259.1 min 208 max 348
+maxpass_binds      median     44.0 mean     70.6 min 40 max 147
+maxpass_runs       median     35.0 mean     60.7 min 31 max 129
+maxpass_distinct   median     28.0 mean     27.6 min 25 max 31
+ds                 median    299.0 mean    326.8 min 280 max 409
+vb                 median    176.0 mean    177.3 min 164 max 192
+
+== files 2450 2560
+frames 89
+passes             median     11.0 mean     11.0 min 11 max 11
+draws              median    290.0 mean    286.6 min 266 max 295
+onedraw            median      6.0 mean      6.0 min 6 max 6
+binds              median     73.0 mean     73.7 min 71 max 76
+runs               median     64.0 mean     64.7 min 62 max 67
+distinct           median     46.0 mean     46.1 min 44 max 48
+maxpass_draws      median    219.0 mean    215.8 min 195 max 226
+maxpass_binds      median     41.0 mean     41.4 min 39 max 43
+maxpass_runs       median     32.0 mean     32.4 min 30 max 34
+maxpass_distinct   median     26.0 mean     25.7 min 24 max 27
+ds                 median    290.0 mean    286.6 min 266 max 295
+vb                 median    173.0 mean    171.5 min 162 max 177

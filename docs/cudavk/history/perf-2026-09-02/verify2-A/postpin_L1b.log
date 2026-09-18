@@ -1,0 +1,168 @@
+main tid 308125468474637 worker tid 308125468474653
+worker cuEventSynchronize rows (submits) 2051
+window (18629876, 8598737501) frames 1024 wall 8580.108 ms -> 8.3790 ms/frame mean
+frame wall median 8.1432 p10 3.8933 p90 10.4393
+device ops in window 1159025 kernels 736846
+device union 5.1517 ms/frame  summed 7.8995  idle 3.2273  overlap 1.533x
+== ops per class on main stream 13 vs side streams (per frame):
+   memcpy1                  main  191.30 side   70.69
+   memset                   main  102.58 side   11.51
+   VS                       main   46.18 side   62.81
+   cp_rasterize_stage2      main   49.14 side   16.57
+   cp_rasterize_stage3      main   49.14 side   16.57
+   cp_fs_compact            main   65.71 side    0.00
+   FS_direct                main   65.71 side    0.00
+   cp_fs_writeback          main   65.71 side    0.00
+   cp_clip_rast_fused       main   44.21 side   16.57
+   cp_clip_rast_fused_abuf  main    1.96 side   37.05
+   cp_rasterize_stage2_abuf main    1.96 side   37.05
+   cp_rasterize_stage3_abuf main    1.96 side   37.05
+   memcpy8                  main   23.30 side    0.00
+   cp_abuf_scan_finish      main   13.13 side    0.00
+   cp_clip_triangles        main    0.00 side    9.20
+   cp_abuf_scan_reduce      main    6.57 side    0.00
+   cp_abuf_fill_recs        main    6.57 side    0.00
+   cp_abuf_sort             main    6.57 side    0.00
+   cp_abuf_quad_count_all   main    6.57 side    0.00
+   cp_abuf_quad_fill_all    main    6.57 side    0.00
+
+== union-exclusive per pool (ms/frame): exclusive, summed, launches/frame
+  all_kernels          4.3083   7.0536   719.58  self-overlap 1.64x
+  clip_all             0.7254   2.3181   108.99  self-overlap 3.20x
+  VS                   0.6815   1.4825   108.99  self-overlap 2.18x
+  FS_direct            0.6646   0.6646    65.71  self-overlap 1.00x
+  clip_rast_fused      0.5854   1.9142    60.78  self-overlap 3.27x
+  memcpy               0.4848   0.5191   298.20  self-overlap 1.07x
+  stage3               0.4196   0.7642    65.71  self-overlap 1.82x
+  fs_compact           0.3683   0.3683    65.71  self-overlap 1.00x
+  memset               0.3220   0.3268   114.09  self-overlap 1.01x
+  stage2               0.2114   0.3692    65.71  self-overlap 1.75x
+  memcpy_HtoD          0.1954   0.2296   261.99  self-overlap 1.18x
+  abuf_support         0.1921   0.1921    66.23  self-overlap 1.00x
+  vertex_fetch         0.1244   0.1491     5.83  self-overlap 1.20x
+  fs_writeback         0.1086   0.1086    65.71  self-overlap 1.00x
+  stage3_abuf          0.0915   0.3110    39.02  self-overlap 3.40x
+  FS_abuf              0.0748   0.0748     2.28  self-overlap 1.00x
+  main_other           0.0355   0.0386     3.92  self-overlap 1.09x
+main-thread runtime rows 1608024
+host blocked in sync APIs 3.9374 ms/frame; all main-thread CUDA API residency 6.2415; blocking calls/frame 17.19 {'cuMemcpyHtoD_v2': 1013, 'cuCtxSynchronize': 1444, 'cuStreamSynchronize': 8419, 'cuMemcpyDtoH_v2': 6722}
+blocking syncs in window 17598 -> 17.19/frame
+ops straddling a sync boundary 372 of 1159025 (0.0%)
+
+== per-segment totals ms/frame: union 5.1515  max-stream-sum 3.8137  span 7.1974  blocked 3.9374
+== pool: sum ΔU, sum ΔCP(max-stream), Σmin(ΔU,blocked), Σmin(ΔCP,blocked)  [ms/frame]
+  VS                 0.6814   0.3689   0.6809   0.3661
+  FS_direct          0.6646   0.6081   0.6646   0.6081
+  clip_all           0.7254   0.5046   0.7240   0.4983
+  clip_rast_fused    0.5853   0.4174   0.5853   0.4174
+  stage3             0.4196   0.3726   0.4195   0.3725
+  stage2             0.2114   0.1977   0.2113   0.1976
+  fs_compact         0.3683   0.3618   0.3683   0.3618
+  fs_writeback       0.1086   0.1068   0.1086   0.1068
+  memcpy             0.4848   0.4418   0.3957   0.3577
+  memcpy_HtoD        0.1954   0.1623   0.1954   0.1623
+  memset             0.3220   0.2989   0.3220   0.2989
+  abuf_support       0.1921   0.1014   0.1903   0.0997
+  stage3_abuf        0.0915   0.0599   0.0914   0.0598
+  FS_abuf            0.0748   0.0734   0.0748   0.0734
+
+== post-sync refill bubble (sync return -> first device op start): median 4.4 us, sum 0.1707 ms/frame over 17.19 syncs/frame
+== single-stream join tail before each sync (device end - last time >=2 streams active): median 74.1 us, sum 2.8200 ms/frame
+== time with k device ops concurrently active (ms/frame): {0: 3.1585, 1: 4.3, 2: 0.2226, 3: 0.1842, 4: 0.1177, 5: 0.0873, 6: 0.0765, 7: 0.0735, 8: 0.0887, 9: 0.0013, 10: 0.0}
+
+== duration model per class: n/frame, min, p10, p50, p90 (us), fit a(us)+b(ns/block), floor share n*a/sum
+  VS                       n/f  108.99 min    1.4 p10    3.1 p50    6.9 p90   31.1  a   9.64 b   64.636  floor  70.9%  sum 1.4825 ms/f  blocks p50 2
+  FS_direct                n/f   65.71 min    0.8 p10    2.8 p50    3.2 p90   18.0  a  -0.17 b    3.224  floor   0.0%  sum 0.6646 ms/f  blocks p50 4096
+  FS_abuf                  n/f    2.28 min    2.9 p10    3.9 p50    4.7 p90   75.6  a  31.14 b  181.212  floor  95.0%  sum 0.0748 ms/f  blocks p50 4
+  cp_clip_rast_fused       n/f   60.78 min    1.5 p10    2.3 p50    9.8 p90  113.6  a  24.85 b   46.780  floor  78.9%  sum 1.9142 ms/f  blocks p50 10
+  cp_clip_rast_fused_abuf  n/f   39.02 min    2.1 p10    3.2 p50    5.9 p90   23.3  a   7.69 b  315.626  floor  86.6%  sum 0.3461 ms/f  blocks p50 1
+  cp_rasterize_stage2      n/f   65.71 min    0.5 p10    0.7 p50    4.1 p90   11.2  a   3.27 b    6.799  floor  58.3%  sum 0.3692 ms/f  blocks p50 512
+  cp_rasterize_stage3      n/f   65.71 min    1.3 p10    1.4 p50    4.8 p90   30.4  a  11.63 b    0.000  floor 100.0%  sum 0.7642 ms/f  blocks p50 2048
+  cp_rasterize_stage3_abuf n/f   39.02 min    0.6 p10    1.3 p50    5.7 p90   19.7  a  14.19 b   -3.751  floor 178.1%  sum 0.3110 ms/f  blocks p50 1920
+  cp_fs_compact            n/f   65.71 min    1.1 p10    2.0 p50    5.3 p90    7.8  a   3.89 b    1.098  floor  69.4%  sum 0.3683 ms/f  blocks p50 900
+  cp_fs_writeback          n/f   65.71 min    0.6 p10    1.2 p50    1.4 p90    2.0  a   0.90 b    0.427  floor  54.5%  sum 0.1086 ms/f  blocks p50 2048
+  cp_vertex_fetch          n/f    5.83 min    2.7 p10    4.3 p50    9.9 p90   65.1  a  17.71 b  453.782  floor  69.2%  sum 0.1491 ms/f  blocks p50 18
+  cp_clip_triangles        n/f    9.20 min    1.4 p10    1.7 p50    8.1 p90   13.0  a   6.02 b   27.147  floor  95.8%  sum 0.0578 ms/f  blocks p50 1
+  cp_abuf_scan_finish      n/f   13.13 min    1.6 p10    3.6 p50    3.7 p90    8.1  a   1.58 b    9.269  floor  27.5%  sum 0.0755 ms/f  blocks p50 450
+  VS by grid bucket: bucket, n/frame, median us, sum ms/frame
+     <=2^0  n/f   48.01  p50     6.6  sum 0.3616
+     <=2^1  n/f    7.91  p50     8.7  sum 0.0736
+     <=2^2  n/f   10.83  p50     5.9  sum 0.1096
+     <=2^3  n/f    7.43  p50     5.8  sum 0.0858
+     <=2^4  n/f    8.81  p50     6.1  sum 0.1373
+     <=2^5  n/f    9.99  p50     5.7  sum 0.1077
+     <=2^6  n/f    4.43  p50     6.0  sum 0.0532
+     <=2^7  n/f    3.77  p50    11.6  sum 0.0791
+     <=2^8  n/f    2.31  p50    17.0  sum 0.0589
+     <=2^9  n/f    2.34  p50    22.7  sum 0.0724
+     <=2^10 n/f    1.68  p50    75.3  sum 0.1252
+     <=2^11 n/f    0.76  p50   104.4  sum 0.0809
+     <=2^12 n/f    0.71  p50   188.7  sum 0.1373
+  FS_direct by grid bucket: bucket, n/frame, median us, sum ms/frame
+     <=2^1  n/f    0.02  p50     4.5  sum 0.0001
+     <=2^3  n/f    0.01  p50     9.0  sum 0.0002
+     <=2^5  n/f    0.01  p50    11.6  sum 0.0003
+     <=2^7  n/f    3.11  p50     3.8  sum 0.0134
+     <=2^11 n/f   16.59  p50     3.0  sum 0.0460
+     <=2^12 n/f   45.97  p50     6.4  sum 0.6047
+
+== inter-sync segment kernel-name topology: 17391 segments, 411 distinct signatures; 95.6% of segments have a signature seen in the previous frame; same-position match 90.4%
+   segment kernel count: p10 0 p50 13 p90 86 max 601; segments/frame 16.98
+   top-50 signatures cover 93.4% of segments; top-5 lengths/counts: [(0, 6742), (13, 1763), (4, 1012), (25, 868), (14, 729)]
+
+== fan-out groups: stage3 direct launches on side streams within one segment: n groups, mean size, mean(max/mean duration)
+   groups 1644, mean size 10.32, median max/mean 2.52, mean 2.58
+   clip_rast_fused side-stream groups 1644, mean size 10.32, median max/mean 1.87
+
+== dependency-respecting what-if replay
+event records 221367 stream waits 199306
+host timeline events 1589593
+L1 excursions matched 9415 (9.19/frame); excursion device ops 32975 (32.20/frame); host R/W calls skipped 150528 (147.00/frame)
+   excursion op kinds: [('memcpy1', 9415), ('VS', 9415), ('cp_clip_triangles', 9415), ('memset', 4730)]
+   excursion device time sum ms/frame: 0.2130
+  launch gap (op start - max(call end, prev same-stream end)) per class: n/f, p50 us, sum ms/f, share<0 (started before call end)
+     memcpy1                  n/f  261.99 p50    2.1 sum 16.1286  neg   0.0%
+     memset                   n/f  114.09 p50    2.0 sum  0.9723  neg   0.0%
+     VS                       n/f  108.99 p50    2.1 sum  0.7910  neg   0.0%
+     cp_clip_rast_fused       n/f   60.78 p50    2.3 sum  0.6658  neg   0.0%
+     cp_abuf_scan_reduce      n/f    6.57 p50   30.7 sum  0.2294  neg   0.0%
+     cp_clip_rast_fused_abuf  n/f   39.02 p50    2.2 sum  0.0984  neg   0.0%
+     cp_fs_compact            n/f   65.71 p50    1.0 sum  0.0868  neg   0.0%
+     FS_direct                n/f   65.71 p50    1.1 sum  0.0820  neg   0.0%
+     memcpy8                  n/f   23.30 p50    1.4 sum  0.0668  neg   0.0%
+     cp_rasterize_stage3      n/f   65.71 p50    0.3 sum  0.0631  neg   3.2%
+     cp_rasterize_stage2      n/f   65.71 p50    0.3 sum  0.0580  neg   3.4%
+     memcpy7                  n/f    6.34 p50    1.4 sum  0.0443  neg   0.0%
+     cp_fs_writeback          n/f   65.71 p50    0.3 sum  0.0195  neg   0.3%
+     cp_clip_triangles        n/f    9.20 p50    2.0 sum  0.0180  neg   0.0%
+     cp_rasterize_stage2_abuf n/f   39.02 p50    0.3 sum  0.0171  neg   0.2%
+     cp_rasterize_stage3_abuf n/f   39.02 p50    0.3 sum  0.0163  neg   0.1%
+     cp_abuf_fill_recs        n/f    6.57 p50    1.7 sum  0.0120  neg   0.0%
+     cp_vertex_fetch          n/f    5.83 p50    1.1 sum  0.0118  neg   0.0%
+     cp_abuf_sort             n/f    6.57 p50    1.8 sum  0.0118  neg   0.0%
+     cp_abuf_quad_count_all   n/f    6.57 p50    1.8 sum  0.0117  neg   0.0%
+     cp_abuf_sort_short       n/f    4.60 p50    2.7 sum  0.0112  neg   0.0%
+     main_other               n/f    3.92 p50    1.9 sum  0.0111  neg   0.0%
+     cp_peel_advance          n/f    2.93 p50    2.3 sum  0.0065  neg   0.0%
+     cp_rasterize_stage1      n/f    4.93 p50    0.8 sum  0.0061  neg   0.0%
+     cp_abuf_worklist         n/f    3.93 p50    1.3 sum  0.0053  neg   0.0%
+     cp_abuf_composite        n/f    4.21 p50    0.9 sum  0.0052  neg   0.0%
+     cp_depth_attachment_store n/f    2.60 p50    2.2 sum  0.0052  neg   0.0%
+     cp_clear_depth_kernel    n/f    2.56 p50    1.8 sum  0.0040  neg   0.0%
+     cp_abuf_seg_scatter      n/f    2.92 p50    0.9 sum  0.0035  neg   0.1%
+     FS_abuf                  n/f    2.28 p50    1.3 sum  0.0035  neg   0.3%
+     cp_abuf_seg_count        n/f    4.60 p50    0.8 sum  0.0035  neg   0.0%
+     cp_clear_kernel          n/f    1.98 p50    1.4 sum  0.0034  neg   0.0%
+     cp_abuf_scan_finish      n/f   13.13 p50    0.2 sum  0.0031  neg   0.0%
+     cp_cache_convert         n/f    1.74 p50    1.1 sum  0.0024  neg   0.0%
+     cp_abuf_quad_fill_all    n/f    6.57 p50    0.1 sum  0.0011  neg   0.0%
+     cp_depth_attachment_load n/f    0.03 p50    1.7 sum  0.0001  neg   0.0%
+     memcpy2                  n/f    6.56 p50   -1.9 sum  0.0000  neg 100.0%
+     total positive launch gap 19.4797 ms/frame (includes cross-stream waits, so an upper figure)
+  E0 replay unchanged: frame median 8.1549 mean 8.3253 (orig median 8.1432); cumulative end-time drift p50 5971 us; per-frame duration error p50 15.2 us p90 27.5 us
+  L1b delete excursion ops + their host API time frame median 7.8665 (Δ -0.2884)  mean 8.0304 (Δ -0.2949)
+  L1b + host x0.78                         frame median 7.5122 (Δ -0.6427)  mean 7.5443 (Δ -0.7810)
+  control: host x0.78 alone                frame median 7.8224 (Δ -0.3325)  mean 7.8439 (Δ -0.4814)
+  L1b + launch gaps zero                   frame median 6.3523 (Δ -1.8026)  mean 6.6634 (Δ -1.6618)
+  control: launch gaps zero                frame median 6.5476 (Δ -1.6074)  mean 6.8605 (Δ -1.4647)
+done in 22.1s

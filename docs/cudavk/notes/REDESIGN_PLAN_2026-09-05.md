@@ -1,5 +1,25 @@
 # Redesign plan: the run-level renderer
 
+> **Current status (updated after implementation attempts): stopped before
+> full M2.** P0 passes on both RTX captures; the P1 RTX gates pass, while the
+> required B200 P1 measurements remain pending. A partial, bit-identical M2 on
+> `redesign/runlevel` made the integrated renderer slower: +1.57/+1.80 ms at
+> 32 px and +2.09/+2.51 ms at 16 px. Merged stage 3 was also +0.147/+0.208 ms.
+> `DEAD_ENDS.md` 44-45 explains the common cause: these wider launches give up
+> overlap already collected by the eight-stream fan-out. The branch stays as
+> evidence; do not merge it as a performance change. A later default-off M2
+> foundation now collects runs and safely groups only one-draw VS members. It
+> removes 208/118 launches over the two full RTX replays and measured neutral
+> (+0.0206/-0.0156 ms whole-frame); broad multi-draw replay failed an image
+> sentinel and remains refused. `M2_RUN_GEOMETRY_FOUNDATION.md` records it.
+> `M2_RUN_CLIP_BIN_STAGE.md` now adds the default-off non-additive renderer
+> transaction: exact geometry preparation, run-wide count/checked scan/fill,
+> device-predicated tile/classic visibility, and the existing grouped shade
+> tail. Standalone and focused gates pass; real-capture committed-arm
+> correctness and timing are still pending, so this is not a performance result. The shipped pieces remain
+> the run census, wide opaque episodes and depth-only batching. This document
+> remains the original charter, not a claim that M2-M5 landed.
+
 Written 2026-09-05, after the 2026-09-02/03 leads landed (favorite3 **5.940**
 ms, favorite2 **5.022** on the RTX 5090; **9.883 / 8.283** on the B200) and
 after the first measurement of the floor: NVIDIA's own driver executes the
@@ -18,6 +38,11 @@ one and why it is worth trying anyway. The short version: Renderer 2 kept one
 vertex, clip and fragment launch per *batch* and charged the fan-out surrender
 in full; this plan removes the per-batch launch structure, which is where the
 verdict's own "undisplaced pools" were, and needs no fan-out to surrender.
+
+The corrected 32-pixel RTX bin probe is 0.0562-0.0563 ms for 354,000
+triangles and 381,933 references (1.079/triangle), including count, scan,
+scatter, and clears. It passes the 0.15 ms P1 gate; it does not time clipping or
+the new renderer kernels, and no B200 result exists yet.
 
 Labels as elsewhere: **MEASURED**, **MODEL**, **ESTIMATED**, **HYPOTHESIS**.
 Conventions: `WORKFLOW.md` §3.1 and §4.
@@ -402,3 +427,51 @@ result that the multi-kernel sort-middle CUDARaster beats the streaming
 megakernel is why this plan has no megakernel; Mesa `llvmpipe`
 (`lp_scene.h`, `lp_rast.h`: 64 px tiles, per-tile command bins with in-order
 state changes), the proven shape for arbitrary API state.
+
+## 10. M2 outcome (2026-09-08)
+
+M2 missed its predeclared continuation gate. The exact classic run transaction
+was neutral in strict alternating measurement (+0.0345 ms whole, -0.0352 ms
+heavy); dense bin and direct compact successors were slower. The implementation
+remains default-off evidence. M3 blended work must not be justified by an M2
+win, because there was none. Any continuation needs a new mechanism and a new
+bound rather than another tile threshold or launch-count forecast.
+
+The post-M2 persistent-kernel and fragment-continuation audits do not reopen
+this decision. Their impossible-best overlap-correct ceilings are 0.560 ms and
+0.729 ms respectively, before preserving any of the work. Both are below M2's
+1.0 ms continuation gate and far below the remaining distance to 4x native.
+
+
+## Post-M2 code-specialized megakernel gate
+
+A code-only reuse key succeeds where exact graph recipes did not: recurring
+VS/FS sets cover 99.1% of favorite3 opaque runs and 99.7% of favorite2 opaque
+runs. Compilation amortisation is therefore plausible in isolation.
+
+The required combined CUDA image is not. A selector over two real favorite3
+hardware-inline FS bodies raises 96/104 component registers to 222 and drops
+from two blocks/SM to one. Three bodies use 230 registers; two 158-register
+bodies use 254 registers plus 184 bytes/thread local. Branch-separated direct
+calls, `.calltargets`, and ABI `.callprototype` indirect calls agree. Register
+caps at 128 or below fail module completion. Since admitted opaque runs need
+p99 18 (favorite3) or 13 (favorite2) distinct FS executions before their VS
+bodies and fixed-function code are added, a cooperative run image would freeze
+the entire grid at the worst resource case and surrender the measured
+side-stream overlap. The resource gate rejects it before integration.
+
+Reproducer: `src/cudavk/tests/cp_ptx_call_probe.py` over output captured with
+`CUDAVK_DUMP_PTX=1 CUDAVK_SHADER_STATS=1`. Census and detailed numbers are in
+`RUN_CENSUS_2026-09-05.md`.
+
+
+## Corrected fused-writeback follow-up
+
+The only parked implementation was recovered. Its historical missing pixels
+were stale hardware-texture cache contents, not a slot mismatch: the fused path
+failed to call `cp_texture_attachment_written()`. Correct notification restores
+the old failing frame byte-for-byte. The current port and an SSA colour handoff
+are exact on both captures, but strict timing is neutral: favorite3
+−0.0147/−0.0017 ms whole/heavy and favorite2 −0.0278/−0.0128, with overlapping
+arms. `CUDAVK_FUSED_WRITEBACK` remains default-off. This closes the parked item
+without changing the run-level continuation decision.

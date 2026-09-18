@@ -1,0 +1,6 @@
+p1: frames=3469 whole med 6.637 mean 7.369 p10 3.64 p90 9.25 | light(1700-2100) med 3.983 | heavy(2200-3150) med 8.212 p10 7.00 p90 9.73 | frames>=10ms 77 
+p2: frames=3469 whole med 6.693 mean 7.412 p10 3.64 p90 9.23 | light(1700-2100) med 3.962 | heavy(2200-3150) med 8.261 p10 7.08 p90 9.83 | frames>=10ms 83 
+p3: frames=3469 whole med 6.676 mean 7.403 p10 3.60 p90 9.29 | light(1700-2100) med 3.939 | heavy(2200-3150) med 8.247 p10 7.08 p90 9.83 | frames>=10ms 78 
+c1: frames=3469 whole med 8.027 mean 8.795 p10 4.55 p90 10.93 | light(1700-2100) med 4.916 | heavy(2200-3150) med 9.653 p10 8.05 p90 11.52 | frames>=10ms 428 
+c2: frames=3469 whole med 7.512 mean 8.266 p10 4.46 p90 10.16 | light(1700-2100) med 4.788 | heavy(2200-3150) med 9.134 p10 7.86 p90 10.73 | frames>=10ms 257 
+c3: frames=3469 whole med 7.605 mean 8.308 p10 4.55 p90 10.18 | light(1700-2100) med 4.863 | heavy(2200-3150) med 9.115 p10 7.93 p90 10.72 | frames>=10ms 252 

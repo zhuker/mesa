@@ -1,0 +1,58 @@
+{
+ "tag": "postdead",
+ "frames": 410,
+ "whatif": {
+  "E0": [
+   7.1668140000000005,
+   7.444539565853659
+  ],
+  "A  geometry run-ahead as published (VS/fetch/clip)": [
+   6.1288374999999995,
+   6.500212265853658
+  ],
+  "B  VS only, all streams (published)": [
+   6.646263,
+   6.957078712195122
+  ],
+  "C  VS only, main stream only": [
+   6.884784,
+   7.206846785365854
+  ],
+  "D  VS only, side streams only": [
+   6.935064,
+   7.191747936585366
+  ],
+  "E  VS+fetch, main only": [
+   6.8546755,
+   7.180555446341463
+  ],
+  "F  VS + its arg copy, main only": [
+   6.8126745,
+   7.1393336000000005
+  ],
+  "G  delete VS main only": [
+   6.8338874999999994,
+   7.1646441
+  ],
+  "H  VS+clip, main only (illegal: depth RAW)": [
+   6.5544545,
+   6.91343348292683
+  ],
+  "I  clip only, main (isolates the illegal part)": [
+   6.7933095,
+   7.121111190243902
+  ],
+  "J  VS main only, +2 us join latency per VS": [
+   6.887784,
+   7.2088792170731715
+  ],
+  "J  VS main only, +5 us join latency per VS": [
+   6.892329500000001,
+   7.212488273170731
+  ],
+  "J  VS main only, +10 us join latency per VS": [
+   6.9109774999999996,
+   7.224375807317073
+  ]
+ }
+}

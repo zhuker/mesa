@@ -1,0 +1,3 @@
+device.optixir
+optix_custom_bench
+optix_bvh_bench

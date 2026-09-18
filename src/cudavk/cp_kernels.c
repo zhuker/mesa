@@ -55,6 +55,10 @@ static const char cp_vf_lane_src[] =
 #include "cp_vf_lane.h.inc"
 ;
 
+static const char cp_fs_write_src[] =
+#include "cp_fs_write.h.inc"
+;
+
 /*
  * Whether the debug instrumentation is compiled into the kernels at all.
  *
@@ -131,9 +135,9 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
                     int sm_minor, bool relocatable)
 {
    const char *header_srcs[] = { cp_rast_types_src, cp_fs_interp_src,
-                                 cp_vf_lane_src };
+                                 cp_vf_lane_src, cp_fs_write_src };
    const char *header_names[] = { "cp_rast_types.h", "cp_fs_interp.h",
-                                  "cp_vf_lane.h" };
+                                  "cp_vf_lane.h", "cp_fs_write.h" };
 
    nvrtcProgram prog;
    nvrtcResult res = nvrtcCreateProgram(&prog, source, name,
@@ -221,6 +225,7 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
       blob_write_string(&key_blob, cp_rast_types_src);
       blob_write_string(&key_blob, cp_fs_interp_src);
       blob_write_string(&key_blob, cp_vf_lane_src);
+      blob_write_string(&key_blob, cp_fs_write_src);
       for (unsigned i = 0; i < num_opts; i++)
          blob_write_string(&key_blob, opts[i]);
       if (!key_blob.out_of_memory) {
@@ -403,6 +408,20 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
    cuModuleGetFunction(&k->rasterize_stage2, k->module, "cp_rasterize_stage2");
    cuModuleGetFunction(&k->rasterize_stage3, k->module, "cp_rasterize_stage3");
    cuModuleGetFunction(&k->clip_triangles, k->module, "cp_clip_triangles");
+   cuModuleGetFunction(&k->run_clip_setup_tile_count, k->module,
+                       "cp_run_clip_setup_tile_count");
+   cuModuleGetFunction(&k->run_clip_setup_direct, k->module,
+                       "cp_run_clip_setup_direct");
+   cuModuleGetFunction(&k->run_clip_direct_raster, k->module,
+                       "cp_run_clip_direct_raster");
+   cuModuleGetFunction(&k->run_clip_bin_check_counts, k->module,
+                       "cp_run_clip_bin_check_counts");
+   cuModuleGetFunction(&k->run_clip_bin_fill, k->module,
+                       "cp_run_clip_bin_fill");
+   cuModuleGetFunction(&k->run_clip_bin_validate_cursors, k->module,
+                       "cp_run_clip_bin_validate_cursors");
+   cuModuleGetFunction(&k->run_clip_bin_fallback_raster, k->module,
+                       "cp_run_clip_bin_fallback_raster");
    k->rasterize_triangles = k->rasterize_stage1;
    cuModuleGetFunction(&k->clear_visbuf, k->module, "cp_clear_visbuf");
    cuModuleGetFunction(&k->peel_advance, k->module, "cp_peel_advance");

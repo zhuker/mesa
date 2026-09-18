@@ -837,6 +837,12 @@ retry_cuda_allocation:
    }
 
 allocated:
+   if (cp_debug->memory_alloc_stats)
+      fprintf(stderr, "cudavk: memory allocation addr=0x%llx size=%zu "
+              "type=%u host-visible=%u exportable=%u\n",
+              (unsigned long long)mem->dev_ptr, size, mem->kind,
+              mem->host_ptr != NULL, mem->exportable);
+
    /*
     * Vulkan defines ordinary allocation contents as undefined, and clearing
     * them anyway cost the Gallium-hosted driver 1,571 blocking cuMemsetD8
@@ -1021,6 +1027,11 @@ cpvk_MapMemory2(VkDevice _device, const VkMemoryMapInfo *pMemoryMapInfo,
       return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
 
    *ppData = (char *)mem->host_ptr + pMemoryMapInfo->offset;
+   if (cp_debug->memory_alloc_stats)
+      fprintf(stderr, "cudavk: memory map addr=0x%llx offset=%llu size=%llu "
+              "type=%u\n", (unsigned long long)mem->dev_ptr,
+              (unsigned long long)pMemoryMapInfo->offset,
+              (unsigned long long)pMemoryMapInfo->size, mem->kind);
    return VK_SUCCESS;
 }
 
@@ -1103,6 +1114,15 @@ cpvk_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
       buffer->offset = pBindInfos[i].memoryOffset;
       cpvk_memory_note_bind(cpvk_device_from_handle(_device), mem,
                             buffer->offset, buffer->vk.size, buffer, NULL);
+      if (cp_debug->memory_alloc_stats && mem)
+         fprintf(stderr, "cudavk: memory bind-buffer addr=0x%llx "
+                 "bind-addr=0x%llx offset=%llu size=%llu usage=0x%llx "
+                 "type=%u\n", (unsigned long long)mem->dev_ptr,
+                 (unsigned long long)(mem->dev_ptr + buffer->offset),
+                 (unsigned long long)buffer->offset,
+                 (unsigned long long)buffer->vk.size,
+                 (unsigned long long)buffer->vk.usage, mem->kind);
+
 
       /*
        * A transfer-destination-only buffer in a managed allocation is a

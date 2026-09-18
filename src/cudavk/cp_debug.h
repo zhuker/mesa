@@ -171,6 +171,14 @@ struct cp_debug {
    bool texture_cache_stats;
    bool plan_stats;
    bool run_census;
+   bool run_geometry;
+   bool run_clip_bin;
+   bool run_clip_direct;
+   bool run_clip_classic;
+   unsigned run_clip_bin_capacity;
+   bool no_run_prep_streams;
+   unsigned run_geometry_fail_alloc;
+   bool run_geometry_fail_launch;
    bool no_wide_episode;
    bool no_depth_only_batch;
    bool debug_vfetch;
@@ -204,6 +212,11 @@ struct cp_debug {
    bool no_fetch_fold;
    bool fused_vfetch;
    bool no_fused_vfetch;
+   bool fused_writeback;
+   bool peel_any_pinned;
+   bool no_peel_any_pinned;
+   bool scratch_pinned;
+   bool no_scratch_pinned;
    unsigned fs_grid_waves;
    unsigned vfetch_decline_nth;
    bool vfetch_skip_seed;
@@ -257,6 +270,7 @@ struct cp_debug {
    unsigned abuf_fuse_break;
    bool flush_drain;
    bool no_seg_merge;
+   bool opaque_ubo_concat;
    bool no_abuf_append;
    bool no_fused_abuf_interp;
    bool no_fused_interp;
@@ -313,6 +327,7 @@ struct cp_debug {
    uint64_t small_alloc_max;
    uint64_t small_alloc_warmup;
    bool     small_alloc_stats;
+   bool     memory_alloc_stats;
 
    /* Shader compilation. */
    unsigned max_registers;

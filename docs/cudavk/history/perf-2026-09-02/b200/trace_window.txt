@@ -1,0 +1,49 @@
+window 9276000000.0 12341000000.0 frames 412.5
+kernels in window: 176208  /frame 427.2  summed 4.968 ms/frame
+kernel union 3.335 ms/frame; overlap factor 1.49
+kernel duration us: p10 1.41 p50 3.78 p90 23.14 mean 11.63
+ENUM_CUPTI_SYNC_TYPE [(0, 'CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_UNKNOWN', 'Unknown'), (1, 'CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_EVENT_SYNCHRONIZE', 'Event sync'), (2, 'CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_STREAM_WAIT_EVENT', 'Stream wait sync'), (3, 'CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_STREAM_SYNCHRONIZE', 'Stream sync'), (4, 'CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_CONTEXT_SYNCHRONIZE', 'Context sync')]
+sync type 1: n=840 /frame=2.04 total 0.656 ms/frame mean 322.1 us
+sync type 2: n=63296 /frame=153.44 total 0.029 ms/frame mean 0.2 us
+sync type 3: n=4704 /frame=11.40 total 1.271 ms/frame mean 111.4 us
+sync type 4: n=841 /frame=2.04 total 1.595 ms/frame mean 782.5 us
+memcpy by copyKind (1 HtoD,2 DtoH,8 DtoD,10 HtoH?):
+ kind 1: n=58486 /frame=141.78 bytes/frame=0.306 MB  time 0.133 ms/frame mean 0.94 us
+ kind 2: n=3680 /frame=8.92 bytes/frame=0.000 MB  time 0.004 ms/frame mean 0.46 us
+ kind 7: n=2110 /frame=5.12 bytes/frame=10.388 MB  time 0.023 ms/frame mean 4.47 us
+ kind 8: n=19281 /frame=46.74 bytes/frame=4.056 MB  time 0.768 ms/frame mean 16.43 us
+ kind 11: n=70642 /frame=171.25 bytes/frame=5.040 MB  time 0.269 ms/frame mean 1.57 us
+ kind 12: n=28564 /frame=69.25 bytes/frame=5.023 MB  time 0.122 ms/frame mean 1.76 us
+runtime/driver API rows in window by name (top 30 by count):
+ cuLaunchKernel                                n/frame=  267.98  ms/frame=0.584  mean us=2.18
+ cuEventRecord                                 n/frame=  220.47  ms/frame=0.060  mean us=0.27
+ cuLaunchKernelEx                              n/frame=  159.19  ms/frame=0.321  mean us=2.02
+ cuStreamWaitEvent                             n/frame=  153.44  ms/frame=0.048  mean us=0.31
+ cuMemcpyHtoDAsync_v2                          n/frame=  140.78  ms/frame=0.262  mean us=1.86
+ cuMemsetD32Async                              n/frame=   88.99  ms/frame=0.182  mean us=2.04
+ cuMemcpy2DAsync_v2                            n/frame=   39.13  ms/frame=0.139  mean us=3.55
+ cuMemsetD8Async                               n/frame=   15.22  ms/frame=0.035  mean us=2.30
+ cuStreamSynchronize                           n/frame=   11.40  ms/frame=1.272  mean us=111.53
+ cuMemcpyDtoH_v2                               n/frame=    8.92  ms/frame=0.065  mean us=7.29
+ cuMemcpyDtoDAsync_v2                          n/frame=    7.61  ms/frame=0.040  mean us=5.28
+ cuMemcpy3DAsync_v2                            n/frame=    5.12  ms/frame=0.026  mean us=5.06
+ cuEventDestroy_v2                             n/frame=    3.12  ms/frame=0.001  mean us=0.43
+ cuLaunchHostFunc                              n/frame=    3.00  ms/frame=0.008  mean us=2.61
+ cuEventCreate                                 n/frame=    2.58  ms/frame=0.001  mean us=0.48
+ cuCtxSynchronize                              n/frame=    2.04  ms/frame=1.596  mean us=782.62
+ cuEventSynchronize                            n/frame=    2.00  ms/frame=0.658  mean us=329.18
+ cuSurfObjectCreate                            n/frame=    1.24  ms/frame=0.001  mean us=1.20
+ cuMemcpyHtoD_v2                               n/frame=    1.01  ms/frame=0.010  mean us=9.58
+ cuSurfObjectDestroy                           n/frame=    0.79  ms/frame=0.001  mean us=0.81
+ cuTexObjectCreate                             n/frame=    0.16  ms/frame=0.002  mean us=13.13
+ cuMipmappedArrayCreate                        n/frame=    0.14  ms/frame=0.008  mean us=59.64
+ cuMemFree_v2                                  n/frame=    0.11  ms/frame=0.004  mean us=37.13
+ cuTexObjectDestroy                            n/frame=    0.10  ms/frame=0.000  mean us=1.42
+ cuMemAllocManaged                             n/frame=    0.10  ms/frame=0.002  mean us=14.77
+ cuMipmappedArrayDestroy                       n/frame=    0.09  ms/frame=0.004  mean us=46.28
+ cuMemAlloc_v2                                 n/frame=    0.09  ms/frame=0.018  mean us=205.92
+ cuEventQuery                                  n/frame=    0.04  ms/frame=0.000  mean us=1.24
+ cuModuleLoadDataEx                            n/frame=    0.01  ms/frame=0.003  mean us=324.69
+ total API time in window 5.351 ms/frame (CUPTI-inflated)
+same-stream kernel-to-kernel gap us (<50us only): n=153300 p10 0.16 p50 1.73 p90 10.66
+streams used in window: (9,)

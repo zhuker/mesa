@@ -15,6 +15,15 @@ Standing when this was written: favorite3 **9.883**, favorite2 **8.283**
 after this and have never been measured on the B200)
 (3 alternating rounds, gates passed, `PERF_HANDOFF.md`).
 
+**Current-tree remeasurement, 2026-09-08.** After synchronising the complete
+post-September-05 renderer and rebuilding with CUDA 13.0, a clean three-round
+identical-arm favorite3 baseline measured **8.5293 ms/frame whole** and
+**9.9813 ms/frame heavy** (median across all six arms). Every arm exited 0 with
+the exact hash, 6,947 rows and 18/18 sentinels. The nominal control/candidate
+medians overlapped, as an identical-arm drift control must. This supersedes
+9.883 ms as the current favorite3 whole-frame standing, but remains far above
+the 2-ms objective. Raw output: `/tmp/harness-ab/current-f3-clean` on B200.
+
 ---
 
 ## 0. Environment — nothing wrong, and one apparent 0.5 ms finding that did not replicate
@@ -159,9 +168,12 @@ The what-if replay agrees: setting every launch gap to zero is worth
 
 The plan records the reopening threshold for the count-phase merge
 (`DEAD_ENDS` 21) as `p_B >= 2.0-2.3 us`. **Measured B200 gaps are 2.2-4.2 us
-across the dominant classes, so that threshold is met** and the lead reopens
-*as a candidate on this host only*. It is not a result -- it is an A/B that has
-not been run. `TODO` 7's threshold (`p_B >= 8 us`) is **not** met.
+across the dominant classes, so that threshold was met** and the lead reopened
+*as a candidate on this host only*. **2026-09-08 correction:** wide episodes
+subsequently cut the complete three-stage population to 69.9 launches/frame;
+even deleting every boundary at 4.2 us is only 0.294 ms/frame. The candidate is
+closed without an A/B (`DEAD_ENDS` 21). `TODO` 7's threshold (`p_B >= 8 us`)
+was **not** met either.
 
 ### 1.4 Device-decided episodes stay closed here
 
@@ -256,8 +268,9 @@ measured. This is the next piece of work, not a result.
   the largest measured device-side item on the deployment target.
 - **`DEAD_ENDS` 41** (device-decided episodes): stays closed. The reopening
   condition, a post-sync bubble >= 35 us, measures 7.8.
-- **`DEAD_ENDS` 21** (count-phase merge): its recorded reopening threshold
-  (2.0-2.3 us) **is met** on this host. A candidate again, on the B200 only.
+- **`DEAD_ENDS` 21** (count-phase merge): its old reopening price was met,
+  but the post-wide-episode population caps all boundary removal at 0.294
+  ms/frame. **Closed** by the 2026-09-08 recount.
 - **Band medians**, previously recorded nowhere: favorite3 whole **9.88**,
   heavy **11.6**; favorite2 whole **8.28**, heavy **9.34**. Every number in
   this document carries its session band, because that host drifts 0.3-1.3 ms
@@ -279,7 +292,10 @@ measured. This is the next piece of work, not a result.
    **unsupported so far**; one more session would close it. The two builds
    alternated inside one session via the new per-arm ICD, so this is not a
    between-session artefact.
-4. **The count-phase merge** -- reopened by measurement, needs its own A/B.
+4. ~~**The count-phase merge**~~ -- **closed after wide episodes**. The current
+   trace carries only 69.9 launches/frame across all three A-buffer count
+   stages. Even deleting every boundary at the old worst B200 price is capped
+   at 0.294 ms/frame before overlap and device cost (`DEAD_ENDS` 21).
 5. **The §4 price table** -- required before any forecast for this host.
 
 Method notes: `nsys` verified by md5 across both hosts; the RTX comparison
@@ -287,3 +303,24 @@ trace was retaken at the same commit rather than reusing the archived one,
 because launch counts had moved under leads A/C/B2/F; `perf` is unavailable in
 that workspace and the API ratio is the plan's documented fallback; traced idle
 share is not quoted as a host-bound claim, for the reason in 1.6.
+
+
+## 7. 2026-09-09 matching-2026.4.1 residency result
+
+A fresh favorite3 trace with allocation and binding telemetry corrected the
+old aggregate allocation hypothesis. The dominant recurring two-page region
+was renderer scratch, not the four-byte peel word or an application image.
+Replacing only renderer-owned host-produced state is effective:
+
+| capture | managed whole/heavy | pinned peel + scratch | delta whole/heavy |
+|---|---:|---:|---:|
+| favorite3 | 8.8291 / 9.9927 | 7.7948 / 8.8979 | **-1.0342 / -1.0948** |
+| favorite2 | 8.4519 / 8.7408 | 7.3965 / 7.6035 | **-1.0554 / -1.1373** |
+
+All three alternating rounds were exact and disjoint. Broad treatment of the
+remaining application allocations is closed rather than inferred from fault
+durations: `SET_READ_MOSTLY` and pinned Vulkan type-1 memory both lost on RTX
+(`DEAD_ENDS.md` 50-51). The accepted renderer-owned paths are default-on with
+`CUDAVK_NO_PEEL_ANY_PINNED=1` and `CUDAVK_NO_SCRATCH_PINNED=1` as reverts.
+This lowers the deployment-host standing result materially but does not reach
+the 2-ms objective.

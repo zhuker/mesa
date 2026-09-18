@@ -127,6 +127,40 @@ static const struct cp_flag_def flags[] = {
      "maximal sequences of consecutive same-class draws in one scope -- and "
      "report at teardown what share of the frame's triangles they hold. "
      "Watches only; changes no rendering decision (REDESIGN_PLAN_2026-09-05)" },
+   { "CUDAVK_RUN_GEOMETRY", CP_FLAG_BOOL_VALUE, F(run_geometry),
+     "collect each opaque run and launch compatible groups of one-draw "
+     "triangle-list members through one fused vertex shader. Default-off M2 "
+     "step; multi-draw members and downstream stages stay on the old path" },
+   { "CUDAVK_RUN_CLIP_BIN", CP_FLAG_BOOL_VALUE, F(run_clip_bin),
+     "preflight at most 64 side-effect-free triangle-list batches and build "
+     "stable run-global clip/bin descriptors before grouped geometry. "
+     "Default-off transactional M2 renderer; requires CUDAVK_RUN_GEOMETRY, "
+     "with exact pre-commit replay and device-predicated classic fallback" },
+   { "CUDAVK_RUN_CLIP_DIRECT", CP_FLAG_BOOL_VALUE, F(run_clip_direct),
+     "use compact clip/setup plus persistent-warp direct visibility for an "
+     "opaque run; default off, requires CUDAVK_RUN_GEOMETRY, and keeps "
+     "CUDAVK_RUN_CLIP_BIN selectable as the old dense-tile A/B arm" },
+   { "CUDAVK_RUN_CLIP_CLASSIC", CP_FLAG_BOOL_VALUE, F(run_clip_classic),
+     "pipeline exact prepare-only VS and the optimized classic fused clip/raster "
+     "chain per segment on the existing side streams; default off and requires "
+     "CUDAVK_RUN_GEOMETRY" },
+   { "CUDAVK_RUN_CLIP_BIN_CAPACITY", CP_FLAG_UINT,
+     F(run_clip_bin_capacity),
+     "diagnostic dense-reference capacity for RUN_CLIP_BIN; 0 uses the "
+     "normal maximum, while a small value forces the device-predicated "
+     "classic visibility arm without a host readback" },
+   { "CUDAVK_NO_RUN_PREP_STREAMS", CP_FLAG_BOOL_VALUE,
+     F(no_run_prep_streams),
+     "keep exact run-transaction vertex preparation serial on the main "
+     "stream; reverts the round-robin side-stream launch schedule" },
+   { "CUDAVK_RUN_GEOMETRY_FAIL_ALLOC", CP_FLAG_UINT,
+     F(run_geometry_fail_alloc),
+     "fault gate for run geometry output growth: 1 injects soft OOM and 2 "
+     "injects a fatal CUDA error before any geometry launch" },
+   { "CUDAVK_RUN_GEOMETRY_FAIL_LAUNCH", CP_FLAG_BOOL_VALUE,
+     F(run_geometry_fail_launch),
+     "fault gate that replaces each admitted run geometry launch with a "
+     "fatal CUDA error; verifies device loss rather than exact replay" },
    { "CUDAVK_PLAN_STATS", CP_FLAG_BOOL_VALUE, F(plan_stats),
      "report at teardown what deciding one draw at a time costs: batch keys "
      "built, pairwise merge tests, flushes, pass episodes closed and every "
@@ -241,6 +275,22 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_FUSED_VFETCH", CP_FLAG_BOOL_VALUE, F(no_fused_vfetch),
      "do not even build the fused vertex execution: the resource-isolated "
      "control, and the revert once the fusion is the default" },
+   { "CUDAVK_FUSED_WRITEBACK", CP_FLAG_BOOL_VALUE, F(fused_writeback),
+     "blend direct-path colour inside the fragment shader instead of "
+     "launching cp_fs_writeback" },
+   { "CUDAVK_PEEL_ANY_PINNED", CP_FLAG_BOOL_VALUE, F(peel_any_pinned),
+     "keep the depth-peel convergence word device-local and copy its four "
+     "bytes to a pinned host mirror before each existing convergence wait",
+     .dflt = 1 },
+   { "CUDAVK_NO_PEEL_ANY_PINNED", CP_FLAG_BOOL_VALUE,
+     F(no_peel_any_pinned),
+     "revert depth-peel convergence to the managed word" },
+   { "CUDAVK_SCRATCH_PINNED", CP_FLAG_BOOL_VALUE, F(scratch_pinned),
+     "allocate host-written/GPU-read renderer scratch as mapped pinned memory "
+     "instead of migration-prone managed memory", .dflt = 1 },
+   { "CUDAVK_NO_SCRATCH_PINNED", CP_FLAG_BOOL_VALUE,
+     F(no_scratch_pinned),
+     "revert renderer scratch to managed memory" },
    { "CUDAVK_FS_GRID_WAVES", CP_FLAG_UINT, F(fs_grid_waves),
      "size the fragment grid to fill the machine this many times over and let "
      "it grid-stride, instead of covering the framebuffer's worst case; 0 "
@@ -358,6 +408,9 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_SEG_MERGE", CP_FLAG_BOOL_VALUE, F(no_seg_merge),
      "disable merged shading groups: every episode segment shades in its "
      "own launch group, as before" },
+   { "CUDAVK_OPAQUE_UBO_CONCAT", CP_FLAG_BOOL_VALUE, F(opaque_ubo_concat),
+     "merge opaque shade groups with different FS argument rows by "
+     "concatenating the rows and applying each segment's row base" },
    { "CUDAVK_NO_ABUF_APPEND", CP_FLAG_BOOL_VALUE, F(no_abuf_append),
      "disable the single-pass A-buffer build: the count pass stops appending "
      "(pixel, prim) records and the fill rasterizes a second time" },
@@ -528,6 +581,11 @@ static const struct cp_flag_def flags[] = {
      .dflt = CP_ARENA_DEFAULT_WARMUP },
    { "CUDAVK_SMALL_ALLOC_STATS", CP_FLAG_BOOL_PRESENCE, F(small_alloc_stats),
      "dump the allocation mix and arena hit rates at exit" },
+   { "CUDAVK_MEMORY_ALLOC_STATS", CP_FLAG_BOOL_PRESENCE,
+     F(memory_alloc_stats),
+     "print every Vulkan memory allocation's CUDA address, size, type and "
+     "host visibility, plus renderer scratch/peel allocation backends, for "
+     "profiler-address correlation" },
 
    /* ---- shader compilation ---- */
    { "CUDAVK_NO_REGCAP", CP_FLAG_BOOL_PRESENCE, F(no_regcap),

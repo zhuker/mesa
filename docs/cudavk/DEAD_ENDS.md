@@ -119,7 +119,7 @@ and entry 1 measured why it does not capture.
 | 12 | Resource-isolated classic fragment binary | 5 | REFUTED | 64 of 65 capture shaders unchanged; classic lost 1.156 ms |
 | 13 | Narrow hardware texture paths | 6, 8, 15 | REFUTED, then **superseded** | 13.6–14.1% coverage; iteration 24 reached 99.9% |
 | 14 | Vertex fetch fused as a device link | 4 | REFUTED, then **superseded** | 48.05 ms; iteration 27's bitcode inline paid +0.49 ms |
-| 15 | Fragment writeback fused into the shader | 28 item 3 | **PARKED** | wrong frames; the central invariant is measured FALSE |
+| 15 | Fragment writeback fused into the shader | 28 item 3 + 2026-09-08 | **REFUTED (neutral)** | cache bug fixed; exact SSA handoff measured neutral on both captures |
 | 16 | Blocking-sync context to coexist with an ML pipeline | interop | REFUTED | +97.8% frame under load, and it saves no CPU there either |
 | 17 | Deferring the driver's object-destruction drains | 2026-08-27 item 1 | REFUTED | the driver owns 55.5% of the site by count and **3.0% by blocked time** — 0.0066 ms/frame |
 | 18 | Wider memory requests in the rasterizer stages | 2026-08-27 item 3 | REFUTED | one 1.00 sectors/request was an artefact, the other is the **optimum**; SoA would make it worse |
@@ -851,7 +851,7 @@ nothing about a frame when one shader takes two launches and another two hundred
 
 ---
 
-## 15. Fragment writeback fused into the fragment shader — PARKED
+## 15. Fragment writeback fused into the fragment shader — REFUTED (neutral)
 
 Iteration 28 item 3. The only record is
 `/tmp/perf16/iter28-item3/README.md` with `wip.patch` (1,590 lines) and
@@ -929,6 +929,45 @@ and the meson bitcode `custom_target` did not list the new shared header in its
 `input`, so header edits silently did not rebuild the bitcode.
 
 ---
+
+
+### Post-2026-09-08 resolution and current-tree port
+
+The historical missing-pixel defect was reproduced at `5a3315bca60` and fixed.
+It was **not** a slot/grid-stride or tail-call-reach defect. Fused writeback
+skipped `cp_texture_attachment_written()`, so later hardware texture sampling
+reused a stale cached attachment. Moving notification after the fused versus
+standalone branch made the old failing frame 2 byte-identical to its unfused
+reference. Explicit virtual-slot spelling and volatile `fs_out` reloads were
+negative controls with the exact broken hash. Reproduction record:
+`/tmp/mesa-wb-repro-results/REPORT.md`.
+
+The corrected mechanism is now ported to cudavk behind default-off value flag
+`CUDAVK_FUSED_WRITEBACK`. Default-off processes do not build the extra shader
+executions. Both captures are exact; favorite3 has 18/18 identical sentinels.
+Strict alternating results are neutral and slightly unfavorable:
+
+```
+favorite3  whole 5.2021 -> 5.2297 (+0.0276)  heavy 6.0646 -> 6.0934 (+0.0288)
+favorite2  whole 4.8783 -> 4.8999 (+0.0215)  heavy 5.0697 -> 5.0825 (+0.0128)
+```
+
+All arms overlap. A bounded follow-up then removed the fused shader's
+redundant location-0 `fs_out` store/reload by carrying the final colour in four
+promotable words. It preserves partial, repeated and dynamically unwritten
+outputs by seeding each grid-stride iteration from the old scratch row, and
+refuses any candidate that adds local memory/spill or loses an occupancy class.
+A conditional/repeated/partial-output gate is byte-identical. Its strict result
+is again neutral:
+
+```
+favorite3  whole -0.0147  heavy -0.0017 ms/frame
+favorite2  whole -0.0278  heavy -0.0128 ms/frame
+```
+
+All arms overlap. The feature stays default-off. Nothing here carries a goal
+margin: the original measured opportunity remains only about 0.04 ms/frame.
+
 
 ## 16. Blocking-sync CUDA context to coexist with a co-located ML pipeline — REFUTED
 
@@ -1246,6 +1285,18 @@ by other means first.
 
 **Cost.** One profiling window, against a build that entry 20 shows would have
 cost an iteration and lost.
+
+
+### Post-2026-09-08: the B200 reopening condition no longer has a population
+
+The 2026-09-03 B200 trace met the old 2.0--2.3-us per-link retry threshold,
+but that threshold multiplied the pre-wide-episode population. The current
+273-frame trace has only 23.3 launches/frame for each A-buffer count stage,
+69.9 across the complete triple. Even deleting **every** one at the worst
+measured B200 dependent-gap price, 4.2 us, caps the boundary pool at **0.294
+ms/frame**. A real merge removes fewer boundaries, retains device work and
+serialises some existing overlap. The B200-specific retry therefore no longer
+clears the 0.500-ms admission gate; no implementation is justified.
 
 ---
 
@@ -2561,6 +2612,27 @@ for a tenth of the cost. The trace that settled all three took nine minutes and
 was only possible because the harness stopped crashing, which is its own
 argument for fixing the tools first.
 
+
+
+### Post-default residency trace (2026-09-09)
+
+A complete matching Nsight Systems 2026.4.1 favorite3 trace of the shipped
+pinned-scratch default contains 6,947 submit rows and the exact application
+stdout prefix. Across the 3,473 real frames it records 9,736 GPU fault events,
+204,056 constituent faults on 667 pages, and **597.224 ms of summed event
+duration: 0.172 ms/frame**. This is still only an overlap-ignorant ceiling;
+event durations are not additive critical-path time.
+
+Allocation/binding telemetry accounts for every leading 2-MiB region. The top
+four are application allocations: transfer-source buffers (262.306 ms summed),
+two 512-KiB uniform buffers (107.731 ms), and two 4.096-MiB index buffers
+(76.865 and 76.636 ms). The old anonymous two-page renderer-scratch region is
+absent. Even impossible deletion of **all** remaining UM event duration misses
+the 0.500-ms admission gate by 2.9x. The two broad treatments that could reach
+those application resources already lost on RTX (`SET_READ_MOSTLY`, entry 50;
+pinned Vulkan type 1, entry 51). Managed-memory residency is therefore closed
+as a remaining route after the accepted renderer-owned correction.
+
 ## 41. Device-decided episodes (G): the wait it removes is the GPU's, not the host's
 
 **What it was.** The last open driver-side lead, and the one carried longest:
@@ -2775,32 +2847,77 @@ re-tune of the raster thresholds, `TILE_BOUND` and `POINT_THRESHOLD` (defaults
 optimal, 0.09-0.10 ms worse either side); 20 batch-break tests, of which 17
 never fire; 3 predicate relaxations; 5 structural rewrites, all slower.
 
-**Frame-wide deferred shading: already done where it is legal.** The 0.411 ms
-carried for it throughout this investigation was never available. An opaque
-episode already defers -- every segment rasterises into one visibility buffer
-and shading runs per identity group afterwards -- so a pixel is shaded once
-per episode. Frame-wide deferral would require all opaque work in a single
-episode, and opaque groups are separated by **15.3 blended runs a frame**. A
-blended draw reads the colour underneath it, so the opaque work before it must
-already have shaded. Merging across it changes the result. The 2.29x overdraw
-is the cost of that interleaving, and it is the application's structure, not
-the driver's.
+**Frame-wide deferred shading: already done for the dominant legal run.** The
+0.411 ms carried for it throughout this investigation was never available. An
+opaque episode already defers -- every segment rasterises into one visibility
+buffer and shading runs per identity group afterwards -- so a pixel is shaded
+once per episode. The corrected current census reports only 1.03/1.01 opaque
+runs per frame, carrying 90.8/95.2% of triangles: the dominant opaque geometry
+is already one run, not repeatedly split by the 22 small blended runs. A
+blended draw still reads the colour underneath it, so merging opaque work across
+one changes the result, but those runs carry only 2.2-2.3% of triangles. Thus
+neither the old 15.3-run claim nor its attribution to application structure is
+a valid current explanation; the measured fact that matters is that dominant
+opaque deferral is already achieved.
 
-**The last hardware-assisted path, priced and refused.** CUDA cannot invoke
-the rasteriser, but this GPU has RT cores that do hardware triangle
-intersection, and using them for visibility is a known technique. It needs a
-BVH over the frame's geometry, and the geometry here is dynamic (skinned
-characters, animated scene) so no BVH survives a frame:
+**The last hardware-assisted path was re-opened and measured.** CUDA cannot
+invoke the rasteriser, but OptiX can use RT traversal without a graphics ICD.
+The original version of this entry rejected it from published BVH-throughput
+estimates: 2.5 ms for an optimistic 250k-triangle LBVH. That was wrong. On the
+RTX here, a pure-build OptiX 8 probe over 354,000 primitives measured:
 
-| build kind | throughput | 250k triangles |
+| one GAS, 354k primitives | coherent bounds | random bounds |
 |---|---:|---:|
-| full | 10 Mtri/s | 25.00 ms |
-| fast full | 50 Mtri/s | 5.00 ms |
-| LBVH | 100 Mtri/s | 2.50 ms |
+| fast triangle build | 0.441 ms | 0.586-0.596 ms |
+| triangle update/refit | 0.035 ms | 0.044-0.047 ms |
+| custom-AABB build | -- | 0.520-0.527 ms |
+| custom-AABB update/refit | -- | 0.040-0.041 ms |
 
-**The fastest build alone exceeds the entire 2.088 ms frame budget**, before a
-single ray is cast -- and rays would give visibility only, leaving shading,
-blending and the A-buffer exactly as they are. Refused on build cost.
+The estimate was wrong by 4--6x, so build cost alone was not a valid rejection.
+A second audit also corrected the assumed transaction shape: the current
+favorite3/favorite2 census has about 1.03/1.01 dominant opaque runs per frame,
+carrying 90.8/95.2% of triangles. The earlier claim that 15.3 blended runs split
+the dominant opaque geometry was not supported by that corrected run unit.
+
+The closest renderer-shaped optimistic probe therefore uses one GAS of 354,000
+custom triangle AABBs plus one 1280x720 trace. With fast-trace build options,
+three GPU-lock-serialised runs measured:
+
+| one dominant opaque run | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| fixed-count update/refit | 0.180 ms | 0.181 ms | 0.179 ms |
+| trace 921,600 rays | 0.057 ms | 0.058 ms | 0.058 ms |
+| refit + trace | **0.237 ms** | **0.238 ms** | **0.237 ms** |
+
+This almost consumes the **entire 0.265-ms joint-renderer budget** while doing
+only closest-hit visibility. It is also 1.58x the 0.15-ms run-level gate and
+can displace at most the current 1.769-ms summed raster pool, far short of the
+required 2.9813-ms overlap-correct frame credit. It excludes AABB generation,
+exact candidate append/sort, depth, fragment shading, writeback and blending.
+
+Exact Vulkan use cannot fuse those omitted stages into the hit program.
+Built-in ray/triangle hits do not have Vulkan's top-left coverage rule, so
+conservative custom AABBs must call the existing edge test. Traversal is not
+stable submission order, so every covered candidate must be appended and
+sorted. Closest hit cannot model discard, shader-written depth or ordered
+blending. OptiX threads also cannot supply the 2x2 same-triangle helper lanes
+used for fragment derivatives. The existing CUDA depth, quad shading,
+writeback and blend stages therefore remain, and raster-only replacement has
+insufficient scope even at zero extra cost.
+
+For completeness, a pessimistic 16-GAS split probe measured 0.649-0.787 ms for
+refit and 0.825-0.826 ms for 16 traces, or 1.475-1.613 ms together. That models
+many separately ordered runs but not the dominant current opaque population;
+it is retained only as the split-cost bound, not the primary rejection.
+Fixed-count refit also requires identical build counts and options while clip
+output varies. Dead fixed-capacity slots are possible but can degrade BVH
+quality.
+
+OptiX itself is outside the CUDA Driver API and would require a
+project-constraint exception; B200 would additionally require an OptiX 9.x
+smoke test. **Refused from the measured one-run cost plus the exact semantic and
+whole-pipeline scope gates, not from the corrected BVH-build estimate or the
+superseded 16-run assumption.**
 
 **The margin is 1.28x, not a wide one**, and this document corrected itself
 eleven times reaching it -- three of those reversals of a stated verdict. The
@@ -2934,3 +3051,390 @@ already overlap. If a pool's union-exclusive time is well below its summed
 time, the fan-out is already collecting most of what the merge would -- and
 if the pool's *work share* is low, that is evidence of overlap being exploited,
 not of waste waiting to be reclaimed.
+
+
+## 46. Opaque FS-UBO row concatenation — REFUTED (pool disappeared)
+
+2026-09-08. `CUDAVK_OPAQUE_UBO_CONCAT` removes the last equality check that
+kept shade-compatible opaque segments with different FS rows in separate
+groups. The existing group table and per-range `row_base` already implement
+the device side, so this is the exact blended-path mechanism rather than a new
+reconstruction.
+
+Both captures retain their exact stdout hash and submit count, and five focused
+batch/run tests pass. The old TODO predicted about 60 removed launches/frame.
+On the current renderer the actual count is only:
+
+```
+favorite3  107400 -> 105628 FS launches / 3473 frames = 0.510/frame
+favorite2   95461 ->  93712 FS launches / about 3482 frames = 0.502/frame
+```
+
+At the measured 0.78--0.81 us value of a removed serial boundary, the complete
+pool is about **0.0004 ms/frame**. Empty-block scheduling was separately bounded
+below 0.2 ns/block by entry 9. The opportunity has already been collected by
+later grouping work; no timing campaign or default-on change is justified.
+The flag stays default-off as a cheap reproducer.
+
+
+## 47. Independent fixed-kernel deletion plus threaded submit — REFUTED
+
+2026-09-08. Reproducer: `src/cudavk/tests/cp_architecture_floor.py`; source
+trace: `/tmp/nsys-runclip-classic-nvtx.sqlite`, 273 frames.
+
+This is the deliberately impossible upper bound for continuing the two old
+axes independently. The trace span is 3.635500 ms/frame and the interval union
+of all GPU kernels is 2.110307. Retaining only shader kernels named `main`
+leaves a 0.909511-ms union, so deleting every fixed-function and housekeeping
+kernel has only **1.200796 ms/frame** of overlap-correct credit and leaves
+2.434705 ms/frame at the observed timestamps. Subtracting the separately
+measured completion-aware fully-threaded-submit gain, 0.126184 ms/frame (entry
+34), still leaves **2.308521 ms/frame**, above the 2-ms target.
+
+This is not a universal lower bound: CUPTI changes host timing, and a joint
+redesign could compact retained intervals rather than merely delete work. It
+is a strict retry rule for the current programme. No further proposal that is
+only a fixed-kernel rewrite, only a host-submit change, or a simple additive
+pair of those has enough measured scope. A candidate must demonstrate a joint
+shader/execution scheduling mechanism before implementation, or change the
+CUDA-only/exact-semantics constraint.
+
+
+## 48. Persistent shader-bytecode interpreter — REFUTED on RTX 5090
+
+2026-09-08. Reproducer: `src/cudavk/tests/cp_shader_interp_bench.cu`.
+
+This was the only newly identified CUDA-only mechanism broad enough to attack
+both sides of entry 47 at once: keep one low-register renderer resident, feed
+it device command records, and interpret shaders rather than linking a
+resource-collapsing combined module. If every fixed-function interval and every
+observed gap vanished, the 0.909511-ms/frame shader union could grow by at most
+**2.20x** before consuming the complete 2-ms target. Raster and scheduler work
+make the real allowance smaller.
+
+The microbenchmark deliberately favours the VM: 1,048,576 active lanes, hot
+uniform bytecode, a uniform program counter and opcode in every warp, only
+eight virtual registers, no texture operations, no divergent control flow, no
+barriers, and no renderer work. It compares an unrolled compiled program with
+the same dynamically indexed bytecode. The one-opcode arm removes even the
+opcode switch. RTX 5090 / sm_120 results:
+
+```
+                       8 ops   16 ops   32 ops   64 ops   128 ops
+mixed local VM          5.75x    8.11x   13.02x   23.00x    28.75x
+one-opcode local VM     5.53x    7.99x   12.97x   15.35x    21.65x
+shared-register VM      2.99x    3.99x    6.98x    8.33x       --
+scalar-switch VM        3.00x    4.99x    8.48x   11.02x       --
+quad/shared VM          1.50x    2.01x    3.49x    3.67x       --
+8-wide/shared VM         2.50x    3.92x    6.01x    7.31x       --
+16-wide/shared VM        3.93x    5.53x    9.03x   10.46x       --
+```
+
+`ptxas` reports 24 registers plus a **32-byte per-thread stack** for the local
+VMs, versus 20--22 registers and no stack for compiled programs. Two explicit
+challenges remove that stack: a structure-of-arrays register file uses 8 KiB
+of shared memory per 256-thread block and 39 registers; eight scalar CUDA
+registers selected by uniform switches use 26 registers. They cut the
+smallest ratio to 2.99x. A final quad-per-thread arm amortises one decode across
+the renderer's natural 2x2 fragment unit and reaches 1.50x at eight ops and
+2.01x at sixteen, but is already 3.49x at 32. Wider 8- and 16-fragment
+vectors lose occupancy (96 and 254 registers) and are slower at every size, so
+quad amortisation is the optimum among the measured representations.
+
+The real `CUDAVK_SHADER_STATS` census counts optimized pre-SSA-destruction NIR
+instructions, excluding constants and dereferences. On favorite3 only 15.96%
+of FS launches are at or below 16 ops; 47.20% exceed 128. On favorite2 the
+figures are 10.21% and 48.01%. Scheduled-block weighting is harsher: 80.2% and
+86.4%, respectively, are above 32 ops. Both censuses retained their exact
+capture hash and 6,947/6,965 rows. The only VM arm inside the 2.20x bound covers
+a small minority of either capture, while the dominant population starts at
+3.49x before raster or scheduler work.
+
+The B200 was recovered through its documented relay and the same source was
+compiled with CUDA 13.0 for sm_100. Its best quad/shared ratios are **1.66x,
+2.32x, 3.58x and 4.48x** at 8/16/32/64 ops. Only the <=8 bucket meets 2.20x,
+and that bucket is merely 7.66% of favorite3 and 4.27% of favorite2 FS
+launches. B200 therefore rejects the VM more strongly for the real shader mix,
+even though its quad kernel uses 32 registers rather than RTX's 40.
+
+Do not build the renderer VM on either GPU. A credible new representation must
+beat the quad/shared arm on the >32-op population, not merely remove the local
+stack, opcode switch, or decode amortisation again.
+
+
+## 49. Pinned depth-peel convergence word — weak alone, accepted with pinned scratch
+
+2026-09-09. Flag: `CUDAVK_PEEL_ANY_PINNED`, now default on with an explicit `CUDAVK_NO_PEEL_ANY_PINNED` revert.
+
+A matching Nsight Systems 2026.4.1 B200 trace found one two-page unified-memory
+region with 1.175 seconds of summed GPU fault-event duration. Allocation order
+and recurrence identified it as the four-byte `peel_any` convergence word:
+raster kernels write it, then the host reads it after the existing peel wait.
+The first prototype put the atomic target directly in mapped host memory.
+Review found that its host clear could race a preceding draw's final unchecked
+pass, and that the historical same-value multi-thread stores were themselves a
+CUDA data race. Those timings were discarded even though their image gates
+passed.
+
+The corrected protocol is exact. Each convergence interval advances a
+`peel_epoch`; accepted raster fragments use `atomicExch(any, epoch)`, and the
+host checks equality only after `cp_sync_timed()`. Older unchecked passes can
+only write an older generation and are ordered before the next interval on the
+same stream. The wrap path synchronizes before resetting. The candidate keeps
+the atomic word device-local, asynchronously copies its four bytes to a pinned
+host mirror immediately before the already-required wait, and falls back to
+the managed word only on pre-use OOM. Other CUDA allocation/free failures
+latch device loss.
+
+Three-round alternating favorite3 results, exact hash, 6,947 rows and 18/18
+sentinels in every arm:
+
+| host | control whole / heavy | pinned whole / heavy | delta whole / heavy |
+|---|---:|---:|---:|
+| RTX 5090 | 5.2673 / 6.0370 | 5.1558 / 6.0421 | **-0.1115 / +0.0050** |
+| B200 | 8.7474 / 9.7441 | 8.4370 / 9.8212 | **-0.3103 / +0.0771** |
+
+The whole-frame arms are disjoint in the useful direction, but both heavy-band
+comparisons overlap and the larger B200 gain is still below the 0.500-ms
+admission gate. The 1.175-second profiler sum was not a critical-path saving:
+fault events overlap other work and event durations are not deletion credit.
+That declined the word as a standalone feature. The recorded retry condition
+was then met: paired with mapped pinned renderer scratch it saves
+1.034-1.055 ms whole-frame and 1.095-1.137 ms in the heavy band on B200, and is
+positive on both RTX captures. The pair is now default-on. The generation and
+atomic fixes also remain because they remove two correctness races independent
+of the storage experiment.
+
+Default and pinned serialized suites pass 83/83. Compute Sanitizer reports zero
+errors for the pinned blended-depth test. `cpvk_batchblend` separately exposes
+three identical pre-existing `cp_abuf_cleanup` invalid frees in both arms, so
+it is not sanitizer evidence for or against this change.
+
+**Retry resolved.** The mapped-pinned scratch treatment provided the measured
+combined premise and cleared 0.500 ms on both B200 captures. The exact paired
+results are in `PERFORMANCE.md`; no credit was inferred by adding profiler
+event durations.
+
+
+## 50. `SET_READ_MOSTLY` on GPU-read-only Vulkan buffers — REFUTED
+
+2026-09-09. Temporary flag `CUDAVK_READMOSTLY_BUFFERS` (removed).
+
+The allocation-correlated B200 unified-memory trace left four large recurring
+managed regions after isolating renderer scratch: a 2-MiB allocation containing
+thousands of transfer-source buffers, a 2-MiB allocation containing two
+uniform buffers, and two 4.096-MiB index-buffer allocations. Their declared
+Vulkan roles are GPU-read-only and their memory is mapped and written by the
+host. The probe applied `CU_MEM_ADVISE_SET_READ_MOSTLY` only when every usage
+bit was one of transfer source, uniform texel, uniform, index, vertex or
+indirect; any write-capable usage bit refused it.
+
+That advice is not a prefetch. CUDA duplicates pages on a reader, then a CPU
+write invalidates the GPU copy. On favorite3 it made the already-positive peel
+plus pinned-scratch candidate slower than its control:
+
+| arm | whole | heavy |
+|---|---:|---:|
+| control | 5.2586 | 6.0402 |
+| peel + pinned scratch + read-mostly | 5.4054 | 6.2436 |
+| delta | **+0.1469** | **+0.2034** |
+
+All three alternating arms were exact (hash, 6,947 rows, 18/18 sentinels) and
+the intervals were disjoint in the wrong direction. The same session without
+read-mostly had measured peel plus pinned scratch at -0.2892/-0.2686, so the
+advice erased roughly 0.44-0.47 ms/frame rather than recovering migration.
+One capture losing this decisively is enough; no B200 run was spent on it.
+
+Review also found that the proposed resource predicate was not a page-lifetime
+predicate. CUDA rounds advice to CPU pages and retains it after a Vulkan buffer
+is destroyed. A later writable alias or adjacent suballocation can legally use
+the same page; writes remain coherent because CUDA invalidates duplicates, but
+the claimed read-only residency policy and its performance become false.
+Shipping it would require page-granular alias/rebind reference tracking and
+checked advice results. The negative A/B means that complexity has no premise.
+The flag and implementation were removed.
+
+
+## 51. Backing all Vulkan host-only memory with mapped pinned memory — REFUTED
+
+2026-09-09. Temporary flag `CUDAVK_HOSTMEM_PINNED` (removed).
+
+After mapped pinned renderer scratch removed more than 1 ms/frame on B200, the
+same physical-memory backend was tried for Vulkan memory type 1. That heap is
+host-visible, host-cached and not device-local. Its managed allocations owned
+the remaining traced transfer-source and index-buffer fault regions. The probe
+used `cuMemHostAlloc(CU_MEMHOSTALLOC_DEVICEMAP)`, retained separate host and
+device aliases, matched destruction with `cuMemFreeHost`, and kept managed
+allocation as the unsupported/OOM fallback.
+
+It was exact on focused transfer, uniform, indirect, texture and blend tests,
+and all six favorite3 arms preserved the hash, 6,947 rows and 18/18 sentinels.
+It did not preserve the performance win of the narrower residency treatment:
+
+| arm | whole | heavy |
+|---|---:|---:|
+| managed control | 5.2746 | 6.0496 |
+| peel + pinned scratch + pinned Vulkan type 1 | 5.0791 | 6.1567 |
+| delta from control | -0.1955 | **+0.1072** |
+
+The same-session peel + pinned-scratch result without this backend was
+-0.2892/-0.2686. Thus broad type-1 pinning cost about 0.09 ms whole and 0.38 ms
+in the heavy band: repeatedly reading index/uniform/application storage across
+the host interconnect costs more than page migration on this capture. A
+mechanism that loses either accepted capture is not enabled and is not sent to
+B200 for rescue. The flag, ownership field and allocation path were removed.
+
+
+## 52. CUDA 12.8/13 execution features as a joint renderer — NO ADMISSIBLE MECHANISM
+
+2026-09-09. This is the post-residency architecture gate, not a failed code
+prototype.
+
+The shipped-default favorite3 median is 4.9813 ms and the objective is 2.0 ms,
+so a replacement needs 2.9813 ms of real frame credit. A complete matching
+CUDA+NVTX trace (6,947 submits, exact stdout prefix, 1,110,019 retained kernel
+events) attributes these summed kernel durations per real frame:
+
+| stage | summed ms/frame |
+|---|---:|
+| raster | 1.769 |
+| vertex | 0.808 |
+| fragment shader | 0.437 |
+| interpolation | 0.148 |
+| writeback | 0.057 |
+| composite | 0.027 |
+| **six-stage total** | **3.247** |
+| all generated shader `main` kernels | 1.275 |
+| every kernel | 3.966 |
+
+Sums double-count concurrent kernels and are not frame-critical time. That only
+makes the necessary gate harsher: a six-stage joint renderer must recover
+**91.8%** of its summed pool and leave at most **0.265 ms/frame** for the entire
+replacement plus its scheduling cost, an optimistic 12.2x end-to-end
+reduction. A deletion mechanism broad enough to absorb every kernel still has
+to recover at least 75.2% of all summed kernel duration. No isolated stage is
+large enough.
+
+Two independent audits checked the remaining CUDA execution families against
+that corrected whole-pipeline gate:
+
+- Thread-block clusters and Blackwell Cluster Launch Control can place,
+  synchronize and rebalance blocks of one already-launched CUfunction. They do
+  not provide cheap indirect execution of arbitrary separately generated
+  shader CUfunctions. Launch Control is therefore at most a narrow raster-tail
+  load balancer; even deleting raster is capped at 1.769 ms summed.
+- Green contexts statically partition SMs and do not guarantee concurrency or
+  forward progress between partitions. Perfect raster/shader overlap is only
+  1.275 ms before the measured loss of eight-stream fan-out.
+- TMA accelerates regular copies/address generation, not triangle coverage,
+  depth/blend ordering, texture semantics or shader ALU. Even deleting the
+  known copy/staging pools is about 0.291 ms.
+- PDL, device graphs, conditional graphs and CDP execute the same child work.
+  Their exposed gaps, recipe-reuse failure and launch costs are already closed
+  in entries 1, 25, 26, 45 and 47.
+- A cooperative/persistent kernel can own the full schedule only if shader code
+  is linked into it, interpreted, or launched as children. Linked real shader
+  selectors collapse occupancy through the call/resource union; the measured
+  VM is 3.49x+ on the dominant shader population on RTX and 3.58x+ on B200;
+  child launch returns to the previous item.
+
+Exact opaque visibility requires all primitives to compete before the winner
+is shaded. Blended layers require count/fill/sort and submission-order
+composition, including attachment encoding at each layer. These dependencies
+forbid speculative shading as free overlap. CUDA exposes no fixed-function
+raster or cheap resource-isolated indirect CUfunction call that changes this
+representation boundary.
+
+**Admission rule.** A future claimed CUDA-only representation must first show
+an exact replay-equivalent raster+VS+FS+interpolation+writeback+composite
+prototype below 0.265 ms/frame on both RTX and B200, then demonstrate
+2.9813 ms of overlap-correct unprofiled frame credit. No known CUDA 12.8/13
+mechanism has a credible route to that prerequisite. Reaching 2 ms now requires
+a constraint change: graphics hardware/ICD use, workload-specific semantics,
+or a higher target.
+
+
+### Software-raster literature cross-check
+
+An independent review then checked whether the gate had excluded a genuinely
+different algorithm rather than only CUDA API mechanisms:
+
+- CUDARaster and nvdiffrast use ordered 128x128 binning, 8x8 fine tiles and a
+  tile-owned ROP. They are much better engineered versions of the measured
+  sort-middle family, but the capture's hottest tile still serializes 26,297
+  triangles for 563 visible pixels. nvdiffrast explicitly removes shading,
+  blending and supersampling; its output is triangle ID/barycentrics.
+- Piko is a staged pipeline compiler whose gains are binning, scheduling and
+  compile-time fusion. Arbitrary separately generated Vulkan shaders still hit
+  the linked-selector/interpreter/child-launch boundary.
+- cuRE is the closest full concurrent streaming design, but its published goal
+  is performance within one order of magnitude of hardware and its mechanism
+  is the same persistent queue/megakernel representation already gated here.
+- LucidRaster's bounded per-pixel depth filter reports 0.5-1% invalid pixels
+  and depth-orders transparency. Exact submission ordering reduces it to the
+  existing count/fill/sort A-buffer and hot-tile walk.
+- Nanite-style microtriangle kernels match cudavk's existing direct small-
+  triangle stage. Gaussian/splat rasterizers do not implement triangle or
+  arbitrary-shader Vulkan semantics.
+
+The existing captured-shape lower-bound walk already reaches 7.8 cycles per
+reference, yet its complete modeled credit is only 0.237-0.580 ms and even a
+free walk caps at 0.582 ms. Reimplementing another queue organization measures
+the same insufficient pool. No literature candidate supplies the missing
+resource-isolated arbitrary shader execution, so none justifies another GPU
+microbenchmark under the 0.265-ms whole-pipeline gate.
+
+## 53. Small-batch fused kernel — REFUTED AT CENSUS
+
+2026-09-09. Not built; the census the plan required as its first step failed
+the plan's own stop rule.
+
+**What it was.** One kernel per small batch — vertex shader body, clip,
+setup, in-place rasterization into the visibility buffer and compaction in a
+single launch, followed by the fragment shader with fused writeback; for
+small blended batches, fragment append and a per-pixel sort in shared memory
+in place of the eleven-kernel A-buffer tail. The premise, from
+`notes/PERF_ANALYSIS_2026-09-02.md`, was that ~68 small batches per frame
+carry 9% of the triangles and most of the launches, and therefore most of
+the serial launch gaps. The plan set a gate before any code: **stop if the
+small batches hold under ~1.5 ms of main-stream wall.**
+
+**The census** (`tests/cp_chain_census.py`, full tables in
+`notes/SMALL_BATCH_CENSUS_2026-09-09.md`; three RTX 5090 nsys exports, CUPTI-
+traced, so the gaps are inflated). A chain is one vertex shader through to
+the next on its stream; small is a VS grid of at most 4,096 vertices. On the
+current build:
+
+| trace | small shaded main chains | launches | wall ms | busy ms |
+|---|---:|---:|---:|---:|
+| whole favorite3 replay (`/tmp/kb.sqlite`, 4.25 traced) | 6.2/frame | 60 | **0.671** | 0.470 |
+| heavy window (`/tmp/nsys-runclip-control.sqlite`, 7.26 traced) | 6.2/frame | 65 | **0.686** | 0.503 |
+
+Most of the ~68 small batches are the **side-stream** blended appends: 18-48
+per frame, four launches each, ~34 µs of wall almost fully busy, already
+overlapped by the fan-out. The small blended chains on the main stream have
+1.55 / 2.81 ms of wall against 0.40 / 0.72 busy, but the difference is the
+A-buffer count phase waiting on those side appends (the `memset` to
+`cp_abuf_scan_reduce` edge, 0.39 / 0.74 ms/frame, the largest in every trace)
+and the peel loop's host waits — joins, which a fused kernel cannot move.
+
+**The arithmetic.** Collectable from the small shaded chains is their gaps
+(0.18-0.20 ms traced) plus the launch shells inside busy (at most ~0.3), about
+**0.5 ms traced** — a third of the gate. Untraced it is smaller: at the
+measured 22.5 / 27.0 µs per whole batch (`CUDAVK_BATCH_MAX=2`,
+`notes/FOURX_DIAGNOSIS_2026-09-05.md`), removing the entire fixed cost of six
+to eight chains is worth **0.14-0.22 ms/frame** before the fused kernel pays
+for its own launch and work.
+
+**Why the premise was wrong.** The launch count was right; the location was
+not. The main-stream launch-gap pool is ~1.1 ms traced across 500-600 gaps of
+~2 µs on every operation in the stream — kernels, 90-107 argument copies and
+100-150 memsets — not a population concentrated in the small batches. That is
+entry 22's merge rule and entry 45's finding from a third direction: the
+gaps a merge could collect are either already overlapped by the fan-out or
+spread too thin for one kernel to reach.
+
+**Rule.** A per-batch fusion is priced by the batches on the main stream's
+critical path, not by the batch count. Run `cp_chain_census.py` on a trace of
+the current build before pricing any launch-reduction idea; it separates
+main-stream from side-stream chains and launch gaps from joins in one command.
