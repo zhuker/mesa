@@ -173,6 +173,8 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
       opts[num_opts++] = "--relocatable-device-code=true";
    if (cp_kernels_instrumented())
       opts[num_opts++] = "-DCP_ABUF_INSTRUMENT=1";
+   if (cp_debug->clip_copy_bypass && !strcmp(name, "cp_rasterize.cu"))
+      opts[num_opts++] = "-DCP_CLIP_COPY_BYPASS=1";
    /* Only the rasterizer and the fragment module hold PDL secondaries.
     * Defining this for the other four would evict their NVRTC cache entries
     * every time the level is changed, and an A/B that recompiles one side is

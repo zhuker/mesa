@@ -206,6 +206,9 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_DEBUG_ROWS", CP_FLAG_BOOL_PRESENCE, F(debug_rows),
      "trace the per-draw tables a batch builds: fragment UBO slots and the "
      "vertex slice table the fragment stage searches" },
+   { "CUDAVK_CLIP_COPY_BYPASS", CP_FLAG_BOOL_VALUE, F(clip_copy_bypass),
+     "skip polygon copies for clip planes accepting every current vertex; "
+     "experimental, default off" },
    { "CUDAVK_DEBUG_CLIP", CP_FLAG_BOOL_PRESENCE, F(debug_clip),
      "report what each batch hands the clip stage: triangles, draws, whether "
      "the stable slot mode is on" },

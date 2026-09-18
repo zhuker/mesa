@@ -430,7 +430,26 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
    const float4 *src = v;
    int n = 3;
    for (int p = 0; p < CP_CLIP_NUM_PLANES; p++) {
+#if CP_CLIP_COPY_BYPASS
+      /* Test the CURRENT polygon, including vertices made by prior planes.
+       * This is exactly clip_poly's predicate: !(d >= 0), not d < 0,
+       * because a NaN is outside. All inside means clip_poly only copies
+       * the same n vertices in the same order (n <= CP_CLIP_MAX_VERTS).
+       * Retain their bits and buffer; no interpolation is skipped. */
+      bool unchanged = true;
+      for (int i = 0; i < n; i++) {
+         if (!(clip_dist(src + (size_t)i * slots, p) >= 0.0f)) {
+            unchanged = false;
+            break;
+         }
+      }
+      if (unchanged)
+         continue;
+      /* Plane parity is no longer buffer parity after a bypass. */
+      float4 *dst = src == poly_a ? poly_b : poly_a;
+#else
       float4 *dst = (p & 1) ? poly_b : poly_a;
+#endif
       n = clip_poly(dst, src, n, slots, p);
       if (n < 3) {
          if (args->stable && !args->active_ids && !ids)
