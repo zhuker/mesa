@@ -29,7 +29,8 @@ Plugin mode still requires anchored `--submit-regex`, `--frame-regex` and
 `--eof-regex`. Native tocpp mode instead requires **both** `--submit-ts` and
 `--expected-stdout-sha256`; these are mutually exclusive with all regex options.
 It checks the raw stdout hash, exit zero, and strict `ns index` timestamp rows:
-strictly increasing integer nanoseconds and contiguous zero-based indices.
+monotonic nondecreasing integer nanoseconds and contiguous zero-based indices.
+Equal timestamps are allowed because `CLOCK_MONOTONIC` can tie.
 Submit count is the row count; complete real frames are `(rows - 1) // 2`.
 No textual EOF is required in native mode. Missing/truncated timestamps fail.
 Device reports, teardown checks, identity, coverage and BREAK checks are unchanged.

@@ -130,14 +130,15 @@ def replay_mode(spec):
 
 
 def submit_counts(text):
-    rows = text.splitlines()
-    require(bool(rows) and text.endswith("\n"), "empty/truncated submit timestamps")
+    require(bool(text) and text.endswith("\n"), "empty/truncated submit timestamps")
+    rows = text[:-1].split("\n")
     previous = -1
     for index, row in enumerate(rows):
         match = re.fullmatch(r"([0-9]+) ([0-9]+)", row)
         require(match is not None, "malformed submit timestamp row")
         ns, observed = map(int, match.groups())
-        require(ns > previous, "submit timestamps not strictly monotonic")
+        require(ns < 2**63, "submit timestamp exceeds signed int64")
+        require(ns >= previous, "submit timestamps not monotonic")
         require(observed == index, "submit indices not contiguous from zero")
         previous = ns
     return len(rows), (len(rows) - 1) // 2
@@ -248,6 +249,9 @@ class GateTests(unittest.TestCase):
                 ts.write_text(text)
                 spec = dict(base, expected_submits=count, expected_frames=frames)
                 self.assertTrue(validate_files(spec)["pass"])
+                ts.write_text(text.replace("1000000100 1", "1000000000 1"))
+                self.assertTrue(validate_files(spec)["pass"])
+                ts.write_text(text)
                 for changes in [dict(exit_code=1), dict(expected_submits=count-1),
                                 dict(expected_frames=frames-1), dict(submit_regex="submit"),
                                 dict(expected_stdout_sha256=None), dict(submit_ts=None),
@@ -256,13 +260,14 @@ class GateTests(unittest.TestCase):
                         self.assertFalse(validate_files(dict(spec, **changes))["pass"])
                 rows = text.splitlines(keepends=True)
                 reordered = rows[1] + rows[0] + "".join(rows[2:])
-                for broken in [reordered, text.rsplit("\n", 2)[0] + "\n", text[:-1],
+                for broken in [reordered, text.replace("\n", "\r\n"),
+                               text.rsplit("\n", 2)[0] + "\n", text[:-1],
                                text.replace("1000000000 0", "1000000000 1"),
-                               text.replace("1000000100 1", "1000000000 1"),
                                text.replace("1000000100 1", "999999999 1"),
                                text.replace("1000000100 1", "1000000100 2"),
                                text.replace("1000000100 1", "1 1 extra"),
-                               text.replace("1000000100 1", "x 1"), ""]:
+                               text.replace("1000000100 1", "x 1"),
+                               text.replace("1000000100 1", f"{2**63} 1"), ""]:
                     ts.write_text(broken)
                     self.assertFalse(validate_files(spec)["pass"])
                 ts.unlink()
