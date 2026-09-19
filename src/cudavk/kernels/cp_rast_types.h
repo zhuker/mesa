@@ -384,7 +384,7 @@ struct cp_clip_args {
    uint64_t eq_dispatch;
 };
 
-#define CP_CLIP_EQ_REPORT_WORDS 34u
+#define CP_CLIP_EQ_REPORT_WORDS 36u
 
 #define CP_CLIP_MAX_OUT 8
 #define CP_CLIP_PRIM_SHIFT 3

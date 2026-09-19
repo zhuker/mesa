@@ -26,7 +26,7 @@ COUNTERS = ("invocations comparisons words differing_invocations differing_words
             "replay_invocations partial_fan injections errors stable "
             "refs active_ids ids first_failure first_dispatch first_triangle "
             "first_candidate_n first_oracle_n first_candidate_word first_oracle_word "
-            "standalone fused group_bin group_direct unsupported_k0 unsupported_missing scatter_words scatter_mismatch_words").split()
+            "standalone fused group_bin group_direct unsupported_k0 unsupported_missing scatter_words scatter_mismatch_words allocation_failures active_append_overflow").split()
 COVERAGE = ("invocations words scatter_words inside loop_reject clipped "
             "replay_slots replay_invocations partial_fan stable refs active_ids ids "
             "standalone fused group_bin group_direct").split()
@@ -80,12 +80,16 @@ def validate_report(r, arm):
     for field in ["expected", "dispatches", "break", "readback_errors", "checked"]:
         require(uint(r.get(field)), "missing or invalid uint64: " + field)
     raw = r.get("counters")
-    require(isinstance(raw, list) and len(raw) == 34 and all(uint(x) for x in raw),
-            "counters must contain exactly 34 uint64 values")
+    require(isinstance(raw, list) and len(raw) == 36 and all(uint(x) for x in raw),
+            "counters must contain exactly 36 uint64 values")
     c = dict(zip(COUNTERS, raw))
     for field in COUNTERS:
         if field in r:
             require(uint(r[field]) and r[field] == c[field], "named counter mismatch: " + field)
+    for field in ["allocation_failures", "active_append_overflow"]:
+        require(field in r and uint(r[field]), "missing mandatory counter: " + field)
+        require(c[field] == 0, "INCOMPLETE: " + field)
+    require(c["partial_fan"] == 0, "INCOMPLETE: partial fan emission")
     require(c["unsupported_k0"] == 0, "INCOMPLETE: surviving k0 without actual varyings")
     require(c["unsupported_missing"] == 0, "INCOMPLETE: missing actual varying materialization")
     require(c["reject_shortcut"] == 0, "nonzero reserved shortcut counter")
@@ -237,11 +241,11 @@ def validate_files(spec):
 
 class GateTests(unittest.TestCase):
     def setUp(self):
-        self.c = [0] * 34
+        self.c = [0] * 36
         for i, value in {0:10, 1:10, 2:120, 6:4, 8:3, 9:3, 10:6, 11:3,
-                         12:2, 15:10, 26:10, 32:120}.items():
+                         12:0, 15:10, 26:10, 32:120}.items():
             self.c[i] = value
-        self.r = dict(type="clip_equivalence", expected=10, dispatches=2, complete=True,
+        self.r = dict(allocation_failures=0, active_append_overflow=0, type="clip_equivalence", expected=10, dispatches=2, complete=True,
                       error=False, equal=True, lazy=True, readback_errors=0, zero_checked=False, checked=10, counters=self.c, **{"break":0})
         self.s = dict(arm="positive", exit_code=0, expected_submits=2, expected_frames=1,
                       submit_regex=r"^submit$", frame_regex=r"^frame$", eof_regex=r"^EOF$")
@@ -289,8 +293,22 @@ class GateTests(unittest.TestCase):
         c = self.c.copy(); c[30] = c[31] = 5
         with self.assertRaises(ValueError): self.check(dict(self.r, counters=c))
 
+    def test_allocation_failure_closed(self):
+        for arm in ARMS:
+            r = self.negative() if arm == "negative" else self.r.copy()
+            for index, field in [(34, "allocation_failures"), (35, "active_append_overflow"), (12, "partial_fan")]:
+                c = r["counters"].copy(); c[index] = 1
+                with self.subTest(arm=arm, field=field), self.assertRaisesRegex(ValueError, "INCOMPLETE"):
+                    self.check(dict(r, counters=c, **{field: 1}), arm=arm)
+            for field in ["allocation_failures", "active_append_overflow"]:
+                missing = r.copy(); del missing[field]
+                with self.subTest(arm=arm, field=field), self.assertRaisesRegex(ValueError, "missing mandatory"):
+                    self.check(missing, arm=arm)
+            with self.assertRaises(ValueError):
+                self.check(dict(r, counters=r["counters"][:34]), arm=arm)
+
     def test_types(self):
-        for i in range(34):
+        for i in range(36):
             for bad in [-1, 2**64, True, 1.0, "1", None]:
                 c = self.c.copy(); c[i] = bad
                 with self.subTest(index=i, bad=bad), self.assertRaises(ValueError):
@@ -332,8 +350,8 @@ class GateTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError): self.check(**{"min_" + field: 1000})
 
     def test_missing_readback(self):
-        for report in [dict(self.r, complete=False, error=True, counters=[0]*34),
-                       dict(self.r, counters=[0]*34), dict(self.r, complete=False)]:
+        for report in [dict(self.r, complete=False, error=True, counters=[0]*36),
+                       dict(self.r, counters=[0]*36), dict(self.r, complete=False)]:
             with self.assertRaises(ValueError): self.check(report)
         with self.assertRaises(ValueError): validate_logs(self.out, "", self.s)
 

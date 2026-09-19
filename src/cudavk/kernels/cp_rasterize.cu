@@ -271,8 +271,15 @@ clip_alloc(struct cp_clip_args *args, uint32_t tri, uint32_t k,
       ? tri * CP_CLIP_MAX_OUT + k
       : atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
    *id_out = o;
-   if (o >= args->max_triangles)
+   if (o >= args->max_triangles) {
+#if CP_CLIP_EQ_CHECK
+      /* Observe the actual allocation result, never a sampled counter delta.
+       * This shared guard covers inside, eager and lazy on every entry path. */
+      if (args->eq_report)
+         atomicAdd((unsigned long long *)(uintptr_t)args->eq_report + 34, 1ull);
+#endif
       return false;
+   }
 
    /* In stable mode o is the primitive's ordered fixed-slot ID. Append that
     * ID to a compact worklist instead of making the rasterizer visit holes. */
@@ -280,6 +287,11 @@ clip_alloc(struct cp_clip_args *args, uint32_t tri, uint32_t k,
       uint32_t at = atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
       if (at < args->max_triangles)
          ((uint32_t *)(uintptr_t)args->active_ids)[at] = o;
+#if CP_CLIP_EQ_CHECK
+      else if (args->eq_report)
+         /* at is the existing append atomic's ticket, not a second atomic. */
+         atomicAdd((unsigned long long *)(uintptr_t)args->eq_report + 35, 1ull);
+#endif
    }
    return true;
 }

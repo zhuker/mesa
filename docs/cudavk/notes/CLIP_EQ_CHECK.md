@@ -30,11 +30,17 @@ It does not replace external-renderer image gates.
   then check only allocated scatter output. No extra output allocation occurs.
 
 The footer is `CUDAVK_CLIP_EQ_JSON:` followed by one JSON object with type
-`clip_equivalence`. It contains 34 unsigned 64-bit counters. Counters 0–29
+`clip_equivalence`. It contains 36 unsigned 64-bit counters. Counters 0–29
 retain the reference layout, except 7 is reserved (`reject_shortcut`, zero),
 10 is `replay_slots`, 11 is `replay_invocations`, and 12 is `partial_fan`.
 Counters 30–33 are `unsupported_k0`, `unsupported_missing`, `scatter_words`,
-and `scatter_mismatch_words`. The boolean feature field is `lazy`.
+and `scatter_mismatch_words`. Counters 34–35 are mandatory named
+`allocation_failures` and `active_append_overflow`. They observe the existing
+allocation result and existing append atomic ticket at their production bounds
+guards in shared `clip_alloc`, including all-inside and eager-disabled paths.
+No production atomic or allocation is repeated. All three native arms require
+these counters and `partial_fan` to be zero; any nonzero value is INCOMPLETE.
+The boolean feature field is `lazy`.
 `readback_errors`, `zero_checked`, and `checked` are mandatory.
 
 ## CPU-only checks
@@ -56,7 +62,8 @@ capacities, and all four dispatch-path IDs.
 
 The corpus deliberately includes insufficient capacity. A successful CPU
 regression therefore does **not** mean its aggregate counters would pass the
-strict runtime validator: the lazy arms intentionally produce unsupported k0
+strict runtime validator: all arms intentionally produce allocation failures
+and active-list overflow; lazy arms also produce partial fans and unsupported k0
 invocations. The test proves that these are explicitly counted and excluded
 from comparisons, not hidden in a successful total. The missing-materialization
 arm deliberately clears actual seed-evaluation evidence in the extracted
@@ -95,3 +102,22 @@ PTX and SASS show live node load, one-bit XOR, store, snapshot loads and restore
 before scatter. Checker-off standalone has no 64-bit report atomics.
 The extended ABI is not free; no zero-overhead or performance claim is made.
 No GPU command or native admission run was performed for this implementation.
+
+## Allocation-failure acceptance scope
+
+This is a **canonical/scatter plus no-observed-overflow** gate, not an
+independent complete allocation or retirement oracle. It does not reconcile
+counter epochs, detect uint32 wrap from sampled counters, prove unique IDs,
+validate scheduling or retirement store sets, or fix allocator semantics.
+The two new counters observe actual local tickets/control in every call to
+shared `clip_alloc`; there is no pre/post global-count inference. Existing
+production return IDs, append/store bounds, ordering and return values remain
+unchanged. The frozen ORIGINAL69a oracle and exact canonical/scatter predicates
+remain unchanged. Surviving k0 and missing materialization still fail closed.
+
+384 targeted CPU fixtures per arm cover inside/slow, compact/stable, capacity
+zero/exhaustion, partial fans, and successful allocation with exhausted stable
+active append. Full Result and input comparisons retain negative restoration
+checks. CPU success intentionally includes allocation failures and must not be
+reported as native PASS. Updated compile-only, CPU, sanitizer, registry, ABI,
+and build evidence is in `strict-check/allocation-failure-fix/REPORT.md`.

@@ -34,14 +34,14 @@ static unsigned long long atomicCAS(unsigned long long *p,unsigned long long a,u
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"line %d: %s\n",__LINE__,#x); exit(1); } } while(0)
 """
 main = r"""
-static unsigned long long totals[34];
+static unsigned long long totals[36];
 struct Result {
   float4 out[16*3*CP_MAX_CLIP_SLOTS];
   uint64_t refs[16]; uint32_t active[16], ids[8], count; int emitted;
 };
 static void run(Result &r, float4 *in, unsigned slots, unsigned mode, bool candidate,
-                unsigned capacity) {
-  memset(&r,0x5a,sizeof(r)); r.count=1;
+                unsigned capacity, unsigned initial_count = 1) {
+  memset(&r,0x5a,sizeof(r)); r.count=initial_count;
   cp_clip_args a={}; a.eq_report=(uintptr_t)totals; a.eq_dispatch=17; a.vs_out=(uintptr_t)in; a.out=(uintptr_t)r.out;
   a.out_count=(uintptr_t)&r.count; a.num_slots=slots; a.num_triangles=2;
   a.max_triangles=capacity; a.stable=mode&1;
@@ -78,7 +78,62 @@ static void check(float4 a,float4 b,float4 c,int /*unused*/) {
     }
   }
 }
+// Each case observes the real allocator once, including its failed attempt.
+// Counter snapshots also prove that the plain arm does not instrument itself.
+static unsigned allocation_cases;
+static void allocation_case(unsigned slots, unsigned mode, bool slow,
+                            unsigned capacity, unsigned initial_count,
+                            unsigned emitted, unsigned failures,
+                            unsigned append_overflow, unsigned partial) {
+  float4 in[6*CP_MAX_CLIP_SLOTS], saved[6*CP_MAX_CLIP_SLOTS];
+  for (unsigned i=0;i<6*CP_MAX_CLIP_SLOTS;i++)
+    in[i] = {float(i),float(i+1),float(i+2),float(i+3)};
+  in[3*slots] = {0,0,slow ? -.1f : .5f,1};
+  in[4*slots] = {.5f,0,.5f,1};
+  in[5*slots] = {0,.5f,.5f,1};
+  memcpy(saved,in,sizeof(in));
+  unsigned long long before[36]; memcpy(before,totals,sizeof(before));
+  Result plain, observed;
+  run(plain,in,slots,mode,false,capacity,initial_count);
+  CHECK(!memcmp(saved,in,sizeof(in)));
+  CHECK(!memcmp(before,totals,sizeof(before)));
+  run(observed,in,slots,mode,true,capacity,initial_count);
+  CHECK(!memcmp(saved,in,sizeof(in)));
+  CHECK(!memcmp(&plain,&observed,sizeof(plain)));
+  CHECK(observed.emitted == int(emitted));
+  CHECK(observed.count == initial_count +
+        ((mode&1) ? ((mode&2) ? emitted : 0) : emitted+failures));
+  CHECK(totals[34]-before[34] == failures);
+  CHECK(totals[35]-before[35] == append_overflow);
+  CHECK(totals[12]-before[12] == (LAZY ? partial : 0));
+  allocation_cases++;
+}
+static void allocation_tests() {
+  for (unsigned slots: {1u,4u,16u}) for (unsigned mode=0;mode<16;mode++) {
+    unsigned base = (mode&1) ? CP_CLIP_MAX_OUT : 1;
+    // Inside fast path: successful, zero capacity, first fixed/compact ID full.
+    allocation_case(slots,mode,false,base+1,1,1,0,0,0);
+    allocation_case(slots,mode,false,0,1,0,1,0,0);
+    allocation_case(slots,mode,false,base,1,0,1,0,0);
+    // One near-plane crossing gives a quad, hence exactly two fan triangles.
+    allocation_case(slots,mode,true,base+2,1,2,0,0,0);
+    allocation_case(slots,mode,true,0,1,0,1,0,0);
+    allocation_case(slots,mode,true,base,1,0,1,0,0);
+    allocation_case(slots,mode,true,base+1,1,1,1,0,1);
+    if ((mode&3) == 3) {
+      // Fixed IDs remain valid while the independent active append is full.
+      allocation_case(slots,mode,false,base+1,base+1,1,0,1,0);
+      allocation_case(slots,mode,true,base+2,base+2,2,0,2,0);
+      // One append succeeds, then the second overflows (at == capacity).
+      allocation_case(slots,mode,true,base+2,base+1,2,0,1,0);
+      // Partial fan allocation and append overflow must be separate counts.
+      allocation_case(slots,mode,true,base+1,base+1,1,1,1,1);
+    }
+  }
+  CHECK(allocation_cases == 384);
+}
 int main() {
+  allocation_tests();
   check({0,0,.5f,1},{.5f,0,.5f,1},{0,.5f,.5f,1},0); // inside
   for(int p=0;p<7;p++) {
     float4 v={0,0,.5f,1};
@@ -135,6 +190,7 @@ int main() {
   CHECK((totals[11] > 0) == bool(LAZY));
   CHECK((totals[12] > 0) == bool(LAZY));
   CHECK(totals[32] > 0);
+  CHECK(totals[34] > 0 && totals[35] > 0);
   CHECK((totals[13] > 0) == bool(BREAK));
   CHECK((totals[3] > 0) == bool(BREAK));
   CHECK((totals[33] > 0) == bool(BREAK));
@@ -144,8 +200,8 @@ int main() {
     CHECK(totals[4] >= totals[13]);
     CHECK(totals[33] >= totals[13]);
   } else CHECK(totals[4] == 0);
-  printf("PASS lazy=%d break=%d missing=%d actual=%llu checked=%llu unsupported_k0=%llu unsupported_missing=%llu injections=%llu differing_words=%llu scatter_mismatch_words=%llu; complete output/input restoration verified\n",
-    LAZY,BREAK,MISSING,totals[0],totals[1],totals[30],totals[31],totals[13],totals[4],totals[33]);
+  printf("PASS lazy=%d break=%d missing=%d allocation_cases=%u allocation_failures=%llu active_append_overflow=%llu partial_fan=%llu actual=%llu checked=%llu unsupported_k0=%llu unsupported_missing=%llu injections=%llu differing_words=%llu scatter_mismatch_words=%llu; complete output/input restoration verified\n",
+    LAZY,BREAK,MISSING,allocation_cases,totals[34],totals[35],totals[12],totals[0],totals[1],totals[30],totals[31],totals[13],totals[4],totals[33]);
 
 }
 """

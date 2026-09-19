@@ -121,7 +121,8 @@ cp_clip_eq_finish(struct cp_device *dev, bool healthy)
    bool error = !healthy || atomic_load(&dev->clip_eq_error) ||
                 copy != CUDA_SUCCESS || r[14] != 0;
    bool complete = !error && expected != 0 && r[0] == expected &&
-                   r[1] == expected && !r[30] && !r[31];
+                   r[1] == expected && !r[30] && !r[31] &&
+                   !r[12] && !r[34] && !r[35];
    bool equal = complete && !r[3] && !r[4] && !r[5] && !r[33];
    /* One machine-readable footer, including first failure evidence. No
     * partial readback can claim completion, even on a poisoned CUDA context. */
@@ -139,6 +140,7 @@ cp_clip_eq_finish(struct cp_device *dev, bool healthy)
       "first_candidate_word", "first_oracle_word", "standalone", "fused",
       "group_bin", "group_direct", "unsupported_k0", "unsupported_missing",
       "scatter_words", "scatter_mismatch_words",
+      "allocation_failures", "active_append_overflow",
    };
    _Static_assert(ARRAY_SIZE(names) == CP_CLIP_EQ_REPORT_WORDS,
                   "clip equivalence report ABI");
