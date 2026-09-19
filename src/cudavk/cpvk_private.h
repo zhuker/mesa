@@ -855,6 +855,8 @@ struct cpvk_pipeline {
     * where Vulkan puts it and where the Gallium adapter could never have it. */
    struct cp_raster_state raster;
    struct cp_depth_state depth;
+   /* Host eligibility only. Dynamic stencil is conservatively unknown. */
+   bool stencil_may_observe;
    struct cp_blend_desc blend;
    struct cp_vertex_elem velem[16];
    unsigned num_velem, vertex_stride;

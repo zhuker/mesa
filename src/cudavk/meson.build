@@ -216,6 +216,13 @@ cp_shade_equiv_test = executable(
   build_by_default : false)
 test('cp_shade_equiv_test', cp_shade_equiv_test, suite : 'cudavk')
 
+# Pure CPU test; neither loads the ICD nor creates a CUDA/Vulkan device.
+cpvk_stencil_metadata_test = executable(
+  'cpvk_stencil_metadata_test', files('tests/cpvk_stencil_metadata.c'),
+  include_directories : [inc_include],
+  build_by_default : false)
+test('cpvk_stencil_metadata_test', cpvk_stencil_metadata_test, suite : 'cudavk')
+
 # Focused external-API regression suite. These link the Vulkan loader rather
 # than driver internals and select the generated development ICD, so they test
 # the same dispatch and object-lifetime boundary as applications do.

@@ -14,6 +14,7 @@
 #include "util/format/u_format.h"
 #include "util/mesa-blake3.h"
 #include "cpvk_private.h"
+#include "cpvk_stencil_metadata.h"
 
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
@@ -1271,8 +1272,8 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
    for (uint32_t i = 0; i < count; i++) {
       const VkGraphicsPipelineCreateInfo *info = &pCreateInfos[i];
       /*
-       * Stencil and depth bounds are not implemented, and a pipeline that
-       * would observe either is refused rather than quietly ignored. A
+       * Stencil and depth bounds are not implemented. Observable stencil is
+       * warned about below; observable depth bounds are refused. A
        * pipeline that merely enables the test while asking it to pass
        * everything and write nothing is observationally identical to no
        * stencil at all -- the Crossroads capture creates exactly that, and
@@ -1324,6 +1325,8 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
       }
       cpvk_pipeline_init_ref(dev, pipeline, pAllocator);
       pipeline->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
+      pipeline->stencil_may_observe =
+         cpvk_stencil_may_observe(dss, info->pDynamicState);
 
       /* Both stages through the cache, so identical SPIR-V compiles once and
        * two pipelines built from it share one binary -- which is what lets

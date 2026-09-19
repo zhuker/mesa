@@ -9180,6 +9180,9 @@ cp_batch_record_packet(struct cp_context *cp,
                        const struct cp_draw_packet *packet, unsigned tris)
 {
    const struct cp_draw_state *s = &packet->state;
+   /* Eligibility metadata is not a legacy merge condition. A later draw
+    * must not lose its exclusion when the batch retains the first state. */
+   cp->batch.state.stencil_may_observe |= s->stencil_may_observe;
    unsigned n = cp->batch.ndraws;
    if (cp_debug->debug_rows) {
       fprintf(stderr, "row %u: fs slots", n);
