@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-154 switches.
+155 switches.
 
 ## Tracing
 
@@ -85,6 +85,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_SCRATCH_PINNED` | bool (value) | `on` | — | allocate host-written/GPU-read renderer scratch as mapped pinned memory instead of migration-prone managed memory |
 | `CUDAVK_NO_SCRATCH_PINNED` | bool (value) | `off` | — | revert renderer scratch to managed memory |
 | `CUDAVK_FS_GRID_WAVES` | uint | `0` | — | size the fragment grid to fill the machine this many times over and let it grid-stride, instead of covering the framebuffer's worst case; 0 keeps the 4096-block cap, which is the only bound either way |
+| `CUDAVK_VFETCH_REGCAP_RETRY` | bool (value) | `off` | — | retry only occupancy-refused fused vertex fetch with a classic-budget register cap; retain every admission guard (experimental, default off) |
 | `CUDAVK_VFETCH_DECLINE_NTH` | uint | `0` | — | fault injection: refuse the fused execution for the Nth vertex shader compiled, or for every one at 4294967295, after building it either way |
 | `CUDAVK_VFETCH_SKIP_SEED` | bool (value) | `off` | — | fault injection: a fused draw does not seed the clip and raster counters, and the host still skips their clears -- the negative control for the seeding moving into the fused vertex shader |
 | `CUDAVK_NO_OPAQUE_EPISODE` | bool (value) | `off` | — | disable consecutive opaque-run visibility deferral |

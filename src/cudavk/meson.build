@@ -369,6 +369,10 @@ if dep_vulkan_loader.found()
     dependencies : dep_vulkan_loader,
     c_args : ['-Wno-error=missing-prototypes'],
     build_by_default : false)
+  test('cp_vfetch_regcap_retry_host', prog_python,
+       args : [files('tests/cp_vfetch_regcap_retry_test.py')],
+       suite : 'cudavk', timeout : 30)
+
   test('cp_launch_audit', prog_python,
        args : [files('tests/cp_launch_audit.py')],
        suite : 'cudavk')

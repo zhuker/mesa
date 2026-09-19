@@ -295,6 +295,9 @@ static const struct cp_flag_def flags[] = {
      "size the fragment grid to fill the machine this many times over and let "
      "it grid-stride, instead of covering the framebuffer's worst case; 0 "
      "keeps the 4096-block cap, which is the only bound either way" },
+   { "CUDAVK_VFETCH_REGCAP_RETRY", CP_FLAG_BOOL_VALUE, F(vfetch_regcap_retry),
+     "retry only occupancy-refused fused vertex fetch with a classic-budget "
+     "register cap; retain every admission guard (experimental, default off)" },
    { "CUDAVK_VFETCH_DECLINE_NTH", CP_FLAG_UINT, F(vfetch_decline_nth),
      "fault injection: refuse the fused execution for the Nth vertex shader "
      "compiled, or for every one at 4294967295, after building it either way" },

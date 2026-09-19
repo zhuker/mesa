@@ -5366,6 +5366,114 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
  * vertex shader may already carry a __local_depot for a reason that has
  * nothing to do with this.
  */
+#ifdef CP_HAVE_VS_INLINE_BC
+static uint8_t
+cp_vs_fetch_resource_verdict(const struct cp_shader_exec *classic,
+                             const struct cp_shader_exec *fx,
+                             unsigned classic_local, unsigned fused_local,
+                             unsigned nth)
+{
+   if (cp_debug->vfetch_decline_nth == nth ||
+       cp_debug->vfetch_decline_nth == UINT32_MAX)
+      return CP_VS_FETCH_FORCED_DECLINE;
+   if (fused_local > classic_local)
+      return CP_VS_FETCH_LOCAL_MEMORY;
+   if (fx->spill_bytes > classic->spill_bytes)
+      return CP_VS_FETCH_SPILL;
+   if (fx->blocks_per_sm < classic->blocks_per_sm)
+      return CP_VS_FETCH_OCCUPANCY;
+   return CP_VS_FETCH_ADMITTED;
+}
+
+/* Pipeline creation only: fx is still private and has never been launched.
+ * Retry exactly the already-validated PTX (including the helper-symbol check),
+ * with the same linked inputs/options except for the register bound. Do not
+ * use the generic in-place rebuild: keep the refused module until every query
+ * and admission check on its replacement succeeds. No FS or classic rebuild.
+ */
+static bool
+cp_vs_fetch_retry_reg_cap(const struct cp_shader_exec *classic,
+                          struct cp_shader_exec *fx,
+                          unsigned classic_local, unsigned fused_local,
+                          unsigned nth)
+{
+   if (!cp_debug->vfetch_regcap_retry || cp_debug->no_regcap ||
+       cp_debug->max_registers || classic->reg_cap || fx->reg_cap ||
+       !classic->kernel || !fx->kernel || !fx->ptx_text || fx->alt_module ||
+       cp_vs_fetch_resource_verdict(classic, fx, classic_local, fused_local,
+                                    nth) != CP_VS_FETCH_OCCUPANCY)
+      return false;
+
+   /* Do not infer a budget from failed resource queries. The classic register
+    * count is a conservative upper bound; the SM budget can only tighten it.
+    * CUDA's final occupancy query handles allocation granularity, not this
+    * division. There is one attempt, not an occupancy/performance search.
+    */
+   CUdevice dev;
+   int regs_per_sm = 0;
+   struct cp_shader_exec reference = *classic;
+   if (cuCtxGetDevice(&dev) != CUDA_SUCCESS ||
+       cuDeviceGetAttribute(&regs_per_sm,
+          CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR,
+          dev) != CUDA_SUCCESS ||
+       cuFuncGetAttribute(&reference.num_regs, CU_FUNC_ATTRIBUTE_NUM_REGS,
+                          classic->kernel) != CUDA_SUCCESS ||
+       cuFuncGetAttribute(&reference.spill_bytes,
+                          CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                          classic->kernel) != CUDA_SUCCESS ||
+       cuOccupancyMaxActiveBlocksPerMultiprocessor(&reference.blocks_per_sm,
+          classic->kernel, CP_SHADER_BLOCK_THREADS, 0) != CUDA_SUCCESS ||
+       reference.num_regs != classic->num_regs ||
+       reference.spill_bytes != classic->spill_bytes ||
+       reference.blocks_per_sm != classic->blocks_per_sm ||
+       reference.num_regs <= 0 || reference.blocks_per_sm <= 0)
+      return false;
+   int cap = MIN2(reference.num_regs,
+                 regs_per_sm / CP_SHADER_BLOCK_THREADS /
+                 reference.blocks_per_sm);
+   if (cap <= 0 || cap >= fx->num_regs)
+      return false;
+
+   struct cp_shader_exec retry = {0};
+   bool admitted = false;
+   if (load_shader_module(&retry.module, fx->ptx_text, fx->sampler_ptx,
+                          fx->fs_helper_ptx, cap) == CUDA_SUCCESS &&
+       cuModuleGetFunction(&retry.kernel, retry.module, "main") == CUDA_SUCCESS &&
+       cuFuncGetAttribute(&retry.num_regs, CU_FUNC_ATTRIBUTE_NUM_REGS,
+                          retry.kernel) == CUDA_SUCCESS &&
+       cuFuncGetAttribute(&retry.spill_bytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                          retry.kernel) == CUDA_SUCCESS &&
+       cuOccupancyMaxActiveBlocksPerMultiprocessor(&retry.blocks_per_sm,
+          retry.kernel, CP_SHADER_BLOCK_THREADS, 0) == CUDA_SUCCESS &&
+       retry.num_regs > 0 && retry.num_regs <= cap &&
+       cp_vs_fetch_resource_verdict(classic, &retry, classic_local, fused_local,
+                                    nth) == CP_VS_FETCH_ADMITTED)
+      admitted = true;
+
+   if (cp_debug->shader_stats)
+      fprintf(stderr, "cudavk: vsfetch regcap retry cap %d regs %d spill %d "
+              "blocks/sm %d %s\n", cap, retry.num_regs, retry.spill_bytes,
+              retry.blocks_per_sm, admitted ? "admitted" : "refused");
+   if (!admitted) {
+      if (retry.module)
+         cuModuleUnload(retry.module);
+      return false;
+   }
+
+   cuModuleUnload(fx->module);
+   fx->module = retry.module;
+   fx->kernel = retry.kernel;
+   fx->num_regs = retry.num_regs;
+   fx->spill_bytes = retry.spill_bytes;
+   fx->blocks_per_sm = retry.blocks_per_sm;
+   fx->reg_cap = cap;
+   fx->globals_resolved = false;
+   fx->sym_sampler_table = 0;
+   fx->sym_quad_derivs = 0;
+   return true;
+}
+#endif
+
 static void
 cp_vs_attach_fused_fetch(struct cp_shader_binary *bin,
                          struct nir_shader *fused_nir, int sm_major,
@@ -5421,16 +5529,12 @@ cp_vs_attach_fused_fetch(struct cp_shader_binary *bin,
     * what separates infrastructure cost from execution cost. Forced here,
     * after the build, for exactly that reason.
     */
-   uint8_t verdict = CP_VS_FETCH_ADMITTED;
-   if (cp_debug->vfetch_decline_nth == nth ||
-       cp_debug->vfetch_decline_nth == UINT32_MAX)
-      verdict = CP_VS_FETCH_FORCED_DECLINE;
-   else if (fused_local > classic_local)
-      verdict = CP_VS_FETCH_LOCAL_MEMORY;
-   else if (fx->spill_bytes > classic->spill_bytes)
-      verdict = CP_VS_FETCH_SPILL;
-   else if (fx->blocks_per_sm < classic->blocks_per_sm)
-      verdict = CP_VS_FETCH_OCCUPANCY;
+   uint8_t verdict = cp_vs_fetch_resource_verdict(classic, fx, classic_local,
+                                                   fused_local, nth);
+   if (verdict == CP_VS_FETCH_OCCUPANCY &&
+       cp_vs_fetch_retry_reg_cap(classic, fx, classic_local, fused_local, nth))
+      verdict = cp_vs_fetch_resource_verdict(classic, fx, classic_local,
+                                              fused_local, nth);
 
    if (census) {
       census->verdict = verdict;

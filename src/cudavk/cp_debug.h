@@ -218,6 +218,7 @@ struct cp_debug {
    bool scratch_pinned;
    bool no_scratch_pinned;
    unsigned fs_grid_waves;
+   bool vfetch_regcap_retry;
    unsigned vfetch_decline_nth;
    bool vfetch_skip_seed;
    bool no_upload_coalesce;
