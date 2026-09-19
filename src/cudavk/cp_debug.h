@@ -344,6 +344,7 @@ struct cp_debug {
 
    /* Rasterizer tuning. Tri-state: these become NVRTC -D options only when
     * set. Unrelated to the arena despite CUDAVK_SMALL_* naming both. */
+   bool clip_lazy; /* default-off ordered lazy varying interpolation */
    struct cp_opt_int small_threshold;
    struct cp_opt_int medium_threshold;
    struct cp_opt_int point_threshold;

@@ -325,6 +325,110 @@ clip_retire(struct cp_clip_args *args, float4 *out, uint32_t slots,
    }
 }
 
+#ifndef CP_CLIP_LAZY
+#define CP_CLIP_LAZY 0
+#endif
+
+#if CP_CLIP_LAZY
+/* Each plane emits at most ten vertices, even for exceptional positions.
+ * Only intersections create nodes; copies retain their parent's identity.
+ * Edges point backward, and their dependency depth is at most seven. */
+#define CP_CLIP_LAZY_NODES (3 + CP_CLIP_NUM_PLANES * CP_CLIP_MAX_VERTS)
+struct cp_clip_lazy_node {
+   int a, b;
+   float t;
+};
+
+static __device__ int
+cp_clip_lazy(struct cp_clip_args *args, uint32_t tri, uint32_t *ids,
+             const float4 *v, float4 *out, uint32_t slots)
+{
+   float4 positions[2][CP_CLIP_MAX_VERTS];
+   int node_ids[2][CP_CLIP_MAX_VERTS];
+   cp_clip_lazy_node nodes[CP_CLIP_LAZY_NODES];
+   int node_count = 3;
+   for (int i = 0; i < 3; i++) {
+      positions[1][i] = v[(size_t)i * slots];
+      node_ids[1][i] = i;
+   }
+   int n = 3;
+   for (int p = 0; p < CP_CLIP_NUM_PLANES; p++) {
+      int d = p & 1, s = d ^ 1;
+      int out_n = 0;
+      for (int i = 0; i < n; i++) {
+         int j = (i + 1) % n;
+         const float4 *cur = &positions[s][i];
+         const float4 *nxt = &positions[s][j];
+         float dc = clip_dist(cur, p);
+         float dn = clip_dist(nxt, p);
+         bool in_c = dc >= 0.0f, in_n = dn >= 0.0f;
+         if (in_c && out_n < CP_CLIP_MAX_VERTS) {
+            positions[d][out_n] = *cur;
+            node_ids[d][out_n++] = node_ids[s][i];
+         }
+         if (in_c != in_n && out_n < CP_CLIP_MAX_VERTS) {
+            float denom = dc - dn;
+            if (denom != 0.0f) {
+               float t = dc / denom;
+               nodes[node_count] = { node_ids[s][i], node_ids[s][j], t };
+               clip_lerp(&positions[d][out_n], cur, nxt, t, 1);
+               node_ids[d][out_n++] = node_count++;
+            }
+         }
+      }
+      n = out_n;
+      if (n < 3) {
+         if (args->stable && !args->active_ids && !ids)
+            clip_retire(args, out, slots, tri, 0);
+         return 0;
+      }
+   }
+
+   /* Same allocation sequence and failure rule, once only. Complete all
+    * payloads before publishing any reference. Compact atomic allocation is
+    * scheduler-dependent in either arm; this is not an ID-schedule proof. */
+   uint32_t allocated[CP_CLIP_MAX_OUT];
+   int k = 0;
+   for (int i = 1; i + 1 < n; i++) {
+      uint32_t id;
+      if (!clip_alloc(args, tri, (uint32_t)k, &id))
+         break;
+      allocated[k++] = id;
+      float4 *dst = clip_dst(out, slots, id);
+      dst[0] = positions[0][0];
+      dst[slots] = positions[0][i];
+      dst[2 * slots] = positions[0][i + 1];
+   }
+   if (k) {
+      /* Deliberately evaluate all created nodes. Reachability pruning is a
+       * separate optimization. Never reassociate into barycentric weights. */
+      float4 values[CP_CLIP_LAZY_NODES];
+      for (uint32_t slot = 1; slot < slots; slot++) {
+         for (int i = 0; i < 3; i++)
+            values[i] = v[(size_t)i * slots + slot];
+         for (int i = 3; i < node_count; i++)
+            clip_lerp(&values[i], &values[nodes[i].a], &values[nodes[i].b],
+                      nodes[i].t, 1);
+         for (int i = 0; i < k; i++) {
+            float4 *dst = clip_dst(out, slots, allocated[i]);
+            dst[slot] = values[node_ids[0][0]];
+            dst[slots + slot] = values[node_ids[0][i + 1]];
+            dst[2 * slots + slot] = values[node_ids[0][i + 2]];
+         }
+      }
+   }
+   for (int i = 0; i < k; i++) {
+      uint32_t id = allocated[i];
+      clip_publish_ref(args, id, clip_dst(out, slots, id));
+      if (ids)
+         ids[i] = id;
+   }
+   if (args->stable && !args->active_ids && !ids)
+      clip_retire(args, out, slots, tri, (uint32_t)k);
+   return k;
+}
+#endif
+
 /*
  * Clip one input triangle, with every side effect the standalone kernel has:
  * the emitted output triangles, the compact counter, the active-ID worklist
@@ -378,6 +482,9 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
       return emitted;
    }
 
+#if CP_CLIP_LAZY
+   return cp_clip_lazy(args, tri, ids, v, out, slots);
+#else
    float4 poly_a[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
    float4 poly_b[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
 
@@ -418,6 +525,7 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
    if (args->stable && !args->active_ids && !ids)
       clip_retire(args, out, slots, tri, (uint32_t)k);
    return emitted;
+#endif
 }
 
 extern "C" __global__ void

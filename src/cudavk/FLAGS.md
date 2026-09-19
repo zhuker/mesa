@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-154 switches.
+155 switches.
 
 ## Tracing
 
@@ -207,6 +207,7 @@ deliberately: someone's script sets one of these to 0 today.
 
 | variable | type | default | range | meaning |
 |---|---|---|---|---|
+| `CUDAVK_CLIP_LAZY` | bool (value) | `off` | — | experimental ordered lazy varying clipping; defer payload until survival |
 | `CUDAVK_SMALL_THRESHOLD` | int (optional) | `unset` | — | triangle area below which the small-primitive path is used |
 | `CUDAVK_MEDIUM_THRESHOLD` | int (optional) | `unset` | — | triangle area below which the medium-primitive path is used |
 | `CUDAVK_POINT_THRESHOLD` | int (optional) | `unset` | — | triangle area below which a primitive is rasterized as a point |

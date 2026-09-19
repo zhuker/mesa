@@ -624,6 +624,8 @@ static const struct cp_flag_def flags[] = {
      "dynamic sampler helper; they cannot amortise its spills" },
 
    /* ---- rasterizer tuning (NVRTC -D options) ---- */
+   { "CUDAVK_CLIP_LAZY", CP_FLAG_BOOL_VALUE, F(clip_lazy),
+     "experimental ordered lazy varying clipping; defer payload until survival" },
    { "CUDAVK_SMALL_THRESHOLD", CP_FLAG_OPT_INT, F(small_threshold),
      "triangle area below which the small-primitive path is used",
      .empty_is_unset = true },
