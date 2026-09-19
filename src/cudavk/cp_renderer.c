@@ -45,6 +45,122 @@ static uint64_t cp_hwtex_desc_fallback_site[10];
  * no Gallium object at all, which is the point: a Vulkan front end calls
  * this with a cp_device and gets a renderer it can draw with.
  */
+/* Verification is device-owned: one allocation, one zero, one final copy.
+ * It does not add frame-path transfers or change any stream dependency. */
+bool
+cp_clip_eq_init(struct cp_device *dev)
+{
+   if (cp_debug->clip_eq_break > 1 ||
+       (cp_debug->clip_eq_break && !cp_debug->clip_eq_check) ||
+       (cp_debug->clip_eq_break == 1 && !cp_debug->clip_lazy)) {
+      fprintf(stderr, "cudavk: invalid CUDAVK_CLIP_EQ_BREAK configuration\n");
+      return false;
+   }
+   if (!cp_debug->clip_eq_check)
+      return true;
+   atomic_init(&dev->clip_eq_expected, 0);
+   atomic_init(&dev->clip_eq_dispatches, 0);
+   atomic_init(&dev->clip_eq_error, false);
+   dev->clip_eq_initialized = true;
+   const size_t bytes = CP_CLIP_EQ_REPORT_WORDS * sizeof(uint64_t);
+   CUresult err = cuMemAlloc(&dev->clip_eq_report, bytes);
+   void *zero = NULL;
+   if (err == CUDA_SUCCESS)
+      err = cuMemAllocHost(&zero, bytes);
+   if (err == CUDA_SUCCESS) {
+      memset(zero, 0, bytes);
+      /* CUDA 12.8 Driver API, API synchronization behavior: synchronous
+       * pinned-host-to-device copies complete before returning. Pageable
+       * staging or memset would not establish this for non-blocking streams. */
+      err = cuMemcpyHtoD(dev->clip_eq_report, zero, bytes);
+   }
+   if (zero) {
+      CUresult freed = cuMemFreeHost(zero);
+      if (err == CUDA_SUCCESS)
+         err = freed;
+   }
+   if (err != CUDA_SUCCESS) {
+      atomic_store(&dev->clip_eq_error, true);
+      fprintf(stderr, "cudavk: clip equivalence allocation/init failed (%d)\n", err);
+      return false;
+   }
+   return true;
+}
+
+static void
+cp_clip_eq_args(struct cp_device *dev, struct cp_clip_args *args)
+{
+   if (!cp_debug->clip_eq_check)
+      return;
+   args->eq_report = dev->clip_eq_report;
+   args->eq_dispatch = atomic_fetch_add(&dev->clip_eq_dispatches, 1) + 1;
+   if (!args->eq_dispatch || !args->eq_report)
+      atomic_store(&dev->clip_eq_error, true);
+}
+
+static void
+cp_clip_eq_expect(struct cp_device *dev, uint64_t triangles)
+{
+   if (!cp_debug->clip_eq_check)
+      return;
+   uint64_t old = atomic_fetch_add(&dev->clip_eq_expected, triangles);
+   if (old > UINT64_MAX - triangles)
+      atomic_store(&dev->clip_eq_error, true);
+}
+
+void
+cp_clip_eq_finish(struct cp_device *dev, bool healthy)
+{
+   if (!dev->clip_eq_initialized)
+      return;
+   uint64_t r[CP_CLIP_EQ_REPORT_WORDS] = {0};
+   CUresult copy = dev->clip_eq_report
+      ? cuMemcpyDtoH(r, dev->clip_eq_report, sizeof(r)) : CUDA_ERROR_INVALID_VALUE;
+   uint64_t expected = atomic_load(&dev->clip_eq_expected);
+   uint64_t dispatches = atomic_load(&dev->clip_eq_dispatches);
+   bool error = !healthy || atomic_load(&dev->clip_eq_error) ||
+                copy != CUDA_SUCCESS || r[14] != 0;
+   bool complete = !error && expected != 0 && r[0] == expected &&
+                   r[1] == expected && !r[30] && !r[31];
+   bool equal = complete && !r[3] && !r[4] && !r[5] && !r[33];
+   /* One machine-readable footer, including first failure evidence. No
+    * partial readback can claim completion, even on a poisoned CUDA context. */
+   fprintf(stderr,
+           "CUDAVK_CLIP_EQ_JSON: {\"type\":\"clip_equivalence\","
+           "\"expected\":%" PRIu64 ",\"dispatches\":%" PRIu64,
+           expected, dispatches);
+   static const char *const names[] = {
+      "invocations", "comparisons", "words", "differing_invocations",
+      "differing_words", "differing_n", "inside", "reject_shortcut",
+      "loop_reject", "clipped", "replay_slots", "replay_invocations",
+      "partial_fan", "injections", "errors", "stable",
+      "refs", "active_ids", "ids", "first_failure", "first_dispatch",
+      "first_triangle", "first_candidate_n", "first_oracle_n",
+      "first_candidate_word", "first_oracle_word", "standalone", "fused",
+      "group_bin", "group_direct", "unsupported_k0", "unsupported_missing",
+      "scatter_words", "scatter_mismatch_words",
+   };
+   _Static_assert(ARRAY_SIZE(names) == CP_CLIP_EQ_REPORT_WORDS,
+                  "clip equivalence report ABI");
+   for (unsigned i = 0; i < ARRAY_SIZE(names); i++)
+      fprintf(stderr, ",\"%s\":%" PRIu64, names[i], r[i]);
+   fprintf(stderr, ",\"counters\":[");
+   for (unsigned i = 0; i < CP_CLIP_EQ_REPORT_WORDS; i++)
+      fprintf(stderr, "%s%" PRIu64, i ? "," : "", r[i]);
+   fprintf(stderr, "],\"lazy\":%s,\"break\":%u,"
+           "\"checked\":%" PRIu64 ",\"readback_errors\":%u,\"zero_checked\":%s,"
+           "\"complete\":%s,\"error\":%s,\"equal\":%s}\n",
+           cp_debug->clip_lazy ? "true" : "false",
+           cp_debug->clip_eq_break, r[1], copy == CUDA_SUCCESS ? 0u : 1u,
+           r[1] == 0 ? "true" : "false",
+           complete ? "true" : "false", error ? "true" : "false",
+           equal ? "true" : "false");
+   if (dev->clip_eq_report)
+      cuMemFree(dev->clip_eq_report);
+   dev->clip_eq_report = 0;
+   dev->clip_eq_initialized = false;
+}
+
 static uint64_t
 cp_texture_stream_serial_alloc(struct cp_device *dev)
 {
@@ -5500,8 +5616,11 @@ cp_flush_pending_clip(struct cp_context *cp, struct cp_device *screen,
    CUresult err = cp_launch(cp, screen->kernels.clip_triangles,
                                  (clip->args.num_triangles + 63) / 64, 1, 1,
                                  64, 1, 1, 0, cp->stream, params, NULL);
-   if (err != CUDA_SUCCESS)
+   if (err != CUDA_SUCCESS) {
+      if (cp_debug->clip_eq_check)
+         atomic_store(&screen->clip_eq_error, true);
       fprintf(stderr, "cudavk: clip launch failed (%d)\n", err);
+   }
    return err == CUDA_SUCCESS;
 }
 
@@ -7501,6 +7620,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
                    * sequence so every debug census sees the kernels it was
                    * written against.
                    */
+                  cp_clip_eq_args(screen, &clip);
+                  cp_clip_eq_expect(screen, clip.num_triangles);
                   CUresult clip_err = CUDA_SUCCESS;
                   if (screen->kernels.clip_rast_fused &&
                       !cp_debug->no_fused_rast && !cp_kernels_instrumented()) {
@@ -7536,6 +7657,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
                         rast_args.rect_prim_shift = CP_CLIP_PRIM_SHIFT;
                      }
                   } else {
+                     if (cp_debug->clip_eq_check)
+                        atomic_store(&screen->clip_eq_error, true);
                      fprintf(stderr, "cudavk: clip launch failed (%d)\n",
                              clip_err);
                      /* The rasterizer reads the unclipped buffer, which is
@@ -12434,11 +12557,17 @@ cp_run_clip_bin_execute(struct cp_context *cp)
       ps->slices_dev = prepared[s].draw_slices;
    }
 
+   for (unsigned s = 0; s < nsegs; s++)
+      cp_clip_eq_args(screen, &devsegs[s].clip);
    segments_dev = cp_upload(cp, devsegs,
                             (size_t)nsegs * sizeof(devsegs[0]));
    rasts_dev = cp_upload(cp, rasts, (size_t)nsegs * sizeof(rasts[0]));
    if (!segments_dev || !rasts_dev)
       return false;
+   /* Admission is committed. A refused launch leaves an incomplete report,
+    * never a smaller expected population that could hide omitted work. */
+   for (unsigned s = 0; s < nsegs; s++)
+      cp_clip_eq_expect(screen, devsegs[s].clip.num_triangles);
    CUresult err = cuMemsetD32Async(base + primrefs_off, 0,
                                      (size_t)cp->run_geometry.clip_prim_slots * 2u,
                                      cp->stream);

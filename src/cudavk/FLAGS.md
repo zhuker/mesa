@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-155 switches.
+157 switches.
 
 ## Tracing
 
@@ -207,6 +207,8 @@ deliberately: someone's script sets one of these to 0 today.
 
 | variable | type | default | range | meaning |
 |---|---|---|---|---|
+| `CUDAVK_CLIP_EQ_CHECK` | bool (value) | `off` | — | validation-only exact eager versus lazy clipping oracle; default off |
+| `CUDAVK_CLIP_EQ_BREAK` | uint | `0` | — | lazy clip oracle negative control: 0 off, 1 replay payload bit flip; requires CHECK and LAZY |
 | `CUDAVK_CLIP_LAZY` | bool (value) | `off` | — | experimental ordered lazy varying clipping; defer payload until survival |
 | `CUDAVK_SMALL_THRESHOLD` | int (optional) | `unset` | — | triangle area below which the small-primitive path is used |
 | `CUDAVK_MEDIUM_THRESHOLD` | int (optional) | `unset` | — | triangle area below which the medium-primitive path is used |

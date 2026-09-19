@@ -325,6 +325,161 @@ clip_retire(struct cp_clip_args *args, float4 *out, uint32_t slots,
    }
 }
 
+
+#ifndef CP_CLIP_EQ_CHECK
+#define CP_CLIP_EQ_CHECK 0
+#endif
+#ifndef CP_CLIP_EQ_BREAK
+#define CP_CLIP_EQ_BREAK 0
+#endif
+#if CP_CLIP_EQ_CHECK
+/* Frozen original 69a58a486d4 arithmetic and polygon walk. Not the DAG,
+ * and not shared with candidate helpers: changes to either remain detectable. */
+static __device__ __forceinline__ float
+clip_eq_ref_dist(const float4 *v, int plane)
+{
+   return plane == 0 ? v[0].z
+        : plane == 1 ? v[0].w - 1e-6f
+        : plane == 2 ? v[0].w - v[0].z
+        : plane == 3 ? v[0].x + v[0].w
+        : plane == 4 ? v[0].w - v[0].x
+        : plane == 5 ? v[0].y + v[0].w
+                     : v[0].w - v[0].y;
+}
+
+static __device__ __forceinline__ void
+clip_eq_ref_lerp(float4 *dst, const float4 *a, const float4 *b, float t, uint32_t slots)
+{
+   for (uint32_t s = 0; s < slots; s++) {
+      float4 va = a[s], vb = b[s];
+      dst[s] = make_float4(va.x + (vb.x - va.x) * t,
+                           va.y + (vb.y - va.y) * t,
+                           va.z + (vb.z - va.z) * t,
+                           va.w + (vb.w - va.w) * t);
+   }
+}
+
+static __device__ __forceinline__ void
+clip_eq_ref_copy(float4 *dst, const float4 *src, uint32_t slots)
+{
+   for (uint32_t s = 0; s < slots; s++)
+      dst[s] = src[s];
+}
+
+/* Sutherland-Hodgman against one plane. Returns the new vertex count. */
+static __device__ int
+clip_eq_ref_poly(float4 *dst, const float4 *src, int n, uint32_t slots, int plane)
+{
+   int out_n = 0;
+
+   for (int i = 0; i < n; i++) {
+      const float4 *cur = src + (size_t)i * slots;
+      const float4 *nxt = src + (size_t)((i + 1) % n) * slots;
+      float dc = clip_eq_ref_dist(cur, plane);
+      float dn = clip_eq_ref_dist(nxt, plane);
+      bool in_c = dc >= 0.0f, in_n = dn >= 0.0f;
+
+      if (in_c && out_n < CP_CLIP_MAX_VERTS)
+         clip_eq_ref_copy(dst + (size_t)out_n++ * slots, cur, slots);
+
+      if (in_c != in_n && out_n < CP_CLIP_MAX_VERTS) {
+         float denom = dc - dn;
+         if (denom != 0.0f)
+            clip_eq_ref_lerp(dst + (size_t)out_n++ * slots, cur, nxt, dc / denom, slots);
+      }
+   }
+
+   return out_n;
+}
+
+
+static __device__ void
+clip_eq_terminal(struct cp_clip_args *args, uint32_t tri, uint32_t slots,
+                 const float4 *v, int n, const float4 *candidate,
+                 unsigned terminal, bool ids, unsigned path,
+                 unsigned replay_slots = 0, bool partial = false,
+                 unsigned unsupported = 0)
+{
+   unsigned long long *r = (unsigned long long *)(uintptr_t)args->eq_report;
+   if (!r) return; /* Missing report is NOT zero device work. Host rejects it. */
+   atomicAdd(r, 1ull);
+   if (path >= 26 && path <= 29) atomicAdd(r + path, 1ull);
+   else atomicAdd(r + 14, 1ull);
+   atomicAdd(r + terminal, 1ull);
+   atomicAdd(r + 10, (unsigned long long)replay_slots);
+   atomicAdd(r + 11, (unsigned long long)(replay_slots != 0));
+   atomicAdd(r + 12, (unsigned long long)partial);
+   atomicAdd(r + 15, (unsigned long long)(args->stable != 0));
+   atomicAdd(r + 16, (unsigned long long)(args->prim_refs != 0));
+   atomicAdd(r + 17, (unsigned long long)(args->active_ids != 0));
+   atomicAdd(r + 18, (unsigned long long)ids);
+   if (args->num_slots > CP_MAX_CLIP_SLOTS || !slots) {
+      atomicAdd(r + 14, 1ull);
+      unsupported = 31;
+   }
+   if (unsupported) { atomicAdd(r + unsupported, 1ull); return; }
+   float4 a[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
+   float4 b[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
+   const float4 *ref = v;
+   int rn = 3;
+   bool inside = true;
+   for (int i = 0; i < 3; i++)
+      for (int p = 0; p < CP_CLIP_NUM_PLANES; p++)
+         inside = inside && clip_eq_ref_dist(v + (size_t)i * slots, p) >= 0.0f;
+   if (!inside) {
+      for (int p = 0; p < CP_CLIP_NUM_PLANES; p++) {
+         float4 *dst = (p & 1) ? b : a;
+         rn = clip_eq_ref_poly(dst, ref, rn, slots, p);
+         if (rn < 3) { rn = 0; break; }
+         ref = dst;
+      }
+   }
+   if (n < 3) n = 0;
+   atomicAdd(r + 1, 1ull);
+   unsigned long long dw = 0;
+   unsigned cb = 0, rb = 0;
+   if (n == rn) {
+      const unsigned *c = (const unsigned *)candidate;
+      const unsigned *o = (const unsigned *)ref;
+      unsigned words = n * slots * 4;
+      for (unsigned i = 0; i < words; i++) {
+         if (c[i] != o[i]) { dw++; cb = c[i]; rb = o[i]; }
+      }
+      atomicAdd(r + 2, (unsigned long long)words);
+   }
+   if (n != rn) atomicAdd(r + 5, 1ull);
+   if (dw) atomicAdd(r + 4, dw);
+   if (dw || n != rn) {
+      atomicAdd(r + 3, 1ull);
+      if (atomicCAS(r + 19, 0ull, 1ull) == 0) {
+         r[20] = args->eq_dispatch; r[21] = tri;
+         r[22] = n; r[23] = rn; r[24] = cb; r[25] = rb;
+      }
+   }
+}
+/* Check only storage actually allocated, before its reference is published. */
+static __device__ void
+clip_eq_scatter(struct cp_clip_args *args, const float4 *dst,
+                const float4 *canonical, unsigned slots, unsigned fan)
+{
+   unsigned long long *r = (unsigned long long *)(uintptr_t)args->eq_report;
+   if (!r) return;
+   for (unsigned vertex = 0; vertex < 3; vertex++) {
+      unsigned index = vertex ? fan + vertex : 0;
+      const unsigned *a = (const unsigned *)(dst + vertex * slots);
+      const unsigned *b = (const unsigned *)(canonical + index * slots);
+      for (unsigned word = 0; word < slots * 4; word++) {
+         atomicAdd(r + 32, 1ull);
+         if (a[word] != b[word]) atomicAdd(r + 33, 1ull);
+      }
+   }
+}
+#define CLIP_EQ(n, src, terminal) \
+   clip_eq_terminal(args, tri, slots, v, n, src, terminal, ids != NULL, eq_path)
+#else
+#define CLIP_EQ(n, src, terminal) ((void)0)
+#endif
+
 #ifndef CP_CLIP_LAZY
 #define CP_CLIP_LAZY 0
 #endif
@@ -341,12 +496,16 @@ struct cp_clip_lazy_node {
 
 static __device__ int
 cp_clip_lazy(struct cp_clip_args *args, uint32_t tri, uint32_t *ids,
-             const float4 *v, float4 *out, uint32_t slots)
+             const float4 *v, float4 *out, uint32_t slots, unsigned eq_path)
 {
    float4 positions[2][CP_CLIP_MAX_VERTS];
    int node_ids[2][CP_CLIP_MAX_VERTS];
    cp_clip_lazy_node nodes[CP_CLIP_LAZY_NODES];
    int node_count = 3;
+#if CP_CLIP_EQ_CHECK
+   float4 canonical[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
+   unsigned captured = 0;
+#endif
    for (int i = 0; i < 3; i++) {
       positions[1][i] = v[(size_t)i * slots];
       node_ids[1][i] = i;
@@ -378,6 +537,7 @@ cp_clip_lazy(struct cp_clip_args *args, uint32_t tri, uint32_t *ids,
       }
       n = out_n;
       if (n < 3) {
+         CLIP_EQ(0, v, 8);
          if (args->stable && !args->active_ids && !ids)
             clip_retire(args, out, slots, tri, 0);
          return 0;
@@ -387,6 +547,12 @@ cp_clip_lazy(struct cp_clip_args *args, uint32_t tri, uint32_t *ids,
    /* Same allocation sequence and failure rule, once only. Complete all
     * payloads before publishing any reference. Compact atomic allocation is
     * scheduler-dependent in either arm; this is not an ID-schedule proof. */
+#if CP_CLIP_EQ_CHECK
+   for (int i = 0; i < n; i++) {
+      canonical[(size_t)i * slots] = positions[0][i];
+      captured++;
+   }
+#endif
    uint32_t allocated[CP_CLIP_MAX_OUT];
    int k = 0;
    for (int i = 1; i + 1 < n; i++) {
@@ -404,11 +570,44 @@ cp_clip_lazy(struct cp_clip_args *args, uint32_t tri, uint32_t *ids,
        * separate optimization. Never reassociate into barycentric weights. */
       float4 values[CP_CLIP_LAZY_NODES];
       for (uint32_t slot = 1; slot < slots; slot++) {
-         for (int i = 0; i < 3; i++)
+#if CP_CLIP_EQ_CHECK
+         bool evaluated[CP_CLIP_LAZY_NODES] = {};
+#endif
+         for (int i = 0; i < 3; i++) {
             values[i] = v[(size_t)i * slots + slot];
-         for (int i = 3; i < node_count; i++)
+#if CP_CLIP_EQ_CHECK
+            evaluated[i] = true;
+#endif
+         }
+         for (int i = 3; i < node_count; i++) {
             clip_lerp(&values[i], &values[nodes[i].a], &values[nodes[i].b],
                       nodes[i].t, 1);
+#if CP_CLIP_EQ_CHECK
+            evaluated[i] = evaluated[nodes[i].a] && evaluated[nodes[i].b];
+#endif
+         }
+#if CP_CLIP_EQ_CHECK
+         /* Fault the actual evaluator's live value, snapshot it, then restore
+          * before scatter. Never mutate aliased VS input or evaluate twice. */
+         unsigned saved = 0;
+         volatile unsigned *fault = NULL;
+#if CP_CLIP_EQ_BREAK == 1
+         if (slot == 1 && evaluated[node_ids[0][0]]) {
+            fault = (unsigned *)&values[node_ids[0][0]];
+            saved = *fault; *fault ^= 1u;
+            if (args->eq_report)
+               atomicAdd((unsigned long long *)(uintptr_t)args->eq_report + 13, 1ull);
+         }
+#endif
+         for (int i = 0; i < n; i++) {
+            int node = node_ids[0][i];
+            if (node >= 0 && node < node_count && evaluated[node]) {
+               canonical[(size_t)i * slots + slot] = values[node];
+               captured++;
+            }
+         }
+         if (fault) *fault = saved;
+#endif
          for (int i = 0; i < k; i++) {
             float4 *dst = clip_dst(out, slots, allocated[i]);
             dst[slot] = values[node_ids[0][0]];
@@ -417,8 +616,20 @@ cp_clip_lazy(struct cp_clip_args *args, uint32_t tri, uint32_t *ids,
          }
       }
    }
+#if CP_CLIP_EQ_CHECK
+   /* k==0 has no actual varying evaluation. This is an unsupported invocation,
+    * not an equivalent empty polygon and not permission to evaluate it here. */
+   unsigned unsupported = !k ? 30 : captured != (unsigned)n * slots ? 31 : 0;
+   clip_eq_terminal(args, tri, slots, v, n, canonical, 9, ids != NULL,
+                    eq_path, k ? slots - 1 : 0, k > 0 && k < n - 2,
+                    unsupported);
+#endif
    for (int i = 0; i < k; i++) {
       uint32_t id = allocated[i];
+#if CP_CLIP_EQ_CHECK
+      if (!unsupported)
+         clip_eq_scatter(args, clip_dst(out, slots, id), canonical, slots, i);
+#endif
       clip_publish_ref(args, id, clip_dst(out, slots, id));
       if (ids)
          ids[i] = id;
@@ -438,7 +649,8 @@ cp_clip_lazy(struct cp_clip_args *args, uint32_t tri, uint32_t *ids,
  * Returns how many triangles were emitted (and recorded in ids[]).
  */
 static __device__ int
-cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
+cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids,
+            unsigned eq_path = 26)
 {
    uint32_t slots = args->num_slots;
    if (slots > CP_MAX_CLIP_SLOTS)
@@ -449,6 +661,9 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
    const float4 *v = in + (size_t)tri * 3 * slots;
    uint32_t id;
    int emitted = 0;
+#if CP_CLIP_EQ_CHECK
+   if (!slots) { CLIP_EQ(0, v, 8); return 0; }
+#endif
 
    /* The overwhelming majority of triangles are wholly inside, so check that
     * first and copy straight through — the polygon buffers below live in local
@@ -464,6 +679,7 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
    }
 
    if (inside == 3) {
+      CLIP_EQ(3, v, 6);
       if (clip_alloc(args, tri, 0, &id)) {
          if (args->prim_refs) {
             /* Immutable VS output stays live through every consumer of the
@@ -472,6 +688,9 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
          } else {
             float4 *dst = clip_dst(out, slots, id);
             clip_copy(dst, v, 3 * slots);
+#if CP_CLIP_EQ_CHECK
+            clip_eq_scatter(args, dst, v, slots, 0);
+#endif
          }
          if (ids)
             ids[emitted] = id;
@@ -483,7 +702,7 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
    }
 
 #if CP_CLIP_LAZY
-   return cp_clip_lazy(args, tri, ids, v, out, slots);
+   return cp_clip_lazy(args, tri, ids, v, out, slots, eq_path);
 #else
    float4 poly_a[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
    float4 poly_b[CP_CLIP_MAX_VERTS * CP_MAX_CLIP_SLOTS];
@@ -495,12 +714,15 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
       float4 *dst = (p & 1) ? poly_b : poly_a;
       n = clip_poly(dst, src, n, slots, p);
       if (n < 3) {
+         CLIP_EQ(0, v, 8);
          if (args->stable && !args->active_ids && !ids)
             clip_retire(args, out, slots, tri, 0);
          return 0;
       }
       src = dst;
    }
+
+   CLIP_EQ(n, src, 9);
 
    /* Fan-triangulate the clipped polygon, which keeps the original winding. */
    int k = 0;
@@ -515,6 +737,9 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
       /* Publish only after all three vertices are complete. A fused caller's
        * same thread consumes this in program order; later raster/interpolation
        * launches are ordered by the kernel boundary. */
+#if CP_CLIP_EQ_CHECK
+      clip_eq_scatter(args, dst, src, slots, i - 1);
+#endif
       clip_publish_ref(args, id, dst);
       if (ids)
          ids[emitted] = id;
@@ -770,7 +995,7 @@ cp_run_clip_setup_tile_count(struct cp_run_clip_bin_args args)
    for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x;
         tri < clip.num_triangles; tri += blockDim.x * gridDim.x) {
       uint32_t emitted[CP_CLIP_MAX_OUT];
-      int n = cp_clip_one(&clip, tri, emitted);
+      int n = cp_clip_one(&clip, tri, emitted, 28);
       for (int i = 0; i < n; i++) {
          uint32_t local_id = emitted[i];
          uint32_t stable_id = seg.prim_base + local_id;
@@ -848,7 +1073,7 @@ cp_run_clip_setup_direct(struct cp_run_clip_bin_args args)
    for (uint32_t tri = blockIdx.x * blockDim.x + threadIdx.x;
         tri < clip.num_triangles; tri += blockDim.x * gridDim.x) {
       uint32_t emitted[CP_CLIP_MAX_OUT];
-      int n = cp_clip_one(&clip, tri, emitted);
+      int n = cp_clip_one(&clip, tri, emitted, 29);
       for (int i = 0; i < n; i++) {
          uint32_t local = emitted[i], stable = seg.prim_base + local;
          if (stable < seg.prim_base || stable >= args.total_slots) {
@@ -1721,7 +1946,7 @@ cp_clip_rast_fused_body(struct cp_clip_args cargs,
       return;
 
    uint32_t emitted[CP_CLIP_MAX_OUT];
-   int n = cp_clip_one(&cargs, tri, emitted);
+   int n = cp_clip_one(&cargs, tri, emitted, 27);
    for (int i = 0; i < n; i++) {
       cp_rast_small_or_defer<ABUF>(&args, &queues, emitted[i],
                                    queues.mode != CP_QUEUE_REUSE);

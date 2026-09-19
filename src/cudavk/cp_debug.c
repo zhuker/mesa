@@ -624,6 +624,10 @@ static const struct cp_flag_def flags[] = {
      "dynamic sampler helper; they cannot amortise its spills" },
 
    /* ---- rasterizer tuning (NVRTC -D options) ---- */
+   { "CUDAVK_CLIP_EQ_CHECK", CP_FLAG_BOOL_VALUE, F(clip_eq_check),
+     "validation-only exact eager versus lazy clipping oracle; default off" },
+   { "CUDAVK_CLIP_EQ_BREAK", CP_FLAG_UINT, F(clip_eq_break),
+     "lazy clip oracle negative control: 0 off, 1 replay payload bit flip; requires CHECK and LAZY" },
    { "CUDAVK_CLIP_LAZY", CP_FLAG_BOOL_VALUE, F(clip_lazy),
      "experimental ordered lazy varying clipping; defer payload until survival" },
    { "CUDAVK_SMALL_THRESHOLD", CP_FLAG_OPT_INT, F(small_threshold),

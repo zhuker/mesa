@@ -24,6 +24,11 @@
 
 #include "cp_shader_abi.h"
 
+/* Called once per device, with its CUDA context current. Finish follows all
+ * stream drains and emits the only host readback of the report. */
+bool cp_clip_eq_init(struct cp_device *dev);
+void cp_clip_eq_finish(struct cp_device *dev, bool healthy);
+
 #define CP_MAX_SHADER_BUFFERS 16
 /* CP_MAX_CONST_BUFFERS is the shader ABI's, in cp_shader_abi.h. */
 /*

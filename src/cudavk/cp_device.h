@@ -10,6 +10,7 @@
 
 #include <cuda.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 
 #include "cp_kernels.h"
@@ -65,6 +66,14 @@ struct cp_device {
       (*texture_cache_purge)(void *private_data);
    void (*texture_cache_use_begin)(void *private_data);
    void (*texture_cache_use_end)(void *private_data);
+
+   /* Verification-only allocation. Never belongs to a scratch generation or
+    * stream. Host accounting is device-owned too, including dispatch IDs. */
+   CUdeviceptr clip_eq_report;
+   atomic_uint_fast64_t clip_eq_expected;
+   atomic_uint_fast64_t clip_eq_dispatches;
+   atomic_bool clip_eq_error;
+   bool clip_eq_initialized;
 
 };
 

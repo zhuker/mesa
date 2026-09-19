@@ -220,6 +220,14 @@ test('cp_shade_equiv_test', cp_shade_equiv_test, suite : 'cudavk')
 # than driver internals and select the generated development ICD, so they test
 # the same dispatch and object-lifetime boundary as applications do.
 dep_vulkan_loader = dependency('vulkan', required : false)
+# CPU-only checker/source and recorded-log parser regressions. No GPU context.
+test('cp_clip_eq_source', prog_python,
+     args : [files('tests/cp_clip_eq.py')],
+     suite : 'cudavk', timeout : 180)
+test('cp_clip_eq_parser', prog_python,
+     args : [files('tests/cpvk_clip_eq_gate.py'), 'self-test'],
+     suite : 'cudavk')
+
 if dep_vulkan_loader.found()
   cpvk_test_env = environment()
   cpvk_test_env.set('VK_DRIVER_FILES', cpvk_devenv_icd.full_path())
