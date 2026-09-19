@@ -2,7 +2,9 @@
 """Offline clipping full-replay gate (CPU only).
 
 validate reads existing stdout/stderr plus a caller-supplied authoritative
-submit/frame census and anchored line regexes. Regexes count complete matching
+submit/frame census. Tocpp mode uses --submit-ts and --expected-stdout-sha256;
+it requires exit zero and the full timestamp census, not an EOF line. Plugin
+mode uses three anchored line regexes. Regexes count complete matching
 lines, or extract exactly one named (?P<count>...) aggregate. EOF must occur
 exactly once. The stderr footer must be final; one device is the default.
 Use --min-stable/refs/active-ids/ids to require specific dispatch modes.
@@ -142,18 +144,52 @@ def validate_report(r, arm):
     return c
 
 
-def validate_logs(stdout, stderr, spec):
+def replay_mode(spec):
+    toc = any(spec.get(k) is not None for k in ["submit_ts", "expected_stdout_sha256"])
+    regexes = [spec.get(k) for k in ["submit_regex", "frame_regex", "eof_regex"]]
+    if toc:
+        require(all(x is None for x in regexes), "tocpp and plugin regex modes are mutually exclusive")
+        require(isinstance(spec.get("submit_ts"), str) and spec["submit_ts"], "missing submit timestamp path")
+        require(isinstance(spec.get("expected_stdout_sha256"), str) and
+                re.fullmatch(r"[0-9a-f]{64}", spec["expected_stdout_sha256"]), "invalid expected stdout SHA256")
+    else:
+        require(all(isinstance(x, str) for x in regexes), "plugin mode requires all three regexes")
+    return toc
+
+
+def timestamp_census(blob):
+    # submit_shim.c prints CLOCK_MONOTONIC ns, then zero-based submit_count.
+    require(blob and blob.endswith(b"\n"), "empty or truncated submit timestamps")
+    previous = -1
+    lines = blob.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        match = re.fullmatch(rb"([0-9]+) ([0-9]+)\n", line)
+        require(match is not None, "malformed timestamp row: " + str(index))
+        ns, observed_index = map(int, match.groups())
+        require(ns < 2**63 and ns >= previous, "non-monotonic or invalid timestamp")
+        require(observed_index == index, "non-contiguous submit index")
+        previous = ns
+    return len(lines), (len(lines) - 1) // 2
+
+
+def validate_logs(stdout, stderr, spec, submit_ts=None):
     require(type(spec["exit_code"]) is int and spec["exit_code"] == 0, "replay exit is not zero")
     devices = spec.get("devices", 1)
     require(type(devices) is int and devices > 0, "invalid device count")
     for field in ["expected_submits", "expected_frames"]:
         require(uint(spec[field]) and spec[field] > 0, "invalid expectation: " + field)
-    combined = stdout + "\n" + stderr
-    submits = count_log(combined, spec["submit_regex"])
-    frames = count_log(combined, spec["frame_regex"])
+    if replay_mode(spec):
+        require(hashlib.sha256(stdout.encode("utf-8")).hexdigest() == spec["expected_stdout_sha256"],
+                "stdout SHA256 mismatch")
+        submits, frames = timestamp_census(submit_ts if submit_ts is not None else
+                                           Path(spec["submit_ts"]).read_bytes())
+    else:
+        combined = stdout + "\n" + stderr
+        submits = count_log(combined, spec["submit_regex"])
+        frames = count_log(combined, spec["frame_regex"])
+        require(len(line_matches(combined, spec["eof_regex"])[1]) == 1, "normal EOF missing/duplicated")
     require(submits == spec["expected_submits"], "submit count mismatch")
     require(frames == spec["expected_frames"], "frame count mismatch")
-    require(len(line_matches(combined, spec["eof_regex"])[1]) == 1, "normal EOF missing/duplicated")
     lines = [line for line in stderr.splitlines() if line.strip()]
     records = [line for line in lines if PREFIX in line]
     require(not any(PREFIX in line for line in stdout.splitlines()), "report on stdout")
@@ -182,7 +218,12 @@ def validate_files(spec):
                 "recorded command must be nonempty argv array")
         blobs = {key: Path(spec[key]).read_bytes() for key in ["stdout", "stderr"]}
         result["sha256"] = {key: hashlib.sha256(blob).hexdigest() for key, blob in blobs.items()}
-        result.update(validate_logs(blobs["stdout"].decode("utf-8"), blobs["stderr"].decode("utf-8"), spec))
+        timestamps = None
+        if replay_mode(spec):
+            timestamps = Path(spec["submit_ts"]).read_bytes()
+            result["sha256"]["submit_ts"] = hashlib.sha256(timestamps).hexdigest()
+        result.update(validate_logs(blobs["stdout"].decode("utf-8"), blobs["stderr"].decode("utf-8"), spec,
+                                    timestamps))
         result["pass"] = True
     except (ValueError, KeyError, OSError, TypeError, re.error) as error:
         result["error"] = str(error)
@@ -281,6 +322,66 @@ class GateTests(unittest.TestCase):
         self.assertEqual(count_log("not submit", r"^submit$"), 0)
         self.assertEqual(count_log("submit suffix", r"^submit|frame$"), 0)
 
+    def test_tocpp_files(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            out, err, ts = [Path(directory) / name for name in ["stdout", "stderr", "ts"]]
+            # Synthetic stdout is deliberately not a submit/frame/EOF protocol.
+            out.write_bytes(b"memory warning\n")
+            record = PREFIX + json.dumps(self.r)
+            err.write_text(record)
+            spec = dict(arm="positive", exit_code=0, expected_submits=6947,
+                        expected_frames=3473, stdout=str(out), stderr=str(err),
+                        command=["./build/vulkan_app"], submit_ts=str(ts),
+                        expected_stdout_sha256=hashlib.sha256(out.read_bytes()).hexdigest())
+            def check(ok, **changes):
+                result = validate_files(dict(spec, **changes))
+                self.assertEqual(result["pass"], ok, result)
+                return result
+            for rows in [6947, 6965]:
+                ts.write_bytes(b"".join(f"{1000000000+i} {i}\n".encode() for i in range(rows)))
+                result = check(True, expected_submits=rows, expected_frames=(rows-1)//2)
+                self.assertEqual(result["observed_frames"], (rows-1)//2)
+            good = b"".join(f"{1000000000+i} {i}\n".encode() for i in range(6947))
+            ts.write_bytes(good)
+            self.assertEqual(check(True)["sha256"]["submit_ts"], hashlib.sha256(good).hexdigest())
+            self.assertEqual(timestamp_census(b"1 0\n1 1\n1 2\n"), (3, 1))
+            for changes in [dict(exit_code=1), dict(exit_code=-9), dict(expected_submits=6946),
+                            dict(expected_frames=3472), dict(expected_stdout_sha256="0"*64),
+                            dict(expected_stdout_sha256=None), dict(submit_ts=None),
+                            dict(submit_regex="^submit$"), dict(frame_regex="^frame$"),
+                            dict(eof_regex="^EOF$"), dict(devices=2), dict(min_ids=1),
+                            dict(expected_copy=False), dict(arm="negative-copy"),
+                            dict(arm="negative-reject")]:
+                with self.subTest(changes=changes): check(False, **changes)
+            out.write_bytes(b"changed warning\n"); check(False)
+            out.write_bytes(b"memory warning\n")
+            rows = good.splitlines(keepends=True)
+            for bad in [b"", good[:-1], b"".join(rows[:-1]),
+                        rows[1]+rows[0]+b"".join(rows[2:]),
+                        b"bad row\n"+b"".join(rows[1:]),
+                        b"1000000000 0 extra\n"+b"".join(rows[1:]),
+                        b"1000000000 1\n"+b"".join(rows[1:]),
+                        rows[0]+b"999999999 1\n"+b"".join(rows[2:]),
+                        good+b"1000006947 6947\n"]:
+                ts.write_bytes(bad); check(False)
+            ts.unlink(); check(False)
+            ts.write_bytes(good)
+            for bad in ["", record+"\n"+record, record+"\nlate failure"]:
+                err.write_text(bad); check(False)
+            # Actual comparator corruption evidence remains mandatory in tocpp mode.
+            for arm, mode in [("negative-copy", 1), ("negative-reject", 2)]:
+                c = self.c.copy()
+                c[3] = c[13] = mode
+                c[4 if mode == 1 else 5] = mode
+                c[19:26] = [1, 1, 0, 3, 3 if mode == 1 else 0, 1 if mode == 1 else 0, 0]
+                report = dict(self.r, counters=c, equal=False, **{"break":mode})
+                err.write_text(PREFIX + json.dumps(report))
+                check(True, arm=arm)
+                check(False)
+                c[13] = 0
+                err.write_text(PREFIX + json.dumps(report)); check(False, arm=arm)
+
     def test_files(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:
@@ -299,8 +400,10 @@ def main():
     sub = parser.add_subparsers(dest="mode", required=True)
     sub.add_parser("self-test")
     one = sub.add_parser("validate", help="validate one existing full replay")
-    for name in ["stdout", "stderr", "submit-regex", "frame-regex", "eof-regex", "output", "command-json"]:
+    for name in ["stdout", "stderr", "output", "command-json"]:
         one.add_argument("--" + name, required=True)
+    for name in ["submit-regex", "frame-regex", "eof-regex", "submit-ts", "expected-stdout-sha256"]:
+        one.add_argument("--" + name)
     for name in ["exit-code", "expected-submits", "expected-frames"]:
         one.add_argument("--" + name, type=int, required=True)
     one.add_argument("--arm", choices=ARMS, required=True)

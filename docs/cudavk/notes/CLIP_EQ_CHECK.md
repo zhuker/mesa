@@ -69,8 +69,10 @@ changes offsets after the embedded owner in cpvk_device. No timing claim.
 For BOTH authoritative captures run CHECK=1 with off/copy/reject/both feature
 states. For each retained enabled feature run a separate whole-replay negative
 control, also in the retained combination. Preserve argv/environment, process
-exit status, stdout/stderr, exact library/capture hashes, normal EOF, authoritative
-submit and timing-plugin counts. Never infer submits from image/readback counts.
+exit status, stdout/stderr, exact library/capture hashes and authoritative
+submit/frame counts. Plugin replays also require normal EOF. Native tocpp
+replays instead require the exact stdout hash and shim census below.
+Never infer submits from image/readback counts.
 Use the accompanying `cpvk_clip_eq_gate.py` offline validator. Require explicit
 path/mode minima for paths expected by the replay coverage plan; zero feature
 hits cannot support a live-feature verdict. No missing report or incomplete
@@ -114,3 +116,60 @@ The validator checks one final device report by default; trailing stderr is
 rejected rather than silently hiding a late failure. Offline validation cannot
 authenticate caller-supplied argv, exit status, regex, or census: preserve raw
 execution artifacts. No image-only fallback exists.
+
+
+### Native tocpp captures (no replay arguments or plugin)
+
+The authoritative census is
+`/home/alexzhukov/cudavk-3ms-evidence/replay-manifest.json`.
+`submit_shim.c` writes `CLOCK_MONOTONIC` nanoseconds followed by a zero-based
+submit index, separated by one space, with one newline per row. The validator
+requires nondecreasing nanoseconds, contiguous indices starting at zero and
+exact row counts. Complete paired-submit frames are `(rows - 1) // 2`.
+Both `--submit-ts` and `--expected-stdout-sha256` select tocpp mode; all three
+plugin regex options are forbidden in this mode. Plugin mode remains unchanged.
+Tocpp has no EOF line. Exact raw stdout SHA256, recorded exit zero and the full
+census establish replay completion together, not any one alone. These checks
+do not replace the device report, coverage minima or negative controls.
+
+Example for the both-enabled positive arm (use a fresh absolute `$RUN` directory,
+set `$ICD` to the existing validation ICD; do not rebuild during a replay):
+
+```sh
+mkdir "$RUN"
+cd /home/alexzhukov/favorite3-cpp/out
+LD_PRELOAD=/home/alexzhukov/favorite-cpp/submit_shim.so \
+SUBMIT_TS_FILE="$RUN/ts.txt" DUMP_DIR="$RUN" DUMP_EVERY=200 DUMP_MAX=20 \
+VK_DRIVER_FILES="$ICD" CUDAVK_CLIP_EQ_CHECK=1 CUDAVK_CLIP_EQ_BREAK=0 \
+CUDAVK_CLIP_COPY_BYPASS=1 CUDAVK_CLIP_COMMON_REJECT=1 \
+./build/vulkan_app >"$RUN/stdout" 2>"$RUN/stderr"
+REPLAY_EXIT=$?
+printf '%s\n' "$REPLAY_EXIT" >"$RUN/exit-code"
+python3 /home/alexzhukov/mesa-three-ms-clip-check/src/cudavk/tests/cpvk_clip_eq_gate.py validate \
+  --arm positive --expected-copy on --expected-reject on \
+  --stdout "$RUN/stdout" --stderr "$RUN/stderr" --exit-code "$REPLAY_EXIT" \
+  --submit-ts "$RUN/ts.txt" --expected-submits 6947 --expected-frames 3473 \
+  --expected-stdout-sha256 e4a60a7156141649a4c16660f674025af7b9fc3fe2702f4f57845527075d058d \
+  --command-json '["./build/vulkan_app"]' --output "$RUN/verdict.json"
+```
+
+For favorite2, use a new `$RUN`, change the `cd` to
+`/home/alexzhukov/favorite2-cpp/out`, and use this exact verdict command after
+the same native launch and exit capture:
+
+```sh
+python3 /home/alexzhukov/mesa-three-ms-clip-check/src/cudavk/tests/cpvk_clip_eq_gate.py validate \
+  --arm positive --expected-copy on --expected-reject on \
+  --stdout "$RUN/stdout" --stderr "$RUN/stderr" --exit-code "$REPLAY_EXIT" \
+  --submit-ts "$RUN/ts.txt" --expected-submits 6965 --expected-frames 3482 \
+  --expected-stdout-sha256 0240ff4ec576c62b49461a384d90e0c25463f69ecdaf1b2286e92d14264d947e \
+  --command-json '["./build/vulkan_app"]' --output "$RUN/verdict.json"
+```
+
+Add the explicit mode/path coverage minima required by the coverage plan to
+both commands. Repeat the off/copy/reject/both and negative-control matrix above
+with fresh artifacts per arm. A passing command without optional mode minima
+does not establish those modes' coverage. Preserve environment and library and
+capture identities alongside every verdict. No timestamps, stdout lines or EOF
+markers may be synthesized for a real verdict. Self-test census fixtures are
+synthetic CPU tests only, not replay evidence.
