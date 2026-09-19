@@ -163,6 +163,8 @@ enum cp_arena_mode {
  * and better traceability, which is the trade this file exists to make.
  */
 struct cp_debug {
+   bool pixel_trace;
+   unsigned pixel_trace_submit, pixel_trace_x, pixel_trace_y;
    /* Tracing. All presence-only: `=0` switches these ON, because that is what
     * they have always done and someone's script relies on it. */
    bool debug_draw;

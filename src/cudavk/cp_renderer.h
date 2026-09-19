@@ -322,6 +322,21 @@ struct cp_run_clip_bin_segment {
 };
 
 struct cp_context {
+   struct {
+      uint64_t submit;
+      CUdeviceptr device, origins;
+      CUevent initialized;
+      CUstream streams[16];
+      unsigned num_streams;
+      struct cp_pixel_trace *host;
+      uint32_t origin_used, event, incomplete;
+      bool active, readback, reported;
+      struct cp_pixel_final {
+         uint64_t framebuffer, packed;
+         uint32_t event, pass, sample, group;
+      } *finals;
+      unsigned final_count, group, metadata_count;
+   } pixel_trace;
 
    /* Per-renderer A-buffer storage: every CUDA pointer belongs to this
     * context's device instead of to process-global state. */
@@ -1342,6 +1357,8 @@ bool cp_clear_rect_masked(struct cp_context *cp, void *data, uint64_t offset,
 
 bool cp_context_init(struct cp_context *cp, struct cp_device *dev);
 void cp_context_cleanup(struct cp_context *cp);
+void cp_pixel_trace_begin(struct cp_context *cp);
+void cp_pixel_trace_end(struct cp_context *cp);
 
 /*
  * A backstop, not a budget. The arena accumulates across the draws of a frame

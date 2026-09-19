@@ -16,12 +16,16 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-157 switches.
+161 switches.
 
 ## Tracing
 
 | variable | type | default | range | meaning |
 |---|---|---|---|---|
+| `CUDAVK_PIXEL_TRACE` | bool (value) | `off` | — | bounded pixel provenance (diagnostic, default off) |
+| `CUDAVK_PIXEL_TRACE_SUBMIT` | uint | `1` | — | exact 1-based driver queue callback to trace |
+| `CUDAVK_PIXEL_TRACE_X` | uint | `0` | — | pixel provenance x coordinate |
+| `CUDAVK_PIXEL_TRACE_Y` | uint | `0` | — | pixel provenance y coordinate |
 | `CUDAVK_DEBUG_DRAW` | bool (presence) | `off` | — | trace every draw: geometry, attachments, and why a draw was skipped |
 | `CUDAVK_DEBUG_TEX` | bool (presence) | `off` | — | trace sampler and texture-handle setup |
 | `CUDAVK_NO_DEPTH_ONLY_BATCH` | bool (value) | `off` | — | refuse to batch draws in a scope with no colour attachment again, so a shadow scope runs one chain and one full visibility clear per draw instead of batching them |

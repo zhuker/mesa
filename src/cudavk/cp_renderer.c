@@ -632,6 +632,20 @@ cp_launch_after(struct cp_context *cp, CUfunction f,
                 CUfunction pdl_after, unsigned pdl_tier)
 {
    cp_ctx_check("cp_launch", cp->dev->cuda_ctx);
+   if (cp->pixel_trace.active) {
+      bool ordered = false;
+      for (unsigned i = 0; i < cp->pixel_trace.num_streams; i++)
+         ordered |= cp->pixel_trace.streams[i] == stream;
+      if (!ordered) {
+         CUresult trace_err = cuStreamWaitEvent(stream, cp->pixel_trace.initialized, 0);
+         if (trace_err != CUDA_SUCCESS) {
+            cp->pixel_trace.incomplete = 1;
+            return trace_err;
+         }
+         if (cp->pixel_trace.num_streams < ARRAY_SIZE(cp->pixel_trace.streams))
+            cp->pixel_trace.streams[cp->pixel_trace.num_streams++] = stream;
+      }
+   }
    CUresult err = cp_upload_flush(cp);
    if (err != CUDA_SUCCESS)
       return err;
@@ -1227,14 +1241,182 @@ cp_pass_streams_cleanup(struct cp_context *cp)
 }
 
 
+
+/* Diagnostic storage is fixed for the selected callback and never recycled
+ * while side streams can still reference an origin. It is not render scratch. */
+#define CP_PIXEL_ORIGIN_POOL (4u * 1024u * 1024u)
+void
+cp_pixel_trace_begin(struct cp_context *cp)
+{
+   if (!cp_debug->pixel_trace)
+      return;
+   cp->pixel_trace.active = false;
+   if (cp->pixel_trace.submit != cp_debug->pixel_trace_submit)
+      return;
+   cp->pixel_trace.incomplete = 0;
+   fprintf(stderr, "CP_PIXEL_TRACE {\"kind\":\"epoch\",\"epoch\":%" PRIu64
+           ",\"x\":%u,\"y\":%u,\"capacity\":65536}\n", cp->pixel_trace.submit,
+           cp_debug->pixel_trace_x, cp_debug->pixel_trace_y);
+   if (cuMemAlloc(&cp->pixel_trace.device, sizeof(struct cp_pixel_trace)) != CUDA_SUCCESS ||
+       cuMemAlloc(&cp->pixel_trace.origins,
+                  (size_t)CP_PIXEL_ORIGIN_POOL * sizeof(struct cp_pixel_origin)) != CUDA_SUCCESS ||
+       cuMemAllocHost((void **)&cp->pixel_trace.host,
+                     sizeof(struct cp_pixel_trace)) != CUDA_SUCCESS) {
+      fprintf(stderr, "CP_PIXEL_TRACE allocation failure; INCOMPLETE\n");
+      return;
+   }
+   memset(cp->pixel_trace.host, 0, sizeof(struct cp_pixel_trace));
+   cp->pixel_trace.host->x = cp_debug->pixel_trace_x;
+   cp->pixel_trace.host->y = cp_debug->pixel_trace_y;
+   cp->pixel_trace.host->epoch = cp_debug->pixel_trace_submit;
+   if (cuMemcpyHtoDAsync(cp->pixel_trace.device, cp->pixel_trace.host,
+                         sizeof(struct cp_pixel_trace), cp->stream) != CUDA_SUCCESS ||
+       cuMemsetD8Async(cp->pixel_trace.origins, 0,
+                      (size_t)CP_PIXEL_ORIGIN_POOL * sizeof(struct cp_pixel_origin),
+                      cp->stream) != CUDA_SUCCESS) {
+      fprintf(stderr, "CP_PIXEL_TRACE initialization failure; INCOMPLETE\n");
+      return;
+   }
+   if (cuMemAllocHost((void **)&cp->pixel_trace.finals,
+                     4096 * sizeof(*cp->pixel_trace.finals)) != CUDA_SUCCESS)
+      return;
+   if (cuEventCreate(&cp->pixel_trace.initialized, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS ||
+       cuEventRecord(cp->pixel_trace.initialized, cp->stream) != CUDA_SUCCESS)
+      return;
+   cp->pixel_trace.streams[cp->pixel_trace.num_streams++] = cp->stream;
+   cp->pixel_trace.active = true;
+}
+
+void
+cp_pixel_trace_end(struct cp_context *cp)
+{
+   if (!cp->pixel_trace.active)
+      return;
+   cp->pixel_trace.readback = cuMemcpyDtoHAsync(
+      cp->pixel_trace.host, cp->pixel_trace.device,
+      sizeof(struct cp_pixel_trace), cp->stream) == CUDA_SUCCESS;
+   cp->pixel_trace.active = false;
+}
+
+static bool
+cp_pixel_trace_metadata(struct cp_context *cp)
+{
+   if (cp->pixel_trace.metadata_count == CP_PIXEL_TRACE_CAPACITY) {
+      cp->pixel_trace.incomplete = 1;
+      return false;
+   }
+   cp->pixel_trace.metadata_count++;
+   return true;
+}
+
+static void
+cp_pixel_trace_clip(struct cp_context *cp, struct cp_rasterize_args *rast,
+                    struct cp_clip_args *clip)
+{
+   if (!rast->trace)
+      return;
+   rast->trace_origins = 0;
+   rast->trace_origin_capacity = 0;
+   if (clip->max_triangles <= CP_PIXEL_ORIGIN_POOL - cp->pixel_trace.origin_used) {
+      rast->trace_origins = cp->pixel_trace.origins +
+         (size_t)cp->pixel_trace.origin_used * sizeof(struct cp_pixel_origin);
+      rast->trace_origin_capacity = clip->max_triangles;
+      cp->pixel_trace.origin_used += clip->max_triangles;
+   } else {
+      cp->pixel_trace.incomplete = 1;
+   }
+   clip->trace = rast->trace;
+   clip->trace_event = rast->trace_event;
+   clip->trace_origins = rast->trace_origins;
+   clip->trace_origin_capacity = rast->trace_origin_capacity;
+}
+
+/* Ordered DtoH at shade entry observes the reduction after side-stream joins.
+ * No synchronization is added; report consumes it only at existing teardown. */
+static void
+cp_pixel_trace_final(struct cp_context *cp, CUdeviceptr visbuf,
+                     unsigned w, unsigned h, unsigned samples, unsigned pass,
+                     unsigned event, unsigned group)
+{
+   if (!cp->pixel_trace.active)
+      return;
+   unsigned x = cp_debug->pixel_trace_x, y = cp_debug->pixel_trace_y;
+   if (x >= w || y >= h)
+      return;
+   for (unsigned sample = 0; sample < samples; sample++) {
+      if (cp->pixel_trace.final_count == 4096) {
+         cp->pixel_trace.incomplete = 1;
+         return;
+      }
+      struct cp_pixel_final *f = &cp->pixel_trace.finals[cp->pixel_trace.final_count++];
+      *f = (struct cp_pixel_final) { .framebuffer = visbuf,
+         .event = event, .pass = pass, .sample = sample, .group = group };
+      if (cuMemcpyDtoHAsync(&f->packed,
+                           visbuf + ((size_t)sample * w * h + (size_t)y * w + x) * 8,
+                           8, cp->stream) != CUDA_SUCCESS)
+         cp->pixel_trace.incomplete = 1;
+   }
+}
+
+static void
+cp_pixel_trace_report(struct cp_context *cp)
+{
+   if (!cp_debug->pixel_trace ||
+       cp->pixel_trace.submit < cp_debug->pixel_trace_submit ||
+       cp->pixel_trace.reported)
+      return;
+   cp->pixel_trace.reported = true;
+   for (unsigned i = 0; i < cp->pixel_trace.final_count; i++) {
+      const struct cp_pixel_final *f = &cp->pixel_trace.finals[i];
+      fprintf(stderr, "CP_PIXEL_TRACE {\"kind\":\"final\",\"epoch\":%u,"
+              "\"event\":%u,\"framebuffer\":\"%016" PRIx64 "\","
+              "\"pass\":%u,\"sample\":%u,\"group\":%u,\"packed\":\"%016" PRIx64 "\"}\n",
+              cp_debug->pixel_trace_submit, f->event, f->framebuffer,
+              f->pass, f->sample, f->group, f->packed);
+   }
+   const struct cp_pixel_trace *t = cp->pixel_trace.host;
+   uint32_t count = cp->pixel_trace.readback ? t->count : 0;
+   for (uint32_t i = 0; i < MIN2(count, CP_PIXEL_TRACE_CAPACITY); i++) {
+      const struct cp_pixel_record *r = &t->records[i];
+      fprintf(stderr, "CP_PIXEL_TRACE {\"kind\":\"record\",\"epoch\":%u,"
+              "\"event\":%u,\"framebuffer\":\"%016" PRIx64 "\","
+              "\"packed\":\"%016" PRIx64 "\",\"old\":\"%016" PRIx64 "\","
+              "\"result\":\"%016" PRIx64 "\","
+              "\"segment\":%u,\"pass\":%u,\"sample\":%u,"
+              "\"storage_id\":%u,\"global_id\":%u,\"input_primitive\":%u,\"fan\":%u,"
+              "\"depth_bits\":%u,\"depth_key\":%u,\"compare_op\":%u,\"status\":%u,"
+              "\"origin_valid\":%u,\"won_atomic\":%u,\"abuf_mode\":%u,\"stable\":%u,\"depth_test\":%u,\"blend_peel\":%u}\n",
+              t->epoch, r->event, r->framebuffer, r->packed, r->old, r->result,
+              r->segment, r->pass, r->sample, r->storage_id, r->global_id,
+              r->input_primitive, r->fan, r->depth_bits, r->depth_key,
+              r->compare_op, r->status, r->origin_valid, r->won_atomic,
+              r->abuf_mode, r->stable, r->depth_test, r->blend_peel);
+   }
+   fprintf(stderr, "CP_PIXEL_TRACE {\"kind\":\"end\",\"epoch\":%u,\"count\":%u,"
+           "\"dropped\":%u,\"incomplete\":%u}\n", cp_debug->pixel_trace_submit,
+           count, cp->pixel_trace.readback ? t->dropped : 0,
+           cp->pixel_trace.incomplete || cp->device_fatal || !cp->pixel_trace.readback ||
+           (cp->pixel_trace.readback && t->incomplete));
+}
+
 void
 cp_context_cleanup(struct cp_context *cp)
 {
    if (!cp || !cp->dev)
       return;
 
-   if (cuCtxSynchronize() != CUDA_SUCCESS)
+   if (cuCtxSynchronize() != CUDA_SUCCESS) {
       cp_renderer_texture_fatal(cp);
+      cp->pixel_trace.readback = false;
+      cp->pixel_trace.incomplete = 1;
+      cp->pixel_trace.final_count = 0;
+   }
+   cp_pixel_trace_report(cp);
+   if (cp->pixel_trace.initialized) cuEventDestroy(cp->pixel_trace.initialized);
+   if (cp->pixel_trace.device) cuMemFree(cp->pixel_trace.device);
+   if (cp->pixel_trace.origins) cuMemFree(cp->pixel_trace.origins);
+   if (cp->pixel_trace.host) cuMemFreeHost(cp->pixel_trace.host);
+   if (cp->pixel_trace.finals) cuMemFreeHost(cp->pixel_trace.finals);
    /* Release the exclusive cache-use lifetime even on a poisoned context. */
    cp_texture_cache_unpin(cp);
    cp_hardware_texture_report(cp);
@@ -5526,6 +5708,8 @@ static void
 cp_rast_args_unclip(struct cp_rasterize_args *ra, uint64_t positions,
                     uint32_t num_triangles, uint32_t rect_prim_shift)
 {
+   ra->trace_origins = 0;
+   ra->trace_origin_capacity = ra->trace ? CP_PIXEL_ORIGIN_IDENTITY : 0;
    ra->positions = positions;
    ra->prim_refs = 0;
    ra->tri_count = 0;
@@ -6365,6 +6549,33 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          (state->depth.depth_func == CP_FUNC_GREATER ||
           state->depth.depth_func == CP_FUNC_GEQUAL),
    };
+   if (cp->pixel_trace.active && cp->pixel_trace.event >= CP_PIXEL_TRACE_CAPACITY)
+      cp->pixel_trace.incomplete = 1;
+   if (cp->pixel_trace.active && cp->pixel_trace.event < CP_PIXEL_TRACE_CAPACITY) {
+      rast_args.trace = cp->pixel_trace.device;
+      rast_args.trace_origin_capacity = CP_PIXEL_ORIGIN_IDENTITY;
+      rast_args.trace_event = ++cp->pixel_trace.event;
+      if (cp_pixel_trace_metadata(cp))
+         fprintf(stderr, "CP_PIXEL_TRACE {\"kind\":\"batch\",\"epoch\":%u,"
+              "\"event\":%u,\"draws\":%u,\"triangles\":%u,"
+              "\"framebuffer\":\"%016" PRIx64 "\"}\n",
+              cp_debug->pixel_trace_submit, rast_args.trace_event,
+              batch_draws, num_triangles, (uint64_t)visbuf);
+      unsigned primitive_begin = 0;
+      for (unsigned row = 0; row < batch_draws; row++) {
+         unsigned instances = batch->compact_rows ? MAX2(batch->instance_counts[row], 1u)
+                                                  : MAX2(info->instance_count, 1u);
+         unsigned primitive_count = cp_triangles_for_draw(info->mode, draws[row].count) * instances;
+         if (cp_pixel_trace_metadata(cp))
+            fprintf(stderr, "CP_PIXEL_TRACE {\"kind\":\"slice\",\"epoch\":%u,"
+                 "\"event\":%u,\"row\":%u,\"start\":%u,\"count\":%u,\"drawid\":%u,"
+                 "\"primitive_begin\":%u,\"primitive_count\":%u,\"instances\":%u}\n",
+                 cp_debug->pixel_trace_submit, rast_args.trace_event, row,
+                 draws[row].start, draws[row].count, batch->draw_ids[row],
+                 primitive_begin, primitive_count, instances);
+         primitive_begin += primitive_count;
+      }
+   }
    if (cp->pass.appending && cp->pass.opaque)
       rast_args.abuf_prim_base = cp->pass.next_prim;
 
@@ -6454,6 +6665,11 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
    bool peel = !retry && cp->peel_next && screen->kernels.peel_advance &&
                ((color_data && state->blend.enable) ||
                 (!color_data && fs_side_effects));
+   /* A-buffer count/fill and blend-peel attribution do not yet have a
+    * complete final-composite identity. Never present partial data as proof. */
+   if (cp->pixel_trace.active && (peel || state->blend.enable) &&
+       cp_debug->pixel_trace_x < w && cp_debug->pixel_trace_y < h)
+      cp->pixel_trace.incomplete = 1;
 
    /* Names this draw on the timeline for the rest of the function, however it
     * leaves — see CP_NVTX_SCOPE. */
@@ -7503,6 +7719,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
                    * sequence so every debug census sees the kernels it was
                    * written against.
                    */
+                  cp_pixel_trace_clip(cp, &rast_args, &clip);
                   CUresult clip_err = CUDA_SUCCESS;
                   if (screen->kernels.clip_rast_fused &&
                       !cp_debug->no_fused_rast && !cp_kernels_instrumented()) {
@@ -8532,6 +8749,14 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
        * alpha-test retry clears its own counter and discard mask, so it
        * prepares in place exactly as it did before.
        */
+      if (cp->pixel_trace.active) {
+         unsigned group = ++cp->pixel_trace.group;
+         if (cp_pixel_trace_metadata(cp))
+            fprintf(stderr, "CP_PIXEL_TRACE {\"kind\":\"reduction\",\"epoch\":%u,\"group\":%u,\"event\":%u}\n",
+                 cp_debug->pixel_trace_submit, group, rast_args.trace_event);
+         cp_pixel_trace_final(cp, visbuf, w, h, fb_samples, pass,
+                              rast_args.trace_event, group);
+      }
       if (shade_this_draw) {
          if (shade_prepped) {
             cp_shade_run(cp, &shade_prep);
@@ -9783,6 +10008,16 @@ cp_opaque_finish_common(struct cp_context *cp, bool visibility_ready)
       return;
    }
 
+   if (cp->pixel_trace.active) {
+      unsigned group = ++cp->pixel_trace.group;
+      for (unsigned s = 0; s < nsegs; s++)
+         if (cp_pixel_trace_metadata(cp))
+            fprintf(stderr, "CP_PIXEL_TRACE {\"kind\":\"reduction\",\"epoch\":%u,\"group\":%u,\"event\":%u}\n",
+                 cp_debug->pixel_trace_submit, group, segs[s].rast.trace_event);
+      cp_pixel_trace_final(cp, cp->visbuf, w, h,
+                           MAX2(segs[0].batch.scope.attachment_samples, 1u), 0,
+                           segs[0].rast.trace_event, group);
+   }
    cp_tile_census_visbuf(cp, segs, nsegs, w, h);
 
    uint8_t seg_group[CP_PASS_MAX_SEGS];
@@ -11075,6 +11310,9 @@ cp_pass_record_segment(struct cp_context *cp,
                        unsigned rast_num_triangles, unsigned num_triangles,
                        const struct cp_draw_batch *batch)
 {
+   if (cp->pixel_trace.active && !cp->pass.opaque &&
+       cp_debug->pixel_trace_x < aa->width && cp_debug->pixel_trace_y < aa->height)
+      cp->pixel_trace.incomplete = 1;
    if (!cp->pass.nsegs)
       cp->pass.hw_attempt_start = cp->hardware_texture.fs_attempts;
    struct cp_pass_seg *sg = &cp->pass_segs[cp->pass.nsegs];
@@ -12412,6 +12650,8 @@ cp_run_clip_bin_execute(struct cp_context *cp)
          .rast = rast,
          .prim_base = seg->prim_base,
       };
+      cp_pixel_trace_clip(cp, &rast, &devsegs[s].clip);
+      devsegs[s].rast = rast;
       rasts[s] = rast;
       max_triangles = MAX2(max_triangles, seg->num_triangles);
 

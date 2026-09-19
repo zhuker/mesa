@@ -109,6 +109,14 @@ static const struct cp_flag_value arena_modes[] = {
  */
 static const struct cp_flag_def flags[] = {
    /* ---- tracing ---- */
+   { "CUDAVK_PIXEL_TRACE", CP_FLAG_BOOL_VALUE, F(pixel_trace),
+     "bounded pixel provenance (diagnostic, default off)" },
+   { "CUDAVK_PIXEL_TRACE_SUBMIT", CP_FLAG_UINT, F(pixel_trace_submit),
+     "exact 1-based driver queue callback to trace", .dflt = 1 },
+   { "CUDAVK_PIXEL_TRACE_X", CP_FLAG_UINT, F(pixel_trace_x),
+     "pixel provenance x coordinate", .dflt = 0 },
+   { "CUDAVK_PIXEL_TRACE_Y", CP_FLAG_UINT, F(pixel_trace_y),
+     "pixel provenance y coordinate", .dflt = 0 },
    { "CUDAVK_DEBUG_DRAW", CP_FLAG_BOOL_PRESENCE, F(debug_draw),
      "trace every draw: geometry, attachments, and why a draw was skipped" },
    { "CUDAVK_DEBUG_TEX", CP_FLAG_BOOL_PRESENCE, F(debug_tex),

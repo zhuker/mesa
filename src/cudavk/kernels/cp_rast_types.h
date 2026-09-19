@@ -19,6 +19,56 @@ typedef signed long long int64_t;
 typedef unsigned long long uintptr_t;
 #endif
 
+/* Bounded, diagnostic-only pixel provenance. No record is production identity.
+ * CP_PIXEL_TRACE is compiled out by default; ABI fields stay zero on the host.
+ * A full buffer or unsupported path makes the report INCOMPLETE. */
+#ifndef CP_PIXEL_TRACE
+#define CP_PIXEL_TRACE 0
+#endif
+#define CP_PIXEL_TRACE_CAPACITY 65536u
+#define CP_PIXEL_ORIGIN_IDENTITY 0xffffffffu
+#define CP_PIXEL_STATUS_COVERED 0u
+#define CP_PIXEL_STATUS_REJECTED 1u
+#define CP_PIXEL_STATUS_DEPTH_FAIL 2u
+#define CP_PIXEL_STATUS_ABUFFER 3u
+#define CP_PIXEL_STATUS_PEEL_SKIP 4u
+#define CP_PIXEL_STATUS_ATOMIC 5u
+/* These bounds predicates are shared with the CPU diagnostic tests. */
+#ifdef __CUDACC__
+static __device__ __forceinline__ int
+#else
+static inline int
+#endif
+cp_pixel_record_slot_valid(uint32_t slot)
+{
+   return slot < CP_PIXEL_TRACE_CAPACITY;
+}
+#ifdef __CUDACC__
+static __device__ __forceinline__ int
+#else
+static inline int
+#endif
+cp_pixel_origin_slot_valid(uint32_t slot, uint32_t capacity)
+{
+   return capacity != CP_PIXEL_ORIGIN_IDENTITY && slot < capacity;
+}
+struct cp_pixel_origin {
+   uint32_t input_primitive, fan, valid, reserved;
+};
+struct cp_pixel_record {
+   uint64_t framebuffer, packed, old, result;
+   uint32_t event, segment, pass, sample;
+   uint32_t storage_id, global_id, input_primitive, fan;
+   uint32_t depth_bits, depth_key, compare_op, status;
+   uint32_t origin_valid, won_atomic, abuf_mode, stable;
+   uint32_t depth_test, blend_peel;
+};
+struct cp_pixel_trace {
+   uint32_t count, dropped, incomplete, reserved;
+   uint32_t x, y, epoch, padding;
+   struct cp_pixel_record records[CP_PIXEL_TRACE_CAPACITY];
+};
+
 struct cp_framebuffer_info {
    uint64_t color[4];       /* Device pointers to color attachments */
    uint64_t depth;          /* Device pointer to depth buffer (packed depth|triID or float) */
@@ -110,6 +160,9 @@ struct cp_vertex_args {
    ((translate) + (ndc_z) * (scale))
 
 struct cp_rasterize_args {
+   uint64_t trace, trace_origins;
+   uint32_t trace_origin_capacity, trace_event;
+
    /* Optional device-side launch predicate. Zero leaves the ordinary path
     * unchanged; otherwise every raster stage returns unless *path_flag equals
     * path_value. Opaque tiled episodes use this to run classic rasterization
@@ -352,6 +405,9 @@ struct cp_blend_desc {
  * triangle into at most two, so the output buffer holds 2x the input.
  */
 struct cp_clip_args {
+   uint64_t trace, trace_origins;
+   uint32_t trace_origin_capacity, trace_event;
+
    uint64_t vs_out;         /* Input: 3 vertices per triangle, num_slots float4 each */
    uint64_t out;            /* Output: same layout, compacted */
    uint64_t out_count;      /* Output: uint32 triangle counter */

@@ -298,6 +298,83 @@ clip_poly(float4 *dst, const float4 *src, int n, uint32_t slots, int plane)
    return out_n;
 }
 
+#if CP_PIXEL_TRACE
+/* Reserve only for actual coverage at the chosen pixel. Reservation order is
+ * diagnostic scheduling, never primitive or atomic order. */
+static __device__ __forceinline__ cp_pixel_record *
+cp_trace_cover(const cp_rasterize_args *args, uint32_t tri_id,
+               int px, int py, int sample, float ndc_z)
+{
+   cp_pixel_trace *t = (cp_pixel_trace *)(uintptr_t)args->trace;
+   if (!t || px != (int)t->x || py != (int)t->y)
+      return nullptr;
+   uint32_t slot = atomicAdd(&t->count, 1u);
+   if (!cp_pixel_record_slot_valid(slot)) {
+      atomicAdd(&t->dropped, 1u);
+      atomicExch(&t->incomplete, 1u);
+      return nullptr;
+   }
+   cp_pixel_record *r = &t->records[slot];
+   *r = {};
+   r->framebuffer = args->framebuffer;
+   r->event = args->trace_event;
+   r->segment = args->abuf_prim_base;
+   /* reject_passes is the raster loop index for both retry and peel.
+    * peel_epoch is only a convergence-check generation shared by many passes. */
+   r->pass = args->reject_passes;
+   r->sample = sample;
+   r->storage_id = tri_id;
+   r->global_id = args->abuf_prim_base + tri_id;
+   r->compare_op = args->depth_func;
+   r->depth_test = args->depth_test;
+   r->blend_peel = args->blend_peel;
+   r->abuf_mode = args->abuf_mode;
+   r->stable = !!args->active_ids;
+   float depth = CP_WINDOW_DEPTH(ndc_z, args->depth_scale, args->depth_translate);
+   r->depth_bits = __float_as_uint(depth);
+   r->depth_key = float_to_sortable_uint(depth);
+   if (args->depth_key_invert) r->depth_key = ~r->depth_key;
+   if (args->trace_origin_capacity == CP_PIXEL_ORIGIN_IDENTITY) {
+      r->input_primitive = tri_id;
+      r->fan = 0;
+      r->origin_valid = 1;
+      r->stable = 1;
+   } else if (args->trace_origins && cp_pixel_origin_slot_valid(tri_id, args->trace_origin_capacity)) {
+      const cp_pixel_origin *o =
+         (const cp_pixel_origin *)(uintptr_t)args->trace_origins + tri_id;
+      r->input_primitive = o->input_primitive;
+      r->fan = o->fan;
+      r->origin_valid = o->valid;
+      r->stable = o->reserved;
+   }
+   if (!r->origin_valid) atomicExch(&t->incomplete, 1u);
+   return r;
+}
+static __device__ __forceinline__ void
+cp_trace_depth(cp_pixel_record *r, uint32_t sortable_depth, uint32_t invert)
+{
+   if (!r) return;
+   /* Invert the production sortable conversion, not another floating-point
+    * evaluation. These are exactly the bits used by the real depth test. */
+   r->depth_bits = sortable_depth ^
+      ((sortable_depth & 0x80000000u) ? 0x80000000u : 0xffffffffu);
+   r->depth_key = invert ? ~sortable_depth : sortable_depth;
+}
+static __device__ __forceinline__ void
+cp_trace_atomic(cp_pixel_record *r, uint64_t packed, uint64_t old)
+{
+   if (!r) return;
+   r->packed = packed;
+   r->old = old;
+   r->result = old < packed ? old : packed;
+   r->won_atomic = packed < old;
+   r->status = CP_PIXEL_STATUS_ATOMIC;
+}
+#define CP_TRACE_STATUS(rec, value) do { if (rec) (rec)->status = (value); } while (0)
+#else
+#define CP_TRACE_STATUS(rec, value) do { } while (0)
+#endif
+
 static __device__ __forceinline__ bool
 clip_alloc(struct cp_clip_args *args, uint32_t tri, uint32_t k,
            uint32_t *id_out)
@@ -308,8 +385,27 @@ clip_alloc(struct cp_clip_args *args, uint32_t tri, uint32_t k,
       ? tri * CP_CLIP_MAX_OUT + k
       : atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
    *id_out = o;
-   if (o >= args->max_triangles)
+   if (o >= args->max_triangles) {
+#if CP_PIXEL_TRACE
+      if (args->trace)
+         atomicExch(&((cp_pixel_trace *)(uintptr_t)args->trace)->incomplete, 1u);
+#endif
       return false;
+   }
+#if CP_PIXEL_TRACE
+   if (args->trace) {
+      if (args->trace_origins && cp_pixel_origin_slot_valid(o, args->trace_origin_capacity)) {
+         cp_pixel_origin *origin =
+            (cp_pixel_origin *)(uintptr_t)args->trace_origins + o;
+         origin->input_primitive = tri;
+         origin->fan = k;
+         origin->reserved = args->stable;
+         origin->valid = 1;
+      } else {
+         atomicExch(&((cp_pixel_trace *)(uintptr_t)args->trace)->incomplete, 1u);
+      }
+   }
+#endif
 
    /* In stable mode o is the primitive's ordered fixed-slot ID. Append that
     * ID to a compact worklist instead of making the rasterizer visit holes. */
@@ -867,7 +963,14 @@ cp_run_clip_direct_record(const struct cp_run_clip_direct_live &rec,
          bool rejected = false;
          for (uint32_t q = 0; q < rast.reject_passes; q++)
             if (rej[q] == local) rejected = true;
-         if (rejected) continue;
+         if (rejected) {
+#if CP_PIXEL_TRACE
+            cp_pixel_trace *t = (cp_pixel_trace *)(uintptr_t)rast.trace;
+            if (t && px == (int)t->x && py == (int)t->y)
+               atomicExch(&t->incomplete, 1u);
+#endif
+            continue;
+         }
       }
       float sx = (float)px + 0.5f, sy = (float)py + 0.5f, z;
       if (setup.is_point) {
@@ -885,17 +988,32 @@ cp_run_clip_direct_record(const struct cp_run_clip_direct_live &rec,
          z = w0 * setup.ndc_z0 + w1 * setup.ndc_z1 +
              (1.0f - w0 - w1) * setup.ndc_z2;
       }
+#if CP_PIXEL_TRACE
+      cp_pixel_record *trace = cp_trace_cover(&rast, local, px, py, 0, z);
+#endif
       uint32_t depth = float_to_sortable_uint(
          CP_WINDOW_DEPTH(z, rast.depth_scale, rast.depth_translate));
+#if CP_PIXEL_TRACE
+      cp_trace_depth(trace, depth, rast.depth_key_invert);
+#endif
       if (rast.depth_test && rast.depthbuf) {
          uint32_t prev = ((const uint32_t *)(uintptr_t)rast.depthbuf)[pixel];
          bool pass = rast.depth_func == CP_FUNC_LEQUAL ? depth <= prev :
                      rast.depth_func == CP_FUNC_GEQUAL ? depth >= prev : false;
-         if (!pass) continue;
+         if (!pass) {
+            CP_TRACE_STATUS(trace, CP_PIXEL_STATUS_DEPTH_FAIL);
+            continue;
+         }
       }
       uint32_t key = rast.depth_key_invert ? ~depth : depth;
+#if CP_PIXEL_TRACE
+      unsigned long long trace_old =
+#endif
       atomicMin((unsigned long long *)(uintptr_t)rast.framebuffer + pixel,
                 (unsigned long long)PACK_VISBUF(key, rec.stable_prim));
+#if CP_PIXEL_TRACE
+      cp_trace_atomic(trace, PACK_VISBUF(key, rec.stable_prim), trace_old);
+#endif
    }
 }
 
@@ -1112,14 +1230,22 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
                 (uint32_t)py * args->width + (uint32_t)px, 1u);
 #endif
 
-   if (cp_tri_rejected(args, tri_id, px, py))
+#if CP_PIXEL_TRACE
+   cp_pixel_record *trace = cp_trace_cover(args, tri_id, px, py, sample, ndc_z);
+#endif
+   if (cp_tri_rejected(args, tri_id, px, py)) {
+      CP_TRACE_STATUS(trace, CP_PIXEL_STATUS_REJECTED);
       return;
+   }
 
    uint32_t plane = (uint32_t)sample * args->width * args->height;
    uint32_t at = plane + (uint32_t)py * args->width + (uint32_t)px;
 
    uint32_t depth_uint = float_to_sortable_uint(
       CP_WINDOW_DEPTH(ndc_z, args->depth_scale, args->depth_translate));
+#if CP_PIXEL_TRACE
+   cp_trace_depth(trace, depth_uint, args->depth_key_invert);
+#endif
 
    if (args->depth_test && args->depthbuf) {
       uint32_t prev = ((const uint32_t *)(uintptr_t)args->depthbuf)[at];
@@ -1134,8 +1260,10 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
       case CP_FUNC_GEQUAL:    pass = depth_uint >= prev; break;
       default:                pass = true; break;
       }
-      if (!pass)
+      if (!pass) {
+         CP_TRACE_STATUS(trace, CP_PIXEL_STATUS_DEPTH_FAIL);
          return;
+      }
    }
 
 #if CP_ABUF_INSTRUMENT
@@ -1152,6 +1280,7 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
     * launch can change what is rendered.
     */
    if (ABUF) {
+      CP_TRACE_STATUS(trace, CP_PIXEL_STATUS_ABUFFER);
       uint32_t p = (uint32_t)py * args->width + (uint32_t)px;
       if (args->abuf_mode == CP_ABUF_COUNT) {
          atomicAdd((unsigned int *)(uintptr_t)args->abuf_counts + p, 1u);
@@ -1205,10 +1334,18 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
     */
    if (args->blend_peel) {
       const uint32_t *next = (const uint32_t *)(uintptr_t)args->peel_next;
-      if (tri_id < next[(uint32_t)py * args->width + (uint32_t)px])
+      if (tri_id < next[(uint32_t)py * args->width + (uint32_t)px]) {
+         CP_TRACE_STATUS(trace, CP_PIXEL_STATUS_PEEL_SKIP);
          return;
+      }
+#if CP_PIXEL_TRACE
+      unsigned long long trace_old =
+#endif
       atomicMin((unsigned long long *)&visbuf[at],
                 (unsigned long long)PACK_VISBUF(tri_id, tri_id));
+#if CP_PIXEL_TRACE
+      cp_trace_atomic(trace, PACK_VISBUF(tri_id, tri_id), trace_old);
+#endif
       /* Tells the host another pass is worth running. An atomic is required:
        * CUDA does not define concurrent non-atomic writes even when every
        * writer stores the same value. The generation removes the need for a
@@ -1220,8 +1357,14 @@ emit_fragment(struct cp_rasterize_args *args, uint32_t tri_id,
    }
 
    uint32_t key = args->depth_key_invert ? ~depth_uint : depth_uint;
+#if CP_PIXEL_TRACE
+   unsigned long long trace_old =
+#endif
    atomicMin((unsigned long long *)&visbuf[at],
              (unsigned long long)PACK_VISBUF(key, args->abuf_prim_base + tri_id));
+#if CP_PIXEL_TRACE
+   cp_trace_atomic(trace, PACK_VISBUF(key, args->abuf_prim_base + tri_id), trace_old);
+#endif
 }
 
 /*
@@ -3390,8 +3533,14 @@ cp_opaque_tile_raster(struct cp_opaque_tile_raster_args args)
       int py1 = min(setup.iy_max, tile_y1);
       for (int py = py0; py <= py1; py++) {
          for (int px = px0; px <= px1; px++) {
-            if (cp_tri_rejected(rast, local_prim, px, py))
+            if (cp_tri_rejected(rast, local_prim, px, py)) {
+#if CP_PIXEL_TRACE
+               cp_pixel_trace *t = (cp_pixel_trace *)(uintptr_t)rast->trace;
+               if (t && px == (int)t->x && py == (int)t->y)
+                  atomicExch(&t->incomplete, 1u);
+#endif
                continue;
+            }
             float sx = (float)px + 0.5f, sy = (float)py + 0.5f;
             float ndc_z;
             if (setup.is_point) {
@@ -3416,19 +3565,33 @@ cp_opaque_tile_raster(struct cp_opaque_tile_raster_args args)
                        (1.0f - w0 - w1) * setup.ndc_z2;
             }
 
+#if CP_PIXEL_TRACE
+            cp_pixel_record *trace = cp_trace_cover(rast, local_prim, px, py, 0, ndc_z);
+#endif
             uint32_t depth = float_to_sortable_uint(
                CP_WINDOW_DEPTH(ndc_z, rast->depth_scale,
                                rast->depth_translate));
+#if CP_PIXEL_TRACE
+            cp_trace_depth(trace, depth, rast->depth_key_invert);
+#endif
             uint32_t pixel = (uint32_t)py * args.width + (uint32_t)px;
             /* Admission permits only inclusive depth tests.  Test the real
              * attachment once, exactly as classic raster does, but leave it
              * untouched: all references resolve against that same initial
              * value and only the packed visibility buffer is reduced. */
-            if (!cp_opaque_depth_pass(rast, pixel, depth))
+            if (!cp_opaque_depth_pass(rast, pixel, depth)) {
+               CP_TRACE_STATUS(trace, CP_PIXEL_STATUS_DEPTH_FAIL);
                continue;
+            }
             uint32_t key = rast->depth_key_invert ? ~depth : depth;
+#if CP_PIXEL_TRACE
+            unsigned long long trace_old =
+#endif
             atomicMin((unsigned long long *)&visbuf[pixel],
                       (unsigned long long)PACK_VISBUF(key, global_prim));
+#if CP_PIXEL_TRACE
+            cp_trace_atomic(trace, PACK_VISBUF(key, global_prim), trace_old);
+#endif
          }
       }
    }

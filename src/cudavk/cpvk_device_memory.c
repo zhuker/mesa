@@ -153,6 +153,10 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    struct cpvk_device *dev =
       container_of(vk_queue->base.device, struct cpvk_device, vk);
 
+   /* Count callback entries, including entries refused for device loss. */
+   if (cp_debug->pixel_trace)
+      dev->renderer.pixel_trace.submit++;
+
    /* The census divides by this: these captures submit twice per frame, which
     * is the same paired-submit convention every timing number here uses. */
    cp_smallop_hit(__FILE__, __LINE__, CP_SMALLOP_SUBMIT, 0);
@@ -161,6 +165,7 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
 
    CPVK_CTX_SCOPE(dev);
+   cp_pixel_trace_begin(&dev->renderer);
 
    /*
     * Wait semaphores, on the device where the sync carries a completion event
@@ -367,6 +372,8 @@ cpvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    dev->prev_draw = NULL;
    dev->prev_scope = NULL;
    dev->prev_draw_valid = false;
+
+   cp_pixel_trace_end(&dev->renderer);
 
    size_t pending_size = sizeof(struct cpvk_pending_submit) +
                          (size_t)submit->signal_count *
