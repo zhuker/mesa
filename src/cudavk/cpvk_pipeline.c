@@ -1325,8 +1325,8 @@ cpvk_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache cache,
       }
       cpvk_pipeline_init_ref(dev, pipeline, pAllocator);
       pipeline->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
-      pipeline->stencil_may_observe =
-         cpvk_stencil_may_observe(dss, info->pDynamicState);
+      pipeline->unsupported_raster_order =
+         cpvk_unsupported_raster_order(dss, info->pDynamicState);
 
       /* Both stages through the cache, so identical SPIR-V compiles once and
        * two pipelines built from it share one binary -- which is what lets

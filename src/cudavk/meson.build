@@ -223,6 +223,17 @@ cpvk_stencil_metadata_test = executable(
   build_by_default : false)
 test('cpvk_stencil_metadata_test', cpvk_stencil_metadata_test, suite : 'cudavk')
 
+cp_clip_order_policy_test = executable(
+  'cp_clip_order_policy_test', files('tests/cp_clip_order_policy.c'),
+  include_directories : [include_directories('.'), inc_include],
+  build_by_default : false)
+test('cp_clip_order_policy_test', cp_clip_order_policy_test, suite : 'cudavk')
+cp_clip_seed_test = executable(
+  'cp_clip_seed_test', files('tests/cp_clip_seed_test.c'),
+  include_directories : include_directories('.'), build_by_default : false)
+test('cp_clip_seed_test', cp_clip_seed_test, suite : 'cudavk')
+
+
 # Focused external-API regression suite. These link the Vulkan loader rather
 # than driver internals and select the generated development ICD, so they test
 # the same dispatch and object-lifetime boundary as applications do.

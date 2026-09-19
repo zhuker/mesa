@@ -59,7 +59,7 @@ struct cp_draw_state {
    struct cp_depth_state depth;
    /* Host-only exclusion metadata. OR across every draw in a batch. Keep out
     * of depth state and legacy merge keys so metadata cannot split batches. */
-   bool stencil_may_observe;
+   bool unsupported_raster_order;
    struct cp_blend_desc blend;
    uint32_t pipeline_samples;
 

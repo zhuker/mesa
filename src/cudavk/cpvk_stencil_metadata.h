@@ -1,22 +1,26 @@
-/* Host-only stencil eligibility metadata; no stencil execution support. */
+/* Host-only raster-order exclusions; no dynamic depth or stencil execution. */
 #ifndef CPVK_STENCIL_METADATA_H
 #define CPVK_STENCIL_METADATA_H
 
 #include <stdbool.h>
 #include <vulkan/vulkan_core.h>
 
-/* False is a proof of inert stencil, not the absence of an implementation.
- * Dynamic stencil is deliberately unknown: the native command path does not
- * track its setters. Never infer inertness from ignored static values. */
+/* False proves static depth ordering controls and inert stencil, not execution support.
+ * Dynamic depth and stencil are unknown: the native command path does not
+ * track their setters. Never infer eligibility from ignored static values. */
 static inline bool
-cpvk_stencil_may_observe(const VkPipelineDepthStencilStateCreateInfo *ds,
-                         const VkPipelineDynamicStateCreateInfo *dyn)
+cpvk_unsupported_raster_order(const VkPipelineDepthStencilStateCreateInfo *ds,
+                              const VkPipelineDynamicStateCreateInfo *dyn)
 {
    if (dyn) {
       if (dyn->pNext || (dyn->dynamicStateCount && !dyn->pDynamicStates))
          return true;
       for (uint32_t i = 0; i < dyn->dynamicStateCount; i++) {
          switch (dyn->pDynamicStates[i]) {
+         /* EXT aliases have the same enum values; no duplicate cases. */
+         case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE:
+         case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE:
+         case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP:
          case VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK:
          case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK:
          case VK_DYNAMIC_STATE_STENCIL_REFERENCE:

@@ -2872,7 +2872,7 @@ cpvk_prepare_draw(struct cpvk_device *dev, const struct cp_render_scope *scope,
    packet->state.viewport = d->viewport;
    packet->state.raster = p->raster;
    packet->state.depth = p->depth;
-   packet->state.stencil_may_observe = p->stencil_may_observe;
+   packet->state.unsupported_raster_order = p->unsupported_raster_order;
    packet->state.blend = p->blend;
    packet->state.pipeline_samples = p->samples;
    memcpy(packet->state.velem, p->velem, sizeof(packet->state.velem));

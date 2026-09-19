@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-154 switches.
+155 switches.
 
 ## Tracing
 
@@ -53,6 +53,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_FRAG_CENSUS` | bool (presence) | `off` | — | count fragments per draw; also compiles the instrumented kernels in |
 | `CUDAVK_NVTX` | bool (presence) | `off` | — | push an NVTX range around each draw and stage, for nsys |
 | `CUDAVK_DEBUG_ROWS` | bool (presence) | `off` | — | trace the per-draw tables a batch builds: fragment UBO slots and the vertex slice table the fragment stage searches |
+| `CUDAVK_ORDERED_CLIP` | bool (value) | `off` | — | experimental stable clip IDs for side-effect-free, non-discard draws with depth test and writes enabled, LEQUAL/GEQUAL, and known disabled stencil; default off, no GPU acceptance yet |
 | `CUDAVK_DEBUG_CLIP` | bool (presence) | `off` | — | report what each batch hands the clip stage: triangles, draws, whether the stable slot mode is on |
 | `CUDAVK_DEBUG_PASS` | bool (presence) | `off` | — | report, for the first three batches only, every condition that decides whether a blended batch may join the open pass episode |
 | `CUDAVK_DEBUG_EPISODE` | bool (presence) | `off` | — | trace episode boundaries: what appended to an episode and what cut it |

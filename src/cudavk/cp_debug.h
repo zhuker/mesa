@@ -193,6 +193,7 @@ struct cp_debug {
    bool frag_census;
    bool nvtx;
    bool debug_rows;
+   bool ordered_clip;
    bool debug_clip;
    bool debug_pass;
    bool debug_episode;

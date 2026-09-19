@@ -206,6 +206,10 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_DEBUG_ROWS", CP_FLAG_BOOL_PRESENCE, F(debug_rows),
      "trace the per-draw tables a batch builds: fragment UBO slots and the "
      "vertex slice table the fragment stage searches" },
+   { "CUDAVK_ORDERED_CLIP", CP_FLAG_BOOL_VALUE, F(ordered_clip),
+     "experimental stable clip IDs for side-effect-free, non-discard draws "
+     "with depth test and writes enabled, LEQUAL/GEQUAL, and known disabled "
+     "stencil; default off, no GPU acceptance yet" },
    { "CUDAVK_DEBUG_CLIP", CP_FLAG_BOOL_PRESENCE, F(debug_clip),
      "report what each batch hands the clip stage: triangles, draws, whether "
      "the stable slot mode is on" },

@@ -10,6 +10,7 @@
 #include "cp_renderer.h"
 #include "cp_shade_equiv.h"
 #include "cp_clip_seed.h"
+#include "cp_clip_order.h"
 #include "cp_nvtx.h"
 #include "compiler/glsl_types.h"
 
@@ -36,6 +37,31 @@
 /* Which caller site produced a descriptor fallback; printed with the
  * hardware-texture stats. Attribution before ranking, rule 14. */
 static uint64_t cp_hwtex_desc_fallback_site[10];
+
+/* One admission decision for early allocation/seeding and every late clip.
+ * Fixed IDs repair inclusive equal-depth ties only. Disabled depth/writes and
+ * strict comparisons keep their original policy; their keys are not repaired.
+ */
+static bool
+cp_stable_clip_required(const struct cp_draw_state *state, unsigned batch_draws)
+{
+   const struct cp_clip_order_policy policy = {
+      .blend = state->blend.enable,
+      .reads_const_bufs = state->fs && state->fs->reads_const_bufs,
+      .batch_draws = batch_draws,
+      .depth_test = state->depth.depth_enabled,
+      .depth_write = state->depth.depth_writemask,
+      .inclusive = state->depth.depth_func == CP_FUNC_LEQUAL ||
+                   state->depth.depth_func == CP_FUNC_GEQUAL,
+      .unsupported_raster_order = state->unsupported_raster_order,
+      .shader_side_effects = !state->vs || !state->fs ||
+                            state->vs->writes_memory || state->fs->writes_memory,
+      .discard = state->fs && state->fs->uses_discard,
+   };
+   return cp_clip_order_stable(cp_debug->ordered_clip, &policy);
+}
+
+
 
 /*
  * Bring a renderer up on a device.
@@ -6304,8 +6330,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
    int clip_x1 = MIN2((int)w - 1, (int)(vp_x + vp_w - 0.501f));
    int clip_y1 = MIN2((int)h - 1, (int)(vp_y + vp_h - 0.501f));
    /*
-    * A batch whose primitives can be resolved to their draw — the same
-    * stable-clip condition as the fragment tables — carries one rectangle
+    * The legacy material-row admission carries one rectangle
     * per draw instead of folding the scissor in here, so draws that disagree
     * on it merge. Everything else takes the recorded (or live, unbatched)
     * scissor exactly as before. A deferred draw's scissor is its snapshot,
@@ -6924,8 +6949,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          const unsigned max_clipped_early = num_triangles * CP_CLIP_MAX_OUT;
          const bool clip_block_runs = screen->kernels.clip_triangles &&
                                       num_vs_outputs <= CP_MAX_CLIP_SLOTS;
-         bool stable_clip_early = state->blend.enable ||
-            (batch_draws > 1 && state->fs && state->fs->reads_const_bufs);
+         bool stable_clip_early = cp_stable_clip_required(state, batch_draws);
          CUdeviceptr clip_count_early = 0, active_ids_early = 0;
          struct cp_clip_seed clip_seeded = { 0 };
          if (fetch_fold && clip_block_runs) {
@@ -7460,13 +7484,12 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
                    * buffer needs it too: the primitive index has to name the
                    * input triangle, or cp_write_batch_rows() maps fragments
                    * to the wrong draw's material. An opaque batch whose
-                   * shader reads none keeps the compacting path — stable mode
-                   * rasterizes the whole 4x slot array, holes and all, and
-                   * multithreading paid 72% for ordering nothing consumes.
+                   * shader reads none normally keeps compaction. The opt-in
+                   * ordered-clip predicate also reserves stable IDs for
+                   * inclusive depth ties. Active IDs schedule live slots;
+                   * without that list the clipper retires unused holes.
                    */
-                  bool stable_clip = state->blend.enable ||
-                     (batch_draws > 1 && state->fs &&
-                      state->fs->reads_const_bufs);
+                  bool stable_clip = cp_stable_clip_required(state, batch_draws);
                   /* Stable IDs no longer require rasterizing all seven unused
                    * slots beside the usual one-triangle output.  The clipper
                    * appends live fixed-slot IDs here; allocation failure keeps
@@ -9182,7 +9205,8 @@ cp_batch_record_packet(struct cp_context *cp,
    const struct cp_draw_state *s = &packet->state;
    /* Eligibility metadata is not a legacy merge condition. A later draw
     * must not lose its exclusion when the batch retains the first state. */
-   cp->batch.state.stencil_may_observe |= s->stencil_may_observe;
+   cp->batch.state.unsupported_raster_order = cp_clip_order_accumulate_exclusion(
+      cp->batch.state.unsupported_raster_order, s->unsupported_raster_order);
    unsigned n = cp->batch.ndraws;
    if (cp_debug->debug_rows) {
       fprintf(stderr, "row %u: fs slots", n);
