@@ -356,8 +356,7 @@ cp_trace_depth(cp_pixel_record *r, uint32_t sortable_depth, uint32_t invert)
    if (!r) return;
    /* Invert the production sortable conversion, not another floating-point
     * evaluation. These are exactly the bits used by the real depth test. */
-   r->depth_bits = sortable_depth ^
-      ((sortable_depth & 0x80000000u) ? 0x80000000u : 0xffffffffu);
+   r->depth_bits = cp_pixel_depth_bits(sortable_depth);
    r->depth_key = invert ? ~sortable_depth : sortable_depth;
 }
 static __device__ __forceinline__ void
@@ -413,6 +412,10 @@ clip_alloc(struct cp_clip_args *args, uint32_t tri, uint32_t k,
       uint32_t at = atomicAdd((unsigned int *)(uintptr_t)args->out_count, 1u);
       if (at < args->max_triangles)
          ((uint32_t *)(uintptr_t)args->active_ids)[at] = o;
+#if CP_PIXEL_TRACE
+      else if (args->trace)
+         atomicExch(&((cp_pixel_trace *)(uintptr_t)args->trace)->incomplete, 1u);
+#endif
    }
    return true;
 }
@@ -911,6 +914,10 @@ cp_run_clip_setup_direct(struct cp_run_clip_bin_args args)
             continue;
          uint32_t at = atomicAdd(live_count, 1u);
          if (at >= args.live_capacity) {
+#if CP_PIXEL_TRACE
+            if (rast.trace)
+               atomicExch(&((cp_pixel_trace *)(uintptr_t)rast.trace)->incomplete, 1u);
+#endif
             atomicOr(errors, CP_RUN_CLIP_BIN_ERR_LIVE_BOUNDS); continue;
          }
          live[at].setup = setup;
@@ -1456,8 +1463,13 @@ cp_rast_small_or_defer(struct cp_rasterize_args *args,
       if (append) {
          uint32_t *counter = (uint32_t *)(uintptr_t)queues->nontrivial_count;
          uint32_t idx = atomicAdd(counter, 1u);
-         if (idx >= CP_MAX_NONTRIVIAL)
+         if (idx >= CP_MAX_NONTRIVIAL) {
+#if CP_PIXEL_TRACE
+            if (args->trace)
+               atomicExch(&((cp_pixel_trace *)(uintptr_t)args->trace)->incomplete, 1u);
+#endif
             return;
+         }
          uint32_t *queue = (uint32_t *)(uintptr_t)queues->nontrivial;
          queue[idx] = tri_id;
       }
@@ -1724,6 +1736,11 @@ cp_rasterize_stage2_body(struct cp_rasterize_args args, struct cp_rast_queues qu
 
             uint32_t *huge_counter = (uint32_t *)(uintptr_t)queues.huge_count;
             uint32_t base_idx = atomicAdd(huge_counter, (uint32_t)num_tiles);
+#if CP_PIXEL_TRACE
+            if (args.trace && (base_idx >= CP_MAX_HUGE_TILES ||
+                (uint32_t)num_tiles > CP_MAX_HUGE_TILES - base_idx))
+               atomicExch(&((cp_pixel_trace *)(uintptr_t)args.trace)->incomplete, 1u);
+#endif
 
             struct cp_tile_pair *huge_queue =
                (struct cp_tile_pair *)(uintptr_t)queues.huge_tiles;

@@ -100,6 +100,10 @@ def parse_trace(lines):
             if previous != origin(r):
                 raise TraceError("inconsistent origin map")
             if r["status"] == ATOMIC:
+                packed_high = r["storage_id"] if r["blend_peel"] else r["depth_key"]
+                packed_id = r["storage_id"] if r["blend_peel"] else r["global_id"]
+                if r["packed"] != (packed_high << 32 | (packed_id ^ 0xffffffff)):
+                    raise TraceError("packed candidate disagrees with depth/identity metadata")
                 if r["result"] != min(r["old"], r["packed"]):
                     raise TraceError("atomic result is not minimum")
                 if r["won_atomic"] != int(r["packed"] < r["old"]):

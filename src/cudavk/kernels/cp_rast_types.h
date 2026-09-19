@@ -52,6 +52,18 @@ cp_pixel_origin_slot_valid(uint32_t slot, uint32_t capacity)
 {
    return capacity != CP_PIXEL_ORIGIN_IDENTITY && slot < capacity;
 }
+#ifdef __CUDACC__
+static __device__ __forceinline__ uint32_t
+#else
+static inline uint32_t
+#endif
+cp_pixel_depth_bits(uint32_t sortable_depth)
+{
+   /* Exact inverse of cp_float_to_sortable_uint below. Preserve its actual
+    * signed-shift/unary-minus mask, including negative values. */
+   return sortable_depth ^
+      ((sortable_depth & 0x80000000u) ? 0x80000000u : 0x80000001u);
+}
 struct cp_pixel_origin {
    uint32_t input_primitive, fan, valid, reserved;
 };

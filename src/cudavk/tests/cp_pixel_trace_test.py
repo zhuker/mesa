@@ -175,6 +175,14 @@ class PixelTraceTests(unittest.TestCase):
         for field, value in (("depth_test", 0), ("blend_peel", 1)):
             rows = fixture()
             rows[1][field] = value
+            if field == "blend_peel":
+                for rec in rows[1:3]:
+                    rec["blend_peel"] = 1
+                    rec["packed"] = hex(rec["storage_id"] << 32 | (rec["storage_id"] ^ 0xffffffff))
+                rows[1]["result"] = rows[1]["packed"]
+                rows[2]["old"] = rows[2]["result"] = rows[1]["packed"]
+                rows[2]["won_atomic"] = 0
+                rows[3]["packed"] = rows[1]["packed"]
             self.assertIn("unsupported", predict_ties(parse(rows)[0])[0]["prediction"])
 
     def test_depth_mode_fields_required_booleans(self):
@@ -187,10 +195,23 @@ class PixelTraceTests(unittest.TestCase):
             with self.assertRaises(TraceError):
                 parse(rows)
 
+    def test_packed_low_identity_is_validated(self):
+        rows = fixture()
+        rows[1]["storage_id"] = rows[1]["global_id"] = 8
+        with self.assertRaisesRegex(TraceError, "packed candidate"):
+            parse(rows)
+
+    def test_corrupt_peel_packing_rejected(self):
+        rows = fixture()
+        rows[1]["blend_peel"] = 1
+        with self.assertRaisesRegex(TraceError, "packed candidate"):
+            parse(rows)
+
     def test_non_depth_key_not_predicted(self):
         rows = fixture()
         rows[1]["depth_key"] = 11
-        self.assertIn("not a normal", predict_ties(parse(rows)[0])[0]["prediction"])
+        with self.assertRaisesRegex(TraceError, "packed candidate"):
+            parse(rows)
 
     def test_shared_reduction_earlier_event_needs_explicit_membership(self):
         rows = fixture()
