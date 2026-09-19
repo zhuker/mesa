@@ -392,10 +392,13 @@ cp_vfetch_eq_finish(struct cp_context *cp)
       return;
    /* Called only after cleanup's existing all-stream context drain. */
    struct cp_vfetch_eq_report report = {0};
+   bool report_readback = false;
    if (cp->device_fatal || !s->report)
       s->errors++;
    else if (cuMemcpyDtoH(&report, s->report, sizeof(report)) != CUDA_SUCCESS)
       s->errors++;
+   else
+      report_readback = true;
    for (unsigned i = 0; i < 2; i++) {
       if (s->slot[i].rows && cuMemFree(s->slot[i].rows) != CUDA_SUCCESS)
          s->errors++;
@@ -413,6 +416,9 @@ cp_vfetch_eq_finish(struct cp_context *cp)
 #define EQ_DEVICE(field) EQ_APPEND(field, report.field)
 #define EQ_HOST(field) EQ_APPEND(field, s->field)
    EQ_APPEND(context_id, (uintptr_t)cp);
+   /* Zero fields after a skipped/failed copy are not device observations. */
+   EQ_APPEND(report_readback, report_readback);
+   EQ_APPEND(device_fatal, cp->device_fatal);
    EQ_DEVICE(invocations); EQ_DEVICE(valid); EQ_DEVICE(slots); EQ_DEVICE(words);
    EQ_DEVICE(diff_validity); EQ_DEVICE(diff_ids); EQ_DEVICE(diff_slots);
    EQ_DEVICE(diff_words); EQ_DEVICE(differing_invocations); EQ_DEVICE(injections);
@@ -2173,10 +2179,11 @@ cp_abuf_cleanup(struct cp_abuf *ab)
    CUdeviceptr *device_allocs[] = {
       &ab->counts, &ab->offsets, &ab->cursor,
       &ab->sum1, &ab->sum1x, &ab->sum2, &ab->sum2x,
-      &ab->list, &ab->list_count, &ab->clist, &ab->counters,
+      /* list_count, blk_list_count and dbg are interior aliases of
+       * counters, like sum3/bsum3/clist_count, not owning allocations. */
+      &ab->list, &ab->clist, &ab->counters,
       &ab->blk_counts, &ab->blk_offsets, &ab->blk_list,
-      &ab->blk_list_count, &ab->bsum1, &ab->bsum1x,
-      &ab->bsum2, &ab->bsum2x, &ab->dbg,
+      &ab->bsum1, &ab->bsum1x, &ab->bsum2, &ab->bsum2x,
       &ab->frags, &ab->recs, &ab->quad_prim, &ab->quad_mask,
       &ab->quad_block, &ab->shade_slot, &ab->peel_mask,
       &ab->log, &ab->deep_list, &ab->deep_log,

@@ -475,3 +475,26 @@ cp_vfetch_eq_oracle_cpu = executable(
   c_args : ['-Wno-error=missing-prototypes', '-Wno-attributes'],
   build_by_default : false)
 test('cp_vfetch_eq_oracle_cpu', cp_vfetch_eq_oracle_cpu, suite : 'cudavk-cpu')
+
+# Exercise the actual production NIR-to-PTX compiler, without a CUDA context.
+# CUDA entry points are supplied by the test, not libcuda. The generated
+# bitcode and compiler flags are exactly those used by the driver above.
+if cpvk_fs_inline_args.contains('-DCP_HAVE_VS_INLINE_BC')
+  cp_vfetch_generated_ptx_cpu = executable(
+    'cp_vfetch_generated_ptx_cpu',
+    [files('tests/cp_vfetch_generated_ptx_cpu.c',
+           'nir_to_ptx/cp_nir_to_llvm.c'), cpvk_fs_inline_inc],
+    c_args : cpvk_fs_inline_args,
+    include_directories : [inc_include, inc_src, inc_util,
+                           include_directories('.')],
+    dependencies : [idep_mesautil, idep_nir, dep_llvm, cpvk_fs_inline_deps,
+                    dep_cuda_vk.partial_dependency(compile_args : true,
+                                                   includes : true)],
+    build_by_default : false)
+  test('cp_vfetch_generated_ptx_cpu', cp_vfetch_generated_ptx_cpu,
+       suite : 'cudavk-cpu', timeout : 120)
+endif
+
+test('cp_abuf_cleanup', prog_python,
+     args : [files('tests/cp_abuf_cleanup.py')],
+     suite : 'cudavk-cpu')

@@ -82,3 +82,35 @@ flag-off folding/live-feature PTX seam evidence are under
 `/home/alexzhukov/cudavk-3ms-evidence/vfetch-device-equivalence-implementation.md`
 and its adjacent `vfetch-check-*` artifacts. This finite seam evidence is not
 full generated-shader SASS or replay coverage.
+
+## Failed first replay and cleanup repair
+
+The original favorite3 positive arm completed the native replay (6947 timestamp
+rows and the expected stdout hash), but failed this gate. Keep that failed arm.
+Its `errors=2`, `complete=0` and all-zero checked counts were **not device
+observations**. `cp_abuf_cleanup` attempted to free `list_count`,
+`blk_list_count` and `dbg`, which are interior aliases of the consolidated
+`counters` allocation. The resulting cleanup failure latched one error and
+`device_fatal`. The footer then skipped its device copy and counted a second
+error, printing its zero-initialized host report. Neither error came from a
+host expected-count comparison. This does not show a production vfetch defect.
+
+The repair frees only owning allocations. It keeps fail-closed cleanup and
+readback handling. Reports additionally expose `report_readback` and
+`device_fatal`, so an absent copy is not mistaken for measured zero work.
+`tests/cp_abuf_cleanup.py` compiles the actual cleanup function with CUDA mocks:
+interior/double frees fail, every owner is freed once, and every injected real
+free/event failure propagates. No production resource-admission rule, shader
+comparison, live-slot fault, expected-count rule or fallback classification is
+changed. Full GPU arms must run again under a new binary identity; the original
+failed arm remains evidence, not a discarded result.
+
+The CPU-only `cp_vfetch_generated_ptx_cpu` regression calls the public production
+NIR compiler with live sparse VS input slots 0 and 2. NIR lowering, embedded
+bitcode linking, LLVM optimization and PTX generation are real. Only CUDA module
+load/resource-query calls are mocked; the test does not link a CUDA driver or
+create a context. CHECK-on PTX has 64-bit report atomics and four volatile byte
+stores (fault and restore for two live slots). CHECK-off lacks the hooks and
+classic PTX is unchanged. Mock costs also prove instrumentation pressure does
+not replace ordinary admission. This is generated-kernel evidence, not real
+CUDA resource measurements or device execution evidence.
