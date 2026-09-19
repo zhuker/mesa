@@ -9,6 +9,7 @@
 
 #include "cp_renderer.h"
 #include "cp_shade_equiv.h"
+#include "cp_clip_seed.h"
 #include "cp_nvtx.h"
 #include "compiler/glsl_types.h"
 
@@ -6926,6 +6927,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          bool stable_clip_early = state->blend.enable ||
             (batch_draws > 1 && state->fs && state->fs->reads_const_bufs);
          CUdeviceptr clip_count_early = 0, active_ids_early = 0;
+         struct cp_clip_seed clip_seeded = { 0 };
          if (fetch_fold && clip_block_runs) {
             clip_count_early = cp_scratch_alloc_device(cp, 4);
             if (stable_clip_early)
@@ -6955,8 +6957,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
              * first; the fill relaunch inside a pass still clears its own. */
             vf_args.seed_counts = cp->cur_qset.counts;
             vf_args.seed_clip_count = clip_count_early;
-            vf_args.clip_seed = stable_clip_early && !active_ids_early
-               ? max_clipped_early : 0u;
+            vf_args.clip_seed = cp_clip_seed_value(
+               stable_clip_early, active_ids_early, max_clipped_early);
          }
 
          /* Nothing to gather when the shader declares no inputs — but it still
@@ -6974,9 +6976,13 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             if (vs_input_buf)
                cuMemsetD8Async(vs_input_buf, 0, (size_t)total_verts * vs_in_stride, cp->stream);
             void *vf_params[] = { &vf_args };
-            CP_LAUNCH(screen->kernels.vertex_fetch,
+            CUresult vf_err = cp_launch(cp, screen->kernels.vertex_fetch,
                (total_verts + 255) / 256, 1, 1, 256, 1, 1,
                0, cp->stream, vf_params, NULL);
+            CP_CU_WARN(vf_err, "cuLaunchKernel");
+            cp_clip_seed_record(&clip_seeded,
+                                vf_err == CUDA_SUCCESS && fetch_runs,
+                                vf_args.seed_clip_count, vf_args.clip_seed);
          }
 
          stride = vs_in_stride;
@@ -7355,6 +7361,11 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          if (vs_lane)
             cp_vslane_join(cp);
 
+         cp_clip_seed_record(&clip_seeded,
+                             fused_vfetch && !cp->run_geometry.active_output &&
+                             vs_err == CUDA_SUCCESS && vs_runs,
+                             vf_args.seed_clip_count, vf_args.clip_seed);
+
          if (prepare_only) {
             if (vs_err == CUDA_SUCCESS) {
                /* Exact ordinary template at the pre-clip boundary. */
@@ -7475,12 +7486,26 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
                              (int)stable_clip,
                              state->fs ? (int)state->fs->reads_const_bufs : -1);
 
-                  /* Seeded by cp_vertex_fetch when the fold is on; the value
-                   * is the same expression either way. */
-                  if (!fetch_fold)
-                     cuMemsetD32Async(clip_count,
-                                      stable_clip && !active_ids ? max_clipped : 0,
-                                      1, cp->stream);
+                  /* Allocation retries can change both the seeded pointer
+                   * and the active-list decision. Repair only that mismatch,
+                   * after the VS (and its lane join), before any classic or
+                   * deferred fused clip consumer. Opaque segments stay on
+                   * their current stream throughout this sequence.
+                   * Keep the deliberate skip-seed negative control broken. */
+                  uint32_t clip_seed = cp_clip_seed_value(
+                     stable_clip, active_ids, max_clipped);
+                  if (!(fetch_fold && skip_seed) &&
+                      cp_clip_seed_needed(&clip_seeded, clip_count, clip_seed)) {
+                     CUresult seed_err = cuMemsetD32Async(
+                        clip_count, clip_seed, 1, cp->stream);
+                     if (seed_err != CUDA_SUCCESS) {
+                        CP_CU_WARN(seed_err, "cuMemsetD32Async clip seed");
+                        if (!cp->device_fatal)
+                           cp_renderer_texture_fatal(cp);
+                        FREE(refs);
+                        return;
+                     }
+                  }
 
                   struct cp_clip_args clip = {
                      .vs_out = vs_output_buf,
