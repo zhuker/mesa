@@ -1,5 +1,6 @@
 #include "cp_nir_to_llvm.h"
 #include "cp_debug.h"
+#include "cp_shader_clip_metadata.h"
 
 #include "compiler/nir/nir.h"
 #include "util/u_memory.h"
@@ -5612,6 +5613,11 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    if (!nir)
       return NULL;
 
+   /* Graphics already gathers info immediately before this public boundary.
+    * Snapshot without another gather: do not mutate existing compiler inputs.
+    * Compute returns zero without interpreting fragment-only metadata. */
+   const uint8_t clip_order_exclusions = cp_shader_clip_exclusions(&nir->info);
+
    /* Clone before any software attempt lowers in place. Hardware ownership is
     * independent of generic inline mode and always starts from pristine FS
     * NIR. A build without matching inline bitcode quietly skips this clone. */
@@ -5695,6 +5701,10 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
    ralloc_free(hardware_nir);
    ralloc_free(hardware_fused_nir);
    ralloc_free(hardware_wb_nir);
+   /* Assign the final owner, after every classic/fused fallback and hardware
+    * attachment, before either native cache publication path can see it. */
+   if (bin)
+      bin->clip_order_exclusions = clip_order_exclusions;
    return bin;
 }
 

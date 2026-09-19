@@ -225,9 +225,27 @@ test('cpvk_stencil_metadata_test', cpvk_stencil_metadata_test, suite : 'cudavk')
 
 cp_clip_order_policy_test = executable(
   'cp_clip_order_policy_test', files('tests/cp_clip_order_policy.c'),
-  include_directories : [include_directories('.'), inc_include],
+  include_directories : [include_directories('.'), inc_include, inc_src],
   build_by_default : false)
 test('cp_clip_order_policy_test', cp_clip_order_policy_test, suite : 'cudavk')
+cp_shader_clip_metadata_test = executable(
+  'cp_shader_clip_metadata_test', files('tests/cp_shader_clip_metadata.c'),
+  include_directories : [include_directories('.'), inc_include, inc_src],
+  build_by_default : false)
+test('cp_shader_clip_metadata_test', cp_shader_clip_metadata_test, suite : 'cudavk')
+
+# Device-touching integration harness. Build only; deliberately NOT a test().
+cpvk_clip_shader_cache = executable(
+  'cpvk_clip_shader_cache', files('tests/cpvk_clip_shader_cache.c'),
+  include_directories : [inc_include, inc_src, inc_util,
+                         include_directories('.'),
+                         include_directories('nir_to_ptx')],
+  link_with : libcudavk,
+  dependencies : [idep_vulkan_runtime, idep_vulkan_util, idep_vulkan_wsi,
+                  idep_mesautil, idep_nir, dep_cuda_vk],
+  link_args : ['-Wl,--wrap=cp_compile_nir_to_ptx'],
+  build_by_default : false)
+
 cp_clip_seed_test = executable(
   'cp_clip_seed_test', files('tests/cp_clip_seed_test.c'),
   include_directories : include_directories('.'), build_by_default : false)

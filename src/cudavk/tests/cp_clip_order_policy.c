@@ -1,5 +1,6 @@
 /* CPU-only production admission truth table. No CUDA execution. */
 #include "cp_clip_order.h"
+#include "cp_shader_clip_metadata.h"
 #include "cpvk_stencil_metadata.h"
 #include <assert.h>
 #include <stdio.h>
@@ -67,19 +68,21 @@ int main(void)
 {
    unsigned cases = 0;
    for (unsigned bits = 0; bits < 256; bits++)
-      for (unsigned draws = 1; draws <= 3; draws++) {
+      for (unsigned draws = 1; draws <= 3; draws++)
+       for (unsigned reasons = 0; reasons < 8; reasons++) {
          struct cp_clip_order_policy p = {
             .blend = bits & 1, .reads_const_bufs = bits & 2,
             .batch_draws = draws, .depth_test = bits & 4,
             .depth_write = bits & 8, .inclusive = bits & 16,
             .unsupported_raster_order = bits & 32,
             .shader_side_effects = bits & 64, .discard = bits & 128,
+            .unsupported_fragment_semantics = cp_shader_clip_excluded(reasons),
          };
          bool old = p.blend || (draws > 1 && p.reads_const_bufs);
          assert(cp_clip_order_stable(false, &p) == old);
          bool extra = p.depth_test && p.depth_write && p.inclusive &&
                       !p.unsupported_raster_order && !p.shader_side_effects && !p.discard;
-         assert(cp_clip_order_stable(true, &p) == (old || extra));
+         assert(cp_clip_order_stable(true, &p) == (old || (extra && reasons == 0)));
          cases++;
       }
    printf("clip policy CPU: PASS %u truth-table cases, %u dynamic depth cases, flag off/on\n",

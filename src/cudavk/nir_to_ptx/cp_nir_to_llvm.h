@@ -209,6 +209,8 @@ struct cp_shader_binary {
    unsigned shared_size;
    unsigned nir_num_outputs;
    unsigned nir_num_inputs;
+   /* Immutable host-only scope metadata; never part of the GPU ABI. */
+   uint8_t clip_order_exclusions;
    bool is_fragment;
    bool classic_fallback_reported;
    bool fused_fallback_reported;
@@ -319,7 +321,10 @@ cp_shader_has_standalone_exec(const struct cp_shader_binary *bin)
 }
 
 /* `sampler_ptx` is the relocatable PTX of the texture sampler, linked in when
- * the shader samples textures. May be NULL for shaders that cannot. */
+ * the shader samples textures. May be NULL for shaders that cannot.
+ * Fragment inputs must have current gathered shader_info (the native graphics
+ * caller gathers immediately before this call). The wrapper snapshots host
+ * clip exclusions before any backend attempt mutates the input NIR. */
 struct cp_shader_binary *
 cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
                       const char *sampler_ptx, const char *math_ptx,

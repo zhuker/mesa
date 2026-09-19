@@ -11,6 +11,7 @@
 #include "cp_shade_equiv.h"
 #include "cp_clip_seed.h"
 #include "cp_clip_order.h"
+#include "cp_shader_clip_metadata.h"
 #include "cp_nvtx.h"
 #include "compiler/glsl_types.h"
 
@@ -57,6 +58,8 @@ cp_stable_clip_required(const struct cp_draw_state *state, unsigned batch_draws)
       .shader_side_effects = !state->vs || !state->fs ||
                             state->vs->writes_memory || state->fs->writes_memory,
       .discard = state->fs && state->fs->uses_discard,
+      .unsupported_fragment_semantics = state->fs &&
+         cp_shader_clip_excluded(state->fs->clip_order_exclusions),
    };
    return cp_clip_order_stable(cp_debug->ordered_clip, &policy);
 }

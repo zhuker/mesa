@@ -8,6 +8,7 @@ struct cp_clip_order_policy {
    unsigned batch_draws;
    bool depth_test, depth_write, inclusive;
    bool unsupported_raster_order, shader_side_effects, discard;
+   bool unsupported_fragment_semantics;
 };
 
 /* Metadata is not a legacy merge key. Accumulate every member's exclusion. */
@@ -23,6 +24,7 @@ cp_clip_order_stable(bool enabled, const struct cp_clip_order_policy *p)
    /* Preserve the old condition exactly, even for excluded new cases. */
    return p->blend || (p->batch_draws > 1 && p->reads_const_bufs) ||
           (enabled && p->depth_test && p->depth_write && p->inclusive &&
-           !p->unsupported_raster_order && !p->shader_side_effects && !p->discard);
+           !p->unsupported_raster_order && !p->shader_side_effects && !p->discard &&
+           !p->unsupported_fragment_semantics);
 }
 #endif
