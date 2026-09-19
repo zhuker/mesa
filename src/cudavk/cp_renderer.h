@@ -261,7 +261,9 @@ struct cp_run_geometry_member {
 };
 
 struct cp_run_geometry_span {
-   /* Borrowed from a shared one-draw group for legacy replay. */
+   /* Borrowed first-vertex (slot0) pointer from a shared group. TILE2 may
+    * start at odd phase; preserve this exact address through replay/rollback.
+    * out_stride is logical bytes per vertex, never physical vertex spacing. */
    CUdeviceptr output;
    uint32_t num_verts;
 
@@ -300,6 +302,8 @@ struct cp_run_geometry_group {
    uint32_t first_member;
    uint32_t num_members;
    uint32_t num_draws;
+   /* Owned tile origin. TILE2 capacity is rounded once for the whole group,
+    * not per member; members can share a tile, but never a vertex half. */
    CUdeviceptr output;
    size_t output_capacity;
 };

@@ -64,9 +64,18 @@ cp_interp_setup(const struct cp_fs_interp_args *args, uint32_t tri_id,
    if (!tri->base)
       return false;
    const float4 *positions = (const float4 *)(uintptr_t)tri->base;
+#if CP_VS_TILE2
+   float4 v0 = *(const float4 *)(uintptr_t)cp_vs_slot_address(
+      tri->base, pos_stride * 16u, 0, 0);
+   float4 v1 = *(const float4 *)(uintptr_t)cp_vs_slot_address(
+      tri->base, pos_stride * 16u, 1, 0);
+   float4 v2 = *(const float4 *)(uintptr_t)cp_vs_slot_address(
+      tri->base, pos_stride * 16u, 2, 0);
+#else
    float4 v0 = positions[0 * pos_stride];
    float4 v1 = positions[1 * pos_stride];
    float4 v2 = positions[2 * pos_stride];
+#endif
 
    tri->inv_w0 = 1.0f / v0.w;
    tri->inv_w1 = 1.0f / v1.w;
@@ -183,8 +192,13 @@ cp_interp_pixel_prepared(struct cp_fs_interp_args *args, uint32_t tri_id,
          float4 value = CP_MAKE_FLOAT4(0.0f, 0.0f, 0.0f, 1.0f);
          int32_t src = args->input_vs_slot[i];
          if (src >= 0)
+#if CP_VS_TILE2
+            value = *(const float4 *)(uintptr_t)cp_vs_slot_address(
+               tri->base, args->vs_out_stride, 0, src);
+#else
             value = *(const float4 *)(vs_out +
                (size_t)src * 16);
+#endif
          *(float4 *)(fs_in + i * 16) = value;
       }
 #ifdef CP_INTERP_FIXED_SLOTS
@@ -195,7 +209,12 @@ cp_interp_pixel_prepared(struct cp_fs_interp_args *args, uint32_t tri_id,
           (uint32_t)pntc_input < num_inputs) {
          float size = 1.0f;
          if (args->psiz_slot >= 0)
+#if CP_VS_TILE2
+            size = ((const float4 *)(uintptr_t)cp_vs_slot_address(
+               tri->base, args->vs_out_stride, 0, args->psiz_slot))->x;
+#else
             size = ((const float4 *)vs_out)[args->psiz_slot].x;
+#endif
          if (!(size > 0.0f))
             size = 1.0f;
          if (size > CP_MAX_POINT_SIZE)
@@ -226,12 +245,21 @@ cp_interp_pixel_prepared(struct cp_fs_interp_args *args, uint32_t tri_id,
       float4 value = CP_MAKE_FLOAT4(0.0f, 0.0f, 0.0f, 1.0f);
 
       if (src >= 0) {
+#if CP_VS_TILE2
+         const float4 *a0 = (const float4 *)(uintptr_t)cp_vs_slot_address(
+            tri->base, args->vs_out_stride, 0, src);
+         const float4 *a1 = (const float4 *)(uintptr_t)cp_vs_slot_address(
+            tri->base, args->vs_out_stride, tri->vidx1, src);
+         const float4 *a2 = (const float4 *)(uintptr_t)cp_vs_slot_address(
+            tri->base, args->vs_out_stride, tri->vidx2, src);
+#else
          const float4 *a0 = (const float4 *)(vs_out +
             (size_t)src * 16);
          const float4 *a1 = (const float4 *)(vs_out +
             (size_t)tri->vidx1 * args->vs_out_stride + src * 16);
          const float4 *a2 = (const float4 *)(vs_out +
             (size_t)tri->vidx2 * args->vs_out_stride + src * 16);
+#endif
 
          value.x = (a0->x * persp0 + a1->x * persp1 + a2->x * persp2) * inv_persp;
          value.y = (a0->y * persp0 + a1->y * persp1 + a2->y * persp2) * inv_persp;

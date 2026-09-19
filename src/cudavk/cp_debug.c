@@ -222,6 +222,8 @@ static const struct cp_flag_def flags[] = {
      "its six faces from where the sampler will look; syncs" },
 
    /* ---- subsystem switches ---- */
+   { "CUDAVK_VS_TILE2", CP_FLAG_BOOL_VALUE, F(vs_tile2),
+     "experimental uniform paired-vertex VS and clip output layout; default off" },
    { "CUDAVK_NO_CLIP_ALLOC_HOIST", CP_FLAG_BOOL_VALUE, F(no_clip_alloc_hoist),
      "allocate the clip stage's scratch below the vertex shader's launch and "
      "reserve the direct shade chain's interpolation and fragment argument "

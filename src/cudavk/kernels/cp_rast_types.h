@@ -19,6 +19,8 @@ typedef signed long long int64_t;
 typedef unsigned long long uintptr_t;
 #endif
 
+#include "cp_vs_layout.h"
+
 struct cp_framebuffer_info {
    uint64_t color[4];       /* Device pointers to color attachments */
    uint64_t depth;          /* Device pointer to depth buffer (packed depth|triID or float) */
@@ -879,8 +881,13 @@ cp_primitive_base(uint64_t refs, uint64_t contiguous, uint32_t primitive,
       uint64_t base = ((const uint64_t *)(uintptr_t)refs)[primitive];
       return (const unsigned char *)(uintptr_t)base;
    }
+#if CP_VS_TILE2
+   return (const unsigned char *)(uintptr_t)cp_vs_slot_address(
+      contiguous, vertex_stride, (uint64_t)primitive * 3u, 0);
+#else
    return (const unsigned char *)(uintptr_t)contiguous +
           (size_t)primitive * 3u * vertex_stride;
+#endif
 }
 #endif
 

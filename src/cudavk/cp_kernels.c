@@ -55,6 +55,10 @@ static const char cp_vf_lane_src[] =
 #include "cp_vf_lane.h.inc"
 ;
 
+static const char cp_vs_layout_src[] =
+#include "cp_vs_layout.h.inc"
+;
+
 static const char cp_fs_write_src[] =
 #include "cp_fs_write.h.inc"
 ;
@@ -135,9 +139,9 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
                     int sm_minor, bool relocatable)
 {
    const char *header_srcs[] = { cp_rast_types_src, cp_fs_interp_src,
-                                 cp_vf_lane_src, cp_fs_write_src };
+                                 cp_vf_lane_src, cp_fs_write_src, cp_vs_layout_src };
    const char *header_names[] = { "cp_rast_types.h", "cp_fs_interp.h",
-                                  "cp_vf_lane.h", "cp_fs_write.h" };
+                                  "cp_vf_lane.h", "cp_fs_write.h", "cp_vs_layout.h" };
 
    nvrtcProgram prog;
    nvrtcResult res = nvrtcCreateProgram(&prog, source, name,
@@ -163,10 +167,12 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
     * reproduce. Unset means the header's default.
     */
    char small_opt[64], medium_opt[64], point_opt[64], tilebound_opt[64];
-   const char *opts[10];
+   const char *opts[12];
    unsigned num_opts = 0;
    opts[num_opts++] = arch_opt;
    opts[num_opts++] = "--std=c++14";
+   if (cp_debug->vs_tile2)
+      opts[num_opts++] = "-DCP_VS_TILE2=1";
    if (relocatable)
       opts[num_opts++] = "--relocatable-device-code=true";
    if (cp_kernels_instrumented())
@@ -226,6 +232,7 @@ compile_cuda_source(const char *source, const char *name, int sm_major,
       blob_write_string(&key_blob, cp_fs_interp_src);
       blob_write_string(&key_blob, cp_vf_lane_src);
       blob_write_string(&key_blob, cp_fs_write_src);
+      blob_write_string(&key_blob, cp_vs_layout_src);
       for (unsigned i = 0; i < num_opts; i++)
          blob_write_string(&key_blob, opts[i]);
       if (!key_blob.out_of_memory) {
@@ -385,6 +392,7 @@ cp_kernels_init(struct cp_kernels *k, int sm_major, int sm_minor,
 {
    memset(k, 0, sizeof(*k));
    cp_nvrtc_cache = disk_cache;
+   k->vs_layout = cp_debug->vs_tile2 ? CP_VS_LAYOUT_TILE2_V1 : CP_VS_LAYOUT_AOS;
    /* Recorded before the modules are built, because it is what decides
     * whether they are built with the waits in them. */
    k->pdl = cp_pdl_kernels(sm_major, sm_minor);

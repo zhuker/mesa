@@ -261,6 +261,55 @@ clip_poly(float4 *dst, const float4 *src, int n, uint32_t slots, int plane)
    return out_n;
 }
 
+#if CP_VS_TILE2
+/* Only the first clipping plane reads global tiled vertices. Later planes
+ * retain the original private AoS polygons and identical arithmetic order. */
+static __device__ __forceinline__ const float4 *
+clip_global_slot(const float4 *base, uint32_t slots, uint64_t vertex, uint32_t slot)
+{
+   return (const float4 *)(uintptr_t)cp_vs_slot_address(
+      (uint64_t)(uintptr_t)base, (uint64_t)slots * 16u, vertex, slot);
+}
+static __device__ __forceinline__ void
+clip_global_store(float4 *base, uint32_t slots, uint64_t vertex,
+                  uint32_t slot, float4 value)
+{
+   *(float4 *)(uintptr_t)cp_vs_slot_address(
+      (uint64_t)(uintptr_t)base, (uint64_t)slots * 16u, vertex, slot) = value;
+}
+static __device__ int
+clip_poly_first(float4 *dst, const float4 *src, uint32_t slots)
+{
+   int out_n = 0;
+   for (int i = 0; i < 3; i++) {
+      int next = (i + 1) % 3;
+      float dc = clip_dist(clip_global_slot(src, slots, i, 0), 0);
+      float dn = clip_dist(clip_global_slot(src, slots, next, 0), 0);
+      bool in_c = dc >= 0.0f, in_n = dn >= 0.0f;
+      if (in_c && out_n < CP_CLIP_MAX_VERTS) {
+         for (uint32_t s = 0; s < slots; s++)
+            dst[(size_t)out_n * slots + s] = *clip_global_slot(src, slots, i, s);
+         out_n++;
+      }
+      if (in_c != in_n && out_n < CP_CLIP_MAX_VERTS) {
+         float denom = dc - dn;
+         if (denom != 0.0f) {
+            float t = dc / denom;
+            for (uint32_t s = 0; s < slots; s++) {
+               float4 va = *clip_global_slot(src, slots, i, s);
+               float4 vb = *clip_global_slot(src, slots, next, s);
+               dst[(size_t)out_n * slots + s] = make_float4(
+                  va.x + (vb.x - va.x) * t, va.y + (vb.y - va.y) * t,
+                  va.z + (vb.z - va.z) * t, va.w + (vb.w - va.w) * t);
+            }
+            out_n++;
+         }
+      }
+   }
+   return out_n;
+}
+#endif
+
 static __device__ __forceinline__ bool
 clip_alloc(struct cp_clip_args *args, uint32_t tri, uint32_t k,
            uint32_t *id_out)
@@ -287,7 +336,11 @@ clip_alloc(struct cp_clip_args *args, uint32_t tri, uint32_t k,
 static __device__ __forceinline__ float4 *
 clip_dst(float4 *out, uint32_t slots, uint32_t id)
 {
+#if CP_VS_TILE2
+   return (float4 *)clip_global_slot(out, slots, (uint64_t)id * 3u, 0);
+#else
    return out + (size_t)id * 3 * slots;
+#endif
 }
 
 static __device__ __forceinline__ void
@@ -318,9 +371,15 @@ clip_retire(struct cp_clip_args *args, float4 *out, uint32_t slots,
           * the unused slot retire without writing three degenerate vertices. */
          ((uint64_t *)(uintptr_t)args->prim_refs)[o] = 0;
       } else {
+#if CP_VS_TILE2
+         float4 *dst = clip_dst(out, slots, o);
+         for (uint32_t v = 0; v < 3; v++)
+            clip_global_store(dst, slots, v, 0, make_float4(0.0f, 0.0f, 0.0f, 1.0f));
+#else
          float4 *dst = out + (size_t)o * 3 * slots;
          dst[0] = dst[slots] = dst[2 * (size_t)slots] =
             make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
       }
    }
 }
@@ -342,7 +401,11 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
 
    const float4 *in = (const float4 *)(uintptr_t)args->vs_out;
    float4 *out = (float4 *)(uintptr_t)args->out;
+#if CP_VS_TILE2
+   const float4 *v = clip_global_slot(in, slots, (uint64_t)tri * 3u, 0);
+#else
    const float4 *v = in + (size_t)tri * 3 * slots;
+#endif
    uint32_t id;
    int emitted = 0;
 
@@ -351,7 +414,11 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
     * memory and are worth avoiding. */
    int inside = 0;
    for (int i = 0; i < 3; i++) {
+#if CP_VS_TILE2
+      const float4 *vi = clip_global_slot(v, slots, i, 0);
+#else
       const float4 *vi = v + (size_t)i * slots;
+#endif
       bool in = true;
       for (int p = 0; p < CP_CLIP_NUM_PLANES; p++)
          in = in && clip_dist(vi, p) >= 0.0f;
@@ -367,7 +434,14 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
             clip_publish_ref(args, id, v);
          } else {
             float4 *dst = clip_dst(out, slots, id);
+#if CP_VS_TILE2
+            for (uint32_t vertex = 0; vertex < 3; vertex++)
+               for (uint32_t slot = 0; slot < slots; slot++)
+                  clip_global_store(dst, slots, vertex, slot,
+                                    *clip_global_slot(v, slots, vertex, slot));
+#else
             clip_copy(dst, v, 3 * slots);
+#endif
          }
          if (ids)
             ids[emitted] = id;
@@ -386,7 +460,12 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
    int n = 3;
    for (int p = 0; p < CP_CLIP_NUM_PLANES; p++) {
       float4 *dst = (p & 1) ? poly_b : poly_a;
+#if CP_VS_TILE2
+      n = p == 0 ? clip_poly_first(dst, src, slots)
+                 : clip_poly(dst, src, n, slots, p);
+#else
       n = clip_poly(dst, src, n, slots, p);
+#endif
       if (n < 3) {
          if (args->stable && !args->active_ids && !ids)
             clip_retire(args, out, slots, tri, 0);
@@ -402,9 +481,17 @@ cp_clip_one(struct cp_clip_args *args, uint32_t tri, uint32_t *ids)
          break;
       k++;
       float4 *dst = clip_dst(out, slots, id);
+#if CP_VS_TILE2
+      for (uint32_t slot = 0; slot < slots; slot++) {
+         clip_global_store(dst, slots, 0, slot, src[slot]);
+         clip_global_store(dst, slots, 1, slot, src[(size_t)i * slots + slot]);
+         clip_global_store(dst, slots, 2, slot, src[(size_t)(i + 1) * slots + slot]);
+      }
+#else
       clip_copy(dst, src, slots);
       clip_copy(dst + slots, src + (size_t)i * slots, slots);
       clip_copy(dst + 2 * slots, src + (size_t)(i + 1) * slots, slots);
+#endif
       /* Publish only after all three vertices are complete. A fused caller's
        * same thread consumes this in program order; later raster/interpolation
        * launches are ordered by the kernel boundary. */
@@ -508,9 +595,18 @@ setup_triangle(const struct cp_rasterize_args *args, uint32_t tri_id,
       clip_x0 = r.x; clip_y0 = r.y; clip_x1 = r.z; clip_y1 = r.w;
    }
 
+#if CP_VS_TILE2
+   float4 v0 = *(const float4 *)(uintptr_t)cp_vs_slot_address(
+      (uint64_t)(uintptr_t)positions, pos_stride * 16u, 0, 0);
+   float4 v1 = *(const float4 *)(uintptr_t)cp_vs_slot_address(
+      (uint64_t)(uintptr_t)positions, pos_stride * 16u, 1, 0);
+   float4 v2 = *(const float4 *)(uintptr_t)cp_vs_slot_address(
+      (uint64_t)(uintptr_t)positions, pos_stride * 16u, 2, 0);
+#else
    float4 v0 = positions[0 * pos_stride];
    float4 v1 = positions[1 * pos_stride];
    float4 v2 = positions[2 * pos_stride];
+#endif
 
    float inv_w0 = 1.0f / v0.w;
 
@@ -530,7 +626,13 @@ setup_triangle(const struct cp_rasterize_args *args, uint32_t tri_id,
 
       float size = 1.0f;
       if (args->psiz_slot >= 0)
+#if CP_VS_TILE2
+         size = ((const float4 *)(uintptr_t)cp_vs_slot_address(
+            (uint64_t)(uintptr_t)positions, pos_stride * 16u,
+            0, args->psiz_slot))->x;
+#else
          size = positions[args->psiz_slot].x;
+#endif
 
       /* A zero or negative size draws nothing; NaN fails this too. */
       if (!(size > 0.0f))

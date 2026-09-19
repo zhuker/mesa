@@ -83,7 +83,8 @@ if dep_llvm.version().version_compare('>=18.0.0')
     cpvk_fs_inline_bc = custom_target(
       'cpvk_fs_inline.bc',
       input : ['kernels/cp_fs_inline.c', 'kernels/cp_fs_interp.h',
-               'kernels/cp_rast_types.h', 'kernels/cp_fs_write.h'],
+               'kernels/cp_rast_types.h', 'kernels/cp_fs_write.h',
+               'kernels/cp_vs_layout.h'],
       output : 'cp_fs_inline.bc',
       command : [cpvk_clang,
         '-target', 'nvptx64-nvidia-cuda', '-march=sm_86', '--cuda-feature=+ptx75',
@@ -97,13 +98,31 @@ if dep_llvm.version().version_compare('>=18.0.0')
       output : 'cp_fs_inline.bc.inc',
       command : [prog_python, files('kernels/bin_to_inc.py'), '@INPUT@', '@OUTPUT@'],
     )
+    cpvk_fs_inline_tile2_bc = custom_target(
+      'cpvk_fs_inline_tile2.bc',
+      input : ['kernels/cp_fs_inline.c', 'kernels/cp_fs_interp.h',
+               'kernels/cp_rast_types.h', 'kernels/cp_fs_write.h',
+               'kernels/cp_vs_layout.h'],
+      output : 'cp_fs_inline_tile2.bc',
+      command : [cpvk_clang,
+        '-target', 'nvptx64-nvidia-cuda', '-march=sm_86', '--cuda-feature=+ptx75',
+        '-DCP_VS_TILE2=1', '-O1', '-ffreestanding', '-nostdlib', '-ffp-contract=off',
+        '-emit-llvm', '-c', '@INPUT0@',
+        '-I' + meson.current_source_dir() + '/kernels', '-o', '@OUTPUT@'],
+    )
+    cpvk_fs_inline_tile2_inc = custom_target(
+      'cpvk_fs_inline_tile2.bc.inc',
+      input : cpvk_fs_inline_tile2_bc,
+      output : 'cp_fs_inline_tile2.bc.inc',
+      command : [prog_python, files('kernels/bin_to_inc.py'), '@INPUT@', '@OUTPUT@'],
+    )
     cpvk_fs_inline_args += '-DCP_HAVE_FS_INLINE_BC'
     # The same substitution for the vertex fetch: one lane routine, compiled a
     # second time to bitcode so the generated vertex shader can inline it.
     cpvk_vs_inline_bc = custom_target(
       'cpvk_vs_inline.bc',
       input : ['kernels/cp_vs_inline.c', 'kernels/cp_vf_lane.h',
-               'kernels/cp_rast_types.h'],
+               'kernels/cp_rast_types.h', 'kernels/cp_vs_layout.h'],
       output : 'cp_vs_inline.bc',
       command : [cpvk_clang,
         '-target', 'nvptx64-nvidia-cuda', '-march=sm_86', '--cuda-feature=+ptx75',
@@ -117,7 +136,7 @@ if dep_llvm.version().version_compare('>=18.0.0')
       output : 'cp_vs_inline.bc.inc',
       command : [prog_python, files('kernels/bin_to_inc.py'), '@INPUT@', '@OUTPUT@'],
     )
-    cpvk_fs_inline_inc = [cpvk_fs_inline_inc, cpvk_vs_inline_inc]
+    cpvk_fs_inline_inc = [cpvk_fs_inline_inc, cpvk_fs_inline_tile2_inc, cpvk_vs_inline_inc]
     cpvk_fs_inline_args += '-DCP_HAVE_VS_INLINE_BC'
   else
     warning('cudavk: matching clang-' + cpvk_llvm_major +
@@ -133,7 +152,7 @@ endif
 cpvk_kernel_incs = []
 foreach kernel : ['cp_clear.cu', 'cp_rasterize.cu', 'cp_sampler.cu', 'cp_math.cu', 'cp_fs.cu',
                   'cp_vertex_fetch.cu', 'cp_rast_types.h', 'cp_fs_interp.h',
-                  'cp_vf_lane.h', 'cp_fs_write.h']
+                  'cp_vf_lane.h', 'cp_fs_write.h', 'cp_vs_layout.h']
   cpvk_kernel_incs += custom_target(
     'cpvk_' + kernel + '.inc',
     input : ['kernels/' + kernel],
@@ -215,6 +234,29 @@ cp_shade_equiv_test = executable(
   dependencies : [dep_cuda_vk, idep_mesautil, idep_nir],
   build_by_default : false)
 test('cp_shade_equiv_test', cp_shade_equiv_test, suite : 'cudavk')
+
+# CPU-only tile2 gates. This suite never creates a CUDA context.
+cp_tile2_registry_test = executable(
+  'cp_tile2_registry_test', files('tests/cp_tile2_registry_test.c', 'cp_debug.c'),
+  include_directories : [inc_include, inc_src, include_directories('.')],
+  dependencies : [dep_cuda_vk],
+  c_args : ['-D_GNU_SOURCE'],
+  build_by_default : false)
+foreach value : ['', '0', '1', '2']
+  tile2_registry_env = environment()
+  tile2_registry_env.set('CUDAVK_VS_TILE2', value)
+  test('cp_tile2_registry_' + (value == '' ? 'empty' : value),
+       cp_tile2_registry_test, args : [(value == '1' or value == '2') ? '1' : '0'],
+       env : tile2_registry_env, suite : 'cudavk-tile2-cpu')
+endforeach
+tile2_registry_unset_env = environment()
+tile2_registry_unset_env.unset('CUDAVK_VS_TILE2')
+test('cp_tile2_registry_unset', cp_tile2_registry_test, args : ['0'],
+     env : tile2_registry_unset_env, suite : 'cudavk-tile2-cpu')
+test('cp_tile2_source_audit', prog_python,
+     args : [files('tests/cp_tile2_source_audit.py')], suite : 'cudavk-tile2-cpu')
+test('cp_tile2_renderer', prog_python,
+     args : [files('tests/cp_tile2_renderer_test.py')], suite : 'cudavk-tile2-cpu')
 
 # Focused external-API regression suite. These link the Vulkan loader rather
 # than driver internals and select the generated development ICD, so they test
@@ -459,3 +501,32 @@ if dep_vulkan_loader.found()
        is_parallel : false,
        depends : [libvulkan_cudavk, cpvk_devenv_icd])
 endif
+
+# CPU LLVM IR proof only. No execution engine, CUDA context, or JIT.
+cp_tile2_llvm_test = executable(
+  'cp_tile2_llvm_test', files('tests/cp_tile2_llvm_test.c'),
+  include_directories : include_directories('.'),
+  dependencies : dep_llvm, build_by_default : false)
+test('cp_tile2_llvm_test', cp_tile2_llvm_test, suite : 'cudavk-tile2-cpu')
+
+cp_vs_layout_test = executable(
+  'cp_vs_layout_test', files('tests/cp_vs_layout_test.c'),
+  include_directories : include_directories('.'), build_by_default : false)
+test('cp_vs_layout_test', cp_vs_layout_test, suite : 'cudavk-tile2-cpu')
+foreach cpu_gate : ['cp_vs_clip_cpu', 'cp_vs_interp_cpu']
+  test(cpu_gate, prog_python, args : files('tests/' + cpu_gate + '.py'),
+       suite : 'cudavk-tile2-cpu', timeout : 120)
+endforeach
+
+cp_tile2_family_test = executable(
+  'cp_tile2_family_test', files('tests/cp_tile2_family_test.c'),
+  include_directories : [inc_src, include_directories('.')],
+  dependencies : [dep_cuda_vk, idep_mesautil], build_by_default : false)
+test('cp_tile2_family_test', cp_tile2_family_test, suite : 'cudavk-tile2-cpu')
+cp_tile2_static_args = [files('tests/cp_tile2_compiler_static.py')]
+if cpvk_fs_inline_args.length() > 0
+  cp_tile2_dis = find_program('llvm-dis-' + cpvk_llvm_major, required : true)
+  cp_tile2_static_args += [meson.current_build_dir(), cp_tile2_dis.full_path()]
+endif
+test('cp_tile2_compiler_static', prog_python,
+     args : cp_tile2_static_args, suite : 'cudavk-tile2-cpu')

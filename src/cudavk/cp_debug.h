@@ -204,6 +204,7 @@ struct cp_debug {
    int      debug_fs_row;     /* only this framebuffer row, or -1 for all */
 
    /* Subsystem switches. */
+   bool vs_tile2; /* Immutable, uniform two-vertex output representation. */
    bool no_abuffer;
    bool no_abuf_batch;
    bool no_pass_episode;

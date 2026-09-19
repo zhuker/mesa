@@ -2,6 +2,7 @@
 #define CP_NIR_TO_LLVM_H
 
 #include <cuda.h>
+#include "cp_vs_layout_config.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -146,6 +147,8 @@ void cp_vs_census_report(void);
  * those facts may transfer between the two binaries.
  */
 struct cp_shader_exec {
+   enum cp_vs_layout vs_layout;
+   enum cp_vs_layout helper_layout;
    char *ptx_text;
    size_t ptx_size;
    CUmodule module;
@@ -203,6 +206,7 @@ enum cp_hw_compile_failure {
 };
 
 struct cp_shader_binary {
+   enum cp_vs_layout vs_layout;
    struct cp_shader_exec exec[CP_SHADER_EXEC_COUNT];
    int sm_major;
    int sm_minor;
@@ -283,17 +287,33 @@ struct cp_shader_binary {
    unsigned out_location[CP_MAX_IO_SLOTS];
 };
 
+static inline bool
+cp_shader_exec_helper_matches(const struct cp_shader_exec *exec)
+{
+   return exec && (!exec->fs_helper_ptx || exec->helper_layout == exec->vs_layout);
+}
+
+static inline bool
+cp_shader_exec_family_matches(const struct cp_shader_binary *bin,
+                              const struct cp_shader_exec *exec)
+{
+   return bin && exec && exec->vs_layout == bin->vs_layout &&
+          cp_shader_exec_helper_matches(exec);
+}
+
 static inline struct cp_shader_exec *
 cp_shader_exec(struct cp_shader_binary *bin, enum cp_shader_exec_mode mode)
 {
-   return bin ? &bin->exec[mode] : NULL;
+   return bin && cp_shader_exec_family_matches(bin, &bin->exec[mode])
+      ? &bin->exec[mode] : NULL;
 }
 
 static inline const struct cp_shader_exec *
 cp_shader_exec_const(const struct cp_shader_binary *bin,
                      enum cp_shader_exec_mode mode)
 {
-   return bin ? &bin->exec[mode] : NULL;
+   return bin && cp_shader_exec_family_matches(bin, &bin->exec[mode])
+      ? &bin->exec[mode] : NULL;
 }
 
 static inline bool
@@ -325,7 +345,8 @@ cp_compile_nir_to_ptx(struct nir_shader *nir, int sm_major, int sm_minor,
                       const char *sampler_ptx, const char *math_ptx,
                       const char *fs_helper_ptx,
                       bool no_inline_fs, bool inline_fs, bool force_fused_fs,
-                      bool hw_texture);
+                      bool hw_texture, enum cp_vs_layout vs_layout,
+                      enum cp_vs_layout helper_layout);
 
 void
 cp_shader_binary_destroy(struct cp_shader_binary *bin);

@@ -2,6 +2,7 @@
 #define CP_KERNELS_H
 
 #include <cuda.h>
+#include "cp_vs_layout_config.h"
 #include <stdbool.h>
 
 struct cp_sampler_info;
@@ -20,6 +21,7 @@ struct cp_tex_desc_ref;
 #define CP_SAMPLER_OPT_COUNT 4
 
 struct cp_kernels {
+   enum cp_vs_layout vs_layout;
    /* The PDL level the modules were compiled at: which griddepcontrol.wait
     * instructions are actually in the binaries. Set by cp_kernels_init() from
     * cp_pdl_kernels(); read by cp_launch_after() before it may set the

@@ -25,6 +25,7 @@
 
 #include "cp_nir_options.h"
 #include "cp_nir_to_llvm.h"
+#include "cp_vs_layout_cache.h"
 
 #include "nir.h"
 #include "nir_builder.h"
@@ -894,7 +895,7 @@ cpvk_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       pipeline->bin = cp_compile_nir_to_ptx(
          nir, dev->pdev->sm_major, dev->pdev->sm_minor,
          uses_tex ? sampler_ptx : NULL, NULL, NULL,
-         false, false, false, false);
+         false, false, false, false, CP_VS_LAYOUT_AOS, CP_VS_LAYOUT_AOS);
       if (pipeline->bin) {
          pipeline->bin->uses_tex_3d = (sampler_opts & CP_SAMPLER_3D) != 0;
          pipeline->bin->uses_tex_gather =
@@ -1006,6 +1007,8 @@ cpvk_compile_stage(struct cpvk_device *dev,
 
    unsigned char hash[BLAKE3_OUT_LEN];
    vk_pipeline_hash_shader_stage(flags, stage, &rstate, hash);
+   const enum cp_vs_layout vs_layout = dev->cp_dev.kernels.vs_layout;
+   cp_vs_layout_hash_stage(hash, vs_layout);
 
    void *mem_ctx = ralloc_context(NULL);
    nir_shader *nir = NULL;
@@ -1190,7 +1193,7 @@ cpvk_compile_stage(struct cpvk_device *dev,
                             frag ? dev->cp_dev.kernels.fs_helper_ptx : NULL,
                              cp_debug->no_inline_fs, cp_debug->inline_fs,
                              cp_debug->force_fused_fs,
-                             cp_debug->texture_cache);
+                             cp_debug->texture_cache, vs_layout, dev->cp_dev.kernels.vs_layout);
    if (bin) {
       bin->uses_tex_3d = (sampler_opts & CP_SAMPLER_3D) != 0;
       bin->uses_tex_gather = (sampler_opts & CP_SAMPLER_GATHER) != 0;

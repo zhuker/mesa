@@ -8,6 +8,7 @@
  */
 
 #include "cp_renderer.h"
+#include "kernels/cp_vs_layout.h"
 #include "cp_shade_equiv.h"
 #include "cp_nvtx.h"
 #include "compiler/glsl_types.h"
@@ -315,6 +316,10 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
       return NULL;
 
    unsigned cur = cp->scratch.current;
+   if (cp_debug->vs_tile2 &&
+       (cp->scratch.used > SIZE_MAX - 255 ||
+        bytes > SIZE_MAX - ALIGN_POT(cp->scratch.used, 256)))
+      return NULL;
    size_t offset = ALIGN_POT(cp->scratch.used, 256);
    size_t end = offset + bytes;
 
@@ -331,7 +336,8 @@ cp_scratch_alloc(struct cp_context *cp, size_t bytes)
    /* Arena full — grow it in place by allocating a new larger chunk.
     * This replaces the current arena (the old one stays alive until flush
     * since the GPU may still be reading it). */
-   size_t want = MAX2(end, cp->scratch.size[cur] * 2);
+   size_t want = cp_debug->vs_tile2 && cp->scratch.size[cur] > SIZE_MAX / 2
+      ? (size_t)CP_SCRATCH_MAX_BYTES : MAX2(end, cp->scratch.size[cur] * 2);
    want = MAX2(want, 1 << 20); /* at least 1MB */
 
    /*
@@ -402,6 +408,10 @@ cp_scratch_alloc_device(struct cp_context *cp, size_t bytes)
    if (!bytes)
       return 0;
 
+   if (cp_debug->vs_tile2 &&
+       (cp->dscratch.used > SIZE_MAX - 255 ||
+        bytes > SIZE_MAX - ALIGN_POT(cp->dscratch.used, 256)))
+      return 0;
    size_t offset = ALIGN_POT(cp->dscratch.used, 256);
    size_t end = offset + bytes;
 
@@ -413,7 +423,8 @@ cp_scratch_alloc_device(struct cp_context *cp, size_t bytes)
 
    cp->dscratch.peak = MAX2(cp->dscratch.peak, end);
 
-   size_t want = MAX2(end, cp->dscratch.size * 2);
+   size_t want = cp_debug->vs_tile2 && cp->dscratch.size > SIZE_MAX / 2
+      ? (size_t)CP_SCRATCH_MAX_BYTES : MAX2(end, cp->dscratch.size * 2);
    want = MAX2(want, (size_t)1 << 20);
    if (end > CP_SCRATCH_MAX_BYTES) {
       fprintf(stderr, "cudavk: device scratch wants %zu bytes, over the %zu "
@@ -4962,7 +4973,16 @@ cp_shade_run(struct cp_context *cp, struct cp_shade_prep *prep)
        * first. Wasteful, and correct for a path that already synchronises
        * and prints eight lines.
        */
-      cuCtxSynchronize();
+      /* The enclosing TILE2 span may include a run neighbor written on
+       * another stream. Join the entire context, not only this member. */
+      if (cp_debug->vs_tile2) {
+         if (cuCtxSynchronize() != CUDA_SUCCESS) {
+            cp_renderer_texture_fatal(cp);
+            return;
+         }
+      } else {
+         cuCtxSynchronize();
+      }
 
       /*
        * Only as many pixels as are going to be printed. Fetching all of them
@@ -4982,9 +5002,23 @@ cp_shade_run(struct cp_context *cp, struct cp_shade_prep *prep)
        * their draws shade nothing. An instrument that dies on the case being
        * investigated is worse than none.
        */
-      unsigned dump_verts = MIN2(num_triangles * 3,
-                                 6 * MAX2(cp_debug->debug_fs_vstep, 1u));
+      unsigned dump_verts = cp_debug->vs_tile2
+         ? (unsigned)MIN2((uint64_t)UINT32_MAX,
+                          MIN2((uint64_t)num_triangles * 3,
+                               UINT64_C(6) * MAX2(cp_debug->debug_fs_vstep, 1u)))
+         : MIN2(num_triangles * 3, 6 * MAX2(cp_debug->debug_fs_vstep, 1u));
+      if (cp_debug->vs_tile2 && interpp->prim_refs)
+         fprintf(stderr, "  TILE2 raw clipped storage (not semantic geometry; "
+                         "original references may leave slots unwritten)\n");
       size_t vs_out_bytes = (size_t)dump_verts * num_vs_outputs * 16;
+      uint64_t dump_origin = vs_output_buf;
+      if (cp_debug->vs_tile2 &&
+          !cp_vs_tile2_debug_span(vs_output_buf, dump_verts,
+                                  (size_t)num_vs_outputs * 16,
+                                  &dump_origin, &vs_out_bytes)) {
+         fprintf(stderr, "  (CUDAVK_DEBUG_FS: invalid TILE2 span)\n");
+         return;
+      }
       float *vs_out = vs_out_bytes ? malloc(vs_out_bytes) : NULL;
       uint32_t *plist_buf = dump_pixels ? malloc((size_t)dump_pixels * 4) : NULL;
       float *fin_buf = dump_pixels ? malloc((size_t)dump_pixels * fs_in_stride) : NULL;
@@ -4996,7 +5030,7 @@ cp_shade_run(struct cp_context *cp, struct cp_shade_prep *prep)
          return;
       }
       if (vs_out_bytes)
-         cuMemcpyDtoH(vs_out, vs_output_buf, vs_out_bytes);
+         cuMemcpyDtoH(vs_out, dump_origin, vs_out_bytes);
       if (dump_pixels) {
          cuMemcpyDtoH(plist_buf, pixel_list, (size_t)dump_pixels * 4);
          cuMemcpyDtoH(fin_buf, fs_in, (size_t)dump_pixels * fs_in_stride);
@@ -5007,13 +5041,24 @@ cp_shade_run(struct cp_context *cp, struct cp_shade_prep *prep)
       unsigned vstep = cp_debug->debug_fs_vstep;   /* registry clamps to >= 1 */
       for (unsigned v = 0; v < dump_verts; v += vstep) {
          fprintf(stderr, "  vtx%u:", v);
-         for (unsigned s = 0; s < num_vs_outputs; s++)
-            fprintf(stderr, " slot%u=[%.3f %.3f %.3f %.3f]", s,
-                    vs_out[(v * num_vs_outputs + s) * 4 + 0],
-                    vs_out[(v * num_vs_outputs + s) * 4 + 1],
-                    vs_out[(v * num_vs_outputs + s) * 4 + 2],
-                    vs_out[(v * num_vs_outputs + s) * 4 + 3]);
+         for (unsigned s = 0; s < num_vs_outputs; s++) {
+            if (cp_debug->vs_tile2) {
+               size_t off = cp_vs_tile2_address(vs_output_buf,
+                  (uint64_t)num_vs_outputs * 16, v, s, 0) - dump_origin;
+               const float *slot = (const float *)((const char *)vs_out + off);
+               fprintf(stderr, " slot%u=[%.3f %.3f %.3f %.3f]", s,
+                       slot[0], slot[1], slot[2], slot[3]);
+            } else {
+               fprintf(stderr, " slot%u=[%.3f %.3f %.3f %.3f]", s,
+                       vs_out[(v * num_vs_outputs + s) * 4 + 0],
+                       vs_out[(v * num_vs_outputs + s) * 4 + 1],
+                       vs_out[(v * num_vs_outputs + s) * 4 + 2],
+                       vs_out[(v * num_vs_outputs + s) * 4 + 3]);
+            }
+         }
          fprintf(stderr, "\n");
+         if (cp_debug->vs_tile2 && dump_verts - v <= vstep)
+            break;
       }
       for (unsigned i = 0; i < num_fs_inputs; i++)
          fprintf(stderr, "  fs_in[%u] <- vs slot %d (loc %u)\n", i,
@@ -5797,22 +5842,30 @@ cp_vslane_disarm(struct cp_context *cp, const struct cp_draw_batch *batch)
 static CUdeviceptr
 cp_vslane_output(struct cp_context *cp, size_t bytes)
 {
+   if (cp_debug->vs_tile2 && !bytes)
+      return 0;
    unsigned k = cp->vslane.slot_next & 1u;
-   if (cp->vslane.slot_size[k] >= bytes)
+   if (cp->vslane.slot_size[k] >= bytes) {
+      assert(!cp_debug->vs_tile2 || cp_vs_tile2_origin_valid(cp->vslane.slot[k]));
       return cp->vslane.slot[k];
+   }
    if (bytes > CP_SCRATCH_MAX_BYTES)
       return 0;
    if (cp->vslane.slot[k] &&
        cp->dscratch.num_overflow >= ARRAY_SIZE(cp->dscratch.overflow))
       return 0;
 
-   size_t want = MAX2(bytes, cp->vslane.slot_size[k] * 2);
+   size_t want = cp_debug->vs_tile2 &&
+                 cp->vslane.slot_size[k] > SIZE_MAX / 2
+      ? (size_t)CP_SCRATCH_MAX_BYTES
+      : MAX2(bytes, cp->vslane.slot_size[k] * 2);
    want = MIN2(want, (size_t)CP_SCRATCH_MAX_BYTES);
    CUdeviceptr base;
    if (cp_mem_alloc_retry(cp, &base, want) != CUDA_SUCCESS)
       return 0;
    if (cp->vslane.slot[k])
       cp->dscratch.overflow[cp->dscratch.num_overflow++] = cp->vslane.slot[k];
+   assert(!cp_debug->vs_tile2 || cp_vs_tile2_origin_valid(base));
    cp->vslane.slot[k] = base;
    cp->vslane.slot_size[k] = want;
    return base;
@@ -6496,6 +6549,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
     * index buffer's device address. */
    const void *ib_base = indexed ? info->index_ptr : NULL;
 
+   if (cp_debug->vs_tile2 && (!num_triangles || num_triangles > UINT32_MAX / 3))
+      return;
    unsigned total_verts = num_triangles * 3;
 
    /*
@@ -6570,8 +6625,16 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             char *vb_start = (char *)(uintptr_t)state->vb_base[0];
             unsigned stride = state->vertex_stride ? state->vertex_stride : 16;
 
+            size_t position_bytes = (size_t)total_verts * 16;
+            if (cp_debug->vs_tile2 &&
+                !cp_vs_tile2_capacity(total_verts, 16, &position_bytes)) {
+               FREE(refs);
+               return;
+            }
             packed_positions =
-               (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, (size_t)total_verts * 16);
+               (CUdeviceptr)(uintptr_t)cp_scratch_alloc(cp, position_bytes);
+            assert(!cp_debug->vs_tile2 || !packed_positions ||
+                   cp_vs_tile2_origin_valid(packed_positions));
             if (!packed_positions) {
                FREE(refs);
                return;
@@ -6616,7 +6679,17 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
       if (vb_table != NULL || vb_data2 || state->num_vertex_elements == 0) {
          unsigned stride;
          unsigned num_vs_outputs = state->vs->nir_num_outputs ? state->vs->nir_num_outputs : 2;
+         if (cp_debug->vs_tile2 && num_vs_outputs > UINT32_MAX / 16) {
+            FREE(refs);
+            return;
+         }
          unsigned out_stride = num_vs_outputs * 16;
+         size_t tile2_output_bytes = 0;
+         if (cp_debug->vs_tile2 &&
+             !cp_vs_tile2_capacity(total_verts, out_stride, &tile2_output_bytes)) {
+            FREE(refs);
+            return;
+         }
 
          /*
           * Whether this draw's vertex shader gathers its own attributes.
@@ -6661,7 +6734,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
             assert(cp->run_geometry.active_num_verts == total_verts);
             vs_output_buf = cp->run_geometry.active_output;
          } else if (prepare_only) {
-            size_t output_bytes = (size_t)total_verts * out_stride;
+            size_t output_bytes = cp_debug->vs_tile2 ? tile2_output_bytes
+               : (size_t)total_verts * out_stride;
             if (!prepare->storage || !prepare->storage_capacity ||
                 !cp_run_geometry_device_reserve(cp, prepare->storage,
                                                 prepare->storage_capacity,
@@ -6673,7 +6747,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          }
          if (vs_lane_out) {
             vs_output_buf =
-               cp_vslane_output(cp, (size_t)total_verts * out_stride);
+               cp_vslane_output(cp, cp_debug->vs_tile2 ? tile2_output_bytes
+                                : (size_t)total_verts * out_stride);
             /* No slot, no lane: the shader may not run there and write into
              * the arena the next batch is about to rewind over. */
             if (!vs_output_buf)
@@ -6681,7 +6756,13 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
          }
          if (!vs_output_buf)
             vs_output_buf =
-               cp_scratch_alloc_device(cp, (size_t)total_verts * out_stride);
+               cp_scratch_alloc_device(cp, cp_debug->vs_tile2 ? tile2_output_bytes
+                                       : (size_t)total_verts * out_stride);
+
+         /* Shared group slices are first-vertex pointers, not tile origins. */
+         assert(!cp_debug->vs_tile2 || !vs_output_buf ||
+                cp->run_geometry.active_output ||
+                cp_vs_tile2_origin_valid(vs_output_buf));
 
          /* Build VS input buffer on GPU: the vertex fetch kernel gathers
           * attributes in parallel, one thread per assembled vertex. */
@@ -6920,9 +7001,17 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
           * the fetch can seed it. Four bytes; its seed is not always zero,
           * and the expression that decides it is reproduced there unchanged.
           */
-         const unsigned max_clipped_early = num_triangles * CP_CLIP_MAX_OUT;
+         const bool clip_capacity_valid = !cp_debug->vs_tile2 ||
+            num_triangles <= UINT32_MAX / CP_CLIP_MAX_OUT;
+         const unsigned max_clipped_early = clip_capacity_valid
+            ? num_triangles * CP_CLIP_MAX_OUT : 0;
+         size_t tile2_clip_bytes = 0;
+         const bool clip_bytes_valid = !cp_debug->vs_tile2 ||
+            (clip_capacity_valid && cp_vs_tile2_triangle_capacity(
+               max_clipped_early, out_stride, &tile2_clip_bytes));
          const bool clip_block_runs = screen->kernels.clip_triangles &&
-                                      num_vs_outputs <= CP_MAX_CLIP_SLOTS;
+                                      num_vs_outputs <= CP_MAX_CLIP_SLOTS &&
+                                      clip_bytes_valid;
          bool stable_clip_early = state->blend.enable ||
             (batch_draws > 1 && state->fs && state->fs->reads_const_bufs);
          CUdeviceptr clip_count_early = 0, active_ids_early = 0;
@@ -7230,7 +7319,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
                 * serve the clipped stream rasterizes unclipped, and the shade
                 * chain has to be told which of the two it will read. */
                clip_alloc.clipped = cp_scratch_alloc_device(
-                  cp, (size_t)max_clipped_early * 3 * out_stride);
+                  cp, cp_debug->vs_tile2 ? tile2_clip_bytes
+                     : (size_t)max_clipped_early * 3 * out_stride);
                clip_alloc.clip_count = clip_count_early
                   ? clip_count_early : cp_scratch_alloc_device(cp, 4);
                clip_alloc.prim_refs = !cp_debug->no_prim_refs &&
@@ -7393,7 +7483,7 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
              * interpolator just read the clipped buffer instead.
              */
             if (screen->kernels.clip_triangles &&
-                num_vs_outputs <= CP_MAX_CLIP_SLOTS) {
+                num_vs_outputs <= CP_MAX_CLIP_SLOTS && clip_bytes_valid) {
                unsigned max_clipped = num_triangles * CP_CLIP_MAX_OUT;
                /* Allocated above the vertex launch when the hoist is on, so
                 * that the shade chain's blocks could name these buffers
@@ -7402,7 +7492,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
                assert(!clip_alloc.taken || clip_alloc.max_clipped == max_clipped);
                CUdeviceptr clipped = clip_alloc.taken ? clip_alloc.clipped
                   : cp_scratch_alloc_device(
-                       cp, (size_t)max_clipped * 3 * out_stride);
+                       cp, cp_debug->vs_tile2 ? tile2_clip_bytes
+                           : (size_t)max_clipped * 3 * out_stride);
                /* Allocated above the fetch when that launch seeded it. */
                CUdeviceptr clip_count = clip_alloc.taken ? clip_alloc.clip_count
                   : (clip_count_early
@@ -7434,6 +7525,8 @@ cp_draw_execute_batch_inner(struct cp_context *cp,
                }
 
                if (clipped && clip_count) {
+                  assert(!cp_debug->vs_tile2 ||
+                         cp_vs_tile2_origin_valid(clipped));
                   /*
                    * A blended draw is composited in primitive order, so its
                    * primitives have to *be* in submission order — which
@@ -11727,8 +11820,10 @@ static bool
 cp_run_geometry_device_reserve(struct cp_context *cp, CUdeviceptr *ptr,
                                size_t *capacity, size_t need)
 {
-   if (*capacity >= need)
+   if (*capacity >= need) {
+      assert(!cp_debug->vs_tile2 || !need || cp_vs_tile2_origin_valid(*ptr));
       return true;
+   }
    size_t cap = MAX2(*capacity, (size_t)4096);
    while (cap < need) {
       if (cap > SIZE_MAX / 2)
@@ -11760,6 +11855,7 @@ cp_run_geometry_device_reserve(struct cp_context *cp, CUdeviceptr *ptr,
          return false;
       }
    }
+   assert(!cp_debug->vs_tile2 || cp_vs_tile2_origin_valid(fresh));
    *ptr = fresh;
    *capacity = cap;
    return true;
@@ -11874,6 +11970,8 @@ cp_run_geometry_launch_group(struct cp_context *cp,
 
    unsigned num_outputs = state->vs->nir_num_outputs ?
                           state->vs->nir_num_outputs : 2;
+   if (cp_debug->vs_tile2 && num_outputs > UINT32_MAX / 16)
+      return false;
    unsigned out_stride = num_outputs * 16;
    if (out_stride && total_verts > SIZE_MAX / out_stride)
       return false;
@@ -11890,7 +11988,11 @@ cp_run_geometry_launch_group(struct cp_context *cp,
    size_t vf_off = ALIGN_POT(dp_off + dp_bytes, 16);
    size_t storage_bytes = vf_off + sizeof(struct cp_vertex_fetch_args);
 
-   size_t output_bytes = (size_t)total_verts * out_stride;
+   size_t output_bytes = cp_debug->vs_tile2 ? 0
+      : (size_t)total_verts * out_stride;
+   if (cp_debug->vs_tile2 &&
+       !cp_vs_tile2_capacity(total_verts, out_stride, &output_bytes))
+      return false;
    if (!cp_run_geometry_device_reserve(cp, &group->output,
                                        &group->output_capacity,
                                        output_bytes))
@@ -11906,6 +12008,7 @@ cp_run_geometry_launch_group(struct cp_context *cp,
    }
    memset(host, 0, storage_bytes);
    CUdeviceptr output = group->output;
+   assert(!cp_debug->vs_tile2 || cp_vs_tile2_origin_valid(output));
 
    struct cp_draw_slice *slices = host;
    uint64_t *bases = (uint64_t *)((char *)host + bases_off);
@@ -11963,7 +12066,9 @@ cp_run_geometry_launch_group(struct cp_context *cp,
             b->info.index_size ? (uint32_t)b->draws[d].index_bias : 0;
       }
       struct cp_run_geometry_span *span = &cp->run_geometry.spans[bi];
-      span->output = output + (size_t)batch_begin * out_stride;
+      span->output = cp_debug->vs_tile2
+         ? cp_vs_tile2_address(output, out_stride, batch_begin, 0, 0)
+         : output + (size_t)batch_begin * out_stride;
       span->num_verts = vbegin - batch_begin;
       span->out_stride = out_stride;
    }
@@ -12163,7 +12268,16 @@ cp_run_clip_bin_reserve_prepared(struct cp_context *cp)
       struct cp_run_geometry_span *span = &cp->run_geometry.spans[batch];
       unsigned outputs = b->state.vs->nir_num_outputs ?
                          b->state.vs->nir_num_outputs : 2;
-      uint64_t output_bytes = (uint64_t)b->tris * 3u * outputs * 16u;
+      uint64_t output_bytes = cp_debug->vs_tile2 ? 0
+         : (uint64_t)b->tris * 3u * outputs * 16u;
+      size_t rounded_bytes = 0;
+      if (cp_debug->vs_tile2) {
+         if (outputs > SIZE_MAX / 16 ||
+             !cp_vs_tile2_triangle_capacity(b->tris, (size_t)outputs * 16,
+                                            &rounded_bytes))
+            return false;
+         output_bytes = rounded_bytes;
+      }
       if (output_bytes > SIZE_MAX ||
           !cp_run_geometry_device_reserve(cp, &span->prepared_output,
                                           &span->prepared_capacity,
@@ -12298,10 +12412,22 @@ cp_run_clip_bin_execute(struct cp_context *cp)
     * arm's completeness invariant: an admitted descriptor cannot run out of
     * clipped slots, so reachable device predicates occur only after complete
     * clipped geometry exists. */
+   /* The ICD is 64-bit. Preflight bounds primitive slots by CP_PRIM_ID_LIMIT
+    * (uint32), outputs by 16, ntiles by UINT32_MAX and nsegs by MAX_SEGS.
+    * Thus each live/ref/count product below fits size_t before append checks.
+    * Refuse TILE2 on a narrower host rather than evaluate those products. */
+   if (cp_debug->vs_tile2 && sizeof(size_t) < sizeof(uint64_t))
+      return false;
    size_t off = 0;
 #define RUN_ALLOC(name, bytes, align) \
-   size_t name##_off = (off = cp_run_clip_bin_align(off, (align))); \
-   off += (bytes)
+   size_t name##_off; \
+   if (cp_debug->vs_tile2) { \
+      if (!cp_vs_checked_append(&off, (bytes), (align), &name##_off)) \
+         return false; \
+   } else { \
+      name##_off = (off = cp_run_clip_bin_align(off, (align))); \
+      off += (bytes); \
+   }
    RUN_ALLOC(live, classic ? 0 :
                     (size_t)cp->run_geometry.clip_prim_slots *
                     (direct ? sizeof(struct cp_run_clip_direct_live) :
@@ -12310,9 +12436,19 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    size_t clipped_offs[CP_RUN_CLIP_BIN_MAX_SEGS];
    for (unsigned s = 0; s < nsegs; s++) {
       const struct cp_run_clip_bin_segment *seg = &cp->run_geometry.clip_segments[s];
-      off = cp_run_clip_bin_align(off, 16);
-      clipped_offs[s] = off;
-      off += (size_t)seg->prim_slots * 3u * seg->num_outputs * 16u;
+      if (cp_debug->vs_tile2) {
+         size_t bytes;
+         if (!cp_vs_tile2_triangle_capacity(seg->prim_slots,
+                                            (size_t)seg->num_outputs * 16,
+                                            &bytes) ||
+             !cp_vs_checked_append(&off, bytes, 32, &clipped_offs[s]))
+            return false;
+         assert(!(clipped_offs[s] & 31));
+      } else {
+         off = cp_run_clip_bin_align(off, 16);
+         clipped_offs[s] = off;
+         off += (size_t)seg->prim_slots * 3u * seg->num_outputs * 16u;
+      }
    }
    RUN_ALLOC(counts, classic ? 0 : (size_t)ntiles * 4, 16);
    RUN_ALLOC(offsets, classic ? 0 : (size_t)ntiles * 4, 16);
@@ -12376,6 +12512,7 @@ cp_run_clip_bin_execute(struct cp_context *cp)
    for (unsigned s = 0; s < nsegs; s++) {
       const struct cp_run_clip_bin_segment *seg = &cp->run_geometry.clip_segments[s];
       CUdeviceptr clipped = base + clipped_offs[s];
+      assert(!cp_debug->vs_tile2 || cp_vs_tile2_origin_valid(clipped));
       CUdeviceptr prim_refs = base + primrefs_off + (size_t)seg->prim_base * 8u;
       struct cp_rasterize_args rast = prepared[s].pre_clip_rast;
       uint32_t expected_invert =
