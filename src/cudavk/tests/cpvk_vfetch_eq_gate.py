@@ -113,18 +113,55 @@ def validate_report(r, arm):
         raise ValueError("unknown arm")
 
 
-def validate_logs(stdout, stderr, spec):
+def replay_mode(spec):
+    pair = [spec.get(key) is not None for key in
+            ["submit_ts", "expected_stdout_sha256"]]
+    regexes = [spec.get(key) is not None for key in
+               ["submit_regex", "frame_regex", "eof_regex"]]
+    if any(pair):
+        require(all(pair), "tocpp requires submit_ts and expected_stdout_sha256 together")
+        require(not any(regexes), "tocpp and plugin regex options are mutually exclusive")
+        require(isinstance(spec["expected_stdout_sha256"], str) and
+                re.fullmatch(r"[0-9a-f]{64}", spec["expected_stdout_sha256"]) is not None,
+                "invalid expected stdout SHA256")
+        return "tocpp"
+    require(all(regexes), "plugin mode requires submit/frame/EOF regexes")
+    return "plugin"
+
+
+def submit_counts(text):
+    rows = text.splitlines()
+    require(bool(rows) and text.endswith("\n"), "empty/truncated submit timestamps")
+    previous = -1
+    for index, row in enumerate(rows):
+        match = re.fullmatch(r"([0-9]+) ([0-9]+)", row)
+        require(match is not None, "malformed submit timestamp row")
+        ns, observed = map(int, match.groups())
+        require(ns > previous, "submit timestamps not strictly monotonic")
+        require(observed == index, "submit indices not contiguous from zero")
+        previous = ns
+    return len(rows), (len(rows) - 1) // 2
+
+
+def validate_logs(stdout, stderr, spec, submit_ts=None, stdout_bytes=None):
     require(type(spec["exit_code"]) is int and spec["exit_code"] == 0, "replay exit is not zero")
     for field in ["expected_submits", "expected_frames", "devices"]:
         require(type(spec[field]) is int and spec[field] > 0, "invalid expectation: " + field)
     combined = stdout + "\n" + stderr
     error = ERROR_RE.search(combined)
     require(error is None, "error diagnostic in replay logs: " + (error.group(0) if error else ""))
-    submits = count_log(combined, spec["submit_regex"])
-    frames = count_log(combined, spec["frame_regex"])
+    if replay_mode(spec) == "tocpp":
+        require(isinstance(stdout_bytes, bytes), "tocpp requires raw stdout bytes")
+        require(hashlib.sha256(stdout_bytes).hexdigest() == spec["expected_stdout_sha256"],
+                "stdout SHA256 mismatch")
+        require(isinstance(submit_ts, str), "missing submit timestamps")
+        submits, frames = submit_counts(submit_ts)
+    else:
+        submits = count_log(combined, spec["submit_regex"])
+        frames = count_log(combined, spec["frame_regex"])
+        require(re.search(spec["eof_regex"], combined, re.MULTILINE) is not None, "normal EOF missing")
     require(submits == spec["expected_submits"], "submit count mismatch")
     require(frames == spec["expected_frames"], "frame count mismatch")
-    require(re.search(spec["eof_regex"], combined, re.MULTILINE) is not None, "normal EOF missing")
     lines = [line for line in stderr.splitlines() if line.strip()]
     records = [line for line in lines if line.startswith("VFETCH_EQ ")]
     require(len(records) == spec["devices"], "missing/duplicate device report")
@@ -148,8 +185,14 @@ def validate_files(spec):
     try:
         blobs = {key: Path(spec[key]).read_bytes() for key in ["stdout", "stderr"]}
         result["sha256"] = {key: hashlib.sha256(blob).hexdigest() for key, blob in blobs.items()}
+        timestamps = None
+        if replay_mode(spec) == "tocpp":
+            blobs["submit_ts"] = Path(spec["submit_ts"]).read_bytes()
+            result["sha256"]["submit_ts"] = hashlib.sha256(blobs["submit_ts"]).hexdigest()
+            timestamps = blobs["submit_ts"].decode("ascii", errors="strict")
         result.update(validate_logs(blobs["stdout"].decode("utf-8", errors="strict"),
-                                    blobs["stderr"].decode("utf-8", errors="strict"), spec))
+                                    blobs["stderr"].decode("utf-8", errors="strict"), spec,
+                                    timestamps, blobs["stdout"]))
         result["pass"] = True
     except (ValueError, KeyError, OSError, TypeError) as error:
         result["error"] = str(error)
@@ -168,8 +211,10 @@ def validate_suite(specs):
                 "each capture needs positive, negative and disabled")
         positive = next(s for s in arms if s["arm"] == "positive")
         negative = next(s for s in arms if s["arm"] == "negative")
-        for key in ["expected_submits", "expected_frames", "submit_regex", "frame_regex", "eof_regex", "devices"]:
-            require(positive[key] == negative[key], "positive/BREAK census differs: " + key)
+        require(replay_mode(positive) == replay_mode(negative), "positive/BREAK modes differ")
+        for key in ["expected_submits", "expected_frames", "submit_regex", "frame_regex",
+                    "eof_regex", "expected_stdout_sha256", "devices"]:
+            require(positive.get(key) == negative.get(key), "positive/BREAK census differs: " + key)
     results = [validate_files(s) for s in specs]
     return {"pass": all(r["pass"] for r in results), "runs": results}
 
@@ -187,6 +232,65 @@ class GateTests(unittest.TestCase):
     def check(self, r=None, **changes):
         spec = dict(self.s, **changes)
         return validate_logs(self.out, "VFETCH_EQ " + json.dumps(self.r if r is None else r), spec)
+
+    def test_tocpp_files(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            out, err, ts = [Path(directory) / name for name in ["stdout", "stderr", "ts"]]
+            raw = b"native replay\r\n"
+            out.write_bytes(raw)
+            err.write_text("VFETCH_EQ " + json.dumps(self.r))
+            base = {k: v for k, v in self.s.items() if not k.endswith("_regex")}
+            base.update(stdout=str(out), stderr=str(err), submit_ts=str(ts),
+                        expected_stdout_sha256=hashlib.sha256(raw).hexdigest())
+            for count, frames in [(6947, 3473), (6965, 3482)]:
+                text = "".join(f"{1000000000 + i * 100} {i}\n" for i in range(count))
+                ts.write_text(text)
+                spec = dict(base, expected_submits=count, expected_frames=frames)
+                self.assertTrue(validate_files(spec)["pass"])
+                for changes in [dict(exit_code=1), dict(expected_submits=count-1),
+                                dict(expected_frames=frames-1), dict(submit_regex="submit"),
+                                dict(expected_stdout_sha256=None), dict(submit_ts=None),
+                                dict(devices=2), dict(min_lane_launches=1)]:
+                    with self.subTest(changes=changes):
+                        self.assertFalse(validate_files(dict(spec, **changes))["pass"])
+                rows = text.splitlines(keepends=True)
+                reordered = rows[1] + rows[0] + "".join(rows[2:])
+                for broken in [reordered, text.rsplit("\n", 2)[0] + "\n", text[:-1],
+                               text.replace("1000000000 0", "1000000000 1"),
+                               text.replace("1000000100 1", "1000000000 1"),
+                               text.replace("1000000100 1", "999999999 1"),
+                               text.replace("1000000100 1", "1000000100 2"),
+                               text.replace("1000000100 1", "1 1 extra"),
+                               text.replace("1000000100 1", "x 1"), ""]:
+                    ts.write_text(broken)
+                    self.assertFalse(validate_files(spec)["pass"])
+                ts.unlink()
+                self.assertFalse(validate_files(spec)["pass"])
+                ts.write_text(text)
+                out.write_bytes(raw.replace(b"\r\n", b"\n"))
+                self.assertFalse(validate_files(spec)["pass"])
+                out.write_bytes(raw)
+                self.assertFalse(validate_files(dict(spec, arm="negative"))["pass"])
+                r = dict(self.r, injections=1, diff_words=1, diff_slots=1, differing_invocations=1)
+                err.write_text("VFETCH_EQ " + json.dumps(r))
+                self.assertTrue(validate_files(dict(spec, arm="negative"))["pass"])
+                self.assertFalse(validate_files(spec)["pass"])
+                err.write_text("VFETCH_EQ " + json.dumps(self.r))
+                # A full six-arm native suite also keeps mode/hash census checks.
+                specs = []
+                for capture in ["favorite2", "favorite3"]:
+                    for arm in ["positive", "negative", "disabled"]:
+                        report = self.r if arm == "positive" else r
+                        if arm == "disabled":
+                            report = dict.fromkeys(COUNTERS, 0)
+                            report.update(complete=1, context_id=123)
+                        path = Path(directory) / (capture + arm)
+                        path.write_text("VFETCH_EQ " + json.dumps(report))
+                        specs.append(dict(spec, capture=capture, arm=arm, stderr=str(path)))
+                self.assertTrue(validate_suite(specs)["pass"])
+                specs[1]["expected_stdout_sha256"] = "0" * 64
+                with self.assertRaises(ValueError): validate_suite(specs)
 
     def test_positive(self):
         self.check()
@@ -297,8 +401,10 @@ def main():
     suite.add_argument("manifest")
     suite.add_argument("--output", required=True)
     one = sub.add_parser("validate", help="validate one existing replay log pair")
-    for name in ["stdout", "stderr", "submit-regex", "frame-regex", "eof-regex", "output"]:
+    for name in ["stdout", "stderr", "output"]:
         one.add_argument("--" + name, required=True)
+    for name in ["submit-regex", "frame-regex", "eof-regex", "submit-ts", "expected-stdout-sha256"]:
+        one.add_argument("--" + name)
     for name in ["exit-code", "expected-submits", "expected-frames"]:
         one.add_argument("--" + name, type=int, required=True)
     one.add_argument("--arm", choices=["positive", "negative", "disabled"], required=True)
