@@ -18,7 +18,7 @@ args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 source = (root / "cp_renderer.c").read_text()
 
-def function(name):
+def function(name, source=source):
     pattern = r"(?:static )?(?:bool|void|CUdeviceptr)\n" + name + r"\([^;]*?\n\{"
     matches = list(re.finditer(pattern, source))
     assert len(matches) == 1, (name, len(matches))
@@ -59,6 +59,56 @@ pipeline = (root / "cpvk_pipeline.c").read_text()
 prim = re.search(r"cpvk_prim\([^)]*\)\s*\{(.*?)\n\}", pipeline, re.S).group(1)
 assert "LINE_LIST" not in prim and "LINE_STRIP" not in prim
 assert re.search(r"default:\s*return MESA_PRIM_TRIANGLES;", prim)
+
+# H1 witness: extract construction as well as restore from both immutable
+# baseline and current source. A passing assertion reproduces a known defect;
+# it is deliberately NOT a test claiming successful count rollback.
+BASELINE = "69a58a486d4bf74ba8d77089894d17bed1ce598c"
+baseline = subprocess.run(
+    ["git", "show", BASELINE + ":src/cudavk/cp_renderer.c"],
+    cwd=root, text=True, capture_output=True, check=True).stdout
+
+def construction(text):
+    init = re.findall(r"struct cp_pending_clip pending_clip = \{0\};", text)
+    assignments = re.findall(
+        r"pending_clip\.args = clip;.*?pending_clip\.fs_prim_shift = cp->fs_batch\.prim_shift;",
+        text, re.S)
+    assert len(init) == len(assignments) == 1
+    return init[0], assignments[0]
+
+for label, text in (("baseline69a", baseline), ("current", source)):
+    init, assignments = construction(text)
+    assert not re.search(r"pending_clip\.num_triangles\s*=", assignments)
+# These bounded bodies and construction statements must match mechanically.
+assert construction(baseline) == construction(source)
+for name in ("cp_rast_args_unclip", "cp_restore_preclip"):
+    assert function(name, baseline) == function(name, source), name
+
+witness = r'''
+static void witness_pending_construction(void) {
+ for (unsigned phase=0; phase<2; phase++) {
+   struct { struct { unsigned prim_shift; } fs_batch; } context = {{2}}, *cp=&context;
+   struct cp_clip_args clip={.num_triangles=7};
+   struct cp_rasterize_args rast_args={.positions=0x800000+phase*16,
+      .num_triangles=7,.rect_prim_shift=1};
+   unsigned rast_num_triangles=9;
+   INIT
+   CONSTRUCTION
+   assert(pending_clip.pending && pending_clip.args.num_triangles==7);
+   assert(pending_clip.num_triangles==0); /* inherited H1, not correct rollback */
+   rast_args.positions=0x900000; rast_args.num_triangles=56;
+   rast_args.prim_refs=3; rast_args.tri_count=4; rast_args.active_ids=5;
+   rast_args.rect_prim_shift=3;
+   CUdeviceptr vs=0x900000; unsigned triangles=56, shift=3;
+   cp_restore_preclip(&pending_clip,&rast_args,&vs,&triangles,&shift);
+   assert(vs==0x800000+phase*16 && rast_args.positions==vs);
+   assert(!rast_args.prim_refs && !rast_args.tri_count && !rast_args.active_ids);
+   assert(triangles==9 && shift==2 && rast_args.rect_prim_shift==1);
+   assert(rast_args.num_triangles==0); /* nonzero input is LOST */
+ }
+ puts("H1 inherited defect reproduced: nonzero input 7 -> restored count 0 (both phases); NOT correct rollback");
+}
+'''
 
 pending = re.findall(r"struct cp_pending_clip \{[^}]*\};", source)
 assert len(pending) == 1
@@ -207,15 +257,32 @@ int main(void) {
       assert(!ra.prim_refs && !ra.tri_count && !ra.active_ids);
       assert(ra.num_triangles==3 && triangles==3 && !shift && !ra.rect_prim_shift);
    }
-   puts("TILE2 renderer actual-body CPU tests passed");
+   witness_pending_construction();
+   puts("TILE2 renderer helper tests passed; manually seeded restoration is NOT production construction coverage");
    return 0;
 }
 '''
 with tempfile.TemporaryDirectory(prefix="cp-tile2-renderer-") as tmp:
     cfile = Path(tmp)/"test.c"
     binary = Path(tmp)/"test"
-    cfile.write_text(prefix+limit[0]+"\n"+pending[0]+"\n"+bodies+main)
+    init, assignments = construction(source)
+    current_witness = witness.replace("INIT", init).replace("CONSTRUCTION", assignments)
+    cfile.write_text(prefix+limit[0]+"\n"+pending[0]+"\n"+bodies+current_witness+main)
     flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if args.sanitize else []
     subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra",
                     "-Werror", *flags, "-I", str(root), str(cfile), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+    baseline_pending = re.findall(r"struct cp_pending_clip \{[^}]*\};", baseline)
+    assert len(baseline_pending) == 1
+    init, assignments = construction(baseline)
+    baseline_witness = witness.replace("INIT", init).replace("CONSTRUCTION", assignments)
+    baseline_bodies = "\n".join(function(n, baseline) for n in
+                               ("cp_rast_args_unclip", "cp_restore_preclip"))
+    # Minimal prefix avoids fake allocator globals irrelevant to this witness.
+    minimal = prefix[:prefix.index("struct cp_context {")]
+    cfile.write_text(minimal + baseline_pending[0] + "\n" + baseline_bodies +
+                     baseline_witness + "\nint main(void) { witness_pending_construction(); }\n")
+    subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra",
+                    "-Werror", *flags, "-I", str(root), str(cfile), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+    print("H1 baseline69a/current production construction and restore bodies match; 4 construction witnesses passed")
