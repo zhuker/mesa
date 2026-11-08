@@ -117,6 +117,12 @@ static const struct cp_flag_def flags[] = {
      "report at teardown what deciding one draw at a time costs: batch keys "
      "built, pairwise merge tests, flushes, pass episodes closed and every "
      "reactive reallocation, with per-scope averages" },
+   { "CUDAVK_ORACLE", CP_FLAG_UINT, F(oracle), 0, 2,
+     "diagnostic probe for the value of device-decided episodes: 1 records "
+     "every value the renderer reads back at its four blocking waits into "
+     "/tmp/cudavk-oracle.bin, 2 replays that recording and skips the wait "
+     "entirely. Replay is only meaningful against the run that recorded it, "
+     "and an identical stdout hash is what says the recording was faithful" },
    { "CUDAVK_SPEC_STATS", CP_FLAG_BOOL_VALUE, F(spec_stats),
      "report at teardown how many fragment launches used a sampler-specialised "
      "kernel, and which shaders sample textures the specialiser could not "

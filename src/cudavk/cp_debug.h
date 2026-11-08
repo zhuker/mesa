@@ -170,6 +170,7 @@ struct cp_debug {
    bool spec_stats;
    bool texture_cache_stats;
    bool plan_stats;
+   unsigned oracle;   /* 0 off, 1 record, 2 replay: see CUDAVK_ORACLE */
    bool debug_vfetch;
    bool debug_work;
    bool debug_discard;
