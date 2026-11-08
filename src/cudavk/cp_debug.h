@@ -198,6 +198,7 @@ struct cp_debug {
    bool no_pass_episode;
    bool upload_stats;
    bool no_meta_fold;
+   bool dscratch_reuse;
    bool no_fetch_fold;
    bool fused_vfetch;
    bool no_fused_vfetch;
