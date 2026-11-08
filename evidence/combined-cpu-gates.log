@@ -1,0 +1,28 @@
+ninja: Entering directory `/home/alexzhukov/mesa-three-ms-combined/build-cudavk'
+[1/4] Compiling C object src/cudavk/cp_shade_equiv_test.p/tests_cp_shade_equiv_test.c.o
+[2/4] Linking target src/cudavk/cp_shade_equiv_test
+[3/4] Compiling C object src/cudavk/cp_vfetch_layout_cpu.p/tests_cp_vfetch_layout_cpu.c.o
+In file included from ../src/cudavk/tests/cp_vfetch_layout_cpu.c:6:
+../src/cudavk/tests/../kernels/cp_vs_inline.c:87:1: warning: no previous prototype for ‘cp_vs_fetch_ids’ [-Wmissing-prototypes]
+   87 | cp_vs_fetch_ids(const struct cp_vertex_fetch_args *source, uint32_t v,
+      | ^~~~~~~~~~~~~~~
+../src/cudavk/tests/../kernels/cp_vs_inline.c:98:1: warning: no previous prototype for ‘cp_vs_fetch_element’ [-Wmissing-prototypes]
+   98 | cp_vs_fetch_element(const struct cp_vertex_fetch_args *source, uint32_t e,
+      | ^~~~~~~~~~~~~~~~~~~
+../src/cudavk/tests/../kernels/cp_vs_inline.c:115:1: warning: no previous prototype for ‘cp_vs_fetch_seed’ [-Wmissing-prototypes]
+  115 | cp_vs_fetch_seed(const struct cp_vertex_fetch_args *source, uint32_t gtid)
+      | ^~~~~~~~~~~~~~~~
+../src/cudavk/tests/../kernels/cp_vs_inline.c:131:1: warning: no previous prototype for ‘cp_vs_fetch_element_layout’ [-Wmissing-prototypes]
+  131 | cp_vs_fetch_element_layout(const struct cp_vertex_fetch_args *source, uint32_t e,
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~
+[4/4] Linking target src/cudavk/cp_vfetch_layout_cpu
+1/5 cudavk - mesa:cp_shade_equiv_test      OK               0.01s
+2/5 cudavk-cpu - mesa:cp_vfetch_layout_cpu OK               0.00s
+3/5 cudavk - mesa:cp_launch_audit          OK               0.02s
+4/5 cudavk - mesa:cp_clip_common_reject    OK               0.33s
+5/5 cudavk - mesa:cp_clip_copy_bypass      OK               0.60s
+
+Ok:                5   
+Fail:              0   
+
+Full log written to /home/alexzhukov/mesa-three-ms-combined/build-cudavk/meson-logs/testlog.txt
