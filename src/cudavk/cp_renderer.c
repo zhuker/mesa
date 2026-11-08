@@ -665,22 +665,28 @@ cp_upload(struct cp_context *cp, const void *data, size_t size)
 void
 cp_scratch_begin(struct cp_context *cp)
 {
-   /*
-    * Reclaim when the arena has expanded a few times, or when it has simply
-    * handed out too much. The bump pointer is not reset between draws, so that
-    * one draw's kernels can still be reading their buffers while the host sets
-    * up the next — but that means a frame's draws accumulate, and counting
-    * expansions alone does not notice: once the arena is large enough that
-    * nothing has to grow, the counter stops moving and the pointer climbs
-    * forever. A frame of bloom reached eleven gigabytes that way. Reclaiming
-    * costs a sync, so the limit is high enough that ordinary draws still
-    * pipeline.
-    */
-   if (cp->scratch.num_overflow >= 5 ||
-       cp->scratch.used > CP_SCRATCH_RECLAIM_BYTES ||
-       cp->dscratch.num_overflow >= 5 ||
-       cp->dscratch.used > CP_SCRATCH_RECLAIM_BYTES) {
-      if (cuCtxSynchronize() != CUDA_SUCCESS) {
+   /* Attribute the old whole-context high-water drain before changing it. */
+   bool reason[4] = {
+      cp->scratch.num_overflow >= 5,
+      cp->scratch.used > CP_SCRATCH_RECLAIM_BYTES,
+      cp->dscratch.num_overflow >= 5,
+      !cp_debug->dscratch_reuse &&
+         cp->dscratch.used > CP_SCRATCH_RECLAIM_BYTES,
+   };
+   cp->plan.scratch_used_max = MAX2(cp->plan.scratch_used_max,
+                                    cp->scratch.used);
+   cp->plan.dscratch_used_max = MAX2(cp->plan.dscratch_used_max,
+                                     cp->dscratch.used);
+   if (reason[0] || reason[1] || reason[2] || reason[3]) {
+      for (unsigned i = 0; i < 4; i++)
+         cp->plan.scratch_sync_reason[i] += reason[i];
+      if (cuStreamQuery(cp->stream) == CUDA_SUCCESS)
+         cp->plan.scratch_stream_ready++;
+      int64_t t0 = os_time_get_nano();
+      CUresult err = cuCtxSynchronize();
+      cp->plan.wait_scratch_ns += (uint64_t)(os_time_get_nano() - t0);
+      cp->plan.wait_scratch_n++;
+      if (err != CUDA_SUCCESS) {
          cp_renderer_texture_fatal(cp);
          return;
       }
@@ -874,6 +880,18 @@ cp_plan_report(struct cp_context *cp)
               cp->plan.wait_peel_ns / 1e6, cp->plan.wait_peel_n,
               cp->plan.wait_seg_ns / 1e6, cp->plan.wait_seg_n,
               cp->plan.wait_upload_ns / 1e6, cp->plan.wait_upload_n);
+   if (cp->plan.wait_scratch_n)
+      fprintf(stderr, "cudavk: scratch drains: %.1f ms/%" PRIu64
+              ", reasons managed-overflow=%" PRIu64 " managed-bytes=%" PRIu64
+              " device-overflow=%" PRIu64 " device-bytes=%" PRIu64
+              ", main-stream-ready=%" PRIu64
+              ", high-water managed=%.1f MiB device=%.1f MiB\n",
+              cp->plan.wait_scratch_ns / 1e6, cp->plan.wait_scratch_n,
+              cp->plan.scratch_sync_reason[0], cp->plan.scratch_sync_reason[1],
+              cp->plan.scratch_sync_reason[2], cp->plan.scratch_sync_reason[3],
+              cp->plan.scratch_stream_ready,
+              cp->plan.scratch_used_max / (1024.0 * 1024.0),
+              cp->plan.dscratch_used_max / (1024.0 * 1024.0));
    if (cp->plan.opaque_episodes)
       fprintf(stderr, "cudavk: opaque episodes: %" PRIu64 " closed, %" PRIu64
               " segments (%.2f per episode, longest %" PRIu64 "), %" PRIu64

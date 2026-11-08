@@ -187,6 +187,9 @@ static const struct cp_flag_def flags[] = {
    { "CUDAVK_NO_META_FOLD", CP_FLAG_BOOL_VALUE, F(no_meta_fold),
      "upload the vertex stage's vcount and stride as their own block again "
      "instead of carrying them in the argument block's scalar area" },
+   { "CUDAVK_DSCRATCH_REUSE", CP_FLAG_BOOL_VALUE, F(dscratch_reuse),
+     "probe reusing the device-only scratch high-water under stream order "
+     "instead of draining the whole context at one GiB" },
    { "CUDAVK_NO_COUNTER_BLOCK", CP_FLAG_BOOL_VALUE, F(no_counter_block),
      "clear the A-buffer's scalar counters one at a time again instead of "
      "clearing the whole counter block once per draw or episode" },

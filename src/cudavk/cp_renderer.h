@@ -566,6 +566,10 @@ struct cp_context {
       uint64_t wait_peel_ns, wait_peel_n;          /* peel-advance check */
       uint64_t wait_seg_ns, wait_seg_n;            /* segment composite ctrs */
       uint64_t wait_upload_ns, wait_upload_n;      /* desc-arena HtoD */
+      uint64_t wait_scratch_ns, wait_scratch_n;    /* arena high-water drain */
+      uint64_t scratch_sync_reason[4];             /* managed ovf/bytes, device ovf/bytes */
+      uint64_t scratch_stream_ready;
+      uint64_t scratch_used_max, dscratch_used_max;
    } plan;
 
    /* GPU-resident pipeline state — managed memory, written by CPU on state
