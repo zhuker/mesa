@@ -1,0 +1,89 @@
+ 1/84 cudavk - mesa:cp_shade_equiv_test                      OK               0.00s
+ 2/84 cudavk - mesa:cpvk_batch                               OK               1.04s
+ 3/84 cudavk - mesa:cpvk_batchbig                            OK               1.57s
+ 4/84 cudavk - mesa:cpvk_batchblend                          OK               1.56s
+ 5/84 cudavk - mesa:cpvk_batchclip                           OK               1.42s
+ 6/84 cudavk - mesa:cpvk_batchpush                           OK               0.97s
+ 7/84 cudavk - mesa:cpvk_batchtex                            OK               1.34s
+ 8/84 cudavk - mesa:cpvk_bccopy                              OK               0.73s
+ 9/84 cudavk - mesa:cpvk_blend_depth_write                   OK               0.96s
+10/84 cudavk - mesa:cpvk_compute_pipeline_lifetime           OK               0.84s
+11/84 cudavk - mesa:cpvk_cubebig                             OK               1.57s
+12/84 cudavk - mesa:cpvk_cubebig_pbrsamp                     OK               1.54s
+13/84 cudavk - mesa:cpvk_cubedir                             OK               0.98s
+14/84 cudavk - mesa:cpvk_cubelod                             OK               1.57s
+15/84 cudavk - mesa:cpvk_cubelodf16                          OK               1.89s
+16/84 cudavk - mesa:cpvk_cubesph                             OK               1.37s
+17/84 cudavk - mesa:cpvk_cubesph_nearest                     OK               1.30s
+18/84 cudavk - mesa:cpvk_clear                               OK               1.21s
+19/84 cudavk - mesa:cpvk_d16_attachment                      OK               1.04s
+20/84 cudavk - mesa:cpvk_d16_sampled                         OK               1.59s
+21/84 cudavk - mesa:cpvk_depth_attachment                    OK               0.98s
+22/84 cudavk - mesa:cpvk_depth_convention                    OK               0.96s
+23/84 cudavk - mesa:cpvk_depth_only_pass                     OK               1.17s
+24/84 cudavk - mesa:cpvk_desc_array                          OK               0.89s
+25/84 cudavk - mesa:cpvk_descriptor_pool                     OK               0.86s
+26/84 cudavk - mesa:cpvk_descriptor_semantics                OK               0.90s
+27/84 cudavk - mesa:cpvk_draw                                OK               1.08s
+28/84 cudavk - mesa:cpvk_event_state                         OK               0.99s
+29/84 cudavk - mesa:cpvk_fixed_edge                          OK               1.05s
+30/84 cudavk - mesa:cpvk_gather                              OK               2.02s
+31/84 cudavk - mesa:cpvk_indirect                            OK               0.96s
+32/84 cudavk - mesa:cpvk_lod                                 OK               1.39s
+33/84 cudavk - mesa:cpvk_lodblit                             OK               1.32s
+34/84 cudavk - mesa:cpvk_lodimp                              OK               1.51s
+35/84 cudavk - mesa:cpvk_mesh                                OK               1.06s
+36/84 cudavk - mesa:cpvk_multidevice                         OK               3.72s
+37/84 cudavk - mesa:cpvk_pipeline_lifetime                   OK               1.45s
+38/84 cudavk - mesa:cpvk_query_async                         OK               1.30s
+39/84 cudavk - mesa:cpvk_query_lifetime                      OK               0.69s
+40/84 cudavk - mesa:cpvk_rtt                                 OK               1.36s
+41/84 cudavk - mesa:cpvk_sampler_array                       OK               1.26s
+42/84 cudavk - mesa:cpvk_sampler_two_bindings                OK               1.37s
+43/84 cudavk - mesa:cpvk_texture_cache_descriptors           OK               1.61s
+44/84 cudavk - mesa:cpvk_texture_cache_ops                   OK               1.84s
+45/84 cudavk - mesa:cpvk_texture_cache_no_replay             OK               1.55s
+46/84 cudavk - mesa:cpvk_secondary_descriptor                OK               1.29s
+47/84 cudavk - mesa:cpvk_push_stages                         OK               1.23s
+48/84 cudavk - mesa:cpvk_smoke                               OK               0.87s
+49/84 cudavk - mesa:cpvk_ssbo_length                         OK               0.73s
+50/84 cudavk - mesa:cpvk_static_viewport                     OK               1.04s
+51/84 cudavk - mesa:cpvk_step                                OK               1.86s
+52/84 cudavk - mesa:cpvk_sync_state                          OK               0.85s
+53/84 cudavk - mesa:cpvk_timeline_semaphore                  OK               0.73s
+54/84 cudavk - mesa:cpvk_tex                                 OK               1.54s
+55/84 cudavk - mesa:cpvk_tex3d                               OK               1.30s
+56/84 cudavk - mesa:cpvk_texgrad                             OK               4.96s
+57/84 cudavk - mesa:cpvk_tri                                 OK               1.19s
+58/84 cudavk - mesa:cpvk_ubo                                 OK               1.13s
+59/84 cudavk - mesa:cpvk_uint_attachment                     OK               1.59s
+60/84 cudavk - mesa:cpvk_unorm16_attachment                  OK               1.13s
+61/84 cudavk - mesa:cpvk_wsi                                 OK               0.83s
+62/84 cudavk - mesa:cpvk_run_geometry_gate                   OK              21.40s
+63/84 cudavk - mesa:cpvk_run_clip_classic_gate               OK               4.12s
+64/84 cudavk - mesa:cp_run_clip_bin_gate                     OK               2.17s
+65/84 cudavk - mesa:cpvk_vfetch_formats                      OK               2.34s
+66/84 cudavk - mesa:cpvk_vfetch_sparse                       OK               1.17s
+67/84 cudavk - mesa:cpvk_vfetch_divisor                      OK               1.27s
+68/84 cudavk - mesa:cpvk_vfetch_decline                      OK               1.00s
+69/84 cudavk - mesa:cp_launch_audit                          OK               0.03s
+70/84 cudavk - mesa:cp_vfetch_regcap_retry_host              OK               0.08s
+71/84 cudavk - mesa:cpvk_vfetch_gate                         OK              22.48s
+72/84 cudavk - mesa:cpvk_vfetch_seed_gate                    OK               2.54s
+73/84 cudavk - mesa:cpvk_texgrad_gate                        OK               9.36s
+74/84 cudavk - mesa:cpvk_texture_cache_formats_gate          OK               2.18s
+75/84 cudavk - mesa:cpvk_texture_cache_gate                  OK               1.72s
+76/84 cudavk - mesa:cpvk_texture_cache_fault_gate            OK               1.57s
+77/84 cudavk - mesa:cpvk_texture_cache_purge_gate            OK               1.54s
+78/84 cudavk - mesa:cpvk_texture_cache_oom_gate              OK               1.36s
+79/84 cudavk - mesa:cpvk_texture_cache_array_oom_gate        OK               1.48s
+80/84 cudavk - mesa:cpvk_texture_cache_object_oom_gate       OK               1.51s
+81/84 cudavk - mesa:cpvk_texture_cache_conversion_fault_gate OK               2.08s
+82/84 cudavk - mesa:cpvk_texture_cache_no_replay_fault       OK               1.32s
+83/84 cudavk - mesa:cpvk_texture_cache_fs_arg_fault_gate     OK               1.50s
+84/84 cudavk - mesa:cpvk_texture_cache_create_fault_gate     OK               3.57s
+
+Ok:                84  
+Fail:              0   
+
+Full log written to /home/builder/mesa-three-ms-vfetch-retry/build-cudavk/meson-logs/testlog.txt

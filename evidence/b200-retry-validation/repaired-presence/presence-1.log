@@ -1,0 +1,39 @@
+cudavk: shader MESA_SHADER_VERTEX    regs  32 spill    0 blocks/sm 8  kept (not a fragment shader)
+cudavk: shader vertex fused-fetch    regs  35 spill    0 blocks/sm 6  kept (not a fragment shader)
+cudavk: vsfetch regcap retry cap 32 regs 32 spill 0 blocks/sm 8 admitted
+cudavk: vsfetch verdict admitted        classic regs  32 spill    0 blocks/sm 8 local 0 | fused regs  32 spill    0 blocks/sm 8 local 0
+cudavk: shader fragment fused        regs 222 spill  832 blocks/sm 1 -> cap 128: regs 126 spill 1040 blocks/sm 2  on trial
+cudavk: shader fragment hardware inline regs  92 spill    0 blocks/sm 2  kept (already at the target)
+episode-cut: begin_render
+run-geometry-plan: batches=9 groups=1 members=9
+run-geometry-launch: members=9 draws=9 verts=162000 kernel=0x55b9fc93e430
+append: nsegs=0 opaque=0 ndraws=1
+run-geometry-metadata: draws=1 slices=0 count=0 prim-shift=0 clip-rects=0 prepare=0
+append: nsegs=1 opaque=1 ndraws=1
+gate-once: seg=1 stream=0 owed=0 main=0 carried=0
+run-geometry-metadata: draws=1 slices=0 count=0 prim-shift=0 clip-rects=0 prepare=0
+append: nsegs=2 opaque=1 ndraws=1
+gate-once: seg=2 stream=1 owed=0 main=0 carried=0
+run-geometry-metadata: draws=1 slices=0 count=0 prim-shift=0 clip-rects=0 prepare=0
+append: nsegs=3 opaque=1 ndraws=1
+gate-once: seg=3 stream=2 owed=0 main=0 carried=0
+run-geometry-metadata: draws=1 slices=0 count=0 prim-shift=0 clip-rects=0 prepare=0
+append: nsegs=4 opaque=1 ndraws=1
+gate-once: seg=4 stream=3 owed=0 main=0 carried=0
+run-geometry-metadata: draws=1 slices=0 count=0 prim-shift=0 clip-rects=0 prepare=0
+append: nsegs=5 opaque=1 ndraws=1
+gate-once: seg=5 stream=4 owed=0 main=0 carried=0
+run-geometry-metadata: draws=1 slices=0 count=0 prim-shift=0 clip-rects=0 prepare=0
+append: nsegs=6 opaque=1 ndraws=1
+gate-once: seg=6 stream=5 owed=0 main=0 carried=0
+run-geometry-metadata: draws=1 slices=0 count=0 prim-shift=0 clip-rects=0 prepare=0
+append: nsegs=7 opaque=1 ndraws=1
+gate-once: seg=7 stream=6 owed=0 main=0 carried=0
+run-geometry-metadata: draws=1 slices=0 count=0 prim-shift=0 clip-rects=0 prepare=0
+append: nsegs=8 opaque=1 ndraws=1
+gate-once: seg=8 stream=7 owed=0 main=0 carried=0
+run-geometry-metadata: draws=1 slices=0 count=0 prim-shift=0 clip-rects=0 prepare=0
+episode-cut: flush_why=render scope end nsegs=9
+episode: nsegs=9 opaque=1
+episode-cut: end_render
+  /tmp/lat/native_batchtex.ppm written

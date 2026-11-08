@@ -1,0 +1,15 @@
+capture=favorite3 icd=/home/builder/mesa-three-ms-vfetch-retry/build-cudavk/src/cudavk/cudavk_devenv_icd.x86_64.json rounds=3
+control   : CUDAVK_VFETCH_REGCAP_RETRY=0
+candidate : CUDAVK_VFETCH_REGCAP_RETRY=1
+  c1  rc=0    rows=6947  sentinels=0   OK
+  n1  rc=0    rows=6947  sentinels=0   OK
+  c2  rc=0    rows=6947  sentinels=0   OK
+  n2  rc=0    rows=6947  sentinels=0   OK
+  c3  rc=0    rows=6947  sentinels=0   OK
+  n3  rc=0    rows=6947  sentinels=0   OK
+whole  control [7.8948, 7.9038, 7.8065] -> 7.8948
+whole  cand    [7.7937, 7.882, 7.5309] -> 7.7937
+whole  DELTA   -0.1011 ms/frame   arms OVERLAP (inconclusive)
+heavy  control [9.274, 9.1784, 9.0325] -> 9.1784
+heavy  cand    [9.1397, 9.0363, 8.7479] -> 9.0363
+heavy  DELTA   -0.1421 ms/frame   arms OVERLAP (inconclusive)

@@ -1,0 +1,9 @@
+PATCH: eagerly mapped 321 data packs, 13.12 GB
+PATCH: dropping unsupported device extension VK_KHR_sampler_ycbcr_conversion
+PATCH: dropping unsupported device extension VK_KHR_synchronization2
+PATCH: dropping unsupported device extension VK_KHR_video_maintenance1
+PATCH: dropping unsupported core feature index 11
+PATCH: dropping unsupported core feature index 12
+PATCH: dropping unsupported core feature index 22
+Warning: loaded_vkGetPhysicalDeviceImageFormatProperties2KHR(physicalDevices_1[0], &physicalDeviceImageFormatInfo2_36, &pImageFormatProperties_37) returned -11 (captured 0) at /home/builder/favorite3-cpp/out/src/frame_0000_0000.cpp:290 -- continuing
+abuffer: fragment array 5242880 entries (60.0 MB, 65.0 MB of quads) from a first count of 999560
