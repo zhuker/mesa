@@ -256,6 +256,7 @@ struct cp_debug {
    bool no_counter_pool;
    bool interp_inline;
    bool compact_pdl;
+   bool allow_hw_inline_local;
    bool no_inline_fs;
    bool inline_fs;
    bool force_fused_fs;

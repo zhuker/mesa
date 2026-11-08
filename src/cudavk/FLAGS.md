@@ -16,7 +16,7 @@ Two boolean kinds appear here and the difference bites:
 That is not a design, it is what the flags grew into, and it is preserved
 deliberately: someone's script sets one of these to 0 today.
 
-129 switches.
+130 switches.
 
 ## Tracing
 
@@ -100,6 +100,7 @@ deliberately: someone's script sets one of these to 0 today.
 | `CUDAVK_NO_COUNTER_POOL` | bool (value) | `off` | — | restore the per-shade cuMemsetD32Async that zeroes the direct path's slot counter instead of handing counters out of a pre-zeroed device pool; the revert for the shade-chain counter pool |
 | `CUDAVK_INTERP_INLINE` | bool (value) | `off` | — | carry the fused-interpolation argument block inside the fragment argument block's upload instead of uploading it on its own before the compaction launch. Off by default: it leaves no stream operation between the last rasterizer stage and the compaction, but measured +0.13 ms/frame on favorite3 (4+4 alternating, all four pairs agreeing) for a reason not yet attributed; it exists because CUDAVK_COMPACT_PDL is inert without it |
 | `CUDAVK_COMPACT_PDL` | bool (value) | `off` | — | offer the programmatic dependent launch attribute on the cp_fs_compact launch against whatever kernel precedes it on the stream. Off by default: without CUDAVK_INTERP_INLINE the interpolation-block upload sits in the link and the epoch check declines nearly every offer; with it, the pair measured 0.10 ms/frame better than INTERP_INLINE alone and still 0.05 worse than neither |
+| `CUDAVK_ALLOW_HW_INLINE_LOCAL` | bool (value) | `off` | — | probe hardware-texture same-LLVM interpolation when local memory is its only rejection reason; surviving helpers and bad texture PTX still refuse it |
 | `CUDAVK_NO_INLINE_FS` | bool (value) | `off` | — | restore separate interpolation plus the resource-isolated classic fragment binary instead of same-LLVM inline interpolation |
 | `CUDAVK_INLINE_FS` | bool (value) | `off` | — | opt in to same-LLVM fragment interpolation; default stays on the pre-inline fused path because dual module ownership is expensive |
 | `CUDAVK_FORCE_FUSED_FS` | bool (value) | `off` | — | force pre-inline fused interpolation execution with its isolated tuner (overrides NO_FUSED flags; NO_INLINE_FS takes precedence) |

@@ -5069,8 +5069,11 @@ cp_compile_nir_one(struct nir_shader *nir, int sm_major, int sm_minor,
       return NULL;
    }
 
+   bool allow_local = hardware_texture &&
+                      cp_debug->allow_hw_inline_local;
    if (bad_hardware_ptx ||
-       (inline_interp && (surviving_inline_helper || local_memory))) {
+       (inline_interp &&
+        (surviving_inline_helper || (local_memory && !allow_local)))) {
       if (cp_debug->shader_stats || cp_debug->dump_ir || cp_debug->dump_ptx)
          fprintf(stderr, "cudavk: rejected unsafe inline FS PTX "
                  "(helper=%u local=%u texture=%u)\n",
